@@ -30,9 +30,10 @@ use std::time::Duration;
 
 use sui::{
     Alignment, ArrangeCtx, Breadcrumb, BreadcrumbItem, Constraints, DefaultTheme, Event, EventCtx,
-    FontWeight, IconButton, IconGlyph, ListItem, ListView, MeasureCtx, PaintCtx, Rect, ScrollState,
-    ScrollView, SemanticsCtx, Separator, Size, SizedBox, Stack, Widget, WidgetPod,
-    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, draw_glyph,
+    FontWeight, IconButton, IconGlyph, ListItem, ListView, MeasureCtx, PaintCtx, PointerButton,
+    PointerEventKind, Rect, ScrollState, ScrollView, SemanticsAction, SemanticsCtx, SemanticsNode,
+    SemanticsRole, Separator, Size, SizedBox, Stack, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, WindowEvent, draw_glyph,
 };
 
 use sinomo_cli::app_api::{SifsBrowser, SifsEntry};
@@ -76,6 +77,7 @@ pub struct FilesState {
     pub entries: Vec<SifsEntry>,
     pub selected: Option<usize>,
     pub scroll: f32,
+    pub inspector_details_open: bool,
     worker_tx: Option<Sender<FilesWorkerCommand>>,
     worker_rx: Option<Receiver<FilesWorkerResult>>,
     worker_result_tx: Option<Sender<FilesWorkerResult>>,
@@ -101,6 +103,7 @@ impl FilesState {
             entries: Vec::new(),
             selected: None,
             scroll: 0.0,
+            inspector_details_open: false,
             worker_tx: None,
             worker_rx: None,
             worker_result_tx: None,
@@ -232,6 +235,7 @@ impl FilesState {
         self.entries.clear();
         self.selected = None;
         self.node_id.clear();
+        self.inspector_details_open = false;
         self.loaded = false;
         self.loading = false;
         self.pending_request_id = None;
@@ -776,10 +780,13 @@ impl InspectorView {
     fn summary(&self) -> String {
         let files = self.shared.files();
         if files.loading {
-            return format!("loading|{}", files.path);
+            return format!("loading|{}|{}", files.path, files.inspector_details_open);
         }
         if let Some(error) = &files.error {
-            return format!("error|{}|{}", files.path, error);
+            return format!(
+                "error|{}|{}|{}",
+                files.path, error, files.inspector_details_open
+            );
         }
         match files.selected_entry() {
             Some(entry) => format!(
@@ -792,17 +799,77 @@ impl InspectorView {
 }
 
 const INSPECTOR_PAD: f32 = CONTENT_PAD;
+const INSPECTOR_STATE_PANEL_Y: f32 = INSPECTOR_PAD + 34.0;
+const INSPECTOR_DETAIL_BUTTON_W: f32 = 104.0;
+const INSPECTOR_DETAIL_BUTTON_H: f32 = 24.0;
+
+fn sifs_loading_rows(path: &str, details_open: bool) -> Vec<(&'static str, String)> {
+    let mut rows = vec![("Status", "Connecting to file storage".to_string())];
+    if details_open {
+        rows.push(("Path", path.to_string()));
+        rows.push(("Authority", "SIFS through daemon".to_string()));
+    }
+    rows
+}
+
+fn sifs_unavailable_rows(error: &str, details_open: bool) -> Vec<(&'static str, String)> {
+    let mut rows = vec![(
+        "Next",
+        "Retry SIFS, then open connection settings".to_string(),
+    )];
+    if details_open {
+        rows.push(("Reason", error.to_string()));
+        rows.push(("Authority", "SIFS through daemon".to_string()));
+    }
+    rows
+}
+
+fn inspector_detail_button_rect(bounds: Rect) -> Rect {
+    let content_x = bounds.x() + INSPECTOR_PAD;
+    let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
+    let button_w = INSPECTOR_DETAIL_BUTTON_W.min((content_w - 24.0).max(0.0));
+    Rect::new(
+        content_x + content_w - 12.0 - button_w,
+        bounds.y() + INSPECTOR_STATE_PANEL_Y + 8.0,
+        button_w,
+        INSPECTOR_DETAIL_BUTTON_H,
+    )
+}
+
+fn inspector_detail_button_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
+    sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(7_401))
+}
 
 impl Widget for InspectorView {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        if !matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
-            return;
+        if let Event::Pointer(pointer) = event
+            && pointer.kind == PointerEventKind::Up
+            && pointer.button == Some(PointerButton::Primary)
+        {
+            let can_toggle_details = {
+                let files = self.shared.files();
+                files.loading || files.error.is_some()
+            };
+            if can_toggle_details
+                && inspector_detail_button_rect(ctx.bounds()).contains(pointer.position)
+            {
+                let details_open = self.shared.files().inspector_details_open;
+                self.shared.files_mut().inspector_details_open = !details_open;
+                ctx.request_paint();
+                ctx.request_semantics();
+                ctx.set_handled();
+                return;
+            }
         }
-        let summary = self.summary();
-        let mut last = self.last_seen.borrow_mut();
-        if last.as_deref() != Some(summary.as_str()) {
-            *last = Some(summary);
-            ctx.request_paint();
+
+        if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
+            let summary = self.summary();
+            let mut last = self.last_seen.borrow_mut();
+            if last.as_deref() != Some(summary.as_str()) {
+                *last = Some(summary);
+                ctx.request_paint();
+                ctx.request_semantics();
+            }
         }
     }
 
@@ -829,6 +896,8 @@ impl Widget for InspectorView {
         y += 30.0;
 
         if files.loading {
+            let details_open = files.inspector_details_open;
+            let rows = sifs_loading_rows(&files.path, details_open);
             self.state_panel(
                 ctx,
                 &theme,
@@ -837,16 +906,15 @@ impl Widget for InspectorView {
                 y,
                 w,
                 "Loading SIFS",
-                &[
-                    ("Path", files.path.clone()),
-                    ("Authority", "SIFS through daemon".to_string()),
-                    ("Status", "opening distributed filesystem".to_string()),
-                ],
+                &rows,
+                Some(details_open),
             );
             return;
         }
 
         if let Some(error) = &files.error {
+            let details_open = files.inspector_details_open;
+            let rows = sifs_unavailable_rows(error, details_open);
             self.state_panel(
                 ctx,
                 &theme,
@@ -854,12 +922,9 @@ impl Widget for InspectorView {
                 x,
                 y,
                 w,
-                "SIFS unavailable",
-                &[
-                    ("Reason", error.clone()),
-                    ("Authority", "SIFS through daemon".to_string()),
-                    ("Next", "Retry SIFS, then open settings".to_string()),
-                ],
+                "File storage unavailable",
+                &rows,
+                Some(details_open),
             );
             return;
         }
@@ -883,6 +948,7 @@ impl Widget for InspectorView {
                     ("Entries", files.entries.len().to_string()),
                     ("Status", status.to_string()),
                 ],
+                None,
             );
             return;
         };
@@ -1001,6 +1067,32 @@ impl Widget for InspectorView {
             }
         }
     }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let details_open = {
+            let files = self.shared.files();
+            if !files.loading && files.error.is_none() {
+                return;
+            }
+            files.inspector_details_open
+        };
+
+        let mut node = SemanticsNode::new(
+            inspector_detail_button_widget_id(ctx.widget_id()),
+            SemanticsRole::Button,
+            inspector_detail_button_rect(ctx.bounds()),
+        );
+        node.parent = Some(ctx.widget_id());
+        node.name = Some(if details_open {
+            "Hide details".to_string()
+        } else {
+            "Show details".to_string()
+        });
+        node.description = Some("File storage diagnostics".to_string());
+        node.actions = vec![SemanticsAction::Activate];
+        node.state.selected = details_open;
+        ctx.push(node);
+    }
 }
 
 impl InspectorView {
@@ -1015,6 +1107,7 @@ impl InspectorView {
         w: f32,
         title: &str,
         rows: &[(&str, String)],
+        details_open: Option<bool>,
     ) {
         let label_style = pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text_faint);
         let value_style = pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text);
@@ -1037,17 +1130,27 @@ impl InspectorView {
                 .sum::<f32>();
         let panel = Rect::new(x, y, w, panel_h);
         widgets::round_panel(ctx, panel, pal.panel, pal.border, 8.0);
+        let detail_button =
+            details_open.map(|open| (inspector_detail_button_rect(ctx.bounds()), open));
+        let title_right_gap = if detail_button.is_some() {
+            INSPECTOR_DETAIL_BUTTON_W + 10.0
+        } else {
+            0.0
+        };
         widgets::draw_text_in(
             ctx,
             Rect::new(
                 panel.x() + 12.0,
                 panel.y() + 10.0,
-                panel.width() - 24.0,
+                (panel.width() - 24.0 - title_right_gap).max(0.0),
                 20.0,
             ),
             title,
             pal.text_style(theme, 13.5, FontWeight::SEMIBOLD, pal.text),
         );
+        if let Some((rect, open)) = detail_button {
+            self.detail_button(ctx, theme, pal, rect, open);
+        }
 
         let mut row_y = panel.y() + 38.0;
         for (label, lines) in row_layout {
@@ -1069,6 +1172,27 @@ impl InspectorView {
             }
             row_y += 8.0;
         }
+    }
+
+    fn detail_button(
+        &self,
+        ctx: &mut PaintCtx,
+        theme: &sui::DefaultTheme,
+        pal: &Palette,
+        rect: Rect,
+        details_open: bool,
+    ) {
+        widgets::round_panel(ctx, rect, pal.field, pal.border, 7.0);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(rect.x() + 10.0, rect.y() + 4.0, rect.width() - 20.0, 18.0),
+            if details_open {
+                "Hide details"
+            } else {
+                "Show details"
+            },
+            pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1599,6 +1723,7 @@ mod tests {
         assert!(state.browser.is_none());
         assert!(state.error.is_none());
         assert!(state.entries.is_empty());
+        assert!(!state.inspector_details_open);
     }
 
     #[test]
@@ -1661,11 +1786,16 @@ mod tests {
             files.error = Some("device authorization was denied".to_string());
         }
 
-        let inspector = InspectorView::new(shared);
+        let inspector = InspectorView::new(shared.clone());
 
         assert_eq!(
             inspector.summary(),
-            "error|/|device authorization was denied"
+            "error|/|device authorization was denied|false"
+        );
+        shared.files_mut().inspector_details_open = true;
+        assert_eq!(
+            inspector.summary(),
+            "error|/|device authorization was denied|true"
         );
     }
 
@@ -1679,7 +1809,13 @@ mod tests {
             files.path = "/services".to_string();
         }
         let inspector = InspectorView::new(shared.clone());
-        assert_eq!(inspector.summary(), "loading|/services");
+        assert_eq!(inspector.summary(), "loading|/services|false");
+
+        {
+            let mut files = shared.files_mut();
+            files.inspector_details_open = true;
+        }
+        assert_eq!(inspector.summary(), "loading|/services|true");
 
         {
             let mut files = shared.files_mut();
@@ -1687,6 +1823,27 @@ mod tests {
             files.entries.clear();
         }
         assert_eq!(inspector.summary(), "unselected|/services|0");
+    }
+
+    #[test]
+    fn sifs_unavailable_rows_hide_diagnostics_until_expanded() {
+        let collapsed = sifs_unavailable_rows("device authorization was denied", false);
+        assert!(collapsed.iter().any(|(label, _)| *label == "Next"));
+        assert!(!collapsed.iter().any(|(label, _)| *label == "Reason"));
+        assert!(!collapsed.iter().any(|(label, _)| *label == "Authority"));
+
+        let expanded = sifs_unavailable_rows("device authorization was denied", true);
+        assert!(
+            expanded
+                .iter()
+                .any(|(label, value)| *label == "Reason"
+                    && value == "device authorization was denied")
+        );
+        assert!(
+            expanded
+                .iter()
+                .any(|(label, value)| *label == "Authority" && value == "SIFS through daemon")
+        );
     }
 
     #[test]
@@ -1782,6 +1939,7 @@ mod tests {
             size: Some(1),
         }];
         state.selected = Some(0);
+        state.inspector_details_open = true;
         state.pending_request_id = Some(42);
         state.worker_tx = Some(tx);
         state.worker_rx = Some(result_rx);
@@ -1799,6 +1957,7 @@ mod tests {
         assert!(state.worker_rx.is_none());
         assert_eq!(state.node_id, "");
         assert_eq!(state.path, "/services");
+        assert!(!state.inspector_details_open);
     }
 
     #[test]
@@ -1899,6 +2058,43 @@ mod tests {
         assert!(files.entries.is_empty());
         assert_eq!(files.selected, None);
         assert_eq!(files.path, "/services");
+
+        Ok(())
+    }
+
+    #[test]
+    fn inspector_details_button_toggles_sifs_diagnostics() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.error = Some("device authorization was denied".to_string());
+            files.entries.clear();
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files inspector details")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Show details")
+            .click()?;
+        assert!(shared.files().inspector_details_open);
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Hide details")
+            .click()?;
+        assert!(!shared.files().inspector_details_open);
 
         Ok(())
     }
