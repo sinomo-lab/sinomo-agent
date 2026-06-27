@@ -1393,7 +1393,7 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
         } else {
             sui::IconGlyph::ChevronDown
         })
-        .theme_when(clone_reader(reader))
+        .theme_when(secondary_button_theme(reader))
         .on_press(move || s.settings_mut().toggle_connection_detail(tab))
     };
     let header = Stack::vertical()
@@ -1465,7 +1465,7 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         } else {
             sui::IconGlyph::ChevronDown
         })
-        .theme_when(clone_reader(reader))
+        .theme_when(secondary_button_theme(reader))
         .on_press(move || s.settings_mut().toggle_node_detail())
     };
 
@@ -1474,7 +1474,7 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         .with_child(value_row(shared, reader, "Node ID", short_node_id))
         .with_child(value_row(shared, reader, "Role", role))
         .with_child(
-            FormRow::new("Details", detail_button)
+            FormRow::new("Details", Stack::horizontal().with_child(detail_button))
                 .inline()
                 .theme_when(clone_reader(reader)),
         );
@@ -1782,13 +1782,13 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         } else {
             sui::IconGlyph::ChevronDown
         })
-        .theme_when(clone_reader(reader))
+        .theme_when(secondary_button_theme(reader))
         .on_press(move || {
             s.settings_mut().toggle_provider_detail(&provider, &account);
         })
     };
     body = body.with_child(
-        FormRow::new("Details", detail_button)
+        FormRow::new("Details", Stack::horizontal().with_child(detail_button))
             .inline()
             .theme_when(clone_reader(reader)),
     );
