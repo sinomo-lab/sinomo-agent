@@ -659,10 +659,14 @@ fn overview_lines(
         format!("topology: {direct_edges} edges"),
         format!("LAN: {} segments", topology.lan_segments.len()),
     ];
-    if let Some(warning) = snapshot.warnings.first() {
-        lines.push(format!("warning: {}", short(warning, 42)));
+    let warning = snapshot.warnings.first();
+    if let Some(warning) = warning {
+        lines.push(format!("warning: {}", cluster_warning_summary(warning)));
     }
     if diagnostics_open {
+        if let Some(warning) = warning {
+            lines.push(format!("warning detail: {}", short(warning, 42)));
+        }
         lines.push(format!("diagnostics: {}", snapshot.source));
         lines.push(format!(
             "cluster: {}",
@@ -681,12 +685,28 @@ fn overview_lines(
                 .unwrap_or("-".into())
         ));
     } else {
-        lines.push("hint: Show diagnostics for source and cluster identifiers.".to_string());
+        lines.push(if warning.is_some() {
+            "hint: Show diagnostics for warning detail, source, and cluster identifiers."
+                .to_string()
+        } else {
+            "hint: Show diagnostics for source and cluster identifiers.".to_string()
+        });
     }
     lines.push(
         "hint: Select a node or LAN segment for process and reachability details.".to_string(),
     );
     lines
+}
+
+fn cluster_warning_summary(warning: &str) -> &'static str {
+    let lower = warning.to_ascii_lowercase();
+    if lower.contains("daemon health") || lower.contains("daemon") {
+        "Cluster health needs attention"
+    } else if lower.contains("network") || lower.contains("connect") {
+        "Cluster connectivity needs attention"
+    } else {
+        "Cluster needs attention"
+    }
 }
 
 fn detail_lines(
@@ -1334,6 +1354,36 @@ mod tests {
                 .any(|line| line == "cluster: cluster-test-123456789")
         );
         assert!(open.iter().any(|line| line == "local: node-public"));
+    }
+
+    #[test]
+    fn overview_warning_keeps_raw_detail_behind_diagnostics() {
+        let snapshot = ClusterSnapshot {
+            source: "daemon 127.0.0.1:21353".to_string(),
+            nodes: vec![node("node-a")],
+            warnings: vec!["daemon health unavailable: network error".to_string()],
+            ..ClusterSnapshot::default()
+        };
+        let topology = build_topology(&snapshot);
+
+        let closed = overview_lines(&snapshot, &topology, false);
+        assert!(
+            closed
+                .iter()
+                .any(|line| line == "warning: Cluster health needs attention")
+        );
+        assert!(closed.iter().any(|line| line
+            == "hint: Show diagnostics for warning detail, source, and cluster identifiers."));
+        assert!(
+            !closed.iter().any(|line| line.contains("network error")),
+            "raw warning belongs in diagnostics"
+        );
+
+        let open = overview_lines(&snapshot, &topology, true);
+        assert!(
+            open.iter()
+                .any(|line| line == "warning detail: daemon health unavailable: network error")
+        );
     }
 
     #[test]
