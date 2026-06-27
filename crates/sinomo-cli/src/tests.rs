@@ -77,13 +77,13 @@ use sinomo_runtime::core::{
     ClusterNodeAvailability, ClusterNodeRole, ClusterTransportKind, Confidence, DfsObjectPolicy,
     EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind, Id, LatencyClass,
     PrivacyClass, RollbackPolicy, RollbackTrigger, RolloutPlan, RolloutStrategy, RoutingMetadata,
-    RoutingScope, Salience, Source, TrustDomain, TrustRing, cluster_migration_key,
+    RoutingScope, Salience, Source, TrustDomain, TrustRing,
 };
 use sinomo_runtime::daemon::daemon_status_matches_options;
 use sinomo_runtime::dfs::{
     DfsMetadataBackend, DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsObjectVersionRecord,
-    default_dfs_metadata_shards_root, dfs_import_metadata_root, distributed_sifs,
-    distributed_sifs_bootstrap_objects, metadata_shard_key,
+    default_dfs_metadata_shards_root, distributed_sifs, distributed_sifs_bootstrap_objects,
+    metadata_shard_key,
 };
 use sinomo_runtime::events::{
     EventId, EventStore, InMemoryEventStore, JsonlEventStore, ReplayQuery, SessionId,
@@ -7646,7 +7646,7 @@ fn cluster_migration_plan_rejects_single_node_mode_with_remote_peers() {
 }
 
 #[test]
-fn cluster_join_on_initialized_node_runs_single_node_migration() {
+fn cluster_join_on_initialized_node_rolls_back_when_target_join_fails() {
     let source_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-join-migrate-source");
     let target_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-join-migrate-target");
     let source_paths = ClusterPaths::new(&SinomoDataDir::new(&source_root));
@@ -7692,8 +7692,7 @@ fn cluster_join_on_initialized_node_runs_single_node_migration() {
     .expect("seed source kv");
 
     let invite = signed_test_invite_uri(&target_root, "cluster_join_target", "node_target");
-    let parsed_invite = decode_cluster_join_invite(&invite).expect("decode invite");
-    cluster_join_with_paths(
+    let error = cluster_join_with_paths(
         ClusterJoinOptions {
             invite,
             cluster_id: None,
@@ -7702,11 +7701,18 @@ fn cluster_join_on_initialized_node_runs_single_node_migration() {
         },
         &source_paths,
     )
-    .expect("initialized join should migrate");
+    .expect_err("unreachable target join should fail");
 
-    let migrated = read_cluster_state(&source_paths).expect("target state");
-    assert_eq!(migrated.cluster_id, parsed_invite.cluster_id);
-    assert_eq!(migrated.local_node_id, source_node_id);
+    match error {
+        CliError::ClusterReadOnly { detail } => {
+            assert!(detail.contains("local cluster state was not changed"));
+        }
+        other => panic!("unexpected migration join error: {other}"),
+    }
+
+    let restored = read_cluster_state(&source_paths).expect("restored source state");
+    assert_eq!(restored.cluster_id, source_cluster_id);
+    assert_eq!(restored.local_node_id, source_node_id);
     let migrations_root = source_paths.root.join("migrations");
     let migration_dirs: Vec<_> = fs::read_dir(&migrations_root)
         .expect("migration dirs")
@@ -7714,55 +7720,23 @@ fn cluster_join_on_initialized_node_runs_single_node_migration() {
         .collect();
     assert_eq!(migration_dirs.len(), 1);
     let source_quarantine = migration_dirs[0].join("source");
-    assert!(source_quarantine.join("state.sobj").exists());
     assert!(source_quarantine.join("migration.json").exists());
-    assert!(source_quarantine.join("kv-import.json").exists());
     let local_migration: ClusterMigrationRecord = serde_json::from_slice(
         &fs::read(source_quarantine.join("migration.json")).expect("record"),
     )
     .expect("local migration record");
+    assert_eq!(local_migration.phase, ClusterMigrationPhase::RolledBack);
     assert!(
         local_migration
-            .evidence_refs
-            .iter()
-            .any(|evidence| evidence == "source-kv-policy:target-authoritative")
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("target join failed"))
     );
-    let kv_import: serde_json::Value = serde_json::from_slice(
-        &fs::read(source_quarantine.join("kv-import.json")).expect("import report"),
-    )
-    .expect("decode import report");
-    assert_eq!(kv_import["target_kv_authoritative"], true);
-    assert_eq!(
-        kv_import["deferred_node_local_config_keys"],
-        serde_json::json!([node_local_config_key.clone()])
-    );
-    assert_eq!(kv_import["skipped_cluster_level_config_count"], 1);
-    assert_eq!(
-        kv_import["skipped_cluster_level_config_key_samples"],
-        serde_json::json!([source_cluster_config_key.clone()])
-    );
-    let quarantined_snapshot = sinomo_runtime::kv::read_cluster_kv_cached_snapshot(
-        &sinomo_runtime::kv::ClusterKvPaths::new(source_quarantine.clone()),
-    )
-    .expect("quarantined source kv snapshot");
-    let kv_migration: ClusterMigrationRecord = quarantined_snapshot
-        .get(&cluster_migration_key(&local_migration.migration_id))
-        .expect("source kv migration record")
-        .decode()
-        .expect("decode source kv migration record");
-    assert_eq!(kv_migration.phase, ClusterMigrationPhase::Planned);
-    assert_eq!(kv_migration.source_cluster_id, source_cluster_id);
-    assert_eq!(kv_migration.target_cluster_id, parsed_invite.cluster_id);
-    assert!(quarantined_snapshot.get(&node_local_config_key).is_some());
+    let restored_snapshot = read_cluster_kv_snapshot(&source_paths).expect("restored kv snapshot");
+    assert!(restored_snapshot.get(&node_local_config_key).is_some());
+    assert!(restored_snapshot.get(&source_cluster_config_key).is_some());
     assert!(
-        quarantined_snapshot
-            .get(&source_cluster_config_key)
-            .is_some()
-    );
-    let target_snapshot = read_cluster_kv_snapshot(&source_paths).expect("target kv snapshot");
-    assert!(target_snapshot.get(&source_cluster_config_key).is_none());
-    assert!(
-        dfs_import_metadata_root(&source_data_dir, source_cluster_id)
+        default_dfs_metadata_shards_root(&source_data_dir)
             .join("root")
             .join("marker.txt")
             .exists()
@@ -8397,11 +8371,11 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
 }
 
 #[test]
-fn cluster_join_records_pending_learner_state() {
+fn cluster_join_without_reachable_introducer_leaves_no_local_state() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-join");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
 
-    cluster_join_with_paths(
+    let error = cluster_join_with_paths(
         ClusterJoinOptions {
             invite: signed_test_invite_uri(&root, "cluster_joined", "node_host"),
             cluster_id: Some(ClusterId::from_legacy_named("cluster_joined").expect("cluster")),
@@ -8410,29 +8384,59 @@ fn cluster_join_records_pending_learner_state() {
         },
         &paths,
     )
-    .expect("cluster join");
+    .expect_err("cluster join should require an accepted introducer");
 
-    let state = read_cluster_state(&paths).expect("cluster state");
-    assert_eq!(
-        state.cluster_id,
-        ClusterId::from_legacy_named("cluster_joined").expect("cluster")
-    );
-    assert_eq!(state.term, 0);
-    assert_eq!(state.kv_revision, 0);
-    let local = state
-        .members
-        .iter()
-        .find(|member| member.node_id == state.local_node_id)
-        .expect("local main daemon member");
-    assert_eq!(local.role, ClusterMemberRole::Learner);
-    assert_eq!(local.state, ClusterMemberState::Pending);
-    assert!(!local.node_public_key.trim().is_empty());
-    assert_eq!(state.members.len(), 1);
+    match error {
+        CliError::ClusterReadOnly { detail } => {
+            assert!(detail.contains("local cluster state was not changed"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
     assert!(
-        local
-            .endpoints
-            .iter()
-            .any(|endpoint| endpoint.address == "127.0.0.1:21354")
+        !paths.state.exists(),
+        "failed one-shot join must not leave durable pending state"
+    );
+}
+
+#[test]
+fn cluster_join_removes_stale_pending_state_on_failure() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-join-stale-pending");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let main_identity = super::load_or_create_main_node_identity(&root).expect("main identity");
+    let shadow_identity =
+        sinomo_runtime::node::load_or_create_shadow_node_identity(&root).expect("shadow identity");
+    let pending = super::network::prepare_pending_cluster_join_state(
+        ClusterId::from_legacy_named("cluster_stale_pending").expect("cluster"),
+        "stale pending".to_string(),
+        NodeId::from_legacy_named("node_stale_pending").expect("node"),
+        "stale".to_string(),
+        main_identity.public_key,
+        shadow_identity.public_key,
+        OffsetDateTime::now_utc(),
+    );
+    super::network::write_cluster_state(&paths, &pending).expect("write pending state");
+
+    let error = cluster_join_with_paths(
+        ClusterJoinOptions {
+            invite: signed_test_invite_uri(&root, "cluster_joined", "node_host"),
+            cluster_id: Some(ClusterId::from_legacy_named("cluster_joined").expect("cluster")),
+            node_id: None,
+            name: "joiner".to_string(),
+        },
+        &paths,
+    )
+    .expect_err("cluster join should still require an accepted introducer");
+
+    match error {
+        CliError::ClusterReadOnly { detail } => {
+            assert!(detail.contains("local cluster state was not changed"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert!(
+        !paths.state.exists(),
+        "failed one-shot join must remove stale durable pending state"
     );
 }
 
@@ -8679,7 +8683,7 @@ fn cluster_join_uses_structured_invite_cluster_identity() {
         sign_cluster_join_invite(&offline_invite, &host_identity).expect("resign invite");
     let offline_uri = encode_cluster_join_invite(&offline_invite).expect("offline invite");
 
-    cluster_join_with_paths(
+    let error = cluster_join_with_paths(
         ClusterJoinOptions {
             invite: offline_uri,
             cluster_id: Some(ClusterId::from_legacy_named("cluster_remote").expect("cluster")),
@@ -8688,19 +8692,18 @@ fn cluster_join_uses_structured_invite_cluster_identity() {
         },
         &join_paths,
     )
-    .expect("cluster join");
-    let state = read_cluster_state(&join_paths).expect("cluster state");
+    .expect_err("cluster join should not record an unreachable invite");
 
-    assert_eq!(
-        state.cluster_id,
-        ClusterId::from_legacy_named("cluster_remote").expect("cluster")
+    match error {
+        CliError::ClusterReadOnly { detail } => {
+            assert!(detail.contains("local cluster state was not changed"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert!(
+        !join_paths.state.exists(),
+        "failed structured invite join must not leave pending state"
     );
-    assert_eq!(state.cluster_name, "remote");
-    assert!(state.members.iter().any(|member| {
-        member.node_id == NodeId::from_legacy_named("node_remote").expect("node")
-            && member.role == ClusterMemberRole::Learner
-            && member.state == ClusterMemberState::Pending
-    }));
 }
 
 #[test]
@@ -8708,7 +8711,6 @@ fn introducer_records_joined_members_and_returns_peer_view() {
     let host_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-introducer");
     let join_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-joining");
     let host_paths = ClusterPaths::new(&SinomoDataDir::new(&host_root));
-    let join_paths = ClusterPaths::new(&SinomoDataDir::new(&join_root));
     cluster_init_with_paths(
         ClusterInitOptions {
             cluster_id: Some(ClusterId::from_legacy_named("cluster_register").expect("cluster")),
@@ -8736,21 +8738,24 @@ fn introducer_records_joined_members_and_returns_peer_view() {
         sign_cluster_join_invite(&offline_invite, &host_identity).expect("resign invite");
     super::network::sync_cluster_invitation_to_kv(&host_paths, &offline_invite)
         .expect("active offline invite kv");
-    let offline_uri = encode_cluster_join_invite(&offline_invite).expect("offline invite");
-    cluster_join_with_paths(
-        ClusterJoinOptions {
-            invite: offline_uri,
-            cluster_id: Some(ClusterId::from_legacy_named("cluster_register").expect("cluster")),
-            node_id: Some(NodeId::from_legacy_named("node_remote").expect("node")),
-            name: "remote".to_string(),
-        },
-        &join_paths,
-    )
-    .expect("cluster join local");
-    let remote_state = read_cluster_state(&join_paths).expect("remote state");
+    let remote_node = NodeId::from_legacy_named("node_remote").expect("node");
+    let remote_main_identity =
+        super::load_or_create_main_node_identity(&join_root).expect("remote identity");
+    let remote_shadow_identity =
+        sinomo_runtime::node::load_or_create_shadow_node_identity(&join_root)
+            .expect("remote shadow identity");
+    let remote_state = super::network::prepare_pending_cluster_join_state(
+        ClusterId::from_legacy_named("cluster_register").expect("cluster"),
+        "remote".to_string(),
+        remote_node.clone(),
+        "remote".to_string(),
+        remote_main_identity.public_key,
+        remote_shadow_identity.public_key,
+        time::OffsetDateTime::now_utc(),
+    );
     let mut malicious_members = remote_state.members.clone();
     for member in &mut malicious_members {
-        if member.node_id == NodeId::from_legacy_named("node_remote").expect("node") {
+        if member.node_id == remote_node {
             member.role = ClusterMemberRole::Voter;
             member.state = ClusterMemberState::Pending;
         }
@@ -8789,17 +8794,19 @@ fn introducer_records_joined_members_and_returns_peer_view() {
     assert!(response.kv_snapshot.is_some());
     let host_state = read_cluster_state(&host_paths).expect("host state");
     assert!(host_state.members.iter().any(|member| {
-        member.node_id == NodeId::from_legacy_named("node_remote").expect("node")
-            && member.state == ClusterMemberState::Learner
+        member.node_id == remote_node && member.state == ClusterMemberState::Learner
     }));
     let host_kv_members = read_cluster_members_from_kv(&host_paths).expect("host kv members");
     assert!(host_kv_members.iter().any(|member| {
-        member.node_id == NodeId::from_legacy_named("node_remote").expect("node")
-            && member.state == ClusterMemberState::Learner
+        member.node_id == remote_node && member.state == ClusterMemberState::Learner
     }));
-    assert!(response.state.members.iter().any(|member| {
-        member.node_id == NodeId::from_legacy_named("node_remote").expect("node")
-    }));
+    assert!(
+        response
+            .state
+            .members
+            .iter()
+            .any(|member| { member.node_id == remote_node })
+    );
 }
 
 #[test]
@@ -10475,33 +10482,21 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
 
     let host_identity =
         super::load_or_create_main_node_identity(&host_root).expect("host identity");
-    let mut invite = ClusterJoinInvite {
-        invite_id: ClusterInviteId::from_legacy_named("invite_sync").expect("invite"),
-        cluster_id: cluster_id.clone(),
-        cluster_name: Some("sync cluster".to_string()),
-        cluster_public_key: host_identity.public_key.clone(),
-        invitation_secret: "secret_sync".to_string(),
-        communication_channels: Vec::new(),
-        introducers: Vec::new(),
-        token_id: "token_sync".to_string(),
-        expires_at: time::OffsetDateTime::now_utc() + time::Duration::seconds(60),
-        trust_domain: TrustDomain::new("trust.local").expect("trust"),
-        allowed_member_roles: vec![ClusterMemberRole::Learner],
-        issuer_node_id: NodeId::from_legacy_named("node_host").expect("node"),
-        issuer_public_key: host_identity.public_key.clone(),
-        signature: String::new(),
-    };
-    invite.signature = sign_cluster_join_invite(&invite, &host_identity).expect("sign invite");
-    cluster_join_with_paths(
-        ClusterJoinOptions {
-            invite: encode_cluster_join_invite(&invite).expect("invite uri"),
-            cluster_id: Some(cluster_id.clone()),
-            node_id: Some(NodeId::from_legacy_named("node_peer").expect("node")),
-            name: "peer".to_string(),
-        },
-        &peer_paths,
-    )
-    .expect("cluster join");
+    let peer_main_identity =
+        super::load_or_create_main_node_identity(&peer_root).expect("peer identity");
+    let peer_shadow_identity =
+        sinomo_runtime::node::load_or_create_shadow_node_identity(&peer_root)
+            .expect("peer shadow identity");
+    let peer_pending = super::network::prepare_pending_cluster_join_state(
+        cluster_id.clone(),
+        "sync cluster".to_string(),
+        NodeId::from_legacy_named("node_peer").expect("node"),
+        "peer".to_string(),
+        peer_main_identity.public_key,
+        peer_shadow_identity.public_key,
+        time::OffsetDateTime::now_utc(),
+    );
+    super::network::write_cluster_state(&peer_paths, &peer_pending).expect("peer pending state");
 
     let host_state = read_cluster_state(&host_paths).expect("host state");
     let peer_state = read_cluster_state(&peer_paths).expect("peer state");

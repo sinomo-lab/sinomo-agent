@@ -1840,6 +1840,7 @@ fn dfs_protocol_codec_samples(
                 chunk_hash: None,
                 bytes: payload.to_vec(),
                 object_metadata: None,
+                authority_shard: None,
             }),
         )?,
         dfs_protocol_codec_sample(

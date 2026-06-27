@@ -54,6 +54,7 @@ const DAEMON_DFS_MESSAGE_REPLAY_WAIT: Duration = Duration::from_secs(30);
 static DAEMON_DFS_MESSAGE_REPLAY_CACHE: OnceLock<
     Mutex<BTreeMap<PathBuf, BTreeMap<Vec<u8>, DaemonDfsMessageReplayEntry>>>,
 > = OnceLock::new();
+static DAEMON_CLUSTER_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 
 #[derive(Clone)]
 enum DaemonDfsMessageReplayState {
@@ -101,6 +102,16 @@ async fn daemon_optional_notify(notify: Option<Arc<tokio::sync::Notify>>) {
     } else {
         std::future::pending::<()>().await;
     }
+}
+
+fn daemon_cluster_maintenance_notify() -> Arc<tokio::sync::Notify> {
+    Arc::clone(
+        DAEMON_CLUSTER_MAINTENANCE_NOTIFY.get_or_init(|| Arc::new(tokio::sync::Notify::new())),
+    )
+}
+
+pub(crate) fn request_daemon_cluster_maintenance_refresh() {
+    daemon_cluster_maintenance_notify().notify_one();
 }
 
 async fn start_daemon_network_environment_watch(label: &str) -> Option<Arc<tokio::sync::Notify>> {
@@ -377,6 +388,7 @@ async fn run_daemon_background_maintenance_loop(
         .checked_sub(DAEMON_ROLLOUT_TELEMETRY_INTERVAL)
         .unwrap_or(maintenance_started);
     let dfs_maintenance_notify = daemon_dfs_maintenance_notify();
+    let cluster_maintenance_notify = daemon_cluster_maintenance_notify();
     let network_environment_notify = if label == "daemon" {
         start_daemon_network_environment_watch(&label).await
     } else {
@@ -568,24 +580,26 @@ async fn run_daemon_background_maintenance_loop(
             dfs_maintenance_probe_due,
             shadow_finalization_due,
         );
-        if (dfs_maintenance_enabled && label == "daemon") || network_environment_notify.is_some() {
-            let dfs_notify = (dfs_maintenance_enabled && label == "daemon")
-                .then(|| Arc::clone(&dfs_maintenance_notify));
-            let network_notify = network_environment_notify.as_ref().map(Arc::clone);
-            tokio::select! {
-                _ = tokio::time::sleep(sleep_duration) => {}
-                _ = daemon_optional_notify(dfs_notify) => {
-                    dfs_triggered_maintenance_requested = true;
-                    last_dfs_maintenance = Instant::now()
-                        .checked_sub(DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL)
-                        .unwrap_or(last_dfs_maintenance);
-                }
-                _ = daemon_optional_notify(network_notify) => {
-                    cluster_network.request_network_environment_refresh(Instant::now());
-                }
+        let dfs_notify = (dfs_maintenance_enabled && label == "daemon")
+            .then(|| Arc::clone(&dfs_maintenance_notify));
+        let network_notify = network_environment_notify.as_ref().map(Arc::clone);
+        let cluster_notify = Some(Arc::clone(&cluster_maintenance_notify));
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_duration) => {}
+            _ = daemon_optional_notify(dfs_notify) => {
+                dfs_triggered_maintenance_requested = true;
+                last_dfs_maintenance = Instant::now()
+                    .checked_sub(DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL)
+                    .unwrap_or(last_dfs_maintenance);
             }
-        } else {
-            tokio::time::sleep(sleep_duration).await;
+            _ = daemon_optional_notify(network_notify) => {
+                tracing::info!("sinomo {label} cluster maintenance refreshed after network environment change");
+                cluster_network.request_network_environment_refresh(Instant::now());
+            }
+            _ = daemon_optional_notify(cluster_notify) => {
+                tracing::info!("sinomo {label} cluster maintenance refresh requested");
+                cluster_network.request_network_environment_refresh(Instant::now());
+            }
         }
     }
 }

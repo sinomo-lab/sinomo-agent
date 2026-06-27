@@ -11,6 +11,16 @@ use crate::route::{
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::ClusterBootstrapState;
 use sinomo_node::NodeId;
+use std::time::Instant;
+
+fn membership_forward_trace(args: std::fmt::Arguments<'_>) {
+    let enabled = std::env::var("SINOMO_CLUSTER_JOIN_TRACE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"));
+    if enabled {
+        eprintln!("[sinomo cluster join] {args}");
+    }
+}
 
 pub(crate) trait ClusterMembershipRpcForwardHost {
     fn call_node_object_rpc(
@@ -72,6 +82,11 @@ pub async fn forward_cluster_membership_rpc_to_state_authority_async_with_host(
     let mut failures = Vec::new();
     let mut client = ClusterObjectRpcClient::routed(host, runtime, paths);
     for target in &state_authority_targets {
+        let started = Instant::now();
+        membership_forward_trace(format_args!(
+            "membership forward routed node {} via {} ({:?}) started",
+            target.node_id, target.address, target.transport
+        ));
         match client
             .call_target(
                 state,
@@ -83,9 +98,72 @@ pub async fn forward_cluster_membership_rpc_to_state_authority_async_with_host(
             )
             .await
         {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                membership_forward_trace(format_args!(
+                    "membership forward routed node {} via {} ({:?}) ok in {:?}",
+                    target.node_id,
+                    target.address,
+                    target.transport,
+                    started.elapsed()
+                ));
+                return Ok(response);
+            }
             Err(error) => {
-                failures.push(format!("node {}: {error}", target.node_id));
+                membership_forward_trace(format_args!(
+                    "membership forward routed node {} via {} ({:?}) failed in {:?}: {error}",
+                    target.node_id,
+                    target.address,
+                    target.transport,
+                    started.elapsed()
+                ));
+                failures.push(format!(
+                    "routed node {} via {} ({:?}): {error}",
+                    target.node_id, target.address, target.transport
+                ));
+            }
+        }
+    }
+    {
+        let mut direct_client = ClusterObjectRpcClient::endpoint_only(host);
+        for target in &state_authority_targets {
+            let started = Instant::now();
+            membership_forward_trace(format_args!(
+                "membership forward direct node {} via {} ({:?}) started",
+                target.node_id, target.address, target.transport
+            ));
+            match direct_client
+                .call_endpoint(
+                    target,
+                    request,
+                    ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
+                        DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
+                    )),
+                )
+                .await
+            {
+                Ok(response) => {
+                    membership_forward_trace(format_args!(
+                        "membership forward direct node {} via {} ({:?}) ok in {:?}",
+                        target.node_id,
+                        target.address,
+                        target.transport,
+                        started.elapsed()
+                    ));
+                    return Ok(response);
+                }
+                Err(error) => {
+                    membership_forward_trace(format_args!(
+                        "membership forward direct node {} via {} ({:?}) failed in {:?}: {error}",
+                        target.node_id,
+                        target.address,
+                        target.transport,
+                        started.elapsed()
+                    ));
+                    failures.push(format!(
+                        "direct node {} via {} ({:?}): {error}",
+                        target.node_id, target.address, target.transport
+                    ));
+                }
             }
         }
     }

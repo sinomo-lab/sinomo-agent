@@ -911,6 +911,19 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
         return Ok(());
     };
     let observations = sinomo_dfs::dfs_maintenance_tick_observations(&report);
+    tracing::debug!(
+        target: "sinomo.dfs.maintenance",
+        metadata_replications_sent = observations.metadata_replications_sent,
+        repair_attempt_count = observations.repair_attempt_count,
+        repair_attempt_in_flight_count = observations.repair_attempt_in_flight_count,
+        repair_attempt_backoff_count = observations.repair_attempt_backoff_count,
+        repair_attempt_suppressed_count = observations.repair_attempt_suppressed_count,
+        scheduled_repair_count = report.scheduled_repairs.len(),
+        followup_event_count = report.followup_events.len(),
+        namespace_jobs_scanned = report.namespace_jobs.scanned_job_count,
+        namespace_jobs_resumed = report.namespace_jobs.resumed_job_count,
+        "DFS maintenance tick completed"
+    );
     if let Some(stats) = crate::process_idle_stats() {
         for _ in 0..observations.metadata_replications_sent {
             stats.incr_dfs_metadata_replications_sent();
@@ -2811,6 +2824,7 @@ mod tests {
             content_hash: content_hash.clone(),
             bytes: bytes.clone(),
             object_metadata: Some(object),
+            authority_shard: None,
         });
         let routed_message = DfsRoutedMessage {
             source_node_id: owner.clone(),

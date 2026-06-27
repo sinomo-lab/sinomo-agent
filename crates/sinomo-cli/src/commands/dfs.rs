@@ -791,6 +791,7 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
                 println!("  intents: {}", status.intent_count);
                 println!("  pending writes: {}", status.pending_write_count);
                 println!("  pending repairs: {}", status.pending_repair_count);
+                print_dfs_repair_attempt_summary("  ", &status);
                 println!(
                     "  pending namespace jobs: {}",
                     status.pending_namespace_job_count
@@ -1704,6 +1705,7 @@ fn print_dfs_cluster_status(report: &DfsClusterStatusReport) {
             println!("    versions: {}", status.version_count);
             println!("    pending writes: {}", status.pending_write_count);
             println!("    pending repairs: {}", status.pending_repair_count);
+            print_dfs_repair_attempt_summary("    ", status);
             println!(
                 "    pending namespace jobs: {}",
                 status.pending_namespace_job_count
@@ -1744,6 +1746,34 @@ fn print_dfs_cluster_status(report: &DfsClusterStatusReport) {
             println!("    error: {error}");
         }
     }
+}
+
+fn print_dfs_repair_attempt_summary(indent: &str, status: &sinomo_runtime::dfs::DfsOperatorStatus) {
+    if status.repair_attempts.is_empty() {
+        return;
+    }
+    let in_flight = status
+        .repair_attempts
+        .iter()
+        .filter(|attempt| attempt.in_flight)
+        .count();
+    let suppressed = status
+        .repair_attempts
+        .iter()
+        .filter(|attempt| attempt.next_retry_unix_nanos == u64::MAX)
+        .count();
+    let retry_waiting = status
+        .repair_attempts
+        .len()
+        .saturating_sub(in_flight)
+        .saturating_sub(suppressed);
+    println!(
+        "{indent}repair attempts: {} (in_flight={}, retry_waiting={}, suppressed={})",
+        status.repair_attempts.len(),
+        in_flight,
+        retry_waiting,
+        suppressed
+    );
 }
 
 fn print_dfs_object_view(object: &sinomo_runtime::dfs::DfsOperatorObjectView) {

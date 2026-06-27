@@ -90,10 +90,9 @@ pub use connectivity_publish::{
     sync_cluster_connectivity_records_to_quorum_async_with_host,
     sync_cluster_connectivity_records_to_quorum_with_host,
 };
+pub use connectivity_store::read_local_cluster_connectivity_records;
 #[cfg(test)]
-pub(crate) use connectivity_store::{
-    read_local_cluster_connectivity_records, write_local_cluster_connectivity_records,
-};
+pub(crate) use connectivity_store::write_local_cluster_connectivity_records;
 pub use connectivity_store::{
     read_local_cluster_connectivity_records_for_source,
     record_local_cluster_endpoint_command_connectivity,
@@ -232,9 +231,9 @@ pub use local_membership::{
     apply_cluster_node_role, assign_local_daemon_member_public_keys,
     cluster_state_needs_join_registration, cluster_status_summary_label,
     ensure_daemon_cluster_members, merge_cluster_join_registration,
-    prepare_cluster_join_retry_state, prepare_pending_cluster_join_state,
-    refresh_cluster_connectivity_environment, refresh_cluster_connectivity_environment_async,
-    refresh_local_daemon_membership_from_disk, refresh_local_daemon_membership_from_disk_async,
+    prepare_pending_cluster_join_state, refresh_cluster_connectivity_environment,
+    refresh_cluster_connectivity_environment_async, refresh_local_daemon_membership_from_disk,
+    refresh_local_daemon_membership_from_disk_async,
 };
 pub use local_state_store::{
     read_cluster_state, read_cluster_state_async, read_cluster_state_cached,

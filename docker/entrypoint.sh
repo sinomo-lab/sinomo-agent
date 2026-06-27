@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Sinomo SEGMENTED dev-cluster node entrypoint.
 #
-# Forms (or rejoins) the cluster best-effort, then runs the shadow supervisor as PID 1.
+# Forms the cluster best-effort, then runs the shadow supervisor as PID 1.
 # This cluster is partitioned into network segments with only node3<->node4 bridging them,
 # and iroh is disabled -- so cross-segment joins depend on native multi-hop routing through
-# the bridge nodes. Every node joins best-effort (a failed/timed-out join is logged, not
-# fatal) and always ends up running its daemon, so route convergence stays observable.
+# the bridge nodes. Every node joins once (a failed/timed-out join is logged, not retried)
+# and always ends up running its daemon, so route convergence stays observable.
 #
 # Per-node env (set in docker-compose.yml / docker/docker-compose.dev.yml):
 #   ROLE                seed | joiner
@@ -16,6 +16,8 @@
 #   PUBLISH_INVITE      invite file to (re)publish with PUBLISH_INTRODUCER (seed + bridges)
 #   PUBLISH_INTRODUCER  introducer host:port to advertise in the published invite
 #   SINOMO_DISABLE_IROH "1" => run on direct LAN transports only (default here)
+#   WAIT_FOR_INTRODUCER_READY "1" => wait for /shared/<introducer-host>.joined (dev harness)
+#   WAIT_FOR_JOIN_READY_NODES optional space-separated node names to wait for before joining
 set -uo pipefail   # NOTE: not -e; cross-segment join failures are expected and handled.
 
 BOOTSTRAP_BIN=/usr/local/bin/sinomo
@@ -25,9 +27,10 @@ ROLE="${ROLE:-joiner}"
 CLUSTER_NAME="${CLUSTER_NAME:-dev-cluster}"
 NODE_NAME="${NODE_NAME:-$(hostname)}"
 JOIN_TIMEOUT="${JOIN_TIMEOUT:-60}"
-JOIN_ATTEMPTS="${JOIN_ATTEMPTS:-60}"
-JOIN_RETRY_DELAY="${JOIN_RETRY_DELAY:-1}"
 MAIN_PORT="${MAIN_PORT:-21353}"
+JOIN_READY_DIR="${JOIN_READY_DIR:-/shared}"
+WAIT_FOR_INTRODUCER_READY="${WAIT_FOR_INTRODUCER_READY:-0}"
+WAIT_FOR_JOIN_READY_NODES="${WAIT_FOR_JOIN_READY_NODES:-}"
 
 export SINOMO_DATA_DIR="$DATA"
 # This segmented test cluster runs with iroh off by default so segmentation is real.
@@ -87,18 +90,65 @@ cluster_join_already_accepted() {
   status="$(cluster_join_status || true)"
   case "$status" in
     voter|read-only)
-      log "cluster state already accepted locally (status: $status); stopping join retries"
+      log "cluster state already accepted locally (status: $status); skipping join"
       return 0
       ;;
   esac
   return 1
 }
 
-# Join the cluster in the background AFTER our own daemon is listening, so downstream nodes
-# can reach us as their introducer while we join our own upstream. The CLI join is itself
-# synchronous (it blocks until the introducer -- which forwards to a voter -- confirms the
-# registration), so this logs the real outcome; it just no longer blocks daemon startup.
-join_in_background() {
+publish_join_ready() {
+  [ -d "$JOIN_READY_DIR" ] || return
+  : > "$JOIN_READY_DIR/$NODE_NAME.joined" 2>/dev/null || true
+}
+
+wait_for_introducer_ready() {
+  [ "$WAIT_FOR_INTRODUCER_READY" = "1" ] || return 0
+  local introducer_host marker
+  introducer_host="${INTRODUCER%%:*}"
+  [ -n "$introducer_host" ] || return 0
+  marker="$JOIN_READY_DIR/$introducer_host.joined"
+  if ! wait_for_file "$marker" "$JOIN_TIMEOUT"; then
+    log "WARN: introducer readiness marker $marker did not appear (<=${JOIN_TIMEOUT}s); staying unclustered"
+    return 1
+  fi
+}
+
+wait_for_join_ready_nodes() {
+  local node marker
+  for node in $WAIT_FOR_JOIN_READY_NODES; do
+    marker="$JOIN_READY_DIR/$node.joined"
+    if ! wait_for_file "$marker" "$JOIN_TIMEOUT"; then
+      log "WARN: join dependency marker $marker did not appear (<=${JOIN_TIMEOUT}s); staying unclustered"
+      return 1
+    fi
+  done
+}
+
+publish_invites_once() {
+  local spec introducer output
+  [ -n "${PUBLISH_INVITES:-}" ] || return 0
+  for spec in $PUBLISH_INVITES; do
+    introducer="${spec%%=*}"; output="${spec##*=}"
+    log "publishing join invite (introducer $introducer) -> $output"
+    "$BIN" cluster invite --introducer "$introducer" --ttl-seconds 86400 --output "$output" \
+      || log "WARN: failed to publish invite for introducer $introducer"
+  done
+}
+
+publish_invites_once_in_background() {
+  if ! wait_for_tcp "127.0.0.1:$MAIN_PORT" "$JOIN_TIMEOUT"; then
+    log "WARN: local daemon never came up on :$MAIN_PORT; not publishing join invites"; return
+  fi
+  publish_invites_once
+}
+
+# Join the cluster once in the background AFTER our own daemon is listening. This is
+# intentionally one-shot: a failed join leaves the node unclustered, and the test
+# harness must provide deterministic readiness instead of relying on retries.
+join_once_in_background() {
+  local started elapsed output
+  started="$SECONDS"
   if ! wait_for_tcp "127.0.0.1:$MAIN_PORT" "$JOIN_TIMEOUT"; then
     log "WARN: local daemon never came up on :$MAIN_PORT; staying unclustered"; return
   fi
@@ -111,21 +161,28 @@ join_in_background() {
   if ! wait_for_tcp "$INTRODUCER" "$JOIN_TIMEOUT"; then
     log "WARN: introducer $INTRODUCER unreachable (<=${JOIN_TIMEOUT}s); staying unclustered"; return
   fi
+  if ! wait_for_introducer_ready; then
+    return
+  fi
+  if ! wait_for_join_ready_nodes; then
+    return
+  fi
   log "joining cluster as '$NODE_NAME' via introducer $INTRODUCER"
-  for attempt in $(seq 1 "$JOIN_ATTEMPTS"); do
-    if cluster_join_already_accepted; then
-      return
-    fi
-    if "$BIN" cluster join "$JOIN_INVITE" --name "$NODE_NAME"; then
-      log "joined cluster (attempt $attempt)"; return
-    fi
-    if cluster_join_already_accepted; then
-      return
-    fi
-    log "join attempt $attempt/$JOIN_ATTEMPTS via $INTRODUCER failed; retrying in ${JOIN_RETRY_DELAY}s (upstream bridge may still be joining)"
-    sleep "$JOIN_RETRY_DELAY"
-  done
-  log "WARN: cluster join via $INTRODUCER did not succeed after $JOIN_ATTEMPTS attempts; staying unclustered"
+  if cluster_join_already_accepted; then
+    publish_join_ready
+    return
+  fi
+  output="$("$BIN" cluster join "$JOIN_INVITE" --name "$NODE_NAME" 2>&1)"
+  if [ "$?" -eq 0 ]; then
+    printf '%s\n' "$output"
+    elapsed=$((SECONDS - started))
+    log "joined cluster in ${elapsed}s"
+    publish_join_ready
+    return
+  fi
+  printf '%s\n' "$output"
+  elapsed=$((SECONDS - started))
+  log "WARN: cluster join via $INTRODUCER failed after ${elapsed}s; staying unclustered"
 }
 
 # 1. Managed rollout source repo: symlink to the image's pre-built source tree (/sinomo-src)
@@ -145,6 +202,7 @@ if [ ! -f "$DATA/cluster/state.sobj" ]; then
     if ! "$BIN" cluster init --name "$CLUSTER_NAME"; then
       log "FATAL: seed cluster init failed"; exit 1
     fi
+    publish_join_ready
   else
     # Defer the join until the daemon is up (launched below), so this node is reachable as
     # an introducer for its downstream segment while it joins its own upstream introducer.
@@ -153,24 +211,33 @@ if [ ! -f "$DATA/cluster/state.sobj" ]; then
 
   # The seed (a voter) publishes a join invite for EACH segment, naming the reachable
   # bridge as that segment's introducer. PUBLISH_INVITES is a space-separated list of
-  # "introducer-host:port=output-file". Only a voter can mint invites, so the bridge
-  # learners do not publish; they relay the joins they receive on to a voter.
-  if [ -n "${PUBLISH_INVITES:-}" ]; then
-    for spec in $PUBLISH_INVITES; do
-      introducer="${spec%%=*}"; output="${spec##*=}"
-      log "publishing join invite (introducer $introducer) -> $output"
-      "$BIN" cluster invite --introducer "$introducer" --ttl-seconds 86400 --output "$output" \
-        || log "WARN: failed to publish invite for introducer $introducer"
-    done
-  fi
+  # "introducer-host:port=output-file". Defer publication until the daemon is reachable
+  # so node1 can answer health and forwarded join traffic immediately after startup.
+  [ -n "${PUBLISH_INVITES:-}" ] && DEFER_PUBLISH_INVITES=1
 else
-  log "existing cluster state found; skipping formation"
+  existing_status="$(cluster_join_status || true)"
+  case "$existing_status" in
+    voter|read-only)
+      log "existing accepted cluster state found (status: $existing_status); skipping formation"
+      publish_join_ready
+      ;;
+    *)
+      if [ "$ROLE" = "seed" ]; then
+        log "existing non-accepted seed cluster state found (status: ${existing_status:-unknown}); leaving formation unchanged"
+      else
+        log "existing non-accepted cluster state found (status: ${existing_status:-unknown}); not retrying automatically"
+      fi
+      ;;
+  esac
 fi
 
-# 3. Start the daemon first (so we are reachable as an introducer), then run the deferred
-#    join in the background once our control port is listening.
+# 3. Start the daemon first (so a bridge can be reached as an introducer), then run the
+#    deferred one-shot join in the background once our control port is listening.
 if [ "${DEFER_JOIN:-0}" = 1 ]; then
-  join_in_background &
+  join_once_in_background &
+fi
+if [ "${DEFER_PUBLISH_INVITES:-0}" = 1 ]; then
+  publish_invites_once_in_background &
 fi
 
 # Run the shadow supervisor as PID 1; it starts and supervises the main daemon.
