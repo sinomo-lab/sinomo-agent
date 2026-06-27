@@ -37,6 +37,8 @@ const CLUSTER_RELAY_MAX_FAILURE_DETAILS: usize = 8;
 const CLUSTER_RELAY_FAILURE_DETAIL_MAX_CHARS: usize = 512;
 const CLUSTER_DELIVERY_DEGRADED_LINK_COST: u64 = 50_000;
 const CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST: u64 = CLUSTER_DELIVERY_DEGRADED_LINK_COST / 2;
+const CLUSTER_DELIVERY_CROSS_PREFIX_PRIVATE_TARGET_PENALTY: u64 =
+    CLUSTER_DELIVERY_DEGRADED_LINK_COST;
 const CLUSTER_DELIVERY_UNOBSERVED_NEIGHBOR_COST: u64 = 75_000;
 const MAX_CLUSTER_DELIVERY_ROUTING_TABLE_CACHE_ENTRIES: usize = 128;
 
@@ -1281,9 +1283,14 @@ fn cluster_delivery_local_endpoint_cost(
             &record.state,
         )
         .map(|cost| cost + endpoint_priority),
-        None if endpoint.node_id == *target_node_id => Some(
-            cluster_delivery_unobserved_target_endpoint_cost(path_cost, endpoint_priority),
-        ),
+        None if endpoint.node_id == *target_node_id => {
+            Some(cluster_delivery_unobserved_target_endpoint_cost(
+                endpoint,
+                path_cost,
+                endpoint_priority,
+                local_private_prefixes,
+            ))
+        }
         None if cluster_delivery_endpoint_shares_local_private_prefix(
             endpoint,
             local_private_prefixes,
@@ -1295,8 +1302,24 @@ fn cluster_delivery_local_endpoint_cost(
     }
 }
 
-fn cluster_delivery_unobserved_target_endpoint_cost(path_cost: u64, endpoint_priority: u64) -> u64 {
-    CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST + path_cost + endpoint_priority
+fn cluster_delivery_unobserved_target_endpoint_cost(
+    endpoint: &ClusterEndpointRecord,
+    path_cost: u64,
+    endpoint_priority: u64,
+    local_private_prefixes: &ClusterDeliveryPrivatePrefixes,
+) -> u64 {
+    let private_cross_prefix_penalty = if matches!(endpoint.transport, ClusterTransportKind::LanTcp)
+        && cluster_delivery_private_prefix_for_address(&endpoint.address).is_some()
+        && !cluster_delivery_endpoint_shares_local_private_prefix(endpoint, local_private_prefixes)
+    {
+        CLUSTER_DELIVERY_CROSS_PREFIX_PRIVATE_TARGET_PENALTY
+    } else {
+        0
+    };
+    CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST
+        + path_cost
+        + endpoint_priority
+        + private_cross_prefix_penalty
 }
 
 fn cluster_delivery_connectivity_record_cost(record: &ClusterConnectivityRecord) -> Option<u64> {
@@ -3063,6 +3086,19 @@ mod tests {
         crate::daemon_lan_endpoint(node_id, address.to_string(), priority)
     }
 
+    fn iroh_endpoint(node_id: &NodeId, public_key: &str, priority: u16) -> ClusterEndpointRecord {
+        ClusterEndpointRecord {
+            endpoint_id: crate::stable_iroh_endpoint_id(node_id, public_key),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address: format!("iroh://{public_key}?relay=https://relay.example./"),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority,
+            last_observed_latency_ms: None,
+        }
+    }
+
     fn add_local_endpoint(state: &mut ClusterBootstrapState, endpoint: ClusterEndpointRecord) {
         let local_node_id = state.local_node_id.clone();
         let member = state
@@ -3437,6 +3473,43 @@ mod tests {
         assert_eq!(plan.next_hop, target);
         assert_eq!(plan.endpoints.len(), 1);
         assert_eq!(plan.endpoints[0].address, target_endpoint.address);
+    }
+
+    #[test]
+    fn delivery_plan_prefers_iroh_over_unobserved_cross_prefix_private_target() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-plan-iroh-before-stale-private");
+        let cluster_id = cid("cluster_delivery_plan_iroh_before_stale_private");
+        let local = nid("node_delivery_plan_iroh_before_stale_private_local");
+        let target = nid("node_delivery_plan_iroh_before_stale_private_target");
+        let mut state = test_state(cluster_id, local.clone());
+        add_local_endpoint(&mut state, endpoint(&local, "172.25.0.9:21353", 0));
+        let stale_private_endpoint = endpoint(&target, "172.23.0.2:21353", 0);
+        let relayed_endpoint = iroh_endpoint(&target, "iroh_public_key_route_stale_private", 90);
+        add_member(
+            &mut state,
+            target.clone(),
+            "target",
+            vec![stale_private_endpoint.clone(), relayed_endpoint.clone()],
+        );
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local,
+            &target,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
+
+        assert_eq!(plan.next_hop, target);
+        assert_eq!(plan.endpoints[0].endpoint_id, relayed_endpoint.endpoint_id);
+        assert!(
+            plan.endpoints
+                .iter()
+                .any(|endpoint| endpoint.endpoint_id == stale_private_endpoint.endpoint_id),
+            "cross-prefix private target endpoint should remain as fallback"
+        );
     }
 
     #[test]
