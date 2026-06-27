@@ -41,7 +41,9 @@ fn capture_tabs() {
         (Tab::Files, "files"),
         (Tab::Settings, "settings"),
     ] {
-        capture(boot(tab), name);
+        let shared = boot(tab);
+        shared.borrow_mut().theme_mode = AppThemeMode::Dark;
+        capture(shared, name);
     }
 
     // Light-theme variants to validate the light palette.
