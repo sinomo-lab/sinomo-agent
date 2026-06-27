@@ -265,6 +265,39 @@ enum RuntimeRecoveryTarget {
     Connection,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryCardAction {
+    RetryChatList,
+    OpenConnectionSettings,
+    OpenProviderSetup,
+}
+
+impl RecoveryCardAction {
+    fn label(self) -> &'static str {
+        match self {
+            RecoveryCardAction::RetryChatList => "Retry now",
+            RecoveryCardAction::OpenConnectionSettings => "Open settings",
+            RecoveryCardAction::OpenProviderSetup => "Provider setup",
+        }
+    }
+
+    fn icon(self) -> IconGlyph {
+        match self {
+            RecoveryCardAction::RetryChatList => IconGlyph::Redo,
+            RecoveryCardAction::OpenConnectionSettings => IconGlyph::Alert,
+            RecoveryCardAction::OpenProviderSetup => IconGlyph::Add,
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            RecoveryCardAction::RetryChatList => "Retry the chat list",
+            RecoveryCardAction::OpenConnectionSettings => "Connection settings",
+            RecoveryCardAction::OpenProviderSetup => "Provider setup",
+        }
+    }
+}
+
 impl RuntimeRecoveryTarget {
     fn key(self) -> &'static str {
         match self {
@@ -290,10 +323,10 @@ impl RuntimeRecoveryTarget {
     fn empty_hint(self) -> &'static str {
         match self {
             RuntimeRecoveryTarget::Providers => {
-                "Use Provider setup below to add credentials or choose an available model."
+                "Add credentials or choose an available model from provider setup."
             }
             RuntimeRecoveryTarget::Connection => {
-                "Retry the chat list below, then inspect Connection settings if it still fails."
+                "Retry the chat list first. If it still fails, open Connection settings."
             }
         }
     }
@@ -4019,6 +4052,8 @@ struct TranscriptView {
     content_height: Cell<f32>,
     viewport_height: Cell<f32>,
     bounds: Cell<Rect>,
+    hovered_recovery_action: Cell<Option<RecoveryCardAction>>,
+    pressed_recovery_action: Cell<Option<RecoveryCardAction>>,
 }
 
 impl TranscriptView {
@@ -4028,13 +4063,194 @@ impl TranscriptView {
             content_height: Cell::new(0.0),
             viewport_height: Cell::new(0.0),
             bounds: Cell::new(Rect::ZERO),
+            hovered_recovery_action: Cell::new(None),
+            pressed_recovery_action: Cell::new(None),
         }
+    }
+
+    fn recovery_card_rect(area: Rect) -> Rect {
+        let cx = area.x() + area.width() / 2.0;
+        let cy = area.y() + area.height() / 2.0;
+        let card_w = (area.width() - 56.0).max(220.0).min(560.0);
+        let card_h = 188.0_f32.min((area.height() - 48.0).max(156.0));
+        Rect::new(cx - card_w / 2.0, cy - card_h / 2.0, card_w, card_h)
+    }
+
+    fn recovery_card_text_rect(card: Rect) -> Rect {
+        Rect::new(
+            card.x() + 60.0,
+            card.y() + 17.0,
+            (card.width() - 82.0).max(120.0),
+            (card.height() - 34.0).max(0.0),
+        )
+    }
+
+    fn recovery_card_actions(target: RuntimeRecoveryTarget) -> &'static [RecoveryCardAction] {
+        const CONNECTION: [RecoveryCardAction; 2] = [
+            RecoveryCardAction::RetryChatList,
+            RecoveryCardAction::OpenConnectionSettings,
+        ];
+        const PROVIDERS: [RecoveryCardAction; 1] = [RecoveryCardAction::OpenProviderSetup];
+        match target {
+            RuntimeRecoveryTarget::Providers => &PROVIDERS,
+            RuntimeRecoveryTarget::Connection => &CONNECTION,
+        }
+    }
+
+    fn recovery_card_action_width(action: RecoveryCardAction) -> f32 {
+        match action {
+            RecoveryCardAction::RetryChatList => 112.0,
+            RecoveryCardAction::OpenConnectionSettings => 128.0,
+            RecoveryCardAction::OpenProviderSetup => 142.0,
+        }
+    }
+
+    fn recovery_action_rects(
+        area: Rect,
+        target: RuntimeRecoveryTarget,
+    ) -> Vec<(RecoveryCardAction, Rect)> {
+        let card = Self::recovery_card_rect(area);
+        let text = Self::recovery_card_text_rect(card);
+        let actions = Self::recovery_card_actions(target);
+        let button_h = 28.0;
+        let gap = 8.0;
+
+        if actions.len() == 2 {
+            let first_w = Self::recovery_card_action_width(actions[0]);
+            let second_w = Self::recovery_card_action_width(actions[1]);
+            let row_w = first_w + gap + second_w;
+            if row_w <= text.width() {
+                let y = card.y() + card.height() - button_h - 14.0;
+                return vec![
+                    (actions[0], Rect::new(text.x(), y, first_w, button_h)),
+                    (
+                        actions[1],
+                        Rect::new(text.x() + first_w + gap, y, second_w, button_h),
+                    ),
+                ];
+            }
+        }
+
+        let stack_h =
+            actions.len() as f32 * button_h + actions.len().saturating_sub(1) as f32 * gap;
+        let y0 = card.y() + card.height() - stack_h - 12.0;
+        let button_w = actions
+            .iter()
+            .map(|action| Self::recovery_card_action_width(*action))
+            .fold(0.0_f32, f32::max)
+            .min(text.width())
+            .max(text.width().min(112.0));
+        actions
+            .iter()
+            .enumerate()
+            .map(|(index, action)| {
+                (
+                    *action,
+                    Rect::new(
+                        text.x(),
+                        y0 + index as f32 * (button_h + gap),
+                        button_w,
+                        button_h,
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn recovery_action_at(&self, bounds: Rect, position: Point) -> Option<RecoveryCardAction> {
+        let target = {
+            let chat = self.shared.chat();
+            chat.messages
+                .is_empty()
+                .then(|| chat.runtime_recovery_target())
+                .flatten()
+        }?;
+        Self::recovery_action_rects(bounds, target)
+            .into_iter()
+            .find_map(|(action, rect)| rect.contains(position).then_some(action))
+    }
+
+    fn activate_recovery_action(&self, action: RecoveryCardAction) {
+        match action {
+            RecoveryCardAction::RetryChatList => self.shared.chat_mut().retry_chat_list(),
+            RecoveryCardAction::OpenConnectionSettings => {
+                open_settings_section(&self.shared, SettingsSection::Connection)
+            }
+            RecoveryCardAction::OpenProviderSetup => open_provider_setup(&self.shared),
+        }
+    }
+
+    fn recovery_action_widget_id(parent: sui::WidgetId, slot: usize) -> sui::WidgetId {
+        sui::WidgetId::new(
+            parent
+                .get()
+                .wrapping_mul(37)
+                .wrapping_add(8_001 + slot as u64),
+        )
+    }
+
+    fn request_recovery_action_refresh(ctx: &mut EventCtx) {
+        ctx.request_measure();
+        ctx.request_arrange();
+        ctx.request_paint();
+        ctx.request_semantics();
     }
 }
 
 impl Widget for TranscriptView {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
         match event {
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
+                let hovered = self.recovery_action_at(ctx.bounds(), pointer.position);
+                if self.hovered_recovery_action.get() != hovered {
+                    self.hovered_recovery_action.set(hovered);
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Down
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                if let Some(action) = self.recovery_action_at(ctx.bounds(), pointer.position) {
+                    self.pressed_recovery_action.set(Some(action));
+                    ctx.request_pointer_capture(pointer.pointer_id);
+                    ctx.request_paint();
+                    ctx.set_handled();
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Up
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                let pressed = self.pressed_recovery_action.take();
+                if let Some(pressed) = pressed {
+                    let released = self.recovery_action_at(ctx.bounds(), pointer.position);
+                    if released == Some(pressed) {
+                        self.activate_recovery_action(pressed);
+                    }
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    Self::request_recovery_action_refresh(ctx);
+                    ctx.set_handled();
+                }
+            }
+            Event::Pointer(pointer)
+                if matches!(
+                    pointer.kind,
+                    PointerEventKind::Leave | PointerEventKind::Cancel
+                ) =>
+            {
+                let had_hover = self.hovered_recovery_action.take().is_some();
+                let had_press = self.pressed_recovery_action.take().is_some();
+                if had_press {
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                }
+                if had_hover || had_press {
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                    ctx.set_handled();
+                }
+            }
             Event::Pointer(p)
                 if p.kind == PointerEventKind::Scroll && self.bounds.get().contains(p.position) =>
             {
@@ -4190,6 +4406,36 @@ impl Widget for TranscriptView {
             );
         }
     }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let target = {
+            let chat = self.shared.chat();
+            chat.messages
+                .is_empty()
+                .then(|| chat.runtime_recovery_target())
+                .flatten()
+        };
+        let Some(target) = target else {
+            return;
+        };
+
+        for (slot, (action, rect)) in Self::recovery_action_rects(ctx.bounds(), target)
+            .into_iter()
+            .enumerate()
+        {
+            let mut node = SemanticsNode::new(
+                Self::recovery_action_widget_id(ctx.widget_id(), slot),
+                SemanticsRole::Button,
+                rect,
+            );
+            node.parent = Some(ctx.widget_id());
+            node.name = Some(action.label().to_string());
+            node.description = Some(action.description().to_string());
+            node.actions = vec![SemanticsAction::Activate];
+            node.state.hovered = self.hovered_recovery_action.get() == Some(action);
+            ctx.push(node);
+        }
+    }
 }
 
 impl TranscriptView {
@@ -4242,11 +4488,8 @@ impl TranscriptView {
         chat: &ChatState,
         target: RuntimeRecoveryTarget,
     ) {
-        let cx = area.x() + area.width() / 2.0;
-        let cy = area.y() + area.height() / 2.0;
-        let card_w = (area.width() - 56.0).max(220.0).min(560.0);
-        let card_h = 168.0_f32.min((area.height() - 48.0).max(132.0));
-        let card = Rect::new(cx - card_w / 2.0, cy - card_h / 2.0, card_w, card_h);
+        let card = Self::recovery_card_rect(area);
+        let text = Self::recovery_card_text_rect(card);
         sui::paint_theme_shadow(ctx, card, [10.0; 4], &theme.shadows.box_shadow.xs);
         widgets::round_panel(ctx, card, pal.panel, pal.warn, 12.0);
 
@@ -4258,12 +4501,10 @@ impl TranscriptView {
             pal.warn,
         );
 
-        let text_x = card.x() + 60.0;
-        let text_w = (card.width() - 82.0).max(120.0);
         let title_style = pal.text_style(theme, 15.0, FontWeight::SEMIBOLD, pal.text);
         widgets::draw_text_in(
             ctx,
-            Rect::new(text_x, card.y() + 17.0, text_w, 22.0),
+            Rect::new(text.x(), card.y() + 17.0, text.width(), 22.0),
             chat.recovery_empty_title(target),
             title_style,
         );
@@ -4276,13 +4517,13 @@ impl TranscriptView {
                     .map(|m| m.width)
                     .unwrap_or(0.0)
             };
-            widgets::wrap_lines(&detail, text_w, measure)
+            widgets::wrap_lines(&detail, text.width(), measure)
         };
         let mut y = card.y() + 50.0;
         for line in detail_lines.iter().take(2) {
             widgets::draw_text_in(
                 ctx,
-                Rect::new(text_x, y, text_w, detail_style.line_height + 3.0),
+                Rect::new(text.x(), y, text.width(), detail_style.line_height + 3.0),
                 line,
                 detail_style.clone(),
             );
@@ -4296,31 +4537,78 @@ impl TranscriptView {
                     .map(|m| m.width)
                     .unwrap_or(0.0)
             };
-            widgets::wrap_lines(target.empty_hint(), text_w, measure)
+            widgets::wrap_lines(target.empty_hint(), text.width(), measure)
         };
         y = y.max(card.y() + 86.0);
+        let action_top = Self::recovery_action_rects(area, target)
+            .into_iter()
+            .map(|(_, rect)| rect.y())
+            .fold(card.y() + card.height(), f32::min);
         for line in hint_lines.iter().take(2) {
+            if y + hint_style.line_height + 3.0 > action_top - 4.0 {
+                break;
+            }
             widgets::draw_text_in(
                 ctx,
-                Rect::new(text_x, y, text_w, hint_style.line_height + 3.0),
+                Rect::new(text.x(), y, text.width(), hint_style.line_height + 3.0),
                 line,
                 hint_style.clone(),
             );
             y += hint_style.line_height + 2.0;
         }
 
-        let pill = Rect::new(text_x, card.y() + card.height() - 34.0, 142.0, 22.0);
-        widgets::fill_round_rect(ctx, pill, pal.field, 11.0);
+        for (action, rect) in Self::recovery_action_rects(area, target) {
+            self.paint_recovery_action(ctx, theme, pal, action, rect);
+        }
+    }
+
+    fn paint_recovery_action(
+        &self,
+        ctx: &mut PaintCtx,
+        theme: &sui::DefaultTheme,
+        pal: &Palette,
+        action: RecoveryCardAction,
+        rect: Rect,
+    ) {
+        let hovered = self.hovered_recovery_action.get() == Some(action);
+        let pressed = self.pressed_recovery_action.get() == Some(action);
+        let primary = matches!(
+            action,
+            RecoveryCardAction::RetryChatList | RecoveryCardAction::OpenProviderSetup
+        );
+        let (fill, border, text_color, icon_color) = if primary {
+            let fill = if pressed { pal.selected } else { pal.accent };
+            (fill, fill, pal.on_accent, pal.on_accent)
+        } else {
+            let fill = if pressed {
+                pal.selected
+            } else if hovered {
+                pal.hover
+            } else {
+                pal.field
+            };
+            (fill, pal.border, pal.text_muted, pal.text_muted)
+        };
+
+        widgets::round_panel(ctx, rect, fill, border, 8.0);
+        let icon_side = 14.0;
+        let icon = Rect::new(
+            rect.x() + 10.0,
+            rect.y() + (rect.height() - icon_side) * 0.5,
+            icon_side,
+            icon_side,
+        );
+        draw_glyph(ctx, action.icon(), icon, icon_color);
         widgets::draw_text_in(
             ctx,
             Rect::new(
-                pill.x() + 10.0,
-                pill.y(),
-                pill.width() - 20.0,
-                pill.height(),
+                icon.max_x() + 6.0,
+                rect.y(),
+                (rect.width() - icon_side - 26.0).max(0.0),
+                rect.height(),
             ),
-            target.label(),
-            pal.text_style(theme, 10.5, FontWeight::SEMIBOLD, pal.text_muted),
+            action.label(),
+            pal.text_style(theme, 10.5, FontWeight::SEMIBOLD, text_color),
         );
     }
 }
@@ -6541,6 +6829,121 @@ mod tests {
         assert!(chat.notice.is_none());
         assert!(chat.activity.iter().all(|entry| entry.title != "chat list"));
         assert_eq!(chat.runtime_recovery_target(), None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_recovery_card_retry_button_uses_existing_refresh_path() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.notice = Some("chat list failed: device authorization was denied".to_string());
+            chat.push_activity(
+                "chat list",
+                "device authorization was denied",
+                ActivityTone::Warn,
+            );
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat recovery card retry")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Retry now")
+            .with_description("Retry the chat list")
+            .click()?;
+
+        let chat = shared.chat();
+        assert!(chat.notice.is_none());
+        assert!(chat.activity.iter().all(|entry| entry.title != "chat list"));
+        assert_eq!(chat.runtime_recovery_target(), None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_recovery_card_settings_button_opens_connection_settings() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.notice = Some("chat list failed: device authorization was denied".to_string());
+            chat.push_activity(
+                "chat list",
+                "device authorization was denied",
+                ActivityTone::Warn,
+            );
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat recovery card settings")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Open settings")
+            .with_description("Connection settings")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_recovery_card_provider_button_opens_provider_setup() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            chat.providers.clear();
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat recovery card provider")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Provider setup")
+            .with_description("Provider setup")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        let settings = shared.settings();
+        assert_eq!(settings.selected, Some(SettingsSection::Providers));
+        assert!(settings.provider_add_open);
 
         Ok(())
     }
