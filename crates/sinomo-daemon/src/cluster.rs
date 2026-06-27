@@ -10849,7 +10849,7 @@ mod tests {
                 sinomo_network::DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
                 &snapshot_request
             ),
-            sinomo_network::DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT
+            sinomo_network::DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT
         );
     }
 }
