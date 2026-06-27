@@ -1,4 +1,7 @@
-use crate::{DaemonError, DaemonStatus, sign_daemon_rpc_request_for_local_node};
+use crate::{
+    DaemonError, DaemonStatus, daemon_rpc_body_sha256,
+    sign_daemon_rpc_request_digest_for_local_node, sign_daemon_rpc_request_for_local_node,
+};
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY, CONFIG_SET_ROUTE,
     ConfigCatalogRequest, ConfigCatalogResponse, ConfigClient, ConfigDefinition, ConfigError,
@@ -67,9 +70,13 @@ pub async fn send_daemon_rpc_async(
     timeouts: sinomo_network::DaemonRpcTimeouts,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
-    let request_for_signing = request.clone();
+    let route = request.route.clone();
+    let category = request.category.clone();
+    let body_sha256 = daemon_rpc_body_sha256(request);
     let signed = runtime
-        .spawn_blocking(move || sign_daemon_rpc_request_for_local_node(&request_for_signing))
+        .spawn_blocking(move || {
+            sign_daemon_rpc_request_digest_for_local_node(&route, &category, body_sha256)
+        })
         .await
         .map_err(|source| DaemonError::Network {
             address: address.to_string(),
@@ -248,9 +255,11 @@ pub async fn send_daemon_rpc_stream_async(
     timeouts: sinomo_network::DaemonRpcTimeouts,
     mut on_response: impl FnMut(sinomo_network::ObjectRpcResponse) -> Result<bool, DaemonError>,
 ) -> Result<(), DaemonError> {
-    let request_for_signing = request.clone();
+    let route = request.route.clone();
+    let category = request.category.clone();
+    let body_sha256 = daemon_rpc_body_sha256(request);
     let signed = tokio::task::spawn_blocking(move || {
-        sign_daemon_rpc_request_for_local_node(&request_for_signing)
+        sign_daemon_rpc_request_digest_for_local_node(&route, &category, body_sha256)
     })
     .await
     .map_err(|source| DaemonError::Network {
@@ -665,11 +674,15 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
         &'a mut self,
         request: &'a ObjectRpcRequest,
     ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
-        let request = request.clone();
+        let route = request.route.clone();
+        let category = request.category.clone();
+        let body_sha256 = daemon_rpc_body_sha256(request);
         let runtime = self.runtime.clone();
         Box::pin(async move {
             runtime
-                .spawn_blocking(move || sign_daemon_rpc_request_for_local_node(&request))
+                .spawn_blocking(move || {
+                    sign_daemon_rpc_request_digest_for_local_node(&route, &category, body_sha256)
+                })
                 .await
                 .map_err(|source| sinomo_network::NetworkError::Io {
                     operation: "cluster endpoint signing".to_string(),

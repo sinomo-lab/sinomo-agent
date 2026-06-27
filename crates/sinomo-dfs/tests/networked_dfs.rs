@@ -10854,6 +10854,16 @@ fn networked_dfs_retries_offline_repair_when_replica_appears() {
             .any(|event| matches!(event, NetworkedDfsServiceEvent::ReplicaRepaired { .. }))
     );
     assert!(owner_dfs.coordinator().repair_jobs().is_empty());
+    let owner_metrics = owner_dfs
+        .operational_metrics()
+        .expect("owner metrics after repair");
+    assert_eq!(owner_metrics.repair_job_count, 0);
+    assert_eq!(owner_metrics.pending_write_count, 0);
+    assert_eq!(owner_metrics.repair_attempt_count, 0);
+    assert_eq!(owner_metrics.repair_retry_count, 0);
+    assert_eq!(owner_metrics.repair_inflight_count, 0);
+    assert_eq!(owner_metrics.repair_window_resume_count, 0);
+    assert_eq!(owner_metrics.repair_window_resume_bytes, 0);
     assert!(
         owner_dfs
             .metadata()

@@ -203,10 +203,14 @@ impl ObjectRpcRequest {
     }
 
     pub fn with_trace_context_if_missing(mut self) -> Self {
+        self.ensure_trace_context();
+        self
+    }
+
+    pub fn ensure_trace_context(&mut self) {
         self.metadata
             .entry(OBJECT_RPC_TRACEPARENT_METADATA_KEY.to_string())
             .or_insert_with(new_object_rpc_traceparent);
-        self
     }
 
     pub fn operation_id(&self) -> Option<&str> {

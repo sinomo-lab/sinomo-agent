@@ -3886,10 +3886,27 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonClusterControlP
         request: &'a ObjectRpcRequest,
     ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
         let runtime = self.rpc_mode.runtime().clone();
-        let request = request.clone();
+        let route = request.route.clone();
+        let category = request.category.clone();
+        let body_sha256 = crate::daemon_rpc_body_sha256(request);
         Box::pin(async move {
-            let mut host = DaemonSignedEndpointRpcAsyncHost::new(&runtime, true);
-            host.sign_endpoint_rpc_request_async(&request).await
+            runtime
+                .spawn_blocking(move || {
+                    crate::sign_daemon_rpc_request_digest_for_local_node(
+                        &route,
+                        &category,
+                        body_sha256,
+                    )
+                })
+                .await
+                .map_err(|source| sinomo_network::NetworkError::Io {
+                    operation: "cluster endpoint signing".to_string(),
+                    detail: format!("endpoint signing task failed: {source}"),
+                })?
+                .map_err(|error| sinomo_network::NetworkError::Io {
+                    operation: "cluster endpoint signing".to_string(),
+                    detail: error.to_string(),
+                })
         })
     }
 
@@ -3915,12 +3932,9 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonClusterControlP
         timeouts: sinomo_network::DaemonRpcTimeouts,
     ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
         let runtime = self.rpc_mode.runtime().clone();
-        let endpoint = endpoint.clone();
-        let auth = auth.to_vec();
-        let request = request.clone();
         Box::pin(async move {
             let mut host = DaemonSignedEndpointRpcAsyncHost::new(&runtime, true);
-            host.send_signed_endpoint_rpc_async(&endpoint, &auth, &request, timeouts)
+            host.send_signed_endpoint_rpc_async(endpoint, auth, request, timeouts)
                 .await
         })
     }
