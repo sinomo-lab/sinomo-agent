@@ -136,6 +136,7 @@ pub struct SettingsState {
     connection_detail_expanded: Vec<Tab>,
     node_detail_expanded: bool,
     advanced_detail_expanded: Vec<String>,
+    provider_detail_expanded: Vec<String>,
     provider_remove_confirming: Option<(String, String)>,
 }
 
@@ -242,6 +243,7 @@ impl SettingsState {
             connection_detail_expanded: Vec::new(),
             node_detail_expanded: false,
             advanced_detail_expanded: Vec::new(),
+            provider_detail_expanded: Vec::new(),
             provider_remove_confirming: None,
         }
     }
@@ -313,6 +315,26 @@ impl SettingsState {
         self.provider_remove_confirming
             .as_ref()
             .is_some_and(|(p, a)| p == provider && a == account)
+    }
+
+    fn provider_detail_expanded(&self, provider: &str, account: &str) -> bool {
+        let key = provider_account_key(provider, account);
+        self.provider_detail_expanded
+            .iter()
+            .any(|expanded| expanded == &key)
+    }
+
+    fn toggle_provider_detail(&mut self, provider: &str, account: &str) {
+        let key = provider_account_key(provider, account);
+        if let Some(index) = self
+            .provider_detail_expanded
+            .iter()
+            .position(|expanded| expanded == &key)
+        {
+            self.provider_detail_expanded.remove(index);
+        } else {
+            self.provider_detail_expanded.push(key);
+        }
     }
 
     fn confirm_provider_remove(&mut self, index: usize) {
@@ -694,6 +716,10 @@ fn provider_field_key(provider: &str, account: &str, field: ProviderField) -> St
         ProviderField::BaseUrl => "base_url",
     };
     format!("provider:{provider}:{account}:{suffix}")
+}
+
+fn provider_account_key(provider: &str, account: &str) -> String {
+    format!("{provider}:{account}")
 }
 
 /// A short, right-aligned value preview for a section, shown in the narrow menu rows.
@@ -1556,9 +1582,13 @@ fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     FormSection::new("About", body).theme_when(clone_reader(reader))
 }
 
-/// One provider's card: enable toggle (header action), auth row, model / base URL, and effort.
+/// One provider's card: summary rows first, low-level credential and management controls behind a
+/// details disclosure.
 fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widget + use<> {
     let form = shared.settings().provider_forms[index].clone();
+    let expanded = shared
+        .settings()
+        .provider_detail_expanded(&form.provider, &form.account);
 
     // Enable toggle as the panel's header action.
     let enable_switch = {
@@ -1581,55 +1611,12 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         "Account",
         form.account_label.clone(),
     ));
-
-    // Authentication: device-login (status + button) or an API-key field.
-    if form.uses_device_login {
-        let sign_in_label = if form.signed_in {
-            "Re-authenticate"
-        } else {
-            "Sign in"
-        };
-        let button = {
-            let s = shared.clone();
-            sui::Button::new(sign_in_label)
-                .theme_when(clone_reader(reader))
-                .on_press(move || {
-                    let waker = s.borrow().waker.clone();
-                    s.settings_mut().begin_device_login(index, waker);
-                })
-        };
-        let auth = Stack::vertical()
-            .spacing(6.0)
-            .alignment(Alignment::Stretch)
-            .with_child(StatusReflector::new(shared.clone(), index, reader))
-            .with_child(button);
-        body = body.with_child(
-            FormRow::new("Authentication", auth)
-                .stacked()
-                .theme_when(clone_reader(reader)),
-        );
-    } else {
-        let placeholder = if form.has_api_key {
-            "Configured"
-        } else {
-            "Not set"
-        };
-        let on_change = {
-            let s = shared.clone();
-            move |value: String| {
-                s.settings_mut()
-                    .set_provider_field(index, ProviderField::ApiKey, &value);
-            }
-        };
-        body = body.with_child(text_row(
-            reader,
-            &format!("provider-{index}-api-key"),
-            "API key",
-            "",
-            placeholder,
-            on_change,
-        ));
-    }
+    body = body.with_child(value_row(
+        shared,
+        reader,
+        "Authentication",
+        provider_auth_summary(&form),
+    ));
 
     // Default model.
     body = body.with_child(text_row(
@@ -1647,54 +1634,144 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         },
     ));
 
-    // API base URL.
-    body = body.with_child(text_row(
-        reader,
-        &format!("provider-{index}-base-url"),
-        "API base URL",
-        form.api_base_url.clone(),
-        "Provider default",
-        {
-            let s = shared.clone();
-            move |value: String| {
-                s.settings_mut()
-                    .set_provider_field(index, ProviderField::BaseUrl, &value);
-            }
-        },
-    ));
+    let detail_button = {
+        let s = shared.clone();
+        let provider = form.provider.clone();
+        let account = form.account.clone();
+        sui::Button::new(if expanded {
+            "Hide details"
+        } else {
+            "Show details"
+        })
+        .icon(if expanded {
+            sui::IconGlyph::ChevronUp
+        } else {
+            sui::IconGlyph::ChevronDown
+        })
+        .theme_when(clone_reader(reader))
+        .on_press(move || {
+            s.settings_mut().toggle_provider_detail(&provider, &account);
+        })
+    };
+    body = body.with_child(
+        FormRow::new("Details", detail_button)
+            .inline()
+            .theme_when(clone_reader(reader)),
+    );
 
-    // Reasoning effort (when the provider/model supports it).
-    if form.supports_reasoning {
-        let selected_when = {
-            let s = shared.clone();
-            move || {
-                let settings = s.settings();
-                settings
-                    .provider_forms
-                    .get(index)
-                    .map(|f| reasoning_effort_index(f.reasoning_effort.as_deref()))
-            }
-        };
-        let on_change = {
-            let s = shared.clone();
-            move |idx: usize, _label: String| {
-                s.settings_mut().set_provider_effort_at(index, idx);
-            }
-        };
-        body = body.with_child(select_row(
+    if expanded {
+        // Authentication: device-login (status + button) or an API-key field.
+        if form.uses_device_login {
+            let sign_in_label = if form.signed_in {
+                "Re-authenticate"
+            } else {
+                "Sign in"
+            };
+            let button = {
+                let s = shared.clone();
+                sui::Button::new(sign_in_label)
+                    .theme_when(clone_reader(reader))
+                    .on_press(move || {
+                        let waker = s.borrow().waker.clone();
+                        s.settings_mut().begin_device_login(index, waker);
+                    })
+            };
+            let auth = Stack::vertical()
+                .spacing(6.0)
+                .alignment(Alignment::Stretch)
+                .with_child(StatusReflector::new(shared.clone(), index, reader))
+                .with_child(button);
+            body = body.with_child(
+                FormRow::new("Authentication detail", auth)
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            );
+        } else {
+            let placeholder = if form.has_api_key {
+                "Configured"
+            } else {
+                "Not set"
+            };
+            let on_change = {
+                let s = shared.clone();
+                move |value: String| {
+                    s.settings_mut()
+                        .set_provider_field(index, ProviderField::ApiKey, &value);
+                }
+            };
+            body = body.with_child(text_row(
+                reader,
+                &format!("provider-{index}-api-key"),
+                "API key",
+                "",
+                placeholder,
+                on_change,
+            ));
+        }
+
+        // API base URL.
+        body = body.with_child(text_row(
             reader,
-            &format!("provider-{index}-effort"),
-            "Reasoning effort",
-            REASONING_EFFORT_OPTIONS,
-            selected_when,
-            on_change,
+            &format!("provider-{index}-base-url"),
+            "API base URL",
+            form.api_base_url.clone(),
+            "Provider default",
+            {
+                let s = shared.clone();
+                move |value: String| {
+                    s.settings_mut()
+                        .set_provider_field(index, ProviderField::BaseUrl, &value);
+                }
+            },
         ));
+
+        // Reasoning effort (when the provider/model supports it).
+        if form.supports_reasoning {
+            let selected_when = {
+                let s = shared.clone();
+                move || {
+                    let settings = s.settings();
+                    settings
+                        .provider_forms
+                        .get(index)
+                        .map(|f| reasoning_effort_index(f.reasoning_effort.as_deref()))
+                }
+            };
+            let on_change = {
+                let s = shared.clone();
+                move |idx: usize, _label: String| {
+                    s.settings_mut().set_provider_effort_at(index, idx);
+                }
+            };
+            body = body.with_child(select_row(
+                reader,
+                &format!("provider-{index}-effort"),
+                "Reasoning effort",
+                REASONING_EFFORT_OPTIONS,
+                selected_when,
+                on_change,
+            ));
+        }
+        body = body.with_child(provider_management_row(shared, reader, index, &form));
     }
-    body = body.with_child(provider_management_row(shared, reader, index, &form));
 
     FormSection::new(form.display_name.clone(), body)
         .header_action(enable_switch)
         .theme_when(clone_reader(reader))
+}
+
+fn provider_auth_summary(form: &ProviderForm) -> &'static str {
+    if form.uses_device_login {
+        if form.signed_in {
+            "Signed in"
+        } else {
+            "Sign-in required"
+        }
+    } else if form.has_api_key {
+        "API key configured"
+    } else {
+        "API key required"
+    }
 }
 
 fn provider_management_row(
@@ -1791,6 +1868,7 @@ fn provider_section_signature(shared: &Shared) -> String {
         format!("error:{:?}", settings.provider_add_error),
         format!("action-error:{:?}", settings.provider_action_error),
         format!("remove:{:?}", settings.provider_remove_confirming),
+        format!("expanded:{:?}", settings.provider_detail_expanded),
     ];
     parts.extend(settings.provider_forms.iter().map(|form| {
         format!(
@@ -3247,6 +3325,79 @@ mod tests {
                 .accounts
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn provider_card_details_expand_for_low_level_controls() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let config = shared.settings().config.clone();
+            add_provider_account(config.as_ref(), "openai", "work", "sk-work", "gpt-5", "")
+                .expect("add provider account");
+        }
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            settings.reload();
+            settings.open(SettingsSection::Providers);
+        }
+
+        let collapsed_signature = provider_section_signature(&shared);
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings provider details")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("provider-0-model")
+            .expect()
+            .to_have_value("gpt-5")?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("provider-0-base-url")
+            .expect()
+            .to_be_hidden()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Remove account")
+            .expect()
+            .to_be_hidden()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Show details")
+            .click()?;
+
+        assert_ne!(
+            collapsed_signature,
+            provider_section_signature(&shared),
+            "provider disclosure state must invalidate the retained section"
+        );
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Hide details")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("provider-0-base-url")
+            .expect()
+            .to_have_value("")?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Remove account")
+            .expect()
+            .to_be_visible()?;
+
+        Ok(())
     }
 
     fn test_config_item(key: &str, kind: ConfigEditKind, raw: &str) -> ConfigItem {
