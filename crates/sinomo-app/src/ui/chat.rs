@@ -268,6 +268,7 @@ enum RuntimeRecoveryTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecoveryCardAction {
     RetryChatList,
+    CheckSifs,
     OpenConnectionSettings,
     OpenProviderSetup,
 }
@@ -276,6 +277,7 @@ impl RecoveryCardAction {
     fn label(self) -> &'static str {
         match self {
             RecoveryCardAction::RetryChatList => "Retry now",
+            RecoveryCardAction::CheckSifs => "Check SIFS",
             RecoveryCardAction::OpenConnectionSettings => "Open settings",
             RecoveryCardAction::OpenProviderSetup => "Provider setup",
         }
@@ -284,6 +286,7 @@ impl RecoveryCardAction {
     fn icon(self) -> IconGlyph {
         match self {
             RecoveryCardAction::RetryChatList => IconGlyph::Redo,
+            RecoveryCardAction::CheckSifs => IconGlyph::Storage,
             RecoveryCardAction::OpenConnectionSettings => IconGlyph::Alert,
             RecoveryCardAction::OpenProviderSetup => IconGlyph::Add,
         }
@@ -292,6 +295,7 @@ impl RecoveryCardAction {
     fn description(self) -> &'static str {
         match self {
             RecoveryCardAction::RetryChatList => "Retry the chat list",
+            RecoveryCardAction::CheckSifs => "Open SIFS browser",
             RecoveryCardAction::OpenConnectionSettings => "Connection settings",
             RecoveryCardAction::OpenProviderSetup => "Provider setup",
         }
@@ -997,6 +1001,22 @@ impl ChatState {
     fn should_offer_chat_list_retry(&self) -> bool {
         self.connection_attention_detail_full()
             .is_some_and(|detail| detail.to_ascii_lowercase().contains("chat list"))
+    }
+
+    fn should_offer_sifs_check(&self) -> bool {
+        self.connection_attention_detail_full()
+            .is_some_and(|detail| {
+                let lower = detail.to_ascii_lowercase();
+                [
+                    "sifs",
+                    "dfs",
+                    "session store",
+                    "channel store",
+                    "device authorization",
+                ]
+                .iter()
+                .any(|needle| lower.contains(needle))
+            })
     }
 
     fn recovery_empty_detail(&self, target: RuntimeRecoveryTarget) -> String {
@@ -4367,6 +4387,9 @@ impl TranscriptView {
                 if chat.should_offer_chat_list_retry() {
                     actions.push(RecoveryCardAction::RetryChatList);
                 }
+                if chat.should_offer_sifs_check() {
+                    actions.push(RecoveryCardAction::CheckSifs);
+                }
                 actions.push(RecoveryCardAction::OpenConnectionSettings);
                 actions
             }
@@ -4378,11 +4401,13 @@ impl TranscriptView {
         target: RuntimeRecoveryTarget,
         action: RecoveryCardAction,
     ) -> bool {
+        let actions = Self::recovery_card_actions(chat, target);
         match action {
             RecoveryCardAction::RetryChatList | RecoveryCardAction::OpenProviderSetup => true,
+            RecoveryCardAction::CheckSifs => !actions.contains(&RecoveryCardAction::RetryChatList),
             RecoveryCardAction::OpenConnectionSettings => {
-                !Self::recovery_card_actions(chat, target)
-                    .contains(&RecoveryCardAction::RetryChatList)
+                !actions.contains(&RecoveryCardAction::RetryChatList)
+                    && !actions.contains(&RecoveryCardAction::CheckSifs)
             }
         }
     }
@@ -4390,6 +4415,7 @@ impl TranscriptView {
     fn recovery_card_action_width(action: RecoveryCardAction) -> f32 {
         match action {
             RecoveryCardAction::RetryChatList => 112.0,
+            RecoveryCardAction::CheckSifs => 116.0,
             RecoveryCardAction::OpenConnectionSettings => 128.0,
             RecoveryCardAction::OpenProviderSetup => 142.0,
         }
@@ -4406,19 +4432,24 @@ impl TranscriptView {
         let button_h = 28.0;
         let gap = 8.0;
 
-        if actions.len() == 2 {
-            let first_w = Self::recovery_card_action_width(actions[0]);
-            let second_w = Self::recovery_card_action_width(actions[1]);
-            let row_w = first_w + gap + second_w;
+        if actions.len() > 1 {
+            let widths: Vec<f32> = actions
+                .iter()
+                .map(|action| Self::recovery_card_action_width(*action))
+                .collect();
+            let row_w = widths.iter().sum::<f32>() + actions.len().saturating_sub(1) as f32 * gap;
             if row_w <= text.width() {
                 let y = card.y() + card.height() - button_h - 14.0;
-                return vec![
-                    (actions[0], Rect::new(text.x(), y, first_w, button_h)),
-                    (
-                        actions[1],
-                        Rect::new(text.x() + first_w + gap, y, second_w, button_h),
-                    ),
-                ];
+                let mut x = text.x();
+                return actions
+                    .iter()
+                    .zip(widths)
+                    .map(|(action, width)| {
+                        let rect = Rect::new(x, y, width, button_h);
+                        x += width + gap;
+                        (*action, rect)
+                    })
+                    .collect();
             }
         }
 
@@ -4465,6 +4496,7 @@ impl TranscriptView {
     fn activate_recovery_action(&self, action: RecoveryCardAction) {
         match action {
             RecoveryCardAction::RetryChatList => self.shared.chat_mut().retry_chat_list(),
+            RecoveryCardAction::CheckSifs => open_files_tab(&self.shared),
             RecoveryCardAction::OpenConnectionSettings => {
                 open_settings_section(&self.shared, SettingsSection::Connection)
             }
@@ -4482,8 +4514,11 @@ impl TranscriptView {
     }
 
     fn request_recovery_action_refresh(ctx: &mut EventCtx) {
-        ctx.request_measure();
-        ctx.request_arrange();
+        use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
+
+        let window = InvalidationTarget::Window(ctx.window_id());
+        ctx.request(InvalidationRequest::new(window, InvalidationKind::Measure));
+        ctx.request(InvalidationRequest::new(window, InvalidationKind::Arrange));
         ctx.request_paint();
         ctx.request_semantics();
     }
@@ -5038,6 +5073,10 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
             row = row.with_child(action);
         }
 
+        if let Some(action) = check_sifs_button(shared, reader) {
+            row = row.with_child(action);
+        }
+
         if let Some(action) = runtime_recovery_button(shared, reader) {
             row = row.with_child(action);
         }
@@ -5090,12 +5129,37 @@ fn retry_chat_list_button(shared: &Shared, reader: &ThemeReader) -> Option<Sized
     )
 }
 
+fn check_sifs_button(shared: &Shared, reader: &ThemeReader) -> Option<SizedBox> {
+    let chat = shared.chat();
+    let target = chat.runtime_recovery_target()?;
+    if target != RuntimeRecoveryTarget::Connection {
+        return None;
+    }
+    if !chat.should_offer_sifs_check() {
+        return None;
+    }
+    let s = shared.clone();
+    Some(
+        SizedBox::new().height(SELECTOR_H).with_child(
+            sui::Button::new("Check SIFS")
+                .icon(IconGlyph::Storage)
+                .min_width(120.0)
+                .theme_when(composer_control_reader(reader))
+                .on_press(move || open_files_tab(&s)),
+        ),
+    )
+}
+
 fn open_settings_section(shared: &Shared, section: SettingsSection) {
     let mut app = shared.borrow_mut();
     app.active_tab = Tab::Settings;
     if let Some(ready) = app.ready.as_mut() {
         ready.settings.open(section);
     }
+}
+
+fn open_files_tab(shared: &Shared) {
+    shared.borrow_mut().active_tab = Tab::Files;
 }
 
 fn open_provider_setup(shared: &Shared) {
@@ -7419,6 +7483,15 @@ mod tests {
             1,
             "the card keeps a single settings action"
         );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Check SIFS")
+                .with_description("Open SIFS browser")
+                .count()?,
+            1,
+            "the card exposes the SIFS diagnostic path without duplicating it in the footer"
+        );
 
         Ok(())
     }
@@ -7505,6 +7578,98 @@ mod tests {
     }
 
     #[test]
+    fn rendered_recovery_card_check_sifs_opens_files() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.notice = Some("chat list failed: device authorization was denied".to_string());
+            chat.push_activity(
+                "chat list",
+                "device authorization was denied",
+                ActivityTone::Warn,
+            );
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat recovery card SIFS")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Check SIFS")
+            .with_description("Open SIFS browser")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Files);
+
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_card_pointer_check_sifs_opens_files() -> sui::Result<()> {
+        use sui::{
+            Event, Point, PointerButton, PointerButtons, PointerEvent, PointerEventKind,
+            WindowEvent,
+        };
+
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.notice = Some("chat list failed: device authorization was denied".to_string());
+            chat.push_activity(
+                "chat list",
+                "device authorization was denied",
+                ActivityTone::Warn,
+            );
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat recovery card pointer")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let root = window.root();
+        root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+            1280.0, 720.0,
+        ))))?;
+        app.run_until_idle()?;
+
+        let pos = Point::new(580.0, 402.0);
+        root.dispatch_event(Event::Pointer(PointerEvent::new(
+            PointerEventKind::Move,
+            pos,
+        )))?;
+        let mut down = PointerEvent::new(PointerEventKind::Down, pos);
+        down.button = Some(PointerButton::Primary);
+        down.buttons = PointerButtons::new(1);
+        root.dispatch_event(Event::Pointer(down))?;
+        let mut up = PointerEvent::new(PointerEventKind::Up, pos);
+        up.button = Some(PointerButton::Primary);
+        root.dispatch_event(Event::Pointer(up))?;
+        app.run_until_idle()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Files);
+
+        Ok(())
+    }
+
+    #[test]
     fn rendered_channel_recovery_card_hides_chat_list_retry() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -7556,7 +7721,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_channel_recovery_footer_hides_chat_list_retry() -> sui::Result<()> {
+    fn rendered_channel_recovery_footer_offers_sifs_check_without_retry() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -7591,17 +7756,21 @@ mod tests {
             0,
             "the footer should not offer chat-list retry for channel failures"
         );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Check SIFS")
+                .count()?,
+            1,
+            "the footer should still expose the SIFS diagnostic path for channel failures"
+        );
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Connection settings")
+            .with_name("Check SIFS")
             .click()?;
 
-        assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
+        assert_eq!(shared.borrow().active_tab, Tab::Files);
 
         Ok(())
     }
