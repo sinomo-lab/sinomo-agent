@@ -557,6 +557,24 @@ fn short(s: &str, max: usize) -> String {
     }
 }
 
+fn sifs_unavailable_summary(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("device authorization") || lower.contains("denied") {
+        "SIFS access needs authorization."
+    } else if lower.contains("requires a daemon") || lower.contains("daemon connection") {
+        "SIFS needs a daemon connection."
+    } else if lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("did not finish")
+    {
+        "SIFS did not respond in time."
+    } else if lower.contains("worker stopped") {
+        "SIFS browser stopped unexpectedly."
+    } else {
+        "SIFS could not open through the local cluster service."
+    }
+}
+
 /// The right-aligned metadata for a listing row: `folder` for directories, else a human size.
 fn entry_meta(entry: &SifsEntry) -> String {
     if entry.is_dir {
@@ -677,9 +695,14 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             .with_child(retry)
             .with_child(settings);
         return WidgetPod::new(
-            centered_note(shared, "▤", "SIFS unavailable", format!("{error}"))
-                .glyph(IconGlyph::Storage)
-                .action(actions),
+            centered_note(
+                shared,
+                "▤",
+                "SIFS unavailable",
+                sifs_unavailable_summary(&error),
+            )
+            .glyph(IconGlyph::Storage)
+            .action(actions),
         );
     }
     if is_empty {
@@ -813,10 +836,13 @@ fn sifs_loading_rows(path: &str, details_open: bool) -> Vec<(&'static str, Strin
 }
 
 fn sifs_unavailable_rows(error: &str, details_open: bool) -> Vec<(&'static str, String)> {
-    let mut rows = vec![(
-        "Next",
-        "Retry SIFS, then open connection settings".to_string(),
-    )];
+    let mut rows = vec![
+        ("Status", sifs_unavailable_summary(error).to_string()),
+        (
+            "Next",
+            "Retry SIFS, then open connection settings".to_string(),
+        ),
+    ];
     if details_open {
         rows.push(("Reason", error.to_string()));
         rows.push(("Authority", "SIFS through daemon".to_string()));
@@ -1840,7 +1866,15 @@ mod tests {
         );
 
         let collapsed = sifs_unavailable_rows("device authorization was denied", false);
+        assert!(collapsed.iter().any(|(label, value)| {
+            *label == "Status" && value == "SIFS access needs authorization."
+        }));
         assert!(collapsed.iter().any(|(label, _)| *label == "Next"));
+        assert!(
+            !collapsed
+                .iter()
+                .any(|(_, value)| value.contains("device authorization"))
+        );
         assert!(!collapsed.iter().any(|(label, _)| *label == "Reason"));
         assert!(!collapsed.iter().any(|(label, _)| *label == "Authority"));
 
@@ -1855,6 +1889,22 @@ mod tests {
             expanded
                 .iter()
                 .any(|(label, value)| *label == "Authority" && value == "SIFS through daemon")
+        );
+    }
+
+    #[test]
+    fn sifs_unavailable_summary_uses_recovery_language() {
+        assert_eq!(
+            sifs_unavailable_summary("device authorization was denied"),
+            "SIFS access needs authorization."
+        );
+        assert_eq!(
+            sifs_unavailable_summary("SIFS browsing requires a daemon connection"),
+            "SIFS needs a daemon connection."
+        );
+        assert_eq!(
+            sifs_unavailable_summary("SIFS listing did not finish within 20 seconds"),
+            "SIFS did not respond in time."
         );
     }
 
