@@ -1789,9 +1789,20 @@ impl ChatState {
             ChatEvent::Error { error, .. } => {
                 self.streaming = false;
                 self.control.active_turn = false;
-                self.push_activity("agent error", error.clone(), ActivityTone::Bad);
+                if let Some(detail) = connection_problem_summary(&error) {
+                    self.push_activity("chat connection", detail.clone(), ActivityTone::Warn);
+                    if !self
+                        .notice
+                        .as_deref()
+                        .is_some_and(text_mentions_connection_problem)
+                    {
+                        self.notice = Some(format!("chat connection failed: {detail}"));
+                    }
+                } else {
+                    self.push_activity("agent error", error.clone(), ActivityTone::Bad);
+                    self.notice = None;
+                }
                 Self::apply_error_message(&mut self.messages, &error);
-                self.notice = None;
                 if self.stick_bottom {
                     self.scroll = f32::MAX;
                 }
@@ -2577,6 +2588,7 @@ fn text_mentions_runtime_problem(text: &str) -> bool {
 fn text_mentions_connection_problem(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     [
+        "chat connection",
         "chat list",
         "chat save",
         "chat unavailable",
@@ -2590,6 +2602,41 @@ fn text_mentions_connection_problem(text: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn connection_problem_summary(text: &str) -> Option<String> {
+    if !text_mentions_connection_problem(text) {
+        return None;
+    }
+
+    let lower = text.to_ascii_lowercase();
+    let denied = lower.contains("device authorization") || lower.contains("denied");
+    let summary = if lower.contains("agent channel") || lower.contains("channel store") {
+        if denied {
+            "Agent channel storage could not open through SIFS; device authorization was denied."
+        } else {
+            "Agent channel storage could not open through SIFS."
+        }
+    } else if lower.contains("chat list") {
+        if denied {
+            "Chat list storage could not be read; device authorization was denied."
+        } else {
+            "Chat list storage could not be read through SIFS."
+        }
+    } else if lower.contains("chat save") {
+        if denied {
+            "Chat history could not be saved; device authorization was denied."
+        } else {
+            "Chat history could not be saved through SIFS."
+        }
+    } else if lower.contains("device authorization") {
+        "Device authorization blocked chat storage."
+    } else if lower.contains("daemon") || lower.contains("cluster") {
+        "Chat storage could not reach the cluster service."
+    } else {
+        "Chat storage needs SIFS access."
+    };
+    Some(summary.to_string())
 }
 
 fn transcript_message_display_text(message: &ChatMessage) -> String {
@@ -6808,6 +6855,20 @@ mod tests {
     }
 
     #[test]
+    fn connection_problem_summary_hides_parser_plumbing() {
+        let summary = connection_problem_summary(
+            "chat unavailable: failed to parse command: open agent channel SIFS store failed: device authorization was denied",
+        )
+        .expect("connection summary");
+
+        assert_eq!(
+            summary,
+            "Agent channel storage could not open through SIFS; device authorization was denied."
+        );
+        assert!(!summary.contains("failed to parse command"));
+    }
+
+    #[test]
     fn empty_turn_done_marks_placeholder_as_system_info() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
@@ -7100,6 +7161,40 @@ mod tests {
                 .iter()
                 .any(|entry| entry.title == "agent error" && entry.tone == ActivityTone::Bad)
         );
+    }
+
+    #[test]
+    fn connection_worker_errors_are_activity_not_agent_failures() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+
+        state.apply_event(ChatEvent::Error {
+            session_id: Some(state.session_id.clone()),
+            error: "chat unavailable: failed to parse command: open agent channel SIFS store failed: device authorization was denied".to_string(),
+        });
+
+        assert!(
+            state.activity.iter().any(|entry| {
+                entry.title == "chat connection"
+                    && entry.tone == ActivityTone::Warn
+                    && entry.detail.contains("Agent channel storage")
+                    && !entry.detail.contains("failed to parse command")
+            }),
+            "storage-derived worker errors should read as chat connection recovery"
+        );
+        assert!(
+            state
+                .activity
+                .iter()
+                .all(|entry| entry.title != "agent error"),
+            "connection failures should not be labeled as generic agent failures"
+        );
+        let health = state.runtime_health();
+        assert_eq!(health.label, "DEGRADED");
+        assert_eq!(health.tone, ActivityTone::Warn);
+        assert!(health.detail.contains("chat connection"));
+        assert!(!health.detail.contains("failed to parse command"));
     }
 
     #[test]
