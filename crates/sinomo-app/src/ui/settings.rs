@@ -40,7 +40,7 @@ use crate::backend::config::{
     set_value,
 };
 use crate::rendering::AppRenderMode;
-use crate::state::Shared;
+use crate::state::{Shared, Tab};
 use crate::theme::{AppThemeMode, Palette};
 use crate::ui::widgets;
 
@@ -595,7 +595,13 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
             let app = shared.borrow();
             format!("{} · {}", app.theme_mode.label(), app.render_mode.label())
         }
-        SettingsSection::Connection => shared.settings().mode_label.clone(),
+        SettingsSection::Connection => {
+            if connection_issue_count(shared) > 0 {
+                "Needs attention".to_string()
+            } else {
+                shared.settings().mode_label.clone()
+            }
+        }
         SettingsSection::Node => shared.settings().role.clone(),
         SettingsSection::Cluster => {
             let settings = shared.settings();
@@ -658,6 +664,57 @@ fn value_row(
     FormRow::new(label, muted_label(shared, value))
         .inline()
         .theme_when(clone_reader(reader))
+}
+
+#[derive(Clone)]
+struct ConnectionIssue {
+    title: &'static str,
+    detail: String,
+    tab: Tab,
+    action: &'static str,
+}
+
+fn connection_issues(shared: &Shared) -> Vec<ConnectionIssue> {
+    let app = shared.borrow();
+    let Some(ready) = app.ready.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut issues = Vec::new();
+    if let Some(notice) = ready.chat.notice.as_deref().filter(|text| !text.is_empty()) {
+        issues.push(ConnectionIssue {
+            title: "Chat sessions",
+            detail: notice.to_string(),
+            tab: Tab::Sinomo,
+            action: "Open Chat",
+        });
+    }
+    if let Some(error) = ready.files.error.as_deref().filter(|text| !text.is_empty()) {
+        issues.push(ConnectionIssue {
+            title: "SIFS browser",
+            detail: format!("SIFS unavailable: {error}"),
+            tab: Tab::Files,
+            action: "Open Files",
+        });
+    }
+
+    issues
+}
+
+fn connection_issue_count(shared: &Shared) -> usize {
+    connection_issues(shared).len()
+}
+
+fn connection_issue_key(shared: &Shared) -> String {
+    connection_issues(shared)
+        .into_iter()
+        .map(|issue| format!("{}:{}", issue.title, issue.detail))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn open_tab(shared: &Shared, tab: Tab) {
+    shared.borrow_mut().active_tab = tab;
 }
 
 /// A stacked text field used to present generated values that users may copy.
@@ -875,7 +932,65 @@ fn section_connection(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         .spacing(6.0)
         .with_child(value_row(shared, reader, "Mode", mode_label))
         .with_child(value_row(shared, reader, "Status", status_detail));
-    FormSection::new("Connection", body).theme_when(clone_reader(reader))
+    let connection = FormSection::new("Connection", body).theme_when(clone_reader(reader));
+
+    Stack::vertical()
+        .spacing(12.0)
+        .alignment(Alignment::Stretch)
+        .with_child(connection)
+        .with_child(connection_attention_section(shared, reader))
+}
+
+fn connection_attention_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let issues = connection_issues(shared);
+    let mut body = FieldGroup::new().spacing(8.0);
+    if issues.is_empty() {
+        body.push(value_row(
+            shared,
+            reader,
+            "Status",
+            "No active recovery issues",
+        ));
+    } else {
+        for issue in issues {
+            body.push(connection_issue_row(shared, reader, issue));
+        }
+    }
+
+    let description = if connection_issue_count(shared) == 0 {
+        "User-facing chat and SIFS surfaces are currently reachable.".to_string()
+    } else {
+        "These are visible app-layer issues. Connection to the daemon can still be healthy while a specific surface needs attention.".to_string()
+    };
+    FormSection::new("Attention", body)
+        .description(description)
+        .theme_when(clone_reader(reader))
+}
+
+fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: ConnectionIssue) -> FormRow {
+    let detail = issue.detail.clone();
+    let tab = issue.tab;
+    let action = issue.action;
+    let button = {
+        let s = shared.clone();
+        sui::Button::new(action)
+            .icon(match tab {
+                Tab::Sinomo => sui::IconGlyph::Chat,
+                Tab::Files => sui::IconGlyph::Storage,
+                _ => sui::IconGlyph::Alert,
+            })
+            .theme_when(clone_reader(reader))
+            .on_press(move || open_tab(&s, tab))
+    };
+    let stack = Stack::vertical()
+        .spacing(8.0)
+        .alignment(Alignment::Start)
+        .with_child(muted_label(shared, detail).semantic_name(format!("{} detail", issue.title)))
+        .with_child(button);
+
+    FormRow::new(issue.title, stack)
+        .stacked()
+        .theme_when(clone_reader(reader))
 }
 
 fn section_node(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -2159,6 +2274,8 @@ impl StatusReflector {
 /// `measure` (constraints-driven) and cached so `arrange`/`paint`/event routing all stay in sync.
 pub struct SettingsView {
     shared: Shared,
+    theme_reader: ThemeReader,
+    scroll_state: ScrollState,
     wide: WidgetPod,
     narrow: WidgetPod,
     use_wide: Cell<bool>,
@@ -2167,6 +2284,9 @@ pub struct SettingsView {
     /// `selected` (via a sidebar/menu `ListView`, which requests only a repaint) must trigger a
     /// re-measure+re-arrange for the newly-active child. We diff on `RedrawRequested` to catch it.
     last_selected: Cell<Option<SettingsSection>>,
+    /// The Connection attention card is built from app-layer Chat/Files health snapshots. Those can
+    /// change after startup (Files is loaded lazily), so rebuild the composed pods when they do.
+    last_connection_issue_key: RefCell<String>,
 }
 
 impl SettingsView {
@@ -2180,14 +2300,35 @@ impl SettingsView {
         let wide = wide_pod(&shared, &theme_reader, &scroll_state);
         let narrow = narrow_pod(&shared, &theme_reader, &scroll_state);
         let last_selected = Cell::new(shared.settings().selected);
+        let last_connection_issue_key = RefCell::new(connection_issue_key(&shared));
         Self {
             shared,
+            theme_reader,
+            scroll_state,
             wide,
             narrow,
             // Default to wide before the first measure (matches the old default).
             use_wide: Cell::new(true),
             last_selected,
+            last_connection_issue_key,
         }
+    }
+
+    fn rebuild_pods(&mut self) {
+        self.wide = wide_pod(&self.shared, &self.theme_reader, &self.scroll_state);
+        self.narrow = narrow_pod(&self.shared, &self.theme_reader, &self.scroll_state);
+    }
+
+    fn sync_connection_issues(&mut self) -> bool {
+        let current = connection_issue_key(&self.shared);
+        let mut last = self.last_connection_issue_key.borrow_mut();
+        if current == *last {
+            return false;
+        }
+        *last = current;
+        drop(last);
+        self.rebuild_pods();
+        true
     }
 
     fn active(&self) -> &WidgetPod {
@@ -2229,16 +2370,19 @@ impl Widget for SettingsView {
         // gesture (e.g. an external wake) and relayout (diff-on-redraw, like the widget-book pattern).
         if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
             let current = self.shared.settings().selected;
-            if current != self.last_selected.get() {
+            let issues_changed = self.sync_connection_issues();
+            if current != self.last_selected.get() || issues_changed {
                 self.last_selected.set(current);
                 ctx.request_measure();
                 ctx.request_arrange();
+                ctx.request_semantics();
                 ctx.request_paint();
             }
         }
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.sync_connection_issues();
         let use_wide = constraints.max.width >= WIDE_THRESHOLD;
         self.use_wide.set(use_wide);
         // A measure pass lays out the currently-active child, so the navigation cache is now
@@ -2292,6 +2436,7 @@ pub fn view(shared: Shared) -> impl Widget {
 mod tests {
     use super::*;
     use crate::backend::Backend;
+    use crate::state::{AppState, Shared};
 
     /// A settings state plus the index of a non-boolean (text-editable) config key, or `None`
     /// when this environment has no such keys registered.
@@ -2381,6 +2526,63 @@ mod tests {
         let backend = Backend::local_fallback();
         let state = SettingsState::new(&backend);
         assert!(state.provider_add_api_key.is_empty());
+    }
+
+    #[test]
+    fn connection_preview_surfaces_attention_state() {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        shared.chat_mut().notice =
+            Some("chat list failed: device authorization was denied".to_string());
+
+        assert_eq!(
+            section_preview(&shared, SettingsSection::Connection),
+            "Needs attention"
+        );
+        let issues = connection_issues(&shared);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].title, "Chat sessions");
+
+        shared.files_mut().error = Some("device authorization was denied".to_string());
+        let issues = connection_issues(&shared);
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[1].title, "SIFS browser");
+    }
+
+    #[test]
+    fn connection_attention_action_opens_affected_tab() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            app.ready
+                .as_mut()
+                .expect("ready state")
+                .settings
+                .open(SettingsSection::Connection);
+        }
+        shared.chat_mut().notice =
+            Some("chat list failed: device authorization was denied".to_string());
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings attention")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open Chat")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Sinomo);
+
+        Ok(())
     }
 
     #[test]
