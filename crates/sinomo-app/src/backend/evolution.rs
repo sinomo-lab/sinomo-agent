@@ -123,6 +123,54 @@ pub enum EvolutionStartEvent {
     Finished(Result<(), String>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvolutionDecisionAction {
+    Approve,
+    Reject,
+}
+
+impl EvolutionDecisionAction {
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Reject => "reject",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Approve => "Approve",
+            Self::Reject => "Reject",
+        }
+    }
+
+    pub fn running_label(self) -> &'static str {
+        match self {
+            Self::Approve => "approving candidate",
+            Self::Reject => "rejecting candidate",
+        }
+    }
+
+    pub fn recorded_label(self) -> &'static str {
+        match self {
+            Self::Approve => "approval recorded",
+            Self::Reject => "rejection recorded",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EvolutionDecisionRequest {
+    pub job_id: String,
+    pub action: EvolutionDecisionAction,
+}
+
+#[derive(Clone, Debug)]
+pub enum EvolutionDecisionEvent {
+    Started,
+    Finished(Result<(), String>),
+}
+
 pub fn spawn_evolution_job(request: EvolutionStartRequest) -> Receiver<EvolutionStartEvent> {
     let (tx, rx) = channel();
     let failure_tx = tx.clone();
@@ -136,6 +184,26 @@ pub fn spawn_evolution_job(request: EvolutionStartRequest) -> Receiver<Evolution
     {
         let _ = failure_tx.send(EvolutionStartEvent::Finished(Err(format!(
             "failed to start evolution worker: {error}"
+        ))));
+    }
+    rx
+}
+
+pub fn spawn_evolution_decision(
+    request: EvolutionDecisionRequest,
+) -> Receiver<EvolutionDecisionEvent> {
+    let (tx, rx) = channel();
+    let failure_tx = tx.clone();
+    if let Err(error) = thread::Builder::new()
+        .name("sinomo-app-evolution-decision".to_string())
+        .spawn(move || {
+            let _ = tx.send(EvolutionDecisionEvent::Started);
+            let result = run_evolution_decision(request).map_err(|error| error.to_string());
+            let _ = tx.send(EvolutionDecisionEvent::Finished(result));
+        })
+    {
+        let _ = failure_tx.send(EvolutionDecisionEvent::Finished(Err(format!(
+            "failed to start evolution decision worker: {error}"
         ))));
     }
     rx
@@ -174,6 +242,17 @@ fn run_evolution_job(request: EvolutionStartRequest) -> Result<(), sinomo_evolut
         args.push("--allow".to_string());
         args.push(path);
     }
+    sinomo_evolution::run_evolve_command(&args)
+}
+
+fn run_evolution_decision(
+    request: EvolutionDecisionRequest,
+) -> Result<(), sinomo_evolution::CliError> {
+    let args = vec![
+        request.action.command().to_string(),
+        "--job".to_string(),
+        request.job_id,
+    ];
     sinomo_evolution::run_evolve_command(&args)
 }
 

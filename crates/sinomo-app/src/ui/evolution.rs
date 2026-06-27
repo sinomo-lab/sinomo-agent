@@ -13,8 +13,9 @@ use sui::{
 
 use crate::backend::Backend;
 use crate::backend::evolution::{
-    EvolutionDashboard, EvolutionJobSummary, EvolutionPhase, EvolutionStartEvent,
-    EvolutionStartRequest, load_evolution_dashboard, spawn_evolution_job,
+    EvolutionDashboard, EvolutionDecisionAction, EvolutionDecisionEvent, EvolutionDecisionRequest,
+    EvolutionJobSummary, EvolutionPhase, EvolutionStartEvent, EvolutionStartRequest,
+    load_evolution_dashboard, spawn_evolution_decision, spawn_evolution_job,
 };
 use crate::state::Shared;
 use crate::theme::Palette;
@@ -36,6 +37,8 @@ const RAIL_W: f32 = 318.0;
 const QUEUE_HEADER_H: f32 = 48.0;
 const ROW_H: f32 = 78.0;
 const SECTION_GAP: f32 = 16.0;
+const DECISION_SECTION_H: f32 = 146.0;
+const DECISION_BUTTON_H: f32 = 32.0;
 const OBJECTIVE_PLACEHOLDER: &str = "Describe the improvement or task";
 const SCOPE_PLACEHOLDER: &str = "Optional: crates/sinomo-dfs/**, docs/**";
 
@@ -48,6 +51,10 @@ pub struct EvolutionState {
     pub start_status: Option<String>,
     pub start_error: Option<String>,
     start_rx: Option<Receiver<EvolutionStartEvent>>,
+    pub decision_status: Option<String>,
+    pub decision_error: Option<String>,
+    decision_action: Option<EvolutionDecisionAction>,
+    decision_rx: Option<Receiver<EvolutionDecisionEvent>>,
 }
 
 impl EvolutionState {
@@ -63,6 +70,10 @@ impl EvolutionState {
             start_status: None,
             start_error: None,
             start_rx: None,
+            decision_status: None,
+            decision_error: None,
+            decision_action: None,
+            decision_rx: None,
         }
     }
 
@@ -109,6 +120,14 @@ impl EvolutionState {
 
     pub fn is_starting(&self) -> bool {
         self.start_rx.is_some()
+    }
+
+    pub fn is_deciding(&self) -> bool {
+        self.decision_rx.is_some()
+    }
+
+    pub fn has_pending_worker(&self) -> bool {
+        self.is_starting() || self.is_deciding()
     }
 
     pub fn start(&mut self) {
@@ -166,6 +185,83 @@ impl EvolutionState {
             self.reload_with_selection(backend, true);
         }
         changed
+    }
+
+    pub fn can_decide_selected(&self) -> bool {
+        !self.is_deciding()
+            && self
+                .selected_job()
+                .is_some_and(|job| job.status_key == "awaiting-approval" && job.decision.is_none())
+    }
+
+    pub fn decide_selected(&mut self, action: EvolutionDecisionAction) {
+        if !self.can_decide_selected() {
+            self.decision_error = Some("select a candidate awaiting approval".to_string());
+            return;
+        }
+        let Some((job_id, short_id)) = self
+            .selected_job()
+            .map(|job| (job.id.clone(), job.short_id.clone()))
+        else {
+            self.decision_error = Some("select a candidate awaiting approval".to_string());
+            return;
+        };
+        let request = EvolutionDecisionRequest { job_id, action };
+        self.decision_status = Some(format!("{} {}", action.running_label(), short_id));
+        self.decision_error = None;
+        self.decision_action = Some(action);
+        self.decision_rx = Some(spawn_evolution_decision(request));
+    }
+
+    pub fn pump_decision_events(&mut self, backend: &Backend) -> bool {
+        let events = self
+            .decision_rx
+            .as_ref()
+            .map(|rx| rx.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut changed = false;
+        let mut finished = false;
+        for event in events {
+            match event {
+                EvolutionDecisionEvent::Started => {
+                    changed = true;
+                }
+                EvolutionDecisionEvent::Finished(Ok(())) => {
+                    let label = self
+                        .decision_action
+                        .map(EvolutionDecisionAction::recorded_label)
+                        .unwrap_or("decision recorded");
+                    self.decision_status = Some(label.to_string());
+                    self.decision_error = None;
+                    finished = true;
+                    changed = true;
+                }
+                EvolutionDecisionEvent::Finished(Err(error)) => {
+                    let label = self
+                        .decision_action
+                        .map(EvolutionDecisionAction::label)
+                        .unwrap_or("Decision");
+                    self.decision_status = Some(format!("{label} failed"));
+                    self.decision_error = Some(error);
+                    finished = true;
+                    changed = true;
+                }
+            }
+        }
+        if finished {
+            self.decision_rx = None;
+            self.decision_action = None;
+            self.reload_with_selection(backend, false);
+        }
+        changed
+    }
+
+    pub fn select(&mut self, index: usize) {
+        if self.selected != Some(index) && !self.is_deciding() {
+            self.decision_status = None;
+            self.decision_error = None;
+        }
+        self.selected = Some(index);
     }
 
     pub fn selected_job(&self) -> Option<&EvolutionJobSummary> {
@@ -231,16 +327,55 @@ pub fn view(shared: Shared) -> impl Widget {
 struct EvolutionView {
     shared: Shared,
     start: WidgetPod,
+    approve: WidgetPod,
+    reject: WidgetPod,
     pump_alive: Cell<bool>,
     bounds: Rect,
 }
 
 impl EvolutionView {
     fn new(shared: Shared) -> Self {
+        let reader = theme_reader(&shared);
         let start = WidgetPod::new(StartControls::new(shared.clone()));
+        let approve = {
+            let s = shared.clone();
+            Button::new("Approve")
+                .icon(IconGlyph::Check)
+                .min_height(DECISION_BUTTON_H)
+                .theme_when(clone_reader(&reader))
+                .enabled_when({
+                    let s = s.clone();
+                    move || s.evolution().can_decide_selected()
+                })
+                .on_press_with_ctx(move |ctx| {
+                    s.evolution_mut()
+                        .decide_selected(EvolutionDecisionAction::Approve);
+                    ctx.request_animation_frame();
+                    ctx.request_paint();
+                })
+        };
+        let reject = {
+            let s = shared.clone();
+            Button::new("Reject")
+                .icon(IconGlyph::Close)
+                .min_height(DECISION_BUTTON_H)
+                .theme_when(clone_reader(&reader))
+                .enabled_when({
+                    let s = s.clone();
+                    move || s.evolution().can_decide_selected()
+                })
+                .on_press_with_ctx(move |ctx| {
+                    s.evolution_mut()
+                        .decide_selected(EvolutionDecisionAction::Reject);
+                    ctx.request_animation_frame();
+                    ctx.request_paint();
+                })
+        };
         Self {
             shared,
             start,
+            approve: WidgetPod::new(approve),
+            reject: WidgetPod::new(reject),
             pump_alive: Cell::new(false),
             bounds: Rect::ZERO,
         }
@@ -264,11 +399,16 @@ impl EvolutionView {
         let Some(backend) = ready_backend(&self.shared) else {
             return;
         };
-        let changed = self.shared.evolution_mut().pump_start_events(&backend);
+        let changed = {
+            let mut evolution = self.shared.evolution_mut();
+            let start_changed = evolution.pump_start_events(&backend);
+            let decision_changed = evolution.pump_decision_events(&backend);
+            start_changed || decision_changed
+        };
         if changed {
             ctx.request_paint();
         }
-        if self.shared.evolution().is_starting() {
+        if self.shared.evolution().has_pending_worker() {
             ctx.request_animation_frame();
             self.pump_alive.set(true);
         }
@@ -500,12 +640,12 @@ impl Widget for EvolutionView {
                     let index = ((pointer.position.y - row_start) / ROW_H).floor() as isize;
                     let job_count = self.shared.evolution().dashboard.jobs.len();
                     if index >= 0 && (index as usize) < job_count {
-                        self.shared.evolution_mut().selected = Some(index as usize);
+                        self.shared.evolution_mut().select(index as usize);
                         ctx.request_paint();
                         ctx.set_handled();
                     }
                 }
-                if self.shared.evolution().is_starting() {
+                if self.shared.evolution().has_pending_worker() {
                     self.ensure_pump(ctx);
                 }
             }
@@ -525,6 +665,15 @@ impl Widget for EvolutionView {
         ));
         self.start
             .measure(ctx, Constraints::tight(rect_size(layout.start_controls)));
+        if let Some((approve, reject)) = layout.rail.and_then(decision_button_layout) {
+            self.approve
+                .measure(ctx, Constraints::tight(rect_size(approve)));
+            self.reject
+                .measure(ctx, Constraints::tight(rect_size(reject)));
+        } else {
+            self.approve.measure(ctx, Constraints::tight(Size::ZERO));
+            self.reject.measure(ctx, Constraints::tight(Size::ZERO));
+        }
         constraints.max
     }
 
@@ -532,6 +681,13 @@ impl Widget for EvolutionView {
         self.bounds = bounds;
         let layout = layout_for(bounds);
         self.start.arrange(ctx, layout.start_controls);
+        if let Some((approve, reject)) = layout.rail.and_then(decision_button_layout) {
+            self.approve.arrange(ctx, approve);
+            self.reject.arrange(ctx, reject);
+        } else {
+            self.approve.arrange(ctx, Rect::ZERO);
+            self.reject.arrange(ctx, Rect::ZERO);
+        }
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
@@ -559,7 +715,19 @@ impl Widget for EvolutionView {
         paint_queue(ctx, &theme, &pal, layout.queue, &dashboard, selected);
         paint_detail(ctx, &theme, &pal, layout.detail, selected_job);
         if let Some(rail) = layout.rail {
-            paint_rail(ctx, &theme, &pal, rail, selected_job);
+            let action = {
+                let state = self.shared.evolution();
+                DecisionActionStatus {
+                    status: state.decision_status.clone(),
+                    error: state.decision_error.clone(),
+                    deciding: state.is_deciding(),
+                }
+            };
+            paint_rail(ctx, &theme, &pal, rail, selected_job, &action);
+            if selected_job.is_some() {
+                self.approve.paint(ctx);
+                self.reject.paint(ctx);
+            }
         }
     }
 
@@ -572,14 +740,20 @@ impl Widget for EvolutionView {
         node.name = Some("Evolution dashboard".to_string());
         ctx.push(node);
         self.start.semantics(ctx);
+        self.approve.semantics(ctx);
+        self.reject.semantics(ctx);
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         visitor.visit(&self.start);
+        visitor.visit(&self.approve);
+        visitor.visit(&self.reject);
     }
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
         visitor.visit(&mut self.start);
+        visitor.visit(&mut self.approve);
+        visitor.visit(&mut self.reject);
     }
 }
 
@@ -591,6 +765,13 @@ struct EvolutionLayout {
     queue: Rect,
     detail: Rect,
     rail: Option<Rect>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DecisionActionStatus {
+    status: Option<String>,
+    error: Option<String>,
+    deciding: bool,
 }
 
 fn layout_for(bounds: Rect) -> EvolutionLayout {
@@ -640,6 +821,24 @@ fn layout_for(bounds: Rect) -> EvolutionLayout {
             rail: None,
         }
     }
+}
+
+fn decision_button_layout(rail: Rect) -> Option<(Rect, Rect)> {
+    if rail.width() <= PAD * 2.0 {
+        return None;
+    }
+    let inner = rail.inflate(-PAD, -PAD);
+    let section = Rect::new(
+        inner.x(),
+        inner.y() + 38.0,
+        inner.width(),
+        DECISION_SECTION_H,
+    );
+    let button_y = section.max_y() - 12.0 - DECISION_BUTTON_H;
+    let button_w = ((section.width() - 24.0 - 8.0) / 2.0).max(0.0);
+    let approve = Rect::new(section.x() + 12.0, button_y, button_w, DECISION_BUTTON_H);
+    let reject = Rect::new(approve.max_x() + 8.0, button_y, button_w, DECISION_BUTTON_H);
+    Some((approve, reject))
 }
 
 fn start_height_for(width: f32) -> f32 {
@@ -1363,6 +1562,7 @@ fn paint_rail(
     pal: &Palette,
     rect: Rect,
     job: Option<&EvolutionJobSummary>,
+    action: &DecisionActionStatus,
 ) {
     ctx.fill_rect(rect, pal.sidebar);
     widgets::hairline_left(ctx, rect, pal.border);
@@ -1391,20 +1591,20 @@ fn paint_rail(
     };
 
     let mut y = inner.y() + 38.0;
-    y = paint_rail_section(
+    y = paint_decision_action_section(
         ctx,
         theme,
         pal,
-        Rect::new(inner.x(), y, inner.width(), 116.0),
-        "Decision",
-        &decision_rows(job),
+        Rect::new(inner.x(), y, inner.width(), DECISION_SECTION_H),
+        job,
+        action,
     );
     y += SECTION_GAP;
     y = paint_rail_section(
         ctx,
         theme,
         pal,
-        Rect::new(inner.x(), y, inner.width(), 120.0),
+        Rect::new(inner.x(), y, inner.width(), 112.0),
         "Rollback",
         &rollback_rows(job),
     );
@@ -1413,10 +1613,60 @@ fn paint_rail(
         ctx,
         theme,
         pal,
-        Rect::new(inner.x(), y, inner.width(), 196.0),
+        Rect::new(inner.x(), y, inner.width(), 172.0),
         "Artifacts",
         &artifact_rows(job),
     );
+}
+
+fn paint_decision_action_section(
+    ctx: &mut PaintCtx,
+    theme: &sui::DefaultTheme,
+    pal: &Palette,
+    rect: Rect,
+    job: &EvolutionJobSummary,
+    action: &DecisionActionStatus,
+) -> f32 {
+    widgets::round_panel(ctx, rect, pal.panel, pal.border, 8.0);
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(rect.x() + 12.0, rect.y() + 10.0, rect.width() - 24.0, 20.0),
+        "Operator decision",
+        pal.text_style(theme, 12.5, FontWeight::SEMIBOLD, pal.text),
+    );
+    let mut y = rect.y() + 36.0;
+    for (label, value) in decision_action_rows(job, action).iter().take(3) {
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(rect.x() + 12.0, y, 78.0, 18.0),
+            label,
+            pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text_faint),
+        );
+        let color = if label == "State" && action.error.is_some() {
+            pal.bad
+        } else if label == "State" && action.deciding {
+            pal.accent
+        } else {
+            pal.text
+        };
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(rect.x() + 90.0, y, rect.width() - 102.0, 18.0),
+            &compact(value, ((rect.width() - 102.0) / 6.6).max(14.0) as usize),
+            pal.text_style(theme, 10.8, FontWeight::NORMAL, color),
+        );
+        y += 21.0;
+    }
+    ctx.fill_rect(
+        Rect::new(
+            rect.x() + 12.0,
+            rect.max_y() - DECISION_BUTTON_H - 18.0,
+            rect.width() - 24.0,
+            1.0,
+        ),
+        pal.border.with_alpha(0.56),
+    );
+    rect.max_y()
 }
 
 fn paint_rail_section(
@@ -1505,12 +1755,26 @@ fn scope_rows(job: &EvolutionJobSummary) -> Vec<(String, String)> {
     ]
 }
 
-fn decision_rows(job: &EvolutionJobSummary) -> Vec<(String, String)> {
-    match &job.decision {
-        Some(decision) => vec![
+fn decision_action_rows(
+    job: &EvolutionJobSummary,
+    action: &DecisionActionStatus,
+) -> Vec<(String, String)> {
+    let state = if let Some(error) = &action.error {
+        format!("failed - {}", compact(error, 64))
+    } else if let Some(status) = &action.status {
+        status.clone()
+    } else if job.decision.is_some() {
+        "decision already recorded".to_string()
+    } else if job.status_key == "awaiting-approval" {
+        "ready for operator review".to_string()
+    } else {
+        "no decision pending".to_string()
+    };
+
+    if let Some(decision) = &job.decision {
+        return vec![
+            ("State".to_string(), state),
             ("Outcome".to_string(), decision.outcome.clone()),
-            ("By".to_string(), decision.decided_by.clone()),
-            ("At".to_string(), decision.decided_at.clone()),
             (
                 "Preflight".to_string(),
                 decision
@@ -1518,27 +1782,20 @@ fn decision_rows(job: &EvolutionJobSummary) -> Vec<(String, String)> {
                     .map(|passed| if passed { "passed" } else { "failed" }.to_string())
                     .unwrap_or_else(|| "not recorded".to_string()),
             ),
-            ("Note".to_string(), decision.note.clone()),
-        ],
-        None => vec![
-            ("Status".to_string(), job.status_label.clone()),
-            (
-                "Decision".to_string(),
-                if job.status_key == "awaiting-approval" {
-                    "waiting for operator review".to_string()
-                } else {
-                    "not requested yet".to_string()
-                },
-            ),
-            (
-                "Preflight".to_string(),
-                job.scorecard_path
-                    .as_ref()
-                    .map(|_| "scorecard available".to_string())
-                    .unwrap_or_else(|| "scorecard missing".to_string()),
-            ),
-        ],
+        ];
     }
+
+    vec![
+        ("State".to_string(), state),
+        ("Candidate".to_string(), job.short_id.clone()),
+        (
+            "Evidence".to_string(),
+            job.scorecard_path
+                .as_ref()
+                .map(|_| "scorecard available".to_string())
+                .unwrap_or_else(|| "scorecard missing".to_string()),
+        ),
+    ]
 }
 
 fn rollback_rows(job: &EvolutionJobSummary) -> Vec<(String, String)> {
