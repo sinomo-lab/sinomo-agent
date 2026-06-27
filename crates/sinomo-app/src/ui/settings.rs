@@ -1707,8 +1707,28 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
 }
 
 fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let version = shared.settings().version.clone();
-    let body = FieldGroup::new()
+    let (version, mode_label, status_detail, node_id, role, cluster_summary) = {
+        let settings = shared.settings();
+        (
+            settings.version.clone(),
+            settings.mode_label.clone(),
+            short_one_line(&settings.status_detail, 96),
+            short(&settings.node_id, 38),
+            settings.role.clone(),
+            settings
+                .cluster_summary
+                .clone()
+                .map(|summary| short_one_line(&summary, 96))
+                .unwrap_or_else(|| {
+                    if settings.clustered {
+                        "cluster status unavailable".to_string()
+                    } else {
+                        "not clustered".to_string()
+                    }
+                }),
+        )
+    };
+    let build = FieldGroup::new()
         .spacing(6.0)
         .with_child(value_row(
             shared,
@@ -1717,7 +1737,26 @@ fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             format!("v{version}"),
         ))
         .with_child(value_row(shared, reader, "Toolkit", "SUI"));
-    FormSection::new("About", body).theme_when(clone_reader(reader))
+    let runtime = FieldGroup::new()
+        .spacing(6.0)
+        .with_child(value_row(shared, reader, "Mode", mode_label))
+        .with_child(value_row(shared, reader, "Status", status_detail))
+        .with_child(value_row(shared, reader, "Node", node_id))
+        .with_child(value_row(shared, reader, "Role", role))
+        .with_child(value_row(shared, reader, "Cluster", cluster_summary));
+    Stack::vertical()
+        .spacing(14.0)
+        .alignment(Alignment::Stretch)
+        .with_child(
+            FormSection::new("About", build)
+                .description("Build information for this desktop app.")
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormSection::new("Runtime", runtime)
+                .description("Current connection and node identity for support and diagnostics.")
+                .theme_when(clone_reader(reader)),
+        )
 }
 
 /// One provider's card: summary rows first, low-level credential and management controls behind a
@@ -3708,6 +3747,50 @@ mod tests {
                 >= 1,
             "API-key provider add form should explain why the primary action starts disabled"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn about_settings_show_runtime_identity() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            settings.open(SettingsSection::About);
+            settings.mode_label = "Cluster".to_string();
+            settings.status_detail = "Connected to daemon at 127.0.0.1:21353".to_string();
+            settings.node_id = "node_about_test".to_string();
+            settings.role = "voter".to_string();
+            settings.clustered = true;
+            settings.cluster_summary = Some("cluster test · voter".to_string());
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings about runtime")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert!(
+            window.get_by_text("Runtime").count()? >= 1,
+            "About should include a runtime identity section"
+        );
+        assert!(window.get_by_text("Cluster").count()? >= 1);
+        assert!(
+            window
+                .get_by_text("Connected to daemon at 127.0.0.1:21353")
+                .count()?
+                >= 1
+        );
+        assert!(window.get_by_text("node_about_test").count()? >= 1);
+        assert!(window.get_by_text("cluster test · voter").count()? >= 1);
 
         Ok(())
     }
