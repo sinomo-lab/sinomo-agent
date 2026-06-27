@@ -881,14 +881,41 @@ fn connection_issue_summary(issue: &ConnectionIssue) -> &'static str {
 
 fn connection_issue_recovery_hint(issue: &ConnectionIssue) -> &'static str {
     match issue.tab {
-        Tab::Sinomo => "Return to chat after credentials or SIFS access is fixed.",
+        Tab::Sinomo if connection_issue_has_sifs_recovery(issue) => {
+            "Check SIFS if storage is denied, then return to chat."
+        }
+        Tab::Sinomo => "Return to chat after credentials are fixed.",
         Tab::Files => "Return to Files after credentials or SIFS access is fixed.",
         _ => "Return to the affected surface after the issue is fixed.",
     }
 }
 
+fn connection_issue_has_sifs_recovery(issue: &ConnectionIssue) -> bool {
+    if issue.tab != Tab::Sinomo {
+        return false;
+    }
+    let lower = issue.detail.to_ascii_lowercase();
+    [
+        "sifs",
+        "dfs",
+        "session store",
+        "channel store",
+        "device authorization",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 fn open_tab(shared: &Shared, tab: Tab) {
     shared.borrow_mut().active_tab = tab;
+}
+
+fn tab_action_icon(tab: Tab) -> sui::IconGlyph {
+    match tab {
+        Tab::Sinomo => sui::IconGlyph::Chat,
+        Tab::Files => sui::IconGlyph::Storage,
+        _ => sui::IconGlyph::Alert,
+    }
 }
 
 /// A stacked text field used to present generated values that users may copy.
@@ -1195,14 +1222,17 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
     let button = {
         let s = shared.clone();
         sui::Button::new(action)
-            .icon(match tab {
-                Tab::Sinomo => sui::IconGlyph::Chat,
-                Tab::Files => sui::IconGlyph::Storage,
-                _ => sui::IconGlyph::Alert,
-            })
+            .icon(tab_action_icon(tab))
             .theme_when(clone_reader(reader))
             .on_press(move || open_tab(&s, tab))
     };
+    let sifs_button = connection_issue_has_sifs_recovery(&issue).then(|| {
+        let s = shared.clone();
+        sui::Button::new("Check SIFS")
+            .icon(tab_action_icon(Tab::Files))
+            .theme_when(clone_reader(reader))
+            .on_press(move || open_tab(&s, Tab::Files))
+    });
     let detail_button = {
         let s = shared.clone();
         sui::Button::new(if expanded {
@@ -1223,11 +1253,14 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
         .alignment(Alignment::Stretch)
         .with_child(status)
         .with_child(summary);
-    let controls = Stack::horizontal()
+    let mut controls = Stack::horizontal()
         .spacing(8.0)
         .alignment(Alignment::Start)
-        .with_child(button)
-        .with_child(detail_button);
+        .with_child(button);
+    if let Some(sifs_button) = sifs_button {
+        controls = controls.with_child(sifs_button);
+    }
+    controls = controls.with_child(detail_button);
     let action_row = Stack::vertical()
         .spacing(5.0)
         .alignment(Alignment::Start)
@@ -3318,6 +3351,11 @@ mod tests {
         assert_eq!(issues.len(), 2);
         assert_eq!(issues[0].title, "Chat sessions");
         assert!(issues[0].detail.contains("SIFS store failed"));
+        assert!(connection_issue_has_sifs_recovery(&issues[0]));
+        assert_eq!(
+            connection_issue_recovery_hint(&issues[0]),
+            "Check SIFS if storage is denied, then return to chat."
+        );
     }
 
     #[test]
@@ -3352,6 +3390,45 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Sinomo);
+
+        Ok(())
+    }
+
+    #[test]
+    fn connection_attention_sifs_action_opens_files_tab() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            app.ready
+                .as_mut()
+                .expect("ready state")
+                .settings
+                .open(SettingsSection::Connection);
+        }
+        shared.chat_mut().activity.push(ChatActivityEntry {
+            title: "agent error".to_string(),
+            detail: "chat unavailable: failed to parse command: open agent channel SIFS store failed: device authorization was denied".to_string(),
+            tone: ActivityTone::Bad,
+        });
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings SIFS attention")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Check SIFS")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Files);
 
         Ok(())
     }
