@@ -341,19 +341,13 @@ fn paint_vertices(
             (Some(ClusterSelection::LanSegment(id)), GraphVertexKind::LanSegment)
                 if id == &vertex.vertex.id
         );
-        let fill = match vertex.vertex.kind {
-            GraphVertexKind::Node if vertex.vertex.public_reachable => {
-                Color::srgba(0.14, 0.52, 0.92, 1.0)
-            }
-            GraphVertexKind::Node if vertex.vertex.availability == "online" => pal.good,
-            GraphVertexKind::Node if vertex.vertex.availability == "offline" => pal.bad,
-            GraphVertexKind::Node => pal.field,
-            GraphVertexKind::LanSegment => Color::srgba(0.52, 0.45, 0.16, 1.0),
-        };
+        let fill = vertex_fill(pal, &vertex.vertex);
         let border = if selected_here {
-            pal.on_accent
+            pal.accent
         } else if vertex.vertex.kind == GraphVertexKind::LanSegment {
             pal.warn
+        } else if vertex.vertex.availability == "unknown" {
+            pal.border_strong
         } else {
             pal.border
         };
@@ -393,8 +387,10 @@ fn paint_legend(ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette, bo
     let style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_faint);
     let items = [
         (pal.good, "online"),
-        (Color::srgba(0.14, 0.52, 0.92, 1.0), "public"),
-        (pal.warn, "LAN"),
+        (public_node_color(), "public"),
+        (pal.bad, "offline"),
+        (unknown_node_color(pal), "unknown"),
+        (lan_segment_color(), "LAN"),
     ];
     let mut cursor = x;
     for (color, label) in items {
@@ -405,7 +401,36 @@ fn paint_legend(ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette, bo
             label,
             style.clone(),
         );
-        cursor += 86.0;
+        cursor += 92.0;
+    }
+}
+
+fn vertex_fill(pal: &Palette, vertex: &GraphVertex) -> Color {
+    match vertex.kind {
+        GraphVertexKind::LanSegment => lan_segment_color(),
+        GraphVertexKind::Node if vertex.public_reachable => public_node_color(),
+        GraphVertexKind::Node => match vertex.availability.as_str() {
+            "online" => pal.good,
+            "offline" => pal.bad,
+            "degraded" => pal.warn,
+            _ => unknown_node_color(pal),
+        },
+    }
+}
+
+fn public_node_color() -> Color {
+    Color::srgba(0.14, 0.52, 0.92, 1.0)
+}
+
+fn lan_segment_color() -> Color {
+    Color::srgba(0.58, 0.41, 0.10, 1.0)
+}
+
+fn unknown_node_color(pal: &Palette) -> Color {
+    if pal.dark {
+        Color::srgba(0.28, 0.34, 0.42, 1.0)
+    } else {
+        Color::srgba(0.78, 0.84, 0.91, 1.0)
     }
 }
 
@@ -987,6 +1012,7 @@ fn short(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::{AppThemeMode, resolve_theme};
 
     fn node(id: &str) -> ClusterNodeInfo {
         ClusterNodeInfo {
@@ -1114,6 +1140,23 @@ mod tests {
         assert!(lines.iter().any(|line| line == "public: 1 reachable"));
         assert!(lines.iter().any(|line| line == "topology: 1 edges"));
         assert!(lines.iter().any(|line| line.starts_with("hint: Select")));
+    }
+
+    #[test]
+    fn unknown_nodes_use_visible_neutral_graph_fill() {
+        let mut unknown = node("node-unknown");
+        unknown.availability = "unknown".to_string();
+        let snapshot = ClusterSnapshot {
+            nodes: vec![unknown],
+            ..ClusterSnapshot::default()
+        };
+        let topology = build_topology(&snapshot);
+        let theme = resolve_theme(AppThemeMode::Light);
+        let pal = Palette::from_theme(&theme, false);
+        let fill = vertex_fill(&pal, &topology.vertices[0]);
+
+        assert_eq!(fill, unknown_node_color(&pal));
+        assert_ne!(fill, pal.field);
     }
 
     #[test]
