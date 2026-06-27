@@ -25,12 +25,16 @@ const HEADER_H: f32 = 78.0;
 const PAD: f32 = 20.0;
 const GAP: f32 = 14.0;
 const START_WIDE_H: f32 = 124.0;
-const START_NARROW_H: f32 = 206.0;
+const START_NARROW_COLLAPSED_H: f32 = 206.0;
+const START_NARROW_EXPANDED_H: f32 = 270.0;
 const START_BREAKPOINT: f32 = 760.0;
 const CONTROL_LABEL_H: f32 = 14.0;
 const CONTROL_LABEL_GAP: f32 = 5.0;
 const CONTROL_H: f32 = 38.0;
 const CONTROL_GAP: f32 = 8.0;
+const START_OPTIONS_W: f32 = 112.0;
+const START_BUTTON_W: f32 = 112.0;
+const START_TARGET_W: f32 = 138.0;
 const TRUNCATION_MARKER: &str = "...";
 const QUEUE_W: f32 = 306.0;
 const RAIL_W: f32 = 318.0;
@@ -48,6 +52,7 @@ pub struct EvolutionState {
     pub objective_draft: String,
     pub scope_draft: String,
     pub target_ring_index: usize,
+    pub start_advanced_open: bool,
     pub start_status: Option<String>,
     pub start_error: Option<String>,
     start_rx: Option<Receiver<EvolutionStartEvent>>,
@@ -67,6 +72,7 @@ impl EvolutionState {
             objective_draft: String::new(),
             scope_draft: String::new(),
             target_ring_index: 1,
+            start_advanced_open: false,
             start_status: None,
             start_error: None,
             start_rx: None,
@@ -112,6 +118,10 @@ impl EvolutionState {
 
     pub fn set_target_ring_index(&mut self, index: usize) {
         self.target_ring_index = index.min(EVOLUTION_TARGET_RINGS.len().saturating_sub(1));
+    }
+
+    pub fn toggle_start_advanced(&mut self) {
+        self.start_advanced_open = !self.start_advanced_open;
     }
 
     pub fn can_start(&self) -> bool {
@@ -418,16 +428,20 @@ impl EvolutionView {
 #[derive(Clone, Copy)]
 struct StartControlsLayout {
     objective_label: Rect,
+    options_label: Rect,
     scope_label: Rect,
     target_label: Rect,
     objective: Rect,
+    options: Rect,
     scope: Rect,
     target: Rect,
     start: Rect,
 }
 
 struct StartControls {
+    shared: Shared,
     objective: WidgetPod,
+    options: WidgetPod,
     scope: WidgetPod,
     target: WidgetPod,
     start: WidgetPod,
@@ -445,6 +459,19 @@ impl StartControls {
                 .theme_when(clone_reader(&reader))
                 .on_change(move |value| {
                     s.evolution_mut().set_objective_draft(value);
+                })
+        };
+
+        let options = {
+            let s = shared.clone();
+            Button::new("Options")
+                .icon(IconGlyph::ChevronDown)
+                .theme_when(clone_reader(&reader))
+                .on_press_with_ctx(move |ctx| {
+                    s.evolution_mut().toggle_start_advanced();
+                    ctx.request_measure();
+                    ctx.request_arrange();
+                    ctx.request_paint();
                 })
         };
 
@@ -493,7 +520,9 @@ impl StartControls {
         };
 
         Self {
+            shared,
             objective: WidgetPod::new(objective),
+            options: WidgetPod::new(options),
             scope: WidgetPod::new(scope),
             target: WidgetPod::new(target),
             start: WidgetPod::new(start),
@@ -504,42 +533,66 @@ impl StartControls {
 impl Widget for StartControls {
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         let bounds = Rect::new(0.0, 0.0, constraints.max.width, constraints.max.height);
-        let layout = start_controls_layout(bounds);
+        let advanced_open = self.shared.evolution().start_advanced_open;
+        let layout = start_controls_layout(bounds, advanced_open);
         self.objective
             .measure(ctx, Constraints::tight(rect_size(layout.objective)));
-        self.scope
-            .measure(ctx, Constraints::tight(rect_size(layout.scope)));
-        self.target
-            .measure(ctx, Constraints::tight(rect_size(layout.target)));
+        self.options
+            .measure(ctx, Constraints::tight(rect_size(layout.options)));
+        if advanced_open {
+            self.scope
+                .measure(ctx, Constraints::tight(rect_size(layout.scope)));
+            self.target
+                .measure(ctx, Constraints::tight(rect_size(layout.target)));
+        } else {
+            self.scope.measure(ctx, Constraints::tight(Size::ZERO));
+            self.target.measure(ctx, Constraints::tight(Size::ZERO));
+        }
         self.start
             .measure(ctx, Constraints::tight(rect_size(layout.start)));
         constraints.max
     }
 
     fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        let layout = start_controls_layout(bounds);
+        let advanced_open = self.shared.evolution().start_advanced_open;
+        let layout = start_controls_layout(bounds, advanced_open);
         self.objective.arrange(ctx, layout.objective);
-        self.scope.arrange(ctx, layout.scope);
-        self.target.arrange(ctx, layout.target);
+        self.options.arrange(ctx, layout.options);
+        if advanced_open {
+            self.scope.arrange(ctx, layout.scope);
+            self.target.arrange(ctx, layout.target);
+        } else {
+            self.scope.arrange(ctx, Rect::ZERO);
+            self.target.arrange(ctx, Rect::ZERO);
+        }
         self.start.arrange(ctx, layout.start);
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
+        let advanced_open = self.shared.evolution().start_advanced_open;
         self.objective.paint(ctx);
-        self.scope.paint(ctx);
-        self.target.paint(ctx);
+        self.options.paint(ctx);
+        if advanced_open {
+            self.scope.paint(ctx);
+            self.target.paint(ctx);
+        }
         self.start.paint(ctx);
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let advanced_open = self.shared.evolution().start_advanced_open;
         self.objective.semantics(ctx);
-        self.scope.semantics(ctx);
-        self.target.semantics(ctx);
+        self.options.semantics(ctx);
+        if advanced_open {
+            self.scope.semantics(ctx);
+            self.target.semantics(ctx);
+        }
         self.start.semantics(ctx);
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         visitor.visit(&self.objective);
+        visitor.visit(&self.options);
         visitor.visit(&self.scope);
         visitor.visit(&self.target);
         visitor.visit(&self.start);
@@ -547,36 +600,65 @@ impl Widget for StartControls {
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
         visitor.visit(&mut self.objective);
+        visitor.visit(&mut self.options);
         visitor.visit(&mut self.scope);
         visitor.visit(&mut self.target);
         visitor.visit(&mut self.start);
     }
 }
 
-fn start_controls_layout(bounds: Rect) -> StartControlsLayout {
+fn start_controls_layout(bounds: Rect, advanced_open: bool) -> StartControlsLayout {
     let block_h = control_block_height();
     if bounds.width() >= START_BREAKPOINT {
-        let button_w = 112.0;
-        let target_w = 138.0;
-        let fixed_w = button_w + target_w + CONTROL_GAP * 3.0;
+        let fixed_w = if advanced_open {
+            START_OPTIONS_W + START_BUTTON_W + START_TARGET_W + CONTROL_GAP * 4.0
+        } else {
+            START_OPTIONS_W + START_BUTTON_W + CONTROL_GAP * 2.0
+        };
         let flexible_w = (bounds.width() - fixed_w).max(0.0);
-        let objective_w = flexible_w * 0.58;
-        let scope_w = flexible_w - objective_w;
         let label_y = bounds.y() + (bounds.height() - block_h).max(0.0) / 2.0;
         let y = label_y + CONTROL_LABEL_H + CONTROL_LABEL_GAP;
         let mut x = bounds.x();
+        let (objective_w, scope_w) = if advanced_open {
+            let objective_w = flexible_w * 0.56;
+            (objective_w, flexible_w - objective_w)
+        } else {
+            (flexible_w, 0.0)
+        };
         let objective = Rect::new(x, y, objective_w, CONTROL_H);
         x = objective.max_x() + CONTROL_GAP;
-        let scope = Rect::new(x, y, scope_w, CONTROL_H);
-        x = scope.max_x() + CONTROL_GAP;
-        let target = Rect::new(x, y, target_w, CONTROL_H);
-        x = target.max_x() + CONTROL_GAP;
-        let start = Rect::new(x, y, button_w, CONTROL_H);
+        let scope = if advanced_open {
+            let rect = Rect::new(x, y, scope_w, CONTROL_H);
+            x = rect.max_x() + CONTROL_GAP;
+            rect
+        } else {
+            Rect::ZERO
+        };
+        let target = if advanced_open {
+            let rect = Rect::new(x, y, START_TARGET_W, CONTROL_H);
+            x = rect.max_x() + CONTROL_GAP;
+            rect
+        } else {
+            Rect::ZERO
+        };
+        let options = Rect::new(x, y, START_OPTIONS_W, CONTROL_H);
+        x = options.max_x() + CONTROL_GAP;
+        let start = Rect::new(x, y, START_BUTTON_W, CONTROL_H);
         StartControlsLayout {
             objective_label: label_rect(objective, label_y),
-            scope_label: label_rect(scope, label_y),
-            target_label: label_rect(target, label_y),
+            options_label: label_rect(options, label_y),
+            scope_label: if advanced_open {
+                label_rect(scope, label_y)
+            } else {
+                Rect::ZERO
+            },
+            target_label: if advanced_open {
+                label_rect(target, label_y)
+            } else {
+                Rect::ZERO
+            },
             objective,
+            options,
             scope,
             target,
             start,
@@ -586,23 +668,46 @@ fn start_controls_layout(bounds: Rect) -> StartControlsLayout {
         let row1_y = label_y + CONTROL_LABEL_H + CONTROL_LABEL_GAP;
         let row2_label_y = row1_y + CONTROL_H + CONTROL_GAP;
         let row2_y = row2_label_y + CONTROL_LABEL_H + CONTROL_LABEL_GAP;
-        let button_w = bounds.width().min(104.0);
-        let target_w = (bounds.width() - button_w - CONTROL_GAP)
-            .max(0.0)
-            .min(138.0);
-        let scope_w = (bounds.width() - button_w - target_w - CONTROL_GAP * 2.0).max(0.0);
         let objective = Rect::new(bounds.x(), row1_y, bounds.width(), CONTROL_H);
-        let scope = Rect::new(bounds.x(), row2_y, scope_w, CONTROL_H);
-        let target = Rect::new(scope.max_x() + CONTROL_GAP, row2_y, target_w, CONTROL_H);
-        let start = Rect::new(target.max_x() + CONTROL_GAP, row2_y, button_w, CONTROL_H);
-        StartControlsLayout {
-            objective_label: label_rect(objective, label_y),
-            scope_label: label_rect(scope, row2_label_y),
-            target_label: label_rect(target, row2_label_y),
-            objective,
-            scope,
-            target,
-            start,
+        if advanced_open {
+            let row3_label_y = row2_y + CONTROL_H + CONTROL_GAP;
+            let row3_y = row3_label_y + CONTROL_LABEL_H + CONTROL_LABEL_GAP;
+            let target_w = bounds.width().min(START_TARGET_W);
+            let options_w = bounds.width().min(START_OPTIONS_W);
+            let start_w = bounds.width().min(START_BUTTON_W);
+            let scope = Rect::new(bounds.x(), row2_y, bounds.width(), CONTROL_H);
+            let target = Rect::new(bounds.x(), row3_y, target_w, CONTROL_H);
+            let options = Rect::new(target.max_x() + CONTROL_GAP, row3_y, options_w, CONTROL_H);
+            let start_x = (bounds.max_x() - start_w).max(options.max_x() + CONTROL_GAP);
+            let start = Rect::new(start_x, row3_y, start_w, CONTROL_H);
+            StartControlsLayout {
+                objective_label: label_rect(objective, label_y),
+                options_label: label_rect(options, row3_label_y),
+                scope_label: label_rect(scope, row2_label_y),
+                target_label: label_rect(target, row3_label_y),
+                objective,
+                options,
+                scope,
+                target,
+                start,
+            }
+        } else {
+            let options_w = bounds.width().min(START_OPTIONS_W);
+            let start_w = bounds.width().min(START_BUTTON_W);
+            let options = Rect::new(bounds.x(), row2_y, options_w, CONTROL_H);
+            let start_x = (bounds.max_x() - start_w).max(options.max_x() + CONTROL_GAP);
+            let start = Rect::new(start_x, row2_y, start_w, CONTROL_H);
+            StartControlsLayout {
+                objective_label: label_rect(objective, label_y),
+                options_label: label_rect(options, row2_label_y),
+                scope_label: Rect::ZERO,
+                target_label: Rect::ZERO,
+                objective,
+                options,
+                scope: Rect::ZERO,
+                target: Rect::ZERO,
+                start,
+            }
         }
     }
 }
@@ -634,7 +739,8 @@ impl Widget for EvolutionView {
                     && pointer.button == Some(PointerButton::Primary)
                     && ctx.bounds().contains(pointer.position) =>
             {
-                let layout = layout_for(ctx.bounds());
+                let advanced_open = self.shared.evolution().start_advanced_open;
+                let layout = layout_for(ctx.bounds(), advanced_open);
                 if layout.queue.contains(pointer.position) {
                     let row_start = layout.queue.y() + QUEUE_HEADER_H;
                     let index = ((pointer.position.y - row_start) / ROW_H).floor() as isize;
@@ -657,12 +763,11 @@ impl Widget for EvolutionView {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let layout = layout_for(Rect::new(
-            0.0,
-            0.0,
-            constraints.max.width,
-            constraints.max.height,
-        ));
+        let advanced_open = self.shared.evolution().start_advanced_open;
+        let layout = layout_for(
+            Rect::new(0.0, 0.0, constraints.max.width, constraints.max.height),
+            advanced_open,
+        );
         self.start
             .measure(ctx, Constraints::tight(rect_size(layout.start_controls)));
         if let Some((approve, reject)) = layout.rail.and_then(decision_button_layout) {
@@ -679,7 +784,8 @@ impl Widget for EvolutionView {
 
     fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
         self.bounds = bounds;
-        let layout = layout_for(bounds);
+        let advanced_open = self.shared.evolution().start_advanced_open;
+        let layout = layout_for(bounds, advanced_open);
         self.start.arrange(ctx, layout.start_controls);
         if let Some((approve, reject)) = layout.rail.and_then(decision_button_layout) {
             self.approve.arrange(ctx, approve);
@@ -693,11 +799,15 @@ impl Widget for EvolutionView {
     fn paint(&self, ctx: &mut PaintCtx) {
         let (theme, pal) = self.palette();
         let bounds = ctx.bounds();
-        let layout = layout_for(bounds);
-        let (dashboard, selected) = {
+        let (dashboard, selected, advanced_open) = {
             let state = self.shared.evolution();
-            (state.dashboard.clone(), state.selected)
+            (
+                state.dashboard.clone(),
+                state.selected,
+                state.start_advanced_open,
+            )
         };
+        let layout = layout_for(bounds, advanced_open);
         let selected_job = selected.and_then(|index| dashboard.jobs.get(index));
 
         ctx.fill_bounds(pal.window);
@@ -710,6 +820,7 @@ impl Widget for EvolutionView {
             layout.start_controls,
             &dashboard,
             &self.shared,
+            advanced_open,
         );
         self.start.paint(ctx);
         paint_queue(ctx, &theme, &pal, layout.queue, &dashboard, selected);
@@ -774,11 +885,11 @@ struct DecisionActionStatus {
     deciding: bool,
 }
 
-fn layout_for(bounds: Rect) -> EvolutionLayout {
+fn layout_for(bounds: Rect, advanced_open: bool) -> EvolutionLayout {
     let header = Rect::new(bounds.x(), bounds.y(), bounds.width(), HEADER_H);
-    let start_h = start_height_for(bounds.width());
+    let start_h = start_height_for(bounds.width(), advanced_open);
     let start = Rect::new(bounds.x(), header.max_y(), bounds.width(), start_h);
-    let controls_h = start_controls_height_for(bounds.width());
+    let controls_h = start_controls_height_for(bounds.width(), advanced_open);
     let start_controls = Rect::new(
         start.x() + PAD,
         start.max_y() - PAD - controls_h,
@@ -841,17 +952,21 @@ fn decision_button_layout(rail: Rect) -> Option<(Rect, Rect)> {
     Some((approve, reject))
 }
 
-fn start_height_for(width: f32) -> f32 {
+fn start_height_for(width: f32, advanced_open: bool) -> f32 {
     if width >= START_BREAKPOINT {
         START_WIDE_H
+    } else if advanced_open {
+        START_NARROW_EXPANDED_H
     } else {
-        START_NARROW_H
+        START_NARROW_COLLAPSED_H
     }
 }
 
-fn start_controls_height_for(width: f32) -> f32 {
+fn start_controls_height_for(width: f32, advanced_open: bool) -> f32 {
     if width >= START_BREAKPOINT {
         control_block_height()
+    } else if advanced_open {
+        control_block_height() * 3.0 + CONTROL_GAP * 2.0
     } else {
         control_block_height() * 2.0 + CONTROL_GAP
     }
@@ -950,6 +1065,7 @@ fn paint_start_panel(
     controls_rect: Rect,
     dashboard: &EvolutionDashboard,
     shared: &Shared,
+    advanced_open: bool,
 ) {
     ctx.fill_rect(rect, pal.window);
     widgets::hairline_bottom(ctx, rect, pal.border);
@@ -987,19 +1103,26 @@ fn paint_start_panel(
                 };
                 (label, pal.text_muted)
             } else {
-                let ring = EVOLUTION_TARGET_RINGS
-                    .get(evolution.target_ring_index)
-                    .map(|option| option.label)
-                    .unwrap_or("R1 runtime");
-                let scope_count = parse_scope_paths(&evolution.scope_draft).len();
-                let scope = if scope_count == 0 {
-                    "workspace policy scope".to_string()
-                } else if scope_count == 1 {
-                    "1 scoped path".to_string()
+                if advanced_open {
+                    let ring = EVOLUTION_TARGET_RINGS
+                        .get(evolution.target_ring_index)
+                        .map(|option| option.label)
+                        .unwrap_or("R1 runtime");
+                    let scope_count = parse_scope_paths(&evolution.scope_draft).len();
+                    let scope = if scope_count == 0 {
+                        "workspace policy scope".to_string()
+                    } else if scope_count == 1 {
+                        "1 scoped path".to_string()
+                    } else {
+                        format!("{scope_count} scoped paths")
+                    };
+                    (format!("Ready for {ring} - {scope}"), pal.accent)
                 } else {
-                    format!("{scope_count} scoped paths")
-                };
-                (format!("Ready for {ring} - {scope}"), pal.accent)
+                    (
+                        "Ready to start - use Options for scope and target ring".to_string(),
+                        pal.accent,
+                    )
+                }
             }
         }
     };
@@ -1024,7 +1147,7 @@ fn paint_start_panel(
         &status,
         pal.text_style(theme, 12.0, FontWeight::MEDIUM, status_color),
     );
-    paint_start_labels(ctx, theme, pal, controls_rect);
+    paint_start_labels(ctx, theme, pal, controls_rect, advanced_open);
 }
 
 fn paint_start_labels(
@@ -1032,11 +1155,15 @@ fn paint_start_labels(
     theme: &sui::DefaultTheme,
     pal: &Palette,
     controls_rect: Rect,
+    advanced_open: bool,
 ) {
-    let layout = start_controls_layout(controls_rect);
+    let layout = start_controls_layout(controls_rect, advanced_open);
     paint_start_label(ctx, theme, pal, layout.objective_label, "Objective");
-    paint_start_label(ctx, theme, pal, layout.scope_label, "Scope");
-    paint_start_label(ctx, theme, pal, layout.target_label, "Target ring");
+    paint_start_label(ctx, theme, pal, layout.options_label, "Advanced");
+    if advanced_open {
+        paint_start_label(ctx, theme, pal, layout.scope_label, "Scope");
+        paint_start_label(ctx, theme, pal, layout.target_label, "Target ring");
+    }
 }
 
 fn paint_start_label(
@@ -1931,29 +2058,54 @@ mod tests {
     use crate::state::{AppState, Shared};
 
     #[test]
-    fn wide_start_controls_reserve_label_space() {
-        let layout =
-            start_controls_layout(Rect::new(0.0, 0.0, 900.0, start_controls_height_for(900.0)));
+    fn wide_start_controls_collapse_advanced_fields_by_default() {
+        let layout = start_controls_layout(
+            Rect::new(0.0, 0.0, 900.0, start_controls_height_for(900.0, false)),
+            false,
+        );
+
+        assert!(layout.objective_label.max_y() <= layout.objective.y());
+        assert!(layout.options_label.max_y() <= layout.options.y());
+        assert_eq!(layout.scope, Rect::ZERO);
+        assert_eq!(layout.target, Rect::ZERO);
+        assert_eq!(layout.objective.y(), layout.options.y());
+        assert_eq!(layout.options.y(), layout.start.y());
+        assert!(layout.objective.max_x() <= layout.options.x());
+        assert!(layout.options.max_x() <= layout.start.x());
+    }
+
+    #[test]
+    fn wide_start_controls_reserve_label_space_when_expanded() {
+        let layout = start_controls_layout(
+            Rect::new(0.0, 0.0, 900.0, start_controls_height_for(900.0, true)),
+            true,
+        );
 
         assert!(layout.objective_label.max_y() <= layout.objective.y());
         assert!(layout.scope_label.max_y() <= layout.scope.y());
         assert!(layout.target_label.max_y() <= layout.target.y());
+        assert!(layout.options_label.max_y() <= layout.options.y());
         assert_eq!(layout.objective.y(), layout.scope.y());
         assert_eq!(layout.scope.y(), layout.target.y());
-        assert_eq!(layout.target.y(), layout.start.y());
+        assert_eq!(layout.target.y(), layout.options.y());
+        assert_eq!(layout.options.y(), layout.start.y());
     }
 
     #[test]
-    fn narrow_start_controls_stack_labeled_rows() {
-        let layout =
-            start_controls_layout(Rect::new(0.0, 0.0, 520.0, start_controls_height_for(520.0)));
+    fn narrow_start_controls_stack_labeled_rows_when_expanded() {
+        let layout = start_controls_layout(
+            Rect::new(0.0, 0.0, 520.0, start_controls_height_for(520.0, true)),
+            true,
+        );
 
         assert!(layout.objective_label.max_y() <= layout.objective.y());
         assert!(layout.objective.max_y() + CONTROL_GAP <= layout.scope_label.y());
         assert!(layout.scope_label.max_y() <= layout.scope.y());
+        assert!(layout.scope.max_y() + CONTROL_GAP <= layout.target_label.y());
         assert!(layout.target_label.max_y() <= layout.target.y());
-        assert!(layout.scope.max_x() <= layout.target.x());
-        assert!(layout.target.max_x() <= layout.start.x());
+        assert!(layout.options_label.max_y() <= layout.options.y());
+        assert_eq!(layout.target.y(), layout.options.y());
+        assert_eq!(layout.options.y(), layout.start.y());
     }
 
     #[test]
@@ -1995,6 +2147,7 @@ mod tests {
         let shared = Shared::new(AppState::ready(backend));
         assert!(shared.evolution().objective_draft.is_empty());
         assert!(shared.evolution().scope_draft.is_empty());
+        assert!(!shared.evolution().start_advanced_open);
         assert!(!shared.evolution().can_start());
 
         let runtime = sui::Application::new()
@@ -2012,6 +2165,16 @@ mod tests {
             .with_name("evolution-objective")
             .expect()
             .to_have_value("")?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("evolution-scope")
+            .expect()
+            .to_be_hidden()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Options")
+            .click()?;
+        assert!(shared.evolution().start_advanced_open);
         window
             .get_by_role(sui::SemanticsRole::TextInput)
             .with_name("evolution-scope")
