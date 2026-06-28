@@ -112,6 +112,8 @@ enum FileActionPromptKind {
     NewFile,
     NewFolder,
     Copy,
+    CopyToSifs,
+    CopyToLocal,
     Move,
     Rename,
     Delete,
@@ -161,6 +163,8 @@ impl FileActionPromptKind {
             Self::NewFile => "New file",
             Self::NewFolder => "New folder",
             Self::Copy => "Copy to",
+            Self::CopyToSifs => "Copy to SIFS",
+            Self::CopyToLocal => "Download",
             Self::Move => "Move to",
             Self::Rename => "Rename",
             Self::Delete => "Delete",
@@ -173,6 +177,8 @@ impl FileActionPromptKind {
             Self::NewFile => "Create file",
             Self::NewFolder => "Create folder",
             Self::Copy => "Copy",
+            Self::CopyToSifs => "Copy to SIFS",
+            Self::CopyToLocal => "Download",
             Self::Move => "Move",
             Self::Rename => "Rename",
             Self::Delete => "Delete",
@@ -230,6 +236,8 @@ enum FilesOperationKind {
     CreateFile,
     CreateFolder,
     Copy,
+    CopyToSifs,
+    CopyToLocal,
     Move,
     Rename,
     Delete,
@@ -1090,12 +1098,20 @@ impl FilesState {
                     suggested_copy_name(&target_name)
                 }
             }
+            FileActionPromptKind::CopyToSifs => {
+                default_sifs_transfer_destination(&self.sifs_path, &target_name)
+            }
+            FileActionPromptKind::CopyToLocal => {
+                default_local_transfer_destination(&self.local_path, &target_name)
+            }
             FileActionPromptKind::Move => target_name.clone(),
             FileActionPromptKind::Rename => target_name.clone(),
             FileActionPromptKind::Delete => String::new(),
         };
         let error = match kind {
             FileActionPromptKind::Copy
+            | FileActionPromptKind::CopyToSifs
+            | FileActionPromptKind::CopyToLocal
             | FileActionPromptKind::Move
             | FileActionPromptKind::Rename
             | FileActionPromptKind::Delete
@@ -1228,6 +1244,46 @@ impl FilesState {
                         directory: prompt.target_is_dir,
                     },
                     "Copy".to_string(),
+                    format!("{from} -> {to}"),
+                ))
+            }
+            FileActionPromptKind::CopyToSifs => {
+                if self.source != FilesSourceKind::Local {
+                    return Err("select a local file or folder first".to_string());
+                }
+                let from = prompt
+                    .target_path
+                    .clone()
+                    .ok_or_else(|| "select an item first".to_string())?;
+                let to = resolve_sifs_destination_path(&self.sifs_path, &prompt.input)?;
+                Ok((
+                    FilesOperation {
+                        kind: FilesOperationKind::CopyToSifs,
+                        path: from.clone(),
+                        target: Some(to.clone()),
+                        directory: prompt.target_is_dir,
+                    },
+                    "Copy to SIFS".to_string(),
+                    format!("{from} -> {to}"),
+                ))
+            }
+            FileActionPromptKind::CopyToLocal => {
+                if self.source != FilesSourceKind::Sifs {
+                    return Err("select a SIFS file or folder first".to_string());
+                }
+                let from = prompt
+                    .target_path
+                    .clone()
+                    .ok_or_else(|| "select an item first".to_string())?;
+                let to = resolve_local_destination_path(&self.local_path, &prompt.input)?;
+                Ok((
+                    FilesOperation {
+                        kind: FilesOperationKind::CopyToLocal,
+                        path: from.clone(),
+                        target: Some(to.clone()),
+                        directory: prompt.target_is_dir,
+                    },
+                    "Download".to_string(),
                     format!("{from} -> {to}"),
                 ))
             }
@@ -1442,6 +1498,33 @@ impl FilesState {
         operation: FilesOperation,
         current_path: &str,
     ) -> Result<FilesOperationOutcome, String> {
+        if files_operation_is_cross_source(&operation) {
+            if let Some(browser) = self.browser.as_ref() {
+                return execute_cross_source_operation(
+                    self.source,
+                    browser,
+                    operation,
+                    current_path,
+                    None,
+                )
+                .map_err(files_operation_failure_detail);
+            }
+            let browser = self
+                .daemon_address
+                .as_deref()
+                .ok_or_else(|| "SIFS browsing requires a daemon connection".to_string())
+                .and_then(|address| {
+                    SifsBrowser::open_daemon_on_runtime(address, &self.app_runtime)
+                })?;
+            return execute_cross_source_operation(
+                self.source,
+                &browser,
+                operation,
+                current_path,
+                None,
+            )
+            .map_err(files_operation_failure_detail);
+        }
         match self.source {
             FilesSourceKind::Sifs => self
                 .browser
@@ -1892,7 +1975,9 @@ fn files_worker_loop(
                     Err(FilesOperationFailure::Cancelled(
                         files_operation_cancelled_detail(&operation),
                     ))
-                } else if source == FilesSourceKind::Local {
+                } else if source == FilesSourceKind::Local
+                    && !files_operation_requires_sifs_browser(source, &operation)
+                {
                     let progress = FilesOperationProgress {
                         request_id,
                         result_tx: &result_tx,
@@ -1940,12 +2025,22 @@ fn files_worker_loop(
                                 operation_progress_label(source, &operation, "Running"),
                                 Some(0.35),
                             );
-                            execute_sifs_operation(
-                                browser,
-                                operation,
-                                &current_path,
-                                Some(&progress),
-                            )
+                            if files_operation_is_cross_source(&operation) {
+                                execute_cross_source_operation(
+                                    source,
+                                    browser,
+                                    operation,
+                                    &current_path,
+                                    Some(&progress),
+                                )
+                            } else {
+                                execute_sifs_operation(
+                                    browser,
+                                    operation,
+                                    &current_path,
+                                    Some(&progress),
+                                )
+                            }
                         }
                         (None, Some(error)) => Err(FilesOperationFailure::Error(error.clone())),
                         (None, None) => Err(FilesOperationFailure::Error(
@@ -2364,6 +2459,29 @@ fn suggested_copy_name(name: &str) -> String {
     format!("{trimmed} copy")
 }
 
+fn default_sifs_transfer_destination(parent: &str, name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return normalize_path(parent);
+    }
+    join_sifs_child(parent, name).unwrap_or_else(|_| {
+        let parent = normalize_path(parent);
+        if parent == "/" {
+            format!("/{name}")
+        } else {
+            format!("{parent}/{name}")
+        }
+    })
+}
+
+fn default_local_transfer_destination(parent: &str, name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return parent.to_string();
+    }
+    Path::new(parent).join(name).to_string_lossy().into_owned()
+}
+
 fn normalize_jump_path(
     source: FilesSourceKind,
     current_path: &str,
@@ -2441,6 +2559,15 @@ fn execute_sifs_operation(
                 select_path: Some(target.clone()),
                 message: format!("copied {} to {target}", operation.path),
             })
+        }
+        FilesOperationKind::CopyToSifs | FilesOperationKind::CopyToLocal => {
+            execute_cross_source_operation(
+                FilesSourceKind::Sifs,
+                browser,
+                operation,
+                current_path,
+                progress,
+            )
         }
         FilesOperationKind::Move => {
             let target = operation.target.clone().ok_or_else(|| {
@@ -2532,6 +2659,81 @@ fn execute_sifs_operation(
     }
 }
 
+fn files_operation_is_cross_source(operation: &FilesOperation) -> bool {
+    matches!(
+        operation.kind,
+        FilesOperationKind::CopyToSifs | FilesOperationKind::CopyToLocal
+    )
+}
+
+fn files_operation_requires_sifs_browser(
+    source: FilesSourceKind,
+    operation: &FilesOperation,
+) -> bool {
+    source == FilesSourceKind::Sifs || files_operation_is_cross_source(operation)
+}
+
+fn execute_cross_source_operation(
+    source: FilesSourceKind,
+    browser: &SifsBrowser,
+    operation: FilesOperation,
+    current_path: &str,
+    progress: Option<&FilesOperationProgress<'_>>,
+) -> FilesOperationResult {
+    check_operation_cancelled(&operation, progress)?;
+    match (source, operation.kind) {
+        (FilesSourceKind::Local, FilesOperationKind::CopyToSifs) => {
+            let target = operation.target.clone().ok_or_else(|| {
+                FilesOperationFailure::Error("SIFS destination is missing".to_string())
+            })?;
+            if operation.directory {
+                copy_local_directory_to_sifs_with_progress(
+                    browser,
+                    &operation.path,
+                    &target,
+                    progress,
+                )?;
+            } else {
+                copy_local_file_to_sifs_with_progress(browser, &operation.path, &target, progress)?;
+            }
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: Some(operation.path.clone()),
+                message: format!("copied {} to SIFS {target}", operation.path),
+            })
+        }
+        (FilesSourceKind::Sifs, FilesOperationKind::CopyToLocal) => {
+            let target = operation.target.clone().ok_or_else(|| {
+                FilesOperationFailure::Error("local destination is missing".to_string())
+            })?;
+            if operation.directory {
+                copy_sifs_directory_to_local_with_progress(
+                    browser,
+                    &operation.path,
+                    &target,
+                    progress,
+                )?;
+            } else {
+                copy_sifs_file_to_local_with_progress(browser, &operation.path, &target, progress)?;
+            }
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: Some(operation.path.clone()),
+                message: format!("downloaded {} to {target}", operation.path),
+            })
+        }
+        (FilesSourceKind::Sifs, FilesOperationKind::CopyToSifs) => Err(
+            FilesOperationFailure::Error("copy to SIFS starts from a local selection".to_string()),
+        ),
+        (FilesSourceKind::Local, FilesOperationKind::CopyToLocal) => Err(
+            FilesOperationFailure::Error("download starts from a SIFS selection".to_string()),
+        ),
+        (_, _) => Err(FilesOperationFailure::Error(
+            "operation is not a cross-source copy".to_string(),
+        )),
+    }
+}
+
 fn execute_local_operation(
     operation: FilesOperation,
     current_path: &str,
@@ -2604,6 +2806,9 @@ fn execute_local_operation_with_progress(
                 message: format!("copied {} to {target}", operation.path),
             })
         }
+        FilesOperationKind::CopyToSifs | FilesOperationKind::CopyToLocal => Err(
+            FilesOperationFailure::Error("cross-source copy requires SIFS".to_string()),
+        ),
         FilesOperationKind::Move | FilesOperationKind::Rename => {
             let target = operation.target.clone().ok_or_else(|| {
                 FilesOperationFailure::Error("target path is missing".to_string())
@@ -2824,6 +3029,266 @@ fn collect_sifs_copy_plan(
         }
     }
     Ok(())
+}
+
+fn copy_local_file_to_sifs_with_progress(
+    browser: &SifsBrowser,
+    source_path: &str,
+    target_path: &str,
+    progress: Option<&FilesOperationProgress<'_>>,
+) -> Result<(), FilesOperationFailure> {
+    check_progress_cancelled(
+        progress,
+        format!("cancelled before copying {source_path} to SIFS {target_path}"),
+    )?;
+    let mut source = fs::File::open(source_path).map_err(|error| {
+        FilesOperationFailure::Error(format!("cannot open {source_path}: {error}"))
+    })?;
+    let total_bytes = source.metadata().ok().map(|metadata| metadata.len());
+    if let Some(progress) = progress {
+        progress.report(format!("Reading {source_path} for SIFS import"), Some(0.18));
+    }
+    let mut bytes = Vec::new();
+    source.read_to_end(&mut bytes).map_err(|error| {
+        FilesOperationFailure::Error(format!("cannot read {source_path}: {error}"))
+    })?;
+    check_progress_cancelled(
+        progress,
+        format!("cancelled after reading {source_path}; SIFS {target_path} was not written"),
+    )?;
+    if let Some(progress) = progress {
+        let size = total_bytes.unwrap_or(bytes.len() as u64);
+        progress.report(
+            format!("Writing {} to SIFS {target_path}", human_size(Some(size))),
+            Some(0.78),
+        );
+    }
+    browser
+        .write_file(target_path, &bytes)
+        .map_err(FilesOperationFailure::Error)
+}
+
+fn copy_local_directory_to_sifs_with_progress(
+    browser: &SifsBrowser,
+    source_path: &str,
+    target_path: &str,
+    progress: Option<&FilesOperationProgress<'_>>,
+) -> Result<(), FilesOperationFailure> {
+    check_progress_cancelled(
+        progress,
+        format!("cancelled before copying {source_path} to SIFS {target_path}"),
+    )?;
+    if let Some(progress) = progress {
+        progress.report(
+            format!("Scanning folder {source_path} for SIFS import"),
+            Some(0.08),
+        );
+    }
+    let mut plan = Vec::new();
+    collect_local_to_sifs_copy_plan(Path::new(source_path), target_path, &mut plan)?;
+    let total = plan.len().max(1);
+    for (index, item) in plan.iter().enumerate() {
+        check_progress_cancelled(
+            progress,
+            format!(
+                "cancelled after copying {} of {} items to SIFS {target_path}; partial target remains",
+                index, total
+            ),
+        )?;
+        if item.is_dir {
+            browser
+                .create_dir_all(&item.target)
+                .map_err(FilesOperationFailure::Error)?;
+        } else {
+            copy_local_file_to_sifs_with_progress(browser, &item.source, &item.target, None)?;
+        }
+        report_indexed_progress(
+            progress,
+            "Imported",
+            index + 1,
+            total,
+            &item.target,
+            0.12,
+            0.82,
+        );
+    }
+    Ok(())
+}
+
+fn collect_local_to_sifs_copy_plan(
+    source: &Path,
+    target_sifs_path: &str,
+    plan: &mut Vec<FilesCopyPlanItem>,
+) -> Result<(), FilesOperationFailure> {
+    let metadata = fs::symlink_metadata(source).map_err(|error| {
+        FilesOperationFailure::Error(format!("cannot inspect {}: {error}", source.display()))
+    })?;
+    if metadata.file_type().is_dir() {
+        plan.push(FilesCopyPlanItem {
+            source: source.to_string_lossy().into_owned(),
+            target: target_sifs_path.to_string(),
+            is_dir: true,
+        });
+        let read_dir = fs::read_dir(source).map_err(|error| {
+            FilesOperationFailure::Error(format!("cannot list {}: {error}", source.display()))
+        })?;
+        for entry in read_dir {
+            let entry = entry.map_err(|error| {
+                FilesOperationFailure::Error(format!(
+                    "cannot read entry in {}: {error}",
+                    source.display()
+                ))
+            })?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child_target =
+                join_sifs_child(target_sifs_path, &name).map_err(FilesOperationFailure::Error)?;
+            collect_local_to_sifs_copy_plan(&entry.path(), &child_target, plan)?;
+        }
+    } else {
+        plan.push(FilesCopyPlanItem {
+            source: source.to_string_lossy().into_owned(),
+            target: target_sifs_path.to_string(),
+            is_dir: false,
+        });
+    }
+    Ok(())
+}
+
+fn copy_sifs_file_to_local_with_progress(
+    browser: &SifsBrowser,
+    source_path: &str,
+    target_path: &str,
+    progress: Option<&FilesOperationProgress<'_>>,
+) -> Result<(), FilesOperationFailure> {
+    check_progress_cancelled(
+        progress,
+        format!("cancelled before downloading {source_path} to {target_path}"),
+    )?;
+    if let Some(progress) = progress {
+        progress.report(format!("Reading {source_path} from SIFS"), Some(0.42));
+    }
+    let bytes = browser
+        .read_file(source_path)
+        .map_err(FilesOperationFailure::Error)?;
+    check_progress_cancelled(
+        progress,
+        format!("cancelled after reading {source_path}; {target_path} was not written"),
+    )?;
+    if let Some(progress) = progress {
+        progress.report(
+            format!(
+                "Writing {} to {target_path}",
+                human_size(Some(bytes.len() as u64))
+            ),
+            Some(0.78),
+        );
+    }
+    write_bytes_to_local_file(target_path, &bytes)
+}
+
+fn copy_sifs_directory_to_local_with_progress(
+    browser: &SifsBrowser,
+    source_path: &str,
+    target_path: &str,
+    progress: Option<&FilesOperationProgress<'_>>,
+) -> Result<(), FilesOperationFailure> {
+    check_progress_cancelled(
+        progress,
+        format!("cancelled before downloading {source_path} to {target_path}"),
+    )?;
+    if let Some(progress) = progress {
+        progress.report(
+            format!("Scanning SIFS folder {source_path} for download"),
+            Some(0.08),
+        );
+    }
+    let mut plan = Vec::new();
+    collect_sifs_to_local_copy_plan(browser, source_path, Path::new(target_path), &mut plan)?;
+    let total = plan.len().max(1);
+    for (index, item) in plan.iter().enumerate() {
+        check_progress_cancelled(
+            progress,
+            format!(
+                "cancelled after downloading {} of {} items to {target_path}; partial target remains",
+                index, total
+            ),
+        )?;
+        if item.is_dir {
+            fs::create_dir_all(&item.target).map_err(|error| {
+                FilesOperationFailure::Error(format!(
+                    "cannot create folder {}: {error}",
+                    item.target
+                ))
+            })?;
+        } else {
+            copy_sifs_file_to_local_with_progress(browser, &item.source, &item.target, None)?;
+        }
+        report_indexed_progress(
+            progress,
+            "Downloaded",
+            index + 1,
+            total,
+            &item.target,
+            0.12,
+            0.82,
+        );
+    }
+    Ok(())
+}
+
+fn collect_sifs_to_local_copy_plan(
+    browser: &SifsBrowser,
+    source_path: &str,
+    target: &Path,
+    plan: &mut Vec<FilesCopyPlanItem>,
+) -> Result<(), FilesOperationFailure> {
+    plan.push(FilesCopyPlanItem {
+        source: source_path.to_string(),
+        target: target.to_string_lossy().into_owned(),
+        is_dir: true,
+    });
+    let entries = browser
+        .list_shallow(source_path)
+        .map_err(FilesOperationFailure::Error)?;
+    for entry in entries {
+        let child_target = target.join(&entry.name);
+        if entry.is_dir {
+            collect_sifs_to_local_copy_plan(browser, &entry.path, &child_target, plan)?;
+        } else {
+            plan.push(FilesCopyPlanItem {
+                source: entry.path,
+                target: child_target.to_string_lossy().into_owned(),
+                is_dir: false,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn write_bytes_to_local_file(target_path: &str, bytes: &[u8]) -> Result<(), FilesOperationFailure> {
+    if let Some(parent) = Path::new(target_path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            FilesOperationFailure::Error(format!(
+                "cannot create destination folder {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    let mut target_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target_path)
+        .map_err(|error| {
+            FilesOperationFailure::Error(format!("cannot create {target_path}: {error}"))
+        })?;
+    target_file.write_all(bytes).map_err(|error| {
+        FilesOperationFailure::Error(format!("cannot write {target_path}: {error}"))
+    })?;
+    target_file.flush().map_err(|error| {
+        FilesOperationFailure::Error(format!("cannot finalize {target_path}: {error}"))
+    })
 }
 
 fn delete_sifs_directory_recursive_with_progress(
@@ -3151,6 +3616,20 @@ fn files_operation_cancelled_detail(operation: &FilesOperation) -> String {
             let target = operation.target.as_deref().unwrap_or("target");
             format!("cancelled before copying {} to {target}", operation.path)
         }
+        FilesOperationKind::CopyToSifs => {
+            let target = operation.target.as_deref().unwrap_or("SIFS target");
+            format!(
+                "cancelled before copying {} to SIFS {target}",
+                operation.path
+            )
+        }
+        FilesOperationKind::CopyToLocal => {
+            let target = operation.target.as_deref().unwrap_or("local target");
+            format!(
+                "cancelled before downloading {} to {target}",
+                operation.path
+            )
+        }
         FilesOperationKind::Move => {
             let target = operation.target.as_deref().unwrap_or("target");
             format!("cancelled before moving {} to {target}", operation.path)
@@ -3191,6 +3670,14 @@ fn operation_progress_label(
         FilesOperationKind::Copy => {
             let target = operation.target.as_deref().unwrap_or("target");
             format!("{phase} copy in {scope}: {} -> {target}", operation.path)
+        }
+        FilesOperationKind::CopyToSifs => {
+            let target = operation.target.as_deref().unwrap_or("SIFS target");
+            format!("{phase} SIFS import: {} -> {target}", operation.path)
+        }
+        FilesOperationKind::CopyToLocal => {
+            let target = operation.target.as_deref().unwrap_or("local target");
+            format!("{phase} SIFS download: {} -> {target}", operation.path)
         }
         FilesOperationKind::Move => {
             let target = operation.target.as_deref().unwrap_or("target");
@@ -6443,6 +6930,8 @@ const INSPECTOR_BOTTOM_PAD: f32 = 18.0;
 enum InspectorAction {
     OpenFolder,
     Copy,
+    CopyToSifs,
+    CopyToLocal,
     Move,
     Rename,
     Delete,
@@ -6457,6 +6946,8 @@ impl InspectorAction {
         match self {
             Self::OpenFolder => "Open folder",
             Self::Copy => "Copy",
+            Self::CopyToSifs => "Copy to SIFS",
+            Self::CopyToLocal => "Download",
             Self::Move => "Move",
             Self::Rename => "Rename",
             Self::Delete => "Delete",
@@ -6471,6 +6962,8 @@ impl InspectorAction {
         match self {
             Self::OpenFolder => IconGlyph::Folder,
             Self::Copy => IconGlyph::Restore,
+            Self::CopyToSifs => IconGlyph::Storage,
+            Self::CopyToLocal => IconGlyph::Restore,
             Self::Move => IconGlyph::ChevronRight,
             Self::Rename => IconGlyph::MoreHorizontal,
             Self::Delete => IconGlyph::Trash,
@@ -6484,6 +6977,8 @@ impl InspectorAction {
     fn prompt_kind(self) -> Option<FileActionPromptKind> {
         match self {
             Self::Copy => Some(FileActionPromptKind::Copy),
+            Self::CopyToSifs => Some(FileActionPromptKind::CopyToSifs),
+            Self::CopyToLocal => Some(FileActionPromptKind::CopyToLocal),
             Self::Move => Some(FileActionPromptKind::Move),
             Self::Rename => Some(FileActionPromptKind::Rename),
             Self::Delete => Some(FileActionPromptKind::Delete),
@@ -6502,6 +6997,8 @@ impl InspectorAction {
             Self::RepairReplicas => format!("Repair replicas {}", entry.name),
             Self::PinContent => format!("Pin content {}", entry.name),
             Self::UnpinContent => format!("Unpin content {}", entry.name),
+            Self::CopyToSifs => format!("Copy to SIFS {}", entry.name),
+            Self::CopyToLocal => format!("Download {}", entry.name),
             Self::Copy | Self::Move | Self::Rename | Self::Delete => {
                 format!("{} {}", self.label(), entry.name)
             }
@@ -6515,6 +7012,10 @@ fn inspector_actions(source: FilesSourceKind, entry: &SifsEntry) -> Vec<Inspecto
         actions.push(InspectorAction::OpenFolder);
     }
     actions.push(InspectorAction::Copy);
+    match source {
+        FilesSourceKind::Local => actions.push(InspectorAction::CopyToSifs),
+        FilesSourceKind::Sifs => actions.push(InspectorAction::CopyToLocal),
+    }
     actions.push(InspectorAction::Move);
     actions.push(InspectorAction::Rename);
     actions.push(InspectorAction::Delete);
@@ -6611,6 +7112,8 @@ fn inspector_action_button_widget_id(
     let salt = match action {
         InspectorAction::OpenFolder => 7_497,
         InspectorAction::Copy => 7_511,
+        InspectorAction::CopyToSifs => 7_515,
+        InspectorAction::CopyToLocal => 7_519,
         InspectorAction::Move => 7_523,
         InspectorAction::Rename => 7_541,
         InspectorAction::Delete => 7_553,
@@ -6721,6 +7224,8 @@ impl Widget for InspectorView {
                         request_files_overlay_rebuild(ctx);
                     }
                     InspectorAction::Copy
+                    | InspectorAction::CopyToSifs
+                    | InspectorAction::CopyToLocal
                     | InspectorAction::Move
                     | InspectorAction::Rename
                     | InspectorAction::Delete => {
@@ -7352,6 +7857,12 @@ impl Widget for InspectorView {
                     InspectorAction::UnpinContent => {
                         format!("Remove this node's SIFS content pin for {}", entry.path)
                     }
+                    InspectorAction::CopyToSifs => {
+                        format!("Copy local {} into SIFS", entry.path)
+                    }
+                    InspectorAction::CopyToLocal => {
+                        format!("Download SIFS {} to a local path", entry.path)
+                    }
                     InspectorAction::Copy => format!("Copy {}", entry.path),
                     InspectorAction::Move => format!("Move {}", entry.path),
                     InspectorAction::Rename => format!("Rename {}", entry.path),
@@ -7543,6 +8054,9 @@ impl InspectorView {
             | InspectorAction::RepairReplicas
             | InspectorAction::PinContent
             | InspectorAction::UnpinContent => (pal.field, pal.border, pal.accent, pal.accent),
+            InspectorAction::CopyToSifs | InspectorAction::CopyToLocal => {
+                (pal.field, pal.border, pal.accent, pal.accent)
+            }
             InspectorAction::Copy | InspectorAction::Move | InspectorAction::Rename => {
                 (pal.field, pal.border, pal.text, pal.text_muted)
             }
@@ -7736,7 +8250,7 @@ impl InspectorView {
             widgets::draw_text_in(
                 ctx,
                 Rect::new(panel.x() + 12.0, row_y, inner_w, 18.0),
-                "Select a file to load a bounded preview",
+                "Preview not loaded yet",
                 value_style,
             );
             return panel.max_y();
@@ -8333,6 +8847,16 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .as_deref()
             .map(|path| format!("Copy {path} to another {} path", source.operation_scope()))
             .unwrap_or_else(|| "Select a file to copy".to_string()),
+        FileActionPromptKind::CopyToSifs => prompt
+            .target_path
+            .as_deref()
+            .map(|path| format!("Copy local {path} into SIFS"))
+            .unwrap_or_else(|| "Select a local file or folder to copy into SIFS".to_string()),
+        FileActionPromptKind::CopyToLocal => prompt
+            .target_path
+            .as_deref()
+            .map(|path| format!("Download SIFS {path} to a local path"))
+            .unwrap_or_else(|| "Select a SIFS file or folder to download".to_string()),
         FileActionPromptKind::Move => prompt
             .target_path
             .as_deref()
@@ -8351,7 +8875,10 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     };
     let input_label = match prompt.kind {
         FileActionPromptKind::GoTo => "Path",
-        FileActionPromptKind::Copy | FileActionPromptKind::Move => "Destination",
+        FileActionPromptKind::Copy
+        | FileActionPromptKind::CopyToSifs
+        | FileActionPromptKind::CopyToLocal
+        | FileActionPromptKind::Move => "Destination",
         FileActionPromptKind::Delete => "Type DELETE",
         _ => "Name",
     };
@@ -8359,6 +8886,8 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         let s = shared.clone();
         let placeholder = match prompt.kind {
             FileActionPromptKind::GoTo => go_to_path_placeholder(source),
+            FileActionPromptKind::CopyToSifs => "/services/artifact",
+            FileActionPromptKind::CopyToLocal => "C:\\Users\\you\\Downloads\\artifact",
             _ => input_label,
         };
         sui::TextInput::new(format!("files-action-input-{title}"))
@@ -9042,6 +9571,77 @@ mod tests {
     }
 
     #[test]
+    fn cross_source_prompts_resolve_sifs_and_local_destinations() {
+        let root = files_test_temp_dir("cross-source-destinations");
+        let local_source = root.join("artifact.txt");
+        fs::write(&local_source, b"hello").expect("write local source");
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.source = FilesSourceKind::Local;
+        state.path = root.to_string_lossy().into_owned();
+        state.local_path = state.path.clone();
+        state.sifs_path = "/services".to_string();
+        state.entries = vec![SifsEntry {
+            name: "artifact.txt".to_string(),
+            path: local_source.to_string_lossy().into_owned(),
+            is_dir: false,
+            is_link: false,
+            size: Some(5),
+        }];
+        state.selected = Some(0);
+
+        state.open_action_prompt(FileActionPromptKind::CopyToSifs);
+        let prompt = state
+            .action_prompt
+            .as_ref()
+            .expect("copy to SIFS prompt")
+            .clone();
+        assert_eq!(prompt.input, "/services/artifact.txt");
+        let (operation, title, detail) = state
+            .operation_from_prompt(&prompt)
+            .expect("copy to SIFS operation");
+        assert_eq!(operation.kind, FilesOperationKind::CopyToSifs);
+        assert_eq!(operation.path, local_source.to_string_lossy());
+        assert_eq!(operation.target.as_deref(), Some("/services/artifact.txt"));
+        assert_eq!(title, "Copy to SIFS");
+        assert!(detail.ends_with(" -> /services/artifact.txt"));
+
+        state.source = FilesSourceKind::Sifs;
+        state.path = "/services".to_string();
+        state.local_path = root.to_string_lossy().into_owned();
+        state.entries = vec![SifsEntry {
+            name: "artifact.txt".to_string(),
+            path: "/services/artifact.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(5),
+        }];
+        state.selected = Some(0);
+
+        state.open_action_prompt(FileActionPromptKind::CopyToLocal);
+        let prompt = state
+            .action_prompt
+            .as_ref()
+            .expect("download prompt")
+            .clone();
+        assert_eq!(prompt.input, root.join("artifact.txt").to_string_lossy());
+        let (operation, title, detail) = state
+            .operation_from_prompt(&prompt)
+            .expect("download operation");
+        assert_eq!(operation.kind, FilesOperationKind::CopyToLocal);
+        assert_eq!(operation.path, "/services/artifact.txt");
+        assert_eq!(
+            operation.target.as_deref(),
+            Some(root.join("artifact.txt").to_string_lossy().as_ref())
+        );
+        assert_eq!(title, "Download");
+        assert!(detail.starts_with("/services/artifact.txt -> "));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn local_copy_operation_writes_destination_file() {
         let root = files_test_temp_dir("local-copy-operation");
         let source = root.join("artifact.bin");
@@ -9066,6 +9666,140 @@ mod tests {
             Some(target.to_string_lossy().as_ref())
         );
         assert_eq!(outcome.refresh_path, root.to_string_lossy().into_owned());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cross_source_copy_imports_and_downloads_files_through_sifs() {
+        let backend = Backend::local_fallback();
+        let browser = SifsBrowser::open(&backend.data_dir).expect("open SIFS browser");
+        browser
+            .create_dir_all("/services")
+            .expect("create SIFS services");
+        let root = files_test_temp_dir("cross-source-file-operation");
+        let local_source = root.join("artifact.txt");
+        let local_download = root.join("downloaded.txt");
+        fs::write(&local_source, b"hello from local").expect("write local source");
+
+        let import = execute_cross_source_operation(
+            FilesSourceKind::Local,
+            &browser,
+            FilesOperation {
+                kind: FilesOperationKind::CopyToSifs,
+                path: local_source.to_string_lossy().into_owned(),
+                target: Some("/services/imported.txt".to_string()),
+                directory: false,
+            },
+            &root.to_string_lossy(),
+            None,
+        )
+        .expect("import file to SIFS");
+
+        assert_eq!(
+            browser
+                .read_file("/services/imported.txt")
+                .expect("read SIFS import"),
+            b"hello from local"
+        );
+        assert_eq!(import.refresh_path, root.to_string_lossy());
+        assert_eq!(
+            import.select_path.as_deref(),
+            Some(local_source.to_string_lossy().as_ref())
+        );
+
+        let download = execute_cross_source_operation(
+            FilesSourceKind::Sifs,
+            &browser,
+            FilesOperation {
+                kind: FilesOperationKind::CopyToLocal,
+                path: "/services/imported.txt".to_string(),
+                target: Some(local_download.to_string_lossy().into_owned()),
+                directory: false,
+            },
+            "/services",
+            None,
+        )
+        .expect("download SIFS file");
+
+        assert_eq!(
+            fs::read(&local_download).expect("read local download"),
+            b"hello from local"
+        );
+        assert_eq!(download.refresh_path, "/services");
+        assert_eq!(
+            download.select_path.as_deref(),
+            Some("/services/imported.txt")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cross_source_copy_recurses_between_local_and_sifs_directories() {
+        let backend = Backend::local_fallback();
+        let browser = SifsBrowser::open(&backend.data_dir).expect("open SIFS browser");
+        browser
+            .create_dir_all("/services")
+            .expect("create SIFS services");
+        let root = files_test_temp_dir("cross-source-directory-operation");
+        let source = root.join("workspace");
+        let nested = source.join("nested");
+        let download = root.join("downloaded-workspace");
+        fs::create_dir_all(&nested).expect("create local tree");
+        fs::write(source.join("README.md"), b"readme").expect("write root file");
+        fs::write(nested.join("artifact.bin"), b"nested").expect("write nested file");
+
+        execute_cross_source_operation(
+            FilesSourceKind::Local,
+            &browser,
+            FilesOperation {
+                kind: FilesOperationKind::CopyToSifs,
+                path: source.to_string_lossy().into_owned(),
+                target: Some("/services/workspace".to_string()),
+                directory: true,
+            },
+            &root.to_string_lossy(),
+            None,
+        )
+        .expect("import directory to SIFS");
+
+        assert_eq!(
+            browser
+                .read_file("/services/workspace/README.md")
+                .expect("read imported root file"),
+            b"readme"
+        );
+        assert_eq!(
+            browser
+                .read_file("/services/workspace/nested/artifact.bin")
+                .expect("read imported nested file"),
+            b"nested"
+        );
+
+        execute_cross_source_operation(
+            FilesSourceKind::Sifs,
+            &browser,
+            FilesOperation {
+                kind: FilesOperationKind::CopyToLocal,
+                path: "/services/workspace".to_string(),
+                target: Some(download.to_string_lossy().into_owned()),
+                directory: true,
+            },
+            "/services",
+            None,
+        )
+        .expect("download SIFS directory");
+
+        assert_eq!(
+            fs::read(download.join("README.md")).expect("read downloaded root file"),
+            b"readme"
+        );
+        assert_eq!(
+            fs::read(download.join("nested").join("artifact.bin"))
+                .expect("read downloaded nested file"),
+            b"nested"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -11811,6 +12545,22 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Download artifact.txt")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("download prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::CopyToLocal);
+            assert_eq!(
+                prompt.target_path.as_deref(),
+                Some("/services/artifact.txt")
+            );
+            assert!(prompt.input.ends_with("artifact.txt"));
+        }
+        shared.files_mut().close_action_prompt();
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
             .with_name("Refresh placement artifact.txt")
             .click()?;
 
@@ -11897,6 +12647,66 @@ mod tests {
             FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn selected_local_file_inspector_exposes_copy_to_sifs() -> sui::Result<()> {
+        let root = files_test_temp_dir("local-inspector-copy-to-sifs");
+        let path = root.join("artifact.txt");
+        fs::write(&path, b"hello").expect("write local file");
+
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.source = FilesSourceKind::Local;
+            files.loaded = true;
+            files.loading = false;
+            files.path = root.to_string_lossy().into_owned();
+            files.local_path = files.path.clone();
+            files.sifs_path = "/services".to_string();
+            files.node_id = local_node_label();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: path.to_string_lossy().into_owned(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.selected = Some(0);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files inspector local copy to SIFS")
+                    .root(
+                        SizedBox::new()
+                            .width(INSPECTOR_W)
+                            .height(720.0)
+                            .with_child(InspectorView::new(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Copy to SIFS artifact.txt")
+            .click()?;
+
+        let files = shared.files();
+        let prompt = files.action_prompt.as_ref().expect("copy to SIFS prompt");
+        assert_eq!(prompt.kind, FileActionPromptKind::CopyToSifs);
+        assert_eq!(
+            prompt.target_path.as_deref(),
+            Some(path.to_string_lossy().as_ref())
+        );
+        assert_eq!(prompt.input, "/services/artifact.txt");
+
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
