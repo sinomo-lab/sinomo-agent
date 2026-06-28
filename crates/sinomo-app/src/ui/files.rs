@@ -6206,6 +6206,67 @@ fn files_task_status(files: &FilesState) -> String {
     }
 }
 
+fn files_tasks_signature(tasks: &[FilesTask]) -> String {
+    tasks
+        .iter()
+        .take(6)
+        .map(|task| {
+            format!(
+                "{}:{:?}:{:.2}:{}",
+                task.id,
+                task.state,
+                task.progress.unwrap_or(-1.0),
+                task.detail
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn files_tasks_have_finished(tasks: &[FilesTask]) -> bool {
+    tasks.iter().any(|task| {
+        matches!(
+            task.state,
+            FilesTaskState::Cancelled | FilesTaskState::Completed | FilesTaskState::Failed
+        )
+    })
+}
+
+fn files_task_queue_summary(tasks: &[FilesTask]) -> String {
+    let running = tasks
+        .iter()
+        .filter(|task| task.state == FilesTaskState::Running)
+        .count();
+    let cancelling = tasks
+        .iter()
+        .filter(|task| task.state == FilesTaskState::CancelRequested)
+        .count();
+    let failed = tasks
+        .iter()
+        .filter(|task| task.state == FilesTaskState::Failed)
+        .count();
+    if running > 0 || cancelling > 0 {
+        let active = running + cancelling;
+        if active == 1 {
+            "1 active".to_string()
+        } else {
+            format!("{active} active")
+        }
+    } else if failed > 0 {
+        if failed == 1 {
+            "1 failed".to_string()
+        } else {
+            format!("{failed} failed")
+        }
+    } else if tasks.is_empty() {
+        "idle".to_string()
+    } else if tasks.len() == 1 {
+        "1 finished".to_string()
+    } else {
+        format!("{} finished", tasks.len())
+    }
+}
+
 fn files_status_summary(files: &FilesState) -> String {
     format!(
         "{} | Path {} | {} | {} | {}",
@@ -7294,21 +7355,22 @@ impl InspectorView {
     /// A short, single-line summary used for change detection.
     fn summary(&self) -> String {
         let files = self.shared.files();
+        let task_signature = files_tasks_signature(&files.tasks);
         if files.loading {
             return format!(
-                "loading|{:?}|{}|{}",
-                files.source, files.path, files.inspector_details_open
+                "loading|{:?}|{}|{}|{}",
+                files.source, files.path, files.inspector_details_open, task_signature
             );
         }
         if let Some(error) = &files.error {
             return format!(
-                "error|{:?}|{}|{}|{}",
-                files.source, files.path, error, files.inspector_details_open
+                "error|{:?}|{}|{}|{}|{}",
+                files.source, files.path, error, files.inspector_details_open, task_signature
             );
         }
         match files.selected_entry() {
             Some(entry) => format!(
-                "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 files.source,
                 entry.path,
                 entry.is_dir,
@@ -7321,48 +7383,43 @@ impl InspectorView {
                 files.inspector_details_open,
                 sifs_details_signature(files.selected_details.as_ref()),
                 local_details_signature(files.selected_local_details.as_ref()),
-                files_preview_signature(files.selected_preview.as_ref())
+                files_preview_signature(files.selected_preview.as_ref()),
+                task_signature
             ),
             None => format!(
-                "unselected|{:?}|{}|{}|{}",
+                "unselected|{:?}|{}|{}|{}|{}",
                 files.source,
                 files.path,
                 files.clustered,
-                files.entries.len()
+                files.entries.len(),
+                task_signature
             ),
         }
     }
 
     fn measured_content_height(&self, _ctx: &mut MeasureCtx, width: f32) -> f32 {
         let w = (width - INSPECTOR_PAD * 2.0).max(0.0);
-        let mut y = INSPECTOR_PAD + 4.0 + 30.0;
+        let mut y = INSPECTOR_STATE_PANEL_Y;
         let files = self.shared.files();
 
-        let finish = |end_y: f32, has_tasks: bool| {
-            let task_reserve = if has_tasks {
-                INSPECTOR_TASK_PANEL_H + 12.0
-            } else {
-                0.0
-            };
-            (end_y + task_reserve + INSPECTOR_BOTTOM_PAD).max(INSPECTOR_MIN_CONTENT_H)
-        };
+        let finish = |end_y: f32| (end_y + INSPECTOR_BOTTOM_PAD).max(INSPECTOR_MIN_CONTENT_H);
 
         if files.loading {
             let rows = sifs_loading_rows(&files.path, files.inspector_details_open);
             let panel_h = Self::state_panel_height(w, &rows);
-            return finish(y + panel_h, !files.tasks.is_empty());
+            return finish(y + panel_h);
         }
 
         if let Some(error) = &files.error {
             let rows = sifs_unavailable_rows(error, files.inspector_details_open);
             let panel_h = Self::state_panel_height(w, &rows);
-            return finish(y + panel_h, !files.tasks.is_empty());
+            return finish(y + panel_h);
         }
 
         let Some(entry) = files.selected_entry() else {
             let rows = unselected_inspector_rows(&files);
             let panel_h = Self::state_panel_height(w, &rows);
-            return finish(y + panel_h, !files.tasks.is_empty());
+            return finish(y + panel_h);
         };
 
         y += 26.0;
@@ -7430,7 +7487,7 @@ impl InspectorView {
                     );
             }
 
-            return finish(y, !files.tasks.is_empty());
+            return finish(y);
         }
 
         y += 10.0 + 24.0;
@@ -7519,7 +7576,7 @@ impl InspectorView {
                 );
         }
 
-        finish(y, !files.tasks.is_empty())
+        finish(y)
     }
 
     fn state_panel_height(w: f32, rows: &[(&str, String)]) -> f32 {
@@ -7583,15 +7640,16 @@ impl InspectorView {
 }
 
 const INSPECTOR_PAD: f32 = CONTENT_PAD;
-const INSPECTOR_STATE_PANEL_Y: f32 = INSPECTOR_PAD + 34.0;
 const INSPECTOR_DETAIL_BUTTON_W: f32 = 104.0;
 const INSPECTOR_DETAIL_BUTTON_H: f32 = 24.0;
 const INSPECTOR_ACTION_BUTTON_H: f32 = 28.0;
 const INSPECTOR_ACTION_GAP: f32 = 8.0;
-const INSPECTOR_TASK_PANEL_H: f32 = 128.0;
-const INSPECTOR_TASK_ROW_H: f32 = 28.0;
+const INSPECTOR_TASK_PANEL_H: f32 = 160.0;
+const INSPECTOR_TASK_ROW_H: f32 = 29.0;
 const INSPECTOR_TASK_CANCEL_W: f32 = 58.0;
-const INSPECTOR_MIN_CONTENT_H: f32 = 220.0;
+const INSPECTOR_TASK_PANEL_Y: f32 = INSPECTOR_PAD + 34.0;
+const INSPECTOR_STATE_PANEL_Y: f32 = INSPECTOR_TASK_PANEL_Y + INSPECTOR_TASK_PANEL_H + 12.0;
+const INSPECTOR_MIN_CONTENT_H: f32 = INSPECTOR_STATE_PANEL_Y + 170.0;
 const INSPECTOR_BOTTOM_PAD: f32 = 18.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7747,7 +7805,7 @@ fn inspector_detail_button_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
 }
 
 fn inspector_actions_origin_y(bounds: Rect) -> f32 {
-    bounds.y() + INSPECTOR_PAD + 4.0 + 30.0 + 26.0 + 30.0
+    bounds.y() + INSPECTOR_STATE_PANEL_Y + 26.0 + 30.0
 }
 
 fn inspector_action_button_rect(bounds: Rect, index: usize) -> Rect {
@@ -7798,20 +7856,33 @@ fn inspector_task_panel_rect(bounds: Rect) -> Rect {
     let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
     Rect::new(
         content_x,
-        bounds.max_y() - INSPECTOR_PAD - INSPECTOR_TASK_PANEL_H,
+        bounds.y() + INSPECTOR_TASK_PANEL_Y,
         content_w,
         INSPECTOR_TASK_PANEL_H,
     )
+}
+
+fn inspector_task_clear_rect(bounds: Rect) -> Rect {
+    let panel = inspector_task_panel_rect(bounds);
+    Rect::new(panel.max_x() - 102.0, panel.y() + 8.0, 90.0, 22.0)
 }
 
 fn inspector_task_cancel_rect(bounds: Rect, row_index: usize) -> Rect {
     let panel = inspector_task_panel_rect(bounds);
     Rect::new(
         panel.max_x() - INSPECTOR_TASK_CANCEL_W - 10.0,
-        panel.y() + 34.0 + row_index as f32 * INSPECTOR_TASK_ROW_H + 3.0,
+        panel.y() + 46.0 + row_index as f32 * INSPECTOR_TASK_ROW_H + 2.0,
         INSPECTOR_TASK_CANCEL_W,
         22.0,
     )
+}
+
+fn inspector_task_clear_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
+    sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(9_099))
+}
+
+fn inspector_task_panel_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
+    sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(9_100))
 }
 
 fn inspector_task_cancel_widget_id(parent: sui::WidgetId, task_id: u64) -> sui::WidgetId {
@@ -7830,6 +7901,20 @@ impl Widget for InspectorView {
             && pointer.kind == PointerEventKind::Up
             && pointer.button == Some(PointerButton::Primary)
         {
+            let clear_finished = {
+                let files = self.shared.files();
+                files_tasks_have_finished(&files.tasks)
+                    && inspector_task_clear_rect(ctx.bounds()).contains(pointer.position)
+            };
+            if clear_finished {
+                self.shared.files_mut().clear_finished_tasks();
+                ctx.request_measure();
+                ctx.request_paint();
+                ctx.request_semantics();
+                ctx.set_handled();
+                return;
+            }
+
             let task_to_cancel = {
                 let files = self.shared.files();
                 files
@@ -7964,9 +8049,8 @@ impl Widget for InspectorView {
         let header = pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
         widgets::draw_text_in(ctx, Rect::new(x, y, w, 18.0), "INSPECTOR", header);
         y += 30.0;
-        if !files.tasks.is_empty() {
-            self.task_panel(ctx, &theme, &pal, bounds, &files.tasks);
-        }
+        self.task_panel(ctx, &theme, &pal, bounds, &files.tasks);
+        y += INSPECTOR_TASK_PANEL_H + 12.0;
 
         if files.loading {
             let details_open = files.inspector_details_open;
@@ -8504,6 +8588,30 @@ impl Widget for InspectorView {
             )
         };
 
+        let mut task_panel = SemanticsNode::new(
+            inspector_task_panel_widget_id(ctx.widget_id()),
+            SemanticsRole::Text,
+            inspector_task_panel_rect(ctx.bounds()),
+        );
+        task_panel.parent = Some(ctx.widget_id());
+        task_panel.name = Some("File task queue".to_string());
+        task_panel.description = Some(files_task_queue_summary(&tasks));
+        ctx.push(task_panel);
+
+        if files_tasks_have_finished(&tasks) {
+            let mut node = SemanticsNode::new(
+                inspector_task_clear_widget_id(ctx.widget_id()),
+                SemanticsRole::Button,
+                inspector_task_clear_rect(ctx.bounds()),
+            );
+            node.parent = Some(ctx.widget_id());
+            node.name = Some("Clear finished file tasks".to_string());
+            node.description =
+                Some("Dismiss completed, failed, and cancelled file operations".to_string());
+            node.actions = vec![SemanticsAction::Activate];
+            ctx.push(node);
+        }
+
         for (index, task) in tasks
             .iter()
             .take(3)
@@ -8770,22 +8878,90 @@ impl InspectorView {
     ) {
         let panel = inspector_task_panel_rect(bounds);
         widgets::round_panel(ctx, panel, pal.panel, pal.border, 8.0);
+        let has_finished = files_tasks_have_finished(tasks);
+        let title_right = if has_finished {
+            inspector_task_clear_rect(bounds).x() - 8.0
+        } else {
+            panel.max_x() - 12.0
+        };
         widgets::draw_text_in(
             ctx,
             Rect::new(
                 panel.x() + 12.0,
                 panel.y() + 10.0,
-                panel.width() - 24.0,
+                (title_right - panel.x() - 12.0).max(0.0),
                 18.0,
             ),
-            "TASKS",
+            "FILE TASKS",
             pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint),
         );
+        if has_finished {
+            let clear = inspector_task_clear_rect(bounds);
+            widgets::round_panel(ctx, clear, pal.field, pal.border, 7.0);
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(clear.x() + 8.0, clear.y() + 3.0, clear.width() - 16.0, 16.0),
+                "Clear",
+                pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text),
+            );
+        }
+        let summary = files_task_queue_summary(tasks);
+        let summary_style = pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text_muted);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(
+                panel.x() + 12.0,
+                panel.y() + 27.0,
+                panel.width() - 24.0,
+                16.0,
+            ),
+            &summary,
+            summary_style,
+        );
+
+        if tasks.is_empty() {
+            let badge = Rect::new(panel.x() + 12.0, panel.y() + 52.0, 68.0, 24.0);
+            widgets::round_panel(ctx, badge, pal.field, pal.good, 12.0);
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(
+                    badge.x() + 10.0,
+                    badge.y() + 4.0,
+                    badge.width() - 20.0,
+                    16.0,
+                ),
+                "Idle",
+                pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, pal.good),
+            );
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(
+                    panel.x() + 12.0,
+                    panel.y() + 84.0,
+                    panel.width() - 24.0,
+                    18.0,
+                ),
+                "No active file operations",
+                pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text),
+            );
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(
+                    panel.x() + 12.0,
+                    panel.y() + 104.0,
+                    panel.width() - 24.0,
+                    32.0,
+                ),
+                "Worker queue empty",
+                pal.text_style(theme, 11.0, FontWeight::NORMAL, pal.text_faint),
+            );
+            return;
+        }
 
         let title_style = pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.text);
         let detail_style = pal.text_style(theme, 10.5, FontWeight::NORMAL, pal.text_faint);
         for (index, task) in tasks.iter().take(3).enumerate() {
-            let y = panel.y() + 34.0 + index as f32 * INSPECTOR_TASK_ROW_H;
+            let y = panel.y() + 46.0 + index as f32 * INSPECTOR_TASK_ROW_H;
             let cancel = inspector_task_cancel_rect(bounds, index);
             let text_w = if task.state.can_cancel() {
                 cancel.x() - panel.x() - 20.0
@@ -13655,6 +13831,105 @@ mod tests {
         window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Clear finished tasks")
+            .click()?;
+
+        let files = shared.files();
+        assert_eq!(files.tasks.len(), 1);
+        assert_eq!(files.tasks[0].id, 78);
+        assert_eq!(files.tasks[0].state, FilesTaskState::Running);
+
+        Ok(())
+    }
+
+    #[test]
+    fn inspector_task_queue_is_visible_when_idle() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files idle task queue")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Text)
+                .with_name("File task queue")
+                .with_description("idle")
+                .count()?,
+            1
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn inspector_task_queue_clear_finished_dismisses_terminal_history() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.tasks = vec![
+                FilesTask {
+                    id: 77,
+                    source: FilesSourceKind::Sifs,
+                    title: "Delete".to_string(),
+                    detail: "deleted /artifact.txt".to_string(),
+                    state: FilesTaskState::Completed,
+                    progress: Some(1.0),
+                },
+                FilesTask {
+                    id: 78,
+                    source: FilesSourceKind::Sifs,
+                    title: "Copy".to_string(),
+                    detail: "/artifact.txt -> /copy.txt".to_string(),
+                    state: FilesTaskState::Running,
+                    progress: Some(0.35),
+                },
+            ];
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files inspector task clear")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Clear finished file tasks")
             .click()?;
 
         let files = shared.files();
