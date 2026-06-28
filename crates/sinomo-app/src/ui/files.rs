@@ -3191,6 +3191,15 @@ fn middle_short(s: &str, max: usize) -> String {
     format!("{head}…{tail}")
 }
 
+fn display_name_for_width(name: &str, width: f32, avg_char_width: f32) -> String {
+    if width <= 0.0 {
+        return String::new();
+    }
+    let max_chars = (width / avg_char_width.max(1.0)).floor() as usize;
+    let max_chars = max_chars.clamp(4, 72);
+    middle_short(name, max_chars)
+}
+
 fn crumb_label(segment: &str, parent: Option<&str>) -> String {
     if parent == Some("nodes") && looks_like_opaque_id(segment) {
         return format!("node {}", middle_short(segment, 16));
@@ -3874,8 +3883,9 @@ impl Widget for SifsEntryRow {
             (title_right - title_x).max(0.0),
             bounds.height(),
         );
+        let display_name = display_name_for_width(&self.entry.name, title_rect.width(), 7.1);
         ctx.push_clip_rect(title_rect);
-        widgets::draw_text_in(ctx, title_rect, &self.entry.name, title_style);
+        widgets::draw_text_in(ctx, title_rect, &display_name, title_style);
         ctx.pop_clip();
     }
 
@@ -6143,13 +6153,9 @@ impl Widget for InspectorView {
         self.detail_button(ctx, &theme, &pal, detail_rect, details_open);
         let title_right_gap = INSPECTOR_DETAIL_BUTTON_W + 10.0;
         let name_style = pal.text_style(&theme, 16.0, FontWeight::SEMIBOLD, pal.text);
-        let display_name = middle_short(&entry.name, 36);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x, y, (w - title_right_gap).max(0.0), 24.0),
-            &display_name,
-            name_style,
-        );
+        let title_rect = Rect::new(x, y, (w - title_right_gap).max(0.0), 24.0);
+        let display_name = display_name_for_width(&entry.name, title_rect.width(), 8.8);
+        widgets::draw_text_in(ctx, title_rect, &display_name, name_style);
         y += 26.0;
         let kind = details
             .map(|details| details.kind.as_str())
@@ -7924,6 +7930,22 @@ mod tests {
             crumb_label("sinomo-app-chat-session-01ktsg9dw850xkprvhkn0kfr8t", None),
             "sinomo-app…rvhkn0kfr8t"
         );
+    }
+
+    #[test]
+    fn display_name_for_width_keeps_generated_file_names_readable() {
+        let name = "sinomo-app-chat-session-01ktsg9dw850xkprvhkn0kfr8t.json";
+
+        assert_eq!(
+            display_name_for_width("artifact.txt", 320.0, 7.1),
+            "artifact.txt"
+        );
+        assert_eq!(
+            display_name_for_width(name, 180.0, 8.8),
+            "sinomo-ap…kfr8t.json"
+        );
+        assert_eq!(display_name_for_width(name, 40.0, 8.8), "s…on");
+        assert_eq!(display_name_for_width(name, 0.0, 8.8), "");
     }
 
     #[test]
