@@ -3063,6 +3063,24 @@ fn sifs_placement_next_step(details: Option<&SifsObjectDetails>, clustered: bool
     "inspect details before changing this object's placement".to_string()
 }
 
+fn sifs_inspector_next_step(
+    details: Option<&SifsObjectDetails>,
+    clustered: bool,
+    loading: bool,
+    error: Option<&str>,
+) -> String {
+    if loading {
+        return "waiting for daemon metadata".to_string();
+    }
+    if error.is_some() {
+        return "show metadata details, then refresh placement".to_string();
+    }
+    if details.is_none() && clustered {
+        return "refresh placement to load durable-node metadata".to_string();
+    }
+    sifs_placement_next_step(details, clustered)
+}
+
 fn sifs_details_signature(details: Option<&SifsObjectDetails>) -> String {
     details
         .map(|details| {
@@ -4582,21 +4600,14 @@ impl InspectorView {
         y += 26.0;
 
         let details = files.selected_details.as_ref();
-        let policy = details
-            .map(|details| details.policy.as_str())
-            .unwrap_or(if files.clustered {
-                "cluster policy"
-            } else {
-                "local-owned"
-            });
-        y += 10.0 + Self::info_row_height(w, policy);
         let placement = sifs_replication_summary(details, files.clustered);
-        y += 4.0 + Self::info_row_height(w, &placement);
-        let locations = details
-            .map(details_locations)
-            .unwrap_or_else(|| short_node_label(&files.node_id));
-        y += 4.0 + Self::info_row_height(w, &locations);
-        let next_step = sifs_placement_next_step(details, files.clustered);
+        y += 10.0 + Self::info_row_height(w, &placement);
+        let next_step = sifs_inspector_next_step(
+            details,
+            files.clustered,
+            files.details_loading,
+            files.details_error.as_deref(),
+        );
         y += 4.0 + Self::info_row_height(w, &next_step);
 
         if files.inspector_details_open {
@@ -4608,8 +4619,22 @@ impl InspectorView {
                 y += Self::info_row_height(w, "Waiting for daemon metadata");
             }
 
+            let policy =
+                details
+                    .map(|details| details.policy.as_str())
+                    .unwrap_or(if files.clustered {
+                        "cluster policy"
+                    } else {
+                        "local-owned"
+                    });
+            y += 4.0 + Self::info_row_height(w, policy);
+            let locations = details
+                .map(details_locations)
+                .unwrap_or_else(|| short_node_label(&files.node_id));
+            y += 4.0 + Self::info_row_height(w, &locations);
+
             if let Some(details) = details {
-                y += Self::info_row_height(w, &details.file_system_id);
+                y += 4.0 + Self::info_row_height(w, &details.file_system_id);
                 y += 4.0 + Self::info_row_height(w, &short(&details.object_id, 28));
                 y += 4.0 + Self::info_row_height(w, &short(&details.version, 28));
                 y += 4.0
@@ -4783,6 +4808,14 @@ fn sifs_unavailable_rows(error: &str, details_open: bool) -> Vec<(&'static str, 
         rows.push(("Authority", "SIFS through daemon".to_string()));
     }
     rows
+}
+
+fn inspector_detail_button_label(details_open: bool) -> &'static str {
+    if details_open {
+        "Hide metadata"
+    } else {
+        "Show metadata"
+    }
 }
 
 fn inspector_detail_button_rect(bounds: Rect) -> Rect {
@@ -4963,6 +4996,7 @@ impl Widget for InspectorView {
             {
                 let details_open = self.shared.files().inspector_details_open;
                 self.shared.files_mut().inspector_details_open = !details_open;
+                ctx.request_measure();
                 ctx.request_paint();
                 ctx.request_semantics();
                 ctx.set_handled();
@@ -5291,23 +5325,14 @@ impl Widget for InspectorView {
             } else {
                 "local-owned"
             });
-        y = self.info_row(ctx, &theme, &pal, x, y + 10.0, w, "Policy", policy);
         let placement = sifs_replication_summary(details, files.clustered);
-        y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Placement", &placement);
-        let locations = details
-            .map(details_locations)
-            .unwrap_or_else(|| node_label.clone());
-        y = self.info_row(
-            ctx,
-            &theme,
-            &pal,
-            x,
-            y + 4.0,
-            w,
-            "Durable nodes",
-            &locations,
+        y = self.info_row(ctx, &theme, &pal, x, y + 10.0, w, "Placement", &placement);
+        let next_step = sifs_inspector_next_step(
+            details,
+            files.clustered,
+            files.details_loading,
+            files.details_error.as_deref(),
         );
-        let next_step = sifs_placement_next_step(details, files.clustered);
         y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Next", &next_step);
 
         if details_open {
@@ -5346,13 +5371,28 @@ impl Widget for InspectorView {
                 );
             }
 
+            y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Policy", policy);
+            let locations = details
+                .map(details_locations)
+                .unwrap_or_else(|| node_label.clone());
+            y = self.info_row(
+                ctx,
+                &theme,
+                &pal,
+                x,
+                y + 4.0,
+                w,
+                "Durable nodes",
+                &locations,
+            );
+
             if let Some(details) = details {
                 y = self.info_row(
                     ctx,
                     &theme,
                     &pal,
                     x,
-                    y,
+                    y + 4.0,
                     w,
                     "File system",
                     &details.file_system_id,
@@ -5509,12 +5549,8 @@ impl Widget for InspectorView {
             inspector_detail_button_rect(ctx.bounds()),
         );
         node.parent = Some(ctx.widget_id());
-        node.name = Some(if details_open {
-            "Hide details".to_string()
-        } else {
-            "Show details".to_string()
-        });
-        node.description = Some("File storage diagnostics".to_string());
+        node.name = Some(inspector_detail_button_label(details_open).to_string());
+        node.description = Some("File storage metadata and diagnostics".to_string());
         node.actions = vec![SemanticsAction::Activate];
         node.state.selected = details_open;
         ctx.push(node);
@@ -5612,11 +5648,7 @@ impl InspectorView {
         widgets::draw_text_in(
             ctx,
             Rect::new(rect.x() + 10.0, rect.y() + 4.0, rect.width() - 20.0, 18.0),
-            if details_open {
-                "Hide details"
-            } else {
-                "Show details"
-            },
+            inspector_detail_button_label(details_open),
             pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text),
         );
     }
@@ -7297,6 +7329,26 @@ mod tests {
     }
 
     #[test]
+    fn sifs_inspector_next_step_uses_actionable_metadata_state() {
+        assert_eq!(
+            sifs_inspector_next_step(None, true, true, None),
+            "waiting for daemon metadata"
+        );
+        assert_eq!(
+            sifs_inspector_next_step(None, true, false, Some("metadata read failed")),
+            "show metadata details, then refresh placement"
+        );
+        assert_eq!(
+            sifs_inspector_next_step(None, true, false, None),
+            "refresh placement to load durable-node metadata"
+        );
+        assert_eq!(
+            sifs_inspector_next_step(None, false, false, None),
+            "join a cluster to enable multi-node placement"
+        );
+    }
+
+    #[test]
     fn sifs_details_signature_tracks_placement_changes() {
         let mut details = SifsObjectDetails {
             file_system_id: "sifs".to_string(),
@@ -8556,13 +8608,13 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Show details")
+            .with_name("Show metadata")
             .click()?;
         assert!(shared.files().inspector_details_open);
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Hide details")
+            .with_name("Hide metadata")
             .click()?;
         assert!(!shared.files().inspector_details_open);
 
@@ -8602,13 +8654,13 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Show details")
+            .with_name("Show metadata")
             .click()?;
         assert!(shared.files().inspector_details_open);
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Hide details")
+            .with_name("Hide metadata")
             .click()?;
         assert!(!shared.files().inspector_details_open);
 
