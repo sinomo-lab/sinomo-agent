@@ -16,7 +16,8 @@ use crate::{
 };
 use sinomo_node::{
     DAEMON_MAIN_RUN_CAPABILITY, cluster_member_expected_daemon_process,
-    cluster_member_is_legacy_shadow_daemon, live_cluster_member_probe_possible,
+    cluster_member_is_legacy_shadow_daemon, cluster_member_is_local_process,
+    live_cluster_member_probe_possible,
 };
 
 const CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS: usize = 8;
@@ -126,13 +127,19 @@ pub(crate) fn handle_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
     match request.route.as_str() {
         CLUSTER_HEALTH_ROUTE => {
             let _: () = request.decode_body()?;
-            let rows = cluster_health_rows_with_probe(
-                paths,
-                state,
-                probe,
-                !cluster_health_rpc_request_is_local_scope(&request),
-                observed_at,
-            )?;
+            let local_scope = cluster_health_rpc_request_is_local_scope(&request);
+            let rows = if local_scope {
+                cluster_health_rows_with_probe_for_scope(
+                    paths,
+                    state,
+                    probe,
+                    false,
+                    true,
+                    observed_at,
+                )?
+            } else {
+                cluster_health_rows_with_probe(paths, state, probe, true, observed_at)?
+            };
             ObjectRpcResponse::encode_body(CLUSTER_HEALTH_ROUTE, &rows)
         }
         CLUSTER_NETWORK_PING_ROUTE => {
@@ -165,14 +172,20 @@ pub async fn handle_cluster_health_rpc_request_async<P: ClusterStatusAsyncProbe 
     match request.route.as_str() {
         CLUSTER_HEALTH_ROUTE => {
             let _: () = request.decode_body()?;
-            let rows = cluster_health_rows_with_async_probe(
-                paths,
-                state,
-                probe,
-                !cluster_health_rpc_request_is_local_scope(&request),
-                observed_at,
-            )
-            .await?;
+            let local_scope = cluster_health_rpc_request_is_local_scope(&request);
+            let rows = if local_scope {
+                cluster_health_rows_with_async_probe_for_scope(
+                    paths,
+                    state,
+                    probe,
+                    false,
+                    true,
+                    observed_at,
+                )
+                .await?
+            } else {
+                cluster_health_rows_with_async_probe(paths, state, probe, true, observed_at).await?
+            };
             ObjectRpcResponse::encode_body(CLUSTER_HEALTH_ROUTE, &rows)
         }
         CLUSTER_NETWORK_PING_ROUTE => {
@@ -308,14 +321,31 @@ pub fn cluster_health_rows_with_probe<P: ClusterStatusProbe + ?Sized>(
     include_peer_views: bool,
     observed_at: OffsetDateTime,
 ) -> Result<Vec<ClusterHealthRow>, NetworkError> {
+    cluster_health_rows_with_probe_for_scope(
+        paths,
+        state,
+        probe,
+        include_peer_views,
+        false,
+        observed_at,
+    )
+}
+
+fn cluster_health_rows_with_probe_for_scope<P: ClusterStatusProbe + ?Sized>(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    probe: &P,
+    include_peer_views: bool,
+    local_scope: bool,
+    observed_at: OffsetDateTime,
+) -> Result<Vec<ClusterHealthRow>, NetworkError> {
     let stored_statuses = read_cluster_node_statuses_from_kv(paths)?;
     let mut rows = Vec::new();
-    for member in &state.members {
-        if matches!(member.state, ClusterMemberState::Removed)
-            || !cluster_health_member_is_reportable(member)
-        {
-            continue;
-        }
+    for member in state
+        .members
+        .iter()
+        .filter(|member| cluster_health_member_is_in_scope(state, member, local_scope))
+    {
         let expected_process = cluster_member_expected_daemon_process(member);
         let live = probe
             .probe_member_status(state, member)
@@ -363,6 +393,25 @@ pub async fn cluster_health_rows_with_async_probe<P: ClusterStatusAsyncProbe + ?
     include_peer_views: bool,
     observed_at: OffsetDateTime,
 ) -> Result<Vec<ClusterHealthRow>, NetworkError> {
+    cluster_health_rows_with_async_probe_for_scope(
+        paths,
+        state,
+        probe,
+        include_peer_views,
+        false,
+        observed_at,
+    )
+    .await
+}
+
+async fn cluster_health_rows_with_async_probe_for_scope<P: ClusterStatusAsyncProbe + ?Sized>(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    probe: &P,
+    include_peer_views: bool,
+    local_scope: bool,
+    observed_at: OffsetDateTime,
+) -> Result<Vec<ClusterHealthRow>, NetworkError> {
     let paths_for_statuses = paths.clone();
     let stored_statuses = tokio::task::spawn_blocking(move || {
         read_cluster_node_statuses_from_kv(&paths_for_statuses)
@@ -375,10 +424,7 @@ pub async fn cluster_health_rows_with_async_probe<P: ClusterStatusAsyncProbe + ?
     let reportable_members = state
         .members
         .iter()
-        .filter(|member| {
-            !matches!(member.state, ClusterMemberState::Removed)
-                && cluster_health_member_is_reportable(member)
-        })
+        .filter(|member| cluster_health_member_is_in_scope(state, member, local_scope))
         .cloned()
         .collect::<Vec<_>>();
     let live_statuses = probe
@@ -561,6 +607,16 @@ fn cluster_health_node_is_nonreportable_member(
 
 fn cluster_health_member_is_reportable(member: &ClusterMemberRecord) -> bool {
     !cluster_member_is_legacy_shadow_daemon(member)
+}
+
+fn cluster_health_member_is_in_scope(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    local_scope: bool,
+) -> bool {
+    !matches!(member.state, ClusterMemberState::Removed)
+        && cluster_health_member_is_reportable(member)
+        && (!local_scope || cluster_member_is_local_process(state, member))
 }
 
 pub fn unknown_cluster_node_status(

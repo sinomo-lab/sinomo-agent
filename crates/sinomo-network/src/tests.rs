@@ -18319,14 +18319,13 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
     .expect("local health response");
     let local_response_rows =
         decode_cluster_health_rpc_response(&local_response).expect("local response rows");
-    assert_eq!(local_response_rows.len(), local_rows.len());
     assert_eq!(
         local_response_rows
             .iter()
-            .find(|row| row.member.node_id == target_node)
-            .expect("local response target row")
-            .availability,
-        ClusterNodeAvailability::Offline
+            .map(|row| row.member.node_id.clone())
+            .collect::<Vec<_>>(),
+        vec![local_node.clone()],
+        "local-scope health RPC should not spend its budget probing remote members"
     );
     let local_row = local_rows
         .iter()
