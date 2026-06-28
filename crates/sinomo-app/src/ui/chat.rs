@@ -554,6 +554,7 @@ pub struct ChatState {
     session_kind_filter: SessionKindFilter,
     pending_session_reset: Option<String>,
     session_edit_id: Option<String>,
+    session_edit_details_open: bool,
     session_title_draft: String,
     session_delete_confirm_id: Option<String>,
     pending_delete_id: Option<String>,
@@ -647,6 +648,7 @@ impl ChatState {
             session_kind_filter: SessionKindFilter::All,
             pending_session_reset: None,
             session_edit_id: None,
+            session_edit_details_open: false,
             session_title_draft: String::new(),
             session_delete_confirm_id: None,
             pending_delete_id: None,
@@ -1571,6 +1573,7 @@ impl ChatState {
         self.scroll = 0.0;
         self.stick_bottom = true;
         self.session_edit_id = None;
+        self.session_edit_details_open = false;
         self.session_title_draft.clear();
         self.session_delete_confirm_id = None;
     }
@@ -1666,6 +1669,7 @@ impl ChatState {
             return;
         };
         self.session_edit_id = Some(session.id);
+        self.session_edit_details_open = false;
         self.session_title_draft = session.title;
         self.session_delete_confirm_id = None;
     }
@@ -1679,8 +1683,13 @@ impl ChatState {
 
     fn close_session_edit(&mut self) {
         self.session_edit_id = None;
+        self.session_edit_details_open = false;
         self.session_title_draft.clear();
         self.session_delete_confirm_id = None;
+    }
+
+    fn toggle_session_edit_details(&mut self) {
+        self.session_edit_details_open = !self.session_edit_details_open;
     }
 
     fn set_session_title_draft(&mut self, title: String) {
@@ -1770,6 +1779,7 @@ impl ChatState {
             return;
         }
         self.session_edit_id = Some(session.id.clone());
+        self.session_edit_details_open = false;
         self.session_title_draft = session.title;
         self.session_delete_confirm_id = Some(session.id);
     }
@@ -1790,6 +1800,7 @@ impl ChatState {
         else {
             self.session_delete_confirm_id = None;
             self.session_edit_id = None;
+            self.session_edit_details_open = false;
             self.session_title_draft.clear();
             return;
         };
@@ -1855,6 +1866,7 @@ impl ChatState {
         self.pending_delete_id = Some(session_id.clone());
         self.session_delete_confirm_id = None;
         self.session_edit_id = None;
+        self.session_edit_details_open = false;
         self.session_title_draft.clear();
         self.sessions.retain(|session| session.id != session_id);
         if self.session_id == session_id {
@@ -2023,6 +2035,7 @@ impl ChatState {
         self.scroll = f32::MAX;
         self.stick_bottom = true;
         self.session_edit_id = None;
+        self.session_edit_details_open = false;
         self.session_title_draft.clear();
         self.session_delete_confirm_id = None;
         self.handle.send_command(ChatCommand::Resume {
@@ -2520,6 +2533,7 @@ impl ChatState {
         self.pending_session_reset = Some(session_id.clone());
         self.upsert_session_ref(session_ref.clone());
         self.session_edit_id = Some(session_id.clone());
+        self.session_edit_details_open = false;
         self.session_title_draft = session_ref.title.clone();
         self.session_delete_confirm_id = None;
         self.channel_agent_idx = 0;
@@ -3549,6 +3563,53 @@ fn dialog_section_label(shared: &Shared, text: impl Into<String>) -> Label {
         .color_when(move || palette(&s).text_muted)
 }
 
+fn session_edit_details(
+    shared: &Shared,
+    session: &SessionRef,
+    participant_count: usize,
+    participant_names: &[String],
+) -> impl Widget + use<> {
+    let storage = match session.kind {
+        ConversationKind::Chat => "SIFS-backed chat list",
+        ConversationKind::Channel => "SIFS channel record and timeline",
+    };
+    let mut details = Stack::vertical()
+        .spacing(6.0)
+        .alignment(Alignment::Stretch)
+        .with_child(dialog_section_label(shared, "Details"))
+        .with_child(muted_label(
+            shared,
+            format!("Type: {}", session_kind_icon_description(session.kind)),
+        ))
+        .with_child(muted_label(
+            shared,
+            format!("Session ID: {}", compact_line(&session.id, 48)),
+        ))
+        .with_child(muted_label(
+            shared,
+            format!("Updated: {}", session_updated_label(session.updated_unix)),
+        ))
+        .with_child(muted_label(shared, format!("Storage: {storage}")));
+
+    if session.kind == ConversationKind::Channel {
+        details = details.with_child(muted_label(
+            shared,
+            format!("Agents: {}", active_agents_label(participant_count)),
+        ));
+        if !participant_names.is_empty() {
+            details = details.with_child(muted_label(
+                shared,
+                format!(
+                    "Agent names: {}",
+                    compact_line(&participant_names.join(", "), 56)
+                ),
+            ));
+        }
+    }
+
+    details
+}
+
 fn session_meta_label(session: &SessionRef) -> String {
     let updated = session_updated_label(session.updated_unix);
     match session.kind {
@@ -4520,7 +4581,16 @@ fn sidebar_signature(
 }
 
 fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
-    let (session, draft, confirming_delete, participants, agent_status, agent_keys, agent_options) = {
+    let (
+        session,
+        draft,
+        confirming_delete,
+        details_open,
+        participants,
+        agent_status,
+        agent_keys,
+        agent_options,
+    ) = {
         let chat = shared.chat();
         let edit_id = chat.session_edit_id.as_deref()?;
         let session = chat
@@ -4555,6 +4625,7 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             session,
             chat.session_title_draft.clone(),
             chat.session_delete_confirm_id.as_deref() == Some(edit_id),
+            chat.session_edit_details_open,
             participants,
             agent_status,
             agent_keys,
@@ -4563,6 +4634,27 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     };
     let session_id = session.id.clone();
     let is_channel = session.kind == ConversationKind::Channel;
+    let participant_count = if is_channel {
+        participants
+            .len()
+            .max(session.participant_count)
+            .max(session.participant_names.len())
+    } else {
+        session.participant_count
+    };
+    let participant_names = if is_channel {
+        let names = participants
+            .iter()
+            .map(|participant| participant.agent_name.clone())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            session.participant_names.clone()
+        } else {
+            names
+        }
+    } else {
+        Vec::new()
+    };
     let title = if is_channel {
         "Edit channel"
     } else {
@@ -4610,6 +4702,26 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 ctx.request_paint();
             })
     };
+    let details_toggle = {
+        let s = shared.clone();
+        sui::Button::new(if details_open {
+            "Hide details"
+        } else {
+            "Show details"
+        })
+        .icon(if details_open {
+            IconGlyph::ChevronUp
+        } else {
+            IconGlyph::ChevronDown
+        })
+        .theme_when(secondary_button_theme(reader))
+        .on_press_with_ctx(move |ctx| {
+            s.chat_mut().toggle_session_edit_details();
+            ctx.request_measure();
+            ctx.request_paint();
+            ctx.request_semantics();
+        })
+    };
 
     let mut body = Stack::vertical()
         .spacing(10.0)
@@ -4623,7 +4735,23 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 .spacer()
                 .with_child(done)
                 .with_child(save),
+        )
+        .with_child(
+            Flex::horizontal()
+                .gap(6.0)
+                .align_items(Alignment::Center)
+                .spacer()
+                .with_child(details_toggle),
         );
+
+    if details_open {
+        body = body.with_child(session_edit_details(
+            shared,
+            &session,
+            participant_count,
+            &participant_names,
+        ));
+    }
 
     if is_channel {
         body = body
@@ -5281,11 +5409,12 @@ fn session_edit_dialog_signature(shared: &Shared) -> String {
         .collect::<Vec<_>>()
         .join("\u{1f}");
     format!(
-        "{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}",
         edit_id,
         chat.session_delete_confirm_id
             .as_deref()
             .unwrap_or_default(),
+        chat.session_edit_details_open,
         chat.channel_agent_idx,
         chat.agents.len(),
         chat.channel_create_rx.is_some(),
@@ -9074,6 +9203,34 @@ mod tests {
         );
         window
             .get_by_role(SemanticsRole::Button)
+            .with_name("Show details")
+            .click()?;
+        app.run_until_idle()?;
+        let snapshot = window.snapshot()?;
+        for label in [
+            "Hide details",
+            "Type: Direct chat",
+            "Storage: SIFS-backed chat list",
+        ] {
+            assert!(
+                snapshot
+                    .accessibility
+                    .nodes
+                    .iter()
+                    .any(|node| node.name.as_deref() == Some(label)),
+                "{label} should be visible after expanding chat details"
+            );
+        }
+        assert!(
+            snapshot.accessibility.nodes.iter().any(|node| {
+                node.name
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with("Session ID: "))
+            }),
+            "expanded details should expose the session id"
+        );
+        window
+            .get_by_role(SemanticsRole::Button)
             .with_name("Done")
             .click()?;
         assert!(shared.chat().session_edit_id.is_none());
@@ -9118,6 +9275,11 @@ mod tests {
             .with_name("Edit Team channel")
             .click()?;
         app.run_until_idle()?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Show details")
+            .click()?;
+        app.run_until_idle()?;
         let snapshot = window.snapshot()?;
 
         for label in [
@@ -9131,6 +9293,21 @@ mod tests {
                     node.role == SemanticsRole::Button && node.name.as_deref() == Some(label)
                 }),
                 "{label} control should be visible in the channel edit dialog"
+            );
+        }
+        for label in [
+            "Type: Shared channel",
+            "Storage: SIFS channel record and timeline",
+            "Agents: 2 active agents",
+            "Agent names: main-agent, coding-agent",
+        ] {
+            assert!(
+                snapshot
+                    .accessibility
+                    .nodes
+                    .iter()
+                    .any(|node| node.name.as_deref() == Some(label)),
+                "{label} detail should be visible after expanding channel details"
             );
         }
         assert!(
