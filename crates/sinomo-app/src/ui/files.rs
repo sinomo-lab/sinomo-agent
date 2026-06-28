@@ -115,9 +115,12 @@ enum FileActionPromptKind {
     NewFile,
     NewFolder,
     Copy,
+    CopySelected,
     CopyToSifs,
     CopyToLocal,
+    TransferSelected,
     Move,
+    MoveSelected,
     Rename,
     Delete,
     DeleteSelected,
@@ -167,9 +170,12 @@ impl FileActionPromptKind {
             Self::NewFile => "New file",
             Self::NewFolder => "New folder",
             Self::Copy => "Copy to",
+            Self::CopySelected => "Copy selected",
             Self::CopyToSifs => "Copy to SIFS",
             Self::CopyToLocal => "Download",
+            Self::TransferSelected => "Transfer selected",
             Self::Move => "Move to",
+            Self::MoveSelected => "Move selected",
             Self::Rename => "Rename",
             Self::Delete => "Delete",
             Self::DeleteSelected => "Delete selected",
@@ -182,14 +188,27 @@ impl FileActionPromptKind {
             Self::NewFile => "Create file",
             Self::NewFolder => "Create folder",
             Self::Copy => "Copy",
+            Self::CopySelected => "Copy selected",
             Self::CopyToSifs => "Copy to SIFS",
             Self::CopyToLocal => "Download",
+            Self::TransferSelected => "Transfer selected",
             Self::Move => "Move",
+            Self::MoveSelected => "Move selected",
             Self::Rename => "Rename",
             Self::Delete => "Delete",
             Self::DeleteSelected => "Delete selected",
         }
     }
+}
+
+fn file_prompt_uses_marked_targets(kind: FileActionPromptKind) -> bool {
+    matches!(
+        kind,
+        FileActionPromptKind::CopySelected
+            | FileActionPromptKind::TransferSelected
+            | FileActionPromptKind::MoveSelected
+            | FileActionPromptKind::DeleteSelected
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -266,6 +285,13 @@ struct FilesOperation {
     path: String,
     target: Option<String>,
     directory: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FilesQueuedOperation {
+    operation: FilesOperation,
+    title: String,
+    detail: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1140,7 +1166,7 @@ impl FilesState {
     }
 
     fn open_action_prompt(&mut self, kind: FileActionPromptKind) {
-        let targets = if kind == FileActionPromptKind::DeleteSelected {
+        let targets = if file_prompt_uses_marked_targets(kind) {
             self.marked_targets()
         } else {
             Vec::new()
@@ -1161,12 +1187,19 @@ impl FilesState {
                     suggested_copy_name(&target_name)
                 }
             }
+            FileActionPromptKind::CopySelected | FileActionPromptKind::MoveSelected => {
+                self.path.clone()
+            }
             FileActionPromptKind::CopyToSifs => {
                 default_sifs_transfer_destination(&self.sifs_path, &target_name)
             }
             FileActionPromptKind::CopyToLocal => {
                 default_local_transfer_destination(&self.local_path, &target_name)
             }
+            FileActionPromptKind::TransferSelected => match self.source {
+                FilesSourceKind::Sifs => self.local_path.clone(),
+                FilesSourceKind::Local => self.sifs_path.clone(),
+            },
             FileActionPromptKind::Move => target_name.clone(),
             FileActionPromptKind::Rename => target_name.clone(),
             FileActionPromptKind::Delete | FileActionPromptKind::DeleteSelected => String::new(),
@@ -1182,7 +1215,12 @@ impl FilesState {
             {
                 Some("select an item first".to_string())
             }
-            FileActionPromptKind::DeleteSelected if targets.is_empty() => {
+            FileActionPromptKind::CopySelected
+            | FileActionPromptKind::TransferSelected
+            | FileActionPromptKind::MoveSelected
+            | FileActionPromptKind::DeleteSelected
+                if targets.is_empty() =>
+            {
                 Some("mark one or more entries first".to_string())
             }
             _ => None,
@@ -1272,6 +1310,25 @@ impl FilesState {
             self.start_delete_targets(prompt.targets, waker);
             return;
         }
+        if matches!(
+            prompt.kind,
+            FileActionPromptKind::CopySelected
+                | FileActionPromptKind::TransferSelected
+                | FileActionPromptKind::MoveSelected
+        ) {
+            match self.operations_from_marked_prompt(&prompt) {
+                Ok(operations) => {
+                    self.action_prompt = None;
+                    self.start_marked_operations(operations, waker);
+                }
+                Err(error) => {
+                    if let Some(current) = &mut self.action_prompt {
+                        current.error = Some(error);
+                    }
+                }
+            }
+            return;
+        }
         match self.operation_from_prompt(&prompt) {
             Ok((operation, title, detail)) => {
                 self.action_prompt = None;
@@ -1293,6 +1350,11 @@ impl FilesState {
             FileActionPromptKind::GoTo => unreachable!("Go to path is handled before operations"),
             FileActionPromptKind::DeleteSelected => {
                 unreachable!("Delete selected queues individual delete operations")
+            }
+            FileActionPromptKind::CopySelected
+            | FileActionPromptKind::TransferSelected
+            | FileActionPromptKind::MoveSelected => {
+                unreachable!("marked-entry prompts queue individual operations")
             }
             FileActionPromptKind::NewFile => {
                 let path = self.join_child(&prompt.input)?;
@@ -1445,6 +1507,94 @@ impl FilesState {
         }
     }
 
+    fn operations_from_marked_prompt(
+        &self,
+        prompt: &FileActionPrompt,
+    ) -> Result<Vec<FilesQueuedOperation>, String> {
+        if prompt.targets.is_empty() {
+            return Err("mark one or more entries first".to_string());
+        }
+        let (operation_kind, destination_source, title) = match prompt.kind {
+            FileActionPromptKind::CopySelected => {
+                (FilesOperationKind::Copy, self.source, "Copy selected")
+            }
+            FileActionPromptKind::MoveSelected => {
+                (FilesOperationKind::Move, self.source, "Move selected")
+            }
+            FileActionPromptKind::TransferSelected => match self.source {
+                FilesSourceKind::Sifs => (
+                    FilesOperationKind::CopyToLocal,
+                    FilesSourceKind::Local,
+                    "Download selected",
+                ),
+                FilesSourceKind::Local => (
+                    FilesOperationKind::CopyToSifs,
+                    FilesSourceKind::Sifs,
+                    "Copy selected to SIFS",
+                ),
+            },
+            _ => return Err("prompt does not support marked entries".to_string()),
+        };
+        let destination_root =
+            self.resolve_destination_folder(destination_source, &prompt.input)?;
+        prompt
+            .targets
+            .iter()
+            .map(|target| {
+                let name = file_action_target_name(self.source, &target.path)?;
+                let destination =
+                    join_destination_child(destination_source, &destination_root, &name)?;
+                if self.source == destination_source && target.path == destination {
+                    return Err(format!("destination matches {}", target.path));
+                }
+                if self.source == destination_source
+                    && target.is_dir
+                    && destination_inside_source(self.source, &target.path, &destination)
+                {
+                    return Err(format!(
+                        "destination cannot be inside the selected folder {}",
+                        target.path
+                    ));
+                }
+                Ok(FilesQueuedOperation {
+                    operation: FilesOperation {
+                        kind: operation_kind,
+                        path: target.path.clone(),
+                        target: Some(destination.clone()),
+                        directory: target.is_dir,
+                    },
+                    title: title.to_string(),
+                    detail: format!("{} -> {destination}", target.path),
+                })
+            })
+            .collect()
+    }
+
+    fn resolve_destination_folder(
+        &self,
+        source: FilesSourceKind,
+        input: &str,
+    ) -> Result<String, String> {
+        match source {
+            FilesSourceKind::Sifs => {
+                let base = if self.source == FilesSourceKind::Sifs {
+                    &self.path
+                } else {
+                    &self.sifs_path
+                };
+                resolve_sifs_destination_folder(base, input)
+            }
+            FilesSourceKind::Local => {
+                let base = if self.source == FilesSourceKind::Local {
+                    &self.path
+                } else {
+                    &self.local_path
+                };
+                resolve_local_destination_path(base, input)
+            }
+        }
+    }
+
     fn start_operation(
         &mut self,
         operation: FilesOperation,
@@ -1493,6 +1643,17 @@ impl FilesState {
             .execute_operation(operation, &self.path)
             .map_err(FilesOperationFailure::Error);
         self.apply_operation_result(request_id, result);
+    }
+
+    fn start_marked_operations(
+        &mut self,
+        operations: Vec<FilesQueuedOperation>,
+        waker: Option<sui::UiHandle>,
+    ) {
+        self.clear_marked_entries();
+        for queued in operations {
+            self.start_operation(queued.operation, queued.title, queued.detail, waker.clone());
+        }
     }
 
     fn start_delete_targets(
@@ -2361,6 +2522,27 @@ fn resolve_sifs_destination_path(current_path: &str, input: &str) -> Result<Stri
     Ok(normalized)
 }
 
+fn resolve_sifs_destination_folder(current_path: &str, input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("destination folder cannot be empty".to_string());
+    }
+    if trimmed.bytes().any(|byte| byte == 0) {
+        return Err("destination folder cannot contain NUL bytes".to_string());
+    }
+    let candidate = if trimmed.starts_with('/') || trimmed.starts_with('\\') {
+        trimmed.to_string()
+    } else {
+        let parent = normalize_path(current_path);
+        if parent == "/" {
+            format!("/{trimmed}")
+        } else {
+            format!("{parent}/{trimmed}")
+        }
+    };
+    Ok(normalize_path(&candidate))
+}
+
 fn join_local_child(parent: &str, name: &str) -> Result<String, String> {
     let child = validated_local_relative_path(name, "name")?;
     Ok(Path::new(parent).join(child).to_string_lossy().into_owned())
@@ -2383,6 +2565,35 @@ fn resolve_local_destination_path(current_path: &str, input: &str) -> Result<Str
             .join(child)
             .to_string_lossy()
             .into_owned())
+    }
+}
+
+fn join_destination_child(
+    source: FilesSourceKind,
+    parent: &str,
+    name: &str,
+) -> Result<String, String> {
+    match source {
+        FilesSourceKind::Sifs => join_sifs_child(parent, name),
+        FilesSourceKind::Local => join_local_child(parent, name),
+    }
+}
+
+fn file_action_target_name(source: FilesSourceKind, path: &str) -> Result<String, String> {
+    match source {
+        FilesSourceKind::Sifs => {
+            let path = normalize_path(path);
+            path.rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| format!("cannot determine item name for {path}"))
+        }
+        FilesSourceKind::Local => Path::new(path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("cannot determine item name for {path}")),
     }
 }
 
@@ -5580,6 +5791,58 @@ fn files_clear_marks_button(shared: &Shared, reader: &ThemeReader) -> impl Widge
         })
 }
 
+fn files_copy_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    IconButton::new(IconGlyph::Restore, "Copy marked entries")
+        .size(30.0)
+        .theme_when(clone_reader(reader))
+        .enabled_when({
+            let s = s.clone();
+            move || !s.files().loading && s.files().marked_count() > 0
+        })
+        .on_press_with_ctx(move |ctx| {
+            s.files_mut()
+                .open_action_prompt(FileActionPromptKind::CopySelected);
+            request_files_overlay_rebuild(ctx);
+        })
+}
+
+fn files_transfer_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let (glyph, label) = match shared.files().source {
+        FilesSourceKind::Sifs => (IconGlyph::Download, "Download marked entries"),
+        FilesSourceKind::Local => (IconGlyph::Storage, "Copy marked entries to SIFS"),
+    };
+    IconButton::new(glyph, label)
+        .size(30.0)
+        .theme_when(clone_reader(reader))
+        .enabled_when({
+            let s = s.clone();
+            move || !s.files().loading && s.files().marked_count() > 0
+        })
+        .on_press_with_ctx(move |ctx| {
+            s.files_mut()
+                .open_action_prompt(FileActionPromptKind::TransferSelected);
+            request_files_overlay_rebuild(ctx);
+        })
+}
+
+fn files_move_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    IconButton::new(IconGlyph::ChevronRight, "Move marked entries")
+        .size(30.0)
+        .theme_when(clone_reader(reader))
+        .enabled_when({
+            let s = s.clone();
+            move || !s.files().loading && s.files().marked_count() > 0
+        })
+        .on_press_with_ctx(move |ctx| {
+            s.files_mut()
+                .open_action_prompt(FileActionPromptKind::MoveSelected);
+            request_files_overlay_rebuild(ctx);
+        })
+}
+
 fn files_delete_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
     IconButton::new(IconGlyph::Trash, "Delete marked entries")
@@ -5614,6 +5877,9 @@ fn files_filter_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
         )
         .with_child(files_mark_visible_button(shared, reader))
         .with_child(files_clear_marks_button(shared, reader))
+        .with_child(files_copy_marked_button(shared, reader))
+        .with_child(files_transfer_marked_button(shared, reader))
+        .with_child(files_move_marked_button(shared, reader))
         .with_child(files_delete_marked_button(shared, reader))
 }
 
@@ -9170,6 +9436,13 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .as_deref()
             .map(|path| format!("Copy {path} to another {} path", source.operation_scope()))
             .unwrap_or_else(|| "Select a file to copy".to_string()),
+        FileActionPromptKind::CopySelected => {
+            let label = selected_entries_label(prompt.targets.len());
+            format!(
+                "Copy {label} into a destination folder in {}",
+                source.operation_scope()
+            )
+        }
         FileActionPromptKind::CopyToSifs => prompt
             .target_path
             .as_deref()
@@ -9180,11 +9453,25 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .as_deref()
             .map(|path| format!("Download SIFS {path} to a local path"))
             .unwrap_or_else(|| "Select a SIFS file or folder to download".to_string()),
+        FileActionPromptKind::TransferSelected => {
+            let label = selected_entries_label(prompt.targets.len());
+            match source {
+                FilesSourceKind::Sifs => format!("Download {label} into a local folder"),
+                FilesSourceKind::Local => format!("Copy {label} into a SIFS folder"),
+            }
+        }
         FileActionPromptKind::Move => prompt
             .target_path
             .as_deref()
             .map(|path| format!("Move {path} to another {} path", source.operation_scope()))
             .unwrap_or_else(|| "Select an item to move".to_string()),
+        FileActionPromptKind::MoveSelected => {
+            let label = selected_entries_label(prompt.targets.len());
+            format!(
+                "Move {label} into a destination folder in {}",
+                source.operation_scope()
+            )
+        }
         FileActionPromptKind::Rename => prompt
             .target_path
             .as_deref()
@@ -9203,8 +9490,11 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     let input_label = match prompt.kind {
         FileActionPromptKind::GoTo => "Path",
         FileActionPromptKind::Copy
+        | FileActionPromptKind::CopySelected
         | FileActionPromptKind::CopyToSifs
         | FileActionPromptKind::CopyToLocal
+        | FileActionPromptKind::TransferSelected
+        | FileActionPromptKind::MoveSelected
         | FileActionPromptKind::Move => "Destination",
         FileActionPromptKind::Delete | FileActionPromptKind::DeleteSelected => "Type DELETE",
         _ => "Name",
@@ -9215,6 +9505,15 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             FileActionPromptKind::GoTo => go_to_path_placeholder(source),
             FileActionPromptKind::CopyToSifs => "/services/artifact",
             FileActionPromptKind::CopyToLocal => "C:\\Users\\you\\Downloads\\artifact",
+            FileActionPromptKind::CopySelected | FileActionPromptKind::MoveSelected => match source
+            {
+                FilesSourceKind::Sifs => "/services/archive",
+                FilesSourceKind::Local => "archive",
+            },
+            FileActionPromptKind::TransferSelected => match source {
+                FilesSourceKind::Sifs => "C:\\Users\\you\\Downloads",
+                FilesSourceKind::Local => "/services/imports",
+            },
             _ => input_label,
         };
         sui::TextInput::new(format!("files-action-input-{title}"))
@@ -11735,6 +12034,121 @@ mod tests {
     }
 
     #[test]
+    fn marked_entries_queue_batch_copy_move_and_transfer_tasks() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.loaded = true;
+        state.loading = false;
+        state.path = "/services".to_string();
+        state.sifs_path = "/services".to_string();
+        state.local_path = files_test_temp_dir("batch-download")
+            .to_string_lossy()
+            .into_owned();
+        state.entries = vec![
+            SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/services/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            },
+            SifsEntry {
+                name: "notes.md".to_string(),
+                path: "/services/notes.md".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(9),
+            },
+            SifsEntry {
+                name: "logs".to_string(),
+                path: "/services/logs".to_string(),
+                is_dir: true,
+                is_link: false,
+                size: None,
+            },
+        ];
+        assert!(state.toggle_marked_entry(0));
+        assert!(state.toggle_marked_entry(2));
+
+        state.open_action_prompt(FileActionPromptKind::CopySelected);
+        state.set_action_prompt_input("/users/archive".to_string());
+        let prompt = state.action_prompt.as_ref().expect("copy selected").clone();
+        let operations = state
+            .operations_from_marked_prompt(&prompt)
+            .expect("copy selected operations");
+        assert_eq!(operations.len(), 2);
+        assert_eq!(operations[0].operation.kind, FilesOperationKind::Copy);
+        assert_eq!(
+            operations[0].operation.target.as_deref(),
+            Some("/users/archive/artifact.txt")
+        );
+        assert_eq!(
+            operations[1].operation.target.as_deref(),
+            Some("/users/archive/logs")
+        );
+
+        state.open_action_prompt(FileActionPromptKind::MoveSelected);
+        state.set_action_prompt_input("/users/moved".to_string());
+        let prompt = state.action_prompt.as_ref().expect("move selected").clone();
+        let operations = state
+            .operations_from_marked_prompt(&prompt)
+            .expect("move selected operations");
+        assert_eq!(operations[0].operation.kind, FilesOperationKind::Move);
+        assert_eq!(
+            operations[0].operation.target.as_deref(),
+            Some("/users/moved/artifact.txt")
+        );
+
+        state.open_action_prompt(FileActionPromptKind::TransferSelected);
+        let prompt = state
+            .action_prompt
+            .as_ref()
+            .expect("transfer selected")
+            .clone();
+        let operations = state
+            .operations_from_marked_prompt(&prompt)
+            .expect("transfer selected operations");
+        assert_eq!(
+            operations[0].operation.kind,
+            FilesOperationKind::CopyToLocal
+        );
+        let expected_download = Path::new(&state.local_path)
+            .join("artifact.txt")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            operations[0].operation.target.as_deref(),
+            Some(expected_download.as_str())
+        );
+
+        let (tx, rx) = mpsc::channel();
+        state.worker_tx = Some(tx);
+        state.open_action_prompt(FileActionPromptKind::CopySelected);
+        state.set_action_prompt_input("/services/archive".to_string());
+        state.submit_action_prompt(None);
+
+        assert!(state.action_prompt.is_none());
+        assert_eq!(state.marked_count(), 0);
+        assert_eq!(state.tasks.len(), 2);
+        for expected in ["/services/archive/artifact.txt", "/services/archive/logs"] {
+            match rx.try_recv().expect("copy operation command") {
+                FilesWorkerCommand::Operation {
+                    source, operation, ..
+                } => {
+                    assert_eq!(source, FilesSourceKind::Sifs);
+                    assert_eq!(operation.kind, FilesOperationKind::Copy);
+                    assert_eq!(operation.target.as_deref(), Some(expected));
+                }
+                FilesWorkerCommand::List { .. } => panic!("expected operation command"),
+                FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+                FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+            }
+        }
+
+        let _ = fs::remove_dir_all(&state.local_path);
+    }
+
+    #[test]
     fn setting_filter_clears_hidden_selection() {
         let backend = Backend::local_fallback();
         let mut state = FilesState::new(&backend);
@@ -12696,6 +13110,60 @@ mod tests {
             .click()?;
         assert_eq!(shared.files().marked_count(), 1);
         assert!(shared.files().entry_marked(0));
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Copy marked entries")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("copy selected prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::CopySelected);
+            assert_eq!(prompt.targets.len(), 1);
+            assert_eq!(prompt.targets[0].path, "/services/artifact.txt");
+            assert_eq!(prompt.input, "/services");
+        }
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel")
+            .click()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Download marked entries")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files
+                .action_prompt
+                .as_ref()
+                .expect("transfer selected prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::TransferSelected);
+            assert_eq!(prompt.targets.len(), 1);
+            assert_eq!(prompt.targets[0].path, "/services/artifact.txt");
+            assert_eq!(prompt.input, files.local_path);
+        }
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel")
+            .click()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Move marked entries")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("move selected prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::MoveSelected);
+            assert_eq!(prompt.targets.len(), 1);
+            assert_eq!(prompt.targets[0].path, "/services/artifact.txt");
+            assert_eq!(prompt.input, "/services");
+        }
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel")
+            .click()?;
 
         window
             .get_by_role(sui::SemanticsRole::Button)
