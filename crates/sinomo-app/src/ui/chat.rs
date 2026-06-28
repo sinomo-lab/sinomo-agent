@@ -40,6 +40,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sui::{
     Alignment, ArrangeCtx, Color, Constraints, DefaultTheme, Event, EventCtx, Flex, FlexItem,
@@ -2939,6 +2940,44 @@ fn muted_label(shared: &Shared, text: impl Into<String>) -> Label {
     Label::new(text).color_when(move || palette(&s).text_muted)
 }
 
+fn session_meta_label(session: &SessionRef) -> String {
+    let updated = session_updated_label(session.updated_unix);
+    match session.kind {
+        ConversationKind::Chat => format!("Chat · {updated}"),
+        ConversationKind::Channel => {
+            format!("{} · {updated}", plural_agents(session.participant_count))
+        }
+    }
+}
+
+fn plural_agents(count: usize) -> String {
+    if count == 1 {
+        "1 agent".to_string()
+    } else {
+        format!("{count} agents")
+    }
+}
+
+fn session_updated_label(updated_unix: i64) -> String {
+    if updated_unix <= 0 {
+        return "not saved".to_string();
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(updated_unix);
+    let age = now.saturating_sub(updated_unix);
+    if age < 60 {
+        "just now".to_string()
+    } else if age < 60 * 60 {
+        format!("{}m ago", age / 60)
+    } else if age < 24 * 60 * 60 {
+        format!("{}h ago", age / (60 * 60))
+    } else {
+        format!("{}d ago", age / (24 * 60 * 60))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sidebar — agents + sessions ListViews (rebuilt when the lists change).
 // ---------------------------------------------------------------------------
@@ -3184,7 +3223,7 @@ impl Widget for ChatSessionRow {
             } else {
                 210.0
             },
-            24.0,
+            SIDEBAR_ROW_H,
         ))
     }
 
@@ -3207,12 +3246,7 @@ impl Widget for ChatSessionRow {
                 draw_glyph(
                     ctx,
                     IconGlyph::Chat,
-                    Rect::new(
-                        leading.x() + 1.0,
-                        leading.y() + (leading.height() - side) * 0.5,
-                        side,
-                        side,
-                    ),
+                    Rect::new(leading.x() + 1.0, leading.y() + 7.0, side, side),
                     icon_color,
                 );
             }
@@ -3243,29 +3277,31 @@ impl Widget for ChatSessionRow {
         }
 
         let edit_gap = if show_edit { 28.0 } else { 0.0 };
-        let participant_text = (self.session.kind == ConversationKind::Channel)
-            .then(|| format!("{} agents", self.session.participant_count));
-        let participant_w = participant_text.as_ref().map(|_| 50.0).unwrap_or(0.0);
-        if let Some(text) = participant_text {
-            let rect = Rect::new(
-                (bounds.max_x() - edit_gap - participant_w).max(bounds.x()),
-                bounds.y(),
-                participant_w,
-                bounds.height(),
-            );
-            widgets::draw_text_in(ctx, rect, &text, meta_style);
-        }
-
         let title_x = leading.max_x() + 5.0;
-        let title_right = bounds.max_x() - edit_gap - participant_w - 5.0;
+        let title_right = bounds.max_x() - edit_gap - 5.0;
         let title_rect = Rect::new(
             title_x,
-            bounds.y(),
+            bounds.y() + 2.0,
             (title_right - title_x).max(0.0),
-            bounds.height(),
+            17.0,
         );
         ctx.push_clip_rect(title_rect);
         widgets::draw_text_in(ctx, title_rect, &self.session.title, title_style);
+        ctx.pop_clip();
+
+        let meta_rect = Rect::new(
+            title_x,
+            bounds.y() + 18.0,
+            (title_right - title_x).max(0.0),
+            15.0,
+        );
+        ctx.push_clip_rect(meta_rect);
+        widgets::draw_text_in(
+            ctx,
+            meta_rect,
+            &session_meta_label(&self.session),
+            meta_style,
+        );
         ctx.pop_clip();
     }
 
@@ -6504,6 +6540,27 @@ mod tests {
             },
         ];
         state.info.agent = "main-agent".to_string();
+    }
+
+    #[test]
+    fn session_meta_label_exposes_kind_agents_and_save_state() {
+        let channel = SessionRef {
+            id: "channel-meta".to_string(),
+            title: "Release triage".to_string(),
+            kind: ConversationKind::Channel,
+            updated_unix: 0,
+            participant_count: 2,
+        };
+        let chat = SessionRef {
+            id: "chat-meta".to_string(),
+            title: "Old question".to_string(),
+            kind: ConversationKind::Chat,
+            updated_unix: 0,
+            participant_count: 1,
+        };
+
+        assert_eq!(session_meta_label(&channel), "2 agents · not saved");
+        assert_eq!(session_meta_label(&chat), "Chat · not saved");
     }
 
     fn isolated_chat_state(_slug: &str) -> (Backend, ChatState) {
