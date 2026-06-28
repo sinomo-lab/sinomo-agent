@@ -188,6 +188,8 @@ enum FilesOperationKind {
     Rename,
     Delete,
     RefreshPlacement,
+    PinContent,
+    UnpinContent,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1054,6 +1056,46 @@ impl FilesState {
                 directory: entry.is_dir,
             },
             "Refresh placement".to_string(),
+            entry.path,
+            waker,
+        );
+    }
+
+    fn start_pin_content(&mut self, waker: Option<sui::UiHandle>) {
+        if self.source != FilesSourceKind::Sifs {
+            return;
+        }
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+        self.start_operation(
+            FilesOperation {
+                kind: FilesOperationKind::PinContent,
+                path: entry.path.clone(),
+                target: None,
+                directory: entry.is_dir,
+            },
+            "Pin content".to_string(),
+            entry.path,
+            waker,
+        );
+    }
+
+    fn start_unpin_content(&mut self, waker: Option<sui::UiHandle>) {
+        if self.source != FilesSourceKind::Sifs {
+            return;
+        }
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+        self.start_operation(
+            FilesOperation {
+                kind: FilesOperationKind::UnpinContent,
+                path: entry.path.clone(),
+                target: None,
+                directory: entry.is_dir,
+            },
+            "Unpin content".to_string(),
             entry.path,
             waker,
         );
@@ -2000,6 +2042,30 @@ fn execute_sifs_operation(
                 message: format!("requested placement refresh for {}", operation.path),
             })
         }
+        FilesOperationKind::PinContent => {
+            let node_id = browser
+                .pin_content(&operation.path)
+                .map_err(FilesOperationFailure::Error)?;
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: Some(operation.path.clone()),
+                message: format!("pinned content for {} on {node_id}", operation.path),
+            })
+        }
+        FilesOperationKind::UnpinContent => {
+            let removed = browser
+                .unpin_content(&operation.path)
+                .map_err(FilesOperationFailure::Error)?;
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: Some(operation.path.clone()),
+                message: if removed {
+                    format!("removed content pin for {}", operation.path)
+                } else {
+                    format!("no content pin was recorded for {}", operation.path)
+                },
+            })
+        }
     }
 }
 
@@ -2117,6 +2183,9 @@ fn execute_local_operation_with_progress(
         FilesOperationKind::RefreshPlacement => Err(FilesOperationFailure::Error(
             "placement refresh is only available for SIFS".to_string(),
         )),
+        FilesOperationKind::PinContent | FilesOperationKind::UnpinContent => Err(
+            FilesOperationFailure::Error("content pinning is only available for SIFS".to_string()),
+        ),
     }
 }
 
@@ -2631,6 +2700,12 @@ fn files_operation_cancelled_detail(operation: &FilesOperation) -> String {
                 operation.path
             )
         }
+        FilesOperationKind::PinContent => {
+            format!("cancelled before pinning content for {}", operation.path)
+        }
+        FilesOperationKind::UnpinContent => {
+            format!("cancelled before unpinning content for {}", operation.path)
+        }
     }
 }
 
@@ -2659,6 +2734,12 @@ fn operation_progress_label(
         FilesOperationKind::Delete => format!("{phase} delete in {scope}: {}", operation.path),
         FilesOperationKind::RefreshPlacement => {
             format!("{phase} placement refresh in {scope}: {}", operation.path)
+        }
+        FilesOperationKind::PinContent => {
+            format!("{phase} content pin in {scope}: {}", operation.path)
+        }
+        FilesOperationKind::UnpinContent => {
+            format!("{phase} content unpin in {scope}: {}", operation.path)
         }
     }
 }
@@ -4607,6 +4688,8 @@ enum InspectorAction {
     Rename,
     Delete,
     RefreshPlacement,
+    PinContent,
+    UnpinContent,
 }
 
 impl InspectorAction {
@@ -4618,6 +4701,8 @@ impl InspectorAction {
             Self::Rename => "Rename",
             Self::Delete => "Delete",
             Self::RefreshPlacement => "Refresh placement",
+            Self::PinContent => "Pin content",
+            Self::UnpinContent => "Unpin content",
         }
     }
 
@@ -4629,6 +4714,8 @@ impl InspectorAction {
             Self::Rename => IconGlyph::MoreHorizontal,
             Self::Delete => IconGlyph::Trash,
             Self::RefreshPlacement => IconGlyph::Storage,
+            Self::PinContent => IconGlyph::Lock,
+            Self::UnpinContent => IconGlyph::Unlock,
         }
     }
 
@@ -4638,7 +4725,9 @@ impl InspectorAction {
             Self::Move => Some(FileActionPromptKind::Move),
             Self::Rename => Some(FileActionPromptKind::Rename),
             Self::Delete => Some(FileActionPromptKind::Delete),
-            Self::OpenFolder | Self::RefreshPlacement => None,
+            Self::OpenFolder | Self::RefreshPlacement | Self::PinContent | Self::UnpinContent => {
+                None
+            }
         }
     }
 
@@ -4646,6 +4735,8 @@ impl InspectorAction {
         match self {
             Self::OpenFolder => "Open folder".to_string(),
             Self::RefreshPlacement => format!("Refresh placement {}", entry.name),
+            Self::PinContent => format!("Pin content {}", entry.name),
+            Self::UnpinContent => format!("Unpin content {}", entry.name),
             Self::Copy | Self::Move | Self::Rename | Self::Delete => {
                 format!("{} {}", self.label(), entry.name)
             }
@@ -4664,6 +4755,8 @@ fn inspector_actions(source: FilesSourceKind, entry: &SifsEntry) -> Vec<Inspecto
     actions.push(InspectorAction::Delete);
     if source == FilesSourceKind::Sifs {
         actions.push(InspectorAction::RefreshPlacement);
+        actions.push(InspectorAction::PinContent);
+        actions.push(InspectorAction::UnpinContent);
     }
     actions
 }
@@ -4746,6 +4839,8 @@ fn inspector_action_button_widget_id(
         InspectorAction::Rename => 7_541,
         InspectorAction::Delete => 7_553,
         InspectorAction::RefreshPlacement => 7_571,
+        InspectorAction::PinContent => 7_587,
+        InspectorAction::UnpinContent => 7_599,
     };
     sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(salt))
 }
@@ -4831,6 +4926,16 @@ impl Widget for InspectorView {
                     InspectorAction::RefreshPlacement => {
                         let waker = { self.shared.borrow().waker.clone() };
                         self.shared.files_mut().start_placement_refresh(waker);
+                        request_files_overlay_rebuild(ctx);
+                    }
+                    InspectorAction::PinContent => {
+                        let waker = { self.shared.borrow().waker.clone() };
+                        self.shared.files_mut().start_pin_content(waker);
+                        request_files_overlay_rebuild(ctx);
+                    }
+                    InspectorAction::UnpinContent => {
+                        let waker = { self.shared.borrow().waker.clone() };
+                        self.shared.files_mut().start_unpin_content(waker);
                         request_files_overlay_rebuild(ctx);
                     }
                     InspectorAction::Copy
@@ -5378,6 +5483,12 @@ impl Widget for InspectorView {
                     InspectorAction::RefreshPlacement => {
                         format!("Refresh SIFS placement metadata for {}", entry.path)
                     }
+                    InspectorAction::PinContent => {
+                        format!("Pin SIFS content on this node for {}", entry.path)
+                    }
+                    InspectorAction::UnpinContent => {
+                        format!("Remove this node's SIFS content pin for {}", entry.path)
+                    }
                     InspectorAction::Copy => format!("Copy {}", entry.path),
                     InspectorAction::Move => format!("Move {}", entry.path),
                     InspectorAction::Rename => format!("Rename {}", entry.path),
@@ -5573,7 +5684,9 @@ impl InspectorView {
         let (fill, border, text, icon) = match action {
             InspectorAction::OpenFolder => (pal.accent, pal.accent, pal.on_accent, pal.on_accent),
             InspectorAction::Delete => (pal.field, pal.border, pal.warn, pal.warn),
-            InspectorAction::RefreshPlacement => (pal.field, pal.border, pal.accent, pal.accent),
+            InspectorAction::RefreshPlacement
+            | InspectorAction::PinContent
+            | InspectorAction::UnpinContent => (pal.field, pal.border, pal.accent, pal.accent),
             InspectorAction::Copy | InspectorAction::Move | InspectorAction::Rename => {
                 (pal.field, pal.border, pal.text, pal.text_muted)
             }
@@ -8368,6 +8481,48 @@ mod tests {
                 assert_eq!(request_id, shared.files().tasks[0].id);
                 assert_eq!(source, FilesSourceKind::Sifs);
                 assert_eq!(operation.kind, FilesOperationKind::RefreshPlacement);
+                assert_eq!(operation.path, "/services/artifact.txt");
+            }
+            FilesWorkerCommand::List { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+        }
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Pin content artifact.txt")
+            .click()?;
+
+        assert_eq!(shared.files().tasks[0].title, "Pin content");
+        match rx.try_recv().expect("content pin command") {
+            FilesWorkerCommand::Operation {
+                request_id,
+                source,
+                operation,
+            } => {
+                assert_eq!(request_id, shared.files().tasks[0].id);
+                assert_eq!(source, FilesSourceKind::Sifs);
+                assert_eq!(operation.kind, FilesOperationKind::PinContent);
+                assert_eq!(operation.path, "/services/artifact.txt");
+            }
+            FilesWorkerCommand::List { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+        }
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Unpin content artifact.txt")
+            .click()?;
+
+        assert_eq!(shared.files().tasks[0].title, "Unpin content");
+        match rx.try_recv().expect("content unpin command") {
+            FilesWorkerCommand::Operation {
+                request_id,
+                source,
+                operation,
+            } => {
+                assert_eq!(request_id, shared.files().tasks[0].id);
+                assert_eq!(source, FilesSourceKind::Sifs);
+                assert_eq!(operation.kind, FilesOperationKind::UnpinContent);
                 assert_eq!(operation.path, "/services/artifact.txt");
             }
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),

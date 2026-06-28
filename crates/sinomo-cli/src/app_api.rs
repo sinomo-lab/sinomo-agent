@@ -2203,6 +2203,20 @@ impl SifsBrowser {
         }
     }
 
+    pub fn pin_content(&self, path: &str) -> Result<String, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.pin_content(path),
+            SifsBrowserBackend::Remote(remote) => remote.pin_content(path),
+        }
+    }
+
+    pub fn unpin_content(&self, path: &str) -> Result<bool, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.unpin_content(path),
+            SifsBrowserBackend::Remote(remote) => remote.unpin_content(path),
+        }
+    }
+
     pub fn parent(&self, path: &str) -> Option<String> {
         match &self.backend {
             SifsBrowserBackend::Local(backend) => backend.parent_path(path),
@@ -2361,6 +2375,26 @@ impl RemoteSifsBrowser {
             &sinomo_runtime::daemon::DaemonClusterMaintenanceRefreshRequest,
         )?;
         Ok(())
+    }
+
+    fn pin_content(&self, path: &str) -> Result<String, String> {
+        let response: sinomo_runtime::daemon::DaemonDfsBrowserPinContentResponse = self.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserPinContentRequest {
+                path: path.to_string(),
+            },
+        )?;
+        Ok(response.node_id)
+    }
+
+    fn unpin_content(&self, path: &str) -> Result<bool, String> {
+        let response: sinomo_runtime::daemon::DaemonDfsBrowserUnpinContentResponse = self.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserUnpinContentRequest {
+                path: path.to_string(),
+            },
+        )?;
+        Ok(response.removed)
     }
 }
 

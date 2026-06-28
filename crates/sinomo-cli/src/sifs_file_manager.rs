@@ -9,11 +9,11 @@ use sinomo_runtime::dfs::{
     AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsEndpointTransport,
     DfsMetadataJournalReplicationOptions, DfsMetadataShardConfig, DfsNodeAdvertisement,
     DfsObjectKind, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
-    DfsPeerTransportFuture, DfsStat, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
-    cluster_dfs_data_endpoints, content_services_prefix, default_dfs_metadata_root,
-    default_dfs_metadata_shards_root, fallback_dfs_node_id, metadata_shards_prefix,
-    open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    publish_cluster_dfs_metadata_journal_with_peer_transport,
+    DfsPeerTransportFuture, DfsPinAddRequest, DfsPinMode, DfsStat, DfsWriteOptions,
+    LocalContentStore, NetworkedDfsService, cluster_dfs_data_endpoints, content_services_prefix,
+    default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
+    fallback_dfs_node_id, metadata_shards_prefix, open_local_sharded_metadata_backend,
+    open_root_local_metadata_backend, publish_cluster_dfs_metadata_journal_with_peer_transport,
     refresh_cluster_dfs_kv_snapshot_with_peer_transport, sifs_file_system_id,
 };
 use sinomo_runtime::kv::{self, KvError, KvOp, KvTxn, KvTxnResponse};
@@ -357,6 +357,42 @@ impl SifsFileManagerBackend {
         service
             .posix_mkdir_all_without_local_replay(&path)
             .map_err(|error| format!("cannot create SIFS directory {path}: {error}"))
+    }
+
+    pub(crate) fn pin_content(&self, path: &str) -> Result<String, String> {
+        let stat = self.dfs_stat(path)?;
+        let node_id = self.node_label();
+        let node = NodeId::new(&node_id).map_err(|error| {
+            format!("cannot pin SIFS content on invalid local node id {node_id}: {error}")
+        })?;
+        sinomo_runtime::dfs::add_local_dfs_pin(
+            default_dfs_pin_root(&self.data_dir),
+            DfsPinAddRequest {
+                file_system_id: stat.file_system_id,
+                path: stat.path,
+                object_id: Some(stat.object_id),
+                pinned_by_node_id: node,
+                mode: DfsPinMode::Content,
+                created_at: time::OffsetDateTime::now_utc(),
+            },
+        )
+        .map_err(|error| format!("cannot pin SIFS content {path}: {error}"))?;
+        Ok(node_id)
+    }
+
+    pub(crate) fn unpin_content(&self, path: &str) -> Result<bool, String> {
+        let stat = self.dfs_stat(path)?;
+        let node_id = self.node_label();
+        let node = NodeId::new(&node_id).map_err(|error| {
+            format!("cannot unpin SIFS content on invalid local node id {node_id}: {error}")
+        })?;
+        sinomo_runtime::dfs::remove_local_dfs_pin(
+            default_dfs_pin_root(&self.data_dir),
+            &stat.file_system_id,
+            &stat.path,
+            Some(&node),
+        )
+        .map_err(|error| format!("cannot unpin SIFS content {path}: {error}"))
     }
 }
 
