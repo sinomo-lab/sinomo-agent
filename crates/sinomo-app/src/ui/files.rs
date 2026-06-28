@@ -64,6 +64,7 @@ const CONTENT_PAD: f32 = 16.0;
 const HEADER_H: f32 = 46.0;
 const FILES_STATUS_H: f32 = 38.0;
 const LIST_HEADER_H: f32 = 36.0;
+const LIST_FILTER_H: f32 = 42.0;
 const LIST_TASK_STRIP_H: f32 = 88.0;
 const PLACES_W: f32 = 190.0;
 const PLACE_ROW_H: f32 = 42.0;
@@ -304,6 +305,7 @@ pub struct FilesState {
     preview_loading: bool,
     preview_error: Option<String>,
     action_prompt: Option<FileActionPrompt>,
+    filter_query: String,
     tasks: Vec<FilesTask>,
     pending_select_path: Option<String>,
     pub scroll: f32,
@@ -349,6 +351,7 @@ impl FilesState {
             preview_loading: false,
             preview_error: None,
             action_prompt: None,
+            filter_query: String::new(),
             tasks: Vec::new(),
             pending_select_path: None,
             scroll: 0.0,
@@ -1081,6 +1084,18 @@ impl FilesState {
         if let Some(prompt) = &mut self.action_prompt {
             prompt.input = input;
             prompt.error = None;
+        }
+    }
+
+    fn set_filter_query(&mut self, query: String) {
+        self.filter_query = query;
+        let filter = normalized_files_filter(&self.filter_query);
+        let selected_matches = self
+            .selected_entry()
+            .is_some_and(|entry| file_entry_matches_filter(entry, &filter));
+        if !selected_matches {
+            self.selected = None;
+            self.clear_selected_details();
         }
     }
 
@@ -3756,7 +3771,7 @@ fn unselected_inspector_management(files: &FilesState) -> String {
 fn unselected_inspector_rows(files: &FilesState) -> Vec<(&'static str, String)> {
     vec![
         ("Path", files.path.clone()),
-        ("Entries", files.entries.len().to_string()),
+        ("Entries", files_entry_count_status(files)),
         ("Scope", unselected_inspector_scope(files)),
         (
             "Status",
@@ -3795,6 +3810,30 @@ fn files_preview_signature(preview: Option<&FilesPreview>) -> String {
             )
         })
         .unwrap_or_default()
+}
+
+fn normalized_files_filter(filter: &str) -> String {
+    filter.trim().to_ascii_lowercase()
+}
+
+fn file_entry_matches_filter(entry: &SifsEntry, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    entry.name.to_ascii_lowercase().contains(filter)
+        || entry.path.to_ascii_lowercase().contains(filter)
+        || entry_kind_label(entry)
+            .to_ascii_lowercase()
+            .contains(filter)
+        || human_size(entry.size).to_ascii_lowercase().contains(filter)
+}
+
+fn filtered_file_indices(entries: &[SifsEntry], filter: &str) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| file_entry_matches_filter(entry, filter).then_some(index))
+        .collect()
 }
 
 fn preview_from_read(name: &str, read: SifsFileRead) -> FilesPreview {
@@ -4529,19 +4568,12 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 /// of the entries wrapped in a `ScrollView`. Directory rows navigate; the inline inspect action
 /// selects either files or directories for the SIFS inspector without changing the path.
 fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
-    let (loading, error, is_empty, entries, has_tasks): (
-        bool,
-        Option<String>,
-        bool,
-        Vec<SifsEntry>,
-        bool,
-    ) = {
+    let (loading, error, is_empty, has_tasks): (bool, Option<String>, bool, bool) = {
         let files = shared.files();
         (
             files.loading,
             files.error.clone(),
             files.entries.is_empty(),
-            files.entries.clone(),
             !files.tasks.is_empty(),
         )
     };
@@ -4640,18 +4672,113 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         );
     }
 
+    let scroll = files_list_body_rebuild(shared, reader, scroll_state);
+    let filter = SizedBox::new()
+        .height(LIST_FILTER_H)
+        .with_child(InsetX::new(
+            files_filter_input(shared, reader),
+            CONTENT_PAD * 0.5,
+        ));
+    let header = SizedBox::new()
+        .height(LIST_HEADER_H)
+        .with_child(FilesListHeader::new(shared.clone()));
+    if has_tasks {
+        let top_h = LIST_TASK_STRIP_H + LIST_FILTER_H + LIST_HEADER_H;
+        let top = Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .with_child(
+                SizedBox::new()
+                    .height(LIST_TASK_STRIP_H)
+                    .with_child(FilesTaskStrip::new(shared.clone())),
+            )
+            .with_child(filter)
+            .with_child(header);
+        WidgetPod::new(widgets::Dock::new(scroll).top(top_h, top))
+    } else {
+        let top_h = LIST_FILTER_H + LIST_HEADER_H;
+        let top = Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .with_child(filter)
+            .with_child(header);
+        WidgetPod::new(widgets::Dock::new(scroll).top(top_h, top))
+    }
+}
+
+fn files_filter_input(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let value = shared.files().filter_query.clone();
+    sui::TextInput::new("files-list-filter")
+        .value(value)
+        .placeholder("Filter current folder")
+        .leading_icon(IconGlyph::Search)
+        .theme_when(clone_reader(reader))
+        .on_change(move |value| {
+            s.files_mut().set_filter_query(value);
+        })
+}
+
+fn files_list_body_signature(shared: &Shared) -> (u64, String) {
+    let files = shared.files();
+    (files.list_revision, files.filter_query.clone())
+}
+
+fn files_list_body_rebuild(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_state: &ScrollState,
+) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    let ss = scroll_state.clone();
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || files_list_body_signature(&s)
+        },
+        move |_key| files_list_body(&s, &r, &ss),
+    )
+}
+
+fn files_list_body(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
+    let (entries, filter_query, source) = {
+        let files = shared.files();
+        (
+            files.entries.clone(),
+            files.filter_query.clone(),
+            files.source,
+        )
+    };
+    let filter = normalized_files_filter(&filter_query);
+    let visible_indices = filtered_file_indices(&entries, &filter);
+    if visible_indices.is_empty() {
+        return WidgetPod::new(
+            centered_note(
+                shared,
+                "▤",
+                "No matching entries",
+                format!(
+                    "No {} entries match \"{}\".",
+                    source.label(),
+                    filter_query.trim()
+                ),
+            )
+            .glyph(IconGlyph::Search),
+        );
+    }
+
     // Build the row items: icon + name on the left, compact metadata and inspect action on the
     // right. The child row handles pointer hit-testing while `ListView` keeps selection and scroll.
-    let items: Vec<ListItem> = entries
+    let items: Vec<ListItem> = visible_indices
         .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, entry)| {
-            ListItem::new(entry.name.clone()).with_child(SifsEntryRow::new(
-                shared.clone(),
-                index,
-                entry,
-            ))
+        .filter_map(|index| {
+            let entry = entries.get(*index)?.clone();
+            Some(
+                ListItem::new(entry.name.clone()).with_child(SifsEntryRow::new(
+                    shared.clone(),
+                    *index,
+                    entry,
+                )),
+            )
         })
         .collect();
 
@@ -4665,12 +4792,23 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             // NOT rebuild the list, only repaints + updates the inspector).
             .selected_when({
                 let s = s.clone();
-                move || s.files().selected
+                move || {
+                    let files = s.files();
+                    let filter = normalized_files_filter(&files.filter_query);
+                    filtered_file_indices(&files.entries, &filter)
+                        .into_iter()
+                        .position(|entry_index| files.selected == Some(entry_index))
+                }
             })
             .on_change(move |index, _label| {
                 // Fallback for keyboard-driven ListView activation when no row child receives focus:
                 // directory -> navigate, file -> select. Row children handle pointer activation.
-                s.files_mut().activate_row(index);
+                let mut files = s.files_mut();
+                let filter = normalized_files_filter(&files.filter_query);
+                let visible_indices = filtered_file_indices(&files.entries, &filter);
+                if let Some(entry_index) = visible_indices.get(index) {
+                    files.activate_row(*entry_index);
+                }
             })
     };
 
@@ -4684,26 +4822,7 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             .with_child(SizedBox::new().height(CONTENT_PAD * 0.5)),
         CONTENT_PAD * 0.5,
     );
-    let scroll = ScrollView::vertical(inset).state(scroll_state.clone());
-    if has_tasks {
-        let top = Stack::vertical()
-            .alignment(Alignment::Stretch)
-            .with_child(
-                SizedBox::new()
-                    .height(LIST_TASK_STRIP_H)
-                    .with_child(FilesTaskStrip::new(shared.clone())),
-            )
-            .with_child(
-                SizedBox::new()
-                    .height(LIST_HEADER_H)
-                    .with_child(FilesListHeader::new(shared.clone())),
-            );
-        WidgetPod::new(widgets::Dock::new(scroll).top(LIST_TASK_STRIP_H + LIST_HEADER_H, top))
-    } else {
-        WidgetPod::new(
-            widgets::Dock::new(scroll).top(LIST_HEADER_H, FilesListHeader::new(shared.clone())),
-        )
-    }
+    WidgetPod::new(ScrollView::vertical(inset).state(scroll_state.clone()))
 }
 
 /// A centered empty/error placeholder (mark, title, subtitle) themed off the chrome palette.
@@ -4749,7 +4868,13 @@ fn files_entry_count_status(files: &FilesState) -> String {
     } else if files.error.is_some() {
         "listing unavailable".to_string()
     } else {
-        plural(files.entries.len(), "entry")
+        let filter = normalized_files_filter(&files.filter_query);
+        if filter.is_empty() {
+            plural(files.entries.len(), "entry")
+        } else {
+            let shown = filtered_file_indices(&files.entries, &filter).len();
+            format!("{shown}/{} entries", files.entries.len())
+        }
     }
 }
 
@@ -10199,6 +10324,98 @@ mod tests {
     }
 
     #[test]
+    fn file_filter_matches_name_path_kind_and_size() {
+        let entry = SifsEntry {
+            name: "Artifact.bin".to_string(),
+            path: "/services/releases/Artifact.bin".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(1024),
+        };
+        let dir = SifsEntry {
+            name: "logs".to_string(),
+            path: "/services/logs".to_string(),
+            is_dir: true,
+            is_link: false,
+            size: None,
+        };
+
+        assert!(file_entry_matches_filter(
+            &entry,
+            &normalized_files_filter("artifact")
+        ));
+        assert!(file_entry_matches_filter(
+            &entry,
+            &normalized_files_filter("releases")
+        ));
+        assert!(file_entry_matches_filter(
+            &entry,
+            &normalized_files_filter("1.0 kb")
+        ));
+        assert!(file_entry_matches_filter(
+            &dir,
+            &normalized_files_filter("folder")
+        ));
+        assert!(!file_entry_matches_filter(
+            &entry,
+            &normalized_files_filter("missing")
+        ));
+    }
+
+    #[test]
+    fn setting_filter_clears_hidden_selection() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.loaded = true;
+        state.loading = false;
+        state.path = "/services".to_string();
+        state.entries = vec![
+            SifsEntry {
+                name: "logs".to_string(),
+                path: "/services/logs".to_string(),
+                is_dir: true,
+                is_link: false,
+                size: None,
+            },
+            SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/services/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(42),
+            },
+        ];
+        state.selected = Some(0);
+        state.selected_details = Some(SifsObjectDetails {
+            file_system_id: "sifs".to_string(),
+            object_id: "obj".to_string(),
+            path: "/services/logs".to_string(),
+            kind: "directory".to_string(),
+            version: "v1".to_string(),
+            content_hash: None,
+            size_bytes: None,
+            link_count: 1,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            policy: "replicated-eventual".to_string(),
+            current_locations: Vec::new(),
+            local_pins: Vec::new(),
+            health: None,
+        });
+
+        state.set_filter_query("artifact".to_string());
+
+        assert_eq!(state.selected, None);
+        assert!(state.selected_details.is_none());
+        assert_eq!(files_entry_count_status(&state), "1/2 entries");
+    }
+
+    #[test]
     fn unavailable_placeholder_opens_connection_settings() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -10615,6 +10832,84 @@ mod tests {
             header.description.as_deref(),
             Some("SIFS list columns: Name, Kind / size, Actions. Path /services. 2 entries.")
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_file_rows_map_to_original_entries() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/services".to_string();
+            files.entries = vec![
+                SifsEntry {
+                    name: "logs".to_string(),
+                    path: "/services/logs".to_string(),
+                    is_dir: true,
+                    is_link: false,
+                    size: None,
+                },
+                SifsEntry {
+                    name: "artifact.txt".to_string(),
+                    path: "/services/artifact.txt".to_string(),
+                    is_dir: false,
+                    is_link: false,
+                    size: Some(42),
+                },
+                SifsEntry {
+                    name: "notes.md".to_string(),
+                    path: "/services/notes.md".to_string(),
+                    is_dir: false,
+                    is_link: false,
+                    size: Some(5),
+                },
+            ];
+            files.filter_query = "artifact".to_string();
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files filtered rows")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let snapshot = window.snapshot()?;
+
+        assert!(
+            snapshot.accessibility.nodes.iter().any(|node| {
+                node.role == sui::SemanticsRole::Text
+                    && node.name.as_deref() == Some("Files status")
+                    && node.value
+                        == Some(sui::SemanticsValue::Text(
+                            "Local SIFS | Path /services | 1/3 entries | no selection | idle"
+                                .to_string(),
+                        ))
+            }),
+            "status should show filtered and total entry counts"
+        );
+        assert!(
+            !snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .any(|node| node.name.as_deref() == Some("logs")),
+            "non-matching entries should not be rendered"
+        );
+
+        window
+            .get_by_role(sui::SemanticsRole::ListItem)
+            .with_name("artifact.txt")
+            .with_description("File, SIFS path /services/artifact.txt")
+            .click()?;
+
+        assert_eq!(shared.files().selected, Some(1));
 
         Ok(())
     }
