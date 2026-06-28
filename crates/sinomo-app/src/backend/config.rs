@@ -397,6 +397,8 @@ pub struct ProviderForm {
     pub account: String,
     pub display_name: String,
     pub account_label: String,
+    /// Whether this account is the configured chat default.
+    pub is_default: bool,
     pub enabled: bool,
     pub default_model: String,
     pub api_base_url: String,
@@ -415,6 +417,11 @@ pub struct ProviderForm {
 /// Build the per-account configuration forms from `lm.providers`.
 pub fn provider_forms(client: &dyn ConfigClient) -> Vec<ProviderForm> {
     let config = load_provider_config(client).unwrap_or_default();
+    let default_provider = config
+        .default_provider
+        .as_deref()
+        .and_then(normalize_model_provider);
+    let default_account = normalize_provider_account_name(config.default_account.as_deref());
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
     for account in &config.accounts {
         let provider =
@@ -455,6 +462,8 @@ pub fn provider_forms(client: &dyn ConfigClient) -> Vec<ProviderForm> {
             } else {
                 account_name.clone()
             },
+            is_default: default_provider.as_deref() == Some(provider.as_str())
+                && account_name == default_account,
             enabled: account.enabled,
             supports_reasoning: model_supports_reasoning_effort(&provider, &default_model),
             default_model,

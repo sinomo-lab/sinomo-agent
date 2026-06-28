@@ -739,6 +739,110 @@ fn provider_account_key(provider: &str, account: &str) -> String {
     format!("{provider}:{account}")
 }
 
+fn provider_enabled_count(forms: &[ProviderForm]) -> usize {
+    forms.iter().filter(|form| form.enabled).count()
+}
+
+fn provider_ready_count(forms: &[ProviderForm]) -> usize {
+    forms
+        .iter()
+        .filter(|form| form.enabled && form.signed_in)
+        .count()
+}
+
+fn provider_accounts_summary(forms: &[ProviderForm]) -> String {
+    let total = forms.len();
+    let enabled = provider_enabled_count(forms);
+    format!("{total} total · {enabled} enabled")
+}
+
+fn provider_ready_summary(forms: &[ProviderForm]) -> String {
+    let enabled = provider_enabled_count(forms);
+    let ready = provider_ready_count(forms);
+    if forms.is_empty() {
+        "0 ready".to_string()
+    } else if enabled == 0 {
+        "0 ready · all accounts disabled".to_string()
+    } else if ready == enabled {
+        format!("{ready} ready")
+    } else {
+        let blocked = enabled.saturating_sub(ready);
+        if blocked == 1 {
+            format!("{ready} ready · 1 account needs credentials")
+        } else {
+            format!("{ready} ready · {blocked} accounts need credentials")
+        }
+    }
+}
+
+fn provider_sidebar_preview(forms: &[ProviderForm]) -> String {
+    if forms.is_empty() {
+        return "Not set up".to_string();
+    }
+    let enabled = provider_enabled_count(forms);
+    let ready = provider_ready_count(forms);
+    if ready > 0 {
+        format!("{ready} ready")
+    } else if enabled > 0 {
+        "Needs credentials".to_string()
+    } else {
+        "Disabled".to_string()
+    }
+}
+
+fn provider_model_label(form: &ProviderForm) -> String {
+    let model = form.default_model.trim();
+    if model.is_empty() {
+        "provider default".to_string()
+    } else {
+        model.to_string()
+    }
+}
+
+fn provider_credential_note(form: &ProviderForm) -> &'static str {
+    if form.uses_device_login {
+        "sign-in required"
+    } else {
+        "API key required"
+    }
+}
+
+fn provider_chat_default_summary(forms: &[ProviderForm]) -> String {
+    if forms.is_empty() {
+        return "not configured".to_string();
+    }
+    let (form, fallback) = forms
+        .iter()
+        .find(|form| form.is_default)
+        .map(|form| (form, false))
+        .or_else(|| {
+            forms
+                .iter()
+                .find(|form| form.enabled && form.signed_in)
+                .or_else(|| forms.iter().find(|form| form.enabled))
+                .or_else(|| forms.first())
+                .map(|form| (form, true))
+        })
+        .expect("forms is not empty");
+
+    let mut notes = Vec::new();
+    if fallback {
+        notes.push("fallback");
+    }
+    if !form.enabled {
+        notes.push("disabled");
+    } else if !form.signed_in {
+        notes.push(provider_credential_note(form));
+    }
+
+    let summary = format!("{} / {}", form.display_name, provider_model_label(form));
+    if notes.is_empty() {
+        summary
+    } else {
+        format!("{summary} ({})", notes.join(", "))
+    }
+}
+
 /// A short, right-aligned value preview for a section, shown in the narrow menu rows.
 pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
     match section {
@@ -764,12 +868,7 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
         }
         SettingsSection::Providers => {
             let settings = shared.settings();
-            if settings.provider_forms.is_empty() {
-                "Not set up".to_string()
-            } else {
-                let enabled = settings.provider_forms.iter().filter(|f| f.enabled).count();
-                format!("{enabled} enabled")
-            }
+            provider_sidebar_preview(&settings.provider_forms)
         }
         SettingsSection::Configuration => {
             let settings = shared.settings();
@@ -2106,8 +2205,14 @@ fn provider_section_signature(shared: &Shared) -> String {
     ];
     parts.extend(settings.provider_forms.iter().map(|form| {
         format!(
-            "{}@{}:{}:{}:{}",
-            form.provider, form.account, form.enabled, form.signed_in, form.display_name
+            "{}@{}:{}:{}:{}:{}:{}",
+            form.provider,
+            form.account,
+            form.enabled,
+            form.signed_in,
+            form.is_default,
+            form.default_model,
+            form.display_name
         )
     }));
     parts.join("\u{1f}")
@@ -2126,7 +2231,8 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
                 s.settings_mut().open_provider_add();
             })
     };
-    let body = if shared.settings().provider_forms.is_empty() {
+    let provider_forms = shared.settings().provider_forms.clone();
+    let body = if provider_forms.is_empty() {
         let storage_expanded = shared.settings().provider_storage_detail_expanded();
         let storage_button = {
             let s = shared.clone();
@@ -2179,12 +2285,26 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         }
         group
     } else {
-        FieldGroup::new().spacing(8.0).with_child(value_row(
-            shared,
-            reader,
-            "Accounts",
-            shared.settings().provider_forms.len().to_string(),
-        ))
+        FieldGroup::new()
+            .spacing(8.0)
+            .with_child(value_row(
+                shared,
+                reader,
+                "Accounts",
+                provider_accounts_summary(&provider_forms),
+            ))
+            .with_child(value_row(
+                shared,
+                reader,
+                "Ready for chat",
+                provider_ready_summary(&provider_forms),
+            ))
+            .with_child(value_row(
+                shared,
+                reader,
+                "Chat default",
+                provider_chat_default_summary(&provider_forms),
+            ))
     };
     stack = stack.with_child(
         FormSection::new("Providers", body)
@@ -3669,6 +3789,94 @@ mod tests {
                 .accounts
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn provider_overview_summarizes_ready_and_chat_default() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        add_provider_account(
+            state.config.as_ref(),
+            "openai",
+            "work",
+            "sk-work",
+            "gpt-5",
+            "",
+        )
+        .expect("add openai provider account");
+        add_provider_account(
+            state.config.as_ref(),
+            "deepseek",
+            "default",
+            "sk-deep",
+            "deepseek-v4-flash",
+            "",
+        )
+        .expect("add deepseek provider account");
+        state.reload();
+
+        assert_eq!(
+            provider_accounts_summary(&state.provider_forms),
+            "2 total · 2 enabled"
+        );
+        assert_eq!(provider_ready_summary(&state.provider_forms), "2 ready");
+        assert_eq!(provider_sidebar_preview(&state.provider_forms), "2 ready");
+        assert_eq!(
+            provider_chat_default_summary(&state.provider_forms),
+            "OpenAI (work) / gpt-5"
+        );
+
+        set_provider_enabled(state.config.as_ref(), "openai", "work", false)
+            .expect("disable default provider account");
+        state.reload();
+        assert_eq!(provider_ready_summary(&state.provider_forms), "1 ready");
+        assert_eq!(
+            provider_chat_default_summary(&state.provider_forms),
+            "OpenAI (work) / gpt-5 (disabled)"
+        );
+    }
+
+    #[test]
+    fn provider_list_overview_exposes_operational_summary() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let config = shared.settings().config.clone();
+            add_provider_account(config.as_ref(), "openai", "work", "sk-work", "gpt-5", "")
+                .expect("add provider account");
+        }
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            settings.reload();
+            settings.open(SettingsSection::Providers);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings providers overview")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert!(
+            window.get_by_text("1 total · 1 enabled").count()? >= 1,
+            "provider overview should report total and enabled accounts"
+        );
+        assert!(
+            window.get_by_text("1 ready").count()? >= 1,
+            "provider overview should report accounts ready for chat"
+        );
+        assert!(
+            window.get_by_text("OpenAI (work) / gpt-5").count()? >= 1,
+            "provider overview should report the chat default and model"
+        );
+
+        Ok(())
     }
 
     #[test]

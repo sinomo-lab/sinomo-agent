@@ -66,6 +66,38 @@ fn boot_with_visual_data_dir(
     (sinomo_app::state::Shared::new(state), cleanup)
 }
 
+fn boot_settings_with_provider_accounts(
+    slug: &str,
+) -> (sinomo_app::state::Shared, VisualTempDataDir) {
+    let (data_dir, cleanup) = visual_temp_data_dir(slug);
+    let backend = sinomo_app::backend::Backend::local_fallback_for_data_dir(data_dir);
+    let config = backend.config.clone();
+    sinomo_app::backend::config::add_provider_account(
+        config.as_ref(),
+        "openai",
+        "work",
+        "sk-visual-openai",
+        "gpt-5",
+        "",
+    )
+    .expect("seed OpenAI provider");
+    sinomo_app::backend::config::add_provider_account(
+        config.as_ref(),
+        "deepseek",
+        "default",
+        "sk-visual-deepseek",
+        "deepseek-v4-flash",
+        "",
+    )
+    .expect("seed DeepSeek provider");
+
+    let mut state = sinomo_app::state::AppState::ready(backend);
+    state.active_tab = Tab::Settings;
+    let shared = sinomo_app::state::Shared::new(state);
+    shared.settings_mut().selected = Some(sinomo_app::ui::settings::SettingsSection::Providers);
+    (shared, cleanup)
+}
+
 #[test]
 fn capture_tabs() {
     let dir = shots_dir();
@@ -923,13 +955,10 @@ fn new_chat_row_clears_visible_transcript() {
 /// base URL, reasoning effort).
 #[test]
 fn capture_providers_settings() {
-    use sinomo_app::ui::settings::SettingsSection;
-
     let dir = shots_dir();
     std::fs::create_dir_all(&dir).expect("create shots dir");
 
-    let shared = boot(Tab::Settings);
-    shared.settings_mut().selected = Some(SettingsSection::Providers);
+    let (shared, _cleanup) = boot_settings_with_provider_accounts("providers-settings");
     let runtime = build_runtime(shared).expect("build runtime");
     let app = TestApp::from_runtime(runtime).expect("headless test app");
     let window = app.main_window().expect("main window");
