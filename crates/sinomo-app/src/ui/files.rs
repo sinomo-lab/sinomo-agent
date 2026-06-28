@@ -1191,6 +1191,15 @@ impl FilesState {
         }
     }
 
+    fn clear_finished_tasks(&mut self) {
+        self.tasks.retain(|task| {
+            matches!(
+                task.state,
+                FilesTaskState::Running | FilesTaskState::CancelRequested
+            )
+        });
+    }
+
     fn apply_operation_result(&mut self, request_id: u64, result: FilesOperationResult) -> bool {
         let cancel_requested = self
             .tasks
@@ -4003,6 +4012,11 @@ fn files_task_status(files: &FilesState) -> String {
         .iter()
         .filter(|task| task.state == FilesTaskState::Cancelled)
         .count();
+    let completed = files
+        .tasks
+        .iter()
+        .filter(|task| task.state == FilesTaskState::Completed)
+        .count();
     if running > 0 {
         if running == 1 {
             "1 task running".to_string()
@@ -4026,6 +4040,12 @@ fn files_task_status(files: &FilesState) -> String {
             "1 task cancelled".to_string()
         } else {
             format!("{cancelled} tasks cancelled")
+        }
+    } else if completed > 0 {
+        if completed == 1 {
+            "1 task done".to_string()
+        } else {
+            format!("{completed} tasks done")
         }
     } else {
         "idle".to_string()
@@ -4523,6 +4543,7 @@ impl Widget for FilesPlacesRail {
 struct FilesTaskStrip {
     shared: Shared,
     hovered_cancel: Option<u64>,
+    hovered_clear: bool,
 }
 
 impl FilesTaskStrip {
@@ -4530,7 +4551,26 @@ impl FilesTaskStrip {
         Self {
             shared,
             hovered_cancel: None,
+            hovered_clear: false,
         }
+    }
+
+    fn has_finished_tasks(files: &FilesState) -> bool {
+        files.tasks.iter().any(|task| {
+            matches!(
+                task.state,
+                FilesTaskState::Cancelled | FilesTaskState::Completed | FilesTaskState::Failed
+            )
+        })
+    }
+
+    fn clear_rect(bounds: Rect) -> Rect {
+        Rect::new(
+            bounds.max_x() - CONTENT_PAD - 100.0,
+            bounds.y() + 7.0,
+            100.0,
+            22.0,
+        )
     }
 
     fn cancel_rect(bounds: Rect, row_index: usize) -> Rect {
@@ -4552,6 +4592,10 @@ impl FilesTaskStrip {
         )
     }
 
+    fn clear_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
+        sui::WidgetId::new(parent.get().wrapping_mul(47).wrapping_add(10_199))
+    }
+
     fn task_at_cancel(&self, bounds: Rect, position: Point) -> Option<u64> {
         let files = self.shared.files();
         files
@@ -4564,6 +4608,11 @@ impl FilesTaskStrip {
             })
             .map(|(_, task)| task.id)
     }
+
+    fn clear_hit(&self, bounds: Rect, position: Point) -> bool {
+        let files = self.shared.files();
+        Self::has_finished_tasks(&files) && Self::clear_rect(bounds).contains(position)
+    }
 }
 
 impl Widget for FilesTaskStrip {
@@ -4571,8 +4620,10 @@ impl Widget for FilesTaskStrip {
         match event {
             Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
                 let hovered = self.task_at_cancel(ctx.bounds(), pointer.position);
-                if self.hovered_cancel != hovered {
+                let hovered_clear = self.clear_hit(ctx.bounds(), pointer.position);
+                if self.hovered_cancel != hovered || self.hovered_clear != hovered_clear {
                     self.hovered_cancel = hovered;
+                    self.hovered_clear = hovered_clear;
                     ctx.request_paint();
                     ctx.request_semantics();
                 }
@@ -4582,9 +4633,20 @@ impl Widget for FilesTaskStrip {
                     && (pointer.button == Some(PointerButton::Primary)
                         || pointer.button.is_none()) =>
             {
-                if let Some(task_id) = self.task_at_cancel(ctx.bounds(), pointer.position) {
+                if self.clear_hit(ctx.bounds(), pointer.position) {
+                    self.shared.files_mut().clear_finished_tasks();
+                    self.hovered_cancel = None;
+                    self.hovered_clear = false;
+                    ctx.request_measure();
+                    ctx.request_arrange();
+                    ctx.request_paint();
+                    ctx.request_hit_test();
+                    ctx.request_semantics();
+                    ctx.set_handled();
+                } else if let Some(task_id) = self.task_at_cancel(ctx.bounds(), pointer.position) {
                     self.shared.files_mut().cancel_task(task_id);
                     self.hovered_cancel = None;
+                    self.hovered_clear = false;
                     ctx.request_paint();
                     ctx.request_semantics();
                     ctx.set_handled();
@@ -4596,7 +4658,9 @@ impl Widget for FilesTaskStrip {
                     PointerEventKind::Leave | PointerEventKind::Cancel
                 ) =>
             {
-                if self.hovered_cancel.take().is_some() {
+                let changed = self.hovered_cancel.take().is_some() || self.hovered_clear;
+                self.hovered_clear = false;
+                if changed {
                     ctx.request_paint();
                     ctx.request_semantics();
                 }
@@ -4628,6 +4692,26 @@ impl Widget for FilesTaskStrip {
             "TASKS",
             pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint),
         );
+        if Self::has_finished_tasks(&files) {
+            let clear = Self::clear_rect(bounds);
+            let fill = if self.hovered_clear {
+                pal.hover
+            } else {
+                pal.field
+            };
+            widgets::round_panel(ctx, clear, fill, pal.border, 7.0);
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(
+                    clear.x() + 10.0,
+                    clear.y() + 3.0,
+                    clear.width() - 20.0,
+                    16.0,
+                ),
+                "Clear finished",
+                pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text),
+            );
+        }
 
         let title_style = pal.text_style(&theme, 11.5, FontWeight::MEDIUM, pal.text);
         let detail_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
@@ -4699,6 +4783,20 @@ impl Widget for FilesTaskStrip {
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         let files = self.shared.files();
+        if Self::has_finished_tasks(&files) {
+            let mut node = SemanticsNode::new(
+                Self::clear_widget_id(ctx.widget_id()),
+                SemanticsRole::Button,
+                Self::clear_rect(ctx.bounds()),
+            );
+            node.parent = Some(ctx.widget_id());
+            node.name = Some("Clear finished tasks".to_string());
+            node.description =
+                Some("Dismiss completed, failed, and cancelled file operations".to_string());
+            node.actions = vec![SemanticsAction::Activate];
+            node.state.hovered = self.hovered_clear;
+            ctx.push(node);
+        }
         for (index, task) in files
             .tasks
             .iter()
@@ -7886,6 +7984,54 @@ mod tests {
             files_status_summary(&state),
             "Local SIFS | Path /cluster-tests | 1 entry | selected /cluster-tests/artifact.txt | 1 task cancelled"
         );
+
+        state.tasks[0].state = FilesTaskState::Completed;
+        assert_eq!(
+            files_status_summary(&state),
+            "Local SIFS | Path /cluster-tests | 1 entry | selected /cluster-tests/artifact.txt | 1 task done"
+        );
+    }
+
+    #[test]
+    fn clear_finished_tasks_retains_active_operations() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.tasks = vec![
+            FilesTask {
+                id: 1,
+                title: "Copy".to_string(),
+                detail: "running".to_string(),
+                state: FilesTaskState::Running,
+                progress: Some(0.4),
+            },
+            FilesTask {
+                id: 2,
+                title: "Delete".to_string(),
+                detail: "done".to_string(),
+                state: FilesTaskState::Completed,
+                progress: Some(1.0),
+            },
+            FilesTask {
+                id: 3,
+                title: "Move".to_string(),
+                detail: "failed".to_string(),
+                state: FilesTaskState::Failed,
+                progress: Some(1.0),
+            },
+            FilesTask {
+                id: 4,
+                title: "Rename".to_string(),
+                detail: "cancelling".to_string(),
+                state: FilesTaskState::CancelRequested,
+                progress: Some(0.8),
+            },
+        ];
+
+        state.clear_finished_tasks();
+
+        assert_eq!(state.tasks.len(), 2);
+        assert_eq!(state.tasks[0].id, 1);
+        assert_eq!(state.tasks[1].id, 4);
     }
 
     #[test]
@@ -8878,6 +9024,66 @@ mod tests {
             &shared.files().worker_cancellations,
             77
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn task_strip_clear_finished_dismisses_terminal_history() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.tasks = vec![
+                FilesTask {
+                    id: 77,
+                    title: "Delete".to_string(),
+                    detail: "deleted /artifact.txt".to_string(),
+                    state: FilesTaskState::Completed,
+                    progress: Some(1.0),
+                },
+                FilesTask {
+                    id: 78,
+                    title: "Copy".to_string(),
+                    detail: "/artifact.txt -> /copy.txt".to_string(),
+                    state: FilesTaskState::Running,
+                    progress: Some(0.35),
+                },
+            ];
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new().title("Files task clear").root(
+                    SizedBox::new()
+                        .width(520.0)
+                        .height(720.0)
+                        .with_child(view(shared.clone())),
+                ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Clear finished tasks")
+            .click()?;
+
+        let files = shared.files();
+        assert_eq!(files.tasks.len(), 1);
+        assert_eq!(files.tasks[0].id, 78);
+        assert_eq!(files.tasks[0].state, FilesTaskState::Running);
 
         Ok(())
     }
