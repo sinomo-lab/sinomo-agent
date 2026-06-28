@@ -60,7 +60,7 @@ const INSPECTOR_W: f32 = 340.0;
 const ROW_H: f32 = 34.0;
 const ROW_ACTION_SIDE: f32 = 24.0;
 const ROW_ACTION_GAP: f32 = 4.0;
-const ROW_ACTION_COUNT: f32 = 6.0;
+const ROW_ACTION_COUNT: f32 = 7.0;
 const CONTENT_PAD: f32 = 16.0;
 const HEADER_H: f32 = 46.0;
 const FILES_STATUS_H: f32 = 38.0;
@@ -118,6 +118,7 @@ enum FileActionPromptKind {
     Move,
     Rename,
     Delete,
+    DeleteSelected,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -169,6 +170,7 @@ impl FileActionPromptKind {
             Self::Move => "Move to",
             Self::Rename => "Rename",
             Self::Delete => "Delete",
+            Self::DeleteSelected => "Delete selected",
         }
     }
 
@@ -183,8 +185,15 @@ impl FileActionPromptKind {
             Self::Move => "Move",
             Self::Rename => "Rename",
             Self::Delete => "Delete",
+            Self::DeleteSelected => "Delete selected",
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileActionTarget {
+    path: String,
+    is_dir: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,6 +203,7 @@ struct FileActionPrompt {
     target_name: String,
     target_path: Option<String>,
     target_is_dir: bool,
+    targets: Vec<FileActionTarget>,
     error: Option<String>,
 }
 
@@ -351,6 +361,7 @@ pub struct FilesState {
     preview_loading: bool,
     preview_error: Option<String>,
     action_prompt: Option<FileActionPrompt>,
+    marked_entries: BTreeSet<usize>,
     filter_query: String,
     sort_mode: FileSortMode,
     tasks: Vec<FilesTask>,
@@ -398,6 +409,7 @@ impl FilesState {
             preview_loading: false,
             preview_error: None,
             action_prompt: None,
+            marked_entries: BTreeSet::new(),
             filter_query: String::new(),
             sort_mode: FileSortMode::default(),
             tasks: Vec::new(),
@@ -482,6 +494,7 @@ impl FilesState {
 
     fn reload_sync(&mut self) {
         self.selected = None;
+        self.marked_entries.clear();
         self.clear_selected_details();
         self.loading = false;
         let path = self.path.clone();
@@ -523,6 +536,7 @@ impl FilesState {
         self.next_request_id = self.next_request_id.wrapping_add(1);
         self.pending_request_id = Some(request_id);
         self.selected = None;
+        self.marked_entries.clear();
         self.clear_selected_details();
         self.loading = true;
         self.error = None;
@@ -589,6 +603,7 @@ impl FilesState {
         self.error = None;
         self.entries.clear();
         self.selected = None;
+        self.marked_entries.clear();
         self.clear_selected_details();
         self.node_id.clear();
         self.inspector_details_open = false;
@@ -976,6 +991,46 @@ impl FilesState {
         self.selected.and_then(|i| self.entries.get(i))
     }
 
+    fn entry_marked(&self, index: usize) -> bool {
+        self.marked_entries.contains(&index)
+    }
+
+    fn marked_count(&self) -> usize {
+        self.marked_entries.len()
+    }
+
+    fn marked_targets(&self) -> Vec<FileActionTarget> {
+        self.marked_entries
+            .iter()
+            .filter_map(|index| self.entries.get(*index))
+            .map(|entry| FileActionTarget {
+                path: entry.path.clone(),
+                is_dir: entry.is_dir,
+            })
+            .collect()
+    }
+
+    fn toggle_marked_entry(&mut self, index: usize) -> bool {
+        if index >= self.entries.len() {
+            return false;
+        }
+        if !self.marked_entries.insert(index) {
+            self.marked_entries.remove(&index);
+        }
+        true
+    }
+
+    fn clear_marked_entries(&mut self) {
+        self.marked_entries.clear();
+    }
+
+    fn mark_visible_entries(&mut self) {
+        let filter = normalized_files_filter(&self.filter_query);
+        self.marked_entries = visible_file_indices(&self.entries, &filter, self.sort_mode)
+            .into_iter()
+            .collect();
+    }
+
     fn request_selected_details(&mut self) {
         let Some(entry) = self.selected_entry().cloned() else {
             self.clear_selected_details();
@@ -1083,6 +1138,11 @@ impl FilesState {
     }
 
     fn open_action_prompt(&mut self, kind: FileActionPromptKind) {
+        let targets = if kind == FileActionPromptKind::DeleteSelected {
+            self.marked_targets()
+        } else {
+            Vec::new()
+        };
         let selected = self.selected_entry().cloned();
         let (target_path, target_name, target_is_dir) = match selected {
             Some(entry) => (Some(entry.path), entry.name, entry.is_dir),
@@ -1107,7 +1167,7 @@ impl FilesState {
             }
             FileActionPromptKind::Move => target_name.clone(),
             FileActionPromptKind::Rename => target_name.clone(),
-            FileActionPromptKind::Delete => String::new(),
+            FileActionPromptKind::Delete | FileActionPromptKind::DeleteSelected => String::new(),
         };
         let error = match kind {
             FileActionPromptKind::Copy
@@ -1120,6 +1180,9 @@ impl FilesState {
             {
                 Some("select an item first".to_string())
             }
+            FileActionPromptKind::DeleteSelected if targets.is_empty() => {
+                Some("mark one or more entries first".to_string())
+            }
             _ => None,
         };
         self.action_prompt = Some(FileActionPrompt {
@@ -1128,6 +1191,7 @@ impl FilesState {
             target_name,
             target_path,
             target_is_dir,
+            targets,
             error,
         });
     }
@@ -1146,6 +1210,12 @@ impl FilesState {
     fn set_filter_query(&mut self, query: String) {
         self.filter_query = query;
         let filter = normalized_files_filter(&self.filter_query);
+        let entries = &self.entries;
+        self.marked_entries.retain(|index| {
+            entries
+                .get(*index)
+                .is_some_and(|entry| file_entry_matches_filter(entry, &filter))
+        });
         let selected_matches = self
             .selected_entry()
             .is_some_and(|entry| file_entry_matches_filter(entry, &filter));
@@ -1180,6 +1250,26 @@ impl FilesState {
             }
             return;
         }
+        if prompt.kind == FileActionPromptKind::DeleteSelected {
+            if prompt.targets.is_empty() {
+                if let Some(current) = &mut self.action_prompt {
+                    current.error = Some("mark one or more entries first".to_string());
+                }
+                return;
+            }
+            if prompt.input.trim() != "DELETE" {
+                if let Some(current) = &mut self.action_prompt {
+                    current.error = Some(format!(
+                        "type DELETE to remove {}",
+                        selected_entries_label(prompt.targets.len())
+                    ));
+                }
+                return;
+            }
+            self.action_prompt = None;
+            self.start_delete_targets(prompt.targets, waker);
+            return;
+        }
         match self.operation_from_prompt(&prompt) {
             Ok((operation, title, detail)) => {
                 self.action_prompt = None;
@@ -1199,6 +1289,9 @@ impl FilesState {
     ) -> Result<(FilesOperation, String, String), String> {
         match prompt.kind {
             FileActionPromptKind::GoTo => unreachable!("Go to path is handled before operations"),
+            FileActionPromptKind::DeleteSelected => {
+                unreachable!("Delete selected queues individual delete operations")
+            }
             FileActionPromptKind::NewFile => {
                 let path = self.join_child(&prompt.input)?;
                 Ok((
@@ -1398,6 +1491,27 @@ impl FilesState {
             .execute_operation(operation, &self.path)
             .map_err(FilesOperationFailure::Error);
         self.apply_operation_result(request_id, result);
+    }
+
+    fn start_delete_targets(
+        &mut self,
+        targets: Vec<FileActionTarget>,
+        waker: Option<sui::UiHandle>,
+    ) {
+        self.clear_marked_entries();
+        for target in targets {
+            self.start_operation(
+                FilesOperation {
+                    kind: FilesOperationKind::Delete,
+                    path: target.path.clone(),
+                    target: None,
+                    directory: target.is_dir,
+                },
+                "Delete".to_string(),
+                target.path,
+                waker.clone(),
+            );
+        }
     }
 
     fn start_placement_refresh(&mut self, waker: Option<sui::UiHandle>) {
@@ -4508,6 +4622,7 @@ fn unix_nanos_label(nanos: u64) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SifsEntryRowHit {
     Row,
+    Select,
     Inspect,
     Copy,
     Transfer,
@@ -4539,6 +4654,10 @@ impl SifsEntryRow {
         self.shared.files().selected == Some(self.index)
     }
 
+    fn marked(&self) -> bool {
+        self.shared.files().entry_marked(self.index)
+    }
+
     fn action_rect(&self, bounds: Rect, action: SifsEntryRowHit) -> Rect {
         let Some(slot) = row_action_slot(action) else {
             return Rect::ZERO;
@@ -4563,6 +4682,7 @@ impl SifsEntryRow {
             return None;
         }
         for action in [
+            SifsEntryRowHit::Select,
             SifsEntryRowHit::Inspect,
             SifsEntryRowHit::Copy,
             SifsEntryRowHit::Transfer,
@@ -4582,6 +4702,7 @@ impl SifsEntryRow {
 
     fn action_widget_id(parent: sui::WidgetId, action: SifsEntryRowHit) -> sui::WidgetId {
         let salt = match action {
+            SifsEntryRowHit::Select => 8_309,
             SifsEntryRowHit::Inspect => 8_317,
             SifsEntryRowHit::Copy => 8_329,
             SifsEntryRowHit::Transfer => 8_333,
@@ -4596,12 +4717,13 @@ impl SifsEntryRow {
 
 fn row_action_slot(action: SifsEntryRowHit) -> Option<usize> {
     match action {
-        SifsEntryRowHit::Inspect => Some(0),
-        SifsEntryRowHit::Copy => Some(1),
-        SifsEntryRowHit::Transfer => Some(2),
-        SifsEntryRowHit::Move => Some(3),
-        SifsEntryRowHit::Rename => Some(4),
-        SifsEntryRowHit::Delete => Some(5),
+        SifsEntryRowHit::Select => Some(0),
+        SifsEntryRowHit::Inspect => Some(1),
+        SifsEntryRowHit::Copy => Some(2),
+        SifsEntryRowHit::Transfer => Some(3),
+        SifsEntryRowHit::Move => Some(4),
+        SifsEntryRowHit::Rename => Some(5),
+        SifsEntryRowHit::Delete => Some(6),
         SifsEntryRowHit::Row => None,
     }
 }
@@ -4674,6 +4796,9 @@ impl Widget for SifsEntryRow {
                     match hit {
                         SifsEntryRowHit::Row => {
                             self.shared.files_mut().activate_row(self.index);
+                        }
+                        SifsEntryRowHit::Select => {
+                            self.shared.files_mut().toggle_marked_entry(self.index);
                         }
                         SifsEntryRowHit::Inspect => {
                             self.shared.files_mut().select_entry(self.index);
@@ -4767,6 +4892,7 @@ impl Widget for SifsEntryRow {
         let pal = palette(&self.shared);
         let bounds = ctx.bounds();
         let active = self.active();
+        let marked = self.marked();
         let icon_color = if active { pal.accent } else { pal.text_faint };
         let label_color = if active { pal.text } else { pal.text_muted };
         let title_style = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, label_color);
@@ -4787,8 +4913,13 @@ impl Widget for SifsEntryRow {
             icon_color,
         );
 
-        let show_actions = self.hovered || active || self.pressed.is_some();
+        let show_actions = self.hovered || active || marked || self.pressed.is_some();
         for (action, glyph, color) in [
+            (
+                SifsEntryRowHit::Select,
+                IconGlyph::Check,
+                if marked { pal.accent } else { pal.text_muted },
+            ),
             (
                 SifsEntryRowHit::Inspect,
                 IconGlyph::Search,
@@ -4816,8 +4947,10 @@ impl Widget for SifsEntryRow {
                 continue;
             }
             let rect = self.action_rect(bounds, action);
-            if show_actions {
+            if show_actions || (action == SifsEntryRowHit::Select && marked) {
                 let fill = if self.pressed == Some(action) {
+                    pal.selected
+                } else if action == SifsEntryRowHit::Select && marked {
                     pal.selected
                 } else if active {
                     pal.field
@@ -4866,11 +4999,20 @@ impl Widget for SifsEntryRow {
         ));
         node.state.focused = ctx.is_focused();
         node.state.hovered = self.hovered;
-        node.state.selected = self.active();
+        node.state.selected = self.active() || self.marked();
         node.actions = vec![SemanticsAction::Focus, SemanticsAction::Activate];
         ctx.push(node);
 
         for (action, name, description) in [
+            (
+                SifsEntryRowHit::Select,
+                if self.marked() {
+                    format!("Unmark {}", self.entry.name)
+                } else {
+                    format!("Mark {}", self.entry.name)
+                },
+                "Include this entry in batch actions".to_string(),
+            ),
             (
                 SifsEntryRowHit::Inspect,
                 format!("Inspect {}", self.entry.name),
@@ -4923,7 +5065,7 @@ impl Widget for SifsEntryRow {
             node.description = Some(description);
             node.actions = vec![SemanticsAction::Activate];
             node.state.hovered = self.hovered;
-            node.state.selected = self.active();
+            node.state.selected = self.active() || self.marked();
             ctx.push(node);
         }
     }
@@ -5395,6 +5537,52 @@ fn files_sort_select(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         })
 }
 
+fn files_mark_visible_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    IconButton::new(IconGlyph::Check, "Select visible entries")
+        .size(30.0)
+        .theme_when(clone_reader(reader))
+        .enabled_when({
+            let s = s.clone();
+            move || !s.files().loading && !s.files().entries.is_empty()
+        })
+        .on_press_with_ctx(move |ctx| {
+            s.files_mut().mark_visible_entries();
+            request_files_overlay_rebuild(ctx);
+        })
+}
+
+fn files_clear_marks_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    IconButton::new(IconGlyph::Close, "Clear marked entries")
+        .size(30.0)
+        .theme_when(clone_reader(reader))
+        .enabled_when({
+            let s = s.clone();
+            move || s.files().marked_count() > 0
+        })
+        .on_press_with_ctx(move |ctx| {
+            s.files_mut().clear_marked_entries();
+            request_files_overlay_rebuild(ctx);
+        })
+}
+
+fn files_delete_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    IconButton::new(IconGlyph::Trash, "Delete marked entries")
+        .size(30.0)
+        .theme_when(clone_reader(reader))
+        .enabled_when({
+            let s = s.clone();
+            move || !s.files().loading && s.files().marked_count() > 0
+        })
+        .on_press_with_ctx(move |ctx| {
+            s.files_mut()
+                .open_action_prompt(FileActionPromptKind::DeleteSelected);
+            request_files_overlay_rebuild(ctx);
+        })
+}
+
 fn files_filter_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     Stack::horizontal()
         .spacing(8.0)
@@ -5411,6 +5599,9 @@ fn files_filter_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
                 .height(30.0)
                 .with_child(files_sort_select(shared, reader)),
         )
+        .with_child(files_mark_visible_button(shared, reader))
+        .with_child(files_clear_marks_button(shared, reader))
+        .with_child(files_delete_marked_button(shared, reader))
 }
 
 fn files_list_body_signature(shared: &Shared) -> (u64, String, FileSortMode) {
@@ -5581,6 +5772,14 @@ fn files_entry_count_status(files: &FilesState) -> String {
 }
 
 fn files_selection_status(files: &FilesState) -> String {
+    let marked = files.marked_count();
+    if marked > 0 {
+        return if marked == 1 {
+            "1 entry marked".to_string()
+        } else {
+            format!("{marked} entries marked")
+        };
+    }
     files
         .selected_entry()
         .map(|entry| format!("selected {}", entry.path))
@@ -5903,6 +6102,14 @@ fn plural(count: usize, singular: &str) -> String {
         format!("{count} entries")
     } else {
         format!("{count} {singular}s")
+    }
+}
+
+fn selected_entries_label(count: usize) -> String {
+    if count == 1 {
+        "1 selected entry".to_string()
+    } else {
+        format!("{count} selected entries")
     }
 }
 
@@ -8864,9 +9071,10 @@ fn files_action_dialog_signature(shared: &Shared) -> String {
     let files = shared.files();
     match &files.action_prompt {
         Some(prompt) => format!(
-            "{:?}|{}|{}",
+            "{:?}|{}|{}|{}",
             prompt.kind,
             prompt.target_path.as_deref().unwrap_or(""),
+            prompt.targets.len(),
             prompt.error.as_deref().unwrap_or("")
         ),
         None => "closed".to_string(),
@@ -8927,6 +9135,10 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .as_deref()
             .map(|path| format!("Delete {path}"))
             .unwrap_or_else(|| "Select an item to delete".to_string()),
+        FileActionPromptKind::DeleteSelected => {
+            let label = selected_entries_label(prompt.targets.len());
+            format!("Delete {label} from {}", shared.files().path)
+        }
     };
     let input_label = match prompt.kind {
         FileActionPromptKind::GoTo => "Path",
@@ -8934,7 +9146,7 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         | FileActionPromptKind::CopyToSifs
         | FileActionPromptKind::CopyToLocal
         | FileActionPromptKind::Move => "Destination",
-        FileActionPromptKind::Delete => "Type DELETE",
+        FileActionPromptKind::Delete | FileActionPromptKind::DeleteSelected => "Type DELETE",
         _ => "Name",
     };
     let input = {
@@ -11371,6 +11583,91 @@ mod tests {
     }
 
     #[test]
+    fn marked_entries_filter_and_queue_batch_delete_tasks() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.loaded = true;
+        state.loading = false;
+        state.path = "/services".to_string();
+        state.entries = vec![
+            SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/services/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            },
+            SifsEntry {
+                name: "notes.md".to_string(),
+                path: "/services/notes.md".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(9),
+            },
+            SifsEntry {
+                name: "logs".to_string(),
+                path: "/services/logs".to_string(),
+                is_dir: true,
+                is_link: false,
+                size: None,
+            },
+        ];
+
+        state.mark_visible_entries();
+        assert_eq!(state.marked_count(), 3);
+        state.set_filter_query("artifact".to_string());
+        assert_eq!(state.marked_count(), 1);
+
+        state.clear_marked_entries();
+        state.set_filter_query(String::new());
+        assert!(state.toggle_marked_entry(0));
+        assert!(state.toggle_marked_entry(2));
+        state.open_action_prompt(FileActionPromptKind::DeleteSelected);
+        {
+            let prompt = state
+                .action_prompt
+                .as_ref()
+                .expect("delete selected prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::DeleteSelected);
+            assert_eq!(prompt.targets.len(), 2);
+            assert_eq!(prompt.targets[0].path, "/services/artifact.txt");
+            assert_eq!(prompt.targets[1].path, "/services/logs");
+        }
+
+        state.submit_action_prompt(None);
+        assert_eq!(
+            state
+                .action_prompt
+                .as_ref()
+                .and_then(|prompt| prompt.error.as_deref()),
+            Some("type DELETE to remove 2 selected entries")
+        );
+
+        let (tx, rx) = mpsc::channel();
+        state.worker_tx = Some(tx);
+        state.set_action_prompt_input("DELETE".to_string());
+        state.submit_action_prompt(None);
+
+        assert!(state.action_prompt.is_none());
+        assert_eq!(state.marked_count(), 0);
+        assert_eq!(state.tasks.len(), 2);
+        for expected in ["/services/artifact.txt", "/services/logs"] {
+            match rx.try_recv().expect("delete operation command") {
+                FilesWorkerCommand::Operation {
+                    source, operation, ..
+                } => {
+                    assert_eq!(source, FilesSourceKind::Sifs);
+                    assert_eq!(operation.kind, FilesOperationKind::Delete);
+                    assert_eq!(operation.path, expected);
+                }
+                FilesWorkerCommand::List { .. } => panic!("expected operation command"),
+                FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+                FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+            }
+        }
+    }
+
+    #[test]
     fn setting_filter_clears_hidden_selection() {
         let backend = Backend::local_fallback();
         let mut state = FilesState::new(&backend);
@@ -12219,6 +12516,87 @@ mod tests {
             assert_eq!(prompt.target_name, "artifact.txt");
             assert_eq!(files.selected, Some(0));
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn batch_mark_controls_open_delete_selected_prompt() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/services".to_string();
+            files.entries = vec![
+                SifsEntry {
+                    name: "artifact.txt".to_string(),
+                    path: "/services/artifact.txt".to_string(),
+                    is_dir: false,
+                    is_link: false,
+                    size: Some(5),
+                },
+                SifsEntry {
+                    name: "logs".to_string(),
+                    path: "/services/logs".to_string(),
+                    is_dir: true,
+                    is_link: false,
+                    size: None,
+                },
+            ];
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new().title("Files batch actions").root(
+                    SizedBox::new()
+                        .width(620.0)
+                        .height(720.0)
+                        .with_child(view(shared.clone())),
+                ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Mark artifact.txt")
+            .click()?;
+        assert_eq!(shared.files().marked_count(), 1);
+        assert!(shared.files().entry_marked(0));
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Delete marked entries")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files
+                .action_prompt
+                .as_ref()
+                .expect("delete selected prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::DeleteSelected);
+            assert_eq!(prompt.targets.len(), 1);
+            assert_eq!(prompt.targets[0].path, "/services/artifact.txt");
+        }
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Select visible entries")
+            .click()?;
+        assert_eq!(shared.files().marked_count(), 2);
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Clear marked entries")
+            .click()?;
+        assert_eq!(shared.files().marked_count(), 0);
 
         Ok(())
     }
