@@ -52,8 +52,11 @@ use crate::ui::widgets;
 const WIDE_THRESHOLD: f32 = 640.0;
 const INSPECTOR_W: f32 = 340.0;
 const ROW_H: f32 = 34.0;
+const ROW_ACTION_SIDE: f32 = 24.0;
+const ROW_ACTION_GAP: f32 = 4.0;
 const CONTENT_PAD: f32 = 16.0;
 const HEADER_H: f32 = 46.0;
+const LIST_TASK_STRIP_H: f32 = 88.0;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
@@ -1354,6 +1357,32 @@ fn details_locations(details: &SifsObjectDetails) -> String {
     }
 }
 
+fn sifs_replication_summary(details: Option<&SifsObjectDetails>, clustered: bool) -> String {
+    let Some(details) = details else {
+        return if clustered {
+            "waiting for SIFS metadata".to_string()
+        } else {
+            "local node only".to_string()
+        };
+    };
+    let count = details.current_locations.len();
+    if details.policy == "local-owned" || details.policy == "ephemeral-local" {
+        return "local placement policy".to_string();
+    }
+    if details.policy.starts_with("replicated") {
+        return match count {
+            0 => "replication pending; no durable location recorded".to_string(),
+            1 => "one durable location recorded; replica repair may still be pending".to_string(),
+            count => format!("{count} durable locations recorded"),
+        };
+    }
+    if count == 0 {
+        format!("{}; no durable location recorded", details.policy)
+    } else {
+        format!("{}; {} location(s) recorded", details.policy, count)
+    }
+}
+
 fn unix_nanos_label(nanos: u64) -> String {
     if nanos == 0 {
         return "not recorded".to_string();
@@ -1370,6 +1399,8 @@ fn unix_nanos_label(nanos: u64) -> String {
 enum SifsEntryRowHit {
     Row,
     Inspect,
+    Rename,
+    Delete,
 }
 
 struct SifsEntryRow {
@@ -1395,10 +1426,14 @@ impl SifsEntryRow {
         self.shared.files().selected == Some(self.index)
     }
 
-    fn inspect_rect(&self, bounds: Rect) -> Rect {
-        let side = 24.0_f32.min(bounds.height()).max(0.0);
+    fn action_rect(&self, bounds: Rect, action: SifsEntryRowHit) -> Rect {
+        let Some(slot) = row_action_slot(action) else {
+            return Rect::ZERO;
+        };
+        let side = ROW_ACTION_SIDE.min(bounds.height()).max(0.0);
+        let step = side + ROW_ACTION_GAP;
         Rect::new(
-            bounds.max_x() - side - 2.0,
+            bounds.max_x() - side - 2.0 - slot as f32 * step,
             bounds.y() + (bounds.height() - side) * 0.5,
             side,
             side,
@@ -1409,15 +1444,35 @@ impl SifsEntryRow {
         if !bounds.contains(position) {
             return None;
         }
-        if self.inspect_rect(bounds).contains(position) {
-            Some(SifsEntryRowHit::Inspect)
-        } else {
-            Some(SifsEntryRowHit::Row)
+        for action in [
+            SifsEntryRowHit::Inspect,
+            SifsEntryRowHit::Rename,
+            SifsEntryRowHit::Delete,
+        ] {
+            if self.action_rect(bounds, action).contains(position) {
+                return Some(action);
+            }
         }
+        Some(SifsEntryRowHit::Row)
     }
 
-    fn inspect_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
-        sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(8_317))
+    fn action_widget_id(parent: sui::WidgetId, action: SifsEntryRowHit) -> sui::WidgetId {
+        let salt = match action {
+            SifsEntryRowHit::Inspect => 8_317,
+            SifsEntryRowHit::Rename => 8_351,
+            SifsEntryRowHit::Delete => 8_389,
+            SifsEntryRowHit::Row => 8_401,
+        };
+        sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(salt))
+    }
+}
+
+fn row_action_slot(action: SifsEntryRowHit) -> Option<usize> {
+    match action {
+        SifsEntryRowHit::Inspect => Some(0),
+        SifsEntryRowHit::Rename => Some(1),
+        SifsEntryRowHit::Delete => Some(2),
+        SifsEntryRowHit::Row => None,
     }
 }
 
@@ -1447,7 +1502,8 @@ impl Widget for SifsEntryRow {
             }
             Event::Pointer(pointer)
                 if pointer.kind == PointerEventKind::Up
-                    && pointer.button == Some(PointerButton::Primary) =>
+                    && (pointer.button == Some(PointerButton::Primary)
+                        || self.pressed.is_some()) =>
             {
                 let hit = self.hit_at(ctx.bounds(), pointer.position);
                 if let (Some(pressed), Some(hit)) = (self.pressed.take(), hit)
@@ -1459,6 +1515,18 @@ impl Widget for SifsEntryRow {
                         }
                         SifsEntryRowHit::Inspect => {
                             self.shared.files_mut().select_entry(self.index);
+                        }
+                        SifsEntryRowHit::Rename => {
+                            let mut files = self.shared.files_mut();
+                            files.select_entry(self.index);
+                            files.open_action_prompt(FileActionPromptKind::Rename);
+                            request_files_overlay_rebuild(ctx);
+                        }
+                        SifsEntryRowHit::Delete => {
+                            let mut files = self.shared.files_mut();
+                            files.select_entry(self.index);
+                            files.open_action_prompt(FileActionPromptKind::Delete);
+                            request_files_overlay_rebuild(ctx);
                         }
                     }
                     ctx.request_measure();
@@ -1518,7 +1586,6 @@ impl Widget for SifsEntryRow {
         let pal = palette(&self.shared);
         let bounds = ctx.bounds();
         let active = self.active();
-        let inspect = self.inspect_rect(bounds);
         let icon_color = if active { pal.accent } else { pal.text_faint };
         let label_color = if active { pal.text } else { pal.text_muted };
         let title_style = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, label_color);
@@ -1538,29 +1605,38 @@ impl Widget for SifsEntryRow {
             icon_color,
         );
 
-        {
-            let fill = if self.pressed == Some(SifsEntryRowHit::Inspect) {
-                pal.selected
-            } else if active {
-                pal.field
-            } else if self.hovered {
-                pal.hover
-            } else {
-                pal.panel
-            };
-            widgets::fill_round_rect(ctx, inspect, fill, 6.0);
-            draw_glyph(
-                ctx,
+        let show_actions = self.hovered || active || self.pressed.is_some();
+        for (action, glyph, color) in [
+            (
+                SifsEntryRowHit::Inspect,
                 IconGlyph::Search,
-                inspect.inflate(-5.0, -5.0),
                 if active { pal.accent } else { pal.text_muted },
-            );
+            ),
+            (
+                SifsEntryRowHit::Rename,
+                IconGlyph::MoreHorizontal,
+                pal.text_muted,
+            ),
+            (SifsEntryRowHit::Delete, IconGlyph::Trash, pal.warn),
+        ] {
+            let rect = self.action_rect(bounds, action);
+            if show_actions {
+                let fill = if self.pressed == Some(action) {
+                    pal.selected
+                } else if active {
+                    pal.field
+                } else {
+                    pal.hover
+                };
+                widgets::fill_round_rect(ctx, rect, fill, 6.0);
+                draw_glyph(ctx, glyph, rect.inflate(-5.0, -5.0), color);
+            }
         }
 
-        let inspect_gap = 30.0;
+        let actions_w = ROW_ACTION_SIDE * 3.0 + ROW_ACTION_GAP * 2.0 + 8.0;
         let meta_w = 74.0_f32.min(bounds.width() * 0.36).max(0.0);
         let meta_rect = Rect::new(
-            (bounds.max_x() - inspect_gap - meta_w).max(bounds.x()),
+            (bounds.max_x() - actions_w - meta_w).max(bounds.x()),
             bounds.y(),
             meta_w,
             bounds.height(),
@@ -1595,18 +1671,36 @@ impl Widget for SifsEntryRow {
         node.actions = vec![SemanticsAction::Focus, SemanticsAction::Activate];
         ctx.push(node);
 
-        let mut inspect = SemanticsNode::new(
-            Self::inspect_widget_id(row_id),
-            SemanticsRole::Button,
-            self.inspect_rect(ctx.bounds()),
-        );
-        inspect.parent = Some(row_id);
-        inspect.name = Some(format!("Inspect {}", self.entry.name));
-        inspect.description = Some("Show SIFS placement and metadata".to_string());
-        inspect.actions = vec![SemanticsAction::Activate];
-        inspect.state.hovered = self.hovered;
-        inspect.state.selected = self.active();
-        ctx.push(inspect);
+        for (action, name, description) in [
+            (
+                SifsEntryRowHit::Inspect,
+                format!("Inspect {}", self.entry.name),
+                "Show SIFS placement and metadata".to_string(),
+            ),
+            (
+                SifsEntryRowHit::Rename,
+                format!("Rename {}", self.entry.name),
+                format!("Rename {}", self.entry.path),
+            ),
+            (
+                SifsEntryRowHit::Delete,
+                format!("Delete {}", self.entry.name),
+                format!("Delete {}", self.entry.path),
+            ),
+        ] {
+            let mut node = SemanticsNode::new(
+                Self::action_widget_id(row_id, action),
+                SemanticsRole::Button,
+                self.action_rect(ctx.bounds(), action),
+            );
+            node.parent = Some(row_id);
+            node.name = Some(name);
+            node.description = Some(description);
+            node.actions = vec![SemanticsAction::Activate];
+            node.state.hovered = self.hovered;
+            node.state.selected = self.active();
+            ctx.push(node);
+        }
     }
 
     fn accepts_focus(&self) -> bool {
@@ -1681,9 +1775,10 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 let s = s.clone();
                 move || !s.files().loading
             })
-            .on_press(move || {
+            .on_press_with_ctx(move |ctx| {
                 s.files_mut()
                     .open_action_prompt(FileActionPromptKind::NewFile);
+                request_files_overlay_rebuild(ctx);
             })
     };
 
@@ -1697,9 +1792,10 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 let s = s.clone();
                 move || !s.files().loading
             })
-            .on_press(move || {
+            .on_press_with_ctx(move |ctx| {
                 s.files_mut()
                     .open_action_prompt(FileActionPromptKind::NewFolder);
+                request_files_overlay_rebuild(ctx);
             })
     };
 
@@ -1713,9 +1809,10 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 let s = s.clone();
                 move || !s.files().loading && s.files().selected_entry().is_some()
             })
-            .on_press(move || {
+            .on_press_with_ctx(move |ctx| {
                 s.files_mut()
                     .open_action_prompt(FileActionPromptKind::Rename);
+                request_files_overlay_rebuild(ctx);
             })
     };
 
@@ -1729,9 +1826,10 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 let s = s.clone();
                 move || !s.files().loading && s.files().selected_entry().is_some()
             })
-            .on_press(move || {
+            .on_press_with_ctx(move |ctx| {
                 s.files_mut()
                     .open_action_prompt(FileActionPromptKind::Delete);
+                request_files_overlay_rebuild(ctx);
             })
     };
 
@@ -1755,13 +1853,20 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 /// of the entries wrapped in a `ScrollView`. Directory rows navigate; the inline inspect action
 /// selects either files or directories for the SIFS inspector without changing the path.
 fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
-    let (loading, error, is_empty, entries): (bool, Option<String>, bool, Vec<SifsEntry>) = {
+    let (loading, error, is_empty, entries, has_tasks): (
+        bool,
+        Option<String>,
+        bool,
+        Vec<SifsEntry>,
+        bool,
+    ) = {
         let files = shared.files();
         (
             files.loading,
             files.error.clone(),
             files.entries.is_empty(),
             files.entries.clone(),
+            !files.tasks.is_empty(),
         )
     };
 
@@ -1813,9 +1918,39 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         );
     }
     if is_empty {
+        let create_file = {
+            let s = shared.clone();
+            sui::Button::new("Create file")
+                .icon(IconGlyph::File)
+                .min_width(116.0)
+                .theme_when(clone_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    s.files_mut()
+                        .open_action_prompt(FileActionPromptKind::NewFile);
+                    request_files_overlay_rebuild(ctx);
+                })
+        };
+        let create_folder = {
+            let s = shared.clone();
+            sui::Button::new("Create folder")
+                .icon(IconGlyph::Folder)
+                .min_width(132.0)
+                .theme_when(clone_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    s.files_mut()
+                        .open_action_prompt(FileActionPromptKind::NewFolder);
+                    request_files_overlay_rebuild(ctx);
+                })
+        };
+        let actions = Stack::horizontal()
+            .spacing(8.0)
+            .alignment(Alignment::Center)
+            .with_child(create_file)
+            .with_child(create_folder);
         return WidgetPod::new(
             centered_note(shared, "▤", "Empty directory", "Nothing here yet.")
-                .glyph(IconGlyph::Folder),
+                .glyph(IconGlyph::Folder)
+                .action(actions),
         );
     }
 
@@ -1863,7 +1998,14 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             .with_child(SizedBox::new().height(CONTENT_PAD * 0.5)),
         CONTENT_PAD * 0.5,
     );
-    WidgetPod::new(ScrollView::vertical(inset).state(scroll_state.clone()))
+    let scroll = ScrollView::vertical(inset).state(scroll_state.clone());
+    if has_tasks {
+        WidgetPod::new(
+            widgets::Dock::new(scroll).top(LIST_TASK_STRIP_H, FilesTaskStrip::new(shared.clone())),
+        )
+    } else {
+        WidgetPod::new(scroll)
+    }
 }
 
 /// A centered empty/error placeholder (mark, title, subtitle) themed off the chrome palette.
@@ -1876,11 +2018,226 @@ fn centered_note(
     widgets::Placeholder::new(shared.clone(), mark, title, subtitle)
 }
 
+fn request_files_overlay_rebuild(ctx: &mut EventCtx) {
+    ctx.request_measure();
+    ctx.request_paint();
+    ctx.request_semantics();
+    ctx.request_hit_test();
+}
+
 fn open_settings_section(shared: &Shared, section: SettingsSection) {
     let mut app = shared.borrow_mut();
     app.active_tab = Tab::Settings;
     if let Some(ready) = app.ready.as_mut() {
         ready.settings.open(section);
+    }
+}
+
+struct FilesTaskStrip {
+    shared: Shared,
+    hovered_cancel: Option<u64>,
+}
+
+impl FilesTaskStrip {
+    fn new(shared: Shared) -> Self {
+        Self {
+            shared,
+            hovered_cancel: None,
+        }
+    }
+
+    fn cancel_rect(bounds: Rect, row_index: usize) -> Rect {
+        Rect::new(
+            bounds.max_x() - CONTENT_PAD - INSPECTOR_TASK_CANCEL_W,
+            bounds.y() + 34.0 + row_index as f32 * 24.0,
+            INSPECTOR_TASK_CANCEL_W,
+            22.0,
+        )
+    }
+
+    fn cancel_widget_id(parent: sui::WidgetId, task_id: u64) -> sui::WidgetId {
+        sui::WidgetId::new(
+            parent
+                .get()
+                .wrapping_mul(47)
+                .wrapping_add(10_201)
+                .wrapping_add(task_id),
+        )
+    }
+
+    fn task_at_cancel(&self, bounds: Rect, position: Point) -> Option<u64> {
+        let files = self.shared.files();
+        files
+            .tasks
+            .iter()
+            .take(2)
+            .enumerate()
+            .find(|(index, task)| {
+                task.state.can_cancel() && Self::cancel_rect(bounds, *index).contains(position)
+            })
+            .map(|(_, task)| task.id)
+    }
+}
+
+impl Widget for FilesTaskStrip {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        match event {
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
+                let hovered = self.task_at_cancel(ctx.bounds(), pointer.position);
+                if self.hovered_cancel != hovered {
+                    self.hovered_cancel = hovered;
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Up
+                    && (pointer.button == Some(PointerButton::Primary)
+                        || pointer.button.is_none()) =>
+            {
+                if let Some(task_id) = self.task_at_cancel(ctx.bounds(), pointer.position) {
+                    self.shared.files_mut().cancel_task(task_id);
+                    self.hovered_cancel = None;
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                    ctx.set_handled();
+                }
+            }
+            Event::Pointer(pointer)
+                if matches!(
+                    pointer.kind,
+                    PointerEventKind::Leave | PointerEventKind::Cancel
+                ) =>
+            {
+                if self.hovered_cancel.take().is_some() {
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        constraints.clamp(Size::new(280.0, LIST_TASK_STRIP_H))
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let pal = palette(&self.shared);
+        let bounds = ctx.bounds();
+        let files = self.shared.files();
+
+        ctx.fill_rect(bounds, pal.sidebar);
+        widgets::hairline_bottom(ctx, bounds, pal.border);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(
+                bounds.x() + CONTENT_PAD,
+                bounds.y() + 10.0,
+                bounds.width(),
+                16.0,
+            ),
+            "TASKS",
+            pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint),
+        );
+
+        let title_style = pal.text_style(&theme, 11.5, FontWeight::MEDIUM, pal.text);
+        let detail_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
+        for (index, task) in files.tasks.iter().take(2).enumerate() {
+            let row_y = bounds.y() + 32.0 + index as f32 * 24.0;
+            let cancel = Self::cancel_rect(bounds, index);
+            let text_right = if task.state.can_cancel() {
+                cancel.x() - 8.0
+            } else {
+                bounds.max_x() - CONTENT_PAD
+            };
+            let text_w = (text_right - bounds.x() - CONTENT_PAD).max(0.0);
+            let tone = match task.state {
+                FilesTaskState::Running | FilesTaskState::CancelRequested => pal.accent,
+                FilesTaskState::Completed => pal.good,
+                FilesTaskState::Failed => pal.warn,
+            };
+            let dot = Rect::new(bounds.x() + CONTENT_PAD, row_y + 5.0, 6.0, 6.0);
+            widgets::fill_round_rect(ctx, dot, tone, 3.0);
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(bounds.x() + CONTENT_PAD + 12.0, row_y, text_w, 14.0),
+                &format!("{} · {}", task.title, task.state.label()),
+                title_style.clone(),
+            );
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(bounds.x() + CONTENT_PAD + 12.0, row_y + 13.0, text_w, 13.0),
+                &middle_short(&task.detail, 74),
+                detail_style.clone(),
+            );
+            let bar = Rect::new(
+                bounds.x() + CONTENT_PAD + 12.0,
+                row_y + 28.0,
+                text_w.min(220.0),
+                3.0,
+            );
+            if bar.width() > 0.0 {
+                widgets::fill_round_rect(ctx, bar, pal.field, 1.5);
+                let fraction = task_progress_fraction(task.state);
+                widgets::fill_round_rect(
+                    ctx,
+                    Rect::new(bar.x(), bar.y(), bar.width() * fraction, bar.height()),
+                    tone,
+                    1.5,
+                );
+            }
+            if task.state.can_cancel() {
+                let fill = if self.hovered_cancel == Some(task.id) {
+                    pal.hover
+                } else {
+                    pal.field
+                };
+                widgets::round_panel(ctx, cancel, fill, pal.border, 7.0);
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(
+                        cancel.x() + 8.0,
+                        cancel.y() + 3.0,
+                        cancel.width() - 16.0,
+                        16.0,
+                    ),
+                    "Cancel",
+                    pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text),
+                );
+            }
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let files = self.shared.files();
+        for (index, task) in files
+            .tasks
+            .iter()
+            .take(2)
+            .enumerate()
+            .filter(|(_, task)| task.state.can_cancel())
+        {
+            let mut node = SemanticsNode::new(
+                Self::cancel_widget_id(ctx.widget_id(), task.id),
+                SemanticsRole::Button,
+                Self::cancel_rect(ctx.bounds(), index),
+            );
+            node.parent = Some(ctx.widget_id());
+            node.name = Some(format!("Cancel {}", task.title));
+            node.description = Some(task.detail.clone());
+            node.actions = vec![SemanticsAction::Activate];
+            ctx.push(node);
+        }
+    }
+}
+
+fn task_progress_fraction(state: FilesTaskState) -> f32 {
+    match state {
+        FilesTaskState::Running => 0.45,
+        FilesTaskState::CancelRequested => 0.75,
+        FilesTaskState::Completed | FilesTaskState::Failed => 1.0,
     }
 }
 
@@ -2307,6 +2664,17 @@ impl Widget for InspectorView {
                 "local-owned"
             });
         y = self.info_row(ctx, &theme, &pal, x, y + 10.0, w, "Policy", policy);
+        let replication = sifs_replication_summary(details, files.clustered);
+        y = self.info_row(
+            ctx,
+            &theme,
+            &pal,
+            x,
+            y + 4.0,
+            w,
+            "Replication",
+            &replication,
+        );
         let locations = details
             .map(details_locations)
             .unwrap_or_else(|| node_label.clone());
@@ -3065,7 +3433,7 @@ fn list_column(
             let s = s.clone();
             move || {
                 let files = s.files();
-                (files.path.clone(), files.list_revision)
+                (files.path.clone(), files.list_revision, files.tasks.clone())
             }
         },
         move |_key| listing(&s, &r, &ss),
@@ -3158,6 +3526,34 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 s.files_mut().set_action_prompt_input(value);
             })
     };
+    let primary_label = prompt.kind.primary_label();
+    let submit = {
+        let s = shared.clone();
+        sui::Button::new(primary_label)
+            .min_width(112.0)
+            .theme_when(clone_reader(reader))
+            .on_press_with_ctx(move |ctx| {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut().submit_action_prompt(waker);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+    let cancel = {
+        let s = shared.clone();
+        sui::Button::new("Cancel")
+            .min_width(112.0)
+            .theme_when(secondary_button_theme(reader))
+            .on_press_with_ctx(move |ctx| {
+                s.files_mut().close_action_prompt();
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+    let actions = Stack::horizontal()
+        .spacing(8.0)
+        .alignment(Alignment::End)
+        .with_child(submit)
+        .with_child(cancel);
+
     let dialog_theme = shared.theme();
     let mut body = Stack::vertical()
         .spacing(10.0)
@@ -3167,20 +3563,8 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     if let Some(error) = prompt.error {
         body = body.with_child(sui::Label::new(error).theme(dialog_theme.clone()));
     }
+    body = body.with_child(actions);
 
-    let submit = {
-        let s = shared.clone();
-        move || {
-            let waker = { s.borrow().waker.clone() };
-            s.files_mut().submit_action_prompt(waker);
-        }
-    };
-    let cancel = {
-        let s = shared.clone();
-        move || {
-            s.files_mut().close_action_prompt();
-        }
-    };
     let dismiss = {
         let s = shared.clone();
         move || {
@@ -3194,9 +3578,7 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .description(input_label)
             .max_width(460.0)
             .dismiss_on_scrim(true)
-            .on_dismiss(dismiss)
-            .primary_action(prompt.kind.primary_label(), submit)
-            .secondary_action("Cancel", cancel),
+            .on_dismiss(dismiss),
     ))
 }
 
@@ -3241,6 +3623,7 @@ impl Widget for FilesDialogHost {
             ctx.request_measure();
             ctx.request_paint();
             ctx.request_semantics();
+            ctx.request_hit_test();
         }
     }
 
@@ -3725,6 +4108,49 @@ mod tests {
     }
 
     #[test]
+    fn sifs_replication_summary_uses_user_facing_status() {
+        assert_eq!(
+            sifs_replication_summary(None, true),
+            "waiting for SIFS metadata"
+        );
+        assert_eq!(sifs_replication_summary(None, false), "local node only");
+
+        let mut details = SifsObjectDetails {
+            file_system_id: "sifs".to_string(),
+            object_id: "obj".to_string(),
+            path: "/artifact.txt".to_string(),
+            kind: "file".to_string(),
+            version: "v1".to_string(),
+            content_hash: None,
+            size_bytes: Some(5),
+            link_count: 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            policy: "replicated-eventual".to_string(),
+            current_locations: vec!["node-a".to_string()],
+        };
+        assert_eq!(
+            sifs_replication_summary(Some(&details), true),
+            "one durable location recorded; replica repair may still be pending"
+        );
+        details.current_locations.push("node-b".to_string());
+        assert_eq!(
+            sifs_replication_summary(Some(&details), true),
+            "2 durable locations recorded"
+        );
+        details.policy = "local-owned".to_string();
+        assert_eq!(
+            sifs_replication_summary(Some(&details), true),
+            "local placement policy"
+        );
+    }
+
+    #[test]
     fn sifs_unavailable_summary_uses_recovery_language() {
         assert_eq!(
             sifs_unavailable_summary("device authorization was denied"),
@@ -4097,6 +4523,83 @@ mod tests {
     }
 
     #[test]
+    fn empty_directory_placeholder_exposes_create_actions() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/cluster-tests".to_string();
+            files.entries.clear();
+            files.selected = None;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files empty directory")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Create file")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("create file prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::NewFile);
+            assert_eq!(prompt.input, "untitled.txt");
+            assert_eq!(prompt.target_path, None);
+        }
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel")
+            .click()?;
+        assert!(shared.files().action_prompt.is_none());
+
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/cluster-tests".to_string();
+            files.entries.clear();
+            files.selected = None;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files empty directory folder")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Create folder")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("create folder prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::NewFolder);
+            assert_eq!(prompt.input, "New folder");
+            assert_eq!(prompt.target_path, None);
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn directory_inspect_button_selects_without_navigation() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -4135,6 +4638,120 @@ mod tests {
         assert_eq!(files.path, "/");
         assert_eq!(files.selected, Some(0));
         assert!(files.selected_entry().is_some_and(|entry| entry.is_dir));
+
+        Ok(())
+    }
+
+    #[test]
+    fn row_action_buttons_open_rename_and_delete_prompts() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.selected = None;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files row actions")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Rename artifact.txt")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("rename prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::Rename);
+            assert_eq!(prompt.target_path.as_deref(), Some("/artifact.txt"));
+            assert_eq!(prompt.input, "artifact.txt");
+            assert_eq!(files.selected, Some(0));
+        }
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel")
+            .click()?;
+        assert!(shared.files().action_prompt.is_none());
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Delete artifact.txt")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("delete prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::Delete);
+            assert_eq!(prompt.target_path.as_deref(), Some("/artifact.txt"));
+            assert_eq!(prompt.target_name, "artifact.txt");
+            assert_eq!(files.selected, Some(0));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn task_strip_cancel_marks_running_task() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.tasks = vec![FilesTask {
+                id: 77,
+                title: "Delete".to_string(),
+                detail: "/artifact.txt".to_string(),
+                state: FilesTaskState::Running,
+            }];
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new().title("Files task strip").root(
+                    SizedBox::new()
+                        .width(520.0)
+                        .height(720.0)
+                        .with_child(view(shared.clone())),
+                ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel Delete")
+            .click()?;
+
+        assert_eq!(
+            shared.files().tasks[0].state,
+            FilesTaskState::CancelRequested
+        );
 
         Ok(())
     }
