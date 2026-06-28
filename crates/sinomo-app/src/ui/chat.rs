@@ -511,6 +511,7 @@ struct ChannelAgentRef {
     participant_id: String,
     agent_name: String,
     agent_key: String,
+    pending_store: bool,
 }
 
 /// State backing the chat tab.
@@ -948,6 +949,35 @@ impl ChatState {
                 participant_id: participant.participant_id.to_string(),
                 agent_name: participant.agent_name,
                 agent_key: participant.agent_key,
+                pending_store: false,
+            })
+            .collect()
+    }
+
+    fn fallback_channel_agent_refs(
+        session: &SessionRef,
+        agents: &[AgentSummary],
+    ) -> Vec<ChannelAgentRef> {
+        let mut seen = BTreeSet::new();
+        session
+            .participant_names
+            .iter()
+            .filter_map(|name| {
+                let name = name.trim();
+                if name.is_empty() || !seen.insert(name.to_string()) {
+                    return None;
+                }
+                let agent_key = agents
+                    .iter()
+                    .find(|agent| agent.name == name || agent.key == name)
+                    .map(|agent| agent.key.clone())
+                    .unwrap_or_else(|| name.to_string());
+                Some(ChannelAgentRef {
+                    participant_id: String::new(),
+                    agent_name: name.to_string(),
+                    agent_key,
+                    pending_store: true,
+                })
             })
             .collect()
     }
@@ -4490,11 +4520,14 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .iter()
             .find(|session| session.id == edit_id)
             .cloned()?;
-        let participants = if session.kind == ConversationKind::Channel {
+        let mut participants = if session.kind == ConversationKind::Channel {
             chat.channel_agent_refs(&session.id)
         } else {
             Vec::new()
         };
+        if session.kind == ConversationKind::Channel && participants.is_empty() {
+            participants = ChatState::fallback_channel_agent_refs(&session, &chat.agents);
+        }
         let agent_keys = chat
             .agents
             .iter()
@@ -4714,13 +4747,24 @@ fn channel_agents_editor(
         for participant in participants {
             let row_channel_id = channel_id.clone();
             let participant_id = participant.participant_id.clone();
-            let label = if participant.agent_key == participant.agent_name {
+            let base_label = if participant.agent_key == participant.agent_name {
                 participant.agent_name
             } else {
                 format!("{} ({})", participant.agent_name, participant.agent_key)
             };
+            let label = if participant.pending_store {
+                format!("{base_label} (saving)")
+            } else {
+                base_label
+            };
             let remove_label = label.clone();
-            let remove = {
+            let action = if participant.pending_store {
+                IconButton::new(IconGlyph::Alert, format!("Waiting for {remove_label}"))
+                    .size(26.0)
+                    .icon_size(14.0)
+                    .enabled(false)
+                    .theme_when(clone_reader(reader))
+            } else {
                 let s = shared.clone();
                 IconButton::new(IconGlyph::Trash, format!("Remove {remove_label}"))
                     .size(26.0)
@@ -4733,7 +4777,7 @@ fn channel_agents_editor(
                         ctx.request_paint();
                     })
             };
-            list = list.with_child(ChannelAgentRow::new(shared.clone(), label, remove));
+            list = list.with_child(ChannelAgentRow::new(shared.clone(), label, action));
         }
     }
 
@@ -9010,6 +9054,63 @@ mod tests {
                 .iter()
                 .any(|node| node.name.as_deref() == Some("2 active")),
             "channel edit dialog should show the active-agent count"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_channel_edit_dialog_uses_pending_session_agents() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let channel_id = SessionId::generate().to_string();
+        {
+            let mut chat = shared.chat_mut();
+            seed_test_agents(&mut chat);
+            chat.sessions = vec![SessionRef {
+                id: channel_id.clone(),
+                title: "Pending channel".to_string(),
+                kind: ConversationKind::Channel,
+                updated_unix: 1,
+                participant_count: 1,
+                participant_names: vec!["main-agent".to_string()],
+            }];
+            chat.session_id = channel_id.clone();
+            chat.session_edit_id = Some(channel_id);
+            chat.session_title_draft = "Pending channel".to_string();
+            chat.channel_agent_idx = 0;
+            chat.models_loading = false;
+        }
+
+        let runtime = crate::build_runtime(shared.clone())?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+        let snapshot = window.snapshot()?;
+
+        assert!(
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .any(|node| node.name.as_deref() == Some("1 active")),
+            "pending session participants should contribute to the active count"
+        );
+        assert!(
+            snapshot.accessibility.nodes.iter().any(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("Waiting for main-agent (saving)")
+                    && node.state.disabled
+            }),
+            "pending session participants should render as non-removable saving rows"
+        );
+        assert!(
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .all(|node| node.name.as_deref() != Some("No agents assigned yet.")),
+            "pending session participants should not look like an empty channel"
         );
 
         Ok(())
