@@ -7908,15 +7908,28 @@ fn files_action_dialog_signature(shared: &Shared) -> String {
     }
 }
 
+fn go_to_path_description(source: FilesSourceKind) -> &'static str {
+    match source {
+        FilesSourceKind::Sifs => "Open a SIFS path, e.g. /services or /users",
+        FilesSourceKind::Local => {
+            "Open drive, UNC, or mounted path, e.g. C:\\Users or \\\\server\\share"
+        }
+    }
+}
+
+fn go_to_path_placeholder(source: FilesSourceKind) -> &'static str {
+    match source {
+        FilesSourceKind::Sifs => "/services",
+        FilesSourceKind::Local => "C:\\Users or \\\\server\\share",
+    }
+}
+
 fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     let prompt = shared.files().action_prompt.clone()?;
     let source = shared.files().source;
     let title = prompt.kind.title();
     let description = match prompt.kind {
-        FileActionPromptKind::GoTo => match source {
-            FilesSourceKind::Sifs => "Open a SIFS path, such as /services".to_string(),
-            FilesSourceKind::Local => "Open a local path, such as C:\\Users".to_string(),
-        },
+        FileActionPromptKind::GoTo => go_to_path_description(source).to_string(),
         FileActionPromptKind::NewFile => format!("Create a file in {}", shared.files().path),
         FileActionPromptKind::NewFolder => format!("Create a folder in {}", shared.files().path),
         FileActionPromptKind::Copy => prompt
@@ -7948,9 +7961,13 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     };
     let input = {
         let s = shared.clone();
+        let placeholder = match prompt.kind {
+            FileActionPromptKind::GoTo => go_to_path_placeholder(source),
+            _ => input_label,
+        };
         sui::TextInput::new(format!("files-action-input-{title}"))
             .value(prompt.input.clone())
-            .placeholder(input_label)
+            .placeholder(placeholder)
             .min_width(320.0)
             .theme_when(clone_reader(reader))
             .on_change(move |value| {
@@ -10256,6 +10273,18 @@ mod tests {
             .expect("validation keeps prompt");
         assert_eq!(prompt.kind, FileActionPromptKind::GoTo);
         assert_eq!(prompt.error.as_deref(), Some("path cannot be empty"));
+    }
+
+    #[test]
+    fn go_to_path_dialog_copy_explains_supported_path_forms() {
+        assert_eq!(
+            go_to_path_description(FilesSourceKind::Sifs),
+            "Open a SIFS path, e.g. /services or /users"
+        );
+        assert_eq!(go_to_path_placeholder(FilesSourceKind::Sifs), "/services");
+        assert!(go_to_path_description(FilesSourceKind::Local).contains("UNC"));
+        assert!(go_to_path_description(FilesSourceKind::Local).contains("mounted path"));
+        assert!(go_to_path_placeholder(FilesSourceKind::Local).contains("\\\\server\\share"));
     }
 
     #[test]
