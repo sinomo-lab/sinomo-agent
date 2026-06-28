@@ -453,6 +453,49 @@ pub enum ConversationKind {
     Channel,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SessionKindFilter {
+    All,
+    Chats,
+    Channels,
+}
+
+impl SessionKindFilter {
+    const ALL: [Self; 3] = [Self::All, Self::Chats, Self::Channels];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Chats => "Chats",
+            Self::Channels => "Channels",
+        }
+    }
+
+    fn heading(self) -> &'static str {
+        match self {
+            Self::All => "CONVERSATIONS",
+            Self::Chats => "CHATS",
+            Self::Channels => "CHANNELS",
+        }
+    }
+
+    fn semantic_name(self) -> &'static str {
+        match self {
+            Self::All => "Show all conversations",
+            Self::Chats => "Show chats only",
+            Self::Channels => "Show channels only",
+        }
+    }
+
+    fn matches(self, kind: ConversationKind) -> bool {
+        match self {
+            Self::All => true,
+            Self::Chats => kind == ConversationKind::Chat,
+            Self::Channels => kind == ConversationKind::Channel,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChannelAgentRef {
     participant_id: String,
@@ -491,6 +534,7 @@ pub struct ChatState {
     pub models_loading: bool,
     pub sessions: Vec<SessionRef>,
     session_filter: String,
+    session_kind_filter: SessionKindFilter,
     pending_session_reset: Option<String>,
     session_edit_id: Option<String>,
     session_title_draft: String,
@@ -583,6 +627,7 @@ impl ChatState {
             models_loading: false,
             sessions,
             session_filter: String::new(),
+            session_kind_filter: SessionKindFilter::All,
             pending_session_reset: None,
             session_edit_id: None,
             session_title_draft: String::new(),
@@ -1575,6 +1620,10 @@ impl ChatState {
 
     fn set_session_filter(&mut self, filter: String) {
         self.session_filter = filter;
+    }
+
+    fn set_session_kind_filter(&mut self, filter: SessionKindFilter) {
+        self.session_kind_filter = filter;
     }
 
     fn can_save_session_title(&self) -> bool {
@@ -3464,26 +3513,64 @@ fn session_matches_filter(session: &SessionRef, filter: &str) -> bool {
         || session_kind_filter_label(session.kind).contains(filter)
 }
 
-fn filtered_session_indices(sessions: &[SessionRef], filter: &str) -> Vec<usize> {
+fn session_matches_kind_filter(session: &SessionRef, kind_filter: SessionKindFilter) -> bool {
+    kind_filter.matches(session.kind)
+}
+
+fn session_kind_filter_count(sessions: &[SessionRef], kind_filter: SessionKindFilter) -> usize {
+    sessions
+        .iter()
+        .filter(|session| session_matches_kind_filter(session, kind_filter))
+        .count()
+}
+
+fn filtered_session_indices(
+    sessions: &[SessionRef],
+    filter: &str,
+    kind_filter: SessionKindFilter,
+) -> Vec<usize> {
     sessions
         .iter()
         .enumerate()
-        .filter_map(|(index, session)| session_matches_filter(session, filter).then_some(index))
+        .filter_map(|(index, session)| {
+            (session_matches_kind_filter(session, kind_filter)
+                && session_matches_filter(session, filter))
+            .then_some(index)
+        })
         .collect()
 }
 
 fn chats_heading_text(chat: &ChatState) -> String {
-    let total = chat.sessions.len();
+    let kind_filter = chat.session_kind_filter;
+    let total = chat
+        .sessions
+        .iter()
+        .filter(|session| session_matches_kind_filter(session, kind_filter))
+        .count();
     let filter = normalized_session_filter(&chat.session_filter);
     if filter.is_empty() {
-        format!("CHATS · {total}")
+        format!("{} · {total}", kind_filter.heading())
     } else {
         let shown = chat
             .sessions
             .iter()
-            .filter(|session| session_matches_filter(session, &filter))
+            .filter(|session| {
+                session_matches_kind_filter(session, kind_filter)
+                    && session_matches_filter(session, &filter)
+            })
             .count();
-        format!("CHATS · {shown}/{total}")
+        format!("{} · {shown}/{total}", kind_filter.heading())
+    }
+}
+
+fn empty_sessions_label(filter: &str, kind_filter: SessionKindFilter) -> &'static str {
+    if !filter.is_empty() {
+        return "No matching conversations";
+    }
+    match kind_filter {
+        SessionKindFilter::All => "No conversations yet",
+        SessionKindFilter::Chats => "No chats yet",
+        SessionKindFilter::Channels => "No channels yet",
     }
 }
 
@@ -3579,15 +3666,16 @@ fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 /// Build the CHATS ListView: stored chats/channels only. Creation actions live
 /// above the scroll area so the list itself behaves like persistent history.
 fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (sessions, filter, loading) = {
+    let (sessions, filter, kind_filter, loading) = {
         let chat = shared.chat();
         (
             chat.sessions.clone(),
             normalized_session_filter(&chat.session_filter),
+            chat.session_kind_filter,
             chat.session_list_loading,
         )
     };
-    let visible_indices = filtered_session_indices(&sessions, &filter);
+    let visible_indices = filtered_session_indices(&sessions, &filter, kind_filter);
     let mut items = visible_indices
         .iter()
         .map(|index| {
@@ -3602,9 +3690,9 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 .leading_text("...")
                 .disabled(),
         );
-    } else if !filter.is_empty() && visible_indices.is_empty() {
+    } else if visible_indices.is_empty() {
         items.push(
-            ListItem::new("No matching chats")
+            ListItem::new(empty_sessions_label(&filter, kind_filter))
                 .leading_text(" ")
                 .disabled(),
         );
@@ -3617,7 +3705,7 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             move || {
                 let chat = s.chat();
                 let filter = normalized_session_filter(&chat.session_filter);
-                filtered_session_indices(&chat.sessions, &filter)
+                filtered_session_indices(&chat.sessions, &filter, chat.session_kind_filter)
                     .into_iter()
                     .position(|session_index| chat.sessions[session_index].id == chat.session_id)
                     .map(|index| index)
@@ -3628,7 +3716,8 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .on_change(move |index, _label| {
             let mut chat = s.chat_mut();
             let filter = normalized_session_filter(&chat.session_filter);
-            let visible_indices = filtered_session_indices(&chat.sessions, &filter);
+            let visible_indices =
+                filtered_session_indices(&chat.sessions, &filter, chat.session_kind_filter);
             if let Some(session_index) = visible_indices.get(index) {
                 chat.open_session(*session_index);
             }
@@ -3679,7 +3768,17 @@ fn session_filter_input(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
 
 fn sessions_scroll_signature(
     shared: &Shared,
-) -> (String, String, String, String, String, String, usize, bool) {
+) -> (
+    String,
+    String,
+    SessionKindFilter,
+    String,
+    String,
+    String,
+    String,
+    usize,
+    bool,
+) {
     let chat = shared.chat();
     let sessions = chat
         .sessions
@@ -3690,6 +3789,7 @@ fn sessions_scroll_signature(
     (
         sessions,
         chat.session_filter.clone(),
+        chat.session_kind_filter,
         chat.session_id.clone(),
         chat.session_edit_id.clone().unwrap_or_default(),
         chat.session_delete_confirm_id.clone().unwrap_or_default(),
@@ -3725,6 +3825,204 @@ fn sessions_scroll_rebuild(
         },
         move |_sig| WidgetPod::new(sessions_scroll(&s, &r, &sessions_scroll_state)),
     )
+}
+
+struct SessionKindFilterControl {
+    shared: Shared,
+    hovered: Option<SessionKindFilter>,
+    pressed: Option<SessionKindFilter>,
+}
+
+impl SessionKindFilterControl {
+    fn new(shared: Shared) -> Self {
+        Self {
+            shared,
+            hovered: None,
+            pressed: None,
+        }
+    }
+
+    fn active(&self) -> SessionKindFilter {
+        self.shared.chat().session_kind_filter
+    }
+
+    fn slot_rect(bounds: Rect, slot: usize) -> Rect {
+        let slot_count = SessionKindFilter::ALL.len().max(1);
+        let width = bounds.width() / slot_count as f32;
+        let x = bounds.x() + width * slot as f32;
+        let w = if slot + 1 == slot_count {
+            bounds.max_x() - x
+        } else {
+            width
+        };
+        Rect::new(x, bounds.y(), w.max(0.0), bounds.height())
+    }
+
+    fn hit_filter(bounds: Rect, position: Point) -> Option<SessionKindFilter> {
+        if !bounds.contains(position) {
+            return None;
+        }
+        let slot_count = SessionKindFilter::ALL.len().max(1);
+        let slot_width = (bounds.width() / slot_count as f32).max(1.0);
+        let slot = ((position.x - bounds.x()) / slot_width).floor() as usize;
+        SessionKindFilter::ALL
+            .get(slot.min(slot_count - 1))
+            .copied()
+    }
+
+    fn widget_id(parent: sui::WidgetId, slot: usize) -> sui::WidgetId {
+        sui::WidgetId::new(
+            parent
+                .get()
+                .wrapping_mul(37)
+                .wrapping_add(18_017)
+                .wrapping_add(slot as u64),
+        )
+    }
+
+    fn request_filter_refresh(ctx: &mut EventCtx) {
+        use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
+
+        let window = InvalidationTarget::Window(ctx.window_id());
+        ctx.request(InvalidationRequest::new(window, InvalidationKind::Measure));
+        ctx.request(InvalidationRequest::new(window, InvalidationKind::Arrange));
+        ctx.request_paint();
+        ctx.request_semantics();
+    }
+}
+
+impl Widget for SessionKindFilterControl {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        match event {
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
+                let hovered = Self::hit_filter(ctx.bounds(), pointer.position);
+                if self.hovered != hovered {
+                    self.hovered = hovered;
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Down
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                let Some(filter) = Self::hit_filter(ctx.bounds(), pointer.position) else {
+                    return;
+                };
+                self.pressed = Some(filter);
+                ctx.request_pointer_capture(pointer.pointer_id);
+                ctx.request_paint();
+                ctx.set_handled();
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Up
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                let hit = Self::hit_filter(ctx.bounds(), pointer.position);
+                if let (Some(pressed), Some(hit)) = (self.pressed.take(), hit)
+                    && pressed == hit
+                {
+                    self.shared.chat_mut().set_session_kind_filter(hit);
+                    Self::request_filter_refresh(ctx);
+                }
+                ctx.release_pointer_capture(pointer.pointer_id);
+                ctx.set_handled();
+            }
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Leave => {
+                if self.hovered.take().is_some() {
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Cancel => {
+                if self.pressed.take().is_some() {
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    ctx.request_paint();
+                    ctx.set_handled();
+                }
+                if self.hovered.take().is_some() {
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        constraints.clamp(Size::new(
+            if constraints.max.width.is_finite() {
+                constraints.max.width
+            } else {
+                210.0
+            },
+            28.0,
+        ))
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let pal = palette(&self.shared);
+        let bounds = ctx.bounds();
+        let sessions = { self.shared.chat().sessions.clone() };
+        let active = self.active();
+        widgets::round_panel(ctx, bounds, pal.field, pal.border.with_alpha(0.72), 7.0);
+        for (slot, filter) in SessionKindFilter::ALL.iter().copied().enumerate() {
+            let rect = Self::slot_rect(bounds, slot).inflate(-1.0, -1.0);
+            let selected = filter == active;
+            let fill = if self.pressed == Some(filter) || selected {
+                pal.selected
+            } else if self.hovered == Some(filter) {
+                pal.hover
+            } else {
+                Color::srgba(0.0, 0.0, 0.0, 0.0)
+            };
+            let border = if selected {
+                pal.accent.with_alpha(0.52)
+            } else {
+                Color::srgba(0.0, 0.0, 0.0, 0.0)
+            };
+            if selected || self.hovered == Some(filter) || self.pressed == Some(filter) {
+                widgets::round_panel(ctx, rect, fill, border, 6.0);
+            }
+            let label = format!(
+                "{} {}",
+                filter.label(),
+                session_kind_filter_count(&sessions, filter)
+            );
+            let text_color = if selected { pal.accent } else { pal.text_muted };
+            ctx.push_clip_rect(rect);
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(rect.x() + 7.0, rect.y() + 5.0, rect.width() - 10.0, 16.0),
+                &label,
+                pal.text_style(&theme, 10.0, FontWeight::SEMIBOLD, text_color),
+            );
+            ctx.pop_clip();
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let sessions = { self.shared.chat().sessions.clone() };
+        let active = self.active();
+        for (slot, filter) in SessionKindFilter::ALL.iter().copied().enumerate() {
+            let mut node = SemanticsNode::new(
+                Self::widget_id(ctx.widget_id(), slot),
+                SemanticsRole::Button,
+                Self::slot_rect(ctx.bounds(), slot),
+            );
+            node.parent = Some(ctx.widget_id());
+            node.name = Some(filter.semantic_name().to_string());
+            node.description = Some(format!(
+                "{} visible conversation(s)",
+                session_kind_filter_count(&sessions, filter)
+            ));
+            node.actions = vec![SemanticsAction::Activate];
+            node.state.hovered = self.hovered == Some(filter);
+            node.state.selected = active == filter;
+            ctx.push(node);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4049,6 +4347,13 @@ fn sidebar(
                 .with_child(SizedBox::new().height(6.0))
                 .with_child(InsetX::new(
                     SizedBox::new()
+                        .height(28.0)
+                        .with_child(SessionKindFilterControl::new(s.clone())),
+                    8.0,
+                ))
+                .with_child(SizedBox::new().height(6.0))
+                .with_child(InsetX::new(
+                    SizedBox::new()
                         .height(30.0)
                         .with_child(session_filter_input(&s, &r)),
                     8.0,
@@ -4067,7 +4372,18 @@ fn sidebar(
 
 /// A signature of the sidebar's list contents (agents are static; sessions + the active agent
 /// change). Used to drive the sidebar [`RebuildOnChange`].
-fn sidebar_signature(shared: &Shared) -> (String, String, String, String, String, usize, bool) {
+fn sidebar_signature(
+    shared: &Shared,
+) -> (
+    String,
+    String,
+    SessionKindFilter,
+    String,
+    String,
+    String,
+    usize,
+    bool,
+) {
     let chat = shared.chat();
     let active = chat
         .agents
@@ -4085,6 +4401,7 @@ fn sidebar_signature(shared: &Shared) -> (String, String, String, String, String
     (
         active,
         sessions,
+        chat.session_kind_filter,
         chat.session_id.clone(),
         chat.session_edit_id.clone().unwrap_or_default(),
         chat.session_delete_confirm_id.clone().unwrap_or_default(),
@@ -7294,6 +7611,7 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.models_loading.hash(&mut h);
     chat.activity_panel_visible().hash(&mut h);
     chat.session_list_loading.hash(&mut h);
+    chat.session_kind_filter.hash(&mut h);
     chat.runtime_recovery_target()
         .map(RuntimeRecoveryTarget::key)
         .unwrap_or("none")
@@ -7863,6 +8181,62 @@ mod tests {
             &chat,
             &normalized_session_filter("release")
         ));
+    }
+
+    #[test]
+    fn session_kind_filter_limits_visible_indices() {
+        let sessions = vec![
+            SessionRef {
+                id: "chat-filter-a".to_string(),
+                title: "Current chat".to_string(),
+                kind: ConversationKind::Chat,
+                updated_unix: 0,
+                participant_count: 1,
+            },
+            SessionRef {
+                id: "channel-filter".to_string(),
+                title: "Release triage".to_string(),
+                kind: ConversationKind::Channel,
+                updated_unix: 0,
+                participant_count: 2,
+            },
+            SessionRef {
+                id: "chat-filter-b".to_string(),
+                title: "Release note question".to_string(),
+                kind: ConversationKind::Chat,
+                updated_unix: 0,
+                participant_count: 1,
+            },
+        ];
+
+        assert_eq!(
+            filtered_session_indices(&sessions, "", SessionKindFilter::All),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            filtered_session_indices(&sessions, "", SessionKindFilter::Chats),
+            vec![0, 2]
+        );
+        assert_eq!(
+            filtered_session_indices(&sessions, "", SessionKindFilter::Channels),
+            vec![1]
+        );
+        assert_eq!(
+            filtered_session_indices(
+                &sessions,
+                &normalized_session_filter("release"),
+                SessionKindFilter::Channels,
+            ),
+            vec![1]
+        );
+        assert_eq!(
+            filtered_session_indices(
+                &sessions,
+                &normalized_session_filter("release"),
+                SessionKindFilter::Chats,
+            ),
+            vec![2]
+        );
     }
 
     #[test]
@@ -8632,7 +9006,7 @@ mod tests {
                 .accessibility
                 .nodes
                 .iter()
-                .any(|node| node.name.as_deref() == Some("CHATS · 1/2")),
+                .any(|node| node.name.as_deref() == Some("CONVERSATIONS · 1/2")),
             "chat heading should show filtered and total counts"
         );
         assert!(
@@ -8642,6 +9016,84 @@ mod tests {
                 .iter()
                 .any(|node| node.name.as_deref() == Some("Current chat")),
             "non-matching chats should not be rendered in the filtered list"
+        );
+
+        window
+            .get_by_role(SemanticsRole::ListItem)
+            .with_name("Release triage")
+            .with_description("Channel, 2 agents")
+            .click()?;
+
+        assert_eq!(shared.chat().session_id, second_id);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_session_kind_filter_limits_sidebar_rows() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let first_id = SessionId::generate().to_string();
+        let second_id = SessionId::generate().to_string();
+        {
+            let mut chat = shared.chat_mut();
+            chat.sessions = vec![
+                SessionRef {
+                    id: first_id.clone(),
+                    title: "Current chat".to_string(),
+                    kind: ConversationKind::Chat,
+                    updated_unix: 1,
+                    participant_count: 1,
+                },
+                SessionRef {
+                    id: second_id.clone(),
+                    title: "Release triage".to_string(),
+                    kind: ConversationKind::Channel,
+                    updated_unix: 2,
+                    participant_count: 2,
+                },
+            ];
+            chat.session_id = first_id;
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat kind filtered rows")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Show channels only")
+            .with_description("1 visible conversation(s)")
+            .click()?;
+        app.run_until_idle()?;
+
+        assert_eq!(
+            shared.chat().session_kind_filter,
+            SessionKindFilter::Channels
+        );
+        let snapshot = window.snapshot()?;
+        assert!(
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .any(|node| node.name.as_deref() == Some("CHANNELS · 1")),
+            "channel heading should show the channel-only count"
+        );
+        assert!(
+            !snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .any(|node| node.name.as_deref() == Some("Current chat")),
+            "chat rows should not be rendered in the channel-only list"
         );
 
         window
