@@ -3669,23 +3669,21 @@ impl Widget for ChatSessionRow {
         }
 
         if show_edit {
-            let fill = if self.pressed == Some(ChatSessionRowHit::Edit) {
-                pal.selected
+            let (fill, border, glyph_color) = if self.pressed == Some(ChatSessionRowHit::Edit) {
+                (pal.selected, pal.accent, pal.accent)
             } else if self.editing() {
-                pal.field
+                (pal.field, pal.accent, pal.accent)
+            } else if active {
+                (pal.field, pal.border_strong.with_alpha(0.58), pal.accent)
             } else {
-                pal.hover
+                (pal.hover, pal.border.with_alpha(0.72), pal.text_muted)
             };
-            widgets::fill_round_rect(ctx, edit, fill, 6.0);
+            widgets::round_panel(ctx, edit, fill, border, 6.0);
             draw_glyph(
                 ctx,
                 IconGlyph::MoreHorizontal,
                 edit.inflate(-4.0, -4.0),
-                if self.editing() {
-                    pal.accent
-                } else {
-                    pal.text_muted
-                },
+                glyph_color,
             );
         }
 
