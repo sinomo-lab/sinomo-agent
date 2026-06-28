@@ -20,8 +20,8 @@ use sui::{
     ArrangeCtx, Constraints, Event, EventCtx, EventPhase, FontWeight, Image, ImageFit, ImageHandle,
     Insets, MeasureCtx, PaintCtx, PointerButton, PointerEventKind, Rect, SemanticsAction,
     SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, SingleChild, Size, Spinner,
-    SwitchView, TabBar, ThemeShadow, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    WindowEvent, WindowRenderOptions,
+    SwitchView, TabBar, ThemeShadow, TimerToken, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, WindowEvent, WindowRenderOptions,
 };
 
 use crate::state::{Shared, Tab};
@@ -69,6 +69,7 @@ pub struct Shell {
     tab_strip_rect: Rect,
     status_pill_rect: Cell<Rect>,
     status_pill_pressed: Cell<bool>,
+    chat_session_timer: Cell<Option<TimerToken>>,
     body_rect: Rect,
 }
 
@@ -106,6 +107,7 @@ impl Shell {
             tab_strip_rect: Rect::ZERO,
             status_pill_rect: Cell::new(Rect::ZERO),
             status_pill_pressed: Cell::new(false),
+            chat_session_timer: Cell::new(None),
             body_rect: Rect::ZERO,
         };
         // Built already-ready (headless tooling / visual tests) → show the tabs immediately. The
@@ -129,6 +131,25 @@ impl Shell {
                 move || shared.active_tab().index()
             });
         self.content = Some(WidgetPod::new(content));
+    }
+
+    fn schedule_chat_session_timer(&self, ctx: &mut EventCtx) {
+        if self.chat_session_timer.get().is_some() || !self.shared.is_ready() {
+            return;
+        }
+        if self.shared.chat().session_list_is_loading() {
+            let token = ctx.schedule_timer_after(1.0);
+            self.chat_session_timer.set(Some(token));
+        }
+    }
+
+    fn drain_chat_session_timer(&self, ctx: &mut EventCtx) -> bool {
+        if !self.shared.is_ready() {
+            return false;
+        }
+        let changed = self.shared.chat_mut().pump_session_list();
+        self.schedule_chat_session_timer(ctx);
+        changed
     }
 
     fn palette(&self) -> (sui::DefaultTheme, Palette) {
@@ -430,6 +451,18 @@ impl Widget for Shell {
             }
             _ => {}
         }
+        if let Event::Wake(sui::WakeEvent::Timer { token, .. }) = event
+            && self.chat_session_timer.get() == Some(*token)
+        {
+            self.chat_session_timer.set(None);
+            if self.drain_chat_session_timer(ctx) {
+                ctx.request_measure();
+                ctx.request_arrange();
+                ctx.request_semantics();
+                ctx.request_paint();
+            }
+            return;
+        }
         // The background connect thread wakes us via the sui external-wake mechanism; drain its
         // progress/result here. When the backend arrives, build the tab content and relayout.
         if let Event::Custom(custom) = event {
@@ -439,6 +472,7 @@ impl Widget for Shell {
                     self.build_content();
                     let waker = { self.shared.borrow().waker.clone() };
                     self.shared.chat_mut().start_session_list_load(waker);
+                    self.schedule_chat_session_timer(ctx);
                     ctx.request_measure();
                     ctx.request_arrange();
                     ctx.request_semantics();
@@ -463,6 +497,7 @@ impl Widget for Shell {
                 } else {
                     false
                 };
+                self.schedule_chat_session_timer(ctx);
                 if files_changed || chat_changed {
                     ctx.request_measure();
                     ctx.request_arrange();

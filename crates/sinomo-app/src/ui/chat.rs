@@ -40,7 +40,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sui::{
     Alignment, ArrangeCtx, Color, Constraints, DefaultTheme, Event, EventCtx, Flex, FlexItem,
@@ -86,6 +86,7 @@ const INPUT_ACTION_GAP: f32 = 10.0;
 const SEND_BUTTON_SIZE: f32 = 40.0;
 const COMPOSER_TEXT_SIZE: f32 = 13.5;
 const COMPOSER_LINE_HEIGHT: f32 = 19.0;
+const SESSION_LIST_UI_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as the other tabs.)
@@ -421,6 +422,7 @@ pub struct ChatState {
     pub activity: Vec<ChatActivityEntry>,
     pub tool_calls: Vec<ChatToolActivity>,
     pub control: ChatControlOverview,
+    activity_panel_open: bool,
     pub scroll: f32,
     pub stick_bottom: bool,
     pub agents: Vec<AgentSummary>,
@@ -440,6 +442,7 @@ pub struct ChatState {
     delete_rx: Option<Receiver<DeleteWorkerResult>>,
     session_list_rx: Option<Receiver<SessionListWorkerResult>>,
     session_list_loading: bool,
+    session_list_started_at: Option<Instant>,
     channel_agent_idx: usize,
 }
 
@@ -503,6 +506,7 @@ impl ChatState {
             activity: Vec::new(),
             tool_calls: Vec::new(),
             control: ChatControlOverview::default(),
+            activity_panel_open: false,
             scroll: 0.0,
             stick_bottom: true,
             agents,
@@ -521,6 +525,7 @@ impl ChatState {
             delete_rx: None,
             session_list_rx: None,
             session_list_loading: false,
+            session_list_started_at: None,
             channel_agent_idx: 0,
         };
         if let Some(detail) = session_list_error {
@@ -613,20 +618,47 @@ impl ChatState {
             let detail = error.to_string();
             self.notice = Some(format!("chat list failed: {detail}"));
             self.push_activity("chat list", detail, ActivityTone::Warn);
+            self.session_list_rx = None;
+            self.session_list_loading = false;
+            self.session_list_started_at = None;
             return;
         }
 
         self.session_list_rx = Some(rx);
         self.session_list_loading = true;
+        self.session_list_started_at = Some(Instant::now());
+    }
+
+    pub fn session_list_is_loading(&self) -> bool {
+        self.session_list_loading
     }
 
     pub fn pump_session_list(&mut self) -> bool {
         let result = match self.session_list_rx.as_ref().map(|rx| rx.try_recv()) {
             Some(Ok(result)) => result,
-            Some(Err(TryRecvError::Empty)) | None => return false,
+            Some(Err(TryRecvError::Empty)) => {
+                if self.session_list_loading
+                    && self
+                        .session_list_started_at
+                        .is_some_and(|started| started.elapsed() >= SESSION_LIST_UI_TIMEOUT)
+                {
+                    self.session_list_loading = false;
+                    self.session_list_started_at = None;
+                    let detail = format!(
+                        "SIFS chat list has not returned after {} seconds; cluster connection is still pending",
+                        SESSION_LIST_UI_TIMEOUT.as_secs()
+                    );
+                    self.notice = Some(format!("chat list failed: {detail}"));
+                    self.push_activity("chat list", detail, ActivityTone::Warn);
+                    return true;
+                }
+                return false;
+            }
+            None => return false,
             Some(Err(TryRecvError::Disconnected)) => {
                 self.session_list_rx = None;
                 self.session_list_loading = false;
+                self.session_list_started_at = None;
                 self.notice = Some("chat list failed: worker stopped".to_string());
                 self.push_activity(
                     "chat list",
@@ -638,6 +670,7 @@ impl ChatState {
         };
         self.session_list_rx = None;
         self.session_list_loading = false;
+        self.session_list_started_at = None;
         self.apply_session_list_result(result);
         true
     }
@@ -984,6 +1017,21 @@ impl ChatState {
             detail: "runtime discovery pending".to_string(),
             tone: ActivityTone::Neutral,
         }
+    }
+
+    fn activity_panel_needs_attention(&self) -> bool {
+        matches!(
+            self.runtime_health().tone,
+            ActivityTone::Running | ActivityTone::Warn | ActivityTone::Bad
+        )
+    }
+
+    fn activity_panel_visible(&self) -> bool {
+        self.activity_panel_open || self.activity_panel_needs_attention()
+    }
+
+    fn toggle_activity_panel(&mut self) {
+        self.activity_panel_open = !self.activity_panel_open;
     }
 
     fn runtime_degraded_detail(&self) -> Option<String> {
@@ -4127,15 +4175,105 @@ impl Widget for ChatDialogHost {
 
 struct RuntimeOverview {
     shared: Shared,
+    activity_hovered: Cell<bool>,
+    activity_pressed: Cell<bool>,
 }
 
 impl RuntimeOverview {
     fn new(shared: Shared) -> Self {
-        Self { shared }
+        Self {
+            shared,
+            activity_hovered: Cell::new(false),
+            activity_pressed: Cell::new(false),
+        }
+    }
+
+    fn health_chip_width(bounds: Rect) -> f32 {
+        112.0_f32.min((bounds.width() * 0.34).max(92.0))
+    }
+
+    fn health_chip_rect(bounds: Rect) -> Rect {
+        let chip_w = Self::health_chip_width(bounds);
+        let top = bounds.y() + 10.0;
+        Rect::new(
+            bounds.x() + bounds.width() - PAD - chip_w,
+            top - 1.0,
+            chip_w,
+            20.0,
+        )
+    }
+
+    fn activity_button_rect(bounds: Rect) -> Option<Rect> {
+        let chip = Self::health_chip_rect(bounds);
+        let button_w = 94.0_f32.min((bounds.width() * 0.24).max(78.0));
+        let rect = Rect::new(chip.x() - 8.0 - button_w, chip.y(), button_w, chip.height());
+        (rect.x() >= bounds.x() + PAD + 88.0).then_some(rect)
+    }
+
+    fn activity_button_hit(&self, bounds: Rect, position: Point) -> bool {
+        Self::activity_button_rect(bounds).is_some_and(|rect| rect.contains(position))
+    }
+
+    fn request_activity_refresh(ctx: &mut EventCtx) {
+        ctx.request_measure();
+        ctx.request_arrange();
+        ctx.request_paint();
+        ctx.request_semantics();
     }
 }
 
 impl Widget for RuntimeOverview {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        match event {
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
+                let hovered = self.activity_button_hit(ctx.bounds(), pointer.position);
+                if self.activity_hovered.get() != hovered {
+                    self.activity_hovered.set(hovered);
+                    Self::request_activity_refresh(ctx);
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Down
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                if self.activity_button_hit(ctx.bounds(), pointer.position) {
+                    self.activity_pressed.set(true);
+                    ctx.request_pointer_capture(pointer.pointer_id);
+                    Self::request_activity_refresh(ctx);
+                    ctx.set_handled();
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Up
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                if self.activity_pressed.take() {
+                    if self.activity_button_hit(ctx.bounds(), pointer.position) {
+                        self.shared.chat_mut().toggle_activity_panel();
+                    }
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    Self::request_activity_refresh(ctx);
+                    ctx.set_handled();
+                }
+            }
+            Event::Pointer(pointer)
+                if matches!(
+                    pointer.kind,
+                    PointerEventKind::Leave | PointerEventKind::Cancel
+                ) =>
+            {
+                let had_state =
+                    self.activity_hovered.replace(false) || self.activity_pressed.take();
+                if had_state {
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    Self::request_activity_refresh(ctx);
+                    ctx.set_handled();
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         constraints.clamp(Size::new(constraints.max.width, OVERVIEW_H))
     }
@@ -4154,15 +4292,23 @@ impl Widget for RuntimeOverview {
         let x = bounds.x() + PAD;
         let top = bounds.y() + 10.0;
         let health = chat.runtime_health();
-        let chip_w = 112.0_f32.min((bounds.width() * 0.34).max(92.0));
-        let chip = Rect::new(
-            bounds.x() + bounds.width() - PAD - chip_w,
-            top - 1.0,
-            chip_w,
-            20.0,
-        );
+        let chip = Self::health_chip_rect(bounds);
+        let activity_button = Self::activity_button_rect(bounds);
+        if let Some(button) = activity_button {
+            draw_activity_overview_button(
+                ctx,
+                &pal,
+                &theme,
+                button,
+                chat.activity_panel_visible(),
+                chat.activity_panel_needs_attention(),
+                self.activity_hovered.get(),
+                self.activity_pressed.get(),
+            );
+        }
         draw_health_chip(ctx, &pal, &theme, chip, &health);
-        let title_w = (chip.x() - x - 10.0).max(80.0);
+        let title_right = activity_button.map_or(chip.x(), |button| button.x());
+        let title_w = (title_right - x - 10.0).max(80.0);
         let runtime = if chat.info.provider.is_empty() || chat.info.model.is_empty() {
             "runtime pending".to_string()
         } else {
@@ -4252,6 +4398,25 @@ impl Widget for RuntimeOverview {
             );
         }
     }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let Some(rect) = Self::activity_button_rect(ctx.bounds()) else {
+            return;
+        };
+        let chat = self.shared.chat();
+        let mut node = SemanticsNode::new(
+            sui::WidgetId::new(ctx.widget_id().get().wrapping_mul(47).wrapping_add(12_101)),
+            SemanticsRole::Button,
+            rect,
+        );
+        node.parent = Some(ctx.widget_id());
+        node.name = Some("Activity".to_string());
+        node.description = Some("Show or hide runtime activity".to_string());
+        node.actions = vec![SemanticsAction::Activate];
+        node.state.hovered = self.activity_hovered.get();
+        node.state.selected = chat.activity_panel_visible();
+        ctx.push(node);
+    }
 }
 
 fn draw_health_chip(
@@ -4273,6 +4438,52 @@ fn draw_health_chip(
         ctx,
         Rect::new(rect.x() + 20.0, rect.y() + 2.0, rect.width() - 24.0, 16.0),
         health.label,
+        pal.text_style(theme, 10.0, FontWeight::SEMIBOLD, color),
+    );
+}
+
+fn draw_activity_overview_button(
+    ctx: &mut PaintCtx,
+    pal: &Palette,
+    theme: &DefaultTheme,
+    rect: Rect,
+    active: bool,
+    attention: bool,
+    hovered: bool,
+    pressed: bool,
+) {
+    let fill = if pressed {
+        pal.selected
+    } else if active {
+        pal.field
+    } else if hovered {
+        pal.hover
+    } else {
+        pal.titlebar
+    };
+    widgets::fill_round_rect(ctx, rect, fill, 6.0);
+    let tone = if attention {
+        ActivityTone::Warn
+    } else if active {
+        ActivityTone::Good
+    } else {
+        ActivityTone::Neutral
+    };
+    let color = tone_color(pal, tone);
+    draw_glyph(
+        ctx,
+        if attention {
+            IconGlyph::Alert
+        } else {
+            IconGlyph::History
+        },
+        Rect::new(rect.x() + 6.0, rect.y() + 4.0, 12.0, 12.0),
+        color,
+    );
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(rect.x() + 22.0, rect.y() + 2.0, rect.width() - 26.0, 16.0),
+        "Activity",
         pal.text_style(theme, 10.0, FontWeight::SEMIBOLD, color),
     );
 }
@@ -5895,17 +6106,33 @@ fn main_column(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .bottom(COMPOSER_H, composer(shared, reader))
 }
 
+fn chat_work_area(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<bool> {
+    let key_shared = shared.clone();
+    let build_shared = shared.clone();
+    let build_reader = Rc::clone(reader);
+    RebuildOnChange::new(
+        move || key_shared.chat().activity_panel_visible(),
+        move |activity_visible| {
+            if *activity_visible {
+                WidgetPod::new(Split::right_fixed(
+                    main_column(&build_shared, &build_reader),
+                    ActivityRail::new(build_shared.clone()),
+                    ACTIVITY_RAIL_W,
+                    &build_reader,
+                ))
+            } else {
+                WidgetPod::new(main_column(&build_shared, &build_reader))
+            }
+        },
+    )
+}
+
 fn wide_pod(
     shared: &Shared,
     reader: &ThemeReader,
     sessions_scroll_state: &ScrollState,
 ) -> WidgetPod {
-    let work_area = Split::right_fixed(
-        main_column(shared, reader),
-        ActivityRail::new(shared.clone()),
-        ACTIVITY_RAIL_W,
-        reader,
-    );
+    let work_area = chat_work_area(shared, reader);
     let row = Split::left_fixed(
         sidebar(shared, reader, sessions_scroll_state),
         work_area,
@@ -6078,6 +6305,7 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.effort_visible().hash(&mut h);
     chat.streaming.hash(&mut h);
     chat.models_loading.hash(&mut h);
+    chat.activity_panel_visible().hash(&mut h);
     chat.session_list_loading.hash(&mut h);
     chat.runtime_recovery_target()
         .map(RuntimeRecoveryTarget::key)
@@ -7656,6 +7884,142 @@ mod tests {
         assert_eq!(
             shared.settings().selected,
             Some(SettingsSection::Connection)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn activity_panel_is_quiet_until_requested_or_needed() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.info.provider = "openai".to_string();
+        state.info.model = "gpt-5".to_string();
+
+        assert!(
+            !state.activity_panel_visible(),
+            "ready idle chat should leave the activity rail closed"
+        );
+
+        state.toggle_activity_panel();
+        assert!(state.activity_panel_visible());
+        state.toggle_activity_panel();
+        assert!(!state.activity_panel_visible());
+
+        state.streaming = true;
+        assert!(
+            state.activity_panel_visible(),
+            "active streaming should keep runtime activity visible"
+        );
+        state.streaming = false;
+        assert!(!state.activity_panel_visible());
+
+        state.push_activity(
+            "chat list",
+            "device authorization was denied",
+            ActivityTone::Warn,
+        );
+        assert!(
+            state.activity_panel_visible(),
+            "connection warnings should force the activity rail open"
+        );
+    }
+
+    #[test]
+    fn timed_out_session_list_load_can_recover_from_late_result() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let (tx, rx) = mpsc::channel();
+        state.session_list_rx = Some(rx);
+        state.session_list_loading = true;
+        state.session_list_started_at = Some(
+            Instant::now()
+                .checked_sub(SESSION_LIST_UI_TIMEOUT + Duration::from_millis(1))
+                .expect("past timestamp"),
+        );
+
+        assert!(
+            state.pump_session_list(),
+            "timeout should mutate visible state"
+        );
+        assert!(!state.session_list_loading);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("SIFS chat list")),
+            "timeout should surface an actionable SIFS warning"
+        );
+        assert!(state.activity_panel_visible());
+
+        let session_id = SessionId::generate().to_string();
+        tx.send(SessionListWorkerResult {
+            sessions: vec![SessionRef {
+                id: session_id.clone(),
+                title: "Recovered chat".to_string(),
+                kind: ConversationKind::Chat,
+                updated_unix: 7,
+                participant_count: 1,
+            }],
+            error: None,
+        })
+        .expect("send late result");
+
+        assert!(
+            state.pump_session_list(),
+            "late worker result should still apply"
+        );
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].id, session_id);
+        assert!(state.notice.is_none());
+        assert!(
+            state
+                .activity
+                .iter()
+                .all(|entry| entry.title != "chat list"),
+            "successful late result should clear stale chat-list warnings"
+        );
+    }
+
+    #[test]
+    fn rendered_activity_button_toggles_idle_activity_panel() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.info.provider = "openai".to_string();
+            chat.info.model = "gpt-5".to_string();
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat activity button")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Activity")
+            .click()?;
+        assert!(
+            shared.chat().activity_panel_visible(),
+            "Activity button should open the idle activity rail"
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Activity")
+            .click()?;
+        assert!(
+            !shared.chat().activity_panel_visible(),
+            "Activity button should close the idle activity rail"
         );
 
         Ok(())
