@@ -61,6 +61,7 @@ const ROW_ACTION_GAP: f32 = 4.0;
 const CONTENT_PAD: f32 = 16.0;
 const HEADER_H: f32 = 46.0;
 const FILES_STATUS_H: f32 = 38.0;
+const LIST_HEADER_H: f32 = 36.0;
 const LIST_TASK_STRIP_H: f32 = 88.0;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -3349,11 +3350,23 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
     );
     let scroll = ScrollView::vertical(inset).state(scroll_state.clone());
     if has_tasks {
-        WidgetPod::new(
-            widgets::Dock::new(scroll).top(LIST_TASK_STRIP_H, FilesTaskStrip::new(shared.clone())),
-        )
+        let top = Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .with_child(
+                SizedBox::new()
+                    .height(LIST_TASK_STRIP_H)
+                    .with_child(FilesTaskStrip::new(shared.clone())),
+            )
+            .with_child(
+                SizedBox::new()
+                    .height(LIST_HEADER_H)
+                    .with_child(FilesListHeader::new(shared.clone())),
+            );
+        WidgetPod::new(widgets::Dock::new(scroll).top(LIST_TASK_STRIP_H + LIST_HEADER_H, top))
     } else {
-        WidgetPod::new(scroll)
+        WidgetPod::new(
+            widgets::Dock::new(scroll).top(LIST_HEADER_H, FilesListHeader::new(shared.clone())),
+        )
     }
 }
 
@@ -3475,8 +3488,92 @@ fn files_status_summary(files: &FilesState) -> String {
 fn plural(count: usize, singular: &str) -> String {
     if count == 1 {
         format!("1 {singular}")
+    } else if singular == "entry" {
+        format!("{count} entries")
     } else {
         format!("{count} {singular}s")
+    }
+}
+
+struct FilesListHeader {
+    shared: Shared,
+}
+
+impl FilesListHeader {
+    fn new(shared: Shared) -> Self {
+        Self { shared }
+    }
+}
+
+impl Widget for FilesListHeader {
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        constraints.clamp(Size::new(280.0, LIST_HEADER_H))
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let pal = palette(&self.shared);
+        let bounds = ctx.bounds();
+        let files = self.shared.files();
+
+        ctx.fill_rect(bounds, pal.sidebar);
+        widgets::hairline_bottom(ctx, bounds, pal.border);
+
+        let x = bounds.x() + CONTENT_PAD;
+        let y = bounds.y() + 8.0;
+        let content_w = (bounds.width() - CONTENT_PAD * 2.0).max(0.0);
+        let action_w = ROW_ACTION_SIDE * 5.0 + ROW_ACTION_GAP * 4.0 + 8.0;
+        let meta_w = 88.0_f32.min(content_w * 0.28).max(0.0);
+        let action_x = bounds.max_x() - CONTENT_PAD - action_w;
+        let meta_x = (action_x - meta_w).max(x + 120.0);
+        let title_w = (meta_x - x - 12.0).max(0.0);
+
+        let label_style = pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x, y, title_w, 16.0),
+            "Name",
+            label_style.clone(),
+        );
+        let count_x = (x + 44.0).min(x + title_w);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(count_x, y, (title_w - 44.0).max(0.0), 16.0),
+            &files_entry_count_status(&files),
+            pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text_muted),
+        );
+
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(meta_x, y, meta_w, 16.0),
+            "Kind / size",
+            label_style.clone(),
+        );
+        if content_w > 520.0 {
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(action_x, y, action_w, 16.0),
+                "Actions",
+                label_style,
+            );
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let files = self.shared.files();
+        let summary = format!(
+            "{} list columns: Name, Kind / size, Actions. Path {}. {}.",
+            files.source.label(),
+            files.path,
+            files_entry_count_status(&files)
+        );
+        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::Text, ctx.bounds());
+        node.name = Some("Files list columns".to_string());
+        node.value = Some(SemanticsValue::Text(
+            "Name | Kind / size | Actions".to_string(),
+        ));
+        node.description = Some(summary);
+        ctx.push(node);
     }
 }
 
@@ -7056,6 +7153,67 @@ mod tests {
                 "Local SIFS | Path /cluster-tests | 1 entry | selected /cluster-tests/artifact.txt | idle"
                     .to_string(),
             ))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn files_list_header_exposes_column_context() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/services".to_string();
+            files.entries = vec![
+                SifsEntry {
+                    name: "artifact.txt".to_string(),
+                    path: "/services/artifact.txt".to_string(),
+                    is_dir: false,
+                    is_link: false,
+                    size: Some(42),
+                },
+                SifsEntry {
+                    name: "workspace".to_string(),
+                    path: "/services/workspace".to_string(),
+                    is_dir: true,
+                    is_link: false,
+                    size: None,
+                },
+            ];
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files list columns")
+                    .root(view(shared)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        let snapshot = window.snapshot()?;
+        let header = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::Text
+                    && node.name.as_deref() == Some("Files list columns")
+            })
+            .expect("files list header semantics");
+        assert_eq!(
+            header.value,
+            Some(sui::SemanticsValue::Text(
+                "Name | Kind / size | Actions".to_string(),
+            ))
+        );
+        assert_eq!(
+            header.description.as_deref(),
+            Some("SIFS list columns: Name, Kind / size, Actions. Path /services. 2 entries.")
         );
 
         Ok(())
