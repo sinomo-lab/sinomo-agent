@@ -33,9 +33,9 @@ use sui::{
     Alignment, ArrangeCtx, Breadcrumb, BreadcrumbItem, Color, Constraints, DefaultTheme, Event,
     EventCtx, FontWeight, IconButton, IconGlyph, KeyState, ListItem, ListView, MeasureCtx,
     PaintCtx, Point, PointerButton, PointerEventKind, Rect, ScrollState, ScrollView,
-    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator, Size, SizedBox, Stack,
-    StackHostOptions, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
-    draw_glyph,
+    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator, Size,
+    SizedBox, Stack, StackHostOptions, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    WindowEvent, draw_glyph,
 };
 
 use sinomo_cli::app_api::{SifsBrowser, SifsEntry, SifsObjectDetails};
@@ -56,6 +56,7 @@ const ROW_ACTION_SIDE: f32 = 24.0;
 const ROW_ACTION_GAP: f32 = 4.0;
 const CONTENT_PAD: f32 = 16.0;
 const HEADER_H: f32 = 46.0;
+const FILES_STATUS_H: f32 = 38.0;
 const LIST_TASK_STRIP_H: f32 = 88.0;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -2033,6 +2034,192 @@ fn open_settings_section(shared: &Shared, section: SettingsSection) {
     }
 }
 
+fn files_source_status(files: &FilesState) -> &'static str {
+    if files.error.is_some() {
+        "SIFS unavailable"
+    } else if files.loading {
+        "Loading SIFS"
+    } else if files.clustered {
+        "SIFS online"
+    } else {
+        "Local SIFS"
+    }
+}
+
+fn files_entry_count_status(files: &FilesState) -> String {
+    if files.loading {
+        "loading directory".to_string()
+    } else if files.error.is_some() {
+        "listing unavailable".to_string()
+    } else {
+        plural(files.entries.len(), "entry")
+    }
+}
+
+fn files_selection_status(files: &FilesState) -> String {
+    files
+        .selected_entry()
+        .map(|entry| format!("selected {}", entry.path))
+        .unwrap_or_else(|| "no selection".to_string())
+}
+
+fn files_task_status(files: &FilesState) -> String {
+    let running = files
+        .tasks
+        .iter()
+        .filter(|task| task.state == FilesTaskState::Running)
+        .count();
+    let cancelling = files
+        .tasks
+        .iter()
+        .filter(|task| task.state == FilesTaskState::CancelRequested)
+        .count();
+    let failed = files
+        .tasks
+        .iter()
+        .filter(|task| task.state == FilesTaskState::Failed)
+        .count();
+    if running > 0 {
+        if running == 1 {
+            "1 task running".to_string()
+        } else {
+            format!("{running} tasks running")
+        }
+    } else if cancelling > 0 {
+        if cancelling == 1 {
+            "1 task cancelling".to_string()
+        } else {
+            format!("{cancelling} tasks cancelling")
+        }
+    } else if failed > 0 {
+        if failed == 1 {
+            "1 task failed".to_string()
+        } else {
+            format!("{failed} tasks failed")
+        }
+    } else {
+        "idle".to_string()
+    }
+}
+
+fn files_status_summary(files: &FilesState) -> String {
+    format!(
+        "{} | Path {} | {} | {} | {}",
+        files_source_status(files),
+        files.path,
+        files_entry_count_status(files),
+        files_selection_status(files),
+        files_task_status(files),
+    )
+}
+
+fn plural(count: usize, singular: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {singular}s")
+    }
+}
+
+struct FilesStatusBar {
+    shared: Shared,
+}
+
+impl FilesStatusBar {
+    fn new(shared: Shared) -> Self {
+        Self { shared }
+    }
+
+    fn chip_color(files: &FilesState, pal: &Palette) -> Color {
+        if files.error.is_some() {
+            pal.warn
+        } else if files.loading {
+            pal.accent
+        } else if files.clustered {
+            pal.good
+        } else {
+            pal.text_faint
+        }
+    }
+}
+
+impl Widget for FilesStatusBar {
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        constraints.clamp(Size::new(280.0, FILES_STATUS_H))
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let pal = palette(&self.shared);
+        let bounds = ctx.bounds();
+        let files = self.shared.files();
+
+        ctx.fill_rect(bounds, pal.sidebar);
+        widgets::hairline_top(ctx, bounds, pal.border);
+
+        let x = bounds.x() + CONTENT_PAD;
+        let y = bounds.y() + 7.0;
+        let chip = Rect::new(x, y, 112.0_f32.min(bounds.width() * 0.28).max(86.0), 24.0);
+        let chip_tone = Self::chip_color(&files, &pal);
+        widgets::round_panel(ctx, chip, pal.field, chip_tone, 12.0);
+        widgets::fill_round_rect(
+            ctx,
+            Rect::new(chip.x() + 10.0, chip.y() + 9.0, 6.0, 6.0),
+            chip_tone,
+            3.0,
+        );
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(
+                chip.x() + 22.0,
+                chip.y(),
+                chip.width() - 30.0,
+                chip.height(),
+            ),
+            files_source_status(&files),
+            pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text),
+        );
+
+        let right_w = 190.0_f32.min(bounds.width() * 0.28).max(0.0);
+        let right = Rect::new(bounds.max_x() - CONTENT_PAD - right_w, y, right_w, 24.0);
+        widgets::draw_text_in(
+            ctx,
+            right,
+            &files_task_status(&files),
+            pal.text_style(&theme, 11.0, FontWeight::MEDIUM, pal.text_faint),
+        );
+
+        let info_x = chip.max_x() + 12.0;
+        let info_w = (right.x() - info_x - 12.0).max(0.0);
+        let selected = files
+            .selected_entry()
+            .map(|entry| middle_short(&entry.name, 34))
+            .unwrap_or_else(|| "no selection".to_string());
+        let info = format!(
+            "{} | {} | {}",
+            middle_short(&files.path, 64),
+            files_entry_count_status(&files),
+            selected,
+        );
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(info_x, y, info_w, 24.0),
+            &info,
+            pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_muted),
+        );
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let files = self.shared.files();
+        let summary = files_status_summary(&files);
+        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::Text, ctx.bounds());
+        node.name = Some("Files status".to_string());
+        node.value = Some(SemanticsValue::Text(summary.clone()));
+        node.description = Some(summary);
+        ctx.push(node);
+    }
+}
+
 struct FilesTaskStrip {
     shared: Shared,
     hovered_cancel: Option<u64>,
@@ -3461,7 +3648,11 @@ fn wide_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -
                 .with_child(header_bar(shared, reader)),
         )
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)));
-    WidgetPod::new(widgets::Dock::new(body).top(HEADER_H + 1.0, header))
+    WidgetPod::new(
+        widgets::Dock::new(body)
+            .top(HEADER_H + 1.0, header)
+            .bottom(FILES_STATUS_H, FilesStatusBar::new(shared.clone())),
+    )
 }
 
 /// Narrow: header docked on top, list-only body fills (the inspector is hidden).
@@ -3475,7 +3666,9 @@ fn narrow_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState)
         )
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)));
     WidgetPod::new(
-        widgets::Dock::new(list_column(shared, reader, scroll_state)).top(HEADER_H + 1.0, header),
+        widgets::Dock::new(list_column(shared, reader, scroll_state))
+            .top(HEADER_H + 1.0, header)
+            .bottom(FILES_STATUS_H, FilesStatusBar::new(shared.clone())),
     )
 }
 
@@ -4151,6 +4344,34 @@ mod tests {
     }
 
     #[test]
+    fn files_status_summary_reports_location_selection_and_tasks() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.loaded = true;
+        state.loading = false;
+        state.path = "/cluster-tests".to_string();
+        state.entries = vec![SifsEntry {
+            name: "artifact.txt".to_string(),
+            path: "/cluster-tests/artifact.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(42),
+        }];
+        state.selected = Some(0);
+        state.tasks = vec![FilesTask {
+            id: 42,
+            title: "Delete".to_string(),
+            detail: "/cluster-tests/artifact.txt".to_string(),
+            state: FilesTaskState::Running,
+        }];
+
+        assert_eq!(
+            files_status_summary(&state),
+            "Local SIFS | Path /cluster-tests | 1 entry | selected /cluster-tests/artifact.txt | 1 task running"
+        );
+    }
+
+    #[test]
     fn sifs_unavailable_summary_uses_recovery_language() {
         assert_eq!(
             sifs_unavailable_summary("device authorization was denied"),
@@ -4517,6 +4738,56 @@ mod tests {
                 .with_name("Refresh SIFS")
                 .count()?,
             1
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn files_status_bar_exposes_current_path_state() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/cluster-tests".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/cluster-tests/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(42),
+            }];
+            files.selected = Some(0);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files status")
+                    .root(view(shared)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        let snapshot = window.snapshot()?;
+        let status = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::Text
+                    && node.name.as_deref() == Some("Files status")
+            })
+            .expect("files status semantics");
+        assert_eq!(
+            status.value,
+            Some(sui::SemanticsValue::Text(
+                "Local SIFS | Path /cluster-tests | 1 entry | selected /cluster-tests/artifact.txt | idle"
+                    .to_string(),
+            ))
         );
 
         Ok(())
