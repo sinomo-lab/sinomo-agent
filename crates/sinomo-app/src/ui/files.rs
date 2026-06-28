@@ -34,9 +34,9 @@ use std::thread;
 use std::time::Duration;
 
 use sui::{
-    Alignment, ArrangeCtx, Breadcrumb, BreadcrumbItem, Color, Constraints, DefaultTheme, Event,
-    EventCtx, FontWeight, IconButton, IconGlyph, KeyState, ListItem, ListView, MeasureCtx,
-    PaintCtx, Point, PointerButton, PointerEventKind, Rect, ScrollState, ScrollView,
+    Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, Color, Constraints,
+    DefaultTheme, Event, EventCtx, FontWeight, IconButton, IconGlyph, KeyState, ListItem, ListView,
+    MeasureCtx, PaintCtx, Point, PointerButton, PointerEventKind, Rect, ScrollState, ScrollView,
     SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator, Size,
     SizedBox, Stack, StackHostOptions, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
     WindowEvent, draw_glyph,
@@ -2479,6 +2479,14 @@ fn details_locations(details: &SifsObjectDetails) -> String {
     }
 }
 
+fn short_node_label(node_id: &str) -> String {
+    if node_id.is_empty() {
+        "local".to_string()
+    } else {
+        short(node_id, 18)
+    }
+}
+
 fn sifs_replication_summary(details: Option<&SifsObjectDetails>, clustered: bool) -> String {
     let Some(details) = details else {
         return if clustered {
@@ -3952,6 +3960,191 @@ impl InspectorView {
             ),
         }
     }
+
+    fn measured_content_height(&self, _ctx: &mut MeasureCtx, width: f32) -> f32 {
+        let w = (width - INSPECTOR_PAD * 2.0).max(0.0);
+        let mut y = INSPECTOR_PAD + 4.0 + 30.0;
+        let files = self.shared.files();
+
+        let finish = |end_y: f32, has_tasks: bool| {
+            let task_reserve = if has_tasks {
+                INSPECTOR_TASK_PANEL_H + 12.0
+            } else {
+                0.0
+            };
+            (end_y + task_reserve + INSPECTOR_BOTTOM_PAD).max(INSPECTOR_MIN_CONTENT_H)
+        };
+
+        if files.loading {
+            let rows = sifs_loading_rows(&files.path, files.inspector_details_open);
+            let panel_h = Self::state_panel_height(w, &rows);
+            return finish(y + panel_h, !files.tasks.is_empty());
+        }
+
+        if let Some(error) = &files.error {
+            let rows = sifs_unavailable_rows(error, files.inspector_details_open);
+            let panel_h = Self::state_panel_height(w, &rows);
+            return finish(y + panel_h, !files.tasks.is_empty());
+        }
+
+        let Some(entry) = files.selected_entry() else {
+            let status = if files.entries.is_empty() {
+                "No entries in this directory"
+            } else {
+                "Select an object to inspect placement"
+            };
+            let rows = [
+                ("Path", files.path.clone()),
+                ("Entries", files.entries.len().to_string()),
+                ("Status", status.to_string()),
+            ];
+            let panel_h = Self::state_panel_height(w, &rows);
+            return finish(y + panel_h, !files.tasks.is_empty());
+        };
+
+        y += 26.0;
+        y += 34.0;
+
+        let actions = inspector_actions(files.source, entry);
+        if !actions.is_empty() {
+            let action_start = INSPECTOR_PAD + 4.0 + 30.0 + 26.0 + 30.0;
+            y = (action_start + inspector_actions_height(actions.len())).max(y) + 12.0;
+        }
+
+        y += Self::info_row_height(w, &entry.path);
+
+        if files.source == FilesSourceKind::Local {
+            y += 10.0 + 24.0;
+            y += 26.0;
+            y += 10.0 + Self::info_row_height(w, "Host filesystem");
+
+            let local = files.selected_local_details.as_ref();
+            if let Some(local) = local {
+                y += 4.0
+                    + Self::info_row_height(
+                        w,
+                        if local.readonly {
+                            "read-only"
+                        } else {
+                            "writable"
+                        },
+                    );
+                if let Some(canonical) = &local.canonical_path
+                    && canonical != &local.path
+                {
+                    y += 4.0 + Self::info_row_height(w, canonical);
+                }
+            } else if let Some(error) = &files.details_error {
+                y += 4.0 + Self::info_row_height(w, error);
+            } else if files.details_loading {
+                y += 4.0 + Self::info_row_height(w, "Reading metadata");
+            }
+
+            if files.inspector_details_open {
+                y += 14.0 + 22.0;
+                if let Some(local) = local {
+                    y += Self::info_row_height(w, &local.kind);
+                    y += 4.0
+                        + Self::info_row_height(w, &local_time_label(local.accessed_at_unix_nanos));
+                    y += 4.0
+                        + Self::info_row_height(w, &local_time_label(local.modified_at_unix_nanos));
+                    y += 4.0
+                        + Self::info_row_height(w, &local_time_label(local.created_at_unix_nanos));
+                }
+            }
+
+            return finish(y, !files.tasks.is_empty());
+        }
+
+        y += 10.0 + 24.0;
+        y += 36.0;
+        y += 26.0;
+
+        let details = files.selected_details.as_ref();
+        let policy = details
+            .map(|details| details.policy.as_str())
+            .unwrap_or(if files.clustered {
+                "cluster policy"
+            } else {
+                "local-owned"
+            });
+        y += 10.0 + Self::info_row_height(w, policy);
+        let placement = sifs_replication_summary(details, files.clustered);
+        y += 4.0 + Self::info_row_height(w, &placement);
+        let locations = details
+            .map(details_locations)
+            .unwrap_or_else(|| short_node_label(&files.node_id));
+        y += 4.0 + Self::info_row_height(w, &locations);
+        let next_step = sifs_placement_next_step(details, files.clustered);
+        y += 4.0 + Self::info_row_height(w, &next_step);
+
+        if files.inspector_details_open {
+            y += 14.0 + 22.0;
+            if let Some(error) = &files.details_error {
+                y += Self::info_row_height(w, error);
+                y += 4.0 + Self::info_row_height(w, "SIFS through daemon");
+            } else if files.details_loading {
+                y += Self::info_row_height(w, "Waiting for daemon metadata");
+            }
+
+            if let Some(details) = details {
+                y += Self::info_row_height(w, &details.file_system_id);
+                y += 4.0 + Self::info_row_height(w, &short(&details.object_id, 28));
+                y += 4.0 + Self::info_row_height(w, &short(&details.version, 28));
+                y += 4.0
+                    + Self::info_row_height(
+                        w,
+                        &format!("{:o} · {} links", details.mode, details.link_count),
+                    );
+                y += 4.0
+                    + Self::info_row_height(
+                        w,
+                        &format!("uid {} · gid {}", details.uid, details.gid),
+                    );
+                y += 4.0
+                    + Self::info_row_height(w, &unix_nanos_label(details.modified_at_unix_nanos));
+                if let Some(hash) = &details.content_hash {
+                    y += 4.0 + Self::info_row_height(w, &short(hash, 28));
+                }
+            }
+        }
+
+        if !files.clustered {
+            let lines = Self::estimated_line_count(
+                "Join a cluster to spread this object across nodes and tune replication.",
+                w,
+                7.0,
+            );
+            y += lines as f32 * 17.0;
+        }
+
+        finish(y, !files.tasks.is_empty())
+    }
+
+    fn state_panel_height(w: f32, rows: &[(&str, String)]) -> f32 {
+        let value_w = (w - 24.0).max(0.0);
+        44.0 + rows
+            .iter()
+            .map(|(_, value)| {
+                let lines = Self::estimated_line_count(value, value_w, 6.6);
+                15.0 + (lines as f32 * 16.0) + 8.0
+            })
+            .sum::<f32>()
+    }
+
+    fn info_row_height(w: f32, value: &str) -> f32 {
+        let lines = Self::estimated_line_count(value, w, 7.2);
+        18.0 + lines as f32 * 17.0 + 6.0
+    }
+
+    fn estimated_line_count(value: &str, width: f32, avg_char_width: f32) -> usize {
+        let chars_per_line = (width / avg_char_width).floor().max(8.0) as usize;
+        value
+            .split('\n')
+            .map(|line| line.chars().count().max(1).div_ceil(chars_per_line))
+            .sum::<usize>()
+            .max(1)
+    }
 }
 
 const INSPECTOR_PAD: f32 = CONTENT_PAD;
@@ -3963,6 +4156,8 @@ const INSPECTOR_ACTION_GAP: f32 = 8.0;
 const INSPECTOR_TASK_PANEL_H: f32 = 128.0;
 const INSPECTOR_TASK_ROW_H: f32 = 28.0;
 const INSPECTOR_TASK_CANCEL_W: f32 = 58.0;
+const INSPECTOR_MIN_CONTENT_H: f32 = 220.0;
+const INSPECTOR_BOTTOM_PAD: f32 = 18.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InspectorAction {
@@ -4242,8 +4437,14 @@ impl Widget for InspectorView {
         }
     }
 
-    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        constraints.max
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let width = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            INSPECTOR_W
+        };
+        let height = self.measured_content_height(ctx, width);
+        constraints.clamp(Size::new(width, height))
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
@@ -4490,11 +4691,7 @@ impl Widget for InspectorView {
         y += 24.0;
 
         // node badge: a real Lucide HardDrive (Storage) icon + the node label, in a rounded pill.
-        let node_label = if files.node_id.is_empty() {
-            "local".to_string()
-        } else {
-            short(&files.node_id, 18)
-        };
+        let node_label = short_node_label(&files.node_id);
         let badge_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, pal.accent);
         const BADGE_ICON: f32 = 13.0;
         const BADGE_ICON_GAP: f32 = 7.0;
@@ -5067,8 +5264,16 @@ impl InspectorView {
 /// The inspector wrapped in a `PanelSection`-less host so it can be a `SizedBox` child. We keep the
 /// inspector as a single painter (above), so this is just the bare widget. A thin wrapper exists so
 /// the composed pod reads cleanly.
-fn inspector(shared: &Shared) -> impl Widget + use<> {
-    InspectorView::new(shared.clone())
+fn inspector(shared: &Shared, scroll_state: &ScrollState) -> impl Widget + use<> {
+    let s = shared.clone();
+    Background::new(
+        Color::TRANSPARENT,
+        ScrollView::vertical(InspectorView::new(shared.clone()))
+            .state(scroll_state.clone())
+            .name("File inspector")
+            .viewport_width_hint(true),
+    )
+    .brush_when(move || palette(&s).sidebar)
 }
 
 // ---------------------------------------------------------------------------
@@ -5391,10 +5596,15 @@ fn list_column(
 /// the list/inspector to the listing's content height); and a small [`Split`] so the inspector
 /// keeps its fixed 340px while the list takes the rest (a horizontal `Stack` would let the list
 /// greedily consume the full width before the inspector is measured).
-fn wide_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
+fn wide_pod(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_state: &ScrollState,
+    inspector_scroll_state: &ScrollState,
+) -> WidgetPod {
     let body = Split::new(
         list_column(shared, reader, scroll_state),
-        inspector(shared),
+        inspector(shared, inspector_scroll_state),
         INSPECTOR_W,
         reader,
     );
@@ -5672,9 +5882,17 @@ impl FilesView {
             let s = shared.clone();
             Rc::new(move || s.theme())
         };
-        // One shared scroll state so the list position is consistent across the wide/narrow swap.
+        // One shared list scroll state keeps the file position consistent across the wide/narrow
+        // swap. The inspector owns a separate scroll state because expanded technical details are
+        // independent of the directory listing.
         let scroll_state = ScrollState::new();
-        let wide = wide_pod(&shared, &theme_reader, &scroll_state);
+        let inspector_scroll_state = ScrollState::new();
+        let wide = wide_pod(
+            &shared,
+            &theme_reader,
+            &scroll_state,
+            &inspector_scroll_state,
+        );
         let narrow = narrow_pod(&shared, &theme_reader, &scroll_state);
         Self {
             shared,
@@ -7704,6 +7922,81 @@ mod tests {
             .with_name("Hide details")
             .click()?;
         assert!(!shared.files().inspector_details_open);
+
+        Ok(())
+    }
+
+    #[test]
+    fn expanded_inspector_details_publish_scroll_range() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/services".to_string();
+            files.node_id = "node-a".to_string();
+            files.clustered = true;
+            files.entries = vec![SifsEntry {
+                name: "sinomo-app-chat-session-01ktsg9dv850xkpryhkn0kfr8t.json".to_string(),
+                path: "/services/sinomo-app-chat-session-01ktsg9dv850xkpryhkn0kfr8t.json"
+                    .to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(4096),
+            }];
+            files.selected = Some(0);
+            files.inspector_details_open = true;
+            files.selected_details = Some(SifsObjectDetails {
+                file_system_id: "sifs-primary".to_string(),
+                object_id: "object-01ktsg9dv850xkpryhkn0kfr8t".to_string(),
+                path: "/services/sinomo-app-chat-session-01ktsg9dv850xkpryhkn0kfr8t.json"
+                    .to_string(),
+                kind: "file".to_string(),
+                version: "version-01ktsga2xj2yz8dh05ncdvph1q".to_string(),
+                content_hash: Some(
+                    "sha256:4d96739c4ce08aefbe9f0ea6a97d8a7a71510f008bd023f3b93bbf13e3f70d26"
+                        .to_string(),
+                ),
+                size_bytes: Some(4096),
+                link_count: 1,
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                accessed_at_unix_nanos: 0,
+                modified_at_unix_nanos: 0,
+                created_at_unix_nanos: 0,
+                changed_at_unix_nanos: 0,
+                policy: "replicated-eventual".to_string(),
+                current_locations: vec!["node-a".to_string(), "node-b".to_string()],
+            });
+        }
+        let scroll_state = ScrollState::new();
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files scrollable inspector")
+                    .root(
+                        SizedBox::new()
+                            .width(INSPECTOR_W)
+                            .height(280.0)
+                            .with_child(inspector(&shared, &scroll_state)),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        let _snapshot = window.snapshot()?;
+        assert!(
+            scroll_state.content_size().height > scroll_state.viewport_size().height,
+            "expanded inspector details should exceed the short viewport"
+        );
+        assert!(
+            scroll_state.max_offset().y > 0.0,
+            "expanded inspector details should be vertically scrollable"
+        );
 
         Ok(())
     }
