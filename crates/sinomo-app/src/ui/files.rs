@@ -63,6 +63,8 @@ const HEADER_H: f32 = 46.0;
 const FILES_STATUS_H: f32 = 38.0;
 const LIST_HEADER_H: f32 = 36.0;
 const LIST_TASK_STRIP_H: f32 = 88.0;
+const PLACES_W: f32 = 190.0;
+const PLACE_ROW_H: f32 = 42.0;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
@@ -223,6 +225,15 @@ struct LocalObjectDetails {
 enum FilesObjectDetails {
     Sifs(SifsObjectDetails),
     Local(LocalObjectDetails),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FilePlace {
+    label: String,
+    detail: String,
+    source: FilesSourceKind,
+    path: String,
+    glyph: IconGlyph,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4032,6 +4043,120 @@ fn files_status_summary(files: &FilesState) -> String {
     )
 }
 
+fn push_unique_place(
+    places: &mut Vec<FilePlace>,
+    label: impl Into<String>,
+    detail: impl Into<String>,
+    source: FilesSourceKind,
+    path: impl Into<String>,
+    glyph: IconGlyph,
+) {
+    let path = path.into();
+    if places
+        .iter()
+        .any(|place| place.source == source && place.path == path)
+    {
+        return;
+    }
+    places.push(FilePlace {
+        label: label.into(),
+        detail: detail.into(),
+        source,
+        path,
+        glyph,
+    });
+}
+
+fn local_home_path() -> Option<String> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn files_places(files: &FilesState) -> Vec<FilePlace> {
+    let mut places = Vec::new();
+    push_unique_place(
+        &mut places,
+        "SIFS root",
+        "cluster namespace",
+        FilesSourceKind::Sifs,
+        "/",
+        IconGlyph::Storage,
+    );
+    push_unique_place(
+        &mut places,
+        "Services",
+        "service data",
+        FilesSourceKind::Sifs,
+        "/services",
+        IconGlyph::Storage,
+    );
+    push_unique_place(
+        &mut places,
+        "Users",
+        "user data",
+        FilesSourceKind::Sifs,
+        "/users",
+        IconGlyph::Folder,
+    );
+    push_unique_place(
+        &mut places,
+        "Sinomo",
+        "runtime data",
+        FilesSourceKind::Sifs,
+        "/sinomo",
+        IconGlyph::Folder,
+    );
+    push_unique_place(
+        &mut places,
+        "Current local",
+        "host filesystem",
+        FilesSourceKind::Local,
+        files.local_path.clone(),
+        IconGlyph::Folder,
+    );
+    push_unique_place(
+        &mut places,
+        "Sinomo data",
+        "local data dir",
+        FilesSourceKind::Local,
+        files.data_dir.root().to_string_lossy().into_owned(),
+        IconGlyph::Folder,
+    );
+    if let Some(home) = local_home_path() {
+        push_unique_place(
+            &mut places,
+            "Home",
+            "local profile",
+            FilesSourceKind::Local,
+            home,
+            IconGlyph::Folder,
+        );
+    }
+    places
+}
+
+fn file_place_active(files: &FilesState, place: &FilePlace) -> bool {
+    files.source == place.source && files.path == place.path
+}
+
+fn open_file_place(shared: &Shared, place: FilePlace, ctx: &mut EventCtx) {
+    let waker = { shared.borrow().waker.clone() };
+    {
+        let mut files = shared.files_mut();
+        if files.source != place.source {
+            files.switch_source(place.source, waker);
+        }
+        files.navigate(place.path);
+    }
+    ctx.request_measure();
+    ctx.request_arrange();
+    ctx.request_paint();
+    ctx.request_hit_test();
+    ctx.request_semantics();
+}
+
 fn plural(count: usize, singular: &str) -> String {
     if count == 1 {
         format!("1 {singular}")
@@ -4222,6 +4347,176 @@ impl Widget for FilesStatusBar {
         node.value = Some(SemanticsValue::Text(summary.clone()));
         node.description = Some(summary);
         ctx.push(node);
+    }
+}
+
+struct FilesPlacesRail {
+    shared: Shared,
+    hovered: Option<usize>,
+}
+
+impl FilesPlacesRail {
+    fn new(shared: Shared) -> Self {
+        Self {
+            shared,
+            hovered: None,
+        }
+    }
+
+    fn row_rect(bounds: Rect, index: usize) -> Rect {
+        Rect::new(
+            bounds.x() + 8.0,
+            bounds.y() + 40.0 + index as f32 * PLACE_ROW_H,
+            (bounds.width() - 16.0).max(0.0),
+            PLACE_ROW_H - 6.0,
+        )
+    }
+
+    fn place_widget_id(parent: sui::WidgetId, index: usize) -> sui::WidgetId {
+        sui::WidgetId::new(
+            parent
+                .get()
+                .wrapping_mul(43)
+                .wrapping_add(12_401)
+                .wrapping_add(index as u64),
+        )
+    }
+
+    fn place_at(&self, bounds: Rect, position: Point) -> Option<usize> {
+        let places = {
+            let files = self.shared.files();
+            files_places(&files)
+        };
+        places
+            .iter()
+            .enumerate()
+            .find(|(index, _)| Self::row_rect(bounds, *index).contains(position))
+            .map(|(index, _)| index)
+    }
+}
+
+impl Widget for FilesPlacesRail {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        match event {
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
+                let hovered = self.place_at(ctx.bounds(), pointer.position);
+                if self.hovered != hovered {
+                    self.hovered = hovered;
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Up
+                    && (pointer.button == Some(PointerButton::Primary)
+                        || pointer.button.is_none()) =>
+            {
+                if let Some(index) = self.place_at(ctx.bounds(), pointer.position) {
+                    let place = {
+                        let files = self.shared.files();
+                        files_places(&files).get(index).cloned()
+                    };
+                    if let Some(place) = place {
+                        open_file_place(&self.shared, place, ctx);
+                        self.hovered = None;
+                        ctx.set_handled();
+                    }
+                }
+            }
+            Event::Pointer(pointer)
+                if matches!(
+                    pointer.kind,
+                    PointerEventKind::Leave | PointerEventKind::Cancel
+                ) =>
+            {
+                if self.hovered.take().is_some() {
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        constraints.clamp(Size::new(PLACES_W, 220.0))
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let pal = palette(&self.shared);
+        let bounds = ctx.bounds();
+        let files = self.shared.files();
+        let places = files_places(&files);
+
+        ctx.fill_rect(bounds, pal.sidebar);
+        widgets::hairline_right(ctx, bounds, pal.border);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(
+                bounds.x() + CONTENT_PAD,
+                bounds.y() + 14.0,
+                bounds.width(),
+                16.0,
+            ),
+            "PLACES",
+            pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint),
+        );
+
+        for (index, place) in places.iter().enumerate() {
+            let row = Self::row_rect(bounds, index);
+            let active = file_place_active(&files, place);
+            let hovered = self.hovered == Some(index);
+            let fill = if active {
+                pal.selected
+            } else if hovered {
+                pal.hover
+            } else {
+                pal.sidebar
+            };
+            let border = if active { pal.accent } else { fill };
+            widgets::round_panel(ctx, row, fill, border, 7.0);
+            let icon_rect = Rect::new(row.x() + 10.0, row.y() + 9.0, 16.0, 16.0);
+            let icon_color = if active { pal.accent } else { pal.text_muted };
+            draw_glyph(ctx, place.glyph, icon_rect, icon_color);
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(row.x() + 34.0, row.y() + 5.0, row.width() - 42.0, 15.0),
+                &place.label,
+                pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text),
+            );
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(row.x() + 34.0, row.y() + 20.0, row.width() - 42.0, 14.0),
+                &place.detail,
+                pal.text_style(&theme, 10.0, FontWeight::NORMAL, pal.text_faint),
+            );
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let files = self.shared.files();
+        let places = files_places(&files);
+        let root_id = ctx.widget_id();
+        let mut root = SemanticsNode::new(root_id, SemanticsRole::Text, ctx.bounds());
+        root.name = Some("Files places".to_string());
+        root.description = Some("Pinned SIFS and local filesystem locations".to_string());
+        ctx.push(root);
+
+        for (index, place) in places.iter().enumerate() {
+            let mut node = SemanticsNode::new(
+                Self::place_widget_id(root_id, index),
+                SemanticsRole::Button,
+                Self::row_rect(ctx.bounds(), index),
+            );
+            node.parent = Some(root_id);
+            node.name = Some(format!("Open {}", place.label));
+            node.description = Some(format!("{}: {}", place.source.path_label(), place.path));
+            node.actions = vec![SemanticsAction::Activate];
+            node.state.hovered = self.hovered == Some(index);
+            node.state.selected = file_place_active(&files, place);
+            ctx.push(node);
+        }
     }
 }
 
@@ -6073,6 +6368,109 @@ impl Widget for Split {
 }
 
 // ---------------------------------------------------------------------------
+// FixedLeftSplit — left pane fixed width, right pane fills.
+// ---------------------------------------------------------------------------
+
+struct FixedLeftSplit {
+    left: WidgetPod,
+    separator: WidgetPod,
+    right: WidgetPod,
+    left_width: f32,
+}
+
+impl FixedLeftSplit {
+    fn new<L, R>(left: L, right: R, left_width: f32, reader: &ThemeReader) -> Self
+    where
+        L: Widget + 'static,
+        R: Widget + 'static,
+    {
+        Self {
+            left: WidgetPod::new(left),
+            separator: WidgetPod::new(Separator::vertical().theme_when(clone_reader(reader))),
+            right: WidgetPod::new(right),
+            left_width: left_width.max(0.0),
+        }
+    }
+
+    fn split_widths(&self, total: f32) -> (f32, f32) {
+        let left = self.left_width.min((total - SPLIT_SEPARATOR_W).max(0.0));
+        let right = (total - left - SPLIT_SEPARATOR_W).max(0.0);
+        (left, right)
+    }
+}
+
+impl Widget for FixedLeftSplit {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let total = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            self.left_width + 320.0 + SPLIT_SEPARATOR_W
+        };
+        let height = constraints.max.height;
+        let (left_w, right_w) = self.split_widths(total);
+        self.left
+            .measure(ctx, Constraints::tight(Size::new(left_w, height)));
+        self.separator.measure(
+            ctx,
+            Constraints::tight(Size::new(SPLIT_SEPARATOR_W, height)),
+        );
+        self.right
+            .measure(ctx, Constraints::tight(Size::new(right_w, height)));
+        Size::new(total, height)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let (left_w, right_w) = self.split_widths(bounds.width());
+        self.left.arrange(
+            ctx,
+            Rect::new(bounds.x(), bounds.y(), left_w, bounds.height()),
+        );
+        self.separator.arrange(
+            ctx,
+            Rect::new(
+                bounds.x() + left_w,
+                bounds.y(),
+                SPLIT_SEPARATOR_W,
+                bounds.height(),
+            ),
+        );
+        self.right.arrange(
+            ctx,
+            Rect::new(
+                bounds.x() + left_w + SPLIT_SEPARATOR_W,
+                bounds.y(),
+                right_w,
+                bounds.height(),
+            ),
+        );
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.left.paint(ctx);
+        self.separator.paint(ctx);
+        self.right.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.left.semantics(ctx);
+        self.separator.semantics(ctx);
+        self.right.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.left);
+        visitor.visit(&self.separator);
+        visitor.visit(&self.right);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.left);
+        visitor.visit(&mut self.separator);
+        visitor.visit(&mut self.right);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Small layout helper (copied from settings.rs — horizontal inset without Padding).
 // ---------------------------------------------------------------------------
 
@@ -6186,8 +6584,14 @@ fn wide_pod(
     scroll_state: &ScrollState,
     inspector_scroll_state: &ScrollState,
 ) -> WidgetPod {
-    let body = Split::new(
+    let list_with_places = FixedLeftSplit::new(
+        FilesPlacesRail::new(shared.clone()),
         list_column(shared, reader, scroll_state),
+        PLACES_W,
+        reader,
+    );
+    let body = Split::new(
+        list_with_places,
         inspector(shared, inspector_scroll_state),
         INSPECTOR_W,
         reader,
@@ -6761,6 +7165,76 @@ mod tests {
         assert_eq!(state.path, "/services");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn files_places_include_sifs_and_local_targets() {
+        let root = files_test_temp_dir("places-model");
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.local_path = root.to_string_lossy().into_owned();
+
+        let places = files_places(&state);
+
+        assert!(places.iter().any(|place| {
+            place.label == "SIFS root" && place.source == FilesSourceKind::Sifs && place.path == "/"
+        }));
+        assert!(places.iter().any(|place| {
+            place.label == "Services"
+                && place.source == FilesSourceKind::Sifs
+                && place.path == "/services"
+        }));
+        assert!(places.iter().any(|place| {
+            place.label == "Current local"
+                && place.source == FilesSourceKind::Local
+                && place.path == root.to_string_lossy()
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn places_rail_opens_sifs_services() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.sifs_path = "/".to_string();
+            files.entries = vec![SifsEntry {
+                name: "services".to_string(),
+                path: "/services".to_string(),
+                is_dir: true,
+                is_link: false,
+                size: None,
+            }];
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new().title("Files places").root(
+                    SizedBox::new()
+                        .width(1120.0)
+                        .height(720.0)
+                        .with_child(view(shared.clone())),
+                ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open Services")
+            .click()?;
+
+        let files = shared.files();
+        assert_eq!(files.source, FilesSourceKind::Sifs);
+        assert_eq!(files.path, "/services");
+
+        Ok(())
     }
 
     #[test]
