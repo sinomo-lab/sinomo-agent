@@ -910,22 +910,19 @@ impl FilesState {
                     .target_path
                     .clone()
                     .ok_or_else(|| "select an item first".to_string())?;
-                if prompt.target_is_dir {
-                    return Err(
-                        "folder copy is not available yet; move folders or create a new folder"
-                            .to_string(),
-                    );
-                }
                 let to = self.resolve_destination_path(&prompt.input)?;
                 if from == to {
                     return Err("copy destination matches the source path".to_string());
+                }
+                if prompt.target_is_dir && destination_inside_source(self.source, &from, &to) {
+                    return Err("copy destination cannot be inside the source folder".to_string());
                 }
                 Ok((
                     FilesOperation {
                         kind: FilesOperationKind::Copy,
                         path: from.clone(),
                         target: Some(to.clone()),
-                        directory: false,
+                        directory: prompt.target_is_dir,
                     },
                     "Copy".to_string(),
                     format!("{from} -> {to}"),
@@ -1086,7 +1083,10 @@ impl FilesState {
                 .browser
                 .as_ref()
                 .ok_or_else(|| "SIFS browser is not open".to_string())
-                .and_then(|browser| execute_sifs_operation(browser, operation, current_path)),
+                .and_then(|browser| {
+                    execute_sifs_operation(browser, operation, current_path, None)
+                        .map_err(files_operation_failure_detail)
+                }),
             FilesSourceKind::Local => execute_local_operation(operation, current_path),
         }
     }
@@ -1468,6 +1468,12 @@ fn files_worker_loop(
                     }
                     match (&browser, &open_error) {
                         (Some(browser), _) => {
+                            let progress = FilesOperationProgress {
+                                request_id,
+                                result_tx: &result_tx,
+                                cancellations: &cancellations,
+                                waker: &waker,
+                            };
                             send_task_progress(
                                 &result_tx,
                                 &waker,
@@ -1475,8 +1481,12 @@ fn files_worker_loop(
                                 operation_progress_label(source, &operation, "Running"),
                                 Some(0.35),
                             );
-                            execute_sifs_operation(browser, operation, &current_path)
-                                .map_err(FilesOperationFailure::Error)
+                            execute_sifs_operation(
+                                browser,
+                                operation,
+                                &current_path,
+                                Some(&progress),
+                            )
                         }
                         (None, Some(error)) => Err(FilesOperationFailure::Error(error.clone())),
                         (None, None) => Err(FilesOperationFailure::Error(
@@ -1704,6 +1714,21 @@ fn resolve_local_destination_path(current_path: &str, input: &str) -> Result<Str
     }
 }
 
+fn destination_inside_source(source: FilesSourceKind, from: &str, to: &str) -> bool {
+    match source {
+        FilesSourceKind::Sifs => {
+            let from = normalize_path(from);
+            let to = normalize_path(to);
+            to == from || to.starts_with(&format!("{from}/"))
+        }
+        FilesSourceKind::Local => {
+            let from = Path::new(from);
+            let to = Path::new(to);
+            to == from || to.starts_with(from)
+        }
+    }
+}
+
 fn validated_local_relative_path(input: &str, label: &str) -> Result<PathBuf, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -1879,10 +1904,14 @@ fn execute_sifs_operation(
     browser: &SifsBrowser,
     operation: FilesOperation,
     current_path: &str,
-) -> Result<FilesOperationOutcome, String> {
+    progress: Option<&FilesOperationProgress<'_>>,
+) -> FilesOperationResult {
+    check_operation_cancelled(&operation, progress)?;
     match operation.kind {
         FilesOperationKind::CreateFile => {
-            browser.create_file(&operation.path)?;
+            browser
+                .create_file(&operation.path)
+                .map_err(FilesOperationFailure::Error)?;
             Ok(FilesOperationOutcome {
                 refresh_path: current_path.to_string(),
                 select_path: Some(operation.path.clone()),
@@ -1890,7 +1919,9 @@ fn execute_sifs_operation(
             })
         }
         FilesOperationKind::CreateFolder => {
-            browser.create_dir(&operation.path)?;
+            browser
+                .create_dir(&operation.path)
+                .map_err(FilesOperationFailure::Error)?;
             Ok(FilesOperationOutcome {
                 refresh_path: current_path.to_string(),
                 select_path: Some(operation.path.clone()),
@@ -1898,15 +1929,19 @@ fn execute_sifs_operation(
             })
         }
         FilesOperationKind::Copy => {
+            let target = operation.target.clone().ok_or_else(|| {
+                FilesOperationFailure::Error("copy target is missing".to_string())
+            })?;
             if operation.directory {
-                return Err("folder copy is not available yet".to_string());
+                if destination_inside_source(FilesSourceKind::Sifs, &operation.path, &target) {
+                    return Err(FilesOperationFailure::Error(
+                        "copy destination cannot be inside the source folder".to_string(),
+                    ));
+                }
+                copy_sifs_directory_with_progress(browser, &operation.path, &target, progress)?;
+            } else {
+                copy_sifs_file_with_progress(browser, &operation.path, &target, progress)?;
             }
-            let target = operation
-                .target
-                .clone()
-                .ok_or_else(|| "copy target is missing".to_string())?;
-            let bytes = browser.read_file(&operation.path)?;
-            browser.write_file(&target, &bytes)?;
             Ok(FilesOperationOutcome {
                 refresh_path: parent_path(&target).unwrap_or_else(|| current_path.to_string()),
                 select_path: Some(target.clone()),
@@ -1914,11 +1949,12 @@ fn execute_sifs_operation(
             })
         }
         FilesOperationKind::Move => {
-            let target = operation
-                .target
-                .clone()
-                .ok_or_else(|| "move target is missing".to_string())?;
-            browser.rename(&operation.path, &target)?;
+            let target = operation.target.clone().ok_or_else(|| {
+                FilesOperationFailure::Error("move target is missing".to_string())
+            })?;
+            browser
+                .rename(&operation.path, &target)
+                .map_err(FilesOperationFailure::Error)?;
             Ok(FilesOperationOutcome {
                 refresh_path: parent_path(&target).unwrap_or_else(|| current_path.to_string()),
                 select_path: Some(target.clone()),
@@ -1926,11 +1962,12 @@ fn execute_sifs_operation(
             })
         }
         FilesOperationKind::Rename => {
-            let target = operation
-                .target
-                .clone()
-                .ok_or_else(|| "rename target is missing".to_string())?;
-            browser.rename(&operation.path, &target)?;
+            let target = operation.target.clone().ok_or_else(|| {
+                FilesOperationFailure::Error("rename target is missing".to_string())
+            })?;
+            browser
+                .rename(&operation.path, &target)
+                .map_err(FilesOperationFailure::Error)?;
             Ok(FilesOperationOutcome {
                 refresh_path: current_path.to_string(),
                 select_path: Some(target.clone()),
@@ -1938,7 +1975,14 @@ fn execute_sifs_operation(
             })
         }
         FilesOperationKind::Delete => {
-            browser.delete(&operation.path, operation.directory)?;
+            if operation.directory {
+                delete_sifs_directory_recursive_with_progress(browser, &operation.path, progress)?;
+            } else {
+                check_operation_cancelled(&operation, progress)?;
+                browser
+                    .delete(&operation.path, false)
+                    .map_err(FilesOperationFailure::Error)?;
+            }
             Ok(FilesOperationOutcome {
                 refresh_path: current_path.to_string(),
                 select_path: None,
@@ -1946,7 +1990,9 @@ fn execute_sifs_operation(
             })
         }
         FilesOperationKind::RefreshPlacement => {
-            browser.request_maintenance_refresh()?;
+            browser
+                .request_maintenance_refresh()
+                .map_err(FilesOperationFailure::Error)?;
             let _ = browser.stat(&operation.path);
             Ok(FilesOperationOutcome {
                 refresh_path: current_path.to_string(),
@@ -2009,15 +2055,19 @@ fn execute_local_operation_with_progress(
             })
         }
         FilesOperationKind::Copy => {
-            if operation.directory {
-                return Err(FilesOperationFailure::Error(
-                    "folder copy is not available yet".to_string(),
-                ));
-            }
             let target = operation.target.clone().ok_or_else(|| {
                 FilesOperationFailure::Error("copy target is missing".to_string())
             })?;
-            copy_local_file_with_progress(&operation.path, &target, progress)?;
+            if operation.directory {
+                if destination_inside_source(FilesSourceKind::Local, &operation.path, &target) {
+                    return Err(FilesOperationFailure::Error(
+                        "copy destination cannot be inside the source folder".to_string(),
+                    ));
+                }
+                copy_local_directory_with_progress(&operation.path, &target, progress)?;
+            } else {
+                copy_local_file_with_progress(&operation.path, &target, progress)?;
+            }
             Ok(FilesOperationOutcome {
                 refresh_path: parent_local_path(&target)
                     .unwrap_or_else(|| current_path.to_string()),
@@ -2049,12 +2099,7 @@ fn execute_local_operation_with_progress(
         }
         FilesOperationKind::Delete => {
             if operation.directory {
-                fs::remove_dir(&operation.path).map_err(|error| {
-                    FilesOperationFailure::Error(format!(
-                        "cannot delete folder {}: {error}; only empty folders can be deleted",
-                        operation.path
-                    ))
-                })?;
+                delete_local_directory_recursive_with_progress(&operation.path, progress)?;
             } else {
                 fs::remove_file(&operation.path).map_err(|error| {
                     FilesOperationFailure::Error(format!(
@@ -2075,6 +2120,395 @@ fn execute_local_operation_with_progress(
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FilesCopyPlanItem {
+    source: String,
+    target: String,
+    is_dir: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FilesDeletePlanItem {
+    path: String,
+    is_dir: bool,
+}
+
+fn check_operation_cancelled(
+    operation: &FilesOperation,
+    progress: Option<&FilesOperationProgress<'_>>,
+) -> Result<(), FilesOperationFailure> {
+    check_progress_cancelled(progress, files_operation_cancelled_detail(operation))
+}
+
+fn check_progress_cancelled(
+    progress: Option<&FilesOperationProgress<'_>>,
+    detail: String,
+) -> Result<(), FilesOperationFailure> {
+    if progress.is_some_and(FilesOperationProgress::cancelled) {
+        Err(FilesOperationFailure::Cancelled(detail))
+    } else {
+        Ok(())
+    }
+}
+
+fn report_indexed_progress(
+    progress: Option<&FilesOperationProgress<'_>>,
+    action: &str,
+    processed: usize,
+    total: usize,
+    path: &str,
+    start: f32,
+    span: f32,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    let fraction = if total == 0 {
+        Some((start + span).min(0.98))
+    } else {
+        Some((start + span * (processed as f32 / total as f32)).min(0.98))
+    };
+    progress.report(format!("{action} {processed} of {total}: {path}"), fraction);
+}
+
+fn copy_sifs_file_with_progress(
+    browser: &SifsBrowser,
+    source_path: &str,
+    target_path: &str,
+    progress: Option<&FilesOperationProgress<'_>>,
+) -> Result<(), FilesOperationFailure> {
+    check_progress_cancelled(
+        progress,
+        format!("cancelled before copying {source_path} to {target_path}"),
+    )?;
+    if let Some(progress) = progress {
+        progress.report(format!("Reading {source_path} from SIFS"), Some(0.42));
+    }
+    let bytes = browser
+        .read_file(source_path)
+        .map_err(FilesOperationFailure::Error)?;
+    check_progress_cancelled(
+        progress,
+        format!("cancelled after reading {source_path}; {target_path} was not written"),
+    )?;
+    if let Some(progress) = progress {
+        progress.report(
+            format!(
+                "Writing {} to {target_path}",
+                human_size(Some(bytes.len() as u64))
+            ),
+            Some(0.78),
+        );
+    }
+    browser
+        .write_file(target_path, &bytes)
+        .map_err(FilesOperationFailure::Error)
+}
+
+fn copy_sifs_directory_with_progress(
+    browser: &SifsBrowser,
+    source_path: &str,
+    target_path: &str,
+    progress: Option<&FilesOperationProgress<'_>>,
+) -> Result<(), FilesOperationFailure> {
+    check_progress_cancelled(
+        progress,
+        format!("cancelled before copying {source_path} to {target_path}"),
+    )?;
+    if let Some(progress) = progress {
+        progress.report(format!("Scanning SIFS folder {source_path}"), Some(0.08));
+    }
+    let mut plan = Vec::new();
+    collect_sifs_copy_plan(browser, source_path, target_path, &mut plan)?;
+    let total = plan.len().max(1);
+    for (index, item) in plan.iter().enumerate() {
+        check_progress_cancelled(
+            progress,
+            format!(
+                "cancelled after copying {} of {} items to {target_path}; partial target remains",
+                index, total
+            ),
+        )?;
+        if item.is_dir {
+            browser
+                .create_dir_all(&item.target)
+                .map_err(FilesOperationFailure::Error)?;
+        } else {
+            let bytes = browser
+                .read_file(&item.source)
+                .map_err(FilesOperationFailure::Error)?;
+            check_progress_cancelled(
+                progress,
+                format!(
+                    "cancelled after reading {}; partial target remains at {target_path}",
+                    item.source
+                ),
+            )?;
+            browser
+                .write_file(&item.target, &bytes)
+                .map_err(FilesOperationFailure::Error)?;
+        }
+        report_indexed_progress(
+            progress,
+            "Copied",
+            index + 1,
+            total,
+            &item.target,
+            0.12,
+            0.82,
+        );
+    }
+    Ok(())
+}
+
+fn collect_sifs_copy_plan(
+    browser: &SifsBrowser,
+    source_path: &str,
+    target_path: &str,
+    plan: &mut Vec<FilesCopyPlanItem>,
+) -> Result<(), FilesOperationFailure> {
+    plan.push(FilesCopyPlanItem {
+        source: source_path.to_string(),
+        target: target_path.to_string(),
+        is_dir: true,
+    });
+    let entries = browser
+        .list_shallow(source_path)
+        .map_err(FilesOperationFailure::Error)?;
+    for entry in entries {
+        let child_target =
+            join_sifs_child(target_path, &entry.name).map_err(FilesOperationFailure::Error)?;
+        if entry.is_dir {
+            collect_sifs_copy_plan(browser, &entry.path, &child_target, plan)?;
+        } else {
+            plan.push(FilesCopyPlanItem {
+                source: entry.path,
+                target: child_target,
+                is_dir: false,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn delete_sifs_directory_recursive_with_progress(
+    browser: &SifsBrowser,
+    path: &str,
+    progress: Option<&FilesOperationProgress<'_>>,
+) -> Result<(), FilesOperationFailure> {
+    if let Some(progress) = progress {
+        progress.report(
+            format!("Scanning SIFS folder {path} for delete"),
+            Some(0.08),
+        );
+    }
+    let mut plan = Vec::new();
+    collect_sifs_delete_plan(browser, path, &mut plan)?;
+    let total = plan.len().max(1);
+    for (index, item) in plan.iter().enumerate() {
+        check_progress_cancelled(
+            progress,
+            format!(
+                "cancelled after deleting {} of {} items from {path}",
+                index, total
+            ),
+        )?;
+        browser
+            .delete(&item.path, item.is_dir)
+            .map_err(FilesOperationFailure::Error)?;
+        report_indexed_progress(
+            progress,
+            "Deleted",
+            index + 1,
+            total,
+            &item.path,
+            0.12,
+            0.82,
+        );
+    }
+    Ok(())
+}
+
+fn collect_sifs_delete_plan(
+    browser: &SifsBrowser,
+    path: &str,
+    plan: &mut Vec<FilesDeletePlanItem>,
+) -> Result<(), FilesOperationFailure> {
+    let entries = browser
+        .list_shallow(path)
+        .map_err(FilesOperationFailure::Error)?;
+    for entry in entries {
+        if entry.is_dir {
+            collect_sifs_delete_plan(browser, &entry.path, plan)?;
+        } else {
+            plan.push(FilesDeletePlanItem {
+                path: entry.path,
+                is_dir: false,
+            });
+        }
+    }
+    plan.push(FilesDeletePlanItem {
+        path: path.to_string(),
+        is_dir: true,
+    });
+    Ok(())
+}
+
+fn copy_local_directory_with_progress(
+    source_path: &str,
+    target_path: &str,
+    progress: Option<&FilesOperationProgress<'_>>,
+) -> Result<(), FilesOperationFailure> {
+    check_progress_cancelled(
+        progress,
+        format!("cancelled before copying {source_path} to {target_path}"),
+    )?;
+    if let Some(progress) = progress {
+        progress.report(format!("Scanning folder {source_path}"), Some(0.08));
+    }
+    let mut plan = Vec::new();
+    collect_local_copy_plan(Path::new(source_path), Path::new(target_path), &mut plan)?;
+    let total = plan.len().max(1);
+    for (index, item) in plan.iter().enumerate() {
+        check_progress_cancelled(
+            progress,
+            format!(
+                "cancelled after copying {} of {} items to {target_path}; partial target remains",
+                index, total
+            ),
+        )?;
+        if item.is_dir {
+            fs::create_dir_all(&item.target).map_err(|error| {
+                FilesOperationFailure::Error(format!(
+                    "cannot create folder {}: {error}",
+                    item.target
+                ))
+            })?;
+        } else {
+            copy_local_file_with_progress(&item.source, &item.target, None)?;
+        }
+        report_indexed_progress(
+            progress,
+            "Copied",
+            index + 1,
+            total,
+            &item.target,
+            0.12,
+            0.82,
+        );
+    }
+    Ok(())
+}
+
+fn collect_local_copy_plan(
+    source: &Path,
+    target: &Path,
+    plan: &mut Vec<FilesCopyPlanItem>,
+) -> Result<(), FilesOperationFailure> {
+    let metadata = fs::symlink_metadata(source).map_err(|error| {
+        FilesOperationFailure::Error(format!("cannot inspect {}: {error}", source.display()))
+    })?;
+    if metadata.file_type().is_dir() {
+        plan.push(FilesCopyPlanItem {
+            source: source.to_string_lossy().into_owned(),
+            target: target.to_string_lossy().into_owned(),
+            is_dir: true,
+        });
+        let read_dir = fs::read_dir(source).map_err(|error| {
+            FilesOperationFailure::Error(format!("cannot list {}: {error}", source.display()))
+        })?;
+        for entry in read_dir {
+            let entry = entry.map_err(|error| {
+                FilesOperationFailure::Error(format!(
+                    "cannot read entry in {}: {error}",
+                    source.display()
+                ))
+            })?;
+            collect_local_copy_plan(&entry.path(), &target.join(entry.file_name()), plan)?;
+        }
+    } else {
+        plan.push(FilesCopyPlanItem {
+            source: source.to_string_lossy().into_owned(),
+            target: target.to_string_lossy().into_owned(),
+            is_dir: false,
+        });
+    }
+    Ok(())
+}
+
+fn delete_local_directory_recursive_with_progress(
+    path: &str,
+    progress: Option<&FilesOperationProgress<'_>>,
+) -> Result<(), FilesOperationFailure> {
+    if let Some(progress) = progress {
+        progress.report(format!("Scanning folder {path} for delete"), Some(0.08));
+    }
+    let mut plan = Vec::new();
+    collect_local_delete_plan(Path::new(path), &mut plan)?;
+    let total = plan.len().max(1);
+    for (index, item) in plan.iter().enumerate() {
+        check_progress_cancelled(
+            progress,
+            format!(
+                "cancelled after deleting {} of {} items from {path}",
+                index, total
+            ),
+        )?;
+        if item.is_dir {
+            fs::remove_dir(&item.path).map_err(|error| {
+                FilesOperationFailure::Error(format!("cannot delete folder {}: {error}", item.path))
+            })?;
+        } else {
+            fs::remove_file(&item.path).map_err(|error| {
+                FilesOperationFailure::Error(format!("cannot delete file {}: {error}", item.path))
+            })?;
+        }
+        report_indexed_progress(
+            progress,
+            "Deleted",
+            index + 1,
+            total,
+            &item.path,
+            0.12,
+            0.82,
+        );
+    }
+    Ok(())
+}
+
+fn collect_local_delete_plan(
+    path: &Path,
+    plan: &mut Vec<FilesDeletePlanItem>,
+) -> Result<(), FilesOperationFailure> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        FilesOperationFailure::Error(format!("cannot inspect {}: {error}", path.display()))
+    })?;
+    if metadata.file_type().is_dir() {
+        let read_dir = fs::read_dir(path).map_err(|error| {
+            FilesOperationFailure::Error(format!("cannot list {}: {error}", path.display()))
+        })?;
+        for entry in read_dir {
+            let entry = entry.map_err(|error| {
+                FilesOperationFailure::Error(format!(
+                    "cannot read entry in {}: {error}",
+                    path.display()
+                ))
+            })?;
+            collect_local_delete_plan(&entry.path(), plan)?;
+        }
+        plan.push(FilesDeletePlanItem {
+            path: path.to_string_lossy().into_owned(),
+            is_dir: true,
+        });
+    } else {
+        plan.push(FilesDeletePlanItem {
+            path: path.to_string_lossy().into_owned(),
+            is_dir: false,
+        });
+    }
+    Ok(())
+}
+
 fn copy_local_file_with_progress(
     source_path: &str,
     target_path: &str,
@@ -2084,6 +2518,16 @@ fn copy_local_file_with_progress(
         FilesOperationFailure::Error(format!("cannot open {source_path}: {error}"))
     })?;
     let total_bytes = source.metadata().ok().map(|metadata| metadata.len());
+    if let Some(parent) = Path::new(target_path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            FilesOperationFailure::Error(format!(
+                "cannot create destination folder {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
     let mut target_file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2628,7 +3072,8 @@ impl SifsEntryRow {
     }
 
     fn action_enabled(&self, action: SifsEntryRowHit) -> bool {
-        action != SifsEntryRowHit::Copy || !self.entry.is_dir
+        let _ = action;
+        true
     }
 
     fn hit_at(&self, bounds: Rect, position: Point) -> Option<SifsEntryRowHit> {
@@ -3093,12 +3538,7 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
-                move || {
-                    !s.files().loading
-                        && s.files()
-                            .selected_entry()
-                            .is_some_and(|entry| !entry.is_dir)
-                }
+                move || !s.files().loading && s.files().selected_entry().is_some()
             })
             .on_press_with_ctx(move |ctx| {
                 s.files_mut().open_action_prompt(FileActionPromptKind::Copy);
@@ -4217,9 +4657,8 @@ fn inspector_actions(source: FilesSourceKind, entry: &SifsEntry) -> Vec<Inspecto
     let mut actions = Vec::with_capacity(6);
     if entry.is_dir {
         actions.push(InspectorAction::OpenFolder);
-    } else {
-        actions.push(InspectorAction::Copy);
     }
+    actions.push(InspectorAction::Copy);
     actions.push(InspectorAction::Move);
     actions.push(InspectorAction::Rename);
     actions.push(InspectorAction::Delete);
@@ -6259,6 +6698,93 @@ mod tests {
     }
 
     #[test]
+    fn local_recursive_copy_operation_copies_directory_tree() {
+        let root = files_test_temp_dir("local-copy-directory-operation");
+        let source = root.join("workspace");
+        let nested = source.join("nested");
+        let target = root.join("workspace copy");
+        fs::create_dir_all(&nested).expect("create source tree");
+        fs::write(source.join("README.md"), b"hello").expect("write root file");
+        fs::write(nested.join("artifact.bin"), b"nested").expect("write nested file");
+
+        let outcome = execute_local_operation(
+            FilesOperation {
+                kind: FilesOperationKind::Copy,
+                path: source.to_string_lossy().into_owned(),
+                target: Some(target.to_string_lossy().into_owned()),
+                directory: true,
+            },
+            &root.to_string_lossy(),
+        )
+        .expect("recursive copy operation");
+
+        assert_eq!(
+            fs::read(target.join("README.md")).expect("read copied root file"),
+            b"hello"
+        );
+        assert_eq!(
+            fs::read(target.join("nested").join("artifact.bin")).expect("read copied nested file"),
+            b"nested"
+        );
+        assert_eq!(
+            outcome.select_path.as_deref(),
+            Some(target.to_string_lossy().as_ref())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_recursive_delete_operation_removes_directory_tree() {
+        let root = files_test_temp_dir("local-delete-directory-operation");
+        let source = root.join("workspace");
+        let nested = source.join("nested");
+        fs::create_dir_all(&nested).expect("create source tree");
+        fs::write(source.join("README.md"), b"hello").expect("write root file");
+        fs::write(nested.join("artifact.bin"), b"nested").expect("write nested file");
+
+        let outcome = execute_local_operation(
+            FilesOperation {
+                kind: FilesOperationKind::Delete,
+                path: source.to_string_lossy().into_owned(),
+                target: None,
+                directory: true,
+            },
+            &root.to_string_lossy(),
+        )
+        .expect("recursive delete operation");
+
+        assert!(!source.exists());
+        assert_eq!(outcome.refresh_path, root.to_string_lossy().into_owned());
+        assert_eq!(outcome.select_path, None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_recursive_copy_rejects_destination_inside_source() {
+        let root = files_test_temp_dir("local-copy-directory-loop");
+        let source = root.join("workspace");
+        let target = source.join("workspace copy");
+        fs::create_dir_all(&source).expect("create source tree");
+
+        let error = execute_local_operation(
+            FilesOperation {
+                kind: FilesOperationKind::Copy,
+                path: source.to_string_lossy().into_owned(),
+                target: Some(target.to_string_lossy().into_owned()),
+                directory: true,
+            },
+            &root.to_string_lossy(),
+        )
+        .expect_err("recursive copy into itself should be rejected");
+
+        assert_eq!(error, "copy destination cannot be inside the source folder");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn worker_result_updates_selected_local_details() {
         let root = files_test_temp_dir("local-details");
         let path = root.join("artifact.txt");
@@ -6366,7 +6892,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_prompt_rejects_directories_but_move_allows_them() {
+    fn copy_prompt_accepts_directories_and_move_allows_them() {
         let backend = Backend::local_fallback();
         let mut state = FilesState::new(&backend);
         state.path = "/services".to_string();
@@ -6381,12 +6907,12 @@ mod tests {
 
         state.open_action_prompt(FileActionPromptKind::Copy);
         let prompt = state.action_prompt.as_ref().expect("copy prompt").clone();
-        assert!(
-            state
-                .operation_from_prompt(&prompt)
-                .expect_err("directory copy is not supported yet")
-                .contains("folder copy")
-        );
+        let (operation, _, _) = state
+            .operation_from_prompt(&prompt)
+            .expect("directory copy operation");
+        assert_eq!(operation.kind, FilesOperationKind::Copy);
+        assert!(operation.directory);
+        assert_eq!(operation.target.as_deref(), Some("/services/logs copy"));
 
         state.open_action_prompt(FileActionPromptKind::Move);
         state.set_action_prompt_input("/users/logs".to_string());
@@ -7752,6 +8278,14 @@ mod tests {
             .with_name("Inspect dir")
             .click()?;
         assert_eq!(shared.files().path, "/");
+        assert!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Copy dir")
+                .count()?
+                >= 1,
+            "selected directories should expose recursive copy"
+        );
 
         window
             .get_by_role(sui::SemanticsRole::Button)
