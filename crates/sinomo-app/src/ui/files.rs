@@ -5786,6 +5786,21 @@ fn files_selection_status(files: &FilesState) -> String {
         .unwrap_or_else(|| "no selection".to_string())
 }
 
+fn files_status_bar_selection(files: &FilesState) -> String {
+    let marked = files.marked_count();
+    if marked > 0 {
+        return if marked == 1 {
+            "1 marked".to_string()
+        } else {
+            format!("{marked} marked")
+        };
+    }
+    files
+        .selected_entry()
+        .map(|entry| middle_short(&entry.name, 34))
+        .unwrap_or_else(|| "no selection".to_string())
+}
+
 fn files_task_status(files: &FilesState) -> String {
     let running = files
         .tasks
@@ -6267,10 +6282,7 @@ impl Widget for FilesStatusBar {
 
         let info_x = chip.max_x() + 12.0;
         let info_w = (right.x() - info_x - 12.0).max(0.0);
-        let selected = files
-            .selected_entry()
-            .map(|entry| middle_short(&entry.name, 34))
-            .unwrap_or_else(|| "no selection".to_string());
+        let selected = files_status_bar_selection(&files);
         let info = format!(
             "{} | {} | {}",
             middle_short(&files.path, 64),
@@ -10849,6 +10861,13 @@ mod tests {
         assert_eq!(
             files_status_summary(&state),
             "Local SIFS | Path /cluster-tests | 1 entry | selected /cluster-tests/artifact.txt | 1 task done"
+        );
+
+        state.marked_entries.insert(0);
+        assert_eq!(files_status_bar_selection(&state), "1 marked");
+        assert_eq!(
+            files_status_summary(&state),
+            "Local SIFS | Path /cluster-tests | 1 entry | 1 entry marked | 1 task done"
         );
     }
 
