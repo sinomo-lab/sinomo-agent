@@ -550,6 +550,9 @@ fn paint_vertices(
             border,
             StrokeStyle::new(if selected_here { 2.2 } else { 1.1 }),
         );
+        if vertex.vertex.kind == GraphVertexKind::Node && vertex.vertex.public_reachable {
+            paint_public_reachability_badge(ctx, pal, vertex.center, vertex.radius);
+        }
 
         let label_style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text);
         let label_y = vertex.center.y + vertex.radius + 14.0;
@@ -577,28 +580,28 @@ fn paint_legend(ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette, bo
     let style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_faint);
     let items = [
         (pal.good, "online"),
-        (public_node_color(), "public"),
         (pal.bad, "offline"),
         (unknown_node_color(pal), "unknown"),
         (lan_segment_color(), "LAN"),
+        (public_node_color(), "public route"),
     ];
     let mut cursor = x;
     for (color, label) in items {
+        let label_w = if label == "public route" { 100.0 } else { 72.0 };
         ctx.fill(Path::circle(Point::new(cursor + 6.0, y + 10.0), 5.0), color);
         widgets::draw_text_in(
             ctx,
-            Rect::new(cursor + 16.0, y, 72.0, 22.0),
+            Rect::new(cursor + 16.0, y, label_w, 22.0),
             label,
             style.clone(),
         );
-        cursor += 92.0;
+        cursor += if label == "public route" { 120.0 } else { 92.0 };
     }
 }
 
 fn vertex_fill(pal: &Palette, vertex: &GraphVertex) -> Color {
     match vertex.kind {
         GraphVertexKind::LanSegment => lan_segment_color(),
-        GraphVertexKind::Node if vertex.public_reachable => public_node_color(),
         GraphVertexKind::Node => match vertex.availability.as_str() {
             "online" => pal.good,
             "offline" => pal.bad,
@@ -606,6 +609,16 @@ fn vertex_fill(pal: &Palette, vertex: &GraphVertex) -> Color {
             _ => unknown_node_color(pal),
         },
     }
+}
+
+fn paint_public_reachability_badge(ctx: &mut PaintCtx, pal: &Palette, center: Point, radius: f32) {
+    let badge_center = Point::new(center.x + radius * 0.58, center.y - radius * 0.58);
+    ctx.fill(Path::circle(badge_center, 5.5), public_node_color());
+    ctx.stroke(
+        Path::circle(badge_center, 6.4),
+        pal.panel,
+        StrokeStyle::new(1.8),
+    );
 }
 
 fn public_node_color() -> Color {
@@ -1920,6 +1933,24 @@ mod tests {
 
         assert_eq!(fill, unknown_node_color(&pal));
         assert_ne!(fill, pal.field);
+    }
+
+    #[test]
+    fn public_reachability_does_not_override_health_fill() {
+        let mut offline = node("node-public-offline");
+        offline.availability = "offline".to_string();
+        offline.public_reachable = true;
+        let snapshot = ClusterSnapshot {
+            nodes: vec![offline],
+            ..ClusterSnapshot::default()
+        };
+        let topology = build_topology(&snapshot);
+        let theme = resolve_theme(AppThemeMode::Light);
+        let pal = Palette::from_theme(&theme, false);
+        let fill = vertex_fill(&pal, &topology.vertices[0]);
+
+        assert_eq!(fill, pal.bad);
+        assert_ne!(fill, public_node_color());
     }
 
     #[test]
