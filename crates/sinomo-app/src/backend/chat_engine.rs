@@ -26,6 +26,28 @@ use sinomo_cli::app_api::{
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 
+pub type ChatEventWake = Arc<dyn Fn() + Send + Sync + 'static>;
+
+#[derive(Clone)]
+struct ChatEventSink {
+    tx: Sender<ChatEvent>,
+    wake: Option<ChatEventWake>,
+}
+
+impl ChatEventSink {
+    fn new(tx: Sender<ChatEvent>, wake: Option<ChatEventWake>) -> Self {
+        Self { tx, wake }
+    }
+
+    fn send(&self, event: ChatEvent) {
+        if self.tx.send(event).is_ok() {
+            if let Some(wake) = &self.wake {
+                wake();
+            }
+        }
+    }
+}
+
 /// Who authored a chat message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatRole {
@@ -221,9 +243,11 @@ impl ChatHandle {
         daemon_connected: bool,
         runtime_control_registry: AgentRuntimeControlRegistry,
         sifs_storage: Option<AgentChatSifsStorage>,
+        event_wake: Option<ChatEventWake>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = channel::<ChatCommand>();
         let (evt_tx, evt_rx) = channel::<ChatEvent>();
+        let evt_tx = ChatEventSink::new(evt_tx, event_wake);
         let active_session_id = Arc::new(Mutex::new(None));
         let direct_control = DirectControl {
             runtime_control_registry: runtime_control_registry.clone(),
@@ -297,7 +321,7 @@ impl Drop for ChatHandle {
 struct DirectControl {
     runtime_control_registry: AgentRuntimeControlRegistry,
     active_session_id: Arc<Mutex<Option<SessionId>>>,
-    evt_tx: Sender<ChatEvent>,
+    evt_tx: ChatEventSink,
 }
 
 impl DirectControl {
@@ -421,7 +445,7 @@ impl DirectControl {
 
 fn set_active_session_id(
     active_session_id: &Arc<Mutex<Option<SessionId>>>,
-    evt_tx: &Sender<ChatEvent>,
+    evt_tx: &ChatEventSink,
     session_id: impl AsRef<str>,
 ) {
     match SessionId::from_str(session_id.as_ref()) {
@@ -532,7 +556,7 @@ fn worker(
     sifs_storage: Option<AgentChatSifsStorage>,
     active_session_id: Arc<Mutex<Option<SessionId>>>,
     cmd_rx: Receiver<ChatCommand>,
-    evt_tx: Sender<ChatEvent>,
+    evt_tx: ChatEventSink,
 ) {
     let chat_result = match sifs_storage {
         Some(storage) => AgentChat::with_runtime_control_registry_and_sifs(
@@ -808,7 +832,13 @@ mod tests {
     fn chat_worker_routes_runtime_control_commands() {
         let temp = TempDataDir::new("chat-worker-control");
         let runtime_control = AgentRuntimeControlRegistry::new();
-        let handle = ChatHandle::spawn(temp.data_dir.clone(), false, runtime_control.clone(), None);
+        let handle = ChatHandle::spawn(
+            temp.data_dir.clone(),
+            false,
+            runtime_control.clone(),
+            None,
+            None,
+        );
         let ready = wait_for_event(&handle, |event| matches!(event, ChatEvent::Ready { .. }))
             .expect("ready event");
         let ChatEvent::Ready { session_id, .. } = ready else {
@@ -895,7 +925,7 @@ mod tests {
     fn chat_worker_switches_agent_for_requested_new_session() {
         let temp = TempDataDir::new("chat-worker-agent-switch");
         let runtime_control = AgentRuntimeControlRegistry::new();
-        let handle = ChatHandle::spawn(temp.data_dir.clone(), false, runtime_control, None);
+        let handle = ChatHandle::spawn(temp.data_dir.clone(), false, runtime_control, None, None);
         wait_for_event(&handle, |event| matches!(event, ChatEvent::Ready { .. }))
             .expect("ready event");
 
@@ -943,7 +973,7 @@ mod tests {
             direct_control: DirectControl {
                 runtime_control_registry: runtime_control,
                 active_session_id: Arc::new(Mutex::new(Some(session_id.clone()))),
-                evt_tx,
+                evt_tx: ChatEventSink::new(evt_tx, None),
             },
             worker: None,
         };

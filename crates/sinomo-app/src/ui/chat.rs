@@ -62,7 +62,9 @@ use sinomo_cli::app_api::{
 use sinomo_runtime::{events::SessionId, local::SinomoDataDir};
 
 use crate::backend::Backend;
-use crate::backend::chat_engine::{ChatCommand, ChatEvent, ChatHandle, ChatRole, RuntimeInfo};
+use crate::backend::chat_engine::{
+    ChatCommand, ChatEvent, ChatEventWake, ChatHandle, ChatRole, RuntimeInfo,
+};
 use crate::backend::sessions::{self, StoredMessage};
 use crate::state::{Shared, Tab};
 use crate::theme::Palette;
@@ -454,16 +456,23 @@ struct SessionListWorkerResult {
 
 impl ChatState {
     pub fn new(backend: &Backend) -> Self {
+        Self::new_with_waker(backend, None)
+    }
+
+    pub fn new_with_waker(backend: &Backend, waker: Option<sui::UiHandle>) -> Self {
         let daemon_connected = backend.connection.is_daemon();
         let daemon_address = backend.connection.daemon_address().map(str::to_string);
         let sifs_storage = daemon_address
             .as_deref()
             .map(|address| AgentChatSifsStorage::new(address, backend.app_runtime.handle()));
+        let event_wake: Option<ChatEventWake> =
+            waker.map(|waker| Arc::new(move || waker.wake()) as ChatEventWake);
         let handle = ChatHandle::spawn(
             (*backend.data_dir).clone(),
             daemon_connected,
             backend.agent_runtime_control.clone(),
             sifs_storage,
+            event_wake,
         );
 
         let agents = agent_summaries(&backend.data_dir);
@@ -631,6 +640,15 @@ impl ChatState {
         self.session_list_loading = false;
         self.apply_session_list_result(result);
         true
+    }
+
+    pub fn pump_worker_events(&mut self) -> bool {
+        let events = self.handle.drain();
+        let changed = !events.is_empty();
+        for event in events {
+            self.apply_event(event);
+        }
+        changed
     }
 
     fn apply_session_list_result(&mut self, result: SessionListWorkerResult) {
@@ -1344,6 +1362,31 @@ impl ChatState {
     fn current_is_channel(&self) -> bool {
         self.current_session_ref()
             .is_some_and(|session| session.kind == ConversationKind::Channel)
+    }
+
+    fn empty_conversation_title(&self) -> String {
+        if let Some(session) = self.current_session_ref() {
+            if session.kind == ConversationKind::Channel {
+                format!("Channel: {}", session.title)
+            } else {
+                session.title.clone()
+            }
+        } else {
+            let agent = if self.info.agent.is_empty() {
+                "Sinomo"
+            } else {
+                self.info.agent.as_str()
+            };
+            format!("Chat with {agent}")
+        }
+    }
+
+    fn empty_conversation_hint(&self) -> &'static str {
+        if self.current_is_channel() {
+            "Send a message to the channel."
+        } else {
+            "Type a message below to begin."
+        }
     }
 
     fn begin_edit_session(&mut self, session_id: &str) {
@@ -5333,14 +5376,9 @@ impl TranscriptView {
             pal.text_faint,
         );
         let title = pal.text_style(theme, 17.0, FontWeight::SEMIBOLD, pal.text_muted);
-        let agent = if chat.info.agent.is_empty() {
-            "Sinomo"
-        } else {
-            chat.info.agent.as_str()
-        };
-        widgets::draw_centered(ctx, &format!("Chat with {agent}"), title, cx, cy + 2.0);
+        widgets::draw_centered(ctx, &chat.empty_conversation_title(), title, cx, cy + 2.0);
         let sub = pal.text_style(theme, 12.5, FontWeight::NORMAL, pal.text_faint);
-        widgets::draw_centered(ctx, "Type a message below to begin.", sub, cx, cy + 26.0);
+        widgets::draw_centered(ctx, chat.empty_conversation_hint(), sub, cx, cy + 26.0);
     }
 
     fn paint_recovery_empty_state(
@@ -5989,18 +6027,13 @@ impl ChatView {
     /// alive while streaming or recently active.
     fn pump(&self, ctx: &mut EventCtx) {
         self.pump_alive.set(false);
-        let events = self.shared.chat().handle.drain();
-        let had_events = !events.is_empty();
-        let delete_changed = {
+        let changed = {
             let mut chat = self.shared.chat_mut();
-            for event in events {
-                chat.apply_event(event);
-            }
+            let worker_changed = chat.pump_worker_events();
             let list_changed = chat.pump_session_list();
             let delete_changed = chat.pump_delete();
-            list_changed || delete_changed
+            worker_changed || list_changed || delete_changed
         };
-        let had = had_events || delete_changed;
         let streaming = self.shared.chat().streaming;
 
         // Recompute the coarse signature each tick: a worker event (RuntimeInfo / Models / TurnDone,
@@ -6013,11 +6046,11 @@ impl ChatView {
         if sig_changed {
             self.last_sig.set(sig);
             self.force_window_relayout(ctx);
-        } else if had {
+        } else if changed {
             ctx.request_paint();
         }
 
-        if had || sig_changed {
+        if changed || sig_changed {
             self.idle_frames.set(0);
         } else {
             self.idle_frames
@@ -6686,6 +6719,48 @@ mod tests {
         assert_eq!(
             state.info.agent, "coding-agent",
             "agent selection is allowed again in a fresh chat"
+        );
+    }
+
+    #[test]
+    fn empty_conversation_title_follows_selected_saved_chat() {
+        let (_backend, mut state) = isolated_chat_state("empty-chat-title");
+        let session_id = SessionId::generate().to_string();
+        state.sessions = vec![SessionRef {
+            id: session_id.clone(),
+            title: "Release triage".to_string(),
+            kind: ConversationKind::Chat,
+            updated_unix: 1,
+            participant_count: 1,
+        }];
+        state.session_id = session_id;
+        state.info.agent = "main-agent".to_string();
+
+        assert_eq!(state.empty_conversation_title(), "Release triage");
+        assert_eq!(
+            state.empty_conversation_hint(),
+            "Type a message below to begin."
+        );
+    }
+
+    #[test]
+    fn empty_conversation_title_follows_selected_channel() {
+        let (_backend, mut state) = isolated_chat_state("empty-channel-title");
+        let channel_id = SessionId::generate().to_string();
+        state.sessions = vec![SessionRef {
+            id: channel_id.clone(),
+            title: "Release triage".to_string(),
+            kind: ConversationKind::Channel,
+            updated_unix: 1,
+            participant_count: 2,
+        }];
+        state.session_id = channel_id;
+        state.info.agent = "main-agent".to_string();
+
+        assert_eq!(state.empty_conversation_title(), "Channel: Release triage");
+        assert_eq!(
+            state.empty_conversation_hint(),
+            "Send a message to the channel."
         );
     }
 

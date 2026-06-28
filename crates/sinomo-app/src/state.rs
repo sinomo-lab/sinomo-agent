@@ -91,7 +91,11 @@ impl ReadyState {
     /// Build all tab sub-states from a resolved backend (spawns the chat worker and loads config;
     /// SIFS browsing is opened lazily by the Files tab).
     pub fn build(backend: Backend) -> Self {
-        let chat = ChatState::new(&backend);
+        Self::build_with_waker(backend, None)
+    }
+
+    pub fn build_with_waker(backend: Backend, waker: Option<sui::UiHandle>) -> Self {
+        let chat = ChatState::new_with_waker(&backend, waker);
         let evolution = EvolutionState::new(&backend);
         let cluster = ClusterState::new(&backend);
         let files = FilesState::new(&backend);

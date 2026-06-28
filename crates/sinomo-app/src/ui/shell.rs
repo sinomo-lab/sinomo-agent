@@ -456,9 +456,10 @@ impl Widget for Shell {
                 };
                 let chat_changed = if self.shared.is_ready() {
                     let mut chat = self.shared.chat_mut();
+                    let worker_changed = chat.pump_worker_events();
                     let list_changed = chat.pump_session_list();
                     let delete_changed = chat.pump_delete();
-                    list_changed || delete_changed
+                    worker_changed || list_changed || delete_changed
                 } else {
                     false
                 };

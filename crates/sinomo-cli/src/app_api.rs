@@ -536,7 +536,6 @@ impl AgentChat {
         let info: ChatRuntimeInfo = tui::app_runtime_info(runtime.handler()).into();
         let align_primary_session = should_align_primary_participant(&channel);
         ensure_primary_participant(&mut channel, &info, align_primary_session);
-        let _ = channel_store.save_channel(&channel);
         Ok(Self {
             data_dir,
             daemon_connected,
@@ -558,7 +557,6 @@ impl AgentChat {
         self.channel = AgentChannel::with_default_title(session.session_id.clone());
         let info = self.runtime_info();
         ensure_primary_participant(&mut self.channel, &info, true);
-        let _ = self.channel_store.save_channel(&self.channel);
     }
 
     /// Adopt an existing channel id for continued turns (fresh in-memory context;
@@ -570,15 +568,19 @@ impl AgentChat {
     ) -> Result<(), CliError> {
         let session = app_session(Some(session_id));
         let info = self.runtime_info();
-        let mut channel = match self.channel_store.load_channel(&session.session_id) {
-            Ok(Some(channel)) => channel,
-            Ok(None) => legacy_channel_from_history(session.session_id.clone(), history, &info),
-            Err(error) => {
-                return Err(CliError::Parse {
-                    detail: format!("load chat channel failed: {error}"),
-                });
-            }
-        };
+        let (mut channel, should_save_after_resume) =
+            match self.channel_store.load_channel(&session.session_id) {
+                Ok(Some(channel)) => (channel, true),
+                Ok(None) => (
+                    legacy_channel_from_history(session.session_id.clone(), history, &info),
+                    !history.is_empty(),
+                ),
+                Err(error) => {
+                    return Err(CliError::Parse {
+                        detail: format!("load chat channel failed: {error}"),
+                    });
+                }
+            };
         let align_primary_session = should_align_primary_participant(&channel);
         ensure_primary_participant(&mut channel, &info, align_primary_session);
         self.runtime
@@ -587,7 +589,9 @@ impl AgentChat {
             .handler_mut()
             .replace_agent_session(&session, agent_transcript_from_channel(&channel, history))?;
         self.channel = channel;
-        self.save_channel_best_effort();
+        if should_save_after_resume {
+            self.save_channel_best_effort();
+        }
         Ok(())
     }
 

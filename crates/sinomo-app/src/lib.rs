@@ -74,7 +74,7 @@ pub fn run() -> sui::Result<()> {
                 tracing::info!(mode = %backend.mode_label(), "sinomo-app connected");
                 let _ = tx.send(ConnectEvent::Status("Loading workspace…".to_string()));
                 ui.wake();
-                let ready = ReadyState::build(backend);
+                let ready = ReadyState::build_with_waker(backend, Some(ui.clone()));
                 let _ = tx.send(ConnectEvent::Connected(Box::new(ready)));
                 ui.wake();
             })
