@@ -277,6 +277,13 @@ enum RecoveryCardAction {
     OpenProviderSetup,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatQuickAction {
+    PlanChange,
+    CheckCluster,
+    ReviewRepo,
+}
+
 impl RecoveryCardAction {
     fn label(self) -> &'static str {
         match self {
@@ -302,6 +309,48 @@ impl RecoveryCardAction {
             RecoveryCardAction::CheckSifs => "Open SIFS browser",
             RecoveryCardAction::OpenConnectionSettings => "Connection settings",
             RecoveryCardAction::OpenProviderSetup => "Provider setup",
+        }
+    }
+}
+
+impl ChatQuickAction {
+    const ALL: [Self; 3] = [Self::PlanChange, Self::CheckCluster, Self::ReviewRepo];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::PlanChange => "Plan a change",
+            Self::CheckCluster => "Check cluster",
+            Self::ReviewRepo => "Review repo",
+        }
+    }
+
+    fn prompt(self) -> &'static str {
+        match self {
+            Self::PlanChange => {
+                "Plan the next code change in this repository and identify the safest first step."
+            }
+            Self::CheckCluster => {
+                "Check the local cluster status and explain anything that needs attention."
+            }
+            Self::ReviewRepo => {
+                "Review the current repository state and point out the most important issue to fix next."
+            }
+        }
+    }
+
+    fn icon(self) -> IconGlyph {
+        match self {
+            Self::PlanChange => IconGlyph::Sparkles,
+            Self::CheckCluster => IconGlyph::Storage,
+            Self::ReviewRepo => IconGlyph::Search,
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::PlanChange => "Prepare a planning prompt",
+            Self::CheckCluster => "Prepare a cluster status prompt",
+            Self::ReviewRepo => "Prepare a repository review prompt",
         }
     }
 }
@@ -415,6 +464,7 @@ pub struct ChatState {
     pub messages: Vec<ChatMessage>,
     pub input: String,
     pub cursor: usize,
+    draft_revision: u64,
     pub streaming: bool,
     pub notice: Option<String>,
     pub context: Option<ChatContextSnapshot>,
@@ -501,6 +551,7 @@ impl ChatState {
             messages: Vec::new(),
             input: String::new(),
             cursor: 0,
+            draft_revision: 0,
             streaming: false,
             notice: None,
             context: None,
@@ -2161,6 +2212,13 @@ impl ChatState {
     fn set_draft(&mut self, text: String) {
         self.cursor = text.len();
         self.input = text;
+    }
+
+    fn apply_quick_action(&mut self, action: ChatQuickAction) {
+        let prompt = action.prompt();
+        self.input = prompt.to_string();
+        self.cursor = self.input.len();
+        self.draft_revision = self.draft_revision.wrapping_add(1);
     }
 
     /// Select an agent by sidebar index and tell the worker to switch.
@@ -5432,6 +5490,8 @@ struct TranscriptView {
     bounds: Cell<Rect>,
     hovered_recovery_action: Cell<Option<RecoveryCardAction>>,
     pressed_recovery_action: Cell<Option<RecoveryCardAction>>,
+    hovered_quick_action: Cell<Option<ChatQuickAction>>,
+    pressed_quick_action: Cell<Option<ChatQuickAction>>,
     transcript_recovery_actions: RefCell<Vec<(RecoveryCardAction, Rect)>>,
 }
 
@@ -5444,8 +5504,72 @@ impl TranscriptView {
             bounds: Cell::new(Rect::ZERO),
             hovered_recovery_action: Cell::new(None),
             pressed_recovery_action: Cell::new(None),
+            hovered_quick_action: Cell::new(None),
+            pressed_quick_action: Cell::new(None),
             transcript_recovery_actions: RefCell::new(Vec::new()),
         }
+    }
+
+    fn empty_state_center(area: Rect) -> (f32, f32) {
+        let lift = if area.height() > 260.0 { 28.0 } else { 0.0 };
+        (
+            area.x() + area.width() / 2.0,
+            area.y() + area.height() / 2.0 - lift,
+        )
+    }
+
+    fn quick_action_width(action: ChatQuickAction) -> f32 {
+        match action {
+            ChatQuickAction::PlanChange => 138.0,
+            ChatQuickAction::CheckCluster => 128.0,
+            ChatQuickAction::ReviewRepo => 116.0,
+        }
+    }
+
+    fn quick_action_rects(area: Rect) -> Vec<(ChatQuickAction, Rect)> {
+        if area.height() < 180.0 || area.width() < 260.0 {
+            return Vec::new();
+        }
+        let (_, cy) = Self::empty_state_center(area);
+        let actions = ChatQuickAction::ALL;
+        let gap = 8.0;
+        let button_h = 30.0;
+        let widths = actions
+            .iter()
+            .map(|action| Self::quick_action_width(*action))
+            .collect::<Vec<_>>();
+        let row_w = widths.iter().sum::<f32>() + gap * actions.len().saturating_sub(1) as f32;
+        let max_w = (area.width() - PAD * 4.0).max(0.0).min(520.0);
+
+        if row_w <= max_w {
+            let mut x = area.x() + (area.width() - row_w) * 0.5;
+            let y = cy + 58.0;
+            return actions
+                .into_iter()
+                .zip(widths)
+                .map(|(action, width)| {
+                    let rect = Rect::new(x, y, width, button_h);
+                    x += width + gap;
+                    (action, rect)
+                })
+                .collect();
+        }
+
+        let width = max_w.clamp(180.0, 240.0);
+        let stack_h =
+            button_h * actions.len() as f32 + gap * actions.len().saturating_sub(1) as f32;
+        let x = area.x() + (area.width() - width) * 0.5;
+        let y0 = cy + 54.0 - stack_h * 0.5;
+        actions
+            .into_iter()
+            .enumerate()
+            .map(|(index, action)| {
+                (
+                    action,
+                    Rect::new(x, y0 + index as f32 * (button_h + gap), width, button_h),
+                )
+            })
+            .collect()
     }
 
     fn recovery_card_rect(area: Rect) -> Rect {
@@ -5589,6 +5713,18 @@ impl TranscriptView {
             .find_map(|(action, rect)| rect.contains(position).then_some(*action))
     }
 
+    fn quick_action_at(&self, bounds: Rect, position: Point) -> Option<ChatQuickAction> {
+        {
+            let chat = self.shared.chat();
+            if !chat.messages.is_empty() || chat.runtime_recovery_target().is_some() {
+                return None;
+            }
+        }
+        Self::quick_action_rects(bounds)
+            .into_iter()
+            .find_map(|(action, rect)| rect.contains(position).then_some(action))
+    }
+
     fn activate_recovery_action(&self, action: RecoveryCardAction) {
         match action {
             RecoveryCardAction::RetryChatList => {
@@ -5603,12 +5739,25 @@ impl TranscriptView {
         }
     }
 
+    fn activate_quick_action(&self, action: ChatQuickAction) {
+        self.shared.chat_mut().apply_quick_action(action);
+    }
+
     fn recovery_action_widget_id(parent: sui::WidgetId, slot: usize) -> sui::WidgetId {
         sui::WidgetId::new(
             parent
                 .get()
                 .wrapping_mul(37)
                 .wrapping_add(8_001 + slot as u64),
+        )
+    }
+
+    fn quick_action_widget_id(parent: sui::WidgetId, slot: usize) -> sui::WidgetId {
+        sui::WidgetId::new(
+            parent
+                .get()
+                .wrapping_mul(41)
+                .wrapping_add(9_101 + slot as u64),
         )
     }
 
@@ -5627,9 +5776,17 @@ impl Widget for TranscriptView {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
         match event {
             Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
-                let hovered = self.recovery_action_at(ctx.bounds(), pointer.position);
-                if self.hovered_recovery_action.get() != hovered {
-                    self.hovered_recovery_action.set(hovered);
+                let quick_hovered = self.quick_action_at(ctx.bounds(), pointer.position);
+                let recovery_hovered = if quick_hovered.is_none() {
+                    self.recovery_action_at(ctx.bounds(), pointer.position)
+                } else {
+                    None
+                };
+                if self.hovered_quick_action.get() != quick_hovered
+                    || self.hovered_recovery_action.get() != recovery_hovered
+                {
+                    self.hovered_quick_action.set(quick_hovered);
+                    self.hovered_recovery_action.set(recovery_hovered);
                     ctx.request_paint();
                     ctx.request_semantics();
                 }
@@ -5638,7 +5795,13 @@ impl Widget for TranscriptView {
                 if pointer.kind == PointerEventKind::Down
                     && pointer.button == Some(PointerButton::Primary) =>
             {
-                if let Some(action) = self.recovery_action_at(ctx.bounds(), pointer.position) {
+                if let Some(action) = self.quick_action_at(ctx.bounds(), pointer.position) {
+                    self.pressed_quick_action.set(Some(action));
+                    ctx.request_pointer_capture(pointer.pointer_id);
+                    ctx.request_paint();
+                    ctx.set_handled();
+                } else if let Some(action) = self.recovery_action_at(ctx.bounds(), pointer.position)
+                {
                     self.pressed_recovery_action.set(Some(action));
                     ctx.request_pointer_capture(pointer.pointer_id);
                     ctx.request_paint();
@@ -5649,6 +5812,16 @@ impl Widget for TranscriptView {
                 if pointer.kind == PointerEventKind::Up
                     && pointer.button == Some(PointerButton::Primary) =>
             {
+                if let Some(pressed) = self.pressed_quick_action.take() {
+                    let released = self.quick_action_at(ctx.bounds(), pointer.position);
+                    if released == Some(pressed) {
+                        self.activate_quick_action(pressed);
+                    }
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    Self::request_recovery_action_refresh(ctx);
+                    ctx.set_handled();
+                    return;
+                }
                 let pressed = self.pressed_recovery_action.take();
                 if let Some(pressed) = pressed {
                     let released = self.recovery_action_at(ctx.bounds(), pointer.position);
@@ -5668,10 +5841,12 @@ impl Widget for TranscriptView {
             {
                 let had_hover = self.hovered_recovery_action.take().is_some();
                 let had_press = self.pressed_recovery_action.take().is_some();
-                if had_press {
+                let had_quick_hover = self.hovered_quick_action.take().is_some();
+                let had_quick_press = self.pressed_quick_action.take().is_some();
+                if had_press || had_quick_press {
                     ctx.release_pointer_capture(pointer.pointer_id);
                 }
-                if had_hover || had_press {
+                if had_hover || had_press || had_quick_hover || had_quick_press {
                     ctx.request_paint();
                     ctx.request_semantics();
                     ctx.set_handled();
@@ -5852,14 +6027,36 @@ impl Widget for TranscriptView {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let target = {
+        let (messages_empty, target) = {
             let chat = self.shared.chat();
-            chat.messages
-                .is_empty()
-                .then(|| chat.runtime_recovery_target())
-                .flatten()
+            (
+                chat.messages.is_empty(),
+                chat.messages
+                    .is_empty()
+                    .then(|| chat.runtime_recovery_target())
+                    .flatten(),
+            )
         };
         if target.is_none() {
+            if messages_empty {
+                for (slot, (action, rect)) in Self::quick_action_rects(ctx.bounds())
+                    .into_iter()
+                    .enumerate()
+                {
+                    let mut node = SemanticsNode::new(
+                        Self::quick_action_widget_id(ctx.widget_id(), slot),
+                        SemanticsRole::Button,
+                        rect,
+                    );
+                    node.parent = Some(ctx.widget_id());
+                    node.name = Some(action.label().to_string());
+                    node.description = Some(action.description().to_string());
+                    node.actions = vec![SemanticsAction::Activate];
+                    node.state.hovered = self.hovered_quick_action.get() == Some(action);
+                    ctx.push(node);
+                }
+                return;
+            }
             for (slot, (action, rect)) in self
                 .transcript_recovery_actions
                 .borrow()
@@ -5917,8 +6114,7 @@ impl TranscriptView {
             return;
         }
 
-        let cx = area.x() + area.width() / 2.0;
-        let cy = area.y() + area.height() / 2.0;
+        let (cx, cy) = Self::empty_state_center(area);
         // A real Lucide Sparkles glyph for the empty-state mark (tinted to the muted chrome color),
         // replacing the arbitrary ✦ text rune.
         let mark_side = 40.0;
@@ -5937,6 +6133,10 @@ impl TranscriptView {
         widgets::draw_centered(ctx, &chat.empty_conversation_title(), title, cx, cy + 2.0);
         let sub = pal.text_style(theme, 12.5, FontWeight::NORMAL, pal.text_faint);
         widgets::draw_centered(ctx, chat.empty_conversation_hint(), sub, cx, cy + 26.0);
+
+        for (action, rect) in Self::quick_action_rects(area) {
+            self.paint_quick_action(ctx, theme, pal, action, rect);
+        }
     }
 
     fn paint_recovery_empty_state(
@@ -6067,6 +6267,46 @@ impl TranscriptView {
             ),
             action.label(),
             pal.text_style(theme, 10.5, FontWeight::SEMIBOLD, text_color),
+        );
+    }
+
+    fn paint_quick_action(
+        &self,
+        ctx: &mut PaintCtx,
+        theme: &sui::DefaultTheme,
+        pal: &Palette,
+        action: ChatQuickAction,
+        rect: Rect,
+    ) {
+        let hovered = self.hovered_quick_action.get() == Some(action);
+        let pressed = self.pressed_quick_action.get() == Some(action);
+        let fill = if pressed {
+            pal.selected
+        } else if hovered {
+            pal.hover
+        } else {
+            pal.panel
+        };
+        widgets::round_panel(ctx, rect, fill, pal.border, 8.0);
+        let icon_side = 14.0;
+        let icon = Rect::new(
+            rect.x() + 10.0,
+            rect.y() + (rect.height() - icon_side) * 0.5,
+            icon_side,
+            icon_side,
+        );
+        let icon_color = if hovered { pal.accent } else { pal.text_muted };
+        draw_glyph(ctx, action.icon(), icon, icon_color);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(
+                icon.max_x() + 6.0,
+                rect.y(),
+                (rect.width() - icon_side - 26.0).max(0.0),
+                rect.height(),
+            ),
+            action.label(),
+            pal.text_style(theme, 10.5, FontWeight::SEMIBOLD, pal.text_muted),
         );
     }
 }
@@ -6401,9 +6641,10 @@ fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         )
     };
 
-    // The input row is rebuilt when the streaming flag flips (Send <-> Interrupt) and when provider
-    // availability changes (editable composer <-> setup-required read-only state). The draft text is
-    // owned by the `TextArea`, so we do NOT rebuild on every keystroke.
+    // The input row is rebuilt when the streaming flag flips (Send <-> Interrupt), when provider
+    // availability changes (editable composer <-> setup-required read-only state), and when a
+    // programmatic quick action replaces the draft. Normal typing does not bump the revision, so the
+    // focused `TextArea` is not rebuilt on every keystroke.
     let input_host = {
         let s = shared.clone();
         let r = Rc::clone(reader);
@@ -6412,7 +6653,11 @@ fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 let s = s.clone();
                 move || {
                     let chat = s.chat();
-                    (chat.streaming, chat.providers.is_empty())
+                    (
+                        chat.streaming,
+                        chat.providers.is_empty(),
+                        chat.draft_revision,
+                    )
                 }
             },
             move |_streaming| input_row(&s, &r),
@@ -7908,6 +8153,52 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.chat().session_id, second_id);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_empty_chat_quick_action_fills_composer_draft() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            seed_test_agents(&mut chat);
+            chat.sessions.clear();
+            chat.messages.clear();
+            chat.input.clear();
+            chat.session_id = SessionId::generate().to_string();
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat quick actions")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Check cluster")
+            .with_description("Prepare a cluster status prompt")
+            .click()?;
+
+        let chat = shared.chat();
+        assert_eq!(chat.input, ChatQuickAction::CheckCluster.prompt());
+        assert_eq!(
+            chat.cursor,
+            ChatQuickAction::CheckCluster.prompt().len(),
+            "quick action should place the composer cursor at the end of the prepared draft"
+        );
+        assert!(
+            chat.draft_revision > 0,
+            "quick action should trigger exactly the programmatic composer refresh path"
+        );
 
         Ok(())
     }
