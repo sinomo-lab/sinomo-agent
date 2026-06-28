@@ -1,6 +1,8 @@
 //! "Cluster" tab - network-topology graph of known cluster nodes.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 
 use sui::{
     ArrangeCtx, Color, Constraints, Event, EventCtx, FontWeight, IconGlyph, MeasureCtx, PaintCtx,
@@ -33,6 +35,8 @@ pub struct ClusterState {
     pub snapshot: ClusterSnapshot,
     pub selected: Option<ClusterSelection>,
     pub diagnostics_open: bool,
+    pub refreshing: bool,
+    refresh_rx: Option<Receiver<ClusterSnapshot>>,
 }
 
 impl ClusterState {
@@ -41,8 +45,81 @@ impl ClusterState {
             snapshot: backend.cluster_snapshot(),
             selected: None,
             diagnostics_open: false,
+            refreshing: false,
+            refresh_rx: None,
         }
     }
+
+    pub fn begin_refresh(&mut self, backend: Backend, waker: Option<sui::UiHandle>) -> bool {
+        if self.refreshing {
+            return false;
+        }
+        let (tx, rx) = mpsc::channel();
+        match thread::Builder::new()
+            .name("sinomo-app-cluster-refresh".to_string())
+            .spawn(move || {
+                let snapshot = backend.refresh_cluster_snapshot();
+                let _ = tx.send(snapshot);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }) {
+            Ok(_) => {
+                self.refreshing = true;
+                self.refresh_rx = Some(rx);
+                true
+            }
+            Err(error) => {
+                self.refreshing = false;
+                self.refresh_rx = None;
+                self.snapshot
+                    .warnings
+                    .push(format!("cluster refresh failed: {error}"));
+                true
+            }
+        }
+    }
+
+    pub fn pump_refresh(&mut self) -> bool {
+        let snapshot = match self.refresh_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(snapshot)) => snapshot,
+            Some(Err(TryRecvError::Empty)) | None => return false,
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.refresh_rx = None;
+                self.refreshing = false;
+                self.snapshot
+                    .warnings
+                    .push("cluster refresh worker stopped".to_string());
+                return true;
+            }
+        };
+        self.refresh_rx = None;
+        self.refreshing = false;
+        if !selection_exists(&snapshot, self.selected.as_ref()) {
+            self.selected = None;
+            self.diagnostics_open = false;
+        }
+        self.snapshot = snapshot;
+        true
+    }
+}
+
+pub fn request_refresh(shared: &Shared) -> bool {
+    let (backend, waker) = {
+        let app = shared.borrow();
+        let Some(ready) = app.ready.as_ref() else {
+            return false;
+        };
+        (ready.backend.clone(), app.waker.clone())
+    };
+    shared.cluster_mut().begin_refresh(backend, waker)
+}
+
+pub fn pump_refresh(shared: &Shared) -> bool {
+    if !shared.is_ready() {
+        return false;
+    }
+    shared.cluster_mut().pump_refresh()
 }
 
 #[derive(Clone, Debug)]
@@ -147,10 +224,22 @@ impl Widget for ClusterView {
                     && pointer.button == Some(PointerButton::Primary)
                     && ctx.bounds().contains(pointer.position) =>
             {
-                let overview_warning_action = {
+                let (overview_refresh_action, overview_warning_action) = {
                     let cluster = self.shared.cluster();
-                    cluster.selected.is_none() && !cluster.snapshot.warnings.is_empty()
+                    (
+                        cluster.selected.is_none(),
+                        cluster.selected.is_none() && !cluster.snapshot.warnings.is_empty(),
+                    )
                 };
+                if overview_refresh_action
+                    && cluster_refresh_action_rect(ctx.bounds()).contains(pointer.position)
+                {
+                    request_refresh(&self.shared);
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                    ctx.set_handled();
+                    return;
+                }
                 if overview_warning_action
                     && cluster_warning_action_rect(ctx.bounds()).contains(pointer.position)
                 {
@@ -214,11 +303,17 @@ impl Widget for ClusterView {
         let bounds = ctx.bounds();
         let graph = graph_rect(bounds);
         let layout = layout_vertices(&topology, graph);
-        let selected = self.shared.cluster().selected.clone();
-        let diagnostics_open = self.shared.cluster().diagnostics_open;
+        let (selected, diagnostics_open, refreshing) = {
+            let cluster = self.shared.cluster();
+            (
+                cluster.selected.clone(),
+                cluster.diagnostics_open,
+                cluster.refreshing,
+            )
+        };
 
         ctx.fill_bounds(pal.window);
-        paint_header(ctx, &theme, &pal, bounds, &snapshot, &topology);
+        paint_header(ctx, &theme, &pal, bounds, &snapshot, &topology, refreshing);
 
         if topology.vertices.is_empty() {
             paint_empty(ctx, &theme, &pal, graph, &snapshot);
@@ -237,6 +332,7 @@ impl Widget for ClusterView {
             &topology,
             selected.as_ref(),
             diagnostics_open,
+            refreshing,
         );
     }
 
@@ -257,6 +353,24 @@ impl Widget for ClusterView {
                 cluster.diagnostics_open,
             )
         };
+        if show_overview_details {
+            let cluster = self.shared.cluster();
+            let mut action = SemanticsNode::new(
+                cluster_refresh_action_widget_id(ctx.widget_id()),
+                SemanticsRole::Button,
+                cluster_refresh_action_rect(ctx.bounds()),
+            );
+            action.parent = Some(ctx.widget_id());
+            action.name = Some(if cluster.refreshing {
+                "Refreshing".to_string()
+            } else {
+                "Refresh".to_string()
+            });
+            action.description = Some("Refresh cluster health and topology".to_string());
+            action.actions = vec![SemanticsAction::Activate];
+            action.state.selected = cluster.refreshing;
+            ctx.push(action);
+        }
         if show_warning_action {
             let mut action = SemanticsNode::new(
                 cluster_warning_action_widget_id(ctx.widget_id()),
@@ -296,6 +410,7 @@ fn paint_header(
     bounds: Rect,
     snapshot: &ClusterSnapshot,
     topology: &Topology,
+    refreshing: bool,
 ) {
     let title = pal.text_style(theme, 21.0, FontWeight::SEMIBOLD, pal.text);
     widgets::draw_text_in(
@@ -317,6 +432,11 @@ fn paint_header(
         topology.lan_segments.len(),
         source_summary(&snapshot.source)
     );
+    let subtitle = if refreshing {
+        format!("{subtitle} · refreshing")
+    } else {
+        subtitle
+    };
     let style = pal.text_style(theme, 13.0, FontWeight::NORMAL, pal.text_muted);
     widgets::draw_text_in(
         ctx,
@@ -513,6 +633,7 @@ fn paint_detail_panel(
     topology: &Topology,
     selection: Option<&ClusterSelection>,
     diagnostics_open: bool,
+    refreshing: bool,
 ) {
     let panel_w = PANEL_W.min((bounds.width() - PAD * 2.0).max(220.0));
     let x = bounds.max_x() - panel_w - PAD;
@@ -616,6 +737,15 @@ fn paint_detail_panel(
             diagnostics_open,
         );
     } else {
+        if show_overview_details {
+            paint_cluster_refresh_action(
+                ctx,
+                theme,
+                pal,
+                cluster_refresh_action_rect(bounds),
+                refreshing,
+            );
+        }
         if show_warning_action {
             paint_cluster_warning_action(ctx, theme, pal, cluster_warning_action_rect(bounds));
         }
@@ -843,24 +973,42 @@ fn detail_toggle_rect(bounds: Rect) -> Rect {
 }
 
 fn cluster_warning_action_rect(bounds: Rect) -> Rect {
+    let refresh = cluster_refresh_action_rect(bounds);
+    let panel = detail_panel_rect(bounds);
+    let x = refresh.max_x() + 8.0;
+    let right = panel.max_x() - PANEL_PAD;
+    Rect::new(
+        x,
+        overview_action_row_y(bounds),
+        (right - x).min(132.0).max(0.0),
+        DETAIL_BUTTON_H,
+    )
+}
+
+fn cluster_refresh_action_rect(bounds: Rect) -> Rect {
     let panel = detail_panel_rect(bounds);
     Rect::new(
         panel.x() + PANEL_PAD,
         overview_action_row_y(bounds),
-        172.0,
+        92.0,
         DETAIL_BUTTON_H,
     )
 }
 
 fn overview_detail_toggle_rect(bounds: Rect, has_warning_action: bool) -> Rect {
     let panel = detail_panel_rect(bounds);
-    let width = 144.0;
     let x = if has_warning_action {
-        (cluster_warning_action_rect(bounds).max_x() + 8.0).min(panel.max_x() - PANEL_PAD - width)
+        cluster_warning_action_rect(bounds).max_x() + 8.0
     } else {
-        panel.x() + PANEL_PAD
+        cluster_refresh_action_rect(bounds).max_x() + 8.0
     };
-    Rect::new(x, overview_action_row_y(bounds), width, DETAIL_BUTTON_H)
+    let right = panel.max_x() - PANEL_PAD;
+    Rect::new(
+        x,
+        overview_action_row_y(bounds),
+        (right - x).max(0.0),
+        DETAIL_BUTTON_H,
+    )
 }
 
 fn overview_action_row_y(bounds: Rect) -> f32 {
@@ -870,6 +1018,10 @@ fn overview_action_row_y(bounds: Rect) -> f32 {
 
 fn cluster_warning_action_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
     sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(9_301))
+}
+
+fn cluster_refresh_action_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
+    sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(9_303))
 }
 
 fn cluster_detail_toggle_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
@@ -887,7 +1039,9 @@ fn paint_detail_toggle(
     widgets::draw_text_in(
         ctx,
         Rect::new(rect.x() + 10.0, rect.y() + 5.0, rect.width() - 20.0, 18.0),
-        if diagnostics_open {
+        if rect.width() < 112.0 {
+            if diagnostics_open { "Hide" } else { "Details" }
+        } else if diagnostics_open {
             "Hide diagnostics"
         } else {
             "Show diagnostics"
@@ -912,8 +1066,39 @@ fn paint_cluster_warning_action(
     widgets::draw_text_in(
         ctx,
         Rect::new(rect.x() + 30.0, rect.y() + 5.0, rect.width() - 40.0, 18.0),
-        "Connection settings",
+        if rect.width() < 150.0 {
+            "Settings"
+        } else {
+            "Connection settings"
+        },
         pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.on_accent),
+    );
+}
+
+fn paint_cluster_refresh_action(
+    ctx: &mut PaintCtx,
+    theme: &sui::DefaultTheme,
+    pal: &Palette,
+    rect: Rect,
+    refreshing: bool,
+) {
+    let fill = if refreshing { pal.selected } else { pal.field };
+    widgets::round_panel(ctx, rect, fill, pal.border, 7.0);
+    draw_glyph(
+        ctx,
+        IconGlyph::Redo,
+        Rect::new(rect.x() + 10.0, rect.y() + 7.0, 14.0, 14.0),
+        if refreshing {
+            pal.accent
+        } else {
+            pal.text_muted
+        },
+    );
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(rect.x() + 30.0, rect.y() + 5.0, rect.width() - 36.0, 18.0),
+        if refreshing { "Refreshing" } else { "Refresh" },
+        pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.text),
     );
 }
 
@@ -1106,6 +1291,16 @@ fn hit_test(layout: &[LayoutVertex], point: Point) -> Option<ClusterSelection> {
             GraphVertexKind::Node => ClusterSelection::Node(vertex.vertex.id.clone()),
             GraphVertexKind::LanSegment => ClusterSelection::LanSegment(vertex.vertex.id.clone()),
         })
+}
+
+fn selection_exists(snapshot: &ClusterSnapshot, selection: Option<&ClusterSelection>) -> bool {
+    match selection {
+        None => true,
+        Some(ClusterSelection::Node(id)) => snapshot.nodes.iter().any(|node| &node.node_id == id),
+        Some(ClusterSelection::LanSegment(id)) => {
+            build_topology(snapshot).lan_segments.contains_key(id)
+        }
+    }
 }
 
 fn distance(a: Point, b: Point) -> f32 {
@@ -1388,6 +1583,68 @@ mod tests {
             open.iter()
                 .any(|line| line == "warning detail: daemon health unavailable: network error")
         );
+    }
+
+    #[test]
+    fn pump_refresh_applies_snapshot_and_clears_missing_selection() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut state = ClusterState {
+            snapshot: ClusterSnapshot {
+                nodes: vec![node("node-a"), node("node-b")],
+                ..ClusterSnapshot::default()
+            },
+            selected: Some(ClusterSelection::Node("node-b".to_string())),
+            diagnostics_open: true,
+            refreshing: true,
+            refresh_rx: Some(rx),
+        };
+        tx.send(ClusterSnapshot {
+            nodes: vec![node("node-a")],
+            ..ClusterSnapshot::default()
+        })
+        .expect("send refreshed snapshot");
+
+        assert!(state.pump_refresh());
+        assert!(!state.refreshing);
+        assert_eq!(state.snapshot.nodes.len(), 1);
+        assert_eq!(state.selected, None);
+        assert!(!state.diagnostics_open);
+    }
+
+    #[test]
+    fn overview_refresh_action_is_exposed() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut cluster = shared.cluster_mut();
+            cluster.snapshot = ClusterSnapshot {
+                source: "daemon 127.0.0.1:21353".to_string(),
+                nodes: vec![node("node-a")],
+                ..ClusterSnapshot::default()
+            };
+            cluster.selected = None;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Cluster refresh action")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Refresh")
+                .with_description("Refresh cluster health and topology")
+                .count()?,
+            1
+        );
+
+        Ok(())
     }
 
     #[test]

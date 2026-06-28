@@ -184,10 +184,22 @@ impl Shell {
         }
         self.last_tab.set(current);
         self.tabs = WidgetPod::new(build_tab_bar(&self.shared, self.compact_tabs.get()));
+        self.start_cluster_refresh_if_active();
         ctx.request_measure();
         ctx.request_arrange();
         ctx.request_semantics();
         ctx.request_paint();
+    }
+
+    fn start_cluster_refresh_if_active(&self) -> bool {
+        if !self.shared.is_ready() || self.shared.active_tab() != Tab::Cluster {
+            return false;
+        }
+        cluster::request_refresh(&self.shared)
+    }
+
+    fn pump_cluster_refresh(&self) -> bool {
+        cluster::pump_refresh(&self.shared)
     }
 
     fn open_connection_settings(&self) {
@@ -473,6 +485,7 @@ impl Widget for Shell {
                     let waker = { self.shared.borrow().waker.clone() };
                     self.shared.chat_mut().start_session_list_load(waker);
                     self.schedule_chat_session_timer(ctx);
+                    self.start_cluster_refresh_if_active();
                     ctx.request_measure();
                     ctx.request_arrange();
                     ctx.request_semantics();
@@ -488,6 +501,7 @@ impl Widget for Shell {
                 } else {
                     false
                 };
+                let cluster_changed = self.pump_cluster_refresh();
                 let chat_changed = if self.shared.is_ready() {
                     let mut chat = self.shared.chat_mut();
                     let worker_changed = chat.pump_worker_events();
@@ -498,12 +512,12 @@ impl Widget for Shell {
                     false
                 };
                 self.schedule_chat_session_timer(ctx);
-                if files_changed || chat_changed {
+                if files_changed || cluster_changed || chat_changed {
                     ctx.request_measure();
                     ctx.request_arrange();
                     ctx.request_semantics();
                 }
-                if changed || device_changed || files_changed || chat_changed {
+                if changed || device_changed || files_changed || cluster_changed || chat_changed {
                     ctx.request_paint();
                 }
                 self.sync_active_tab(ctx);
@@ -517,6 +531,13 @@ impl Widget for Shell {
         // the relayout (diff-on-redraw, mirroring how the old hand-painted `switch_to` relayouted,
         // and how the inner tab hosts catch nested switches).
         if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
+            let cluster_changed = self.pump_cluster_refresh();
+            if cluster_changed {
+                ctx.request_measure();
+                ctx.request_arrange();
+                ctx.request_semantics();
+                ctx.request_paint();
+            }
             self.sync_active_tab(ctx);
             self.sync_render_options(ctx);
         }

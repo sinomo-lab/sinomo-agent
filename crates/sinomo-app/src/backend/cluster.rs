@@ -18,7 +18,14 @@ use time::OffsetDateTime;
 
 use crate::backend::{Backend, Connection};
 
-const CLUSTER_SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_millis(1200);
+const CLUSTER_LOCAL_SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_millis(1200);
+const CLUSTER_REFRESH_RPC_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClusterHealthScope {
+    Local,
+    Full,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ClusterSnapshot {
@@ -104,6 +111,17 @@ impl Backend {
     }
 
     pub fn cluster_snapshot(&self) -> ClusterSnapshot {
+        self.cluster_snapshot_with_health_scope(ClusterHealthScope::Local)
+    }
+
+    pub fn refresh_cluster_snapshot(&self) -> ClusterSnapshot {
+        self.cluster_snapshot_with_health_scope(ClusterHealthScope::Full)
+    }
+
+    fn cluster_snapshot_with_health_scope(
+        &self,
+        health_scope: ClusterHealthScope,
+    ) -> ClusterSnapshot {
         let observed_at = OffsetDateTime::now_utc();
         let paths = ClusterPaths::new(self.data_dir.as_ref());
         let mut warnings = Vec::new();
@@ -121,8 +139,11 @@ impl Backend {
             Some(state) => {
                 let cached_rows = rows_from_state(&paths, state, observed_at, &mut warnings);
                 match self.connection.daemon_address() {
-                    Some(address) => match fetch_local_health_rows(address) {
-                        Ok(live_rows) => {
+                    Some(address) => match fetch_daemon_health_rows(address, health_scope) {
+                        Ok((live_rows, warning)) => {
+                            if let Some(warning) = warning {
+                                warnings.push(warning);
+                            }
                             live_node_ids
                                 .extend(live_rows.iter().map(|row| row.member.node_id.to_string()));
                             merge_health_rows(cached_rows, live_rows)
@@ -136,8 +157,11 @@ impl Backend {
                 }
             }
             None => match self.connection.daemon_address() {
-                Some(address) => match fetch_local_health_rows(address) {
-                    Ok(rows) => {
+                Some(address) => match fetch_daemon_health_rows(address, health_scope) {
+                    Ok((rows, warning)) => {
+                        if let Some(warning) = warning {
+                            warnings.push(warning);
+                        }
                         warnings
                             .retain(|warning| !warning.starts_with("cluster state unavailable:"));
                         live_node_ids.extend(rows.iter().map(|row| row.member.node_id.to_string()));
@@ -175,11 +199,45 @@ impl Backend {
     }
 }
 
+fn fetch_daemon_health_rows(
+    address: &str,
+    health_scope: ClusterHealthScope,
+) -> Result<(Vec<ClusterHealthRow>, Option<String>), String> {
+    match health_scope {
+        ClusterHealthScope::Local => fetch_local_health_rows(address).map(|rows| (rows, None)),
+        ClusterHealthScope::Full => match fetch_cluster_health_rows(address) {
+            Ok(rows) => Ok((rows, None)),
+            Err(cluster_error) => match fetch_local_health_rows(address) {
+                Ok(rows) => Ok((
+                    rows,
+                    Some(format!(
+                        "daemon health aggregation unavailable: {cluster_error}; showing local daemon health"
+                    )),
+                )),
+                Err(local_error) => Err(format!(
+                    "cluster health unavailable: {cluster_error}; local health unavailable: {local_error}"
+                )),
+            },
+        },
+    }
+}
+
+fn fetch_cluster_health_rows(address: &str) -> Result<Vec<ClusterHealthRow>, String> {
+    let request = network::cluster_health_rpc_request().map_err(|error| error.to_string())?;
+    let response =
+        sinomo_runtime::daemon::send_daemon_rpc(address, &request, CLUSTER_REFRESH_RPC_TIMEOUT)
+            .map_err(|error| error.to_string())?;
+    network::decode_cluster_health_rpc_response(&response).map_err(|error| error.to_string())
+}
+
 fn fetch_local_health_rows(address: &str) -> Result<Vec<ClusterHealthRow>, String> {
     let request = network::cluster_local_health_rpc_request().map_err(|error| error.to_string())?;
-    let response =
-        sinomo_runtime::daemon::send_daemon_rpc(address, &request, CLUSTER_SNAPSHOT_RPC_TIMEOUT)
-            .map_err(|error| error.to_string())?;
+    let response = sinomo_runtime::daemon::send_daemon_rpc(
+        address,
+        &request,
+        CLUSTER_LOCAL_SNAPSHOT_RPC_TIMEOUT,
+    )
+    .map_err(|error| error.to_string())?;
     network::decode_cluster_health_rpc_response(&response).map_err(|error| error.to_string())
 }
 
