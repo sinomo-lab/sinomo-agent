@@ -1,4 +1,4 @@
-//! "Files" tab — a SIFS distributed-filesystem browser.
+//! "Files" tab — source-aware file manager for SIFS and local files.
 //!
 //! Standard file-manager UX (breadcrumb + listing) plus a SIFS inspector that
 //! shows where an object lives and its placement / replication policy.
@@ -24,6 +24,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -64,6 +66,35 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as `settings.rs`.)
 type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FilesSourceKind {
+    Sifs,
+    Local,
+}
+
+impl FilesSourceKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sifs => "SIFS",
+            Self::Local => "Local files",
+        }
+    }
+
+    fn path_label(self) -> &'static str {
+        match self {
+            Self::Sifs => "SIFS path",
+            Self::Local => "Local path",
+        }
+    }
+
+    fn operation_scope(self) -> &'static str {
+        match self {
+            Self::Sifs => "SIFS",
+            Self::Local => "local",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileActionPromptKind {
@@ -171,6 +202,24 @@ struct FilesOperationOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalObjectDetails {
+    path: String,
+    canonical_path: Option<String>,
+    kind: String,
+    size_bytes: Option<u64>,
+    readonly: bool,
+    accessed_at_unix_nanos: Option<u64>,
+    modified_at_unix_nanos: Option<u64>,
+    created_at_unix_nanos: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FilesObjectDetails {
+    Sifs(SifsObjectDetails),
+    Local(LocalObjectDetails),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum FilesOperationFailure {
     Cancelled(String),
     Error(String),
@@ -187,6 +236,7 @@ pub struct FilesState {
     pub data_dir: Arc<SinomoDataDir>,
     daemon_address: Option<String>,
     app_runtime: tokio::runtime::Handle,
+    pub source: FilesSourceKind,
     pub browser: Option<SifsBrowser>,
     pub error: Option<String>,
     pub clustered: bool,
@@ -195,9 +245,12 @@ pub struct FilesState {
     pub list_revision: u64,
     pub node_id: String,
     pub path: String,
+    sifs_path: String,
+    local_path: String,
     pub entries: Vec<SifsEntry>,
     pub selected: Option<usize>,
     pub selected_details: Option<SifsObjectDetails>,
+    selected_local_details: Option<LocalObjectDetails>,
     pub details_loading: bool,
     pub details_error: Option<String>,
     action_prompt: Option<FileActionPrompt>,
@@ -217,10 +270,12 @@ pub struct FilesState {
 
 impl FilesState {
     pub fn new(backend: &Backend) -> Self {
+        let local_path = default_local_path(backend.data_dir.root());
         Self {
             data_dir: backend.data_dir.clone(),
             daemon_address: backend.connection.daemon_address().map(str::to_string),
             app_runtime: backend.app_runtime.handle().clone(),
+            source: FilesSourceKind::Sifs,
             browser: None,
             error: None,
             clustered: backend.connection.is_clustered(),
@@ -229,9 +284,12 @@ impl FilesState {
             list_revision: 0,
             node_id: String::new(),
             path: "/".to_string(),
+            sifs_path: "/".to_string(),
+            local_path,
             entries: Vec::new(),
             selected: None,
             selected_details: None,
+            selected_local_details: None,
             details_loading: false,
             details_error: None,
             action_prompt: None,
@@ -267,6 +325,13 @@ impl FilesState {
     fn load_sync(&mut self) {
         self.loaded = true;
         self.loading = false;
+        if self.source == FilesSourceKind::Local {
+            self.browser = None;
+            self.node_id = local_node_label();
+            self.error = None;
+            self.reload();
+            return;
+        }
         let result = self
             .daemon_address
             .as_deref()
@@ -300,11 +365,17 @@ impl FilesState {
         self.clear_selected_details();
         self.loading = false;
         let path = self.path.clone();
-        let listing = self.browser.as_ref().map(|b| b.list_shallow(&path));
+        let listing = match self.source {
+            FilesSourceKind::Sifs => self.browser.as_ref().map(|b| b.list_shallow(&path)),
+            FilesSourceKind::Local => Some(list_local_dir(&path)),
+        };
         match listing {
             Some(Ok(entries)) => {
                 self.entries = entries;
                 self.error = None;
+                if self.source == FilesSourceKind::Local {
+                    self.node_id = local_node_label();
+                }
                 if let Some(select_path) = self.pending_select_path.take()
                     && let Some(index) = self
                         .entries
@@ -339,6 +410,7 @@ impl FilesState {
         self.list_revision = self.list_revision.wrapping_add(1);
         let command = FilesWorkerCommand::List {
             request_id,
+            source: self.source,
             path: self.path.clone(),
         };
         if tx.send(command).is_err() {
@@ -350,6 +422,7 @@ impl FilesState {
         }
         if let Some(result_tx) = self.worker_result_tx.clone() {
             let path = self.path.clone();
+            let source = self.source;
             let waker = self.worker_waker.clone();
             let _ = thread::Builder::new()
                 .name("sinomo-app-files-timeout".to_string())
@@ -357,9 +430,11 @@ impl FilesState {
                     thread::sleep(LOAD_TIMEOUT);
                     let _ = result_tx.send(FilesWorkerResult::List {
                         request_id,
+                        source,
                         path,
                         result: Err(format!(
-                            "SIFS listing did not finish within {} seconds",
+                            "{} listing did not finish within {} seconds",
+                            source.label(),
                             LOAD_TIMEOUT.as_secs()
                         )),
                     });
@@ -397,7 +472,7 @@ impl FilesState {
         self.clear_selected_details();
         self.node_id.clear();
         self.inspector_details_open = false;
-        self.loaded = false;
+        self.loaded = self.source == FilesSourceKind::Local;
         self.loading = false;
         self.pending_request_id = None;
         self.pending_details_request_id = None;
@@ -488,15 +563,20 @@ impl FilesState {
         match result {
             FilesWorkerResult::List {
                 request_id,
+                source,
                 path,
                 result,
             } => {
                 if self.pending_request_id != Some(request_id) {
                     return false;
                 }
+                if self.source != source {
+                    return false;
+                }
                 self.pending_request_id = None;
                 self.loading = false;
                 self.path = path;
+                self.store_active_path();
                 match result {
                     Ok(listing) => {
                         self.node_id = listing.node_id;
@@ -522,10 +602,14 @@ impl FilesState {
             }
             FilesWorkerResult::Details {
                 request_id,
+                source,
                 path,
                 result,
             } => {
                 if self.pending_details_request_id != Some(request_id) {
+                    return false;
+                }
+                if self.source != source {
                     return false;
                 }
                 self.pending_details_request_id = None;
@@ -535,12 +619,19 @@ impl FilesState {
                     return false;
                 }
                 match result {
-                    Ok(details) => {
+                    Ok(FilesObjectDetails::Sifs(details)) => {
                         self.selected_details = Some(details);
+                        self.selected_local_details = None;
+                        self.details_error = None;
+                    }
+                    Ok(FilesObjectDetails::Local(details)) => {
+                        self.selected_details = None;
+                        self.selected_local_details = Some(details);
                         self.details_error = None;
                     }
                     Err(error) => {
                         self.selected_details = None;
+                        self.selected_local_details = None;
                         self.details_error = Some(error);
                     }
                 }
@@ -553,28 +644,75 @@ impl FilesState {
     }
 
     fn navigate(&mut self, path: String) {
-        let normalized = self
-            .browser
-            .as_ref()
-            .map(|b| b.normalize(&path))
-            .unwrap_or_else(|| normalize_path(&path));
+        let normalized = match self.source {
+            FilesSourceKind::Sifs => self
+                .browser
+                .as_ref()
+                .map(|b| b.normalize(&path))
+                .unwrap_or_else(|| normalize_path(&path)),
+            FilesSourceKind::Local => match normalize_local_path(&path) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.error = Some(error);
+                    self.list_revision = self.list_revision.wrapping_add(1);
+                    return;
+                }
+            },
+        };
         self.path = normalized;
+        self.store_active_path();
         self.reload();
     }
 
     fn go_up(&mut self) {
-        let parent = self
-            .browser
-            .as_ref()
-            .and_then(|b| b.parent(&self.path))
-            .or_else(|| parent_path(&self.path));
+        let parent = match self.source {
+            FilesSourceKind::Sifs => self
+                .browser
+                .as_ref()
+                .and_then(|b| b.parent(&self.path))
+                .or_else(|| parent_path(&self.path)),
+            FilesSourceKind::Local => parent_local_path(&self.path),
+        };
         if let Some(parent) = parent {
             self.navigate(parent);
         }
     }
 
+    fn switch_source(&mut self, source: FilesSourceKind, waker: Option<sui::UiHandle>) {
+        if self.source == source {
+            return;
+        }
+        self.store_active_path();
+        self.source = source;
+        self.path = match source {
+            FilesSourceKind::Sifs => self.sifs_path.clone(),
+            FilesSourceKind::Local => self.local_path.clone(),
+        };
+        self.error = None;
+        self.entries.clear();
+        self.selected = None;
+        self.clear_selected_details();
+        self.loading = false;
+        self.pending_request_id = None;
+        self.pending_details_request_id = None;
+        self.list_revision = self.list_revision.wrapping_add(1);
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        self.loaded = true;
+        self.reload();
+    }
+
+    fn store_active_path(&mut self) {
+        match self.source {
+            FilesSourceKind::Sifs => self.sifs_path = self.path.clone(),
+            FilesSourceKind::Local => self.local_path = self.path.clone(),
+        }
+    }
+
     fn clear_selected_details(&mut self) {
         self.selected_details = None;
+        self.selected_local_details = None;
         self.details_loading = false;
         self.details_error = None;
         self.pending_details_request_id = None;
@@ -597,7 +735,11 @@ impl FilesState {
             self.pending_details_request_id = Some(request_id);
             self.details_loading = true;
             if tx
-                .send(FilesWorkerCommand::Details { request_id, path })
+                .send(FilesWorkerCommand::Details {
+                    request_id,
+                    source: self.source,
+                    path,
+                })
                 .is_err()
             {
                 self.pending_details_request_id = None;
@@ -609,10 +751,17 @@ impl FilesState {
 
         self.pending_details_request_id = None;
         self.details_loading = false;
-        match self.browser.as_ref().map(|browser| browser.stat(&path)) {
-            Some(Ok(details)) => self.selected_details = Some(details),
-            Some(Err(error)) => self.details_error = Some(error),
-            None => {}
+        match self.source {
+            FilesSourceKind::Sifs => match self.browser.as_ref().map(|browser| browser.stat(&path))
+            {
+                Some(Ok(details)) => self.selected_details = Some(details),
+                Some(Err(error)) => self.details_error = Some(error),
+                None => {}
+            },
+            FilesSourceKind::Local => match local_details(&path) {
+                Ok(details) => self.selected_local_details = Some(details),
+                Err(error) => self.details_error = Some(error),
+            },
         }
     }
 
@@ -722,7 +871,7 @@ impl FilesState {
         match prompt.kind {
             FileActionPromptKind::GoTo => unreachable!("Go to path is handled before operations"),
             FileActionPromptKind::NewFile => {
-                let path = join_sifs_child(&self.path, &prompt.input)?;
+                let path = self.join_child(&prompt.input)?;
                 Ok((
                     FilesOperation {
                         kind: FilesOperationKind::CreateFile,
@@ -735,7 +884,7 @@ impl FilesState {
                 ))
             }
             FileActionPromptKind::NewFolder => {
-                let path = join_sifs_child(&self.path, &prompt.input)?;
+                let path = self.join_child(&prompt.input)?;
                 Ok((
                     FilesOperation {
                         kind: FilesOperationKind::CreateFolder,
@@ -758,7 +907,7 @@ impl FilesState {
                             .to_string(),
                     );
                 }
-                let to = resolve_sifs_destination_path(&self.path, &prompt.input)?;
+                let to = self.resolve_destination_path(&prompt.input)?;
                 if from == to {
                     return Err("copy destination matches the source path".to_string());
                 }
@@ -778,7 +927,7 @@ impl FilesState {
                     .target_path
                     .clone()
                     .ok_or_else(|| "select an item first".to_string())?;
-                let to = resolve_sifs_destination_path(&self.path, &prompt.input)?;
+                let to = self.resolve_destination_path(&prompt.input)?;
                 if from == to {
                     return Err("move destination matches the source path".to_string());
                 }
@@ -798,7 +947,7 @@ impl FilesState {
                     .target_path
                     .clone()
                     .ok_or_else(|| "select an item first".to_string())?;
-                let to = join_sifs_child(&self.path, &prompt.input)?;
+                let to = self.join_child(&prompt.input)?;
                 if from == to {
                     return Err("new name matches the current name".to_string());
                 }
@@ -863,6 +1012,7 @@ impl FilesState {
             if tx
                 .send(FilesWorkerCommand::Operation {
                     request_id,
+                    source: self.source,
                     operation,
                 })
                 .is_err()
@@ -877,12 +1027,38 @@ impl FilesState {
         }
 
         let result = self
-            .browser
-            .as_ref()
-            .ok_or_else(|| "SIFS browser is not open".to_string())
-            .and_then(|browser| execute_files_operation(browser, operation, &self.path))
+            .execute_operation(operation, &self.path)
             .map_err(FilesOperationFailure::Error);
         self.apply_operation_result(request_id, result);
+    }
+
+    fn join_child(&self, name: &str) -> Result<String, String> {
+        match self.source {
+            FilesSourceKind::Sifs => join_sifs_child(&self.path, name),
+            FilesSourceKind::Local => join_local_child(&self.path, name),
+        }
+    }
+
+    fn resolve_destination_path(&self, input: &str) -> Result<String, String> {
+        match self.source {
+            FilesSourceKind::Sifs => resolve_sifs_destination_path(&self.path, input),
+            FilesSourceKind::Local => resolve_local_destination_path(&self.path, input),
+        }
+    }
+
+    fn execute_operation(
+        &self,
+        operation: FilesOperation,
+        current_path: &str,
+    ) -> Result<FilesOperationOutcome, String> {
+        match self.source {
+            FilesSourceKind::Sifs => self
+                .browser
+                .as_ref()
+                .ok_or_else(|| "SIFS browser is not open".to_string())
+                .and_then(|browser| execute_sifs_operation(browser, operation, current_path)),
+            FilesSourceKind::Local => execute_local_operation(operation, current_path),
+        }
     }
 
     fn cancel_task(&mut self, task_id: u64) {
@@ -960,6 +1136,9 @@ impl FilesState {
 
     /// The breadcrumb path segments as `(label, target_path)` pairs, root first.
     fn crumbs(&self) -> Vec<(String, String)> {
+        if self.source == FilesSourceKind::Local {
+            return local_crumbs(&self.path);
+        }
         let mut out = vec![("SIFS".to_string(), "/".to_string())];
         let mut acc = String::new();
         let mut parent: Option<String> = None;
@@ -981,13 +1160,15 @@ struct FilesListing {
 enum FilesWorkerResult {
     List {
         request_id: u64,
+        source: FilesSourceKind,
         path: String,
         result: Result<FilesListing, String>,
     },
     Details {
         request_id: u64,
+        source: FilesSourceKind,
         path: String,
-        result: Result<SifsObjectDetails, String>,
+        result: Result<FilesObjectDetails, String>,
     },
     Operation {
         request_id: u64,
@@ -998,14 +1179,17 @@ enum FilesWorkerResult {
 enum FilesWorkerCommand {
     List {
         request_id: u64,
+        source: FilesSourceKind,
         path: String,
     },
     Details {
         request_id: u64,
+        source: FilesSourceKind,
         path: String,
     },
     Operation {
         request_id: u64,
+        source: FilesSourceKind,
         operation: FilesOperation,
     },
 }
@@ -1025,11 +1209,36 @@ fn files_worker_loop(
         .then(|| "SIFS browsing requires a daemon connection".to_string());
     while let Ok(command) = command_rx.recv() {
         match command {
-            FilesWorkerCommand::List { request_id, path } => {
-                let requested_path = normalize_path(&path);
-                let (path, result) = if let Some(error) = &open_error {
+            FilesWorkerCommand::List {
+                request_id,
+                source,
+                path,
+            } => {
+                let requested_path = normalize_source_path(source, &path);
+                let (path, result) = if source == FilesSourceKind::Local {
+                    let path = requested_path.unwrap_or_else(|error| {
+                        let _ = result_tx.send(FilesWorkerResult::List {
+                            request_id,
+                            source,
+                            path: path.clone(),
+                            result: Err(error),
+                        });
+                        String::new()
+                    });
+                    if path.is_empty() {
+                        waker.wake();
+                        continue;
+                    }
+                    let result = list_local_dir(&path).map(|entries| FilesListing {
+                        node_id: local_node_label(),
+                        entries,
+                    });
+                    (path, result)
+                } else if let Some(error) = &open_error {
+                    let requested_path = requested_path.unwrap_or_else(|_| normalize_path(&path));
                     (requested_path, Err(error.clone()))
                 } else {
+                    let requested_path = requested_path.unwrap_or_else(|_| normalize_path(&path));
                     if browser.is_none() {
                         match daemon_address.as_deref() {
                             Some(address) => {
@@ -1063,15 +1272,38 @@ fn files_worker_loop(
                 };
                 let _ = result_tx.send(FilesWorkerResult::List {
                     request_id,
+                    source,
                     path,
                     result,
                 });
             }
-            FilesWorkerCommand::Details { request_id, path } => {
-                let requested_path = normalize_path(&path);
-                let (path, result) = if let Some(error) = &open_error {
+            FilesWorkerCommand::Details {
+                request_id,
+                source,
+                path,
+            } => {
+                let requested_path = normalize_source_path(source, &path);
+                let (path, result) = if source == FilesSourceKind::Local {
+                    let path = requested_path.unwrap_or_else(|error| {
+                        let _ = result_tx.send(FilesWorkerResult::Details {
+                            request_id,
+                            source,
+                            path: path.clone(),
+                            result: Err(error),
+                        });
+                        String::new()
+                    });
+                    if path.is_empty() {
+                        waker.wake();
+                        continue;
+                    }
+                    let result = local_details(&path).map(FilesObjectDetails::Local);
+                    (path, result)
+                } else if let Some(error) = &open_error {
+                    let requested_path = requested_path.unwrap_or_else(|_| normalize_path(&path));
                     (requested_path, Err(error.clone()))
                 } else {
+                    let requested_path = requested_path.unwrap_or_else(|_| normalize_path(&path));
                     if browser.is_none() {
                         match daemon_address.as_deref() {
                             Some(address) => {
@@ -1090,7 +1322,7 @@ fn files_worker_loop(
                     match (&browser, &open_error) {
                         (Some(browser), _) => {
                             let path = browser.normalize(&requested_path);
-                            let result = browser.stat(&path);
+                            let result = browser.stat(&path).map(FilesObjectDetails::Sifs);
                             (path, result)
                         }
                         (None, Some(error)) => (requested_path, Err(error.clone())),
@@ -1102,28 +1334,24 @@ fn files_worker_loop(
                 };
                 let _ = result_tx.send(FilesWorkerResult::Details {
                     request_id,
+                    source,
                     path,
                     result,
                 });
             }
             FilesWorkerCommand::Operation {
                 request_id,
+                source,
                 operation,
             } => {
-                let current_path = normalize_path(&operation.path)
-                    .rsplit_once('/')
-                    .map(|(parent, _)| {
-                        if parent.is_empty() {
-                            "/".to_string()
-                        } else {
-                            parent.to_string()
-                        }
-                    })
-                    .unwrap_or_else(|| "/".to_string());
+                let current_path = operation_parent_path(source, &operation.path);
                 let result = if operation_cancelled(&cancellations, request_id) {
                     Err(FilesOperationFailure::Cancelled(
                         files_operation_cancelled_detail(&operation),
                     ))
+                } else if source == FilesSourceKind::Local {
+                    execute_local_operation(operation, &current_path)
+                        .map_err(FilesOperationFailure::Error)
                 } else if let Some(error) = &open_error {
                     Err(FilesOperationFailure::Error(error.clone()))
                 } else {
@@ -1144,7 +1372,7 @@ fn files_worker_loop(
                     }
                     match (&browser, &open_error) {
                         (Some(browser), _) => {
-                            execute_files_operation(browser, operation, &current_path)
+                            execute_sifs_operation(browser, operation, &current_path)
                                 .map_err(FilesOperationFailure::Error)
                         }
                         (None, Some(error)) => Err(FilesOperationFailure::Error(error.clone())),
@@ -1204,6 +1432,27 @@ fn normalize_path(path: &str) -> String {
     }
 }
 
+fn default_local_path(fallback: impl AsRef<Path>) -> String {
+    std::env::current_dir()
+        .or_else(|_| Ok::<PathBuf, std::io::Error>(fallback.as_ref().to_path_buf()))
+        .and_then(|path| path.canonicalize().or(Ok(path)))
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| ".".to_string())
+}
+
+fn local_node_label() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "this node".to_string())
+}
+
+fn normalize_source_path(source: FilesSourceKind, path: &str) -> Result<String, String> {
+    match source {
+        FilesSourceKind::Sifs => Ok(normalize_path(path)),
+        FilesSourceKind::Local => normalize_local_path(path),
+    }
+}
+
 fn parent_path(path: &str) -> Option<String> {
     let path = normalize_path(path);
     if path == "/" {
@@ -1215,6 +1464,52 @@ fn parent_path(path: &str) -> Option<String> {
     } else {
         parent.to_string()
     })
+}
+
+fn normalize_local_path(path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("path cannot be empty".to_string());
+    }
+    if trimmed.bytes().any(|byte| byte == 0) {
+        return Err("path cannot contain NUL bytes".to_string());
+    }
+    let path = PathBuf::from(trimmed);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("cannot read current directory: {error}"))?
+            .join(path)
+    };
+    Ok(path
+        .canonicalize()
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn parent_local_path(path: &str) -> Option<String> {
+    Path::new(path)
+        .parent()
+        .map(|parent| parent.to_string_lossy().into_owned())
+        .filter(|parent| !parent.is_empty())
+}
+
+fn operation_parent_path(source: FilesSourceKind, path: &str) -> String {
+    match source {
+        FilesSourceKind::Sifs => normalize_path(path)
+            .rsplit_once('/')
+            .map(|(parent, _)| {
+                if parent.is_empty() {
+                    "/".to_string()
+                } else {
+                    parent.to_string()
+                }
+            })
+            .unwrap_or_else(|| "/".to_string()),
+        FilesSourceKind::Local => parent_local_path(path).unwrap_or_else(|| path.to_string()),
+    }
 }
 
 fn validate_child_name(name: &str) -> Result<&str, String> {
@@ -1266,6 +1561,177 @@ fn resolve_sifs_destination_path(current_path: &str, input: &str) -> Result<Stri
     Ok(normalized)
 }
 
+fn join_local_child(parent: &str, name: &str) -> Result<String, String> {
+    let child = validated_local_relative_path(name, "name")?;
+    Ok(Path::new(parent).join(child).to_string_lossy().into_owned())
+}
+
+fn resolve_local_destination_path(current_path: &str, input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("destination cannot be empty".to_string());
+    }
+    if trimmed.bytes().any(|byte| byte == 0) {
+        return Err("destination cannot contain NUL bytes".to_string());
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        Ok(path.to_string_lossy().into_owned())
+    } else {
+        let child = validated_local_relative_path(trimmed, "destination")?;
+        Ok(Path::new(current_path)
+            .join(child)
+            .to_string_lossy()
+            .into_owned())
+    }
+}
+
+fn validated_local_relative_path(input: &str, label: &str) -> Result<PathBuf, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label} cannot be empty"));
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err(format!(
+            "use a relative {label} inside the current directory"
+        ));
+    }
+    let mut has_name = false;
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                has_name = true;
+                normalized.push(part);
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(format!("{label} cannot leave the current directory"));
+            }
+        }
+    }
+    if !has_name {
+        return Err(format!("{label} cannot be empty"));
+    }
+    Ok(normalized)
+}
+
+fn list_local_dir(path: &str) -> Result<Vec<SifsEntry>, String> {
+    let read_dir = fs::read_dir(path).map_err(|error| format!("cannot list {path}: {error}"))?;
+    let mut entries = Vec::new();
+    for entry in read_dir {
+        let entry = entry.map_err(|error| format!("cannot read entry in {path}: {error}"))?;
+        let entry_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {}: {error}", entry_path.display()))?;
+        let metadata = entry.metadata().ok();
+        let is_dir = file_type.is_dir();
+        let is_link = file_type.is_symlink();
+        let size = metadata
+            .as_ref()
+            .filter(|_| !is_dir)
+            .map(|metadata| metadata.len());
+        entries.push(SifsEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            path: entry_path.to_string_lossy().into_owned(),
+            is_dir,
+            is_link,
+            size,
+        });
+    }
+    Ok(sort_file_entries(entries))
+}
+
+fn local_details(path: &str) -> Result<LocalObjectDetails, String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("cannot inspect {path}: {error}"))?;
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_file() {
+        "file"
+    } else if file_type.is_symlink() {
+        "symlink"
+    } else {
+        "item"
+    }
+    .to_string();
+    Ok(LocalObjectDetails {
+        path: path.to_string(),
+        canonical_path: Path::new(path)
+            .canonicalize()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned()),
+        kind,
+        size_bytes: file_type.is_file().then_some(metadata.len()),
+        readonly: metadata.permissions().readonly(),
+        accessed_at_unix_nanos: metadata.accessed().ok().and_then(system_time_unix_nanos),
+        modified_at_unix_nanos: metadata.modified().ok().and_then(system_time_unix_nanos),
+        created_at_unix_nanos: metadata.created().ok().and_then(system_time_unix_nanos),
+    })
+}
+
+fn system_time_unix_nanos(time: std::time::SystemTime) -> Option<u64> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+}
+
+fn local_time_label(nanos: Option<u64>) -> String {
+    nanos
+        .map(unix_nanos_label)
+        .unwrap_or_else(|| "not recorded".to_string())
+}
+
+fn local_crumbs(path: &str) -> Vec<(String, String)> {
+    let path = Path::new(path);
+    let mut out = Vec::new();
+    let mut acc = PathBuf::new();
+    let mut saw_root = false;
+
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => {
+                acc.push(prefix.as_os_str());
+                let label = prefix.as_os_str().to_string_lossy().into_owned();
+                out.push((label.clone(), format!("{label}\\")));
+            }
+            std::path::Component::RootDir => {
+                saw_root = true;
+                if acc.as_os_str().is_empty() {
+                    acc.push(std::path::MAIN_SEPARATOR.to_string());
+                } else {
+                    acc.push(std::path::MAIN_SEPARATOR.to_string());
+                }
+                if out.is_empty() {
+                    out.push(("Local".to_string(), acc.to_string_lossy().into_owned()));
+                }
+            }
+            std::path::Component::Normal(part) => {
+                acc.push(part);
+                let label = part.to_string_lossy().into_owned();
+                out.push((
+                    crumb_label(&label, None),
+                    acc.to_string_lossy().into_owned(),
+                ));
+            }
+            std::path::Component::CurDir | std::path::Component::ParentDir => {}
+        }
+    }
+
+    if out.is_empty() {
+        out.push(("Local".to_string(), path.to_string_lossy().into_owned()));
+    } else if !saw_root && out[0].0 != "Local" {
+        let target = out[0].1.clone();
+        out.insert(0, ("Local".to_string(), target));
+    }
+    out
+}
+
 fn suggested_copy_name(name: &str) -> String {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -1291,7 +1757,7 @@ fn normalize_jump_path(path: &str) -> Result<String, String> {
     Ok(normalize_path(trimmed))
 }
 
-fn execute_files_operation(
+fn execute_sifs_operation(
     browser: &SifsBrowser,
     operation: FilesOperation,
     current_path: &str,
@@ -1355,6 +1821,96 @@ fn execute_files_operation(
         }
         FilesOperationKind::Delete => {
             browser.delete(&operation.path, operation.directory)?;
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: None,
+                message: format!("deleted {}", operation.path),
+            })
+        }
+    }
+}
+
+fn execute_local_operation(
+    operation: FilesOperation,
+    current_path: &str,
+) -> Result<FilesOperationOutcome, String> {
+    match operation.kind {
+        FilesOperationKind::CreateFile => {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&operation.path)
+                .map_err(|error| format!("cannot create file {}: {error}", operation.path))?;
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: Some(operation.path.clone()),
+                message: format!("created {}", operation.path),
+            })
+        }
+        FilesOperationKind::CreateFolder => {
+            fs::create_dir(&operation.path)
+                .map_err(|error| format!("cannot create folder {}: {error}", operation.path))?;
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: Some(operation.path.clone()),
+                message: format!("created {}", operation.path),
+            })
+        }
+        FilesOperationKind::Copy => {
+            if operation.directory {
+                return Err("folder copy is not available yet".to_string());
+            }
+            let target = operation
+                .target
+                .clone()
+                .ok_or_else(|| "copy target is missing".to_string())?;
+            let mut source = fs::File::open(&operation.path)
+                .map_err(|error| format!("cannot open {}: {error}", operation.path))?;
+            let mut target_file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .map_err(|error| format!("cannot create {target}: {error}"))?;
+            std::io::copy(&mut source, &mut target_file)
+                .map_err(|error| format!("cannot copy {} to {target}: {error}", operation.path))?;
+            Ok(FilesOperationOutcome {
+                refresh_path: parent_local_path(&target)
+                    .unwrap_or_else(|| current_path.to_string()),
+                select_path: Some(target.clone()),
+                message: format!("copied {} to {target}", operation.path),
+            })
+        }
+        FilesOperationKind::Move | FilesOperationKind::Rename => {
+            let target = operation
+                .target
+                .clone()
+                .ok_or_else(|| "target path is missing".to_string())?;
+            fs::rename(&operation.path, &target)
+                .map_err(|error| format!("cannot move {} to {target}: {error}", operation.path))?;
+            let action = if operation.kind == FilesOperationKind::Rename {
+                "renamed"
+            } else {
+                "moved"
+            };
+            Ok(FilesOperationOutcome {
+                refresh_path: parent_local_path(&target)
+                    .unwrap_or_else(|| current_path.to_string()),
+                select_path: Some(target.clone()),
+                message: format!("{action} {} to {target}", operation.path),
+            })
+        }
+        FilesOperationKind::Delete => {
+            if operation.directory {
+                fs::remove_dir(&operation.path).map_err(|error| {
+                    format!(
+                        "cannot delete folder {}: {error}; only empty folders can be deleted",
+                        operation.path
+                    )
+                })?;
+            } else {
+                fs::remove_file(&operation.path)
+                    .map_err(|error| format!("cannot delete file {}: {error}", operation.path))?;
+            }
             Ok(FilesOperationOutcome {
                 refresh_path: current_path.to_string(),
                 select_path: None,
@@ -1511,6 +2067,13 @@ fn sifs_unavailable_summary(error: &str) -> &'static str {
     }
 }
 
+fn source_unavailable_summary(source: FilesSourceKind, error: &str) -> String {
+    match source {
+        FilesSourceKind::Sifs => sifs_unavailable_summary(error).to_string(),
+        FilesSourceKind::Local => format!("Local filesystem error: {error}"),
+    }
+}
+
 fn sifs_metadata_status_label(
     loading: bool,
     error: Option<&str>,
@@ -1544,6 +2107,39 @@ fn sifs_metadata_status_color(
     }
 }
 
+fn local_metadata_status_label(
+    loading: bool,
+    error: Option<&str>,
+    details: Option<&LocalObjectDetails>,
+) -> &'static str {
+    if loading {
+        "Loading metadata"
+    } else if error.is_some() {
+        "Metadata unavailable"
+    } else if details.is_some() {
+        "Metadata current"
+    } else {
+        "Metadata pending"
+    }
+}
+
+fn local_metadata_status_color(
+    pal: &Palette,
+    loading: bool,
+    error: Option<&str>,
+    details: Option<&LocalObjectDetails>,
+) -> Color {
+    if loading {
+        pal.accent
+    } else if error.is_some() {
+        pal.warn
+    } else if details.is_some() {
+        pal.good
+    } else {
+        pal.text_muted
+    }
+}
+
 /// The right-aligned metadata for a listing row: `folder` for directories, else a human size.
 fn entry_meta(entry: &SifsEntry) -> String {
     if entry.is_dir {
@@ -1563,6 +2159,15 @@ fn entry_kind_label(entry: &SifsEntry) -> &'static str {
     } else {
         "File"
     }
+}
+
+fn sort_file_entries(mut entries: Vec<SifsEntry>) -> Vec<SifsEntry> {
+    entries.sort_by(|a, b| {
+        (b.is_dir as u8)
+            .cmp(&(a.is_dir as u8))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    entries
 }
 
 fn entry_icon(entry: &SifsEntry) -> IconGlyph {
@@ -1655,6 +2260,23 @@ fn sifs_details_signature(details: Option<&SifsObjectDetails>) -> String {
                 details.version,
                 details.policy,
                 details.current_locations.join(",")
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn local_details_signature(details: Option<&LocalObjectDetails>) -> String {
+    details
+        .map(|details| {
+            format!(
+                "{}|{}|{}|{}",
+                details.path,
+                details.kind,
+                details
+                    .size_bytes
+                    .map(|size| size.to_string())
+                    .unwrap_or_default(),
+                details.readonly
             )
         })
         .unwrap_or_default()
@@ -1972,10 +2594,12 @@ impl Widget for SifsEntryRow {
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         let row_id = ctx.widget_id();
         let mut node = SemanticsNode::new(row_id, SemanticsRole::ListItem, ctx.bounds());
+        let source = self.shared.files().source;
         node.name = Some(self.entry.name.clone());
         node.description = Some(format!(
-            "{}, SIFS path {}",
+            "{}, {} {}",
             entry_kind_label(&self.entry),
+            source.path_label(),
             self.entry.path
         ));
         node.state.focused = ctx.is_focused();
@@ -1993,12 +2617,20 @@ impl Widget for SifsEntryRow {
             (
                 SifsEntryRowHit::Copy,
                 format!("Copy {}", self.entry.name),
-                format!("Copy {} to another SIFS path", self.entry.path),
+                format!(
+                    "Copy {} to another {} path",
+                    self.entry.path,
+                    source.operation_scope()
+                ),
             ),
             (
                 SifsEntryRowHit::Move,
                 format!("Move {}", self.entry.name),
-                format!("Move {} to another SIFS path", self.entry.path),
+                format!(
+                    "Move {} to another {} path",
+                    self.entry.path,
+                    source.operation_scope()
+                ),
             ),
             (
                 SifsEntryRowHit::Rename,
@@ -2057,7 +2689,8 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 
     let breadcrumb = {
         let s = shared.clone();
-        Breadcrumb::new("SIFS path")
+        let path_label = shared.files().source.path_label();
+        Breadcrumb::new(path_label)
             .items(
                 crumbs
                     .iter()
@@ -2072,9 +2705,36 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             })
     };
 
+    let source = {
+        let s = shared.clone();
+        sui::Select::new("files-source")
+            .options(vec!["SIFS".to_string(), "Local".to_string()])
+            .placeholder("Source")
+            .theme_when(clone_reader(reader))
+            .selected_when({
+                let s = s.clone();
+                move || {
+                    Some(match s.files().source {
+                        FilesSourceKind::Sifs => 0,
+                        FilesSourceKind::Local => 1,
+                    })
+                }
+            })
+            .on_change(move |index, _label| {
+                let source = if index == 1 {
+                    FilesSourceKind::Local
+                } else {
+                    FilesSourceKind::Sifs
+                };
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut().switch_source(source, waker);
+            })
+    };
+
     let refresh = {
         let s = shared.clone();
-        IconButton::new(IconGlyph::Redo, "Refresh SIFS")
+        let label = format!("Refresh {}", shared.files().source.label());
+        IconButton::new(IconGlyph::Redo, label)
             .size(30.0)
             .theme_when(clone_reader(reader))
             .selected_when({
@@ -2213,6 +2873,7 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .spacing(8.0)
         .alignment(Alignment::Center)
         .with_child(up)
+        .with_child(SizedBox::new().width(118.0).height(30.0).with_child(source))
         .with_child(breadcrumb)
         .with_child(refresh)
         .with_child(go_to)
@@ -2248,14 +2909,18 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             !files.tasks.is_empty(),
         )
     };
+    let source = shared.files().source;
 
     if loading {
         return WidgetPod::new(
             centered_note(
                 shared,
                 "▤",
-                "Loading SIFS",
-                "Opening the distributed filesystem...",
+                format!("Loading {}", source.label()),
+                match source {
+                    FilesSourceKind::Sifs => "Opening the distributed filesystem...",
+                    FilesSourceKind::Local => "Reading the local directory...",
+                },
             )
             .glyph(IconGlyph::Storage),
         );
@@ -2263,34 +2928,40 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
     if let Some(error) = error {
         let retry = {
             let s = shared.clone();
-            sui::Button::new("Retry SIFS")
+            sui::Button::new(format!("Retry {}", source.label()))
                 .icon(IconGlyph::Redo)
-                .min_width(112.0)
+                .min_width(128.0)
                 .theme_when(clone_reader(reader))
                 .on_press(move || {
                     let waker = { s.borrow().waker.clone() };
                     s.files_mut().retry(waker);
                 })
         };
-        let settings = {
+        let settings = if source == FilesSourceKind::Sifs {
             let s = shared.clone();
-            sui::Button::new("Connection settings")
-                .icon(IconGlyph::Alert)
-                .min_width(160.0)
-                .theme_when(secondary_button_theme(reader))
-                .on_press(move || open_settings_section(&s, SettingsSection::Connection))
+            Some(
+                sui::Button::new("Connection settings")
+                    .icon(IconGlyph::Alert)
+                    .min_width(160.0)
+                    .theme_when(secondary_button_theme(reader))
+                    .on_press(move || open_settings_section(&s, SettingsSection::Connection)),
+            )
+        } else {
+            None
         };
-        let actions = Stack::horizontal()
+        let mut actions = Stack::horizontal()
             .spacing(8.0)
             .alignment(Alignment::Center)
-            .with_child(retry)
-            .with_child(settings);
+            .with_child(retry);
+        if let Some(settings) = settings {
+            actions = actions.with_child(settings);
+        }
         return WidgetPod::new(
             centered_note(
                 shared,
                 "▤",
-                "SIFS unavailable",
-                sifs_unavailable_summary(&error),
+                format!("{} unavailable", source.label()),
+                source_unavailable_summary(source, &error),
             )
             .glyph(IconGlyph::Storage)
             .action(actions),
@@ -2350,7 +3021,7 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
 
     let list = {
         let s = shared.clone();
-        ListView::new("sifs-listing")
+        ListView::new("files-listing")
             .items(items)
             .row_height(ROW_H)
             .theme_when(clone_reader(reader))
@@ -2413,14 +3084,14 @@ fn open_settings_section(shared: &Shared, section: SettingsSection) {
 }
 
 fn files_source_status(files: &FilesState) -> &'static str {
-    if files.error.is_some() {
-        "SIFS unavailable"
-    } else if files.loading {
-        "Loading SIFS"
-    } else if files.clustered {
-        "SIFS online"
-    } else {
-        "Local SIFS"
+    match files.source {
+        FilesSourceKind::Sifs if files.error.is_some() => "SIFS unavailable",
+        FilesSourceKind::Sifs if files.loading => "Loading SIFS",
+        FilesSourceKind::Sifs if files.clustered => "SIFS online",
+        FilesSourceKind::Sifs => "Local SIFS",
+        FilesSourceKind::Local if files.error.is_some() => "Local unavailable",
+        FilesSourceKind::Local if files.loading => "Loading local",
+        FilesSourceKind::Local => "Local files",
     }
 }
 
@@ -2524,6 +3195,8 @@ impl FilesStatusBar {
             pal.warn
         } else if files.loading {
             pal.accent
+        } else if files.source == FilesSourceKind::Local {
+            pal.good
         } else if files.clustered {
             pal.good
         } else {
@@ -2847,17 +3520,21 @@ impl InspectorView {
     fn summary(&self) -> String {
         let files = self.shared.files();
         if files.loading {
-            return format!("loading|{}|{}", files.path, files.inspector_details_open);
+            return format!(
+                "loading|{:?}|{}|{}",
+                files.source, files.path, files.inspector_details_open
+            );
         }
         if let Some(error) = &files.error {
             return format!(
-                "error|{}|{}|{}",
-                files.path, error, files.inspector_details_open
+                "error|{:?}|{}|{}|{}",
+                files.source, files.path, error, files.inspector_details_open
             );
         }
         match files.selected_entry() {
             Some(entry) => format!(
-                "{}|{}|{}|{}|{}|{}|{}|{}",
+                "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                files.source,
                 entry.path,
                 entry.is_dir,
                 entry.is_link,
@@ -2865,9 +3542,15 @@ impl InspectorView {
                 files.details_loading,
                 files.details_error.as_deref().unwrap_or(""),
                 files.inspector_details_open,
-                sifs_details_signature(files.selected_details.as_ref())
+                sifs_details_signature(files.selected_details.as_ref()),
+                local_details_signature(files.selected_local_details.as_ref())
             ),
-            None => format!("unselected|{}|{}", files.path, files.entries.len()),
+            None => format!(
+                "unselected|{:?}|{}|{}",
+                files.source,
+                files.path,
+                files.entries.len()
+            ),
         }
     }
 }
@@ -3167,6 +3850,118 @@ impl Widget for InspectorView {
         }
 
         y = self.info_row(ctx, &theme, &pal, x, y, w, "Path", &entry.path);
+
+        if files.source == FilesSourceKind::Local {
+            y += 10.0;
+            let sect = pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
+            widgets::draw_text_in(ctx, Rect::new(x, y, w, 16.0), "LOCAL FILE", sect);
+            y += 24.0;
+
+            let local = files.selected_local_details.as_ref();
+            let status_label = local_metadata_status_label(
+                files.details_loading,
+                files.details_error.as_deref(),
+                local,
+            );
+            let status_color = local_metadata_status_color(
+                &pal,
+                files.details_loading,
+                files.details_error.as_deref(),
+                local,
+            );
+            y = self.status_badge(ctx, &theme, &pal, x, y, w, status_label, status_color);
+            y = self.info_row(
+                ctx,
+                &theme,
+                &pal,
+                x,
+                y + 10.0,
+                w,
+                "Source",
+                "Host filesystem",
+            );
+            if let Some(local) = local {
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y + 4.0,
+                    w,
+                    "Permissions",
+                    if local.readonly {
+                        "read-only"
+                    } else {
+                        "writable"
+                    },
+                );
+                if let Some(canonical) = &local.canonical_path
+                    && canonical != &local.path
+                {
+                    y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Canonical", canonical);
+                }
+            } else if let Some(error) = &files.details_error {
+                y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Reason", error);
+            } else if files.details_loading {
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y + 4.0,
+                    w,
+                    "Status",
+                    "Reading metadata",
+                );
+            }
+
+            if details_open {
+                y += 14.0;
+                let detail_heading =
+                    pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(x, y, w, 16.0),
+                    "TECHNICAL DETAILS",
+                    detail_heading,
+                );
+                y += 22.0;
+                if let Some(local) = local {
+                    y = self.info_row(ctx, &theme, &pal, x, y, w, "Kind", &local.kind);
+                    y = self.info_row(
+                        ctx,
+                        &theme,
+                        &pal,
+                        x,
+                        y + 4.0,
+                        w,
+                        "Accessed",
+                        &local_time_label(local.accessed_at_unix_nanos),
+                    );
+                    y = self.info_row(
+                        ctx,
+                        &theme,
+                        &pal,
+                        x,
+                        y + 4.0,
+                        w,
+                        "Modified",
+                        &local_time_label(local.modified_at_unix_nanos),
+                    );
+                    let _ = self.info_row(
+                        ctx,
+                        &theme,
+                        &pal,
+                        x,
+                        y + 4.0,
+                        w,
+                        "Created",
+                        &local_time_label(local.created_at_unix_nanos),
+                    );
+                }
+            }
+            return;
+        }
 
         // Placement section.
         y += 10.0;
@@ -4074,20 +4869,24 @@ fn files_action_dialog_signature(shared: &Shared) -> String {
 
 fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     let prompt = shared.files().action_prompt.clone()?;
+    let source = shared.files().source;
     let title = prompt.kind.title();
     let description = match prompt.kind {
-        FileActionPromptKind::GoTo => "Open a SIFS path, such as /services".to_string(),
+        FileActionPromptKind::GoTo => match source {
+            FilesSourceKind::Sifs => "Open a SIFS path, such as /services".to_string(),
+            FilesSourceKind::Local => "Open a local path, such as C:\\Users".to_string(),
+        },
         FileActionPromptKind::NewFile => format!("Create a file in {}", shared.files().path),
         FileActionPromptKind::NewFolder => format!("Create a folder in {}", shared.files().path),
         FileActionPromptKind::Copy => prompt
             .target_path
             .as_deref()
-            .map(|path| format!("Copy {path} to another SIFS path"))
+            .map(|path| format!("Copy {path} to another {} path", source.operation_scope()))
             .unwrap_or_else(|| "Select a file to copy".to_string()),
         FileActionPromptKind::Move => prompt
             .target_path
             .as_deref()
-            .map(|path| format!("Move {path} to another SIFS path"))
+            .map(|path| format!("Move {path} to another {} path", source.operation_scope()))
             .unwrap_or_else(|| "Select an item to move".to_string()),
         FileActionPromptKind::Rename => prompt
             .target_path
@@ -4392,6 +5191,19 @@ mod tests {
     use crate::backend::Backend;
     use crate::state::AppState;
 
+    fn files_test_temp_dir(name: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-app-files-{name}-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        root
+    }
+
     #[test]
     fn crumbs_start_at_root_and_split_on_segments() {
         let backend = Backend::local_fallback();
@@ -4533,6 +5345,137 @@ mod tests {
             state.selected_entry().map(|e| e.name.as_str()),
             Some("a.txt")
         );
+    }
+
+    #[test]
+    fn switch_source_lists_local_files_and_preserves_sifs_path() {
+        let root = files_test_temp_dir("source-switch");
+        fs::write(root.join("alpha.txt"), b"alpha").expect("write file");
+        fs::create_dir(root.join("nested")).expect("create nested dir");
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.path = "/services".to_string();
+        state.sifs_path = "/services".to_string();
+        state.local_path = root.to_string_lossy().into_owned();
+
+        state.switch_source(FilesSourceKind::Local, None);
+
+        assert_eq!(state.source, FilesSourceKind::Local);
+        assert_eq!(state.path, root.to_string_lossy());
+        assert!(state.error.is_none());
+        assert_eq!(state.node_id, local_node_label());
+        assert!(
+            state.entries.iter().any(|entry| {
+                entry.name == "alpha.txt" && !entry.is_dir && entry.size == Some(5)
+            })
+        );
+        assert!(
+            state
+                .entries
+                .iter()
+                .any(|entry| { entry.name == "nested" && entry.is_dir })
+        );
+        assert_eq!(files_source_status(&state), "Local files");
+
+        state.switch_source(FilesSourceKind::Sifs, None);
+        assert_eq!(state.source, FilesSourceKind::Sifs);
+        assert_eq!(state.path, "/services");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_copy_move_prompts_resolve_destination_paths() {
+        let root = files_test_temp_dir("local-destinations");
+        let absolute_target = root.join("elsewhere.txt");
+
+        assert_eq!(
+            resolve_local_destination_path(&root.to_string_lossy(), "archive/artifact.txt"),
+            Ok(root
+                .join("archive")
+                .join("artifact.txt")
+                .to_string_lossy()
+                .into_owned())
+        );
+        assert_eq!(
+            resolve_local_destination_path(
+                &root.to_string_lossy(),
+                &absolute_target.to_string_lossy()
+            ),
+            Ok(absolute_target.to_string_lossy().into_owned())
+        );
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.source = FilesSourceKind::Local;
+        state.path = root.to_string_lossy().into_owned();
+        state.entries = vec![SifsEntry {
+            name: "artifact.txt".to_string(),
+            path: root.join("artifact.txt").to_string_lossy().into_owned(),
+            is_dir: false,
+            is_link: false,
+            size: Some(5),
+        }];
+        state.selected = Some(0);
+
+        state.open_action_prompt(FileActionPromptKind::Copy);
+        let prompt = state.action_prompt.as_ref().expect("copy prompt").clone();
+        assert_eq!(prompt.input, "artifact copy.txt");
+        let (operation, _, _) = state
+            .operation_from_prompt(&prompt)
+            .expect("copy operation");
+        assert_eq!(operation.kind, FilesOperationKind::Copy);
+        let expected_target = root
+            .join("artifact copy.txt")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(operation.target.as_deref(), Some(expected_target.as_str()));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_result_updates_selected_local_details() {
+        let root = files_test_temp_dir("local-details");
+        let path = root.join("artifact.txt");
+        fs::write(&path, b"hello").expect("write file");
+        let path = path.to_string_lossy().into_owned();
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.source = FilesSourceKind::Local;
+        state.entries = vec![SifsEntry {
+            name: "artifact.txt".to_string(),
+            path: path.clone(),
+            is_dir: false,
+            is_link: false,
+            size: Some(5),
+        }];
+        state.selected = Some(0);
+        state.details_loading = true;
+        state.pending_details_request_id = Some(13);
+
+        let details = local_details(&path).expect("local details");
+        let changed = state.apply_worker_result(FilesWorkerResult::Details {
+            request_id: 13,
+            source: FilesSourceKind::Local,
+            path: path.clone(),
+            result: Ok(FilesObjectDetails::Local(details)),
+        });
+
+        assert!(changed);
+        assert!(!state.details_loading);
+        assert!(state.selected_details.is_none());
+        assert_eq!(
+            state
+                .selected_local_details
+                .as_ref()
+                .map(|details| details.kind.as_str()),
+            Some("file")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5008,6 +5951,7 @@ mod tests {
 
         let changed = state.apply_worker_result(FilesWorkerResult::List {
             request_id: 7,
+            source: FilesSourceKind::Sifs,
             path: "/services".to_string(),
             result: Ok(FilesListing {
                 node_id: "node-a".to_string(),
@@ -5046,6 +5990,7 @@ mod tests {
 
         let changed = state.apply_worker_result(FilesWorkerResult::List {
             request_id: 9,
+            source: FilesSourceKind::Sifs,
             path: "/".to_string(),
             result: Err("timed out".to_string()),
         });
@@ -5074,8 +6019,9 @@ mod tests {
 
         let changed = state.apply_worker_result(FilesWorkerResult::Details {
             request_id: 11,
+            source: FilesSourceKind::Sifs,
             path: "/services/artifact.txt".to_string(),
-            result: Ok(SifsObjectDetails {
+            result: Ok(FilesObjectDetails::Sifs(SifsObjectDetails {
                 file_system_id: "sifs".to_string(),
                 object_id: "obj_artifact".to_string(),
                 path: "/services/artifact.txt".to_string(),
@@ -5093,7 +6039,7 @@ mod tests {
                 changed_at_unix_nanos: 0,
                 policy: "replicated-eventual".to_string(),
                 current_locations: vec!["node-a".to_string(), "node-b".to_string()],
-            }),
+            })),
         });
 
         assert!(changed);
@@ -5211,8 +6157,13 @@ mod tests {
         assert_eq!(state.pending_request_id, Some(0));
         assert_eq!(state.list_revision, 1);
         match rx.try_recv().expect("refresh command") {
-            FilesWorkerCommand::List { request_id, path } => {
+            FilesWorkerCommand::List {
+                request_id,
+                source,
+                path,
+            } => {
                 assert_eq!(request_id, 0);
+                assert_eq!(source, FilesSourceKind::Sifs);
                 assert_eq!(path, "/services");
             }
             FilesWorkerCommand::Details { .. } => panic!("expected list command"),
