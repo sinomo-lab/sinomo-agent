@@ -700,7 +700,11 @@ fn overview_lines(
 
 fn cluster_warning_summary(warning: &str) -> &'static str {
     let lower = warning.to_ascii_lowercase();
-    if lower.contains("daemon health") || lower.contains("daemon") {
+    if lower.contains("daemon health")
+        || lower.contains("daemon")
+        || lower.contains("offline")
+        || lower.contains("health unknown")
+    {
         "Cluster health needs attention"
     } else if lower.contains("network") || lower.contains("connect") {
         "Cluster connectivity needs attention"

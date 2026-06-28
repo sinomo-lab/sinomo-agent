@@ -6,10 +6,14 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 pub use sinomo_cli::app_api::{AppClusterInvite, AppClusterStatus};
-use sinomo_runtime::core::{ClusterEndpointPrivacy, ClusterNodeAvailability};
+use sinomo_runtime::core::{
+    ClusterEndpointPrivacy, ClusterMemberRecord, ClusterMemberState, ClusterNodeAvailability,
+    ClusterNodeStatusRecord,
+};
 use sinomo_runtime::network::{
     self, ClusterConnectivityRecord, ClusterConnectivityState, ClusterHealthRow, ClusterPaths,
 };
+use sinomo_runtime::node::cluster_member_expected_daemon_process;
 use time::OffsetDateTime;
 
 use crate::backend::{Backend, Connection};
@@ -112,24 +116,34 @@ impl Backend {
             }
         };
 
-        let rows = match self.connection.daemon_address() {
-            Some(address) => match fetch_health_rows(address) {
-                Ok(rows) => {
-                    warnings.retain(|warning| !warning.starts_with("cluster state unavailable:"));
-                    rows
+        let rows = match state.as_ref() {
+            Some(state) => {
+                let cached_rows = rows_from_state(&paths, state, observed_at, &mut warnings);
+                match self.connection.daemon_address() {
+                    Some(address) => match fetch_local_health_rows(address) {
+                        Ok(live_rows) => merge_health_rows(cached_rows, live_rows),
+                        Err(error) => {
+                            warnings.push(format!("daemon health unavailable: {error}"));
+                            cached_rows
+                        }
+                    },
+                    None => cached_rows,
                 }
-                Err(error) => {
-                    warnings.push(format!("daemon health unavailable: {error}"));
-                    state
-                        .as_ref()
-                        .map(|state| rows_from_state(state, observed_at))
-                        .unwrap_or_default()
-                }
+            }
+            None => match self.connection.daemon_address() {
+                Some(address) => match fetch_local_health_rows(address) {
+                    Ok(rows) => {
+                        warnings
+                            .retain(|warning| !warning.starts_with("cluster state unavailable:"));
+                        rows
+                    }
+                    Err(error) => {
+                        warnings.push(format!("daemon health unavailable: {error}"));
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
             },
-            None => state
-                .as_ref()
-                .map(|state| rows_from_state(state, observed_at))
-                .unwrap_or_default(),
         };
 
         let connectivity = match network::read_cluster_connectivity_graph_from_kv(&paths) {
@@ -151,8 +165,8 @@ impl Backend {
     }
 }
 
-fn fetch_health_rows(address: &str) -> Result<Vec<ClusterHealthRow>, String> {
-    let request = network::cluster_health_rpc_request().map_err(|error| error.to_string())?;
+fn fetch_local_health_rows(address: &str) -> Result<Vec<ClusterHealthRow>, String> {
+    let request = network::cluster_local_health_rpc_request().map_err(|error| error.to_string())?;
     let response =
         sinomo_runtime::daemon::send_daemon_rpc(address, &request, CLUSTER_SNAPSHOT_RPC_TIMEOUT)
             .map_err(|error| error.to_string())?;
@@ -160,27 +174,63 @@ fn fetch_health_rows(address: &str) -> Result<Vec<ClusterHealthRow>, String> {
 }
 
 fn rows_from_state(
+    paths: &ClusterPaths,
     state: &sinomo_runtime::core::ClusterBootstrapState,
     observed_at: OffsetDateTime,
+    warnings: &mut Vec<String>,
 ) -> Vec<ClusterHealthRow> {
+    let cached_statuses = match network::read_cluster_node_statuses_from_kv(paths) {
+        Ok(statuses) => statuses,
+        Err(error) => {
+            warnings.push(format!("cluster node status cache unavailable: {error}"));
+            Vec::new()
+        }
+    };
     state
         .members
         .iter()
-        .filter(|member| {
-            !matches!(
-                member.state,
-                sinomo_runtime::core::ClusterMemberState::Removed
-            )
-        })
+        .filter(|member| !matches!(member.state, ClusterMemberState::Removed))
         .map(|member| {
-            let status = network::unknown_cluster_node_status(state, member, observed_at);
+            let status = cached_statuses
+                .iter()
+                .find(|status| status_matches_member(status, member))
+                .cloned()
+                .unwrap_or_else(|| {
+                    network::unknown_cluster_node_status(state, member, observed_at)
+                });
+            let availability = status.availability.clone();
             ClusterHealthRow {
                 member: member.clone(),
                 status,
-                availability: ClusterNodeAvailability::Unknown,
+                availability,
             }
         })
         .collect()
+}
+
+fn status_matches_member(status: &ClusterNodeStatusRecord, member: &ClusterMemberRecord) -> bool {
+    status.node_id == member.node_id
+        && cluster_member_expected_daemon_process(member)
+            .map(|process| status.process == process)
+            .unwrap_or(true)
+}
+
+fn merge_health_rows(
+    mut rows: Vec<ClusterHealthRow>,
+    live_rows: Vec<ClusterHealthRow>,
+) -> Vec<ClusterHealthRow> {
+    for live in live_rows {
+        if let Some(existing) = rows
+            .iter_mut()
+            .find(|row| status_matches_member(&live.status, &row.member))
+        {
+            *existing = live;
+        } else {
+            rows.push(live);
+        }
+    }
+    rows.sort_by(|left, right| left.member.node_id.cmp(&right.member.node_id));
+    rows
 }
 
 fn snapshot_from_parts(
@@ -307,6 +357,7 @@ fn snapshot_from_parts(
     if rows.is_empty() && state.is_none() {
         warnings.push("no cluster metadata was found for this data directory".to_string());
     }
+    push_cluster_health_warnings(rows, &mut warnings);
 
     ClusterSnapshot {
         cluster_id: state
@@ -318,6 +369,23 @@ fn snapshot_from_parts(
         nodes,
         links,
         warnings,
+    }
+}
+
+fn push_cluster_health_warnings(rows: &[ClusterHealthRow], warnings: &mut Vec<String>) {
+    let offline = rows
+        .iter()
+        .filter(|row| row.availability == ClusterNodeAvailability::Offline)
+        .count();
+    let unknown = rows
+        .iter()
+        .filter(|row| row.availability == ClusterNodeAvailability::Unknown)
+        .count();
+    if offline > 0 {
+        warnings.push(format!("{offline} cluster node(s) offline"));
+    }
+    if unknown > 0 {
+        warnings.push(format!("{unknown} cluster node(s) health unknown"));
     }
 }
 
@@ -399,5 +467,100 @@ fn is_public_ip(ip: IpAddr) -> bool {
                 || ip.is_unicast_link_local()
                 || ip.is_multicast())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_runtime::core::{ClusterMemberRecord, Id};
+
+    fn id(name: &str) -> Id {
+        Id::from_legacy_named(name).expect("test id")
+    }
+
+    fn member(cluster_id: &Id, node_id: &Id, name: &str) -> ClusterMemberRecord {
+        ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            node_id.clone(),
+            name,
+            format!("{name}-key"),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+    }
+
+    fn row(
+        member: ClusterMemberRecord,
+        availability: ClusterNodeAvailability,
+        commit: &str,
+        pid: u32,
+    ) -> ClusterHealthRow {
+        ClusterHealthRow {
+            status: ClusterNodeStatusRecord {
+                cluster_id: member.cluster_id.clone(),
+                node_id: member.node_id.clone(),
+                process: "daemon-main".to_string(),
+                availability: availability.clone(),
+                daemon_version: "0.1.0".to_string(),
+                commit: Some(commit.to_string()),
+                target_os: Some("windows".to_string()),
+                target_arch: Some("x86_64".to_string()),
+                pid: Some(pid),
+                address: Some("127.0.0.1:21353".to_string()),
+                bind_address: None,
+                executable: None,
+                rollout: None,
+                daemon_started_at: None,
+                observed_at: OffsetDateTime::UNIX_EPOCH,
+            },
+            member,
+            availability,
+        }
+    }
+
+    #[test]
+    fn merge_health_rows_prefers_live_row_over_cached_row() {
+        let cluster_id = id("cluster_app_health_merge");
+        let node_id = id("node_app_health_merge");
+        let member = member(&cluster_id, &node_id, "local");
+
+        let cached = row(
+            member.clone(),
+            ClusterNodeAvailability::Offline,
+            "cached",
+            10,
+        );
+        let live = row(member, ClusterNodeAvailability::Online, "live", 20);
+        let merged = merge_health_rows(vec![cached], vec![live]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].availability, ClusterNodeAvailability::Online);
+        assert_eq!(merged[0].status.commit.as_deref(), Some("live"));
+        assert_eq!(merged[0].status.pid, Some(20));
+    }
+
+    #[test]
+    fn snapshot_warns_for_cached_offline_health() {
+        let cluster_id = id("cluster_app_health_warning");
+        let node_id = id("node_app_health_warning");
+        let member = member(&cluster_id, &node_id, "remote");
+        let rows = vec![row(member, ClusterNodeAvailability::Offline, "cached", 10)];
+
+        let snapshot = snapshot_from_parts(
+            None,
+            &rows,
+            &[],
+            "daemon 127.0.0.1:21353".to_string(),
+            OffsetDateTime::UNIX_EPOCH,
+            Vec::new(),
+        );
+
+        assert_eq!(snapshot.nodes[0].availability, "offline");
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning == "1 cluster node(s) offline")
+        );
     }
 }
