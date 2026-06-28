@@ -25,6 +25,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -168,12 +169,13 @@ impl FilesTaskState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct FilesTask {
     id: u64,
     title: String,
     detail: String,
     state: FilesTaskState,
+    progress: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -638,6 +640,11 @@ impl FilesState {
                 }
                 true
             }
+            FilesWorkerResult::TaskProgress {
+                request_id,
+                detail,
+                progress,
+            } => self.update_task_progress(request_id, detail, progress),
             FilesWorkerResult::Operation { request_id, result } => {
                 self.apply_operation_result(request_id, result)
             }
@@ -1005,6 +1012,7 @@ impl FilesState {
                 title,
                 detail,
                 state: FilesTaskState::Running,
+                progress: Some(0.02),
             },
         );
         self.trim_tasks();
@@ -1098,8 +1106,28 @@ impl FilesState {
         if let Some(task) = self.tasks.iter_mut().find(|task| task.id == task_id) {
             task.state = state;
             task.detail = detail;
+            task.progress = Some(1.0);
         }
         self.trim_tasks();
+    }
+
+    fn update_task_progress(
+        &mut self,
+        task_id: u64,
+        detail: String,
+        progress: Option<f32>,
+    ) -> bool {
+        let Some(task) = self.tasks.iter_mut().find(|task| task.id == task_id) else {
+            return false;
+        };
+        if task.state != FilesTaskState::Running {
+            return false;
+        }
+        task.detail = detail;
+        if let Some(progress) = progress {
+            task.progress = Some(progress.clamp(0.0, 0.98));
+        }
+        true
     }
 
     fn trim_tasks(&mut self) {
@@ -1191,6 +1219,11 @@ enum FilesWorkerResult {
         path: String,
         result: Result<FilesObjectDetails, String>,
     },
+    TaskProgress {
+        request_id: u64,
+        detail: String,
+        progress: Option<f32>,
+    },
     Operation {
         request_id: u64,
         result: FilesOperationResult,
@@ -1213,6 +1246,28 @@ enum FilesWorkerCommand {
         source: FilesSourceKind,
         operation: FilesOperation,
     },
+}
+
+struct FilesOperationProgress<'a> {
+    request_id: u64,
+    result_tx: &'a Sender<FilesWorkerResult>,
+    cancellations: &'a Arc<Mutex<BTreeSet<u64>>>,
+    waker: &'a sui::UiHandle,
+}
+
+impl FilesOperationProgress<'_> {
+    fn report(&self, detail: impl Into<String>, progress: Option<f32>) {
+        let _ = self.result_tx.send(FilesWorkerResult::TaskProgress {
+            request_id: self.request_id,
+            detail: detail.into(),
+            progress,
+        });
+        self.waker.wake();
+    }
+
+    fn cancelled(&self) -> bool {
+        operation_cancelled(self.cancellations, self.request_id)
+    }
 }
 
 fn files_worker_loop(
@@ -1365,18 +1420,37 @@ fn files_worker_loop(
                 source,
                 operation,
             } => {
+                send_task_progress(
+                    &result_tx,
+                    &waker,
+                    request_id,
+                    operation_progress_label(source, &operation, "Preparing"),
+                    Some(0.05),
+                );
                 let current_path = operation_parent_path(source, &operation.path);
                 let result = if operation_cancelled(&cancellations, request_id) {
                     Err(FilesOperationFailure::Cancelled(
                         files_operation_cancelled_detail(&operation),
                     ))
                 } else if source == FilesSourceKind::Local {
-                    execute_local_operation(operation, &current_path)
-                        .map_err(FilesOperationFailure::Error)
+                    let progress = FilesOperationProgress {
+                        request_id,
+                        result_tx: &result_tx,
+                        cancellations: &cancellations,
+                        waker: &waker,
+                    };
+                    execute_local_operation_with_progress(operation, &current_path, Some(&progress))
                 } else if let Some(error) = &open_error {
                     Err(FilesOperationFailure::Error(error.clone()))
                 } else {
                     if browser.is_none() {
+                        send_task_progress(
+                            &result_tx,
+                            &waker,
+                            request_id,
+                            "Opening SIFS connection".to_string(),
+                            Some(0.12),
+                        );
                         match daemon_address.as_deref() {
                             Some(address) => {
                                 match SifsBrowser::open_daemon_on_runtime(address, &app_runtime) {
@@ -1393,6 +1467,13 @@ fn files_worker_loop(
                     }
                     match (&browser, &open_error) {
                         (Some(browser), _) => {
+                            send_task_progress(
+                                &result_tx,
+                                &waker,
+                                request_id,
+                                operation_progress_label(source, &operation, "Running"),
+                                Some(0.35),
+                            );
                             execute_sifs_operation(browser, operation, &current_path)
                                 .map_err(FilesOperationFailure::Error)
                         }
@@ -1408,6 +1489,21 @@ fn files_worker_loop(
         }
         waker.wake();
     }
+}
+
+fn send_task_progress(
+    result_tx: &Sender<FilesWorkerResult>,
+    waker: &sui::UiHandle,
+    request_id: u64,
+    detail: String,
+    progress: Option<f32>,
+) {
+    let _ = result_tx.send(FilesWorkerResult::TaskProgress {
+        request_id,
+        detail,
+        progress,
+    });
+    waker.wake();
 }
 
 fn mark_cancelled_operation(cancellations: &Arc<Mutex<BTreeSet<u64>>>, request_id: u64) {
@@ -1864,13 +1960,34 @@ fn execute_local_operation(
     operation: FilesOperation,
     current_path: &str,
 ) -> Result<FilesOperationOutcome, String> {
+    execute_local_operation_with_progress(operation, current_path, None)
+        .map_err(files_operation_failure_detail)
+}
+
+fn execute_local_operation_with_progress(
+    operation: FilesOperation,
+    current_path: &str,
+    progress: Option<&FilesOperationProgress<'_>>,
+) -> FilesOperationResult {
+    if let Some(progress) = progress
+        && progress.cancelled()
+    {
+        return Err(FilesOperationFailure::Cancelled(
+            files_operation_cancelled_detail(&operation),
+        ));
+    }
     match operation.kind {
         FilesOperationKind::CreateFile => {
             fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&operation.path)
-                .map_err(|error| format!("cannot create file {}: {error}", operation.path))?;
+                .map_err(|error| {
+                    FilesOperationFailure::Error(format!(
+                        "cannot create file {}: {error}",
+                        operation.path
+                    ))
+                })?;
             Ok(FilesOperationOutcome {
                 refresh_path: current_path.to_string(),
                 select_path: Some(operation.path.clone()),
@@ -1878,8 +1995,12 @@ fn execute_local_operation(
             })
         }
         FilesOperationKind::CreateFolder => {
-            fs::create_dir(&operation.path)
-                .map_err(|error| format!("cannot create folder {}: {error}", operation.path))?;
+            fs::create_dir(&operation.path).map_err(|error| {
+                FilesOperationFailure::Error(format!(
+                    "cannot create folder {}: {error}",
+                    operation.path
+                ))
+            })?;
             Ok(FilesOperationOutcome {
                 refresh_path: current_path.to_string(),
                 select_path: Some(operation.path.clone()),
@@ -1888,21 +2009,14 @@ fn execute_local_operation(
         }
         FilesOperationKind::Copy => {
             if operation.directory {
-                return Err("folder copy is not available yet".to_string());
+                return Err(FilesOperationFailure::Error(
+                    "folder copy is not available yet".to_string(),
+                ));
             }
-            let target = operation
-                .target
-                .clone()
-                .ok_or_else(|| "copy target is missing".to_string())?;
-            let mut source = fs::File::open(&operation.path)
-                .map_err(|error| format!("cannot open {}: {error}", operation.path))?;
-            let mut target_file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&target)
-                .map_err(|error| format!("cannot create {target}: {error}"))?;
-            std::io::copy(&mut source, &mut target_file)
-                .map_err(|error| format!("cannot copy {} to {target}: {error}", operation.path))?;
+            let target = operation.target.clone().ok_or_else(|| {
+                FilesOperationFailure::Error("copy target is missing".to_string())
+            })?;
+            copy_local_file_with_progress(&operation.path, &target, progress)?;
             Ok(FilesOperationOutcome {
                 refresh_path: parent_local_path(&target)
                     .unwrap_or_else(|| current_path.to_string()),
@@ -1911,12 +2025,15 @@ fn execute_local_operation(
             })
         }
         FilesOperationKind::Move | FilesOperationKind::Rename => {
-            let target = operation
-                .target
-                .clone()
-                .ok_or_else(|| "target path is missing".to_string())?;
-            fs::rename(&operation.path, &target)
-                .map_err(|error| format!("cannot move {} to {target}: {error}", operation.path))?;
+            let target = operation.target.clone().ok_or_else(|| {
+                FilesOperationFailure::Error("target path is missing".to_string())
+            })?;
+            fs::rename(&operation.path, &target).map_err(|error| {
+                FilesOperationFailure::Error(format!(
+                    "cannot move {} to {target}: {error}",
+                    operation.path
+                ))
+            })?;
             let action = if operation.kind == FilesOperationKind::Rename {
                 "renamed"
             } else {
@@ -1932,14 +2049,18 @@ fn execute_local_operation(
         FilesOperationKind::Delete => {
             if operation.directory {
                 fs::remove_dir(&operation.path).map_err(|error| {
-                    format!(
+                    FilesOperationFailure::Error(format!(
                         "cannot delete folder {}: {error}; only empty folders can be deleted",
                         operation.path
-                    )
+                    ))
                 })?;
             } else {
-                fs::remove_file(&operation.path)
-                    .map_err(|error| format!("cannot delete file {}: {error}", operation.path))?;
+                fs::remove_file(&operation.path).map_err(|error| {
+                    FilesOperationFailure::Error(format!(
+                        "cannot delete file {}: {error}",
+                        operation.path
+                    ))
+                })?;
             }
             Ok(FilesOperationOutcome {
                 refresh_path: current_path.to_string(),
@@ -1947,9 +2068,97 @@ fn execute_local_operation(
                 message: format!("deleted {}", operation.path),
             })
         }
-        FilesOperationKind::RefreshPlacement => {
-            Err("placement refresh is only available for SIFS".to_string())
+        FilesOperationKind::RefreshPlacement => Err(FilesOperationFailure::Error(
+            "placement refresh is only available for SIFS".to_string(),
+        )),
+    }
+}
+
+fn copy_local_file_with_progress(
+    source_path: &str,
+    target_path: &str,
+    progress: Option<&FilesOperationProgress<'_>>,
+) -> Result<(), FilesOperationFailure> {
+    let mut source = fs::File::open(source_path).map_err(|error| {
+        FilesOperationFailure::Error(format!("cannot open {source_path}: {error}"))
+    })?;
+    let total_bytes = source.metadata().ok().map(|metadata| metadata.len());
+    let mut target_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target_path)
+        .map_err(|error| {
+            FilesOperationFailure::Error(format!("cannot create {target_path}: {error}"))
+        })?;
+
+    if let Some(progress) = progress {
+        progress.report(
+            format!(
+                "Copying {} to {target_path}",
+                total_bytes
+                    .map_or_else(|| source_path.to_string(), |bytes| human_size(Some(bytes)))
+            ),
+            Some(0.08),
+        );
+    }
+
+    const BUFFER_SIZE: usize = 1024 * 1024;
+    const REPORT_STEP: u64 = 4 * 1024 * 1024;
+    let mut buffer = vec![0_u8; BUFFER_SIZE];
+    let mut copied = 0_u64;
+    let mut next_report = REPORT_STEP;
+
+    loop {
+        if let Some(progress) = progress
+            && progress.cancelled()
+        {
+            drop(target_file);
+            let _ = fs::remove_file(target_path);
+            return Err(FilesOperationFailure::Cancelled(format!(
+                "cancelled after copying {} to {target_path}",
+                human_size(Some(copied))
+            )));
         }
+
+        let read = source.read(&mut buffer).map_err(|error| {
+            FilesOperationFailure::Error(format!("cannot read {source_path}: {error}"))
+        })?;
+        if read == 0 {
+            break;
+        }
+        target_file.write_all(&buffer[..read]).map_err(|error| {
+            FilesOperationFailure::Error(format!("cannot write {target_path}: {error}"))
+        })?;
+        copied += read as u64;
+
+        if let Some(progress) = progress
+            && (copied >= next_report || total_bytes.is_some_and(|total| copied >= total))
+        {
+            let fraction = total_bytes
+                .filter(|total| *total > 0)
+                .map(|total| 0.08 + 0.86 * (copied as f32 / total as f32));
+            let detail = match total_bytes {
+                Some(total) => format!(
+                    "Copied {} of {} to {target_path}",
+                    human_size(Some(copied)),
+                    human_size(Some(total))
+                ),
+                None => format!("Copied {} to {target_path}", human_size(Some(copied))),
+            };
+            progress.report(detail, fraction);
+            next_report = copied.saturating_add(REPORT_STEP);
+        }
+    }
+
+    target_file.flush().map_err(|error| {
+        FilesOperationFailure::Error(format!("cannot finalize {target_path}: {error}"))
+    })?;
+    Ok(())
+}
+
+fn files_operation_failure_detail(failure: FilesOperationFailure) -> String {
+    match failure {
+        FilesOperationFailure::Cancelled(detail) | FilesOperationFailure::Error(detail) => detail,
     }
 }
 
@@ -1976,6 +2185,35 @@ fn files_operation_cancelled_detail(operation: &FilesOperation) -> String {
                 "cancelled before refreshing placement for {}",
                 operation.path
             )
+        }
+    }
+}
+
+fn operation_progress_label(
+    source: FilesSourceKind,
+    operation: &FilesOperation,
+    phase: &str,
+) -> String {
+    let scope = source.operation_scope();
+    match operation.kind {
+        FilesOperationKind::CreateFile | FilesOperationKind::CreateFolder => {
+            format!("{phase} create in {scope}: {}", operation.path)
+        }
+        FilesOperationKind::Copy => {
+            let target = operation.target.as_deref().unwrap_or("target");
+            format!("{phase} copy in {scope}: {} -> {target}", operation.path)
+        }
+        FilesOperationKind::Move => {
+            let target = operation.target.as_deref().unwrap_or("target");
+            format!("{phase} move in {scope}: {} -> {target}", operation.path)
+        }
+        FilesOperationKind::Rename => {
+            let target = operation.target.as_deref().unwrap_or("target");
+            format!("{phase} rename in {scope}: {} -> {target}", operation.path)
+        }
+        FilesOperationKind::Delete => format!("{phase} delete in {scope}: {}", operation.path),
+        FilesOperationKind::RefreshPlacement => {
+            format!("{phase} placement refresh in {scope}: {}", operation.path)
         }
     }
 }
@@ -3490,7 +3728,7 @@ impl Widget for FilesTaskStrip {
             );
             if bar.width() > 0.0 {
                 widgets::fill_round_rect(ctx, bar, pal.field, 1.5);
-                let fraction = task_progress_fraction(task.state);
+                let fraction = task_progress_fraction(task);
                 widgets::fill_round_rect(
                     ctx,
                     Rect::new(bar.x(), bar.y(), bar.width() * fraction, bar.height()),
@@ -3543,8 +3781,11 @@ impl Widget for FilesTaskStrip {
     }
 }
 
-fn task_progress_fraction(state: FilesTaskState) -> f32 {
-    match state {
+fn task_progress_fraction(task: &FilesTask) -> f32 {
+    if let Some(progress) = task.progress {
+        return progress.clamp(0.0, 1.0);
+    }
+    match task.state {
         FilesTaskState::Running => 0.45,
         FilesTaskState::CancelRequested => 0.75,
         FilesTaskState::Cancelled | FilesTaskState::Completed | FilesTaskState::Failed => 1.0,
@@ -4660,6 +4901,22 @@ impl InspectorView {
                 &middle_short(&task.detail, 42),
                 detail_style.clone(),
             );
+            let tone = match task.state {
+                FilesTaskState::Running | FilesTaskState::CancelRequested => pal.accent,
+                FilesTaskState::Completed | FilesTaskState::Cancelled => pal.good,
+                FilesTaskState::Failed => pal.warn,
+            };
+            let bar = Rect::new(panel.x() + 12.0, y + 26.0, text_w.min(180.0), 2.0);
+            if bar.width() > 0.0 {
+                widgets::fill_round_rect(ctx, bar, pal.field, 1.0);
+                let fraction = task_progress_fraction(task);
+                widgets::fill_round_rect(
+                    ctx,
+                    Rect::new(bar.x(), bar.y(), bar.width() * fraction, bar.height()),
+                    tone,
+                    1.0,
+                );
+            }
             if task.state.can_cancel() {
                 widgets::round_panel(ctx, cancel, pal.field, pal.border, 7.0);
                 widgets::draw_text_in(
@@ -5658,6 +5915,35 @@ mod tests {
     }
 
     #[test]
+    fn local_copy_operation_writes_destination_file() {
+        let root = files_test_temp_dir("local-copy-operation");
+        let source = root.join("artifact.bin");
+        let target = root.join("artifact copy.bin");
+        let bytes = vec![7_u8; 1024 * 1024 + 17];
+        fs::write(&source, &bytes).expect("write source");
+
+        let outcome = execute_local_operation(
+            FilesOperation {
+                kind: FilesOperationKind::Copy,
+                path: source.to_string_lossy().into_owned(),
+                target: Some(target.to_string_lossy().into_owned()),
+                directory: false,
+            },
+            &root.to_string_lossy(),
+        )
+        .expect("copy operation");
+
+        assert_eq!(fs::read(&target).expect("read copied file"), bytes);
+        assert_eq!(
+            outcome.select_path.as_deref(),
+            Some(target.to_string_lossy().as_ref())
+        );
+        assert_eq!(outcome.refresh_path, root.to_string_lossy().into_owned());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn worker_result_updates_selected_local_details() {
         let root = files_test_temp_dir("local-details");
         let path = root.join("artifact.txt");
@@ -6107,6 +6393,7 @@ mod tests {
             title: "Delete".to_string(),
             detail: "/cluster-tests/artifact.txt".to_string(),
             state: FilesTaskState::Running,
+            progress: Some(0.35),
         }];
 
         assert_eq!(
@@ -6277,6 +6564,41 @@ mod tests {
     }
 
     #[test]
+    fn worker_progress_updates_running_task_detail_and_fraction() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.tasks = vec![FilesTask {
+            id: 21,
+            title: "Copy".to_string(),
+            detail: "queued".to_string(),
+            state: FilesTaskState::Running,
+            progress: Some(0.02),
+        }];
+
+        let changed = state.apply_worker_result(FilesWorkerResult::TaskProgress {
+            request_id: 21,
+            detail: "Copied 4.0 MB of 8.0 MB".to_string(),
+            progress: Some(0.51),
+        });
+
+        assert!(changed);
+        assert_eq!(state.tasks[0].detail, "Copied 4.0 MB of 8.0 MB");
+        assert_eq!(state.tasks[0].progress, Some(0.51));
+        assert_eq!(task_progress_fraction(&state.tasks[0]), 0.51);
+
+        state.tasks[0].state = FilesTaskState::CancelRequested;
+        let changed = state.apply_worker_result(FilesWorkerResult::TaskProgress {
+            request_id: 21,
+            detail: "late progress".to_string(),
+            progress: Some(0.9),
+        });
+
+        assert!(!changed);
+        assert_eq!(state.tasks[0].detail, "Copied 4.0 MB of 8.0 MB");
+        assert_eq!(state.tasks[0].progress, Some(0.51));
+    }
+
+    #[test]
     fn cancelled_operation_result_marks_task_cancelled() {
         let backend = Backend::local_fallback();
         let mut state = FilesState::new(&backend);
@@ -6288,6 +6610,7 @@ mod tests {
             title: "Delete".to_string(),
             detail: "/services/artifact.txt".to_string(),
             state: FilesTaskState::CancelRequested,
+            progress: Some(0.75),
         }];
         mark_cancelled_operation(&state.worker_cancellations, 12);
 
@@ -6984,6 +7307,7 @@ mod tests {
                 title: "Delete".to_string(),
                 detail: "/artifact.txt".to_string(),
                 state: FilesTaskState::Running,
+                progress: Some(0.35),
             }];
         }
 
