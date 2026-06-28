@@ -514,6 +514,12 @@ struct ChannelAgentRef {
     pending_store: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ChannelAgentsStoreStatus {
+    Saving,
+    Failed(String),
+}
+
 /// State backing the chat tab.
 pub struct ChatState {
     pub data_dir: Arc<SinomoDataDir>,
@@ -4512,7 +4518,7 @@ fn sidebar_signature(
 }
 
 fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
-    let (session, draft, confirming_delete, participants, agent_keys, agent_options) = {
+    let (session, draft, confirming_delete, participants, agent_status, agent_keys, agent_options) = {
         let chat = shared.chat();
         let edit_id = chat.session_edit_id.as_deref()?;
         let session = chat
@@ -4528,6 +4534,11 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         if session.kind == ConversationKind::Channel && participants.is_empty() {
             participants = ChatState::fallback_channel_agent_refs(&session, &chat.agents);
         }
+        let agent_status = channel_agents_store_status(
+            &participants,
+            chat.channel_create_rx.is_some(),
+            chat.notice.as_deref(),
+        );
         let agent_keys = chat
             .agents
             .iter()
@@ -4543,6 +4554,7 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             chat.session_title_draft.clone(),
             chat.session_delete_confirm_id.as_deref() == Some(edit_id),
             participants,
+            agent_status,
             agent_keys,
             agent_options,
         )
@@ -4619,6 +4631,7 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 reader,
                 session_id.clone(),
                 participants,
+                agent_status,
                 agent_keys,
                 agent_options,
             ));
@@ -4716,11 +4729,37 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     ))
 }
 
+fn channel_agents_store_status(
+    participants: &[ChannelAgentRef],
+    creating_channel: bool,
+    notice: Option<&str>,
+) -> Option<ChannelAgentsStoreStatus> {
+    if !participants
+        .iter()
+        .any(|participant| participant.pending_store)
+    {
+        return None;
+    }
+    let notice = notice.unwrap_or_default();
+    let lower = notice.to_ascii_lowercase();
+    if lower.contains("channel create failed") || lower.contains("channel config failed") {
+        return Some(ChannelAgentsStoreStatus::Failed(notice.to_string()));
+    }
+    if creating_channel {
+        Some(ChannelAgentsStoreStatus::Saving)
+    } else {
+        Some(ChannelAgentsStoreStatus::Failed(
+            "channel membership has not reached SIFS yet".to_string(),
+        ))
+    }
+}
+
 fn channel_agents_editor(
     shared: &Shared,
     reader: &ThemeReader,
     channel_id: String,
     participants: Vec<ChannelAgentRef>,
+    agent_status: Option<ChannelAgentsStoreStatus>,
     agent_keys: Vec<String>,
     agent_options: Vec<String>,
 ) -> impl Widget + use<> {
@@ -4753,13 +4792,23 @@ fn channel_agents_editor(
                 format!("{} ({})", participant.agent_name, participant.agent_key)
             };
             let label = if participant.pending_store {
-                format!("{base_label} (saving)")
+                let suffix = match agent_status.as_ref() {
+                    Some(ChannelAgentsStoreStatus::Failed(_)) => "not saved",
+                    _ => "saving",
+                };
+                format!("{base_label} ({suffix})")
             } else {
                 base_label
             };
             let remove_label = label.clone();
             let action = if participant.pending_store {
-                IconButton::new(IconGlyph::Alert, format!("Waiting for {remove_label}"))
+                let action_label = match agent_status.as_ref() {
+                    Some(ChannelAgentsStoreStatus::Failed(_)) => {
+                        format!("Connection needed for {remove_label}")
+                    }
+                    _ => format!("Waiting for {remove_label}"),
+                };
+                IconButton::new(IconGlyph::Alert, action_label)
                     .size(26.0)
                     .icon_size(14.0)
                     .enabled(false)
@@ -4778,6 +4827,40 @@ fn channel_agents_editor(
                     })
             };
             list = list.with_child(ChannelAgentRow::new(shared.clone(), label, action));
+        }
+    }
+
+    if let Some(agent_status) = agent_status {
+        match agent_status {
+            ChannelAgentsStoreStatus::Saving => {
+                list = list.with_child(muted_label(shared, "Saving channel membership to SIFS..."));
+            }
+            ChannelAgentsStoreStatus::Failed(detail) => {
+                let settings = {
+                    let s = shared.clone();
+                    sui::Button::new("Connection settings")
+                        .icon(IconGlyph::Alert)
+                        .theme_when(secondary_button_theme(reader))
+                        .on_press(move || open_settings_section(&s, SettingsSection::Connection))
+                };
+                list = list
+                    .with_child(muted_label(
+                        shared,
+                        "Channel membership is not saved. Connection settings has recovery detail.",
+                    ))
+                    .with_child(
+                        Flex::horizontal()
+                            .gap(6.0)
+                            .align_items(Alignment::Center)
+                            .with_child(settings)
+                            .spacer()
+                            .with_child(muted_label(
+                                shared,
+                                connection_recovery_display_detail(&detail)
+                                    .unwrap_or_else(|| "SIFS needs attention.".to_string()),
+                            )),
+                    );
+            }
         }
     }
 
@@ -5196,13 +5279,15 @@ fn session_edit_dialog_signature(shared: &Shared) -> String {
         .collect::<Vec<_>>()
         .join("\u{1f}");
     format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}",
         edit_id,
         chat.session_delete_confirm_id
             .as_deref()
             .unwrap_or_default(),
         chat.channel_agent_idx,
         chat.agents.len(),
+        chat.channel_create_rx.is_some(),
+        chat.notice.as_deref().unwrap_or_default(),
         sessions
     )
 }
@@ -9067,6 +9152,7 @@ mod tests {
         {
             let mut chat = shared.chat_mut();
             seed_test_agents(&mut chat);
+            let (_tx, rx) = mpsc::channel();
             chat.sessions = vec![SessionRef {
                 id: channel_id.clone(),
                 title: "Pending channel".to_string(),
@@ -9079,6 +9165,7 @@ mod tests {
             chat.session_edit_id = Some(channel_id);
             chat.session_title_draft = "Pending channel".to_string();
             chat.channel_agent_idx = 0;
+            chat.channel_create_rx = Some(rx);
             chat.models_loading = false;
         }
 
@@ -9111,6 +9198,69 @@ mod tests {
                 .iter()
                 .all(|node| node.name.as_deref() != Some("No agents assigned yet.")),
             "pending session participants should not look like an empty channel"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_channel_edit_dialog_surfaces_failed_pending_agents() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let channel_id = SessionId::generate().to_string();
+        {
+            let mut chat = shared.chat_mut();
+            seed_test_agents(&mut chat);
+            chat.sessions = vec![SessionRef {
+                id: channel_id.clone(),
+                title: "Blocked channel".to_string(),
+                kind: ConversationKind::Channel,
+                updated_unix: 1,
+                participant_count: 1,
+                participant_names: vec!["main-agent".to_string()],
+            }];
+            chat.session_id = channel_id.clone();
+            chat.session_edit_id = Some(channel_id);
+            chat.session_title_draft = "Blocked channel".to_string();
+            chat.channel_agent_idx = 0;
+            chat.notice =
+                Some("channel create failed: device authorization was denied".to_string());
+            chat.models_loading = false;
+        }
+
+        let runtime = crate::build_runtime(shared.clone())?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+
+        let snapshot = window.snapshot()?;
+        assert!(
+            snapshot.accessibility.nodes.iter().any(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("Connection needed for main-agent (not saved)")
+                    && node.state.disabled
+            }),
+            "failed pending agents should render as a blocked storage state"
+        );
+        assert!(
+            snapshot.accessibility.nodes.iter().any(|node| {
+                node.name.as_deref()
+                    == Some(
+                        "Channel membership is not saved. Connection settings has recovery detail.",
+                    )
+            }),
+            "failed pending agents should explain the recovery path"
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Connection settings")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
         );
 
         Ok(())
