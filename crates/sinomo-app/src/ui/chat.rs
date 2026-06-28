@@ -3236,6 +3236,25 @@ fn activity_work_summary(chat: &ChatState) -> String {
     parts.join(" · ")
 }
 
+fn activity_button_label(chat: &ChatState) -> &'static str {
+    match chat.runtime_health().tone {
+        ActivityTone::Bad | ActivityTone::Warn => "Review",
+        ActivityTone::Running => "Monitor",
+        ActivityTone::Good | ActivityTone::Neutral => "Details",
+    }
+}
+
+fn activity_button_description(chat: &ChatState) -> String {
+    let health = chat.runtime_health();
+    let status = activity_status_summary(&health.detail);
+    format!(
+        "Show or hide runtime details. {}: {}. {}",
+        health.label,
+        compact_line(&status, 72),
+        activity_work_summary(chat)
+    )
+}
+
 fn usage_summary(chat: &ChatState) -> Option<String> {
     chat.usage.as_ref().map(|usage| {
         let output = usage
@@ -4902,11 +4921,13 @@ impl Widget for RuntimeOverview {
         let chip = Self::health_chip_rect(bounds);
         let activity_button = Self::activity_button_rect(bounds);
         if let Some(button) = activity_button {
+            let activity_label = activity_button_label(&chat);
             draw_activity_overview_button(
                 ctx,
                 &pal,
                 &theme,
                 button,
+                activity_label,
                 chat.activity_panel_visible(),
                 chat.activity_panel_needs_attention(),
                 self.activity_hovered.get(),
@@ -5000,8 +5021,8 @@ impl Widget for RuntimeOverview {
             rect,
         );
         node.parent = Some(ctx.widget_id());
-        node.name = Some("Activity".to_string());
-        node.description = Some("Show or hide runtime activity".to_string());
+        node.name = Some(activity_button_label(&chat).to_string());
+        node.description = Some(activity_button_description(&chat));
         node.actions = vec![SemanticsAction::Activate];
         node.state.hovered = self.activity_hovered.get();
         node.state.selected = chat.activity_panel_visible();
@@ -5037,6 +5058,7 @@ fn draw_activity_overview_button(
     pal: &Palette,
     theme: &DefaultTheme,
     rect: Rect,
+    label: &str,
     active: bool,
     attention: bool,
     hovered: bool,
@@ -5073,7 +5095,7 @@ fn draw_activity_overview_button(
     widgets::draw_text_in(
         ctx,
         Rect::new(rect.x() + 22.0, rect.y() + 2.0, rect.width() - 26.0, 16.0),
-        "Activity",
+        label,
         pal.text_style(theme, 10.0, FontWeight::SEMIBOLD, color),
     );
 }
@@ -9160,7 +9182,7 @@ mod tests {
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Activity")
+            .with_name("Details")
             .click()?;
         assert!(
             shared.chat().activity_panel_visible(),
@@ -9169,7 +9191,7 @@ mod tests {
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Activity")
+            .with_name("Details")
             .click()?;
         assert!(
             !shared.chat().activity_panel_visible(),
@@ -9177,6 +9199,37 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn activity_button_label_tracks_runtime_state() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.info.provider = "openai".to_string();
+        state.info.model = "gpt-5".to_string();
+        state.models_loading = false;
+
+        assert_eq!(activity_button_label(&state), "Details");
+        assert!(
+            activity_button_description(&state).contains("READY"),
+            "quiet runtime description should include the readiness state"
+        );
+
+        state.streaming = true;
+        assert_eq!(activity_button_label(&state), "Monitor");
+        state.streaming = false;
+
+        state.push_activity(
+            "chat list",
+            "device authorization was denied",
+            ActivityTone::Warn,
+        );
+        assert_eq!(activity_button_label(&state), "Review");
+        assert!(
+            activity_button_description(&state).contains("Chat history needs recovery"),
+            "warning description should use the user-facing recovery summary"
+        );
     }
 
     #[test]
