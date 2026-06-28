@@ -282,6 +282,7 @@ enum ChatQuickAction {
     PlanChange,
     CheckCluster,
     ReviewRepo,
+    ManageChannel,
 }
 
 impl RecoveryCardAction {
@@ -314,27 +315,30 @@ impl RecoveryCardAction {
 }
 
 impl ChatQuickAction {
-    const ALL: [Self; 3] = [Self::PlanChange, Self::CheckCluster, Self::ReviewRepo];
+    const CHAT: [Self; 3] = [Self::PlanChange, Self::CheckCluster, Self::ReviewRepo];
+    const CHANNEL: [Self; 3] = [Self::ManageChannel, Self::PlanChange, Self::CheckCluster];
 
     fn label(self) -> &'static str {
         match self {
             Self::PlanChange => "Plan a change",
             Self::CheckCluster => "Check cluster",
             Self::ReviewRepo => "Review repo",
+            Self::ManageChannel => "Manage channel",
         }
     }
 
-    fn prompt(self) -> &'static str {
+    fn prompt(self) -> Option<&'static str> {
         match self {
-            Self::PlanChange => {
-                "Plan the next code change in this repository and identify the safest first step."
-            }
+            Self::PlanChange => Some(
+                "Plan the next code change in this repository and identify the safest first step.",
+            ),
             Self::CheckCluster => {
-                "Check the local cluster status and explain anything that needs attention."
+                Some("Check the local cluster status and explain anything that needs attention.")
             }
-            Self::ReviewRepo => {
-                "Review the current repository state and point out the most important issue to fix next."
-            }
+            Self::ReviewRepo => Some(
+                "Review the current repository state and point out the most important issue to fix next.",
+            ),
+            Self::ManageChannel => None,
         }
     }
 
@@ -343,6 +347,7 @@ impl ChatQuickAction {
             Self::PlanChange => IconGlyph::Sparkles,
             Self::CheckCluster => IconGlyph::Storage,
             Self::ReviewRepo => IconGlyph::Search,
+            Self::ManageChannel => IconGlyph::Chat,
         }
     }
 
@@ -351,6 +356,7 @@ impl ChatQuickAction {
             Self::PlanChange => "Prepare a planning prompt",
             Self::CheckCluster => "Prepare a cluster status prompt",
             Self::ReviewRepo => "Prepare a repository review prompt",
+            Self::ManageChannel => "Open channel agents and settings",
         }
     }
 }
@@ -2308,7 +2314,13 @@ impl ChatState {
     }
 
     fn apply_quick_action(&mut self, action: ChatQuickAction) {
-        let prompt = action.prompt();
+        if action == ChatQuickAction::ManageChannel {
+            self.begin_edit_current_session();
+            return;
+        }
+        let Some(prompt) = action.prompt() else {
+            return;
+        };
         self.input = prompt.to_string();
         self.cursor = self.input.len();
         self.draft_revision = self.draft_revision.wrapping_add(1);
@@ -5801,15 +5813,23 @@ impl TranscriptView {
             ChatQuickAction::PlanChange => 138.0,
             ChatQuickAction::CheckCluster => 128.0,
             ChatQuickAction::ReviewRepo => 116.0,
+            ChatQuickAction::ManageChannel => 136.0,
         }
     }
 
-    fn quick_action_rects(area: Rect) -> Vec<(ChatQuickAction, Rect)> {
+    fn quick_actions(chat: &ChatState) -> &'static [ChatQuickAction] {
+        if chat.current_is_channel() {
+            &ChatQuickAction::CHANNEL
+        } else {
+            &ChatQuickAction::CHAT
+        }
+    }
+
+    fn quick_action_rects(area: Rect, actions: &[ChatQuickAction]) -> Vec<(ChatQuickAction, Rect)> {
         if area.height() < 180.0 || area.width() < 260.0 {
             return Vec::new();
         }
         let (_, cy) = Self::empty_state_center(area);
-        let actions = ChatQuickAction::ALL;
         let gap = 8.0;
         let button_h = 30.0;
         let widths = actions
@@ -5828,7 +5848,7 @@ impl TranscriptView {
                 .map(|(action, width)| {
                     let rect = Rect::new(x, y, width, button_h);
                     x += width + gap;
-                    (action, rect)
+                    (*action, rect)
                 })
                 .collect();
         }
@@ -5839,11 +5859,11 @@ impl TranscriptView {
         let x = area.x() + (area.width() - width) * 0.5;
         let y0 = cy + 54.0 - stack_h * 0.5;
         actions
-            .into_iter()
+            .iter()
             .enumerate()
             .map(|(index, action)| {
                 (
-                    action,
+                    *action,
                     Rect::new(x, y0 + index as f32 * (button_h + gap), width, button_h),
                 )
             })
@@ -5997,10 +6017,11 @@ impl TranscriptView {
             if !chat.messages.is_empty() || chat.runtime_recovery_target().is_some() {
                 return None;
             }
+            let actions = Self::quick_actions(&chat).to_vec();
+            return Self::quick_action_rects(bounds, &actions)
+                .into_iter()
+                .find_map(|(action, rect)| rect.contains(position).then_some(action));
         }
-        Self::quick_action_rects(bounds)
-            .into_iter()
-            .find_map(|(action, rect)| rect.contains(position).then_some(action))
     }
 
     fn activate_recovery_action(&self, action: RecoveryCardAction) {
@@ -6349,7 +6370,11 @@ impl Widget for TranscriptView {
                     node.name = Some(name);
                     ctx.push(node);
                 }
-                for (slot, (action, rect)) in Self::quick_action_rects(ctx.bounds())
+                let actions = {
+                    let chat = self.shared.chat();
+                    Self::quick_actions(&chat).to_vec()
+                };
+                for (slot, (action, rect)) in Self::quick_action_rects(ctx.bounds(), &actions)
                     .into_iter()
                     .enumerate()
                 {
@@ -6445,7 +6470,7 @@ impl TranscriptView {
         let hint = chat.empty_conversation_hint();
         widgets::draw_centered(ctx, &hint, sub, cx, cy + 26.0);
 
-        for (action, rect) in Self::quick_action_rects(area) {
+        for (action, rect) in Self::quick_action_rects(area, Self::quick_actions(chat)) {
             self.paint_quick_action(ctx, theme, pal, action, rect);
         }
     }
@@ -8627,10 +8652,13 @@ mod tests {
             .click()?;
 
         let chat = shared.chat();
-        assert_eq!(chat.input, ChatQuickAction::CheckCluster.prompt());
+        let check_cluster_prompt = ChatQuickAction::CheckCluster
+            .prompt()
+            .expect("prompt action");
+        assert_eq!(chat.input, check_cluster_prompt);
         assert_eq!(
             chat.cursor,
-            ChatQuickAction::CheckCluster.prompt().len(),
+            check_cluster_prompt.len(),
             "quick action should place the composer cursor at the end of the prepared draft"
         );
         assert!(
@@ -8675,7 +8703,7 @@ mod tests {
                 updated_unix: 1,
                 participant_count: 2,
             }];
-            chat.session_id = channel_id;
+            chat.session_id = channel_id.clone();
             chat.messages.clear();
             chat.models_loading = false;
         }
@@ -8696,6 +8724,16 @@ mod tests {
                 .count()?
                 >= 1,
             "selected channel empty state should show the active-agent count"
+        );
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Manage channel")
+            .with_description("Open channel agents and settings")
+            .click()?;
+        assert_eq!(
+            shared.chat().session_edit_id.as_deref(),
+            Some(channel_id.as_str()),
+            "Manage channel should open the selected channel editor"
         );
 
         Ok(())
