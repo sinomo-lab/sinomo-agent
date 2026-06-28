@@ -766,16 +766,6 @@ fn overview_lines(
     topology: &Topology,
     diagnostics_open: bool,
 ) -> Vec<String> {
-    let online = snapshot
-        .nodes
-        .iter()
-        .filter(|node| node.availability == "online")
-        .count();
-    let public = snapshot
-        .nodes
-        .iter()
-        .filter(|node| node.public_reachable)
-        .count();
     let direct_edges = topology
         .edges
         .iter()
@@ -784,14 +774,17 @@ fn overview_lines(
     let mut lines = vec![
         "Cluster overview".to_string(),
         format!("source: {}", source_summary(&snapshot.source)),
-        format!("nodes: {online} / {} online", snapshot.nodes.len()),
-        format!("public: {public} reachable"),
+        format!("health: {}", cluster_health_summary(snapshot)),
+        format!("reach: {}", public_reachability_summary(snapshot)),
         format!("topology: {direct_edges} edges"),
         format!("LAN: {} segments", topology.lan_segments.len()),
     ];
     let warning = snapshot.warnings.first();
     if let Some(warning) = warning {
-        lines.push(format!("warning: {}", cluster_warning_summary(warning)));
+        lines.push(format!(
+            "attention: {}",
+            cluster_attention_summary(snapshot, warning)
+        ));
     }
     if diagnostics_open {
         if let Some(warning) = warning {
@@ -826,6 +819,85 @@ fn overview_lines(
         "hint: Select a node or LAN segment for process and reachability details.".to_string(),
     );
     lines
+}
+
+#[derive(Clone, Copy, Default)]
+struct AvailabilityCounts {
+    total: usize,
+    online: usize,
+    offline: usize,
+    unknown: usize,
+}
+
+fn availability_counts(snapshot: &ClusterSnapshot) -> AvailabilityCounts {
+    let mut counts = AvailabilityCounts {
+        total: snapshot.nodes.len(),
+        ..AvailabilityCounts::default()
+    };
+    for node in &snapshot.nodes {
+        match node.availability.to_ascii_lowercase().as_str() {
+            "online" => counts.online += 1,
+            "offline" | "unavailable" => counts.offline += 1,
+            _ => counts.unknown += 1,
+        }
+    }
+    counts
+}
+
+fn cluster_health_summary(snapshot: &ClusterSnapshot) -> String {
+    let counts = availability_counts(snapshot);
+    if counts.total == 0 {
+        return "no nodes discovered".to_string();
+    }
+
+    let mut parts = vec![format!("{} / {} online", counts.online, counts.total)];
+    if counts.offline > 0 {
+        parts.push(plural_count(counts.offline, "offline"));
+    }
+    if counts.unknown > 0 {
+        parts.push(plural_count(counts.unknown, "unknown"));
+    }
+    parts.join(", ")
+}
+
+fn public_reachability_summary(snapshot: &ClusterSnapshot) -> String {
+    let public = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.public_reachable)
+        .count();
+    format!("{} public reachable", public)
+}
+
+fn cluster_attention_summary(snapshot: &ClusterSnapshot, warning: &str) -> String {
+    let counts = availability_counts(snapshot);
+    if counts.offline > 0 {
+        return format!(
+            "{} {}",
+            counts.offline,
+            node_plural(counts.offline, "offline")
+        );
+    }
+    if counts.unknown > 0 {
+        return format!(
+            "{} {}",
+            counts.unknown,
+            node_plural(counts.unknown, "unknown")
+        );
+    }
+    cluster_warning_summary(warning).to_string()
+}
+
+fn node_plural(count: usize, state: &str) -> String {
+    if count == 1 {
+        format!("node {state}")
+    } else {
+        format!("nodes {state}")
+    }
+}
+
+fn plural_count(count: usize, label: &str) -> String {
+    format!("{} {}", count, label)
 }
 
 fn cluster_warning_summary(warning: &str) -> &'static str {
@@ -1570,8 +1642,8 @@ mod tests {
         let lines = overview_lines(&snapshot, &topology, false);
 
         assert_eq!(lines[0], "Cluster overview");
-        assert!(lines.iter().any(|line| line == "nodes: 2 / 2 online"));
-        assert!(lines.iter().any(|line| line == "public: 1 reachable"));
+        assert!(lines.iter().any(|line| line == "health: 2 / 2 online"));
+        assert!(lines.iter().any(|line| line == "reach: 1 public reachable"));
         assert!(lines.iter().any(|line| line == "topology: 1 edges"));
         assert!(lines.iter().any(|line| line == "source: daemon connected"));
         assert!(
@@ -1603,9 +1675,11 @@ mod tests {
 
     #[test]
     fn overview_warning_keeps_raw_detail_behind_diagnostics() {
+        let mut offline = node("node-b");
+        offline.availability = "offline".to_string();
         let snapshot = ClusterSnapshot {
             source: "daemon 127.0.0.1:21353".to_string(),
-            nodes: vec![node("node-a")],
+            nodes: vec![node("node-a"), offline],
             warnings: vec!["daemon health unavailable: network error".to_string()],
             ..ClusterSnapshot::default()
         };
@@ -1615,7 +1689,7 @@ mod tests {
         assert!(
             closed
                 .iter()
-                .any(|line| line == "warning: Cluster health needs attention")
+                .any(|line| line == "attention: 1 node offline")
         );
         assert!(closed.iter().any(|line| line
             == "hint: Show diagnostics for warning detail, source, and cluster identifiers."));
