@@ -521,6 +521,7 @@ fn open_chat_provider_select(window: &sui_testing::TestWindow) -> sui::Rect {
 #[test]
 fn capture_files_composed() {
     use sinomo_app::theme::AppThemeMode;
+    use sinomo_cli::app_api::{SifsEntry, SifsObjectDetails, SifsObjectHealth, SifsPinDetails};
     use sui::{Event, Size, WindowEvent};
 
     let dir = shots_dir();
@@ -538,9 +539,86 @@ fn capture_files_composed() {
         );
     };
 
+    let seed_listing = |shared: &sinomo_app::state::Shared| {
+        let mut files = shared.files_mut();
+        files.loaded = true;
+        files.loading = false;
+        files.error = None;
+        files.clustered = true;
+        files.node_id = "node-desktop-a".to_string();
+        files.path = "/services".to_string();
+        files.entries = vec![
+            SifsEntry {
+                name: "logs".to_string(),
+                path: "/services/logs".to_string(),
+                is_dir: true,
+                is_link: false,
+                size: None,
+            },
+            SifsEntry {
+                name: "artifact.bin".to_string(),
+                path: "/services/artifact.bin".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(4_194_304),
+            },
+            SifsEntry {
+                name: "release-notes.md".to_string(),
+                path: "/services/release-notes.md".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(8_192),
+            },
+        ];
+        files.selected = None;
+        files.selected_details = None;
+        files.details_loading = false;
+        files.details_error = None;
+    };
+
+    let seed_selected_file = |shared: &sinomo_app::state::Shared| {
+        seed_listing(shared);
+        let mut files = shared.files_mut();
+        files.selected = Some(1);
+        files.selected_details = Some(SifsObjectDetails {
+            file_system_id: "sifs".to_string(),
+            object_id: "obj-artifact-bin".to_string(),
+            path: "/services/artifact.bin".to_string(),
+            kind: "file".to_string(),
+            version: "version-42".to_string(),
+            content_hash: Some("sha256:8df4e83a7f2d0c1b".to_string()),
+            size_bytes: Some(4_194_304),
+            link_count: 1,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            accessed_at_unix_nanos: 1_766_000_000_000_000_000,
+            modified_at_unix_nanos: 1_766_000_030_000_000_000,
+            created_at_unix_nanos: 1_766_000_000_000_000_000,
+            changed_at_unix_nanos: 1_766_000_030_000_000_000,
+            policy: "replicated-eventual".to_string(),
+            current_locations: vec!["node-desktop-a".to_string(), "node-home-server".to_string()],
+            local_pins: vec![SifsPinDetails {
+                pinned_by_node_id: "node-desktop-a".to_string(),
+                mode: "content".to_string(),
+                created_at_unix_nanos: Some(1_766_000_040_000_000_000),
+            }],
+            health: Some(SifsObjectHealth {
+                agent_state: "healthy".to_string(),
+                version_count: 1,
+                receipt_count: 2,
+                intent_count: 0,
+                open_conflict_count: 0,
+                pending_repair_count: 0,
+                missing_replica_nodes: Vec::new(),
+            }),
+        });
+    };
+
     // Dark: root listing + empty inspector ("Select a file to see its SIFS placement.").
     {
         let shared = boot(Tab::Files);
+        seed_listing(&shared);
         let runtime = build_runtime(shared).expect("build runtime");
         let app = TestApp::from_runtime(runtime).expect("headless test app");
         let window = app.main_window().expect("main window");
@@ -551,6 +629,7 @@ fn capture_files_composed() {
     // Light: the same root listing restyled live by the theme reader.
     {
         let shared = boot(Tab::Files);
+        seed_listing(&shared);
         shared.borrow_mut().theme_mode = AppThemeMode::Light;
         let runtime = build_runtime(shared).expect("build runtime");
         let app = TestApp::from_runtime(runtime).expect("headless test app");
@@ -559,12 +638,10 @@ fn capture_files_composed() {
         capture("files-composed-light", &window);
     }
 
-    // Selected entry: pick the first entry so the inspector populates (placement panel).
+    // Selected entry: pick a file so the inspector populates placement and pin panels.
     {
         let shared = boot(Tab::Files);
-        if !shared.files().entries.is_empty() {
-            shared.files_mut().selected = Some(0);
-        }
+        seed_selected_file(&shared);
         let runtime = build_runtime(shared).expect("build runtime");
         let app = TestApp::from_runtime(runtime).expect("headless test app");
         let window = app.main_window().expect("main window");
@@ -575,6 +652,7 @@ fn capture_files_composed() {
     // Narrow: collapse to a list-only column (the inspector is hidden below WIDE_THRESHOLD).
     {
         let shared = boot(Tab::Files);
+        seed_listing(&shared);
         let runtime = build_runtime(shared).expect("build runtime");
         let app = TestApp::from_runtime(runtime).expect("headless test app");
         let window = app.main_window().expect("main window");

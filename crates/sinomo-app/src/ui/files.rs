@@ -117,6 +117,43 @@ enum FileActionPromptKind {
     Delete,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FileSortMode {
+    #[default]
+    NameAsc,
+    NameDesc,
+    Kind,
+    SizeDesc,
+    SizeAsc,
+}
+
+impl FileSortMode {
+    const ALL: [Self; 5] = [
+        Self::NameAsc,
+        Self::NameDesc,
+        Self::Kind,
+        Self::SizeDesc,
+        Self::SizeAsc,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NameAsc => "Name A-Z",
+            Self::NameDesc => "Name Z-A",
+            Self::Kind => "Kind",
+            Self::SizeDesc => "Size largest",
+            Self::SizeAsc => "Size smallest",
+        }
+    }
+
+    fn options() -> Vec<String> {
+        Self::ALL
+            .iter()
+            .map(|mode| mode.label().to_string())
+            .collect()
+    }
+}
+
 impl FileActionPromptKind {
     fn title(self) -> &'static str {
         match self {
@@ -306,6 +343,7 @@ pub struct FilesState {
     preview_error: Option<String>,
     action_prompt: Option<FileActionPrompt>,
     filter_query: String,
+    sort_mode: FileSortMode,
     tasks: Vec<FilesTask>,
     pending_select_path: Option<String>,
     pub scroll: f32,
@@ -352,6 +390,7 @@ impl FilesState {
             preview_error: None,
             action_prompt: None,
             filter_query: String::new(),
+            sort_mode: FileSortMode::default(),
             tasks: Vec::new(),
             pending_select_path: None,
             scroll: 0.0,
@@ -1097,6 +1136,10 @@ impl FilesState {
             self.selected = None;
             self.clear_selected_details();
         }
+    }
+
+    fn set_sort_mode(&mut self, mode: FileSortMode) {
+        self.sort_mode = mode;
     }
 
     fn submit_action_prompt(&mut self, waker: Option<sui::UiHandle>) {
@@ -3836,6 +3879,62 @@ fn filtered_file_indices(entries: &[SifsEntry], filter: &str) -> Vec<usize> {
         .collect()
 }
 
+fn visible_file_indices(
+    entries: &[SifsEntry],
+    filter: &str,
+    sort_mode: FileSortMode,
+) -> Vec<usize> {
+    let mut indices = filtered_file_indices(entries, filter);
+    indices
+        .sort_by(|left, right| compare_file_entries(&entries[*left], &entries[*right], sort_mode));
+    indices
+}
+
+fn compare_file_entries(
+    left: &SifsEntry,
+    right: &SifsEntry,
+    sort_mode: FileSortMode,
+) -> std::cmp::Ordering {
+    let dir_order = (right.is_dir as u8).cmp(&(left.is_dir as u8));
+    if dir_order != std::cmp::Ordering::Equal {
+        return dir_order;
+    }
+    match sort_mode {
+        FileSortMode::NameAsc => compare_file_names(left, right),
+        FileSortMode::NameDesc => compare_file_names(right, left),
+        FileSortMode::Kind => entry_kind_rank(left)
+            .cmp(&entry_kind_rank(right))
+            .then_with(|| compare_file_names(left, right)),
+        FileSortMode::SizeDesc => right
+            .size
+            .unwrap_or(0)
+            .cmp(&left.size.unwrap_or(0))
+            .then_with(|| compare_file_names(left, right)),
+        FileSortMode::SizeAsc => left
+            .size
+            .unwrap_or(0)
+            .cmp(&right.size.unwrap_or(0))
+            .then_with(|| compare_file_names(left, right)),
+    }
+}
+
+fn compare_file_names(left: &SifsEntry, right: &SifsEntry) -> std::cmp::Ordering {
+    left.name
+        .to_ascii_lowercase()
+        .cmp(&right.name.to_ascii_lowercase())
+        .then_with(|| left.name.cmp(&right.name))
+}
+
+fn entry_kind_rank(entry: &SifsEntry) -> u8 {
+    if entry.is_dir {
+        0
+    } else if entry.is_link {
+        1
+    } else {
+        2
+    }
+}
+
 fn preview_from_read(name: &str, read: SifsFileRead) -> FilesPreview {
     if read.bytes.is_empty() {
         return FilesPreview {
@@ -4676,7 +4775,7 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
     let filter = SizedBox::new()
         .height(LIST_FILTER_H)
         .with_child(InsetX::new(
-            files_filter_input(shared, reader),
+            files_filter_bar(shared, reader),
             CONTENT_PAD * 0.5,
         ));
     let header = SizedBox::new()
@@ -4717,9 +4816,53 @@ fn files_filter_input(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         })
 }
 
-fn files_list_body_signature(shared: &Shared) -> (u64, String) {
+fn files_sort_select(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    sui::Select::new("files-sort")
+        .options(FileSortMode::options())
+        .placeholder("Sort")
+        .theme_when(clone_reader(reader))
+        .selected_when({
+            let s = s.clone();
+            move || {
+                let mode = s.files().sort_mode;
+                FileSortMode::ALL
+                    .iter()
+                    .position(|candidate| *candidate == mode)
+            }
+        })
+        .on_change(move |index, _label| {
+            if let Some(mode) = FileSortMode::ALL.get(index).copied() {
+                s.files_mut().set_sort_mode(mode);
+            }
+        })
+}
+
+fn files_filter_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    Stack::horizontal()
+        .spacing(8.0)
+        .alignment(Alignment::Center)
+        .with_child(
+            SizedBox::new()
+                .width(240.0)
+                .height(30.0)
+                .with_child(files_filter_input(shared, reader)),
+        )
+        .with_child(
+            SizedBox::new()
+                .width(150.0)
+                .height(30.0)
+                .with_child(files_sort_select(shared, reader)),
+        )
+}
+
+fn files_list_body_signature(shared: &Shared) -> (u64, String, FileSortMode) {
     let files = shared.files();
-    (files.list_revision, files.filter_query.clone())
+    (
+        files.list_revision,
+        files.filter_query.clone(),
+        files.sort_mode,
+    )
 }
 
 fn files_list_body_rebuild(
@@ -4740,16 +4883,17 @@ fn files_list_body_rebuild(
 }
 
 fn files_list_body(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
-    let (entries, filter_query, source) = {
+    let (entries, filter_query, source, sort_mode) = {
         let files = shared.files();
         (
             files.entries.clone(),
             files.filter_query.clone(),
             files.source,
+            files.sort_mode,
         )
     };
     let filter = normalized_files_filter(&filter_query);
-    let visible_indices = filtered_file_indices(&entries, &filter);
+    let visible_indices = visible_file_indices(&entries, &filter, sort_mode);
     if visible_indices.is_empty() {
         return WidgetPod::new(
             centered_note(
@@ -4795,7 +4939,7 @@ fn files_list_body(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollS
                 move || {
                     let files = s.files();
                     let filter = normalized_files_filter(&files.filter_query);
-                    filtered_file_indices(&files.entries, &filter)
+                    visible_file_indices(&files.entries, &filter, files.sort_mode)
                         .into_iter()
                         .position(|entry_index| files.selected == Some(entry_index))
                 }
@@ -4805,7 +4949,8 @@ fn files_list_body(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollS
                 // directory -> navigate, file -> select. Row children handle pointer activation.
                 let mut files = s.files_mut();
                 let filter = normalized_files_filter(&files.filter_query);
-                let visible_indices = filtered_file_indices(&files.entries, &filter);
+                let visible_indices =
+                    visible_file_indices(&files.entries, &filter, files.sort_mode);
                 if let Some(entry_index) = visible_indices.get(index) {
                     files.activate_row(*entry_index);
                 }
@@ -10363,6 +10508,65 @@ mod tests {
     }
 
     #[test]
+    fn visible_file_indices_sort_entries_without_losing_original_indices() {
+        let entries = vec![
+            SifsEntry {
+                name: "logs".to_string(),
+                path: "/services/logs".to_string(),
+                is_dir: true,
+                is_link: false,
+                size: None,
+            },
+            SifsEntry {
+                name: "small.txt".to_string(),
+                path: "/services/small.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            },
+            SifsEntry {
+                name: "large.bin".to_string(),
+                path: "/services/large.bin".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(4096),
+            },
+            SifsEntry {
+                name: "alias".to_string(),
+                path: "/services/alias".to_string(),
+                is_dir: false,
+                is_link: true,
+                size: None,
+            },
+        ];
+
+        assert_eq!(
+            visible_file_indices(&entries, "", FileSortMode::NameAsc),
+            vec![0, 3, 2, 1]
+        );
+        assert_eq!(
+            visible_file_indices(&entries, "", FileSortMode::NameDesc),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            visible_file_indices(&entries, "", FileSortMode::Kind),
+            vec![0, 3, 2, 1]
+        );
+        assert_eq!(
+            visible_file_indices(&entries, "", FileSortMode::SizeDesc),
+            vec![0, 2, 1, 3]
+        );
+        assert_eq!(
+            visible_file_indices(
+                &entries,
+                &normalized_files_filter("txt"),
+                FileSortMode::SizeDesc
+            ),
+            vec![1]
+        );
+    }
+
+    #[test]
     fn setting_filter_clears_hidden_selection() {
         let backend = Backend::local_fallback();
         let mut state = FilesState::new(&backend);
@@ -10907,6 +11111,63 @@ mod tests {
             .get_by_role(sui::SemanticsRole::ListItem)
             .with_name("artifact.txt")
             .with_description("File, SIFS path /services/artifact.txt")
+            .click()?;
+
+        assert_eq!(shared.files().selected, Some(1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_sorted_file_rows_select_original_entry() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/services".to_string();
+            files.entries = vec![
+                SifsEntry {
+                    name: "small.txt".to_string(),
+                    path: "/services/small.txt".to_string(),
+                    is_dir: false,
+                    is_link: false,
+                    size: Some(5),
+                },
+                SifsEntry {
+                    name: "large.bin".to_string(),
+                    path: "/services/large.bin".to_string(),
+                    is_dir: false,
+                    is_link: false,
+                    size: Some(4096),
+                },
+            ];
+            files.sort_mode = FileSortMode::SizeDesc;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files sorted rows")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::ComboBox)
+                .with_name("files-sort")
+                .count()?,
+            1
+        );
+
+        window
+            .get_by_role(sui::SemanticsRole::ListItem)
+            .with_name("large.bin")
+            .with_description("File, SIFS path /services/large.bin")
             .click()?;
 
         assert_eq!(shared.files().selected, Some(1));
