@@ -236,6 +236,13 @@ struct FilePlace {
     source: FilesSourceKind,
     path: String,
     glyph: IconGlyph,
+    action: FilePlaceAction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FilePlaceAction {
+    OpenPath,
+    OpenPathPrompt,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -969,7 +976,7 @@ impl FilesState {
             return;
         };
         if prompt.kind == FileActionPromptKind::GoTo {
-            match normalize_jump_path(&prompt.input) {
+            match normalize_jump_path(self.source, &self.path, &prompt.input) {
                 Ok(path) => {
                     self.action_prompt = None;
                     if let Some(waker) = waker {
@@ -1824,7 +1831,7 @@ fn default_local_path(fallback: impl AsRef<Path>) -> String {
     std::env::current_dir()
         .or_else(|_| Ok::<PathBuf, std::io::Error>(fallback.as_ref().to_path_buf()))
         .and_then(|path| path.canonicalize().or(Ok(path)))
-        .map(|path| path.to_string_lossy().into_owned())
+        .map(|path| display_local_path(path.to_string_lossy().into_owned()))
         .unwrap_or_else(|_| ".".to_string())
 }
 
@@ -1875,6 +1882,7 @@ fn normalize_local_path(path: &str) -> Result<String, String> {
         .unwrap_or(path)
         .to_string_lossy()
         .into_owned())
+    .map(display_local_path)
 }
 
 fn parent_local_path(path: &str) -> Option<String> {
@@ -2068,7 +2076,7 @@ fn local_details(path: &str) -> Result<LocalObjectDetails, String> {
         canonical_path: Path::new(path)
             .canonicalize()
             .ok()
-            .map(|path| path.to_string_lossy().into_owned()),
+            .map(|path| display_local_path(path.to_string_lossy().into_owned())),
         kind,
         size_bytes: file_type.is_file().then_some(metadata.len()),
         readonly: metadata.permissions().readonly(),
@@ -2164,7 +2172,11 @@ fn suggested_copy_name(name: &str) -> String {
     format!("{trimmed} copy")
 }
 
-fn normalize_jump_path(path: &str) -> Result<String, String> {
+fn normalize_jump_path(
+    source: FilesSourceKind,
+    current_path: &str,
+    path: &str,
+) -> Result<String, String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err("path cannot be empty".to_string());
@@ -2172,7 +2184,22 @@ fn normalize_jump_path(path: &str) -> Result<String, String> {
     if trimmed.bytes().any(|byte| byte == 0) {
         return Err("path cannot contain NUL bytes".to_string());
     }
-    Ok(normalize_path(trimmed))
+    match source {
+        FilesSourceKind::Sifs => Ok(normalize_path(trimmed)),
+        FilesSourceKind::Local => {
+            let path = Path::new(trimmed);
+            if path.is_absolute() {
+                normalize_local_path(trimmed)
+            } else {
+                normalize_local_path(
+                    &Path::new(current_path)
+                        .join(path)
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            }
+        }
+    }
 }
 
 fn execute_sifs_operation(
@@ -4385,10 +4412,30 @@ fn push_unique_place(
     path: impl Into<String>,
     glyph: IconGlyph,
 ) {
+    push_unique_place_with_action(
+        places,
+        label,
+        detail,
+        source,
+        path,
+        glyph,
+        FilePlaceAction::OpenPath,
+    );
+}
+
+fn push_unique_place_with_action(
+    places: &mut Vec<FilePlace>,
+    label: impl Into<String>,
+    detail: impl Into<String>,
+    source: FilesSourceKind,
+    path: impl Into<String>,
+    glyph: IconGlyph,
+    action: FilePlaceAction,
+) {
     let path = path.into();
     if places
         .iter()
-        .any(|place| place.source == source && place.path == path)
+        .any(|place| place.source == source && place.path == path && place.action == action)
     {
         return;
     }
@@ -4398,6 +4445,7 @@ fn push_unique_place(
         source,
         path,
         glyph,
+        action,
     });
 }
 
@@ -4406,6 +4454,76 @@ fn local_home_path() -> Option<String> {
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
         .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn local_root_path(path: &str) -> Option<String> {
+    let mut root = PathBuf::new();
+    let mut saw_prefix = false;
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::Prefix(prefix) => {
+                root.push(prefix.as_os_str());
+                saw_prefix = true;
+            }
+            std::path::Component::RootDir => {
+                root.push(std::path::MAIN_SEPARATOR.to_string());
+                let label = root.to_string_lossy().into_owned();
+                return (!label.is_empty()).then_some(display_local_path(label));
+            }
+            _ => break,
+        }
+    }
+    if saw_prefix {
+        let label = root.to_string_lossy().into_owned();
+        (!label.is_empty()).then_some(display_local_path(label))
+    } else {
+        None
+    }
+}
+
+fn display_local_path(path: String) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = path.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    path
+}
+
+fn local_root_label(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    if trimmed.ends_with(':') {
+        return trimmed.to_string();
+    }
+    if path == "/" {
+        return "Filesystem".to_string();
+    }
+    Path::new(trimmed)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+fn system_drive_path() -> Option<String> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("SystemDrive").map(|drive| {
+            let mut path = drive.to_string_lossy().into_owned();
+            if !path.ends_with('\\') && !path.ends_with('/') {
+                path.push('\\');
+            }
+            path
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 fn files_places(files: &FilesState) -> Vec<FilePlace> {
@@ -4450,6 +4568,16 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
         files.local_path.clone(),
         IconGlyph::Folder,
     );
+    if let Some(root) = local_root_path(&files.local_path) {
+        push_unique_place(
+            &mut places,
+            local_root_label(&root),
+            "current volume",
+            FilesSourceKind::Local,
+            root,
+            IconGlyph::Storage,
+        );
+    }
     push_unique_place(
         &mut places,
         "Sinomo data",
@@ -4468,11 +4596,32 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
             IconGlyph::Folder,
         );
     }
+    if let Some(system_drive) = system_drive_path() {
+        push_unique_place(
+            &mut places,
+            local_root_label(&system_drive),
+            "system drive",
+            FilesSourceKind::Local,
+            system_drive,
+            IconGlyph::Storage,
+        );
+    }
+    push_unique_place_with_action(
+        &mut places,
+        "Other path",
+        "drive, UNC, or mount",
+        FilesSourceKind::Local,
+        files.local_path.clone(),
+        IconGlyph::Search,
+        FilePlaceAction::OpenPathPrompt,
+    );
     places
 }
 
 fn file_place_active(files: &FilesState, place: &FilePlace) -> bool {
-    files.source == place.source && files.path == place.path
+    place.action == FilePlaceAction::OpenPath
+        && files.source == place.source
+        && files.path == place.path
 }
 
 fn open_file_place(shared: &Shared, place: FilePlace, ctx: &mut EventCtx) {
@@ -4482,13 +4631,12 @@ fn open_file_place(shared: &Shared, place: FilePlace, ctx: &mut EventCtx) {
         if files.source != place.source {
             files.switch_source(place.source, waker);
         }
-        files.navigate(place.path);
+        match place.action {
+            FilePlaceAction::OpenPath => files.navigate(place.path),
+            FilePlaceAction::OpenPathPrompt => files.open_action_prompt(FileActionPromptKind::GoTo),
+        }
     }
-    ctx.request_measure();
-    ctx.request_arrange();
-    ctx.request_paint();
-    ctx.request_hit_test();
-    ctx.request_semantics();
+    request_files_overlay_rebuild(ctx);
 }
 
 fn plural(count: usize, singular: &str) -> String {
@@ -7785,6 +7933,19 @@ mod tests {
                 && place.source == FilesSourceKind::Local
                 && place.path == root.to_string_lossy()
         }));
+        let current_root = local_root_path(&state.local_path).expect("temp dir has root");
+        assert!(places.iter().any(|place| {
+            place.label == local_root_label(&current_root)
+                && place.detail == "current volume"
+                && place.source == FilesSourceKind::Local
+                && place.path == current_root
+                && place.action == FilePlaceAction::OpenPath
+        }));
+        assert!(places.iter().any(|place| {
+            place.label == "Other path"
+                && place.source == FilesSourceKind::Local
+                && place.action == FilePlaceAction::OpenPathPrompt
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -9019,11 +9180,11 @@ mod tests {
         );
         assert_eq!(normalize_path("users\\sinomo"), "/users/sinomo");
         assert_eq!(
-            normalize_jump_path(" services\\sinomo/.. ").as_deref(),
+            normalize_jump_path(FilesSourceKind::Sifs, "/", " services\\sinomo/.. ").as_deref(),
             Ok("/services")
         );
         assert_eq!(
-            normalize_jump_path("   "),
+            normalize_jump_path(FilesSourceKind::Sifs, "/", "   "),
             Err("path cannot be empty".to_string())
         );
         assert_eq!(
@@ -9031,6 +9192,27 @@ mod tests {
             Some("/services".to_string())
         );
         assert_eq!(parent_path("/"), None);
+    }
+
+    #[test]
+    fn local_jump_paths_resolve_against_current_file_manager_path() {
+        let root = files_test_temp_dir("local-jump");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("create nested");
+        let root_label = root.to_string_lossy().into_owned();
+        let nested_label = nested.to_string_lossy().into_owned();
+        let expected_nested = normalize_local_path(&nested_label).expect("normalize nested");
+
+        assert_eq!(
+            normalize_jump_path(FilesSourceKind::Local, &root_label, "nested").as_deref(),
+            Ok(expected_nested.as_str())
+        );
+        assert_eq!(
+            normalize_jump_path(FilesSourceKind::Local, &root_label, &nested_label).as_deref(),
+            Ok(expected_nested.as_str())
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
