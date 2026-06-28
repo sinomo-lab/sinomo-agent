@@ -184,6 +184,7 @@ enum FilesOperationKind {
     Move,
     Rename,
     Delete,
+    RefreshPlacement,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1032,6 +1033,26 @@ impl FilesState {
         self.apply_operation_result(request_id, result);
     }
 
+    fn start_placement_refresh(&mut self, waker: Option<sui::UiHandle>) {
+        if self.source != FilesSourceKind::Sifs {
+            return;
+        }
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+        self.start_operation(
+            FilesOperation {
+                kind: FilesOperationKind::RefreshPlacement,
+                path: entry.path.clone(),
+                target: None,
+                directory: entry.is_dir,
+            },
+            "Refresh placement".to_string(),
+            entry.path,
+            waker,
+        );
+    }
+
     fn join_child(&self, name: &str) -> Result<String, String> {
         match self.source {
             FilesSourceKind::Sifs => join_sifs_child(&self.path, name),
@@ -1827,6 +1848,15 @@ fn execute_sifs_operation(
                 message: format!("deleted {}", operation.path),
             })
         }
+        FilesOperationKind::RefreshPlacement => {
+            browser.request_maintenance_refresh()?;
+            let _ = browser.stat(&operation.path);
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: Some(operation.path.clone()),
+                message: format!("requested placement refresh for {}", operation.path),
+            })
+        }
     }
 }
 
@@ -1917,6 +1947,9 @@ fn execute_local_operation(
                 message: format!("deleted {}", operation.path),
             })
         }
+        FilesOperationKind::RefreshPlacement => {
+            Err("placement refresh is only available for SIFS".to_string())
+        }
     }
 }
 
@@ -1938,6 +1971,12 @@ fn files_operation_cancelled_detail(operation: &FilesOperation) -> String {
             format!("cancelled before renaming {} to {target}", operation.path)
         }
         FilesOperationKind::Delete => format!("cancelled before deleting {}", operation.path),
+        FilesOperationKind::RefreshPlacement => {
+            format!(
+                "cancelled before refreshing placement for {}",
+                operation.path
+            )
+        }
     }
 }
 
@@ -2835,6 +2874,27 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             })
     };
 
+    let refresh_placement = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Storage, "Refresh placement")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || {
+                    let files = s.files();
+                    files.source == FilesSourceKind::Sifs
+                        && !files.loading
+                        && files.selected_entry().is_some()
+                }
+            })
+            .on_press_with_ctx(move |ctx| {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut().start_placement_refresh(waker);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+
     let rename = {
         let s = shared.clone();
         sui::Button::new("Rename")
@@ -2881,6 +2941,7 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .with_child(new_folder)
         .with_child(copy)
         .with_child(move_to)
+        .with_child(refresh_placement)
         .with_child(rename)
         .with_child(delete)
 }
@@ -6168,6 +6229,46 @@ mod tests {
             }
             FilesWorkerCommand::Details { .. } => panic!("expected list command"),
             FilesWorkerCommand::Operation { .. } => panic!("expected list command"),
+        }
+    }
+
+    #[test]
+    fn placement_refresh_queues_sifs_worker_operation() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        let (tx, rx) = mpsc::channel();
+        let (_result_tx, result_rx) = mpsc::channel();
+
+        state.loaded = true;
+        state.loading = false;
+        state.path = "/services".to_string();
+        state.entries = vec![SifsEntry {
+            name: "artifact.txt".to_string(),
+            path: "/services/artifact.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(1),
+        }];
+        state.selected = Some(0);
+        state.worker_tx = Some(tx);
+        state.worker_rx = Some(result_rx);
+
+        state.start_placement_refresh(None);
+
+        assert_eq!(state.tasks[0].title, "Refresh placement");
+        match rx.try_recv().expect("placement refresh command") {
+            FilesWorkerCommand::Operation {
+                request_id,
+                source,
+                operation,
+            } => {
+                assert_eq!(request_id, state.tasks[0].id);
+                assert_eq!(source, FilesSourceKind::Sifs);
+                assert_eq!(operation.kind, FilesOperationKind::RefreshPlacement);
+                assert_eq!(operation.path, "/services/artifact.txt");
+            }
+            FilesWorkerCommand::List { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
         }
     }
 

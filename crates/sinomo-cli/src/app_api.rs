@@ -2183,6 +2183,13 @@ impl SifsBrowser {
         }
     }
 
+    pub fn request_maintenance_refresh(&self) -> Result<(), String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(_) => Ok(()),
+            SifsBrowserBackend::Remote(remote) => remote.request_maintenance_refresh(),
+        }
+    }
+
     pub fn parent(&self, path: &str) -> Option<String> {
         match &self.backend {
             SifsBrowserBackend::Local(backend) => backend.parent_path(path),
@@ -2331,6 +2338,14 @@ impl RemoteSifsBrowser {
                 path: path.to_string(),
                 directory,
             },
+        )?;
+        Ok(())
+    }
+
+    fn request_maintenance_refresh(&self) -> Result<(), String> {
+        let _: sinomo_runtime::daemon::DaemonClusterMaintenanceRefreshResponse = self.rpc(
+            sinomo_runtime::daemon::DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
+            &sinomo_runtime::daemon::DaemonClusterMaintenanceRefreshRequest,
         )?;
         Ok(())
     }
