@@ -27,7 +27,7 @@ use sinomo_lm::{
 };
 use sinomo_runtime::events::{InMemoryEventStore, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::{ClusterPaths, ObjectRpcRequest};
+use sinomo_runtime::network::{self, ClusterHealthRow, ClusterPaths, ObjectRpcRequest};
 use sinomo_runtime::node::NodeId;
 use std::collections::BTreeSet;
 use time::format_description::well_known::Rfc3339;
@@ -1821,6 +1821,20 @@ pub fn cluster_status(data_dir: &SinomoDataDir) -> AppClusterStatus {
             ..AppClusterStatus::default()
         },
     }
+}
+
+/// Read cluster health rows using the same direct probe fallback as the CLI.
+pub fn cluster_health_rows(data_dir: &SinomoDataDir) -> Result<Vec<ClusterHealthRow>, CliError> {
+    let paths = ClusterPaths::new(data_dir);
+    let state = read_cli_cluster_state(&paths)?;
+    network::cluster_health_rows_with_probe(
+        &paths,
+        &state,
+        &crate::CliClusterStatusProbe { paths: &paths },
+        false,
+        time::OffsetDateTime::now_utc(),
+    )
+    .map_err(Into::into)
 }
 
 /// Ensure this data directory has a local single-node cluster, without printing CLI output.

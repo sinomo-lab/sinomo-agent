@@ -1706,6 +1706,46 @@ mod tests {
     }
 
     #[test]
+    fn overview_keeps_probe_health_counts_when_daemon_aggregation_warns() {
+        let mut offline = node("node-c");
+        offline.availability = "offline".to_string();
+        let snapshot = ClusterSnapshot {
+            source: "daemon 127.0.0.1:21353".to_string(),
+            nodes: vec![node("node-a"), node("node-b"), offline],
+            warnings: vec![
+                "daemon health aggregation unavailable: rpc failed; showing direct cluster probes"
+                    .to_string(),
+            ],
+            ..ClusterSnapshot::default()
+        };
+        let topology = build_topology(&snapshot);
+
+        let closed = overview_lines(&snapshot, &topology, false);
+        assert!(
+            closed
+                .iter()
+                .any(|line| line == "health: 2 / 3 online, 1 offline"),
+            "overview should trust direct probe rows instead of reducing to local health"
+        );
+        assert!(
+            closed
+                .iter()
+                .any(|line| line == "attention: 1 node offline")
+        );
+        assert!(
+            !closed.iter().any(|line| line.contains("rpc failed")),
+            "raw aggregation error belongs behind diagnostics"
+        );
+
+        let open = overview_lines(&snapshot, &topology, true);
+        assert!(
+            open.iter()
+                .any(|line| line
+                    .starts_with("warning detail: daemon health aggregation unavailable"))
+        );
+    }
+
+    #[test]
     fn pump_refresh_applies_snapshot_and_clears_missing_selection() {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut state = ClusterState {

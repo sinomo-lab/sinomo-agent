@@ -140,7 +140,11 @@ impl Backend {
             Some(state) => {
                 let cached_rows = rows_from_state(&paths, state, observed_at, &mut warnings);
                 match self.connection.daemon_address() {
-                    Some(address) => match fetch_daemon_health_rows(address, health_scope) {
+                    Some(address) => match fetch_daemon_health_rows(
+                        self.data_dir.as_ref(),
+                        address,
+                        health_scope,
+                    ) {
                         Ok((live_rows, warning)) => {
                             if let Some(warning) = warning {
                                 health_limited_to_local =
@@ -160,23 +164,27 @@ impl Backend {
                 }
             }
             None => match self.connection.daemon_address() {
-                Some(address) => match fetch_daemon_health_rows(address, health_scope) {
-                    Ok((rows, warning)) => {
-                        if let Some(warning) = warning {
-                            health_limited_to_local =
-                                matches!(health_scope, ClusterHealthScope::Full);
-                            warnings.push(warning);
+                Some(address) => {
+                    match fetch_daemon_health_rows(self.data_dir.as_ref(), address, health_scope) {
+                        Ok((rows, warning)) => {
+                            if let Some(warning) = warning {
+                                health_limited_to_local =
+                                    matches!(health_scope, ClusterHealthScope::Full);
+                                warnings.push(warning);
+                            }
+                            warnings.retain(|warning| {
+                                !warning.starts_with("cluster state unavailable:")
+                            });
+                            live_node_ids
+                                .extend(rows.iter().map(|row| row.member.node_id.to_string()));
+                            rows
                         }
-                        warnings
-                            .retain(|warning| !warning.starts_with("cluster state unavailable:"));
-                        live_node_ids.extend(rows.iter().map(|row| row.member.node_id.to_string()));
-                        rows
+                        Err(error) => {
+                            warnings.push(format!("daemon health unavailable: {error}"));
+                            Vec::new()
+                        }
                     }
-                    Err(error) => {
-                        warnings.push(format!("daemon health unavailable: {error}"));
-                        Vec::new()
-                    }
-                },
+                }
                 None => Vec::new(),
             },
         };
@@ -208,6 +216,7 @@ impl Backend {
 }
 
 fn fetch_daemon_health_rows(
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
     address: &str,
     health_scope: ClusterHealthScope,
 ) -> Result<(Vec<ClusterHealthRow>, Option<String>), String> {
@@ -215,16 +224,24 @@ fn fetch_daemon_health_rows(
         ClusterHealthScope::Local => fetch_local_health_rows(address).map(|rows| (rows, None)),
         ClusterHealthScope::Full => match fetch_cluster_health_rows(address) {
             Ok(rows) => Ok((rows, None)),
-            Err(cluster_error) => match fetch_local_health_rows(address) {
+            Err(cluster_error) => match sinomo_cli::app_api::cluster_health_rows(data_dir) {
                 Ok(rows) => Ok((
                     rows,
                     Some(format!(
-                        "daemon health aggregation unavailable: {cluster_error}; showing local daemon health"
+                        "daemon health aggregation unavailable: {cluster_error}; showing direct cluster probes"
                     )),
                 )),
-                Err(local_error) => Err(format!(
-                    "cluster health unavailable: {cluster_error}; local health unavailable: {local_error}"
-                )),
+                Err(probe_error) => match fetch_local_health_rows(address) {
+                    Ok(rows) => Ok((
+                        rows,
+                        Some(format!(
+                            "daemon health aggregation unavailable: {cluster_error}; direct cluster probes unavailable: {probe_error}; showing local daemon health"
+                        )),
+                    )),
+                    Err(local_error) => Err(format!(
+                        "cluster health unavailable: {cluster_error}; direct cluster probes unavailable: {probe_error}; local health unavailable: {local_error}"
+                    )),
+                },
             },
         },
     }
