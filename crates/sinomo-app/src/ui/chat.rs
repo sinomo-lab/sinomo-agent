@@ -2701,6 +2701,55 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
+fn context_capacity_bytes(context: &ChatContextSnapshot) -> usize {
+    context
+        .max_context_bytes
+        .or(context.compaction_threshold_bytes)
+        .unwrap_or(context.total_bytes.max(1))
+        .max(1)
+}
+
+fn context_count_label(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
+fn context_overview_summary(chat: &ChatState) -> String {
+    if let Some(context) = &chat.context {
+        return format!(
+            "Context {} of {} · {} · {}",
+            format_bytes(context.total_bytes),
+            format_bytes(context_capacity_bytes(context)),
+            context_count_label(context.included_count, "source", "sources"),
+            context_count_label(context.omitted_count, "omitted", "omitted")
+        );
+    }
+
+    if chat.streaming {
+        return "Assembling context for this response".to_string();
+    }
+
+    if let Some(target) = chat.runtime_recovery_target() {
+        return match target {
+            RuntimeRecoveryTarget::Providers => "Context waits for provider setup".to_string(),
+            RuntimeRecoveryTarget::Connection => "Context waits for cluster connection".to_string(),
+        };
+    }
+
+    if chat
+        .messages
+        .iter()
+        .any(|message| message.source == ChatMessageSource::User)
+    {
+        "Context will refresh on the next send".to_string()
+    } else {
+        "Context will assemble when you send a message".to_string()
+    }
+}
+
 fn compact_line(text: &str, max_chars: usize) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= max_chars {
@@ -4344,11 +4393,7 @@ impl Widget for RuntimeOverview {
         );
         widgets::fill_round_rect(ctx, bar, pal.field, 5.0);
         if let Some(context) = &chat.context {
-            let denominator = context
-                .max_context_bytes
-                .or(context.compaction_threshold_bytes)
-                .unwrap_or(context.total_bytes.max(1))
-                .max(1);
+            let denominator = context_capacity_bytes(context);
             let mut offset = 0.0;
             let used_w = (bar.width() * (context.total_bytes as f32 / denominator as f32))
                 .clamp(2.0, bar.width());
@@ -4377,26 +4422,13 @@ impl Widget for RuntimeOverview {
                     }
                 }
             }
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(x, bounds.y() + 40.0, bounds.width() - PAD * 2.0, 16.0),
-                &format!(
-                    "context {} / {} · {} source(s) · {} omitted",
-                    format_bytes(context.total_bytes),
-                    format_bytes(denominator),
-                    context.included_count,
-                    context.omitted_count
-                ),
-                label_style,
-            );
-        } else {
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(x, bounds.y() + 40.0, bounds.width() - PAD * 2.0, 16.0),
-                "context pending",
-                label_style,
-            );
         }
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x, bounds.y() + 40.0, bounds.width() - PAD * 2.0, 16.0),
+            &context_overview_summary(&chat),
+            label_style,
+        );
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
@@ -9126,6 +9158,85 @@ mod tests {
             2_097_152,
         );
         assert!(long.starts_with("very long prompt referenc... · 1.0 MB · 50%"));
+    }
+
+    #[test]
+    fn context_overview_summary_describes_lifecycle_state() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.info.provider = "openai".to_string();
+        state.info.model = "gpt-5".to_string();
+        state.activity.clear();
+        state.notice = None;
+
+        assert_eq!(
+            context_overview_summary(&state),
+            "Context will assemble when you send a message"
+        );
+
+        state.messages.push(ChatMessage::user("hello"));
+        assert_eq!(
+            context_overview_summary(&state),
+            "Context will refresh on the next send"
+        );
+
+        state.streaming = true;
+        assert_eq!(
+            context_overview_summary(&state),
+            "Assembling context for this response"
+        );
+
+        state.streaming = false;
+        state.context = Some(ChatContextSnapshot {
+            step_index: 0,
+            provider: "openai".to_string(),
+            model: "gpt-5".to_string(),
+            total_bytes: 4096,
+            max_context_bytes: Some(8192),
+            compaction_threshold_bytes: Some(7000),
+            lanes: vec![sinomo_cli::app_api::ChatContextLane {
+                kind: "recent_tail".to_string(),
+                label: "recent transcript".to_string(),
+                bytes: 1024,
+                priority: 2,
+            }],
+            included_count: 3,
+            omitted_count: 1,
+        });
+        assert_eq!(
+            context_overview_summary(&state),
+            "Context 4.0 KB of 8.0 KB · 3 sources · 1 omitted"
+        );
+    }
+
+    #[test]
+    fn context_overview_summary_routes_blocked_context_to_setup() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.providers.clear();
+        state.models_loading = false;
+        state.activity.clear();
+        state.notice = None;
+
+        assert_eq!(
+            context_overview_summary(&state),
+            "Context waits for provider setup"
+        );
+
+        seed_default_provider(&mut state);
+        state.info.provider = "openai".to_string();
+        state.info.model = "gpt-5".to_string();
+        state.activity.push(ChatActivityEntry {
+            title: "chat list".to_string(),
+            detail: "SIFS unavailable: daemon not reachable".to_string(),
+            tone: ActivityTone::Warn,
+        });
+
+        assert_eq!(
+            context_overview_summary(&state),
+            "Context waits for cluster connection"
+        );
     }
 
     #[test]
