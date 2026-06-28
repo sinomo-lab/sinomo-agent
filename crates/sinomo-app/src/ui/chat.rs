@@ -3435,18 +3435,42 @@ fn session_updated_label(updated_unix: i64) -> String {
     }
 }
 
+fn agent_list_detail(agent: &AgentSummary) -> String {
+    match agent.key.as_str() {
+        "main-agent" => return "Interactive assistant".to_string(),
+        "coding-agent" => return "Code and verification".to_string(),
+        "evolution-agent" => return "Self-evolution workflows".to_string(),
+        "background-agent" => return "Maintenance + cluster support".to_string(),
+        _ => {}
+    }
+    let description = agent.description.trim();
+    if !description.is_empty() {
+        return compact_line(description, 36);
+    }
+    "Agent participant".to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Sidebar — agents + sessions ListViews (rebuilt when the lists change).
 // ---------------------------------------------------------------------------
 
 /// Build the AGENTS ListView: one row per agent, the active one selected, selecting one switches.
 fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let items: Vec<ListItem> = shared
-        .chat()
-        .agents
-        .iter()
-        .map(|agent| ListItem::new(agent.name.clone()).leading_text("✦"))
-        .collect();
+    let items: Vec<ListItem> = {
+        let chat = shared.chat();
+        chat.agents
+            .iter()
+            .map(|agent| {
+                let mut item = ListItem::new(agent.name.clone())
+                    .detail(agent_list_detail(agent))
+                    .leading_icon(IconGlyph::Sparkles);
+                if chat.info.agent == agent.key {
+                    item = item.trailing("Active");
+                }
+                item
+            })
+            .collect()
+    };
     let s = shared.clone();
     ListView::new("chat-agents")
         .items(items)
@@ -7603,6 +7627,26 @@ mod tests {
             &chat,
             &normalized_session_filter("release")
         ));
+    }
+
+    #[test]
+    fn agent_list_detail_uses_catalog_description_and_built_in_fallbacks() {
+        let described = AgentSummary {
+            key: "custom-agent".to_string(),
+            name: "Custom".to_string(),
+            description: "Investigates product workflows and summarizes risky edges.".to_string(),
+        };
+        let coding = AgentSummary {
+            key: "coding-agent".to_string(),
+            name: "coding-agent".to_string(),
+            description: String::new(),
+        };
+
+        assert_eq!(
+            agent_list_detail(&described),
+            "Investigates product workflows an..."
+        );
+        assert_eq!(agent_list_detail(&coding), "Code and verification");
     }
 
     fn isolated_chat_state(_slug: &str) -> (Backend, ChatState) {
