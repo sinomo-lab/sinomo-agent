@@ -886,10 +886,10 @@ fn connection_issues(shared: &Shared) -> Vec<ConnectionIssue> {
             action: "Open Chat",
         });
     }
-    if let Some(error) = ready.files.error.as_deref().filter(|text| !text.is_empty()) {
+    if let Some(detail) = ready.files.connection_attention_detail() {
         issues.push(ConnectionIssue {
-            title: "SIFS browser",
-            detail: format!("SIFS unavailable: {error}"),
+            title: "SIFS access",
+            detail,
             tab: Tab::Files,
             action: "Open Files",
         });
@@ -986,7 +986,7 @@ fn configuration_key(shared: &Shared) -> String {
 fn connection_issue_summary(issue: &ConnectionIssue) -> &'static str {
     match issue.tab {
         Tab::Sinomo => "Chat history and agent channels need recovery.",
-        Tab::Files => "SIFS browsing cannot open through the daemon.",
+        Tab::Files => "SIFS file access needs recovery.",
         _ => "A surface needs recovery.",
     }
 }
@@ -997,7 +997,7 @@ fn connection_issue_recovery_hint(issue: &ConnectionIssue) -> &'static str {
             "Inspect SIFS access from Files, then return to chat."
         }
         Tab::Sinomo => "Return to chat after credentials are fixed.",
-        Tab::Files => "Return to Files after credentials or SIFS access is fixed.",
+        Tab::Files => "Return to Files after SIFS authorization or daemon access is fixed.",
         _ => "Return to the affected surface after the issue is fixed.",
     }
 }
@@ -4128,10 +4128,10 @@ mod tests {
         shared.files_mut().error = Some("device authorization was denied".to_string());
         let issues = connection_issues(&shared);
         assert_eq!(issues.len(), 2);
-        assert_eq!(issues[1].title, "SIFS browser");
+        assert_eq!(issues[1].title, "SIFS access");
         assert_eq!(
             connection_issue_summary(&issues[1]),
-            "SIFS browsing cannot open through the daemon."
+            "SIFS file access needs recovery."
         );
 
         shared.chat_mut().notice = None;

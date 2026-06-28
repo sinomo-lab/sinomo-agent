@@ -362,6 +362,18 @@ impl FilesState {
         }
     }
 
+    pub(crate) fn connection_attention_detail(&self) -> Option<String> {
+        if let Some(error) = self.error.as_deref().filter(|text| !text.is_empty()) {
+            return Some(format!("SIFS unavailable: {error}"));
+        }
+        self.tasks
+            .iter()
+            .find(|task| {
+                task.source == FilesSourceKind::Sifs && task.state == FilesTaskState::Failed
+            })
+            .map(|task| format!("{} failed: {}", task.title, task.detail))
+    }
+
     fn ensure_loaded(&mut self, waker: Option<sui::UiHandle>) {
         if self.loaded {
             self.pump_load();
@@ -9014,6 +9026,41 @@ mod tests {
         assert_eq!(
             files_task_detail_display(&running_task),
             "Copying 4.0 MB of 8.0 MB"
+        );
+    }
+
+    #[test]
+    fn connection_attention_reports_failed_sifs_tasks() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.tasks = vec![
+            FilesTask {
+                id: 1,
+                source: FilesSourceKind::Sifs,
+                title: "Refresh placement".to_string(),
+                detail: "device authorization was denied".to_string(),
+                state: FilesTaskState::Failed,
+                progress: Some(1.0),
+            },
+            FilesTask {
+                id: 2,
+                source: FilesSourceKind::Local,
+                title: "Delete".to_string(),
+                detail: "access denied".to_string(),
+                state: FilesTaskState::Failed,
+                progress: Some(1.0),
+            },
+        ];
+
+        assert_eq!(
+            state.connection_attention_detail(),
+            Some("Refresh placement failed: device authorization was denied".to_string())
+        );
+
+        state.error = Some("daemon connection refused".to_string());
+        assert_eq!(
+            state.connection_attention_detail(),
+            Some("SIFS unavailable: daemon connection refused".to_string())
         );
     }
 
