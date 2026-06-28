@@ -2272,8 +2272,22 @@ impl ChatState {
 
     /// Update the composer draft (bound to the composer `TextArea` via its `on_change`).
     fn set_draft(&mut self, text: String) {
+        let was_empty = self.input.is_empty();
+        let is_empty = text.is_empty();
         self.cursor = text.len();
         self.input = text;
+        if was_empty != is_empty {
+            self.draft_revision = self.draft_revision.wrapping_add(1);
+        }
+    }
+
+    fn clear_draft(&mut self) {
+        if self.input.is_empty() {
+            return;
+        }
+        self.input.clear();
+        self.cursor = 0;
+        self.draft_revision = self.draft_revision.wrapping_add(1);
     }
 
     fn apply_quick_action(&mut self, action: ChatQuickAction) {
@@ -6760,6 +6774,7 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     };
 
     let streaming = shared.chat().streaming;
+    let has_draft = !shared.chat().input.is_empty();
     let send: WidgetPod = if streaming {
         let s = shared.clone();
         WidgetPod::new(
@@ -6770,6 +6785,38 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 .on_press(move || {
                     s.chat_mut().interrupt_turn();
                 }),
+        )
+    } else if has_draft {
+        let clear = {
+            let s = shared.clone();
+            IconButton::new(IconGlyph::Close, "Clear draft")
+                .size(SEND_BUTTON_SIZE)
+                .icon_size(16.0)
+                .theme_when(secondary_button_theme(reader))
+                .on_press(move || {
+                    s.chat_mut().clear_draft();
+                })
+        };
+        let send = {
+            let s = shared.clone();
+            IconButton::new(IconGlyph::Send, "Send")
+                .size(SEND_BUTTON_SIZE)
+                .icon_size(17.0)
+                .theme_when(clone_reader(reader))
+                .enabled_when({
+                    let s = s.clone();
+                    move || s.chat().can_send()
+                })
+                .on_press(move || {
+                    s.chat_mut().submit();
+                })
+        };
+        WidgetPod::new(
+            Flex::horizontal()
+                .gap(6.0)
+                .align_items(Alignment::Center)
+                .with_child(clear)
+                .with_child(send),
         )
     } else {
         let s = shared.clone();
@@ -6787,10 +6834,16 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 }),
         )
     };
+    let action_width = if !streaming && has_draft {
+        SEND_BUTTON_SIZE * 2.0 + 6.0
+    } else {
+        SEND_BUTTON_SIZE
+    };
 
     let row = ComposerInputRow::new(
         WidgetPod::new(input),
         send,
+        action_width,
         SEND_BUTTON_SIZE,
         INPUT_ACTION_GAP,
     );
@@ -7250,38 +7303,47 @@ impl<K: PartialEq + Clone + 'static> Widget for RebuildOnChange<K> {
 struct ComposerInputRow {
     input: WidgetPod,
     action: WidgetPod,
+    action_width: f32,
     action_side: f32,
     gap: f32,
 }
 
 impl ComposerInputRow {
-    fn new(input: WidgetPod, action: WidgetPod, action_side: f32, gap: f32) -> Self {
+    fn new(
+        input: WidgetPod,
+        action: WidgetPod,
+        action_width: f32,
+        action_side: f32,
+        gap: f32,
+    ) -> Self {
         Self {
             input,
             action,
+            action_width: action_width.max(0.0),
             action_side: action_side.max(0.0),
             gap: gap.max(0.0),
         }
     }
 
     fn layout_rects(&self, bounds: Rect) -> (Rect, Rect) {
-        let side = self
+        let height = self
             .action_side
             .min(bounds.width())
             .min(bounds.height())
             .max(0.0);
-        let gap = if side > 0.0 && bounds.width() > side {
-            self.gap.min(bounds.width() - side).max(0.0)
+        let width = self.action_width.min(bounds.width()).max(0.0);
+        let gap = if width > 0.0 && bounds.width() > width {
+            self.gap.min(bounds.width() - width).max(0.0)
         } else {
             0.0
         };
-        let input_width = (bounds.width() - side - gap).max(0.0);
+        let input_width = (bounds.width() - width - gap).max(0.0);
         let input = Rect::new(bounds.x(), bounds.y(), input_width, bounds.height());
         let action = Rect::new(
             bounds.x() + input_width + gap,
-            bounds.y() + ((bounds.height() - side) * 0.5).max(0.0),
-            side,
-            side,
+            bounds.y() + ((bounds.height() - height) * 0.5).max(0.0),
+            width,
+            height,
         );
         (input, action)
     }
@@ -8392,6 +8454,24 @@ mod tests {
         assert!(
             chat.draft_revision > 0,
             "quick action should trigger exactly the programmatic composer refresh path"
+        );
+        let revision_after_quick_action = chat.draft_revision;
+        drop(chat);
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Clear draft")
+            .click()?;
+
+        let chat = shared.chat();
+        assert!(
+            chat.input.is_empty(),
+            "clear draft should empty the composer"
+        );
+        assert_eq!(chat.cursor, 0, "clear draft should reset the cursor");
+        assert!(
+            chat.draft_revision > revision_after_quick_action,
+            "clear draft should trigger the programmatic composer refresh path"
         );
 
         Ok(())
