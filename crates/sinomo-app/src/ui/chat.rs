@@ -1094,9 +1094,20 @@ impl ChatState {
             };
         }
 
+        if let Some(provider) = self.current_provider() {
+            let model = self.current_model();
+            if !model.is_empty() {
+                return RuntimeHealth {
+                    label: "READY",
+                    detail: format!("{} / {}", provider.id, model),
+                    tone: ActivityTone::Good,
+                };
+            }
+        }
+
         RuntimeHealth {
-            label: "PENDING",
-            detail: "runtime discovery pending".to_string(),
+            label: "SETUP",
+            detail: "choose a provider and model".to_string(),
             tone: ActivityTone::Neutral,
         }
     }
@@ -3006,6 +3017,22 @@ fn context_overview_summary(chat: &ChatState) -> String {
     } else {
         "Context will assemble when you send a message".to_string()
     }
+}
+
+fn runtime_overview_title(chat: &ChatState) -> String {
+    if let Some(provider) = chat.current_provider() {
+        let model = chat.current_model();
+        if !model.is_empty() {
+            return format!("{} / {}", provider.name, model);
+        }
+        return format!("{} / Choose a model", provider.name);
+    }
+
+    if !chat.info.provider.is_empty() && !chat.info.model.is_empty() {
+        return format!("{} / {}", chat.info.provider, chat.info.model);
+    }
+
+    "Choose a provider".to_string()
 }
 
 fn compact_line(text: &str, max_chars: usize) -> String {
@@ -4973,11 +5000,7 @@ impl Widget for RuntimeOverview {
         draw_health_chip(ctx, &pal, &theme, chip, &health);
         let title_right = activity_button.map_or(chip.x(), |button| button.x());
         let title_w = (title_right - x - 10.0).max(80.0);
-        let runtime = if chat.info.provider.is_empty() || chat.info.model.is_empty() {
-            "runtime pending".to_string()
-        } else {
-            format!("{} / {}", chat.info.provider, chat.info.model)
-        };
+        let runtime = runtime_overview_title(&chat);
         widgets::draw_text_in(ctx, Rect::new(x, top, title_w, 18.0), &runtime, title_style);
 
         let usage = usage_summary(&chat);
@@ -9393,6 +9416,22 @@ mod tests {
             activity_button_description(&state).contains("Chat history needs recovery"),
             "warning description should use the user-facing recovery summary"
         );
+    }
+
+    #[test]
+    fn runtime_overview_uses_visible_model_selection_before_runtime_info() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.info = RuntimeInfo::default();
+        state.models_loading = false;
+
+        assert_eq!(runtime_overview_title(&state), "OpenAI / gpt-5");
+
+        let health = state.runtime_health();
+        assert_eq!(health.label, "READY");
+        assert_eq!(health.detail, "openai / gpt-5");
+        assert_eq!(health.tone, ActivityTone::Good);
     }
 
     #[test]
