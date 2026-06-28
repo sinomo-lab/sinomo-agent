@@ -401,10 +401,12 @@ impl FilesState {
     fn crumbs(&self) -> Vec<(String, String)> {
         let mut out = vec![("SIFS".to_string(), "/".to_string())];
         let mut acc = String::new();
+        let mut parent: Option<String> = None;
         for part in self.path.split('/').filter(|s| !s.is_empty()) {
             acc.push('/');
             acc.push_str(part);
-            out.push((part.to_string(), acc.clone()));
+            out.push((crumb_label(part, parent.as_deref()), acc.clone()));
+            parent = Some(part.to_string());
         }
         out
     }
@@ -602,6 +604,24 @@ fn middle_short(s: &str, max: usize) -> String {
         .rev()
         .collect();
     format!("{head}…{tail}")
+}
+
+fn crumb_label(segment: &str, parent: Option<&str>) -> String {
+    if parent == Some("nodes") && looks_like_opaque_id(segment) {
+        return format!("node {}", middle_short(segment, 16));
+    }
+    if segment.chars().count() > 22 {
+        middle_short(segment, 22)
+    } else {
+        segment.to_string()
+    }
+}
+
+fn looks_like_opaque_id(segment: &str) -> bool {
+    segment.chars().count() >= 20
+        && segment
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
 }
 
 fn sifs_unavailable_summary(error: &str) -> &'static str {
@@ -2070,6 +2090,45 @@ mod tests {
                 .iter()
                 .skip(1)
                 .all(|(_, target)| target.starts_with('/'))
+        );
+    }
+
+    #[test]
+    fn crumbs_compact_node_ids_without_changing_targets() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.path = "/sinomo/nodes/01kr3d54d45zkm0p0xgps8k7mt/files".to_string();
+
+        let crumbs = state.crumbs();
+
+        assert_eq!(crumbs[0], ("SIFS".to_string(), "/".to_string()));
+        assert_eq!(crumbs[1], ("sinomo".to_string(), "/sinomo".to_string()));
+        assert_eq!(
+            crumbs[2],
+            ("nodes".to_string(), "/sinomo/nodes".to_string())
+        );
+        assert_eq!(
+            crumbs[3],
+            (
+                "node 01kr3d5…gps8k7mt".to_string(),
+                "/sinomo/nodes/01kr3d54d45zkm0p0xgps8k7mt".to_string()
+            )
+        );
+        assert_eq!(
+            crumbs[4],
+            (
+                "files".to_string(),
+                "/sinomo/nodes/01kr3d54d45zkm0p0xgps8k7mt/files".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn crumb_label_compacts_long_non_node_segments() {
+        assert_eq!(crumb_label("services", None), "services");
+        assert_eq!(
+            crumb_label("sinomo-app-chat-session-01ktsg9dw850xkprvhkn0kfr8t", None),
+            "sinomo-app…rvhkn0kfr8t"
         );
     }
 
