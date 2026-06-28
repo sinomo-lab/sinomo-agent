@@ -4945,6 +4945,22 @@ fn row_actions_width() -> f32 {
     ROW_ACTION_SIDE * ROW_ACTION_COUNT + ROW_ACTION_GAP * (ROW_ACTION_COUNT - 1.0) + 8.0
 }
 
+fn row_action_visible(
+    entry: &SifsEntry,
+    action: SifsEntryRowHit,
+    hovered: bool,
+    active: bool,
+    marked: bool,
+    pressed: Option<SifsEntryRowHit>,
+) -> bool {
+    hovered
+        || active
+        || marked
+        || pressed.is_some()
+        || (entry.is_dir && action == SifsEntryRowHit::Inspect)
+        || (marked && action == SifsEntryRowHit::Select)
+}
+
 fn row_transfer_prompt_kind(source: FilesSourceKind) -> FileActionPromptKind {
     match source {
         FilesSourceKind::Sifs => FileActionPromptKind::CopyToLocal,
@@ -5126,7 +5142,6 @@ impl Widget for SifsEntryRow {
             icon_color,
         );
 
-        let show_actions = self.hovered || active || marked || self.pressed.is_some();
         for (action, glyph, color) in [
             (
                 SifsEntryRowHit::Select,
@@ -5160,7 +5175,14 @@ impl Widget for SifsEntryRow {
                 continue;
             }
             let rect = self.action_rect(bounds, action);
-            if show_actions || (action == SifsEntryRowHit::Select && marked) {
+            if row_action_visible(
+                &self.entry,
+                action,
+                self.hovered,
+                active,
+                marked,
+                self.pressed,
+            ) {
                 let fill = if self.pressed == Some(action) {
                     pal.selected
                 } else if action == SifsEntryRowHit::Select && marked {
@@ -5204,12 +5226,16 @@ impl Widget for SifsEntryRow {
         let mut node = SemanticsNode::new(row_id, SemanticsRole::ListItem, ctx.bounds());
         let source = self.shared.files().source;
         node.name = Some(self.entry.name.clone());
-        node.description = Some(format!(
+        let mut description = format!(
             "{}, {} {}",
             entry_kind_label(&self.entry),
             source.path_label(),
             self.entry.path
-        ));
+        );
+        if self.entry.is_dir {
+            description.push_str(". Activate opens the folder; Inspect selects it for management");
+        }
+        node.description = Some(description);
         node.state.focused = ctx.is_focused();
         node.state.hovered = self.hovered;
         node.state.selected = self.active() || self.marked();
@@ -10088,6 +10114,49 @@ mod tests {
     }
 
     #[test]
+    fn directory_inspect_action_is_visible_before_hover() {
+        let dir = SifsEntry {
+            name: "dir".to_string(),
+            path: "/dir".to_string(),
+            is_dir: true,
+            is_link: false,
+            size: None,
+        };
+        let file = SifsEntry {
+            name: "file.txt".to_string(),
+            path: "/file.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(10),
+        };
+
+        assert!(
+            row_action_visible(&dir, SifsEntryRowHit::Inspect, false, false, false, None),
+            "directory rows should always expose the inspect/manage affordance"
+        );
+        assert!(
+            !row_action_visible(&file, SifsEntryRowHit::Inspect, false, false, false, None),
+            "file rows should keep secondary actions quiet until hover or selection"
+        );
+        assert!(row_action_visible(
+            &file,
+            SifsEntryRowHit::Inspect,
+            true,
+            false,
+            false,
+            None
+        ));
+        assert!(row_action_visible(
+            &file,
+            SifsEntryRowHit::Select,
+            false,
+            false,
+            true,
+            None
+        ));
+    }
+
+    #[test]
     fn selected_entry_tracks_selection() {
         let backend = Backend::local_fallback();
         let mut state = FilesState::new(&backend);
@@ -10233,6 +10302,21 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
+        let snapshot = window.snapshot()?;
+        let row = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::ListItem && node.name.as_deref() == Some("dir")
+            })
+            .expect("directory row semantics should be present");
+        assert!(
+            row.description.as_deref().is_some_and(|description| {
+                description.contains("Activate opens the folder; Inspect selects it for management")
+            }),
+            "directory row should explain the open versus inspect split"
+        );
 
         window
             .get_by_role(sui::SemanticsRole::Button)
