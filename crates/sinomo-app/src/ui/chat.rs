@@ -4048,7 +4048,7 @@ fn sidebar_signature(shared: &Shared) -> (String, String, String, String, String
 }
 
 fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
-    let (session, draft, confirming_delete, participants, agent_options) = {
+    let (session, draft, confirming_delete, participants, agent_keys, agent_options) = {
         let chat = shared.chat();
         let edit_id = chat.session_edit_id.as_deref()?;
         let session = chat
@@ -4061,6 +4061,11 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         } else {
             Vec::new()
         };
+        let agent_keys = chat
+            .agents
+            .iter()
+            .map(|agent| agent.key.clone())
+            .collect::<Vec<_>>();
         let agent_options = chat
             .agents
             .iter()
@@ -4071,6 +4076,7 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             chat.session_title_draft.clone(),
             chat.session_delete_confirm_id.as_deref() == Some(edit_id),
             participants,
+            agent_keys,
             agent_options,
         )
     };
@@ -4146,6 +4152,7 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 reader,
                 session_id.clone(),
                 participants,
+                agent_keys,
                 agent_options,
             ));
     }
@@ -4247,9 +4254,14 @@ fn channel_agents_editor(
     reader: &ThemeReader,
     channel_id: String,
     participants: Vec<ChannelAgentRef>,
+    agent_keys: Vec<String>,
     agent_options: Vec<String>,
 ) -> impl Widget + use<> {
     let participant_count = participants.len();
+    let assigned_agent_keys = participants
+        .iter()
+        .map(|participant| participant.agent_key.clone())
+        .collect::<Vec<_>>();
     let mut list = Stack::vertical()
         .spacing(4.0)
         .alignment(Alignment::Stretch)
@@ -4318,7 +4330,17 @@ fn channel_agents_editor(
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
-                move || !s.chat().agents.is_empty()
+                let agent_keys = agent_keys.clone();
+                let assigned_agent_keys = assigned_agent_keys.clone();
+                move || {
+                    let chat = s.chat();
+                    let Some(agent_key) = agent_keys.get(chat.channel_agent_idx) else {
+                        return false;
+                    };
+                    !assigned_agent_keys
+                        .iter()
+                        .any(|assigned_key| assigned_key == agent_key)
+                }
             })
             .on_press_with_ctx(move |ctx| {
                 s.chat_mut().add_selected_agent_to_channel();
@@ -8360,6 +8382,58 @@ mod tests {
                 .iter()
                 .any(|node| node.name.as_deref() == Some("2 active")),
             "channel edit dialog should show the active-agent count"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_channel_edit_dialog_disables_duplicate_agent_add() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let data_dir = backend.data_dir.clone();
+        let shared = Shared::new(AppState::ready(backend));
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Ops channel");
+        channel.ensure_participant("main-agent", "main-agent");
+        SifsAgentChannelStore::open(&data_dir)
+            .expect("open channel store")
+            .save_channel(&channel)
+            .expect("save channel");
+        let session_id = channel_id.to_string();
+        {
+            let mut chat = shared.chat_mut();
+            seed_test_agents(&mut chat);
+            chat.sessions = vec![SessionRef {
+                id: session_id.clone(),
+                title: "Ops channel".to_string(),
+                kind: ConversationKind::Channel,
+                updated_unix: 1,
+                participant_count: 1,
+            }];
+            chat.session_id = session_id.clone();
+            chat.session_edit_id = Some(session_id);
+            chat.session_title_draft = "Ops channel".to_string();
+            chat.channel_agent_idx = 0;
+            chat.models_loading = false;
+        }
+
+        let runtime = crate::build_runtime(shared.clone())?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+        let snapshot = window.snapshot()?;
+        let add_agent = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button && node.name.as_deref() == Some("Add agent")
+            })
+            .expect("Add agent button should be visible");
+
+        assert!(
+            add_agent.state.disabled,
+            "Add agent should be disabled when the selected agent is already assigned"
         );
 
         Ok(())
