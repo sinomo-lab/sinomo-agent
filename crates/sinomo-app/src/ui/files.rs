@@ -67,6 +67,7 @@ type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileActionPromptKind {
+    GoTo,
     NewFile,
     NewFolder,
     Rename,
@@ -76,6 +77,7 @@ enum FileActionPromptKind {
 impl FileActionPromptKind {
     fn title(self) -> &'static str {
         match self {
+            Self::GoTo => "Go to path",
             Self::NewFile => "New file",
             Self::NewFolder => "New folder",
             Self::Rename => "Rename",
@@ -85,6 +87,7 @@ impl FileActionPromptKind {
 
     fn primary_label(self) -> &'static str {
         match self {
+            Self::GoTo => "Open path",
             Self::NewFile => "Create file",
             Self::NewFolder => "Create folder",
             Self::Rename => "Rename",
@@ -624,6 +627,7 @@ impl FilesState {
             None => (None, String::new(), false),
         };
         let input = match kind {
+            FileActionPromptKind::GoTo => self.path.clone(),
             FileActionPromptKind::NewFile => "untitled.txt".to_string(),
             FileActionPromptKind::NewFolder => "New folder".to_string(),
             FileActionPromptKind::Rename => target_name.clone(),
@@ -662,6 +666,23 @@ impl FilesState {
         let Some(prompt) = self.action_prompt.clone() else {
             return;
         };
+        if prompt.kind == FileActionPromptKind::GoTo {
+            match normalize_jump_path(&prompt.input) {
+                Ok(path) => {
+                    self.action_prompt = None;
+                    if let Some(waker) = waker {
+                        self.ensure_worker(waker);
+                    }
+                    self.navigate(path);
+                }
+                Err(error) => {
+                    if let Some(current) = &mut self.action_prompt {
+                        current.error = Some(error);
+                    }
+                }
+            }
+            return;
+        }
         match self.operation_from_prompt(&prompt) {
             Ok((operation, title, detail)) => {
                 self.action_prompt = None;
@@ -680,6 +701,7 @@ impl FilesState {
         prompt: &FileActionPrompt,
     ) -> Result<(FilesOperation, String, String), String> {
         match prompt.kind {
+            FileActionPromptKind::GoTo => unreachable!("Go to path is handled before operations"),
             FileActionPromptKind::NewFile => {
                 let path = join_sifs_child(&self.path, &prompt.input)?;
                 Ok((
@@ -1152,6 +1174,17 @@ fn join_sifs_child(parent: &str, name: &str) -> Result<String, String> {
     } else {
         format!("{parent}/{name}")
     })
+}
+
+fn normalize_jump_path(path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("path cannot be empty".to_string());
+    }
+    if trimmed.bytes().any(|byte| byte == 0) {
+        return Err("path cannot contain NUL bytes".to_string());
+    }
+    Ok(normalize_path(trimmed))
 }
 
 fn execute_files_operation(
@@ -1831,6 +1864,21 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             })
     };
 
+    let go_to = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Search, "Go to path")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.files().loading
+            })
+            .on_press_with_ctx(move |ctx| {
+                s.files_mut().open_action_prompt(FileActionPromptKind::GoTo);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+
     let new_file = {
         let s = shared.clone();
         sui::Button::new("New file")
@@ -1905,6 +1953,7 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .with_child(up)
         .with_child(breadcrumb)
         .with_child(refresh)
+        .with_child(go_to)
         .with_child(new_file)
         .with_child(new_folder)
         .with_child(rename)
@@ -3766,6 +3815,7 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     let prompt = shared.files().action_prompt.clone()?;
     let title = prompt.kind.title();
     let description = match prompt.kind {
+        FileActionPromptKind::GoTo => "Open a SIFS path, such as /services".to_string(),
         FileActionPromptKind::NewFile => format!("Create a file in {}", shared.files().path),
         FileActionPromptKind::NewFolder => format!("Create a folder in {}", shared.files().path),
         FileActionPromptKind::Rename => prompt
@@ -3779,10 +3829,10 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .map(|path| format!("Delete {path}"))
             .unwrap_or_else(|| "Select an item to delete".to_string()),
     };
-    let input_label = if prompt.kind == FileActionPromptKind::Delete {
-        "Type DELETE"
-    } else {
-        "Name"
+    let input_label = match prompt.kind {
+        FileActionPromptKind::GoTo => "Path",
+        FileActionPromptKind::Delete => "Type DELETE",
+        _ => "Name",
     };
     let input = {
         let s = shared.clone();
@@ -4725,6 +4775,14 @@ mod tests {
         );
         assert_eq!(normalize_path("users\\sinomo"), "/users/sinomo");
         assert_eq!(
+            normalize_jump_path(" services\\sinomo/.. ").as_deref(),
+            Ok("/services")
+        );
+        assert_eq!(
+            normalize_jump_path("   "),
+            Err("path cannot be empty".to_string())
+        );
+        assert_eq!(
             parent_path("/services/sinomo"),
             Some("/services".to_string())
         );
@@ -4854,8 +4912,79 @@ mod tests {
                 .count()?,
             1
         );
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Go to path")
+                .count()?,
+            1
+        );
 
         Ok(())
+    }
+
+    #[test]
+    fn header_go_to_path_opens_current_path_prompt() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/services".to_string();
+            files.entries.clear();
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files go to path")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Go to path")
+            .click()?;
+
+        let files = shared.files();
+        let prompt = files.action_prompt.as_ref().expect("go to path prompt");
+        assert_eq!(prompt.kind, FileActionPromptKind::GoTo);
+        assert_eq!(prompt.input, "/services");
+        assert_eq!(prompt.error, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn go_to_path_prompt_navigates_or_reports_validation_error() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.loaded = true;
+        state.loading = false;
+        state.path = "/".to_string();
+
+        state.open_action_prompt(FileActionPromptKind::GoTo);
+        state.set_action_prompt_input("services/../cluster-tests".to_string());
+        state.submit_action_prompt(None);
+
+        assert_eq!(state.path, "/cluster-tests");
+        assert!(state.action_prompt.is_none());
+
+        state.open_action_prompt(FileActionPromptKind::GoTo);
+        state.set_action_prompt_input("   ".to_string());
+        state.submit_action_prompt(None);
+
+        assert_eq!(state.path, "/cluster-tests");
+        let prompt = state
+            .action_prompt
+            .as_ref()
+            .expect("validation keeps prompt");
+        assert_eq!(prompt.kind, FileActionPromptKind::GoTo);
+        assert_eq!(prompt.error.as_deref(), Some("path cannot be empty"));
     }
 
     #[test]
