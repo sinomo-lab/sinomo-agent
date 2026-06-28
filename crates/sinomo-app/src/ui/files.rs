@@ -230,6 +230,20 @@ impl FilesState {
         self.ensure_loaded(waker);
     }
 
+    fn refresh(&mut self, waker: Option<sui::UiHandle>) {
+        if !self.loaded {
+            self.ensure_loaded(waker);
+            return;
+        }
+        if self.loading {
+            return;
+        }
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        self.reload();
+    }
+
     fn reset_for_retry(&mut self) {
         self.browser = None;
         self.error = None;
@@ -565,6 +579,29 @@ fn short(s: &str, max: usize) -> String {
             .collect();
         format!("…{tail}")
     }
+}
+
+fn middle_short(s: &str, max: usize) -> String {
+    let len = s.chars().count();
+    if len <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let kept = max - 1;
+    let head_len = kept / 2;
+    let tail_len = kept - head_len;
+    let head: String = s.chars().take(head_len).collect();
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}…{tail}")
 }
 
 fn sifs_unavailable_summary(error: &str) -> &'static str {
@@ -905,11 +942,31 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             })
     };
 
+    let refresh = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Redo, "Refresh SIFS")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .selected_when({
+                let s = s.clone();
+                move || s.files().loading
+            })
+            .enabled_when({
+                let s = s.clone();
+                move || !s.files().loading
+            })
+            .on_press(move || {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut().refresh(waker);
+            })
+    };
+
     Stack::horizontal()
         .spacing(8.0)
         .alignment(Alignment::Center)
         .with_child(up)
         .with_child(breadcrumb)
+        .with_child(refresh)
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,7 +1314,8 @@ impl Widget for InspectorView {
 
         // Name + kind.
         let name_style = pal.text_style(&theme, 16.0, FontWeight::SEMIBOLD, pal.text);
-        widgets::draw_text_in(ctx, Rect::new(x, y, w, 24.0), &entry.name, name_style);
+        let display_name = middle_short(&entry.name, 36);
+        widgets::draw_text_in(ctx, Rect::new(x, y, w, 24.0), &display_name, name_style);
         y += 26.0;
         let kind = if entry.is_dir {
             "Directory"
@@ -2211,6 +2269,17 @@ mod tests {
     }
 
     #[test]
+    fn middle_short_keeps_long_sifs_names_single_line() {
+        let name = "sinomo-app-chat-session-01ktsg9dw850xkprvhkn0kfr8t.json";
+        let compact = middle_short(name, 36);
+
+        assert_eq!(compact.chars().count(), 36);
+        assert!(compact.starts_with("sinomo-app-chat"));
+        assert!(compact.ends_with("hkn0kfr8t.json"));
+        assert!(compact.contains('…'));
+    }
+
+    #[test]
     fn files_secondary_button_theme_remaps_accent_slots() {
         let reader: ThemeReader = Rc::new(DefaultTheme::light);
         let base = reader();
@@ -2325,6 +2394,43 @@ mod tests {
     }
 
     #[test]
+    fn refresh_queues_current_sifs_path_without_navigation() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        let (tx, rx) = mpsc::channel();
+        let (_result_tx, result_rx) = mpsc::channel();
+
+        state.loaded = true;
+        state.loading = false;
+        state.path = "/services".to_string();
+        state.entries = vec![SifsEntry {
+            name: "old".to_string(),
+            path: "/services/old".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(1),
+        }];
+        state.selected = Some(0);
+        state.worker_tx = Some(tx);
+        state.worker_rx = Some(result_rx);
+
+        state.refresh(None);
+
+        assert!(state.loading);
+        assert_eq!(state.path, "/services");
+        assert_eq!(state.selected, None);
+        assert!(state.entries.is_empty());
+        assert_eq!(state.pending_request_id, Some(0));
+        assert_eq!(state.list_revision, 1);
+        match rx.try_recv().expect("refresh command") {
+            FilesWorkerCommand::List { request_id, path } => {
+                assert_eq!(request_id, 0);
+                assert_eq!(path, "/services");
+            }
+        }
+    }
+
+    #[test]
     fn path_normalization_keeps_sifs_paths_absolute() {
         assert_eq!(
             normalize_path("/users/../services/./sinomo"),
@@ -2422,6 +2528,45 @@ mod tests {
         assert!(files.entries.is_empty());
         assert_eq!(files.selected, None);
         assert_eq!(files.path, "/services");
+
+        Ok(())
+    }
+
+    #[test]
+    fn header_exposes_refresh_sifs_action() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.entries = vec![SifsEntry {
+                name: "services".to_string(),
+                path: "/services".to_string(),
+                is_dir: true,
+                is_link: false,
+                size: None,
+            }];
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files refresh")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Refresh SIFS")
+                .count()?,
+            1
+        );
 
         Ok(())
     }
