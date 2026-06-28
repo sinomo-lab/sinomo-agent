@@ -3423,8 +3423,15 @@ fn session_meta_label(session: &SessionRef) -> String {
 
 fn session_kind_badge_label(kind: ConversationKind) -> &'static str {
     match kind {
-        ConversationKind::Chat => "CHAT",
-        ConversationKind::Channel => "CHANNEL",
+        ConversationKind::Chat => "Chat",
+        ConversationKind::Channel => "Channel",
+    }
+}
+
+fn session_kind_badge_width(kind: ConversationKind) -> f32 {
+    match kind {
+        ConversationKind::Chat => 42.0,
+        ConversationKind::Channel => 62.0,
     }
 }
 
@@ -3894,11 +3901,16 @@ impl Widget for ChatSessionRow {
         let meta_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
         let badge_style = pal.text_style(
             &theme,
-            8.5,
+            9.5,
             FontWeight::SEMIBOLD,
             if active { pal.accent } else { pal.text_faint },
         );
-        let badge = Rect::new(bounds.x() + 2.0, bounds.y() + 7.0, 54.0, 18.0);
+        let badge = Rect::new(
+            bounds.x() + 2.0,
+            bounds.y() + 7.0,
+            session_kind_badge_width(self.session.kind),
+            18.0,
+        );
         let badge_fill = if active { pal.selected } else { pal.field };
         let badge_border = if active {
             pal.accent.with_alpha(0.42)
@@ -3908,7 +3920,7 @@ impl Widget for ChatSessionRow {
         widgets::round_panel(ctx, badge, badge_fill, badge_border, 5.0);
         widgets::draw_text_in(
             ctx,
-            Rect::new(badge.x() + 6.0, badge.y() + 1.0, badge.width() - 8.0, 15.0),
+            Rect::new(badge.x() + 7.0, badge.y() + 1.0, badge.width() - 12.0, 15.0),
             session_kind_badge_label(self.session.kind),
             badge_style,
         );
@@ -7762,8 +7774,12 @@ mod tests {
 
         assert_eq!(session_meta_label(&channel), "2 agents · not saved");
         assert_eq!(session_meta_label(&chat), "Chat · not saved");
-        assert_eq!(session_kind_badge_label(channel.kind), "CHANNEL");
-        assert_eq!(session_kind_badge_label(chat.kind), "CHAT");
+        assert_eq!(session_kind_badge_label(channel.kind), "Channel");
+        assert_eq!(session_kind_badge_label(chat.kind), "Chat");
+        assert!(
+            session_kind_badge_width(channel.kind) > session_kind_badge_width(chat.kind),
+            "channel badge needs extra width for its longer label"
+        );
     }
 
     #[test]
