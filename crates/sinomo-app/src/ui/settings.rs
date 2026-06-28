@@ -109,6 +109,7 @@ pub struct SettingsState {
     pub role: String,
     pub clustered: bool,
     pub cluster_id: Option<String>,
+    pub cluster_node_id: Option<String>,
     pub cluster_summary: Option<String>,
     pub join_invite: String,
     pub invite_result: Option<AppClusterInvite>,
@@ -223,6 +224,7 @@ impl SettingsState {
             role: format!("{:?}", backend.node.role).to_lowercase(),
             clustered,
             cluster_id: cluster_status.cluster_id.clone(),
+            cluster_node_id: cluster_status.local_node_id.clone(),
             cluster_summary,
             join_invite: String::new(),
             invite_result: None,
@@ -471,6 +473,7 @@ impl SettingsState {
         let previous_cluster_id = self.cluster_id.clone();
         self.clustered = status.clustered;
         self.cluster_id = status.cluster_id;
+        self.cluster_node_id = status.local_node_id;
         self.cluster_summary = status.summary;
         self.cluster_action_error = status.error;
         self.leave_confirming = false;
@@ -750,7 +753,7 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
                 shared.settings().mode_label.clone()
             }
         }
-        SettingsSection::Node => shared.settings().role.clone(),
+        SettingsSection::Node => app_surface_summary(&shared.settings().role),
         SettingsSection::Cluster => {
             let settings = shared.settings();
             if settings.clustered {
@@ -920,12 +923,13 @@ fn connection_issue_key(shared: &Shared) -> String {
 fn node_detail_key(shared: &Shared) -> String {
     let settings = shared.settings();
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{:?}\nexpanded:{}",
+        "{}\n{}\n{}\n{}\n{}\n{:?}\n{:?}\nexpanded:{}",
         settings.node_id,
         settings.role,
         settings.mode_label,
         settings.status_detail,
         settings.clustered,
+        settings.cluster_node_id,
         settings.cluster_summary,
         settings.node_detail_expanded
     )
@@ -1445,14 +1449,24 @@ fn section_node(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 }
 
 fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (short_node_id, full_node_id, role, mode_label, status_detail, cluster_summary, expanded) = {
+    let (
+        short_surface_id,
+        full_surface_id,
+        surface_summary,
+        mode_label,
+        status_detail,
+        cluster_node_id,
+        cluster_summary,
+        expanded,
+    ) = {
         let s = shared.settings();
         (
             short(&s.node_id, 30),
             s.node_id.clone(),
-            s.role.clone(),
+            app_surface_summary(&s.role),
             s.mode_label.clone(),
             s.status_detail.clone(),
+            s.cluster_node_id.clone(),
             s.cluster_summary.clone(),
             s.node_detail_expanded(),
         )
@@ -1475,7 +1489,7 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
 
     let mut body = FieldGroup::new()
         .spacing(6.0)
-        .with_child(value_row(shared, reader, "This device", role.clone()))
+        .with_child(value_row(shared, reader, "App surface", surface_summary))
         .with_child(value_row(shared, reader, "Connection", mode_label.clone()))
         .with_child(
             FormRow::new("Details", Stack::horizontal().with_child(detail_button))
@@ -1484,25 +1498,46 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         );
     if expanded {
         body = body
-            .with_child(value_row(shared, reader, "Node ID", short_node_id))
+            .with_child(value_row(
+                shared,
+                reader,
+                "App surface ID",
+                short_surface_id,
+            ))
             .with_child(copyable_text_row(
                 reader,
-                "node-full-id",
-                "Full node ID",
-                full_node_id,
+                "app-surface-full-id",
+                "Full app surface ID",
+                full_surface_id,
             ))
-            .with_child(value_row(shared, reader, "Connection", mode_label))
             .with_child(copyable_area_row(
                 reader,
                 "node-connection-detail",
                 "Connection detail",
                 status_detail,
             ));
+        if let Some(cluster_node_id) = cluster_node_id {
+            body = body
+                .with_child(value_row(
+                    shared,
+                    reader,
+                    "Daemon node ID",
+                    short(&cluster_node_id, 30),
+                ))
+                .with_child(copyable_text_row(
+                    reader,
+                    "daemon-node-full-id",
+                    "Full daemon node ID",
+                    cluster_node_id,
+                ));
+        }
         if let Some(summary) = cluster_summary {
             body = body.with_child(value_row(shared, reader, "Cluster", summary));
         }
     }
-    FormSection::new("Node", body).theme_when(clone_reader(reader))
+    FormSection::new("Node", body)
+        .description("App surface identity and the attached daemon or cluster connection.")
+        .theme_when(clone_reader(reader))
 }
 
 fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -1708,14 +1743,26 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
 }
 
 fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (version, mode_label, status_detail, node_id, role, cluster_summary) = {
+    let (
+        version,
+        mode_label,
+        status_detail,
+        app_surface_id,
+        surface_role,
+        cluster_node_id,
+        cluster_summary,
+    ) = {
         let settings = shared.settings();
         (
             settings.version.clone(),
             settings.mode_label.clone(),
             short_one_line(&settings.status_detail, 96),
             short(&settings.node_id, 38),
-            settings.role.clone(),
+            app_surface_summary(&settings.role),
+            settings
+                .cluster_node_id
+                .as_deref()
+                .map(|node_id| short(node_id, 38)),
             settings
                 .cluster_summary
                 .clone()
@@ -1738,13 +1785,16 @@ fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             format!("v{version}"),
         ))
         .with_child(value_row(shared, reader, "Toolkit", "SUI"));
-    let runtime = FieldGroup::new()
+    let mut runtime = FieldGroup::new()
         .spacing(6.0)
         .with_child(value_row(shared, reader, "Mode", mode_label))
         .with_child(value_row(shared, reader, "Status", status_detail))
-        .with_child(value_row(shared, reader, "Node", node_id))
-        .with_child(value_row(shared, reader, "Role", role))
-        .with_child(value_row(shared, reader, "Cluster", cluster_summary));
+        .with_child(value_row(shared, reader, "App surface", app_surface_id))
+        .with_child(value_row(shared, reader, "Surface role", surface_role));
+    if let Some(cluster_node_id) = cluster_node_id {
+        runtime = runtime.with_child(value_row(shared, reader, "Daemon node", cluster_node_id));
+    }
+    runtime = runtime.with_child(value_row(shared, reader, "Cluster", cluster_summary));
     Stack::vertical()
         .spacing(14.0)
         .alignment(Alignment::Stretch)
@@ -1755,7 +1805,9 @@ fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         )
         .with_child(
             FormSection::new("Runtime", runtime)
-                .description("Current connection and node identity for support and diagnostics.")
+                .description(
+                    "Current connection plus app surface and daemon identity for diagnostics.",
+                )
                 .theme_when(clone_reader(reader)),
         )
 }
@@ -3439,6 +3491,15 @@ fn short(s: &str, max: usize) -> String {
     }
 }
 
+fn app_surface_summary(role: &str) -> String {
+    let role = role.trim();
+    if role.is_empty() {
+        "app surface".to_string()
+    } else {
+        format!("{role} app surface")
+    }
+}
+
 /// Build the settings tab content.
 pub fn view(shared: Shared) -> impl Widget {
     SettingsView::new(shared)
@@ -3766,6 +3827,7 @@ mod tests {
             settings.node_id = "node_about_test".to_string();
             settings.role = "voter".to_string();
             settings.clustered = true;
+            settings.cluster_node_id = Some("daemon_node_about_test".to_string());
             settings.cluster_summary = Some("cluster test · voter".to_string());
         }
 
@@ -3791,6 +3853,8 @@ mod tests {
                 >= 1
         );
         assert!(window.get_by_text("node_about_test").count()? >= 1);
+        assert!(window.get_by_text("voter app surface").count()? >= 1);
+        assert!(window.get_by_text("daemon_node_about_test").count()? >= 1);
         assert!(window.get_by_text("cluster test · voter").count()? >= 1);
 
         Ok(())
@@ -3977,6 +4041,7 @@ mod tests {
             settings.role = "mobile".to_string();
             settings.mode_label = "Cluster".to_string();
             settings.status_detail = "Connected to daemon at 127.0.0.1:21353".to_string();
+            settings.cluster_node_id = Some("01daemon-full-id-for-test".to_string());
         }
 
         let runtime = sui::Application::new()
@@ -3989,14 +4054,29 @@ mod tests {
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
-        window.get_by_text("This device").expect().to_be_visible()?;
-        window.get_by_text("mobile").expect().to_be_visible()?;
+        window.get_by_text("App surface").expect().to_be_visible()?;
+        window
+            .get_by_text("mobile app surface")
+            .expect()
+            .to_be_visible()?;
         window.get_by_text("Connection").expect().to_be_visible()?;
         window.get_by_text("Cluster").expect().to_be_visible()?;
-        window.get_by_text("Node ID").expect().to_be_hidden()?;
+        window
+            .get_by_text("App surface ID")
+            .expect()
+            .to_be_hidden()?;
+        window
+            .get_by_text("Daemon node ID")
+            .expect()
+            .to_be_hidden()?;
         window
             .get_by_role(sui::SemanticsRole::TextInput)
-            .with_name("node-full-id")
+            .with_name("app-surface-full-id")
+            .expect()
+            .to_be_hidden()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("daemon-node-full-id")
             .expect()
             .to_be_hidden()?;
 
@@ -4004,12 +4084,24 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Show detail")
             .click()?;
-        window.get_by_text("Node ID").expect().to_be_visible()?;
+        window
+            .get_by_text("App surface ID")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_text("Daemon node ID")
+            .expect()
+            .to_be_visible()?;
         window
             .get_by_role(sui::SemanticsRole::TextInput)
-            .with_name("node-full-id")
+            .with_name("app-surface-full-id")
             .expect()
             .to_have_value("01node-full-id-for-test")?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("daemon-node-full-id")
+            .expect()
+            .to_have_value("01daemon-full-id-for-test")?;
 
         Ok(())
     }
