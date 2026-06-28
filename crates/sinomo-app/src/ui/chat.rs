@@ -1511,11 +1511,17 @@ impl ChatState {
         }
     }
 
-    fn empty_conversation_hint(&self) -> &'static str {
-        if self.current_is_channel() {
-            "Send a message to the channel."
+    fn empty_conversation_hint(&self) -> String {
+        if let Some(session) = self
+            .current_session_ref()
+            .filter(|session| session.kind == ConversationKind::Channel)
+        {
+            format!(
+                "{} · send a message to the channel.",
+                active_agents_label(session.participant_count)
+            )
         } else {
-            "Type a message below to begin."
+            "Type a message below to begin.".to_string()
         }
     }
 
@@ -3445,6 +3451,14 @@ fn plural_agents(count: usize) -> String {
         "1 agent".to_string()
     } else {
         format!("{count} agents")
+    }
+}
+
+fn active_agents_label(count: usize) -> String {
+    if count == 1 {
+        "1 active agent".to_string()
+    } else {
+        format!("{count} active agents")
     }
 }
 
@@ -5968,6 +5982,15 @@ impl TranscriptView {
         )
     }
 
+    fn empty_text_widget_id(parent: sui::WidgetId, slot: usize) -> sui::WidgetId {
+        sui::WidgetId::new(
+            parent
+                .get()
+                .wrapping_mul(43)
+                .wrapping_add(9_501 + slot as u64),
+        )
+    }
+
     fn request_recovery_action_refresh(ctx: &mut EventCtx) {
         use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
 
@@ -6246,6 +6269,29 @@ impl Widget for TranscriptView {
         };
         if target.is_none() {
             if messages_empty {
+                let (title, hint) = {
+                    let chat = self.shared.chat();
+                    (
+                        chat.empty_conversation_title(),
+                        chat.empty_conversation_hint(),
+                    )
+                };
+                let (cx, cy) = Self::empty_state_center(ctx.bounds());
+                let text_width = (ctx.bounds().width() - PAD * 4.0).max(120.0).min(560.0);
+                for (slot, (name, y, height)) in
+                    [(title, cy + 2.0, 22.0_f32), (hint, cy + 26.0, 18.0_f32)]
+                        .into_iter()
+                        .enumerate()
+                {
+                    let mut node = SemanticsNode::new(
+                        Self::empty_text_widget_id(ctx.widget_id(), slot),
+                        SemanticsRole::Text,
+                        Rect::new(cx - text_width / 2.0, y, text_width, height),
+                    );
+                    node.parent = Some(ctx.widget_id());
+                    node.name = Some(name);
+                    ctx.push(node);
+                }
                 for (slot, (action, rect)) in Self::quick_action_rects(ctx.bounds())
                     .into_iter()
                     .enumerate()
@@ -6339,7 +6385,8 @@ impl TranscriptView {
         let title = pal.text_style(theme, 17.0, FontWeight::SEMIBOLD, pal.text_muted);
         widgets::draw_centered(ctx, &chat.empty_conversation_title(), title, cx, cy + 2.0);
         let sub = pal.text_style(theme, 12.5, FontWeight::NORMAL, pal.text_faint);
-        widgets::draw_centered(ctx, chat.empty_conversation_hint(), sub, cx, cy + 26.0);
+        let hint = chat.empty_conversation_hint();
+        widgets::draw_centered(ctx, &hint, sub, cx, cy + 26.0);
 
         for (action, rect) in Self::quick_action_rects(area) {
             self.paint_quick_action(ctx, theme, pal, action, rect);
@@ -7897,7 +7944,7 @@ mod tests {
         assert_eq!(state.empty_conversation_title(), "Channel: Release triage");
         assert_eq!(
             state.empty_conversation_hint(),
-            "Send a message to the channel."
+            "2 active agents · send a message to the channel."
         );
     }
 
@@ -8494,6 +8541,48 @@ mod tests {
         assert!(
             chat.draft_revision > revision_after_quick_action,
             "clear draft should trigger the programmatic composer refresh path"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_empty_channel_surfaces_active_agent_count() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let channel_id = SessionId::generate().to_string();
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            seed_test_agents(&mut chat);
+            chat.sessions = vec![SessionRef {
+                id: channel_id.clone(),
+                title: "Release triage".to_string(),
+                kind: ConversationKind::Channel,
+                updated_unix: 1,
+                participant_count: 2,
+            }];
+            chat.session_id = channel_id;
+            chat.messages.clear();
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Channel empty state")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert!(
+            window
+                .get_by_text("2 active agents · send a message to the channel.")
+                .count()?
+                >= 1,
+            "selected channel empty state should show the active-agent count"
         );
 
         Ok(())
