@@ -64,6 +64,8 @@ pub struct AgentChannelSummary {
     pub deleted_at: Option<time::OffsetDateTime>,
     #[serde(default)]
     pub enabled_participant_count: usize,
+    #[serde(default)]
+    pub participant_names: Vec<String>,
 }
 
 impl AgentChannelSummary {
@@ -79,6 +81,17 @@ impl AgentChannelSummary {
                 .iter()
                 .filter(|participant| participant.enabled)
                 .count(),
+            participant_names: channel
+                .enabled_participants_in_order()
+                .into_iter()
+                .map(|participant| {
+                    if participant.agent_name.trim().is_empty() {
+                        participant.agent_key
+                    } else {
+                        participant.agent_name
+                    }
+                })
+                .collect(),
         }
     }
 

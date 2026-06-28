@@ -445,6 +445,7 @@ pub struct SessionRef {
     pub kind: ConversationKind,
     pub updated_unix: i64,
     pub participant_count: usize,
+    pub participant_names: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1587,6 +1588,29 @@ impl ChatState {
         }
     }
 
+    fn empty_conversation_context(&self) -> Option<String> {
+        let session = self
+            .current_session_ref()
+            .filter(|session| session.kind == ConversationKind::Channel)?;
+        if session.participant_names.is_empty() {
+            return None;
+        }
+
+        let mut names = session
+            .participant_names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        names.dedup();
+        let shown = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+        let extra = names.len().saturating_sub(3);
+        Some(if extra > 0 {
+            format!("Agents: {shown}, +{extra} more")
+        } else {
+            format!("Agents: {shown}")
+        })
+    }
+
     fn begin_edit_session(&mut self, session_id: &str) {
         let Some(session) = self
             .sessions
@@ -2709,6 +2733,7 @@ fn list_conversations_with_error(
             kind: ConversationKind::Chat,
             updated_unix: meta.updated_unix,
             participant_count: 1,
+            participant_names: Vec::new(),
         })
         .collect::<Vec<_>>();
 
@@ -2741,6 +2766,7 @@ fn list_conversations_with_error(
                     kind: ConversationKind::Channel,
                     updated_unix: channel.updated_at.unix_timestamp(),
                     participant_count: channel.enabled_participant_count,
+                    participant_names: channel.participant_names,
                 });
             }
             None
@@ -2766,6 +2792,17 @@ fn session_ref_for_channel(channel: &AgentChannel) -> SessionRef {
         kind: ConversationKind::Channel,
         updated_unix: channel.updated_at.unix_timestamp(),
         participant_count: channel.enabled_participants_in_order().len(),
+        participant_names: channel
+            .enabled_participants_in_order()
+            .into_iter()
+            .map(|participant| {
+                if participant.agent_name.trim().is_empty() {
+                    participant.agent_key
+                } else {
+                    participant.agent_name
+                }
+            })
+            .collect(),
     }
 }
 
@@ -6659,20 +6696,21 @@ impl Widget for TranscriptView {
         };
         if target.is_none() {
             if messages_empty {
-                let (title, hint) = {
+                let (title, hint, context) = {
                     let chat = self.shared.chat();
                     (
                         chat.empty_conversation_title(),
                         chat.empty_conversation_hint(),
+                        chat.empty_conversation_context(),
                     )
                 };
                 let (cx, cy) = Self::empty_state_center(ctx.bounds());
                 let text_width = (ctx.bounds().width() - PAD * 4.0).max(120.0).min(560.0);
-                for (slot, (name, y, height)) in
-                    [(title, cy + 2.0, 22.0_f32), (hint, cy + 26.0, 18.0_f32)]
-                        .into_iter()
-                        .enumerate()
-                {
+                let mut text_nodes = vec![(title, cy + 2.0, 22.0_f32), (hint, cy + 26.0, 18.0)];
+                if let Some(context) = context {
+                    text_nodes.push((context, cy + 44.0, 18.0));
+                }
+                for (slot, (name, y, height)) in text_nodes.into_iter().enumerate() {
                     let mut node = SemanticsNode::new(
                         Self::empty_text_widget_id(ctx.widget_id(), slot),
                         SemanticsRole::Text,
@@ -6781,6 +6819,10 @@ impl TranscriptView {
         let sub = pal.text_style(theme, 12.5, FontWeight::NORMAL, pal.text_faint);
         let hint = chat.empty_conversation_hint();
         widgets::draw_centered(ctx, &hint, sub, cx, cy + 26.0);
+        if let Some(context) = chat.empty_conversation_context() {
+            let context_style = pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.text_muted);
+            widgets::draw_centered(ctx, &context, context_style, cx, cy + 44.0);
+        }
 
         for (action, rect) in Self::quick_action_rects(area, Self::quick_actions(chat)) {
             self.paint_quick_action(ctx, theme, pal, action, rect);
@@ -8125,6 +8167,7 @@ mod tests {
             kind: ConversationKind::Channel,
             updated_unix: 0,
             participant_count: 2,
+            participant_names: Vec::new(),
         };
         let chat = SessionRef {
             id: "chat-meta".to_string(),
@@ -8132,6 +8175,7 @@ mod tests {
             kind: ConversationKind::Chat,
             updated_unix: 0,
             participant_count: 1,
+            participant_names: Vec::new(),
         };
 
         assert_eq!(session_meta_label(&channel), "2 agents · not saved");
@@ -8152,6 +8196,7 @@ mod tests {
             kind: ConversationKind::Channel,
             updated_unix: 0,
             participant_count: 2,
+            participant_names: Vec::new(),
         };
         let chat = SessionRef {
             id: "chat-filter".to_string(),
@@ -8159,6 +8204,7 @@ mod tests {
             kind: ConversationKind::Chat,
             updated_unix: 0,
             participant_count: 1,
+            participant_names: Vec::new(),
         };
 
         assert!(session_matches_filter(
@@ -8192,6 +8238,7 @@ mod tests {
                 kind: ConversationKind::Chat,
                 updated_unix: 0,
                 participant_count: 1,
+                participant_names: Vec::new(),
             },
             SessionRef {
                 id: "channel-filter".to_string(),
@@ -8199,6 +8246,7 @@ mod tests {
                 kind: ConversationKind::Channel,
                 updated_unix: 0,
                 participant_count: 2,
+                participant_names: Vec::new(),
             },
             SessionRef {
                 id: "chat-filter-b".to_string(),
@@ -8206,6 +8254,7 @@ mod tests {
                 kind: ConversationKind::Chat,
                 updated_unix: 0,
                 participant_count: 1,
+                participant_names: Vec::new(),
             },
         ];
 
@@ -8411,6 +8460,7 @@ mod tests {
             kind: ConversationKind::Chat,
             updated_unix: 1,
             participant_count: 1,
+            participant_names: Vec::new(),
         }];
         state.session_id = session_id;
         state.info.agent = "main-agent".to_string();
@@ -8432,6 +8482,7 @@ mod tests {
             kind: ConversationKind::Channel,
             updated_unix: 1,
             participant_count: 2,
+            participant_names: vec!["main-agent".to_string(), "coding-agent".to_string()],
         }];
         state.session_id = channel_id;
         state.info.agent = "main-agent".to_string();
@@ -8440,6 +8491,10 @@ mod tests {
         assert_eq!(
             state.empty_conversation_hint(),
             "2 active agents · send a message to the channel."
+        );
+        assert_eq!(
+            state.empty_conversation_context().as_deref(),
+            Some("Agents: main-agent, coding-agent")
         );
     }
 
@@ -8677,6 +8732,7 @@ mod tests {
                 kind: ConversationKind::Chat,
                 updated_unix: 1,
                 participant_count: 1,
+                participant_names: Vec::new(),
             }];
             chat.session_id = session_id.clone();
             chat.session_edit_id = Some(session_id.clone());
@@ -8720,6 +8776,7 @@ mod tests {
                 kind: ConversationKind::Chat,
                 updated_unix: 1,
                 participant_count: 1,
+                participant_names: Vec::new(),
             }];
             chat.session_id = session_id.clone();
             chat.session_edit_id = Some(session_id.clone());
@@ -8763,6 +8820,7 @@ mod tests {
                 kind: ConversationKind::Chat,
                 updated_unix: 1,
                 participant_count: 1,
+                participant_names: Vec::new(),
             }];
             chat.session_id = session_id.clone();
             chat.models_loading = false;
@@ -8819,6 +8877,7 @@ mod tests {
                 kind: ConversationKind::Channel,
                 updated_unix: 1,
                 participant_count: 2,
+                participant_names: vec!["main-agent".to_string(), "coding-agent".to_string()],
             }];
             chat.session_id = session_id.clone();
             chat.models_loading = false;
@@ -8882,6 +8941,7 @@ mod tests {
                 kind: ConversationKind::Channel,
                 updated_unix: 1,
                 participant_count: 1,
+                participant_names: vec!["main-agent".to_string()],
             }];
             chat.session_id = session_id.clone();
             chat.session_edit_id = Some(session_id);
@@ -8927,6 +8987,7 @@ mod tests {
                     kind: ConversationKind::Chat,
                     updated_unix: 1,
                     participant_count: 1,
+                    participant_names: Vec::new(),
                 },
                 SessionRef {
                     id: second_id.clone(),
@@ -8934,6 +8995,7 @@ mod tests {
                     kind: ConversationKind::Chat,
                     updated_unix: 2,
                     participant_count: 1,
+                    participant_names: Vec::new(),
                 },
             ];
             chat.session_id = first_id;
@@ -8976,6 +9038,7 @@ mod tests {
                     kind: ConversationKind::Chat,
                     updated_unix: 1,
                     participant_count: 1,
+                    participant_names: Vec::new(),
                 },
                 SessionRef {
                     id: second_id.clone(),
@@ -8983,6 +9046,7 @@ mod tests {
                     kind: ConversationKind::Channel,
                     updated_unix: 2,
                     participant_count: 2,
+                    participant_names: Vec::new(),
                 },
             ];
             chat.session_id = first_id;
@@ -9044,6 +9108,7 @@ mod tests {
                     kind: ConversationKind::Chat,
                     updated_unix: 1,
                     participant_count: 1,
+                    participant_names: Vec::new(),
                 },
                 SessionRef {
                     id: second_id.clone(),
@@ -9051,6 +9116,7 @@ mod tests {
                     kind: ConversationKind::Channel,
                     updated_unix: 2,
                     participant_count: 2,
+                    participant_names: Vec::new(),
                 },
             ];
             chat.session_id = first_id;
@@ -9177,8 +9243,17 @@ mod tests {
     #[test]
     fn rendered_empty_channel_surfaces_active_agent_count() -> sui::Result<()> {
         let backend = Backend::local_fallback();
+        let data_dir = backend.data_dir.clone();
         let shared = Shared::new(AppState::ready(backend));
-        let channel_id = SessionId::generate().to_string();
+        let parsed_channel_id = SessionId::generate();
+        let channel_id = parsed_channel_id.to_string();
+        let mut channel = AgentChannel::new_channel(parsed_channel_id, "Release triage");
+        channel.ensure_participant("main-agent", "main-agent");
+        channel.ensure_participant("coding-agent", "coding-agent");
+        SifsAgentChannelStore::open(&data_dir)
+            .expect("open channel store")
+            .save_channel(&channel)
+            .expect("save channel");
         {
             let mut chat = shared.chat_mut();
             seed_default_provider(&mut chat);
@@ -9189,6 +9264,7 @@ mod tests {
                 kind: ConversationKind::Channel,
                 updated_unix: 1,
                 participant_count: 2,
+                participant_names: vec!["main-agent".to_string(), "coding-agent".to_string()],
             }];
             chat.session_id = channel_id.clone();
             chat.messages.clear();
@@ -9211,6 +9287,13 @@ mod tests {
                 .count()?
                 >= 1,
             "selected channel empty state should show the active-agent count"
+        );
+        assert!(
+            window
+                .get_by_text("Agents: main-agent, coding-agent")
+                .count()?
+                >= 1,
+            "selected channel empty state should show the active-agent names"
         );
         window
             .get_by_role(SemanticsRole::Button)
@@ -9295,6 +9378,7 @@ mod tests {
                 kind: ConversationKind::Chat,
                 updated_unix: index,
                 participant_count: 1,
+                participant_names: Vec::new(),
             })
             .collect::<Vec<_>>();
         let active_id = sessions[0].id.clone();
@@ -9356,6 +9440,7 @@ mod tests {
                     kind: ConversationKind::Chat,
                     updated_unix: index,
                     participant_count: 1,
+                    participant_names: Vec::new(),
                 })
                 .collect();
             chat.session_id = chat.sessions[0].id.clone();
@@ -9862,6 +9947,7 @@ mod tests {
                 kind: ConversationKind::Chat,
                 updated_unix: 7,
                 participant_count: 1,
+                participant_names: Vec::new(),
             }],
             error: None,
         })

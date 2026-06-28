@@ -1097,6 +1097,7 @@ fn capture_chat_composed() {
                 kind: ConversationKind::Chat,
                 updated_unix: 1,
                 participant_count: 1,
+                participant_names: Vec::new(),
             }];
             chat.session_id = session_id;
             chat.models_loading = false;
@@ -1144,6 +1145,7 @@ fn capture_chat_composed() {
                 kind: ConversationKind::Channel,
                 updated_unix: 1,
                 participant_count: 2,
+                participant_names: vec!["main-agent".to_string(), "coding-agent".to_string()],
             }];
             chat.session_id = session_id;
             chat.models_loading = false;
