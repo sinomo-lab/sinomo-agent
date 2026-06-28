@@ -4679,18 +4679,17 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
     let source = shared.files().source;
 
     if loading {
-        return WidgetPod::new(
-            centered_note(
-                shared,
-                "▤",
-                format!("Loading {}", source.label()),
-                match source {
-                    FilesSourceKind::Sifs => "Opening the distributed filesystem...",
-                    FilesSourceKind::Local => "Reading the local directory...",
-                },
-            )
-            .glyph(IconGlyph::Storage),
-        );
+        let body = centered_note(
+            shared,
+            "▤",
+            format!("Loading {}", source.label()),
+            match source {
+                FilesSourceKind::Sifs => "Opening the distributed filesystem...",
+                FilesSourceKind::Local => "Reading the local directory...",
+            },
+        )
+        .glyph(IconGlyph::Storage);
+        return placeholder_with_task_strip(shared, body, has_tasks);
     }
     if let Some(error) = error {
         let retry = {
@@ -4723,16 +4722,15 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         if let Some(settings) = settings {
             actions = actions.with_child(settings);
         }
-        return WidgetPod::new(
-            centered_note(
-                shared,
-                "▤",
-                format!("{} unavailable", source.label()),
-                source_unavailable_summary(source, &error),
-            )
-            .glyph(IconGlyph::Storage)
-            .action(actions),
-        );
+        let body = centered_note(
+            shared,
+            "▤",
+            format!("{} unavailable", source.label()),
+            source_unavailable_summary(source, &error),
+        )
+        .glyph(IconGlyph::Storage)
+        .action(actions);
+        return placeholder_with_task_strip(shared, body, has_tasks);
     }
     if is_empty {
         let create_file = {
@@ -4764,11 +4762,10 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             .alignment(Alignment::Center)
             .with_child(create_file)
             .with_child(create_folder);
-        return WidgetPod::new(
-            centered_note(shared, "▤", "Empty directory", "Nothing here yet.")
-                .glyph(IconGlyph::Folder)
-                .action(actions),
-        );
+        let body = centered_note(shared, "▤", "Empty directory", "Nothing here yet.")
+            .glyph(IconGlyph::Folder)
+            .action(actions);
+        return placeholder_with_task_strip(shared, body, has_tasks);
     }
 
     let scroll = files_list_body_rebuild(shared, reader, scroll_state);
@@ -4800,6 +4797,24 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             .with_child(filter)
             .with_child(header);
         WidgetPod::new(widgets::Dock::new(scroll).top(top_h, top))
+    }
+}
+
+fn placeholder_with_task_strip<W>(shared: &Shared, body: W, has_tasks: bool) -> WidgetPod
+where
+    W: Widget + 'static,
+{
+    if has_tasks {
+        WidgetPod::new(
+            widgets::Dock::new(body).top(
+                LIST_TASK_STRIP_H,
+                SizedBox::new()
+                    .height(LIST_TASK_STRIP_H)
+                    .with_child(FilesTaskStrip::new(shared.clone())),
+            ),
+        )
+    } else {
+        WidgetPod::new(body)
     }
 }
 
@@ -11452,6 +11467,103 @@ mod tests {
             &shared.files().worker_cancellations,
             77
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn task_strip_stays_visible_for_empty_directories() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/empty".to_string();
+            files.entries.clear();
+            files.tasks = vec![FilesTask {
+                id: 78,
+                source: FilesSourceKind::Sifs,
+                title: "Copy".to_string(),
+                detail: "/services/artifact.bin -> /empty/artifact.bin".to_string(),
+                state: FilesTaskState::Running,
+                progress: Some(0.35),
+            }];
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files empty task strip")
+                    .root(
+                        SizedBox::new()
+                            .width(520.0)
+                            .height(720.0)
+                            .with_child(view(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel Copy")
+            .click()?;
+
+        assert_eq!(
+            shared.files().tasks[0].state,
+            FilesTaskState::CancelRequested
+        );
+        assert!(operation_cancelled(
+            &shared.files().worker_cancellations,
+            78
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn failed_task_recovery_stays_visible_when_listing_unavailable() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/services".to_string();
+            files.entries.clear();
+            files.error = Some("device authorization was denied".to_string());
+            files.tasks = vec![FilesTask {
+                id: 91,
+                source: FilesSourceKind::Sifs,
+                title: "Refresh placement".to_string(),
+                detail: "device authorization was denied".to_string(),
+                state: FilesTaskState::Failed,
+                progress: Some(1.0),
+            }];
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files unavailable task strip")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open Connection settings for Refresh placement")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
 
         Ok(())
     }
