@@ -1482,6 +1482,44 @@ fn sifs_replication_summary(details: Option<&SifsObjectDetails>, clustered: bool
     }
 }
 
+fn sifs_placement_next_step(details: Option<&SifsObjectDetails>, clustered: bool) -> String {
+    if !clustered {
+        return "join a cluster to enable multi-node placement".to_string();
+    }
+    let Some(details) = details else {
+        return "load SIFS metadata before changing placement".to_string();
+    };
+    if details.policy == "local-owned" {
+        return "copy or move into a replicated SIFS namespace to spread across nodes".to_string();
+    }
+    if details.policy == "ephemeral-local" {
+        return "copy into durable SIFS storage before relying on this object".to_string();
+    }
+    if details.policy.starts_with("replicated") {
+        return match details.current_locations.len() {
+            0 => "refresh metadata; no durable replica receipt is recorded yet".to_string(),
+            1 => "keep peers online and refresh after replica repair settles".to_string(),
+            _ => {
+                "replica locations are visible; use details for object and version ids".to_string()
+            }
+        };
+    }
+    "inspect details before changing this object's placement".to_string()
+}
+
+fn sifs_details_signature(details: Option<&SifsObjectDetails>) -> String {
+    details
+        .map(|details| {
+            format!(
+                "{}|{}|{}",
+                details.version,
+                details.policy,
+                details.current_locations.join(",")
+            )
+        })
+        .unwrap_or_default()
+}
+
 fn unix_nanos_label(nanos: u64) -> String {
     if nanos == 0 {
         return "not recorded".to_string();
@@ -2601,11 +2639,7 @@ impl InspectorView {
                 files.details_loading,
                 files.details_error.as_deref().unwrap_or(""),
                 files.inspector_details_open,
-                files
-                    .selected_details
-                    .as_ref()
-                    .map(|details| details.version.as_str())
-                    .unwrap_or("")
+                sifs_details_signature(files.selected_details.as_ref())
             ),
             None => format!("unselected|{}|{}", files.path, files.entries.len()),
         }
@@ -2976,7 +3010,11 @@ impl Widget for InspectorView {
                 "local-owned"
             });
         y = self.info_row(ctx, &theme, &pal, x, y + 10.0, w, "Policy", policy);
-        let replication = sifs_replication_summary(details, files.clustered);
+        let placement = sifs_replication_summary(details, files.clustered);
+        y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Placement", &placement);
+        let locations = details
+            .map(details_locations)
+            .unwrap_or_else(|| node_label.clone());
         y = self.info_row(
             ctx,
             &theme,
@@ -2984,13 +3022,11 @@ impl Widget for InspectorView {
             x,
             y + 4.0,
             w,
-            "Replication",
-            &replication,
+            "Durable nodes",
+            &locations,
         );
-        let locations = details
-            .map(details_locations)
-            .unwrap_or_else(|| node_label.clone());
-        y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Locations", &locations);
+        let next_step = sifs_placement_next_step(details, files.clustered);
+        y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Next", &next_step);
 
         if details_open {
             y += 14.0;
@@ -4466,6 +4502,89 @@ mod tests {
             sifs_replication_summary(Some(&details), true),
             "local placement policy"
         );
+    }
+
+    #[test]
+    fn sifs_placement_next_step_uses_policy_and_location_state() {
+        assert_eq!(
+            sifs_placement_next_step(None, true),
+            "load SIFS metadata before changing placement"
+        );
+        assert_eq!(
+            sifs_placement_next_step(None, false),
+            "join a cluster to enable multi-node placement"
+        );
+
+        let mut details = SifsObjectDetails {
+            file_system_id: "sifs".to_string(),
+            object_id: "obj".to_string(),
+            path: "/artifact.txt".to_string(),
+            kind: "file".to_string(),
+            version: "v1".to_string(),
+            content_hash: None,
+            size_bytes: Some(5),
+            link_count: 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            policy: "replicated-eventual".to_string(),
+            current_locations: Vec::new(),
+        };
+
+        assert_eq!(
+            sifs_placement_next_step(Some(&details), true),
+            "refresh metadata; no durable replica receipt is recorded yet"
+        );
+        details.current_locations.push("node-a".to_string());
+        assert_eq!(
+            sifs_placement_next_step(Some(&details), true),
+            "keep peers online and refresh after replica repair settles"
+        );
+        details.current_locations.push("node-b".to_string());
+        assert_eq!(
+            sifs_placement_next_step(Some(&details), true),
+            "replica locations are visible; use details for object and version ids"
+        );
+        details.policy = "local-owned".to_string();
+        assert_eq!(
+            sifs_placement_next_step(Some(&details), true),
+            "copy or move into a replicated SIFS namespace to spread across nodes"
+        );
+    }
+
+    #[test]
+    fn sifs_details_signature_tracks_placement_changes() {
+        let mut details = SifsObjectDetails {
+            file_system_id: "sifs".to_string(),
+            object_id: "obj".to_string(),
+            path: "/artifact.txt".to_string(),
+            kind: "file".to_string(),
+            version: "v1".to_string(),
+            content_hash: None,
+            size_bytes: Some(5),
+            link_count: 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            policy: "replicated-eventual".to_string(),
+            current_locations: vec!["node-a".to_string()],
+        };
+        let first = sifs_details_signature(Some(&details));
+
+        details.current_locations.push("node-b".to_string());
+        assert_ne!(sifs_details_signature(Some(&details)), first);
+
+        let second = sifs_details_signature(Some(&details));
+        details.policy = "local-owned".to_string();
+        assert_ne!(sifs_details_signature(Some(&details)), second);
     }
 
     #[test]
