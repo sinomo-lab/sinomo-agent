@@ -3310,6 +3310,44 @@ fn sifs_task_failure_summary(error: &str) -> String {
     }
 }
 
+fn sifs_metadata_error_next_step(error: &str) -> String {
+    match sifs_unavailable_summary(error) {
+        "SIFS access needs authorization." => {
+            "Authorize SIFS in Connection, then refresh metadata".to_string()
+        }
+        "SIFS needs a daemon connection." => {
+            "Check daemon in Connection, then retry metadata".to_string()
+        }
+        "SIFS did not respond in time." => {
+            "Retry metadata, then inspect Cluster health if it stalls".to_string()
+        }
+        "SIFS browser stopped unexpectedly." => "Retry the SIFS metadata request".to_string(),
+        _ => "Show metadata details, then refresh placement".to_string(),
+    }
+}
+
+fn file_preview_error_display(source: FilesSourceKind, error: &str) -> String {
+    if source != FilesSourceKind::Sifs {
+        return error.to_string();
+    }
+    match sifs_unavailable_summary(error) {
+        "SIFS access needs authorization." => {
+            "SIFS preview needs authorization. Open Connection settings, authorize this device, then retry preview.".to_string()
+        }
+        "SIFS needs a daemon connection." => {
+            "SIFS preview needs a daemon connection. Check Connection settings, then retry preview."
+                .to_string()
+        }
+        "SIFS did not respond in time." => {
+            "SIFS preview timed out. Retry preview or inspect Cluster health.".to_string()
+        }
+        "SIFS browser stopped unexpectedly." => {
+            "SIFS preview worker stopped. Retry preview after the Files tab reconnects.".to_string()
+        }
+        _ => error.to_string(),
+    }
+}
+
 fn files_task_detail_display(task: &FilesTask) -> String {
     if task.state == FilesTaskState::Failed {
         match task.source {
@@ -3604,8 +3642,8 @@ fn sifs_inspector_next_step(
     if loading {
         return "waiting for daemon metadata".to_string();
     }
-    if error.is_some() {
-        return "show metadata details, then refresh placement".to_string();
+    if let Some(error) = error {
+        return sifs_metadata_error_next_step(error);
     }
     if details.is_none() && clustered {
         return "refresh placement to load durable-node metadata".to_string();
@@ -5913,11 +5951,15 @@ impl InspectorView {
 
         y += Self::info_row_height(w, &entry.path);
         if !entry.is_dir {
+            let preview_error = files
+                .preview_error
+                .as_deref()
+                .map(|error| file_preview_error_display(files.source, error));
             y += 10.0
                 + Self::preview_section_height(
                     w,
                     files.preview_loading,
-                    files.preview_error.as_deref(),
+                    preview_error.as_deref(),
                     files.selected_preview.as_ref(),
                 );
         }
@@ -6561,6 +6603,10 @@ impl Widget for InspectorView {
         y = self.info_row(ctx, &theme, &pal, x, y, w, "Path", &entry.path);
         if !entry.is_dir {
             y += 10.0;
+            let preview_error = files
+                .preview_error
+                .as_deref()
+                .map(|error| file_preview_error_display(files.source, error));
             y = self.preview_section(
                 ctx,
                 &theme,
@@ -6569,7 +6615,7 @@ impl Widget for InspectorView {
                 y,
                 w,
                 files.preview_loading,
-                files.preview_error.as_deref(),
+                preview_error.as_deref(),
                 files.selected_preview.as_ref(),
             );
         }
@@ -9364,7 +9410,20 @@ mod tests {
         );
         assert_eq!(
             sifs_inspector_next_step(None, true, false, Some("metadata read failed")),
-            "show metadata details, then refresh placement"
+            "Show metadata details, then refresh placement"
+        );
+        assert_eq!(
+            sifs_inspector_next_step(None, true, false, Some("device authorization was denied")),
+            "Authorize SIFS in Connection, then refresh metadata"
+        );
+        assert_eq!(
+            sifs_inspector_next_step(
+                None,
+                true,
+                false,
+                Some("SIFS browsing requires a daemon connection")
+            ),
+            "Check daemon in Connection, then retry metadata"
         );
         assert_eq!(
             sifs_inspector_next_step(None, true, false, None),
@@ -9373,6 +9432,25 @@ mod tests {
         assert_eq!(
             sifs_inspector_next_step(None, false, false, None),
             "join a cluster to enable multi-node placement"
+        );
+    }
+
+    #[test]
+    fn sifs_preview_error_display_points_to_connection_recovery() {
+        assert_eq!(
+            file_preview_error_display(FilesSourceKind::Local, "access is denied"),
+            "access is denied"
+        );
+        assert_eq!(
+            file_preview_error_display(FilesSourceKind::Sifs, "device authorization was denied"),
+            "SIFS preview needs authorization. Open Connection settings, authorize this device, then retry preview."
+        );
+        assert_eq!(
+            file_preview_error_display(
+                FilesSourceKind::Sifs,
+                "SIFS browsing requires a daemon connection"
+            ),
+            "SIFS preview needs a daemon connection. Check Connection settings, then retry preview."
         );
     }
 
