@@ -178,6 +178,7 @@ impl FilesTaskState {
 #[derive(Clone, Debug, PartialEq)]
 struct FilesTask {
     id: u64,
+    source: FilesSourceKind,
     title: String,
     detail: String,
     state: FilesTaskState,
@@ -1236,6 +1237,7 @@ impl FilesState {
             0,
             FilesTask {
                 id: request_id,
+                source: self.source,
                 title,
                 detail,
                 state: FilesTaskState::Running,
@@ -3241,6 +3243,31 @@ fn source_unavailable_summary(source: FilesSourceKind, error: &str) -> String {
         FilesSourceKind::Sifs => sifs_unavailable_summary(error).to_string(),
         FilesSourceKind::Local => format!("Local filesystem error: {error}"),
     }
+}
+
+fn sifs_task_failure_summary(error: &str) -> String {
+    match sifs_unavailable_summary(error) {
+        "SIFS access needs authorization." => "Authorize SIFS in Connection".to_string(),
+        "SIFS needs a daemon connection." => "Check daemon in Connection".to_string(),
+        "SIFS did not respond in time." => "Retry or inspect Cluster health".to_string(),
+        "SIFS browser stopped unexpectedly." => "Retry the SIFS operation".to_string(),
+        _ => "Inspect metadata or Cluster diagnostics".to_string(),
+    }
+}
+
+fn files_task_detail_display(task: &FilesTask) -> String {
+    if task.state == FilesTaskState::Failed {
+        match task.source {
+            FilesSourceKind::Sifs => sifs_task_failure_summary(&task.detail),
+            FilesSourceKind::Local => format!("Local filesystem error: {}", task.detail),
+        }
+    } else {
+        task.detail.clone()
+    }
+}
+
+fn files_task_detail_display_for_width(task: &FilesTask, width: f32) -> String {
+    display_name_for_width(&files_task_detail_display(task), width, 6.2)
 }
 
 fn sifs_metadata_status_label(
@@ -5343,7 +5370,7 @@ impl Widget for FilesTaskStrip {
             widgets::draw_text_in(
                 ctx,
                 Rect::new(bounds.x() + CONTENT_PAD + 12.0, row_y + 13.0, text_w, 13.0),
-                &middle_short(&task.detail, 74),
+                &files_task_detail_display_for_width(task, text_w),
                 detail_style.clone(),
             );
             let bar = Rect::new(
@@ -6827,7 +6854,7 @@ impl InspectorView {
             widgets::draw_text_in(
                 ctx,
                 Rect::new(panel.x() + 12.0, y + 13.0, text_w, 13.0),
-                &middle_short(&task.detail, 42),
+                &files_task_detail_display_for_width(task, text_w),
                 detail_style.clone(),
             );
             let tone = match task.state {
@@ -8858,6 +8885,7 @@ mod tests {
         state.selected = Some(0);
         state.tasks = vec![FilesTask {
             id: 42,
+            source: FilesSourceKind::Sifs,
             title: "Delete".to_string(),
             detail: "/cluster-tests/artifact.txt".to_string(),
             state: FilesTaskState::Running,
@@ -8889,6 +8917,7 @@ mod tests {
         state.tasks = vec![
             FilesTask {
                 id: 1,
+                source: FilesSourceKind::Sifs,
                 title: "Copy".to_string(),
                 detail: "running".to_string(),
                 state: FilesTaskState::Running,
@@ -8896,6 +8925,7 @@ mod tests {
             },
             FilesTask {
                 id: 2,
+                source: FilesSourceKind::Sifs,
                 title: "Delete".to_string(),
                 detail: "done".to_string(),
                 state: FilesTaskState::Completed,
@@ -8903,6 +8933,7 @@ mod tests {
             },
             FilesTask {
                 id: 3,
+                source: FilesSourceKind::Sifs,
                 title: "Move".to_string(),
                 detail: "failed".to_string(),
                 state: FilesTaskState::Failed,
@@ -8910,6 +8941,7 @@ mod tests {
             },
             FilesTask {
                 id: 4,
+                source: FilesSourceKind::Sifs,
                 title: "Rename".to_string(),
                 detail: "cancelling".to_string(),
                 state: FilesTaskState::CancelRequested,
@@ -8937,6 +8969,51 @@ mod tests {
         assert_eq!(
             sifs_unavailable_summary("SIFS listing did not finish within 20 seconds"),
             "SIFS did not respond in time."
+        );
+    }
+
+    #[test]
+    fn task_detail_display_makes_sifs_failures_actionable() {
+        let sifs_task = FilesTask {
+            id: 1,
+            source: FilesSourceKind::Sifs,
+            title: "Refresh placement".to_string(),
+            detail: "device authorization was denied".to_string(),
+            state: FilesTaskState::Failed,
+            progress: Some(1.0),
+        };
+        assert_eq!(
+            files_task_detail_display(&sifs_task),
+            "Authorize SIFS in Connection"
+        );
+        let compact = files_task_detail_display_for_width(&sifs_task, 180.0);
+        assert_eq!(compact, "Authorize SIFS in Connection");
+        assert!(compact.chars().count() <= 29);
+
+        let local_task = FilesTask {
+            id: 2,
+            source: FilesSourceKind::Local,
+            title: "Copy".to_string(),
+            detail: "access denied".to_string(),
+            state: FilesTaskState::Failed,
+            progress: Some(1.0),
+        };
+        assert_eq!(
+            files_task_detail_display(&local_task),
+            "Local filesystem error: access denied"
+        );
+
+        let running_task = FilesTask {
+            id: 3,
+            source: FilesSourceKind::Sifs,
+            title: "Copy".to_string(),
+            detail: "Copying 4.0 MB of 8.0 MB".to_string(),
+            state: FilesTaskState::Running,
+            progress: Some(0.5),
+        };
+        assert_eq!(
+            files_task_detail_display(&running_task),
+            "Copying 4.0 MB of 8.0 MB"
         );
     }
 
@@ -9190,6 +9267,7 @@ mod tests {
         let mut state = FilesState::new(&backend);
         state.tasks = vec![FilesTask {
             id: 21,
+            source: FilesSourceKind::Sifs,
             title: "Copy".to_string(),
             detail: "queued".to_string(),
             state: FilesTaskState::Running,
@@ -9228,6 +9306,7 @@ mod tests {
         state.path = "/services".to_string();
         state.tasks = vec![FilesTask {
             id: 12,
+            source: FilesSourceKind::Sifs,
             title: "Delete".to_string(),
             detail: "/services/artifact.txt".to_string(),
             state: FilesTaskState::CancelRequested,
@@ -10074,6 +10153,7 @@ mod tests {
             }];
             files.tasks = vec![FilesTask {
                 id: 77,
+                source: FilesSourceKind::Sifs,
                 title: "Delete".to_string(),
                 detail: "/artifact.txt".to_string(),
                 state: FilesTaskState::Running,
@@ -10130,6 +10210,7 @@ mod tests {
             files.tasks = vec![
                 FilesTask {
                     id: 77,
+                    source: FilesSourceKind::Sifs,
                     title: "Delete".to_string(),
                     detail: "deleted /artifact.txt".to_string(),
                     state: FilesTaskState::Completed,
@@ -10137,6 +10218,7 @@ mod tests {
                 },
                 FilesTask {
                     id: 78,
+                    source: FilesSourceKind::Sifs,
                     title: "Copy".to_string(),
                     detail: "/artifact.txt -> /copy.txt".to_string(),
                     state: FilesTaskState::Running,
