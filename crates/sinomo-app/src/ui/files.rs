@@ -1175,6 +1175,8 @@ const INSPECTOR_PAD: f32 = CONTENT_PAD;
 const INSPECTOR_STATE_PANEL_Y: f32 = INSPECTOR_PAD + 34.0;
 const INSPECTOR_DETAIL_BUTTON_W: f32 = 104.0;
 const INSPECTOR_DETAIL_BUTTON_H: f32 = 24.0;
+const INSPECTOR_OPEN_BUTTON_W: f32 = 128.0;
+const INSPECTOR_OPEN_BUTTON_H: f32 = 28.0;
 
 fn sifs_loading_rows(path: &str, details_open: bool) -> Vec<(&'static str, String)> {
     let mut rows = vec![("Status", "Connecting to SIFS".to_string())];
@@ -1216,12 +1218,46 @@ fn inspector_detail_button_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
     sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(7_401))
 }
 
+fn inspector_open_folder_button_rect(bounds: Rect) -> Rect {
+    let content_x = bounds.x() + INSPECTOR_PAD;
+    let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
+    let button_w = INSPECTOR_OPEN_BUTTON_W.min(content_w);
+    Rect::new(
+        content_x,
+        bounds.y() + INSPECTOR_PAD + 4.0 + 30.0 + 26.0 + 30.0,
+        button_w,
+        INSPECTOR_OPEN_BUTTON_H,
+    )
+}
+
+fn inspector_open_folder_button_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
+    sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(7_497))
+}
+
 impl Widget for InspectorView {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
         if let Event::Pointer(pointer) = event
             && pointer.kind == PointerEventKind::Up
             && pointer.button == Some(PointerButton::Primary)
         {
+            let selected_dir_path = {
+                let files = self.shared.files();
+                files
+                    .selected_entry()
+                    .filter(|entry| entry.is_dir)
+                    .map(|entry| entry.path.clone())
+            };
+            if let Some(path) = selected_dir_path
+                && inspector_open_folder_button_rect(ctx.bounds()).contains(pointer.position)
+            {
+                self.shared.files_mut().navigate(path);
+                ctx.request_measure();
+                ctx.request_paint();
+                ctx.request_semantics();
+                ctx.set_handled();
+                return;
+            }
+
             let can_toggle_details = {
                 let files = self.shared.files();
                 files.loading || files.error.is_some()
@@ -1350,6 +1386,11 @@ impl Widget for InspectorView {
         );
         y += 34.0;
 
+        if entry.is_dir {
+            self.open_folder_button(ctx, &theme, &pal, inspector_open_folder_button_rect(bounds));
+            y += INSPECTOR_OPEN_BUTTON_H + 12.0;
+        }
+
         y = self.info_row(ctx, &theme, &pal, x, y, w, "Path", &entry.path);
 
         // Placement section.
@@ -1446,12 +1487,29 @@ impl Widget for InspectorView {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let details_open = {
+        let (selected_directory, details_open) = {
             let files = self.shared.files();
-            if !files.loading && files.error.is_none() {
-                return;
-            }
-            files.inspector_details_open
+            (
+                files.selected_entry().filter(|entry| entry.is_dir).cloned(),
+                (files.loading || files.error.is_some()).then_some(files.inspector_details_open),
+            )
+        };
+
+        if let Some(entry) = selected_directory {
+            let mut node = SemanticsNode::new(
+                inspector_open_folder_button_widget_id(ctx.widget_id()),
+                SemanticsRole::Button,
+                inspector_open_folder_button_rect(ctx.bounds()),
+            );
+            node.parent = Some(ctx.widget_id());
+            node.name = Some("Open folder".to_string());
+            node.description = Some(format!("Open {}", entry.path));
+            node.actions = vec![SemanticsAction::Activate];
+            ctx.push(node);
+        }
+
+        let Some(details_open) = details_open else {
+            return;
         };
 
         let mut node = SemanticsNode::new(
@@ -1569,6 +1627,24 @@ impl InspectorView {
                 "Show details"
             },
             pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text),
+        );
+    }
+
+    fn open_folder_button(
+        &self,
+        ctx: &mut PaintCtx,
+        theme: &sui::DefaultTheme,
+        pal: &Palette,
+        rect: Rect,
+    ) {
+        widgets::round_panel(ctx, rect, pal.accent, pal.accent, 7.0);
+        let icon = Rect::new(rect.x() + 10.0, rect.y() + 7.0, 14.0, 14.0);
+        draw_glyph(ctx, IconGlyph::Folder, icon, pal.on_accent);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(rect.x() + 30.0, rect.y() + 5.0, rect.width() - 38.0, 18.0),
+            "Open folder",
+            pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.on_accent),
         );
     }
 
@@ -2666,6 +2742,54 @@ mod tests {
         assert_eq!(files.path, "/");
         assert_eq!(files.selected, Some(0));
         assert!(files.selected_entry().is_some_and(|entry| entry.is_dir));
+
+        Ok(())
+    }
+
+    #[test]
+    fn selected_directory_inspector_exposes_open_folder_action() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.node_id = "node-a".to_string();
+            files.entries = vec![SifsEntry {
+                name: "dir".to_string(),
+                path: "/dir".to_string(),
+                is_dir: true,
+                is_link: false,
+                size: None,
+            }];
+            files.selected = None;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files inspector open folder")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Inspect dir")
+            .click()?;
+        assert_eq!(shared.files().path, "/");
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open folder")
+            .click()?;
+
+        let files = shared.files();
+        assert_eq!(files.path, "/dir");
+        assert_eq!(files.selected, None);
 
         Ok(())
     }
