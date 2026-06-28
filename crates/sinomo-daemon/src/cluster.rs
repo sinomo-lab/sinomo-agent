@@ -19,13 +19,12 @@ use crate::{
     send_daemon_rpc_to_endpoint_on_runtime, write_daemon_status,
 };
 use sinomo_core::{
-    ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRecord, ClusterNodeRole,
-    ClusterNodeRolloutStatus, ClusterNodeStatusRecord, ClusterTransportKind,
+    ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRecord, ClusterNodeAvailability,
+    ClusterNodeRole, ClusterNodeRolloutStatus, ClusterNodeStatusRecord, ClusterTransportKind,
 };
 #[cfg(test)]
 use sinomo_core::{
-    ClusterEndpointPrivacy, ClusterJoinInvite, ClusterMemberRole, ClusterMemberState,
-    ClusterNodeAvailability, TrustDomain,
+    ClusterEndpointPrivacy, ClusterJoinInvite, ClusterMemberRole, ClusterMemberState, TrustDomain,
 };
 use sinomo_kv::{
     ClusterKvRaftAppendReplicationOutcome, ClusterKvReplicationRequest,
@@ -70,6 +69,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 pub const DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const CLUSTER_HEALTH_IROH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DAEMON_CLUSTER_TICK_INTERVAL: Duration = Duration::from_secs(15);
 #[cfg(test)]
 const DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL: Duration =
@@ -3189,6 +3189,18 @@ async fn probe_member_daemon_status_async(
         crate::DAEMON_RPC_CATEGORY,
         &(),
     )?;
+    if let Some(status) = probe_member_daemon_status_endpoints_async(
+        paths,
+        state,
+        member,
+        &request,
+        CLUSTER_HEALTH_PROBE_TIMEOUT,
+        runtime,
+    )
+    .await?
+    {
+        return Ok(Some(status));
+    }
     let Some(response) = call_member_object_rpc_target_async(
         paths,
         state,
@@ -3202,6 +3214,86 @@ async fn probe_member_daemon_status_async(
     else {
         return Ok(None);
     };
+    Ok(
+        match decode_cluster_health_probe_response(state, member, &response) {
+            ClusterHealthProbeResponse::Accepted(status) => Some(status),
+            ClusterHealthProbeResponse::ShadowResponder | ClusterHealthProbeResponse::Ignored => {
+                None
+            }
+        },
+    )
+}
+
+async fn probe_member_daemon_status_endpoints_async(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    request: &sinomo_network::ObjectRpcRequest,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<ClusterNodeStatusRecord>, DaemonError> {
+    let endpoints = sinomo_network::ClusterEndpointSelector::new(paths, state)
+        .try_select(sinomo_network::ClusterEndpointSelectionPurpose::MemberDaemonStatus)?;
+    let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, true);
+    let mut client = sinomo_network::ClusterObjectRpcClient::endpoint_only(&mut host);
+    for endpoint in endpoints
+        .into_iter()
+        .filter(|endpoint| endpoint.node_id == member.node_id)
+    {
+        let options = sinomo_network::ClusterObjectRpcOptions::new(
+            sinomo_network::DaemonRpcTimeouts::connect_and_idle(
+                cluster_health_endpoint_probe_timeout(&endpoint, timeout),
+            ),
+        );
+        match client.call_endpoint(&endpoint, request, options).await {
+            Ok(response) => match decode_cluster_health_probe_response(state, member, &response) {
+                ClusterHealthProbeResponse::Accepted(status) => return Ok(Some(status)),
+                ClusterHealthProbeResponse::ShadowResponder => {
+                    if let Some(status) = probe_member_status_via_shadow_endpoint_async(
+                        member, &endpoint, timeout, runtime,
+                    )
+                    .await?
+                    {
+                        return Ok(Some(status));
+                    }
+                }
+                ClusterHealthProbeResponse::Ignored => {}
+            },
+            Err(error) => {
+                tracing::warn!(
+                    "sinomo daemon cluster health endpoint probe of {} via {} ({:?}) failed: {error}",
+                    member.node_id,
+                    endpoint.address,
+                    endpoint.transport
+                );
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn cluster_health_endpoint_probe_timeout(
+    endpoint: &ClusterEndpointRecord,
+    default_timeout: Duration,
+) -> Duration {
+    if matches!(endpoint.transport, ClusterTransportKind::Iroh) {
+        default_timeout.max(CLUSTER_HEALTH_IROH_PROBE_TIMEOUT)
+    } else {
+        default_timeout
+    }
+}
+
+enum ClusterHealthProbeResponse {
+    Accepted(ClusterNodeStatusRecord),
+    ShadowResponder,
+    Ignored,
+}
+
+fn decode_cluster_health_probe_response(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    response: &sinomo_network::ObjectRpcResponse,
+) -> ClusterHealthProbeResponse {
     let status: crate::DaemonStatus = match response.decode_body() {
         Ok(status) => status,
         Err(error) => {
@@ -3209,7 +3301,7 @@ async fn probe_member_daemon_status_async(
                 "sinomo daemon cluster health probe of {} failed to decode: {error}",
                 member.node_id
             );
-            return Ok(None);
+            return ClusterHealthProbeResponse::Ignored;
         }
     };
     let Some(cluster) = status.cluster.as_ref() else {
@@ -3217,7 +3309,7 @@ async fn probe_member_daemon_status_async(
             "sinomo daemon cluster health probe of {}: status has no cluster section",
             member.node_id
         );
-        return Ok(None);
+        return ClusterHealthProbeResponse::Ignored;
     };
     let cluster_id_matches =
         cluster.cluster_id == state.cluster_id || cluster.cluster_id == member.cluster_id;
@@ -3230,7 +3322,7 @@ async fn probe_member_daemon_status_async(
             cluster.cluster_id,
             cluster.node_id
         );
-        return Ok(None);
+        return ClusterHealthProbeResponse::Ignored;
     }
     let status =
         cluster_node_status_from_daemon_status(&status, cluster, None, OffsetDateTime::now_utc());
@@ -3243,9 +3335,67 @@ async fn probe_member_daemon_status_async(
             cluster_member_expected_daemon_process(member).unwrap_or("unknown"),
             status.process
         );
-        return Ok(None);
+        return if cluster_member_expected_daemon_process(member)
+            == Some(sinomo_node::DAEMON_MAIN_CLUSTER_ROLE)
+            && status.process == sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE
+        {
+            ClusterHealthProbeResponse::ShadowResponder
+        } else {
+            ClusterHealthProbeResponse::Ignored
+        };
     }
-    Ok(Some(status))
+    ClusterHealthProbeResponse::Accepted(status)
+}
+
+async fn probe_member_status_via_shadow_endpoint_async(
+    member: &ClusterMemberRecord,
+    endpoint: &ClusterEndpointRecord,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<ClusterNodeStatusRecord>, DaemonError> {
+    let request = sinomo_network::cluster_local_health_rpc_request()?;
+    let mut host = DaemonSignedEndpointRpcAsyncHost::direct_only(runtime);
+    let mut client = sinomo_network::ClusterObjectRpcClient::endpoint_only(&mut host);
+    let options = sinomo_network::ClusterObjectRpcOptions::new(
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(cluster_health_endpoint_probe_timeout(
+            endpoint, timeout,
+        )),
+    );
+    let response = match client.call_endpoint(endpoint, &request, options).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(
+                "sinomo daemon cluster health shadow-local probe of {} via {} ({:?}) failed: {error}",
+                member.node_id,
+                endpoint.address,
+                endpoint.transport
+            );
+            return Ok(None);
+        }
+    };
+    let rows = match sinomo_network::decode_cluster_health_rpc_response(&response) {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(
+                "sinomo daemon cluster health shadow-local rows from {} failed to decode: {error}",
+                member.node_id
+            );
+            return Ok(None);
+        }
+    };
+    Ok(rows.into_iter().find_map(|row| {
+        let expected_process = cluster_member_expected_daemon_process(member);
+        if row.availability == ClusterNodeAvailability::Online
+            && row.status.node_id == member.node_id
+            && expected_process
+                .map(|process| row.status.process == process)
+                .unwrap_or(true)
+        {
+            Some(row.status)
+        } else {
+            None
+        }
+    }))
 }
 
 async fn call_member_object_rpc_target_async(

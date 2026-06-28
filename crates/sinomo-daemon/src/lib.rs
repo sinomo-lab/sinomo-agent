@@ -203,8 +203,9 @@ pub(crate) use client::{
 pub use client::{
     RemoteConfigClient, fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
     fetch_daemon_status_from_endpoint_async, send_daemon_cluster_maintenance_refresh,
-    send_daemon_rollout_binary, send_daemon_rollout_binary_to_endpoint,
-    send_daemon_rollout_binary_upload_chunk, send_daemon_rollout_binary_upload_chunk_to_endpoint,
+    send_daemon_cluster_maintenance_refresh_to_endpoint, send_daemon_rollout_binary,
+    send_daemon_rollout_binary_to_endpoint, send_daemon_rollout_binary_upload_chunk,
+    send_daemon_rollout_binary_upload_chunk_to_endpoint,
     send_daemon_rollout_binary_upload_finalize,
     send_daemon_rollout_binary_upload_finalize_to_endpoint, send_daemon_rollout_build,
     send_daemon_rollout_build_to_endpoint, send_daemon_rollout_clear_status,

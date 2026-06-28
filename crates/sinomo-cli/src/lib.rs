@@ -117,6 +117,7 @@ use sinomo_runtime::daemon::{
     run_daemon_control_loop_with_services as daemon_run_daemon_control_loop_with_services,
     run_shadow_daemon_supervision_loop as daemon_run_shadow_daemon_supervision_loop,
     send_daemon_cluster_maintenance_refresh as daemon_send_daemon_cluster_maintenance_refresh,
+    send_daemon_cluster_maintenance_refresh_to_endpoint as daemon_send_daemon_cluster_maintenance_refresh_to_endpoint,
     send_daemon_rollout_binary as daemon_send_daemon_rollout_binary,
     send_daemon_rollout_binary_to_endpoint as daemon_send_daemon_rollout_binary_to_endpoint,
     send_daemon_rollout_binary_upload_chunk as daemon_send_daemon_rollout_binary_upload_chunk,
@@ -350,20 +351,52 @@ fn cli_probe_member_daemon_status(
     {
         return Some(status);
     }
+    let trace = std::env::var_os("SINOMO_CLUSTER_HEALTH_TRACE").is_some();
     for endpoint in network::ClusterEndpointSelector::new(paths, state)
         .select(network::ClusterEndpointSelectionPurpose::MemberDaemonStatus)
         .into_iter()
         .filter(|endpoint| endpoint.node_id == member.node_id)
     {
-        let Ok(status) =
-            daemon_fetch_daemon_status_from_endpoint(&endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT)
-        else {
-            continue;
-        };
+        if trace {
+            eprintln!(
+                "cluster health trace: probing {} {} {:?}",
+                member.node_id, endpoint.address, endpoint.transport
+            );
+        }
+        let status =
+            match daemon_fetch_daemon_status_from_endpoint(&endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT)
+            {
+                Ok(status) => status,
+                Err(error) => {
+                    if trace {
+                        eprintln!(
+                            "cluster health trace: {} {} failed: {error}",
+                            member.node_id, endpoint.address
+                        );
+                    }
+                    continue;
+                }
+            };
         let Some(cluster) = status.cluster.as_ref() else {
+            if trace {
+                eprintln!(
+                    "cluster health trace: {} {} returned no cluster status",
+                    member.node_id, endpoint.address
+                );
+            }
             continue;
         };
         if cluster.cluster_id != state.cluster_id || cluster.node_id != member.node_id {
+            if trace {
+                eprintln!(
+                    "cluster health trace: {} {} returned cluster={} node={} process={}",
+                    member.node_id,
+                    endpoint.address,
+                    cluster.cluster_id,
+                    cluster.node_id,
+                    cluster.process
+                );
+            }
             continue;
         }
         let status = cluster_node_status_from_daemon_status(
@@ -375,11 +408,86 @@ fn cli_probe_member_daemon_status(
         if cluster_member_expected_daemon_process(member)
             .is_some_and(|process| status.process != process)
         {
+            if trace {
+                eprintln!(
+                    "cluster health trace: {} {} returned unexpected process {}",
+                    member.node_id, endpoint.address, status.process
+                );
+            }
+            if cluster_member_expected_daemon_process(member)
+                == Some(sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE)
+                && status.process == sinomo_runtime::node::DAEMON_SHADOW_CLUSTER_ROLE
+                && let Some(status) =
+                    cli_probe_member_status_via_shadow_endpoint(member, &endpoint, trace)
+            {
+                return Some(status);
+            }
             continue;
+        }
+        if trace {
+            eprintln!(
+                "cluster health trace: {} {} accepted",
+                member.node_id, endpoint.address
+            );
         }
         return Some(status);
     }
     None
+}
+
+fn cli_probe_member_status_via_shadow_endpoint(
+    member: &ClusterMemberRecord,
+    endpoint: &ClusterEndpointRecord,
+    trace: bool,
+) -> Option<ClusterNodeStatusRecord> {
+    let request = network::cluster_local_health_rpc_request().ok()?;
+    let response = match daemon_send_daemon_rpc_to_endpoint(
+        endpoint,
+        &request,
+        CLUSTER_HEALTH_PEER_ROWS_TIMEOUT,
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            if trace {
+                eprintln!(
+                    "cluster health trace: {} {} shadow-local health failed: {error}",
+                    member.node_id, endpoint.address
+                );
+            }
+            return None;
+        }
+    };
+    let rows = match network::decode_cluster_health_rpc_response(&response) {
+        Ok(rows) => rows,
+        Err(error) => {
+            if trace {
+                eprintln!(
+                    "cluster health trace: {} {} shadow-local health decode failed: {error}",
+                    member.node_id, endpoint.address
+                );
+            }
+            return None;
+        }
+    };
+    rows.into_iter().find_map(|row| {
+        let expected_process = cluster_member_expected_daemon_process(member);
+        if row.availability == ClusterNodeAvailability::Online
+            && row.status.node_id == member.node_id
+            && expected_process
+                .map(|process| row.status.process == process)
+                .unwrap_or(true)
+        {
+            if trace {
+                eprintln!(
+                    "cluster health trace: {} {} accepted via shadow-local health",
+                    member.node_id, endpoint.address
+                );
+            }
+            Some(row.status)
+        } else {
+            None
+        }
+    })
 }
 
 fn cli_probe_local_member_daemon_status(

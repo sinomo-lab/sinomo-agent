@@ -15492,6 +15492,63 @@ fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
 }
 
 #[test]
+fn member_daemon_status_targets_filter_shadow_endpoints_before_ordering() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-status-filters-shadow-first");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_status_filters_shadow_first").expect("cluster");
+    let local = NodeId::from_legacy_named("node_status_filters_shadow_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_status_filters_shadow_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "status filters shadow first",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let shadow = shadow_daemon_node_id(&remote);
+    let mut stale_shadow_endpoints = (17..=31)
+        .map(|octet| daemon_lan_endpoint(&shadow, format!("172.{octet}.0.1:21354"), 30))
+        .map(|mut endpoint| {
+            endpoint.node_id = remote.clone();
+            endpoint
+        })
+        .collect::<Vec<_>>();
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&remote, "iroh_public_key_status_filters_shadow"),
+        node_id: remote.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_status_filters_shadow?relay=https://relay.example./"
+            .to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    stale_shadow_endpoints.push(iroh.clone());
+    member.endpoints = stale_shadow_endpoints;
+    state.members.push(member.clone());
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::MemberDaemonStatus)
+        .into_iter()
+        .filter(|endpoint| endpoint.node_id == member.node_id)
+        .collect::<Vec<_>>();
+
+    assert_eq!(targets, vec![iroh]);
+}
+
+#[test]
 fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-rollout-lan-public-iroh");
     let data_dir = SinomoDataDir::new(&root);

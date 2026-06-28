@@ -466,7 +466,7 @@ pub(crate) fn parse_cluster_repair_members_options(
     }
     Ok(ClusterRepairMembersOptions {
         from: from.ok_or_else(|| CliError::Parse {
-            detail: "cluster repair-members requires --from <host:port>".to_string(),
+            detail: "cluster repair-members requires --from <host:port|iroh://...>".to_string(),
         })?,
         promote,
     })
@@ -2326,8 +2326,17 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
     let paths = cluster_paths_from_defaults()?;
     refresh_cluster_kv_from_local_daemon(&paths)?;
     let mut state = read_cluster_state(&paths)?;
-    let peer_status = daemon_fetch_daemon_status_from_address(&options.from, DAEMON_JOIN_TIMEOUT)?;
-    let peer_snapshot = daemon_fetch_cluster_kv_snapshot(&options.from, DAEMON_JOIN_TIMEOUT)?;
+    let explicit_endpoint = explicit_cluster_repair_endpoint(&options.from);
+    let peer_status = if let Some(endpoint) = explicit_endpoint.as_ref() {
+        daemon_fetch_daemon_status_from_endpoint(endpoint, DAEMON_JOIN_TIMEOUT)?
+    } else {
+        daemon_fetch_daemon_status_from_address(&options.from, DAEMON_JOIN_TIMEOUT)?
+    };
+    let peer_snapshot = if let Some(endpoint) = explicit_endpoint.as_ref() {
+        daemon_fetch_cluster_kv_snapshot_from_endpoint(endpoint, DAEMON_JOIN_TIMEOUT)?
+    } else {
+        daemon_fetch_cluster_kv_snapshot(&options.from, DAEMON_JOIN_TIMEOUT)?
+    };
     let mut imported = Vec::new();
     let mut endpoint_updates = Vec::new();
     for mut member in network::read_cluster_members_from_snapshot(&peer_snapshot)? {
@@ -2341,12 +2350,7 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
         {
             let mut merged_endpoints = 0usize;
             for endpoint in member.endpoints {
-                if !existing
-                    .endpoints
-                    .iter()
-                    .any(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
-                {
-                    existing.endpoints.push(endpoint);
+                if merge_cluster_member_endpoint(existing, endpoint) {
                     merged_endpoints += 1;
                 }
             }
@@ -2369,18 +2373,13 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
         && cluster.cluster_id == state.cluster_id
         && cluster.process == sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE
     {
-        let observed_endpoint =
-            network::daemon_lan_endpoint(&cluster.node_id, options.from.clone(), 0);
+        let observed_endpoint = observed_cluster_repair_endpoint(&cluster.node_id, &options.from);
         if let Some(existing) = state
             .members
             .iter_mut()
             .find(|candidate| candidate.node_id == observed_endpoint.node_id)
-            && !existing
-                .endpoints
-                .iter()
-                .any(|candidate| candidate.endpoint_id == observed_endpoint.endpoint_id)
+            && merge_cluster_member_endpoint(existing, observed_endpoint)
         {
-            existing.endpoints.push(observed_endpoint);
             existing.updated_at = OffsetDateTime::now_utc();
             endpoint_updates.push((existing.node_id.clone(), 1));
         }
@@ -2409,6 +2408,25 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
     }
     if !endpoint_updates.is_empty() || imported_changed {
         sync_cluster_state_to_kv(&paths, &state)?;
+    }
+    let maintenance_endpoint = explicit_endpoint.as_ref().map(|endpoint| {
+        peer_status
+            .cluster
+            .as_ref()
+            .filter(|cluster| cluster.cluster_id == state.cluster_id)
+            .map(|cluster| observed_cluster_repair_endpoint(&cluster.node_id, &options.from))
+            .unwrap_or_else(|| endpoint.clone())
+    });
+    if let Some(endpoint) = maintenance_endpoint.as_ref()
+        && let Err(error) = crate::daemon_send_daemon_cluster_maintenance_refresh_to_endpoint(
+            endpoint,
+            DAEMON_JOIN_TIMEOUT,
+        )
+    {
+        eprintln!(
+            "warning: peer cluster maintenance refresh through {} failed: {error}",
+            options.from
+        );
     }
 
     if let Some(node_id) = options.promote {
@@ -2439,6 +2457,55 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
         }
     }
     Ok(())
+}
+
+fn explicit_cluster_repair_endpoint(address: &str) -> Option<ClusterEndpointRecord> {
+    if !address.starts_with("iroh://") {
+        return None;
+    }
+    Some(network::invite_introducer_endpoint(
+        &NodeId::from_legacy_named("node_cluster_repair_explicit_peer")
+            .expect("static cluster repair peer node id"),
+        address.to_string(),
+    ))
+}
+
+fn observed_cluster_repair_endpoint(node_id: &NodeId, address: &str) -> ClusterEndpointRecord {
+    if address.starts_with("iroh://") {
+        network::invite_introducer_endpoint(node_id, address.to_string())
+    } else {
+        network::daemon_lan_endpoint(node_id, address.to_string(), 0)
+    }
+}
+
+fn merge_cluster_member_endpoint(
+    member: &mut ClusterMemberRecord,
+    endpoint: ClusterEndpointRecord,
+) -> bool {
+    if let Some(existing) = member
+        .endpoints
+        .iter_mut()
+        .find(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
+    {
+        if *existing == endpoint {
+            false
+        } else {
+            *existing = endpoint;
+            true
+        }
+    } else if let Some(existing) = member.endpoints.iter_mut().find(|candidate| {
+        candidate.transport == endpoint.transport && candidate.address == endpoint.address
+    }) {
+        if *existing == endpoint {
+            false
+        } else {
+            *existing = endpoint;
+            true
+        }
+    } else {
+        member.endpoints.push(endpoint);
+        true
+    }
 }
 
 pub(crate) fn cluster_remove(options: ClusterRemoveOptions) -> Result<(), CliError> {
@@ -2891,5 +2958,40 @@ pub(crate) fn format_member_state(state: &ClusterMemberState) -> &'static str {
         ClusterMemberState::Suspect => "suspect",
         ClusterMemberState::Offline => "offline",
         ClusterMemberState::Removed => "removed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repair_member_endpoint_replaces_same_address_with_canonical_identity() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_repair_same_address").expect("cluster id");
+        let main_node =
+            NodeId::from_legacy_named("node_repair_same_address_main").expect("main node");
+        let shadow_node = shadow_daemon_node_id(&main_node);
+        let now = OffsetDateTime::now_utc();
+        let address = "iroh://repair_same_address?relay=https://relay.example./".to_string();
+        let shadow_endpoint = network::invite_introducer_endpoint(&shadow_node, address.clone());
+        let main_endpoint = network::invite_introducer_endpoint(&main_node, address);
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            main_node,
+            "remote main",
+            "remote-key",
+            now,
+        );
+        member.endpoints.push(shadow_endpoint);
+
+        assert!(merge_cluster_member_endpoint(
+            &mut member,
+            main_endpoint.clone()
+        ));
+        assert_eq!(member.endpoints, vec![main_endpoint]);
+        assert!(network::cluster_endpoint_can_carry_main_daemon_rpc(
+            &member.endpoints[0]
+        ));
     }
 }

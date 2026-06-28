@@ -988,6 +988,19 @@ pub fn send_daemon_cluster_maintenance_refresh(
     )
 }
 
+pub fn send_daemon_cluster_maintenance_refresh_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    timeout: Duration,
+) -> Result<crate::DaemonClusterMaintenanceRefreshResponse, DaemonError> {
+    send_daemon_rpc_body_to_endpoint(
+        endpoint,
+        crate::DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
+        crate::DAEMON_RPC_CATEGORY,
+        &crate::DaemonClusterMaintenanceRefreshRequest,
+        timeout,
+    )
+}
+
 pub fn send_daemon_shutdown_request(
     address: &str,
     timeout: Duration,

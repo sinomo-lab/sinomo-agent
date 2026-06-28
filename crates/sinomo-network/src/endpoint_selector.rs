@@ -1231,6 +1231,12 @@ fn try_cluster_member_daemon_status_targets_with_graph(
     let member_runs_main_daemon = cluster_member_has_main_daemon_capability(member);
     let mut member_endpoints = Vec::new();
     for endpoint in &member.endpoints {
+        if !is_local_process && matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly) {
+            continue;
+        }
+        if member_runs_main_daemon && cluster_endpoint_identifies_shadow_daemon_for_node(endpoint) {
+            continue;
+        }
         crate::object::try_reserve_vec(
             &mut member_endpoints,
             1,
@@ -1243,19 +1249,7 @@ fn try_cluster_member_daemon_status_targets_with_graph(
     }
     let mut endpoints = try_prefer_bounded_daemon_command_targets(member_endpoints)?;
     endpoints.sort_by(|left, right| cluster_member_daemon_status_endpoint_cmp(graph, left, right));
-    let mut selected = Vec::new();
-    for endpoint in endpoints {
-        if !is_local_process && matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly) {
-            continue;
-        }
-        if member_runs_main_daemon && cluster_endpoint_identifies_shadow_daemon_for_node(&endpoint)
-        {
-            continue;
-        }
-        crate::object::try_reserve_vec(&mut selected, 1, "filter member daemon status endpoints")?;
-        selected.push(endpoint);
-    }
-    Ok(selected)
+    Ok(endpoints)
 }
 
 fn cluster_member_daemon_status_endpoint_cmp(
