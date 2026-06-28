@@ -108,8 +108,17 @@ pub struct DaemonDfsBrowserStatResponse {
     pub changed_at_unix_nanos: u64,
     pub policy: sinomo_core::DfsObjectPolicy,
     pub current_locations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_pins: Vec<DaemonDfsBrowserPinRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<DaemonDfsBrowserObjectHealth>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserPinRecord {
+    pub pinned_by_node_id: String,
+    pub mode: sinomo_dfs::DfsPinMode,
+    pub created_at_unix_nanos: Option<u64>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]

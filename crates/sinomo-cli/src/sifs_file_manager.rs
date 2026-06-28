@@ -340,6 +340,26 @@ impl SifsFileManagerBackend {
             .map_err(|error| format!("cannot read SIFS operational metrics: {error}"))
     }
 
+    pub(crate) fn local_pins_for_path(
+        &self,
+        file_system_id: &sinomo_runtime::dfs::DfsFileSystemId,
+        path: &str,
+    ) -> Result<Vec<sinomo_runtime::dfs::DfsPinRecord>, String> {
+        let normalized_path = normalize_sifs_path(path)?;
+        sinomo_runtime::dfs::list_local_dfs_pins(
+            default_dfs_pin_root(&self.data_dir),
+            Some(file_system_id),
+        )
+        .map(|pins| {
+            pins.into_iter()
+                .filter(|pin| {
+                    normalize_sifs_path(&pin.path).is_ok_and(|path| path == normalized_path)
+                })
+                .collect()
+        })
+        .map_err(|error| format!("cannot read SIFS content pins: {error}"))
+    }
+
     pub(crate) fn create_dir_all(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;

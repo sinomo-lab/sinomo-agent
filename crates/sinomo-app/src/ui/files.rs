@@ -3452,6 +3452,44 @@ fn details_locations(details: &SifsObjectDetails) -> String {
     }
 }
 
+fn sifs_pin_summary(details: Option<&SifsObjectDetails>) -> String {
+    let Some(details) = details else {
+        return "pin state unavailable".to_string();
+    };
+    if details.local_pins.is_empty() {
+        return "not pinned on this node".to_string();
+    }
+    details
+        .local_pins
+        .iter()
+        .map(|pin| format!("{} pin on {}", pin.mode, short(&pin.pinned_by_node_id, 20)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn sifs_pin_detail_summary(details: &SifsObjectDetails) -> String {
+    if details.local_pins.is_empty() {
+        return "none recorded".to_string();
+    }
+    details
+        .local_pins
+        .iter()
+        .map(|pin| {
+            let created = pin
+                .created_at_unix_nanos
+                .map(unix_nanos_label)
+                .unwrap_or_else(|| "unknown time".to_string());
+            format!(
+                "{} on {} since {}",
+                pin.mode,
+                short(&pin.pinned_by_node_id, 24),
+                created
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn short_node_label(node_id: &str) -> String {
     if node_id.is_empty() {
         "local".to_string()
@@ -3594,11 +3632,23 @@ fn sifs_details_signature(details: Option<&SifsObjectDetails>) -> String {
                     )
                 })
                 .unwrap_or_default();
+            let pins = details
+                .local_pins
+                .iter()
+                .map(|pin| {
+                    format!(
+                        "{}:{}:{:?}",
+                        pin.mode, pin.pinned_by_node_id, pin.created_at_unix_nanos
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             format!(
-                "{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}",
                 details.version,
                 details.policy,
                 details.current_locations.join(","),
+                pins,
                 health
             )
         })
@@ -5922,6 +5972,8 @@ impl InspectorView {
         let details = files.selected_details.as_ref();
         let placement = sifs_replication_summary(details, files.clustered);
         y += 10.0 + Self::info_row_height(w, &placement);
+        let pins = sifs_pin_summary(details);
+        y += 4.0 + Self::info_row_height(w, &pins);
         let next_step = sifs_inspector_next_step(
             details,
             files.clustered,
@@ -5954,6 +6006,7 @@ impl InspectorView {
             y += 4.0 + Self::info_row_height(w, &locations);
 
             if let Some(details) = details {
+                y += 4.0 + Self::info_row_height(w, &sifs_pin_detail_summary(details));
                 y += 4.0 + Self::info_row_height(w, &details.file_system_id);
                 y += 4.0 + Self::info_row_height(w, &short(&details.object_id, 28));
                 y += 4.0 + Self::info_row_height(w, &short(&details.version, 28));
@@ -6700,6 +6753,8 @@ impl Widget for InspectorView {
         y = self.info_row(ctx, &theme, &pal, x, y + 10.0, w, "Placement", &placement);
         let health = sifs_health_summary(details);
         y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Health", &health);
+        let pins = sifs_pin_summary(details);
+        y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Pin", &pins);
         let next_step = sifs_inspector_next_step(
             details,
             files.clustered,
@@ -6811,6 +6866,16 @@ impl Widget for InspectorView {
             );
 
             if let Some(details) = details {
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y + 4.0,
+                    w,
+                    "Local pins",
+                    &sifs_pin_detail_summary(details),
+                );
                 y = self.info_row(
                     ctx,
                     &theme,
@@ -9127,6 +9192,7 @@ mod tests {
             changed_at_unix_nanos: 0,
             policy: "replicated-eventual".to_string(),
             current_locations: vec!["node-a".to_string()],
+            local_pins: Vec::new(),
             health: None,
         };
         assert_eq!(
@@ -9161,6 +9227,7 @@ mod tests {
             changed_at_unix_nanos: 0,
             policy: "replicated-eventual".to_string(),
             current_locations: vec!["node-a".to_string()],
+            local_pins: Vec::new(),
             health: None,
         };
         assert_eq!(
@@ -9201,6 +9268,7 @@ mod tests {
             changed_at_unix_nanos: 0,
             policy: "replicated-eventual".to_string(),
             current_locations: vec!["node-a".to_string()],
+            local_pins: Vec::new(),
             health: Some(SifsObjectHealth {
                 agent_state: "pending-repair".to_string(),
                 version_count: 2,
@@ -9263,6 +9331,7 @@ mod tests {
             changed_at_unix_nanos: 0,
             policy: "replicated-eventual".to_string(),
             current_locations: Vec::new(),
+            local_pins: Vec::new(),
             health: None,
         };
 
@@ -9327,6 +9396,7 @@ mod tests {
             changed_at_unix_nanos: 0,
             policy: "replicated-eventual".to_string(),
             current_locations: vec!["node-a".to_string()],
+            local_pins: Vec::new(),
             health: None,
         };
         let first = sifs_details_signature(Some(&details));
@@ -9337,6 +9407,43 @@ mod tests {
         let second = sifs_details_signature(Some(&details));
         details.policy = "local-owned".to_string();
         assert_ne!(sifs_details_signature(Some(&details)), second);
+    }
+
+    #[test]
+    fn sifs_pin_summary_surfaces_local_content_pins() {
+        let mut details = SifsObjectDetails {
+            file_system_id: "sifs".to_string(),
+            object_id: "obj".to_string(),
+            path: "/artifact.txt".to_string(),
+            kind: "file".to_string(),
+            version: "v1".to_string(),
+            content_hash: None,
+            size_bytes: Some(5),
+            link_count: 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            policy: "replicated-eventual".to_string(),
+            current_locations: vec!["node-a".to_string()],
+            local_pins: vec![sinomo_cli::app_api::SifsPinDetails {
+                pinned_by_node_id: "node-a".to_string(),
+                mode: "content".to_string(),
+                created_at_unix_nanos: Some(0),
+            }],
+            health: None,
+        };
+
+        assert_eq!(sifs_pin_summary(Some(&details)), "content pin on node-a");
+        assert!(sifs_pin_detail_summary(&details).contains("content on node-a since"));
+
+        let pinned = sifs_details_signature(Some(&details));
+        details.local_pins.clear();
+        assert_eq!(sifs_pin_summary(Some(&details)), "not pinned on this node");
+        assert_ne!(sifs_details_signature(Some(&details)), pinned);
     }
 
     #[test]
@@ -9651,6 +9758,7 @@ mod tests {
                 changed_at_unix_nanos: 0,
                 policy: "replicated-eventual".to_string(),
                 current_locations: vec!["node-a".to_string(), "node-b".to_string()],
+                local_pins: Vec::new(),
                 health: None,
             })),
         });
@@ -11172,6 +11280,7 @@ mod tests {
                 changed_at_unix_nanos: 0,
                 policy: "replicated-eventual".to_string(),
                 current_locations: vec!["node-a".to_string(), "node-b".to_string()],
+                local_pins: Vec::new(),
                 health: None,
             });
         }

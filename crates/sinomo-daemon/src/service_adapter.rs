@@ -1351,7 +1351,9 @@ impl DaemonDfsBrowserBackend {
             .posix_stat_distributed(&path)
             .map_err(dfs_browser_service_error)?;
         let health = daemon_dfs_browser_object_health(&service, &stat.object_id);
-        Ok(daemon_dfs_browser_stat_response(stat, health))
+        let local_pins =
+            daemon_dfs_browser_local_pins(&self.data_dir, &stat.file_system_id, &stat.path);
+        Ok(daemon_dfs_browser_stat_response(stat, local_pins, health))
     }
 
     fn read_file(
@@ -1747,6 +1749,7 @@ impl Service for DaemonDfsBrowserService {
 
 fn daemon_dfs_browser_stat_response(
     stat: sinomo_dfs::DfsStat,
+    local_pins: Vec<crate::DaemonDfsBrowserPinRecord>,
     health: Option<crate::DaemonDfsBrowserObjectHealth>,
 ) -> crate::DaemonDfsBrowserStatResponse {
     crate::DaemonDfsBrowserStatResponse {
@@ -1771,8 +1774,34 @@ fn daemon_dfs_browser_stat_response(
             .into_iter()
             .map(|node_id| node_id.to_string())
             .collect(),
+        local_pins,
         health,
     }
+}
+
+fn daemon_dfs_browser_local_pins(
+    data_dir: &SinomoDataDir,
+    file_system_id: &sinomo_dfs::DfsFileSystemId,
+    path: &str,
+) -> Vec<crate::DaemonDfsBrowserPinRecord> {
+    let normalized_path = normalize_sifs_browser_path(path).unwrap_or_else(|_| path.to_string());
+    let Ok(pins) = sinomo_dfs::list_local_dfs_pins(
+        sinomo_dfs::default_dfs_pin_root(data_dir),
+        Some(file_system_id),
+    ) else {
+        return Vec::new();
+    };
+    pins.into_iter()
+        .filter(|pin| {
+            normalize_sifs_browser_path(&pin.path).unwrap_or_else(|_| pin.path.clone())
+                == normalized_path
+        })
+        .map(|pin| crate::DaemonDfsBrowserPinRecord {
+            pinned_by_node_id: pin.pinned_by_node_id.to_string(),
+            mode: pin.mode,
+            created_at_unix_nanos: u64::try_from(pin.created_at.unix_timestamp_nanos()).ok(),
+        })
+        .collect()
 }
 
 fn daemon_dfs_browser_object_health(

@@ -1998,7 +1998,16 @@ pub struct SifsObjectDetails {
     pub changed_at_unix_nanos: u64,
     pub policy: String,
     pub current_locations: Vec<String>,
+    pub local_pins: Vec<SifsPinDetails>,
     pub health: Option<SifsObjectHealth>,
+}
+
+/// Local DFS pin state for a selected SIFS object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SifsPinDetails {
+    pub pinned_by_node_id: String,
+    pub mode: String,
+    pub created_at_unix_nanos: Option<u64>,
 }
 
 /// Operator-facing DFS health for a selected SIFS object.
@@ -2135,9 +2144,12 @@ impl SifsBrowser {
 
     pub fn stat(&self, path: &str) -> Result<SifsObjectDetails, String> {
         match &self.backend {
-            SifsBrowserBackend::Local(backend) => {
-                backend.dfs_stat(path).map(sifs_details_from_stat)
-            }
+            SifsBrowserBackend::Local(backend) => backend.dfs_stat(path).map(|stat| {
+                let local_pins = backend
+                    .local_pins_for_path(&stat.file_system_id, &stat.path)
+                    .unwrap_or_default();
+                sifs_details_from_stat(stat, local_pins)
+            }),
             SifsBrowserBackend::Remote(remote) => remote.stat(path),
         }
     }
@@ -2465,7 +2477,10 @@ fn sifs_entry_from_rpc(entry: sinomo_runtime::daemon::DaemonDfsBrowserEntry) -> 
     }
 }
 
-fn sifs_details_from_stat(stat: sinomo_runtime::dfs::DfsStat) -> SifsObjectDetails {
+fn sifs_details_from_stat(
+    stat: sinomo_runtime::dfs::DfsStat,
+    local_pins: Vec<sinomo_runtime::dfs::DfsPinRecord>,
+) -> SifsObjectDetails {
     SifsObjectDetails {
         file_system_id: stat.file_system_id.to_string(),
         object_id: stat.object_id.to_string(),
@@ -2488,6 +2503,7 @@ fn sifs_details_from_stat(stat: sinomo_runtime::dfs::DfsStat) -> SifsObjectDetai
             .into_iter()
             .map(|node_id| node_id.to_string())
             .collect(),
+        local_pins: local_pins.into_iter().map(sifs_pin_from_record).collect(),
         health: None,
     }
 }
@@ -2513,7 +2529,28 @@ fn sifs_details_from_rpc(
         changed_at_unix_nanos: response.changed_at_unix_nanos,
         policy: sifs_policy_label(&response.policy).to_string(),
         current_locations: response.current_locations,
+        local_pins: response
+            .local_pins
+            .into_iter()
+            .map(sifs_pin_from_rpc)
+            .collect(),
         health: response.health.map(sifs_health_from_rpc),
+    }
+}
+
+fn sifs_pin_from_record(pin: sinomo_runtime::dfs::DfsPinRecord) -> SifsPinDetails {
+    SifsPinDetails {
+        pinned_by_node_id: pin.pinned_by_node_id.to_string(),
+        mode: sifs_pin_mode_label(&pin.mode).to_string(),
+        created_at_unix_nanos: u64::try_from(pin.created_at.unix_timestamp_nanos()).ok(),
+    }
+}
+
+fn sifs_pin_from_rpc(pin: sinomo_runtime::daemon::DaemonDfsBrowserPinRecord) -> SifsPinDetails {
+    SifsPinDetails {
+        pinned_by_node_id: pin.pinned_by_node_id,
+        mode: sifs_pin_mode_label(&pin.mode).to_string(),
+        created_at_unix_nanos: pin.created_at_unix_nanos,
     }
 }
 
@@ -2550,6 +2587,13 @@ fn sifs_policy_label(policy: &sinomo_runtime::core::DfsObjectPolicy) -> &'static
         sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual => "replicated-eventual",
         sinomo_runtime::core::DfsObjectPolicy::AppendOnly => "append-only",
         sinomo_runtime::core::DfsObjectPolicy::EphemeralLocal => "ephemeral-local",
+    }
+}
+
+fn sifs_pin_mode_label(mode: &sinomo_runtime::dfs::DfsPinMode) -> &'static str {
+    match mode {
+        sinomo_runtime::dfs::DfsPinMode::Metadata => "metadata",
+        sinomo_runtime::dfs::DfsPinMode::Content => "content",
     }
 }
 
