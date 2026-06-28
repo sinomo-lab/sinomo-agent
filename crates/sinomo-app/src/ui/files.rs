@@ -5185,6 +5185,7 @@ impl Widget for FilesPlacesRail {
 struct FilesTaskStrip {
     shared: Shared,
     hovered_cancel: Option<u64>,
+    hovered_recovery: Option<u64>,
     hovered_clear: bool,
 }
 
@@ -5193,6 +5194,7 @@ impl FilesTaskStrip {
         Self {
             shared,
             hovered_cancel: None,
+            hovered_recovery: None,
             hovered_clear: false,
         }
     }
@@ -5224,6 +5226,31 @@ impl FilesTaskStrip {
         )
     }
 
+    fn recovery_rect(bounds: Rect, row_index: usize) -> Rect {
+        Rect::new(
+            bounds.max_x() - CONTENT_PAD - 92.0,
+            bounds.y() + 33.0 + row_index as f32 * 24.0,
+            92.0,
+            22.0,
+        )
+    }
+
+    fn task_has_recovery(task: &FilesTask) -> bool {
+        task.source == FilesSourceKind::Sifs && task.state == FilesTaskState::Failed
+    }
+
+    fn detail_display(task: &FilesTask, width: f32) -> String {
+        let detail = files_task_detail_display(task);
+        let detail = if Self::task_has_recovery(task) {
+            detail
+                .strip_suffix(" in Connection")
+                .unwrap_or(detail.as_str())
+        } else {
+            detail.as_str()
+        };
+        display_name_for_width(detail, width, 6.2)
+    }
+
     fn cancel_widget_id(parent: sui::WidgetId, task_id: u64) -> sui::WidgetId {
         sui::WidgetId::new(
             parent
@@ -5236,6 +5263,16 @@ impl FilesTaskStrip {
 
     fn clear_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
         sui::WidgetId::new(parent.get().wrapping_mul(47).wrapping_add(10_199))
+    }
+
+    fn recovery_widget_id(parent: sui::WidgetId, task_id: u64) -> sui::WidgetId {
+        sui::WidgetId::new(
+            parent
+                .get()
+                .wrapping_mul(47)
+                .wrapping_add(10_301)
+                .wrapping_add(task_id),
+        )
     }
 
     fn task_at_cancel(&self, bounds: Rect, position: Point) -> Option<u64> {
@@ -5251,6 +5288,20 @@ impl FilesTaskStrip {
             .map(|(_, task)| task.id)
     }
 
+    fn task_at_recovery(&self, bounds: Rect, position: Point) -> Option<u64> {
+        let files = self.shared.files();
+        files
+            .tasks
+            .iter()
+            .take(2)
+            .enumerate()
+            .find(|(index, task)| {
+                Self::task_has_recovery(task)
+                    && Self::recovery_rect(bounds, *index).contains(position)
+            })
+            .map(|(_, task)| task.id)
+    }
+
     fn clear_hit(&self, bounds: Rect, position: Point) -> bool {
         let files = self.shared.files();
         Self::has_finished_tasks(&files) && Self::clear_rect(bounds).contains(position)
@@ -5262,9 +5313,14 @@ impl Widget for FilesTaskStrip {
         match event {
             Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
                 let hovered = self.task_at_cancel(ctx.bounds(), pointer.position);
+                let hovered_recovery = self.task_at_recovery(ctx.bounds(), pointer.position);
                 let hovered_clear = self.clear_hit(ctx.bounds(), pointer.position);
-                if self.hovered_cancel != hovered || self.hovered_clear != hovered_clear {
+                if self.hovered_cancel != hovered
+                    || self.hovered_recovery != hovered_recovery
+                    || self.hovered_clear != hovered_clear
+                {
                     self.hovered_cancel = hovered;
+                    self.hovered_recovery = hovered_recovery;
                     self.hovered_clear = hovered_clear;
                     ctx.request_paint();
                     ctx.request_semantics();
@@ -5285,9 +5341,24 @@ impl Widget for FilesTaskStrip {
                     ctx.request_hit_test();
                     ctx.request_semantics();
                     ctx.set_handled();
+                } else if self
+                    .task_at_recovery(ctx.bounds(), pointer.position)
+                    .is_some()
+                {
+                    open_settings_section(&self.shared, SettingsSection::Connection);
+                    self.hovered_cancel = None;
+                    self.hovered_recovery = None;
+                    self.hovered_clear = false;
+                    ctx.request_measure();
+                    ctx.request_arrange();
+                    ctx.request_paint();
+                    ctx.request_hit_test();
+                    ctx.request_semantics();
+                    ctx.set_handled();
                 } else if let Some(task_id) = self.task_at_cancel(ctx.bounds(), pointer.position) {
                     self.shared.files_mut().cancel_task(task_id);
                     self.hovered_cancel = None;
+                    self.hovered_recovery = None;
                     self.hovered_clear = false;
                     ctx.request_paint();
                     ctx.request_semantics();
@@ -5300,7 +5371,9 @@ impl Widget for FilesTaskStrip {
                     PointerEventKind::Leave | PointerEventKind::Cancel
                 ) =>
             {
-                let changed = self.hovered_cancel.take().is_some() || self.hovered_clear;
+                let changed = self.hovered_cancel.take().is_some()
+                    || self.hovered_recovery.take().is_some()
+                    || self.hovered_clear;
                 self.hovered_clear = false;
                 if changed {
                     ctx.request_paint();
@@ -5360,8 +5433,11 @@ impl Widget for FilesTaskStrip {
         for (index, task) in files.tasks.iter().take(2).enumerate() {
             let row_y = bounds.y() + 32.0 + index as f32 * 24.0;
             let cancel = Self::cancel_rect(bounds, index);
+            let recovery = Self::recovery_rect(bounds, index);
             let text_right = if task.state.can_cancel() {
                 cancel.x() - 8.0
+            } else if Self::task_has_recovery(task) {
+                recovery.x() - 8.0
             } else {
                 bounds.max_x() - CONTENT_PAD
             };
@@ -5382,7 +5458,7 @@ impl Widget for FilesTaskStrip {
             widgets::draw_text_in(
                 ctx,
                 Rect::new(bounds.x() + CONTENT_PAD + 12.0, row_y + 13.0, text_w, 13.0),
-                &files_task_detail_display_for_width(task, text_w),
+                &Self::detail_display(task, text_w),
                 detail_style.clone(),
             );
             let bar = Rect::new(
@@ -5419,6 +5495,30 @@ impl Widget for FilesTaskStrip {
                     "Cancel",
                     pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text),
                 );
+            } else if Self::task_has_recovery(task) {
+                let fill = if self.hovered_recovery == Some(task.id) {
+                    pal.hover
+                } else {
+                    pal.field
+                };
+                widgets::round_panel(ctx, recovery, fill, pal.border, 7.0);
+                draw_glyph(
+                    ctx,
+                    IconGlyph::Alert,
+                    Rect::new(recovery.x() + 8.0, recovery.y() + 5.0, 12.0, 12.0),
+                    pal.warn,
+                );
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(
+                        recovery.x() + 24.0,
+                        recovery.y() + 3.0,
+                        recovery.width() - 30.0,
+                        16.0,
+                    ),
+                    "Connection",
+                    pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text),
+                );
             }
         }
     }
@@ -5437,6 +5537,25 @@ impl Widget for FilesTaskStrip {
                 Some("Dismiss completed, failed, and cancelled file operations".to_string());
             node.actions = vec![SemanticsAction::Activate];
             node.state.hovered = self.hovered_clear;
+            ctx.push(node);
+        }
+        for (index, task) in files
+            .tasks
+            .iter()
+            .take(2)
+            .enumerate()
+            .filter(|(_, task)| Self::task_has_recovery(task))
+        {
+            let mut node = SemanticsNode::new(
+                Self::recovery_widget_id(ctx.widget_id(), task.id),
+                SemanticsRole::Button,
+                Self::recovery_rect(ctx.bounds(), index),
+            );
+            node.parent = Some(ctx.widget_id());
+            node.name = Some(format!("Open Connection settings for {}", task.title));
+            node.description = Some(format!("{}: {}", task.title, task.detail));
+            node.actions = vec![SemanticsAction::Activate];
+            node.state.hovered = self.hovered_recovery == Some(task.id);
             ctx.push(node);
         }
         for (index, task) in files
@@ -8998,6 +9117,10 @@ mod tests {
             files_task_detail_display(&sifs_task),
             "Authorize SIFS in Connection"
         );
+        assert_eq!(
+            FilesTaskStrip::detail_display(&sifs_task, 120.0),
+            "Authorize SIFS"
+        );
         let compact = files_task_detail_display_for_width(&sifs_task, 180.0);
         assert_eq!(compact, "Authorize SIFS in Connection");
         assert!(compact.chars().count() <= 29);
@@ -10296,6 +10419,59 @@ mod tests {
         assert_eq!(files.tasks.len(), 1);
         assert_eq!(files.tasks[0].id, 78);
         assert_eq!(files.tasks[0].state, FilesTaskState::Running);
+
+        Ok(())
+    }
+
+    #[test]
+    fn task_strip_failed_sifs_task_opens_connection_settings() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.tasks = vec![FilesTask {
+                id: 91,
+                source: FilesSourceKind::Sifs,
+                title: "Refresh placement".to_string(),
+                detail: "device authorization was denied".to_string(),
+                state: FilesTaskState::Failed,
+                progress: Some(1.0),
+            }];
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new().title("Files task recovery").root(
+                    SizedBox::new()
+                        .width(520.0)
+                        .height(720.0)
+                        .with_child(view(shared.clone())),
+                ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open Connection settings for Refresh placement")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
 
         Ok(())
     }
