@@ -35,11 +35,11 @@ use std::time::Duration;
 
 use sui::{
     Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, Color, Constraints,
-    DefaultTheme, Event, EventCtx, FontWeight, IconButton, IconGlyph, KeyState, ListItem, ListView,
-    MeasureCtx, PaintCtx, Point, PointerButton, PointerEventKind, Rect, ScrollState, ScrollView,
-    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator, Size,
-    SizedBox, Stack, StackHostOptions, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    WindowEvent, draw_glyph,
+    DefaultTheme, Event, EventCtx, Flex, FlexItem, FontWeight, IconButton, IconGlyph, KeyState,
+    ListItem, ListView, MeasureCtx, PaintCtx, Point, PointerButton, PointerEventKind, Rect,
+    ScrollState, ScrollView, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole,
+    SemanticsValue, Separator, Size, SizedBox, Stack, StackHostOptions, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, draw_glyph,
 };
 
 use sinomo_cli::app_api::{
@@ -62,7 +62,9 @@ const ROW_ACTION_SIDE: f32 = 24.0;
 const ROW_ACTION_GAP: f32 = 4.0;
 const ROW_ACTION_COUNT: f32 = 7.0;
 const CONTENT_PAD: f32 = 16.0;
-const HEADER_H: f32 = 46.0;
+const HEADER_H: f32 = 78.0;
+const HEADER_COMMAND_GAP: f32 = 8.0;
+const HEADER_ROW_GAP: f32 = 6.0;
 const FILES_STATUS_H: f32 = 38.0;
 const LIST_HEADER_H: f32 = 36.0;
 const LIST_FILTER_H: f32 = 42.0;
@@ -5292,10 +5294,9 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 
     let rename = {
         let s = shared.clone();
-        sui::Button::new("Rename")
-            .icon(IconGlyph::MoreHorizontal)
-            .min_width(88.0)
-            .theme_when(secondary_button_theme(reader))
+        IconButton::new(IconGlyph::MoreHorizontal, "Rename")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
                 move || !s.files().loading && s.files().selected_entry().is_some()
@@ -5309,10 +5310,9 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 
     let delete = {
         let s = shared.clone();
-        sui::Button::new("Delete")
-            .icon(IconGlyph::Trash)
-            .min_width(82.0)
-            .theme_when(secondary_button_theme(reader))
+        IconButton::new(IconGlyph::Trash, "Delete")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
                 move || !s.files().loading && s.files().selected_entry().is_some()
@@ -5324,23 +5324,36 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             })
     };
 
-    Stack::horizontal()
-        .spacing(8.0)
-        .alignment(Alignment::Center)
-        .with_child(back)
-        .with_child(forward)
-        .with_child(up)
-        .with_child(SizedBox::new().width(118.0).height(30.0).with_child(source))
-        .with_child(breadcrumb)
-        .with_child(refresh)
-        .with_child(go_to)
-        .with_child(new_file)
-        .with_child(new_folder)
-        .with_child(copy)
-        .with_child(move_to)
-        .with_child(refresh_placement)
-        .with_child(rename)
-        .with_child(delete)
+    let navigation_row = Flex::horizontal()
+        .main_gap(HEADER_COMMAND_GAP)
+        .align_items(Alignment::Center)
+        .with_item(back, FlexItem::new().no_shrink())
+        .with_item(forward, FlexItem::new().no_shrink())
+        .with_item(up, FlexItem::new().no_shrink())
+        .with_item(
+            SizedBox::new().width(118.0).height(30.0).with_child(source),
+            FlexItem::fixed(118.0),
+        )
+        .with_item(breadcrumb, FlexItem::fill().min_width(180.0))
+        .with_item(refresh, FlexItem::new().no_shrink())
+        .with_item(go_to, FlexItem::new().no_shrink());
+
+    let command_row = Flex::horizontal()
+        .main_gap(HEADER_COMMAND_GAP)
+        .align_items(Alignment::Center)
+        .with_item(new_file, FlexItem::new().no_shrink())
+        .with_item(new_folder, FlexItem::new().no_shrink())
+        .with_item(copy, FlexItem::new().no_shrink())
+        .with_item(move_to, FlexItem::new().no_shrink())
+        .with_item(refresh_placement, FlexItem::new().no_shrink())
+        .with_item(rename, FlexItem::new().no_shrink())
+        .with_item(delete, FlexItem::new().no_shrink());
+
+    Stack::vertical()
+        .spacing(HEADER_ROW_GAP)
+        .alignment(Alignment::Stretch)
+        .with_child(SizedBox::new().height(30.0).with_child(navigation_row))
+        .with_child(SizedBox::new().height(30.0).with_child(command_row))
 }
 
 // ---------------------------------------------------------------------------
@@ -12411,6 +12424,69 @@ mod tests {
         assert_eq!(files.path, "/");
         assert_eq!(files.selected, Some(0));
         assert!(files.selected_entry().is_some_and(|entry| entry.is_dir));
+
+        Ok(())
+    }
+
+    #[test]
+    fn files_header_keeps_commands_usable_for_long_paths() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let long_path =
+            "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.623.5546.0_x64__2p2nqsd0c76g0\\app";
+        {
+            let mut files = shared.files_mut();
+            files.source = FilesSourceKind::Local;
+            files.loaded = true;
+            files.loading = false;
+            files.path = long_path.to_string();
+            files.entries = vec![SifsEntry {
+                name: "chrome.dll".to_string(),
+                path: Path::new(long_path)
+                    .join("chrome.dll")
+                    .to_string_lossy()
+                    .into_owned(),
+                is_dir: false,
+                is_link: false,
+                size: Some(294_300_000),
+            }];
+            files.selected = Some(0);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new().title("Files long header").root(
+                    SizedBox::new()
+                        .width(1280.0)
+                        .height(720.0)
+                        .with_child(view(shared.clone())),
+                ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let snapshot = window.snapshot()?;
+
+        for label in ["Rename", "Delete"] {
+            let node = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == sui::SemanticsRole::Button && node.name.as_deref() == Some(label)
+                })
+                .unwrap_or_else(|| panic!("{label} command should be present"));
+            assert!(
+                node.bounds.width() >= 28.0 && node.bounds.height() >= 28.0,
+                "{label} command should keep a usable hit target, got {:?}",
+                node.bounds
+            );
+            assert!(
+                node.bounds.max_x() <= 1280.0 && node.bounds.max_y() <= HEADER_H,
+                "{label} command should stay inside the header, got {:?}",
+                node.bounds
+            );
+        }
 
         Ok(())
     }
