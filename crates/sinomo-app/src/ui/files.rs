@@ -30,11 +30,12 @@ use std::thread;
 use std::time::Duration;
 
 use sui::{
-    Alignment, ArrangeCtx, Breadcrumb, BreadcrumbItem, Constraints, DefaultTheme, Event, EventCtx,
-    FontWeight, IconButton, IconGlyph, KeyState, ListItem, ListView, MeasureCtx, PaintCtx, Point,
-    PointerButton, PointerEventKind, Rect, ScrollState, ScrollView, SemanticsAction, SemanticsCtx,
-    SemanticsNode, SemanticsRole, Separator, Size, SizedBox, Stack, StackHostOptions, Widget,
-    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, draw_glyph,
+    Alignment, ArrangeCtx, Breadcrumb, BreadcrumbItem, Color, Constraints, DefaultTheme, Event,
+    EventCtx, FontWeight, IconButton, IconGlyph, KeyState, ListItem, ListView, MeasureCtx,
+    PaintCtx, Point, PointerButton, PointerEventKind, Rect, ScrollState, ScrollView,
+    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator, Size, SizedBox, Stack,
+    StackHostOptions, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
+    draw_glyph,
 };
 
 use sinomo_cli::app_api::{SifsBrowser, SifsEntry, SifsObjectDetails};
@@ -1268,6 +1269,39 @@ fn sifs_unavailable_summary(error: &str) -> &'static str {
     }
 }
 
+fn sifs_metadata_status_label(
+    loading: bool,
+    error: Option<&str>,
+    details: Option<&SifsObjectDetails>,
+) -> &'static str {
+    if loading {
+        "Loading metadata"
+    } else if error.is_some() {
+        "Metadata unavailable"
+    } else if details.is_some() {
+        "Metadata current"
+    } else {
+        "Metadata pending"
+    }
+}
+
+fn sifs_metadata_status_color(
+    pal: &Palette,
+    loading: bool,
+    error: Option<&str>,
+    details: Option<&SifsObjectDetails>,
+) -> Color {
+    if loading {
+        pal.accent
+    } else if error.is_some() {
+        pal.warn
+    } else if details.is_some() {
+        pal.good
+    } else {
+        pal.text_muted
+    }
+}
+
 /// The right-aligned metadata for a listing row: `folder` for directories, else a human size.
 fn entry_meta(entry: &SifsEntry) -> String {
     if entry.is_dir {
@@ -1890,13 +1924,14 @@ impl InspectorView {
         }
         match files.selected_entry() {
             Some(entry) => format!(
-                "{}|{}|{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}|{}|{}",
                 entry.path,
                 entry.is_dir,
                 entry.is_link,
                 files.clustered,
                 files.details_loading,
                 files.details_error.as_deref().unwrap_or(""),
+                files.inspector_details_open,
                 files
                     .selected_details
                     .as_ref()
@@ -2053,7 +2088,7 @@ impl Widget for InspectorView {
 
             let can_toggle_details = {
                 let files = self.shared.files();
-                files.loading || files.error.is_some()
+                files.loading || files.error.is_some() || files.selected_entry().is_some()
             };
             if can_toggle_details
                 && inspector_detail_button_rect(ctx.bounds()).contains(pointer.position)
@@ -2164,9 +2199,18 @@ impl Widget for InspectorView {
         let details = files.selected_details.as_ref();
 
         // Name + kind.
+        let details_open = files.inspector_details_open;
+        let detail_rect = inspector_detail_button_rect(bounds);
+        self.detail_button(ctx, &theme, &pal, detail_rect, details_open);
+        let title_right_gap = INSPECTOR_DETAIL_BUTTON_W + 10.0;
         let name_style = pal.text_style(&theme, 16.0, FontWeight::SEMIBOLD, pal.text);
         let display_name = middle_short(&entry.name, 36);
-        widgets::draw_text_in(ctx, Rect::new(x, y, w, 24.0), &display_name, name_style);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x, y, (w - title_right_gap).max(0.0), 24.0),
+            &display_name,
+            name_style,
+        );
         y += 26.0;
         let kind = details
             .map(|details| details.kind.as_str())
@@ -2242,36 +2286,19 @@ impl Widget for InspectorView {
         );
         y += 36.0;
 
-        let row_label = pal.text_style(&theme, 12.5, FontWeight::NORMAL, pal.text_muted);
-        let row_val = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, pal.text);
-        let metadata_status = if files.details_loading {
-            "loading metadata".to_string()
-        } else if let Some(error) = &files.details_error {
-            format!("metadata unavailable: {error}")
-        } else if details.is_some() {
-            "metadata current".to_string()
-        } else {
-            "select item to load metadata".to_string()
-        };
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x, y, 130.0, 20.0),
-            "Status",
-            row_label.clone(),
+        let status_label = sifs_metadata_status_label(
+            files.details_loading,
+            files.details_error.as_deref(),
+            details,
         );
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x + 130.0, y, w - 130.0, 20.0),
-            &metadata_status,
-            row_val.clone(),
+        let status_color = sifs_metadata_status_color(
+            &pal,
+            files.details_loading,
+            files.details_error.as_deref(),
+            details,
         );
-        y += 24.0;
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x, y, 130.0, 20.0),
-            "Policy",
-            row_label.clone(),
-        );
+        y = self.status_badge(ctx, &theme, &pal, x, y, w, status_label, status_color);
+
         let policy = details
             .map(|details| details.policy.as_str())
             .unwrap_or(if files.clustered {
@@ -2279,95 +2306,122 @@ impl Widget for InspectorView {
             } else {
                 "local-owned"
             });
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x + 130.0, y, w - 130.0, 20.0),
-            policy,
-            row_val.clone(),
-        );
-        y += 24.0;
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x, y, 130.0, 20.0),
-            "Locations",
-            row_label.clone(),
-        );
+        y = self.info_row(ctx, &theme, &pal, x, y + 10.0, w, "Policy", policy);
         let locations = details
             .map(details_locations)
             .unwrap_or_else(|| node_label.clone());
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x + 130.0, y, w - 130.0, 20.0),
-            &locations,
-            row_val.clone(),
-        );
-        y += 24.0;
+        y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Locations", &locations);
 
-        if let Some(details) = details {
+        if details_open {
+            y += 14.0;
+            let detail_heading = pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
             widgets::draw_text_in(
                 ctx,
-                Rect::new(x, y, 130.0, 20.0),
-                "Object",
-                row_label.clone(),
+                Rect::new(x, y, w, 16.0),
+                "TECHNICAL DETAILS",
+                detail_heading,
             );
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(x + 130.0, y, w - 130.0, 20.0),
-                &short(&details.object_id, 28),
-                row_val.clone(),
-            );
-            y += 24.0;
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(x, y, 130.0, 20.0),
-                "Version",
-                row_label.clone(),
-            );
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(x + 130.0, y, w - 130.0, 20.0),
-                &short(&details.version, 28),
-                row_val.clone(),
-            );
-            y += 24.0;
-            widgets::draw_text_in(ctx, Rect::new(x, y, 130.0, 20.0), "Mode", row_label.clone());
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(x + 130.0, y, w - 130.0, 20.0),
-                &format!("{:o} · {} links", details.mode, details.link_count),
-                row_val.clone(),
-            );
-            y += 24.0;
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(x, y, 130.0, 20.0),
-                "Modified",
-                row_label.clone(),
-            );
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(x + 130.0, y, w - 130.0, 20.0),
-                &unix_nanos_label(details.modified_at_unix_nanos),
-                row_val.clone(),
-            );
-            y += 24.0;
-            if let Some(hash) = &details.content_hash {
-                widgets::draw_text_in(
+            y += 22.0;
+
+            if let Some(error) = &files.details_error {
+                y = self.info_row(ctx, &theme, &pal, x, y, w, "Reason", error);
+                y = self.info_row(
                     ctx,
-                    Rect::new(x, y, 130.0, 20.0),
-                    "Content",
-                    row_label.clone(),
+                    &theme,
+                    &pal,
+                    x,
+                    y + 4.0,
+                    w,
+                    "Authority",
+                    "SIFS through daemon",
                 );
-                widgets::draw_text_in(
+            } else if files.details_loading {
+                y = self.info_row(
                     ctx,
-                    Rect::new(x + 130.0, y, w - 130.0, 20.0),
-                    &short(hash, 28),
-                    row_val.clone(),
+                    &theme,
+                    &pal,
+                    x,
+                    y,
+                    w,
+                    "Status",
+                    "Waiting for daemon metadata",
                 );
-                y += 24.0;
             }
-        } else {
-            y += 10.0;
+
+            if let Some(details) = details {
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y,
+                    w,
+                    "File system",
+                    &details.file_system_id,
+                );
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y + 4.0,
+                    w,
+                    "Object",
+                    &short(&details.object_id, 28),
+                );
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y + 4.0,
+                    w,
+                    "Version",
+                    &short(&details.version, 28),
+                );
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y + 4.0,
+                    w,
+                    "Mode",
+                    &format!("{:o} · {} links", details.mode, details.link_count),
+                );
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y + 4.0,
+                    w,
+                    "Owner",
+                    &format!("uid {} · gid {}", details.uid, details.gid),
+                );
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y + 4.0,
+                    w,
+                    "Modified",
+                    &unix_nanos_label(details.modified_at_unix_nanos),
+                );
+                if let Some(hash) = &details.content_hash {
+                    y = self.info_row(
+                        ctx,
+                        &theme,
+                        &pal,
+                        x,
+                        y + 4.0,
+                        w,
+                        "Content",
+                        &short(hash, 28),
+                    );
+                }
+            }
         }
 
         if !files.clustered {
@@ -2392,7 +2446,8 @@ impl Widget for InspectorView {
             let files = self.shared.files();
             (
                 files.selected_entry().filter(|entry| entry.is_dir).cloned(),
-                (files.loading || files.error.is_some()).then_some(files.inspector_details_open),
+                (files.loading || files.error.is_some() || files.selected_entry().is_some())
+                    .then_some(files.inspector_details_open),
                 files.tasks.clone(),
             )
         };
@@ -2548,6 +2603,39 @@ impl InspectorView {
             },
             pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text),
         );
+    }
+
+    fn status_badge(
+        &self,
+        ctx: &mut PaintCtx,
+        theme: &sui::DefaultTheme,
+        pal: &Palette,
+        x: f32,
+        y: f32,
+        w: f32,
+        label: &str,
+        tone: Color,
+    ) -> f32 {
+        let text_style = pal.text_style(theme, 12.0, FontWeight::SEMIBOLD, tone);
+        let text_w = ctx
+            .measure_text(label.to_string(), text_style.clone())
+            .map(|m| m.width)
+            .unwrap_or(120.0);
+        let badge_w = (text_w + 22.0).min(w).max(80.0);
+        let badge = Rect::new(x, y, badge_w, 26.0);
+        widgets::round_panel(ctx, badge, pal.field, tone, 13.0);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(
+                badge.x() + 11.0,
+                badge.y() + 4.0,
+                badge.width() - 22.0,
+                18.0,
+            ),
+            label,
+            text_style,
+        );
+        badge.max_y()
     }
 
     fn open_folder_button(
@@ -3525,6 +3613,37 @@ mod tests {
     }
 
     #[test]
+    fn inspector_summary_reflects_selected_details_disclosure() {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.selected = Some(0);
+            files.clustered = true;
+            files.details_error = Some("device authorization was denied".to_string());
+        }
+
+        let inspector = InspectorView::new(shared.clone());
+        assert!(inspector.summary().contains(
+            "/artifact.txt|false|false|true|false|device authorization was denied|false|"
+        ));
+
+        shared.files_mut().inspector_details_open = true;
+        assert!(inspector.summary().contains(
+            "/artifact.txt|false|false|true|false|device authorization was denied|true|"
+        ));
+    }
+
+    #[test]
     fn sifs_unavailable_rows_hide_diagnostics_until_expanded() {
         let loading = sifs_loading_rows("/services", false);
         assert!(
@@ -3562,6 +3681,46 @@ mod tests {
             expanded
                 .iter()
                 .any(|(label, value)| *label == "Authority" && value == "SIFS through daemon")
+        );
+    }
+
+    #[test]
+    fn selected_metadata_status_uses_compact_user_labels() {
+        assert_eq!(
+            sifs_metadata_status_label(true, None, None),
+            "Loading metadata"
+        );
+        assert_eq!(
+            sifs_metadata_status_label(false, Some("device authorization was denied"), None),
+            "Metadata unavailable"
+        );
+        assert_eq!(
+            sifs_metadata_status_label(false, None, None),
+            "Metadata pending"
+        );
+
+        let details = SifsObjectDetails {
+            file_system_id: "sifs".to_string(),
+            object_id: "obj".to_string(),
+            path: "/artifact.txt".to_string(),
+            kind: "file".to_string(),
+            version: "v1".to_string(),
+            content_hash: None,
+            size_bytes: Some(5),
+            link_count: 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            policy: "replicated-eventual".to_string(),
+            current_locations: vec!["node-a".to_string()],
+        };
+        assert_eq!(
+            sifs_metadata_status_label(false, None, Some(&details)),
+            "Metadata current"
         );
     }
 
@@ -4044,6 +4203,52 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Files inspector details")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Show details")
+            .click()?;
+        assert!(shared.files().inspector_details_open);
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Hide details")
+            .click()?;
+        assert!(!shared.files().inspector_details_open);
+
+        Ok(())
+    }
+
+    #[test]
+    fn selected_file_details_button_toggles_sifs_diagnostics() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.node_id = "node-a".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.selected = Some(0);
+            files.details_error = Some("device authorization was denied".to_string());
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files selected inspector details")
                     .root(view(shared.clone())),
             )
             .build()?;
