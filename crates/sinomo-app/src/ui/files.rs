@@ -7009,19 +7009,6 @@ impl InspectorView {
         }
 
         y += Self::info_row_height(w, &entry.path);
-        if !entry.is_dir {
-            let preview_error = files
-                .preview_error
-                .as_deref()
-                .map(|error| file_preview_error_display(files.source, error));
-            y += 10.0
-                + Self::preview_section_height(
-                    w,
-                    files.preview_loading,
-                    preview_error.as_deref(),
-                    files.selected_preview.as_ref(),
-                );
-        }
 
         if files.source == FilesSourceKind::Local {
             y += 10.0 + 24.0;
@@ -7061,6 +7048,20 @@ impl InspectorView {
                     y += 4.0
                         + Self::info_row_height(w, &local_time_label(local.created_at_unix_nanos));
                 }
+            }
+
+            if !entry.is_dir {
+                let preview_error = files
+                    .preview_error
+                    .as_deref()
+                    .map(|error| file_preview_error_display(files.source, error));
+                y += 10.0
+                    + Self::preview_section_height(
+                        w,
+                        files.preview_loading,
+                        preview_error.as_deref(),
+                        files.selected_preview.as_ref(),
+                    );
             }
 
             return finish(y, !files.tasks.is_empty());
@@ -7136,6 +7137,20 @@ impl InspectorView {
                 7.0,
             );
             y += lines as f32 * 17.0;
+        }
+
+        if !entry.is_dir {
+            let preview_error = files
+                .preview_error
+                .as_deref()
+                .map(|error| file_preview_error_display(files.source, error));
+            y += 10.0
+                + Self::preview_section_height(
+                    w,
+                    files.preview_loading,
+                    preview_error.as_deref(),
+                    files.selected_preview.as_ref(),
+                );
         }
 
         finish(y, !files.tasks.is_empty())
@@ -7678,24 +7693,6 @@ impl Widget for InspectorView {
         }
 
         y = self.info_row(ctx, &theme, &pal, x, y, w, "Path", &entry.path);
-        if !entry.is_dir {
-            y += 10.0;
-            let preview_error = files
-                .preview_error
-                .as_deref()
-                .map(|error| file_preview_error_display(files.source, error));
-            y = self.preview_section(
-                ctx,
-                &theme,
-                &pal,
-                x,
-                y,
-                w,
-                files.preview_loading,
-                preview_error.as_deref(),
-                files.selected_preview.as_ref(),
-            );
-        }
 
         if files.source == FilesSourceKind::Local {
             y += 10.0;
@@ -7805,6 +7802,25 @@ impl Widget for InspectorView {
                         &local_time_label(local.created_at_unix_nanos),
                     );
                 }
+            }
+
+            if !entry.is_dir {
+                y += 10.0;
+                let preview_error = files
+                    .preview_error
+                    .as_deref()
+                    .map(|error| file_preview_error_display(files.source, error));
+                let _ = self.preview_section(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y,
+                    w,
+                    files.preview_loading,
+                    preview_error.as_deref(),
+                    files.selected_preview.as_ref(),
+                );
             }
             return;
         }
@@ -8088,6 +8104,25 @@ impl Widget for InspectorView {
                 widgets::draw_text_in(ctx, Rect::new(x, y, w, 18.0), &line, note.clone());
                 y += 17.0;
             }
+        }
+
+        if !entry.is_dir {
+            y += 10.0;
+            let preview_error = files
+                .preview_error
+                .as_deref()
+                .map(|error| file_preview_error_display(files.source, error));
+            let _ = self.preview_section(
+                ctx,
+                &theme,
+                &pal,
+                x,
+                y,
+                w,
+                files.preview_loading,
+                preview_error.as_deref(),
+                files.selected_preview.as_ref(),
+            );
         }
     }
 
