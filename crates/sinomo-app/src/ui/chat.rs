@@ -2255,7 +2255,7 @@ impl ChatState {
             .unwrap_or(false)
     }
 
-    /// Start a fresh session (the "New chat" sidebar row).
+    /// Start a fresh session from the sidebar "New chat" action.
     fn new_session(&mut self) {
         self.persist();
         let interrupted_session_id = self.session_id.clone();
@@ -2272,7 +2272,7 @@ impl ChatState {
             .send_command(ChatCommand::NewSession { session_id });
     }
 
-    /// Start a fresh explicit channel (the "New channel" sidebar row).
+    /// Start a fresh explicit channel from the sidebar "New channel" action.
     fn new_channel(&mut self) {
         self.persist();
         let interrupted_session_id = self.session_id.clone();
@@ -3344,7 +3344,8 @@ fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         })
 }
 
-/// Build the CHATS ListView: new-chat/new-channel actions followed by stored chats/channels.
+/// Build the CHATS ListView: stored chats/channels only. Creation actions live
+/// above the scroll area so the list itself behaves like persistent history.
 fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let (sessions, filter, loading) = {
         let chat = shared.chat();
@@ -3355,15 +3356,14 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         )
     };
     let visible_indices = filtered_session_indices(&sessions, &filter);
-    let mut items = vec![
-        ListItem::new("New chat").leading_text("+"),
-        ListItem::new("New channel").leading_text("#"),
-    ];
-    items.extend(visible_indices.iter().map(|index| {
-        let session = sessions[*index].clone();
-        ListItem::new(session.title.clone())
-            .with_child(ChatSessionRow::new(shared.clone(), session))
-    }));
+    let mut items = visible_indices
+        .iter()
+        .map(|index| {
+            let session = sessions[*index].clone();
+            ListItem::new(session.title.clone())
+                .with_child(ChatSessionRow::new(shared.clone(), session))
+        })
+        .collect::<Vec<_>>();
     if loading && sessions.is_empty() {
         items.push(
             ListItem::new("Loading chats...")
@@ -3388,25 +3388,48 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 filtered_session_indices(&chat.sessions, &filter)
                     .into_iter()
                     .position(|session_index| chat.sessions[session_index].id == chat.session_id)
-                    .map(|index| index + 2)
+                    .map(|index| index)
             }
         })
         .row_height(SIDEBAR_ROW_H)
         .theme_when(clone_reader(reader))
         .on_change(move |index, _label| {
             let mut chat = s.chat_mut();
-            if index == 0 {
-                chat.new_session();
-            } else if index == 1 {
-                chat.new_channel();
-            } else {
-                let filter = normalized_session_filter(&chat.session_filter);
-                let visible_indices = filtered_session_indices(&chat.sessions, &filter);
-                if let Some(session_index) = visible_indices.get(index - 2) {
-                    chat.open_session(*session_index);
-                }
+            let filter = normalized_session_filter(&chat.session_filter);
+            let visible_indices = filtered_session_indices(&chat.sessions, &filter);
+            if let Some(session_index) = visible_indices.get(index) {
+                chat.open_session(*session_index);
             }
         })
+}
+
+fn session_create_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let new_chat = {
+        let s = shared.clone();
+        sui::Button::new("New chat")
+            .icon(IconGlyph::Chat)
+            .min_height(32.0)
+            .theme_when(clone_reader(reader))
+            .on_press(move || {
+                s.chat_mut().new_session();
+            })
+    };
+    let new_channel = {
+        let s = shared.clone();
+        sui::Button::new("New channel")
+            .icon(IconGlyph::Add)
+            .min_height(32.0)
+            .theme_when(clone_reader(reader))
+            .on_press(move || {
+                s.chat_mut().new_channel();
+            })
+    };
+
+    Flex::vertical()
+        .main_gap(6.0)
+        .align_items(Alignment::Stretch)
+        .with_child(new_chat)
+        .with_child(new_channel)
 }
 
 fn session_filter_input(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -3790,6 +3813,8 @@ fn sidebar(
                     8.0,
                 ))
                 .with_child(SizedBox::new().height(6.0))
+                .with_child(InsetX::new(session_create_actions(&s, &r), 8.0))
+                .with_child(SizedBox::new().height(8.0))
                 .with_item(
                     InsetX::new(sessions_scroll_rebuild(&s, &r, &sessions_scroll_state), 8.0),
                     FlexItem::flex(1.0).min_height(0.0),
@@ -8196,6 +8221,64 @@ mod tests {
         assert!(
             chat.draft_revision > 0,
             "quick action should trigger exactly the programmatic composer refresh path"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_sidebar_create_actions_are_explicit_buttons() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            seed_test_agents(&mut chat);
+            chat.sessions.clear();
+            chat.messages.clear();
+            chat.input.clear();
+            chat.models_loading = false;
+            chat.session_edit_id = None;
+        }
+
+        let initial_session_id = shared.chat().session_id.clone();
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat sidebar create actions")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("New chat")
+            .click()?;
+        let new_chat_id = shared.chat().session_id.clone();
+        assert_ne!(
+            new_chat_id, initial_session_id,
+            "New chat button should start a fresh visible session"
+        );
+        assert!(
+            shared.chat().session_edit_id.is_none(),
+            "New chat should not open the edit dialog"
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("New channel")
+            .click()?;
+        let chat = shared.chat();
+        assert_ne!(
+            chat.session_id, new_chat_id,
+            "New channel button should start a separate visible session"
+        );
+        assert_eq!(
+            chat.session_edit_id.as_deref(),
+            Some(chat.session_id.as_str()),
+            "New channel should open its edit dialog"
         );
 
         Ok(())
