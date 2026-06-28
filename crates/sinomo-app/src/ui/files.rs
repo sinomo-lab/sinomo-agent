@@ -3801,9 +3801,8 @@ fn files_action_dialog_signature(shared: &Shared) -> String {
     let files = shared.files();
     match &files.action_prompt {
         Some(prompt) => format!(
-            "{:?}|{}|{}|{}",
+            "{:?}|{}|{}",
             prompt.kind,
-            prompt.input,
             prompt.target_path.as_deref().unwrap_or(""),
             prompt.error.as_deref().unwrap_or("")
         ),
@@ -4985,6 +4984,41 @@ mod tests {
             .expect("validation keeps prompt");
         assert_eq!(prompt.kind, FileActionPromptKind::GoTo);
         assert_eq!(prompt.error.as_deref(), Some("path cannot be empty"));
+    }
+
+    #[test]
+    fn action_dialog_signature_does_not_change_while_typing() {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.open_action_prompt(FileActionPromptKind::GoTo);
+        }
+
+        let opened = files_action_dialog_signature(&shared);
+        shared
+            .files_mut()
+            .set_action_prompt_input("/services".to_string());
+
+        assert_eq!(
+            files_action_dialog_signature(&shared),
+            opened,
+            "live text edits should not rebuild and replace the focused dialog input"
+        );
+
+        shared
+            .files_mut()
+            .set_action_prompt_input("   ".to_string());
+        shared.files_mut().submit_action_prompt(None);
+
+        assert_ne!(
+            files_action_dialog_signature(&shared),
+            opened,
+            "validation errors still need to rebuild the dialog content"
+        );
     }
 
     #[test]

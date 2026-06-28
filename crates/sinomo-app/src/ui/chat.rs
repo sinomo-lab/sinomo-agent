@@ -2295,13 +2295,8 @@ impl ChatState {
 
     /// Update the composer draft (bound to the composer `TextArea` via its `on_change`).
     fn set_draft(&mut self, text: String) {
-        let was_empty = self.input.is_empty();
-        let is_empty = text.is_empty();
         self.cursor = text.len();
         self.input = text;
-        if was_empty != is_empty {
-            self.draft_revision = self.draft_revision.wrapping_add(1);
-        }
     }
 
     fn clear_draft(&mut self) {
@@ -6885,6 +6880,85 @@ fn open_provider_setup(shared: &Shared) {
 /// The composer's bottom row: a flexible message `TextArea` and a fixed-size action slot. The input
 /// is bound to the draft via `on_change`; Enter submits normally, or queues a follow-up during an
 /// active stream. The action control swaps from Send to Interrupt while streaming.
+fn composer_action_signature(shared: &Shared) -> (bool, bool) {
+    let chat = shared.chat();
+    (chat.streaming, !chat.input.is_empty())
+}
+
+fn composer_actions(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let (streaming, has_draft) = composer_action_signature(shared);
+    if streaming {
+        let s = shared.clone();
+        WidgetPod::new(
+            Flex::horizontal()
+                .align_items(Alignment::Center)
+                .spacer()
+                .with_child(
+                    IconButton::new(IconGlyph::Close, "Interrupt")
+                        .size(SEND_BUTTON_SIZE)
+                        .icon_size(17.0)
+                        .theme_when(clone_reader(reader))
+                        .on_press(move || {
+                            s.chat_mut().interrupt_turn();
+                        }),
+                ),
+        )
+    } else if has_draft {
+        let clear = {
+            let s = shared.clone();
+            IconButton::new(IconGlyph::Close, "Clear draft")
+                .size(SEND_BUTTON_SIZE)
+                .icon_size(16.0)
+                .theme_when(secondary_button_theme(reader))
+                .on_press(move || {
+                    s.chat_mut().clear_draft();
+                })
+        };
+        let send = {
+            let s = shared.clone();
+            IconButton::new(IconGlyph::Send, "Send")
+                .size(SEND_BUTTON_SIZE)
+                .icon_size(17.0)
+                .theme_when(clone_reader(reader))
+                .enabled_when({
+                    let s = s.clone();
+                    move || s.chat().can_send()
+                })
+                .on_press(move || {
+                    s.chat_mut().submit();
+                })
+        };
+        WidgetPod::new(
+            Flex::horizontal()
+                .gap(6.0)
+                .align_items(Alignment::Center)
+                .spacer()
+                .with_child(clear)
+                .with_child(send),
+        )
+    } else {
+        let s = shared.clone();
+        WidgetPod::new(
+            Flex::horizontal()
+                .align_items(Alignment::Center)
+                .spacer()
+                .with_child(
+                    IconButton::new(IconGlyph::Send, "Send")
+                        .size(SEND_BUTTON_SIZE)
+                        .icon_size(17.0)
+                        .theme_when(clone_reader(reader))
+                        .enabled_when({
+                            let s = s.clone();
+                            move || s.chat().can_send()
+                        })
+                        .on_press(move || {
+                            s.chat_mut().submit();
+                        }),
+                ),
+        )
+    }
+}
+
 fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let input = {
         let s = shared.clone();
@@ -6924,77 +6998,22 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         input
     };
 
-    let streaming = shared.chat().streaming;
-    let has_draft = !shared.chat().input.is_empty();
-    let send: WidgetPod = if streaming {
+    let action = {
         let s = shared.clone();
-        WidgetPod::new(
-            IconButton::new(IconGlyph::Close, "Interrupt")
-                .size(SEND_BUTTON_SIZE)
-                .icon_size(17.0)
-                .theme_when(clone_reader(reader))
-                .on_press(move || {
-                    s.chat_mut().interrupt_turn();
-                }),
-        )
-    } else if has_draft {
-        let clear = {
-            let s = shared.clone();
-            IconButton::new(IconGlyph::Close, "Clear draft")
-                .size(SEND_BUTTON_SIZE)
-                .icon_size(16.0)
-                .theme_when(secondary_button_theme(reader))
-                .on_press(move || {
-                    s.chat_mut().clear_draft();
-                })
-        };
-        let send = {
-            let s = shared.clone();
-            IconButton::new(IconGlyph::Send, "Send")
-                .size(SEND_BUTTON_SIZE)
-                .icon_size(17.0)
-                .theme_when(clone_reader(reader))
-                .enabled_when({
-                    let s = s.clone();
-                    move || s.chat().can_send()
-                })
-                .on_press(move || {
-                    s.chat_mut().submit();
-                })
-        };
-        WidgetPod::new(
-            Flex::horizontal()
-                .gap(6.0)
-                .align_items(Alignment::Center)
-                .with_child(clear)
-                .with_child(send),
-        )
-    } else {
-        let s = shared.clone();
-        WidgetPod::new(
-            IconButton::new(IconGlyph::Send, "Send")
-                .size(SEND_BUTTON_SIZE)
-                .icon_size(17.0)
-                .theme_when(clone_reader(reader))
-                .enabled_when({
-                    let s = s.clone();
-                    move || s.chat().can_send()
-                })
-                .on_press(move || {
-                    s.chat_mut().submit();
-                }),
-        )
-    };
-    let action_width = if !streaming && has_draft {
-        SEND_BUTTON_SIZE * 2.0 + 6.0
-    } else {
-        SEND_BUTTON_SIZE
+        let r = Rc::clone(reader);
+        WidgetPod::new(RebuildOnChange::new(
+            {
+                let s = s.clone();
+                move || composer_action_signature(&s)
+            },
+            move |_sig| composer_actions(&s, &r),
+        ))
     };
 
     let row = ComposerInputRow::new(
         WidgetPod::new(input),
-        send,
-        action_width,
+        action,
+        SEND_BUTTON_SIZE * 2.0 + 6.0,
         SEND_BUTTON_SIZE,
         INPUT_ACTION_GAP,
     );
@@ -7871,6 +7890,22 @@ mod tests {
         let mut state = ChatState::new(&backend);
         state.sessions.clear();
         (backend, state)
+    }
+
+    #[test]
+    fn typing_draft_does_not_rebuild_focused_composer() {
+        let (_backend, mut state) = isolated_chat_state("typing-draft");
+        let revision = state.draft_revision;
+
+        state.set_draft("h".to_string());
+        state.set_draft("hello".to_string());
+
+        assert_eq!(state.input, "hello");
+        assert_eq!(state.cursor, "hello".len());
+        assert_eq!(
+            state.draft_revision, revision,
+            "typing must not change the programmatic composer rebuild key"
+        );
     }
 
     fn chat_sessions_list_y(window: &sui_testing::TestWindow) -> sui::Result<f32> {
