@@ -3620,11 +3620,81 @@ const INSPECTOR_PAD: f32 = CONTENT_PAD;
 const INSPECTOR_STATE_PANEL_Y: f32 = INSPECTOR_PAD + 34.0;
 const INSPECTOR_DETAIL_BUTTON_W: f32 = 104.0;
 const INSPECTOR_DETAIL_BUTTON_H: f32 = 24.0;
-const INSPECTOR_OPEN_BUTTON_W: f32 = 128.0;
-const INSPECTOR_OPEN_BUTTON_H: f32 = 28.0;
+const INSPECTOR_ACTION_BUTTON_H: f32 = 28.0;
+const INSPECTOR_ACTION_GAP: f32 = 8.0;
 const INSPECTOR_TASK_PANEL_H: f32 = 128.0;
 const INSPECTOR_TASK_ROW_H: f32 = 28.0;
 const INSPECTOR_TASK_CANCEL_W: f32 = 58.0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InspectorAction {
+    OpenFolder,
+    Copy,
+    Move,
+    Rename,
+    Delete,
+    RefreshPlacement,
+}
+
+impl InspectorAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::OpenFolder => "Open folder",
+            Self::Copy => "Copy",
+            Self::Move => "Move",
+            Self::Rename => "Rename",
+            Self::Delete => "Delete",
+            Self::RefreshPlacement => "Refresh placement",
+        }
+    }
+
+    fn glyph(self) -> IconGlyph {
+        match self {
+            Self::OpenFolder => IconGlyph::Folder,
+            Self::Copy => IconGlyph::Restore,
+            Self::Move => IconGlyph::ChevronRight,
+            Self::Rename => IconGlyph::MoreHorizontal,
+            Self::Delete => IconGlyph::Trash,
+            Self::RefreshPlacement => IconGlyph::Storage,
+        }
+    }
+
+    fn prompt_kind(self) -> Option<FileActionPromptKind> {
+        match self {
+            Self::Copy => Some(FileActionPromptKind::Copy),
+            Self::Move => Some(FileActionPromptKind::Move),
+            Self::Rename => Some(FileActionPromptKind::Rename),
+            Self::Delete => Some(FileActionPromptKind::Delete),
+            Self::OpenFolder | Self::RefreshPlacement => None,
+        }
+    }
+
+    fn semantic_name(self, entry: &SifsEntry) -> String {
+        match self {
+            Self::OpenFolder => "Open folder".to_string(),
+            Self::RefreshPlacement => format!("Refresh placement {}", entry.name),
+            Self::Copy | Self::Move | Self::Rename | Self::Delete => {
+                format!("{} {}", self.label(), entry.name)
+            }
+        }
+    }
+}
+
+fn inspector_actions(source: FilesSourceKind, entry: &SifsEntry) -> Vec<InspectorAction> {
+    let mut actions = Vec::with_capacity(6);
+    if entry.is_dir {
+        actions.push(InspectorAction::OpenFolder);
+    } else {
+        actions.push(InspectorAction::Copy);
+    }
+    actions.push(InspectorAction::Move);
+    actions.push(InspectorAction::Rename);
+    actions.push(InspectorAction::Delete);
+    if source == FilesSourceKind::Sifs {
+        actions.push(InspectorAction::RefreshPlacement);
+    }
+    actions
+}
 
 fn sifs_loading_rows(path: &str, details_open: bool) -> Vec<(&'static str, String)> {
     let mut rows = vec![("Status", "Connecting to SIFS".to_string())];
@@ -3666,20 +3736,46 @@ fn inspector_detail_button_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
     sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(7_401))
 }
 
-fn inspector_open_folder_button_rect(bounds: Rect) -> Rect {
+fn inspector_actions_origin_y(bounds: Rect) -> f32 {
+    bounds.y() + INSPECTOR_PAD + 4.0 + 30.0 + 26.0 + 30.0
+}
+
+fn inspector_action_button_rect(bounds: Rect, index: usize) -> Rect {
     let content_x = bounds.x() + INSPECTOR_PAD;
     let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
-    let button_w = INSPECTOR_OPEN_BUTTON_W.min(content_w);
+    let col_w = ((content_w - INSPECTOR_ACTION_GAP) * 0.5).max(0.0);
+    let col = index % 2;
+    let row = index / 2;
     Rect::new(
-        content_x,
-        bounds.y() + INSPECTOR_PAD + 4.0 + 30.0 + 26.0 + 30.0,
-        button_w,
-        INSPECTOR_OPEN_BUTTON_H,
+        content_x + col as f32 * (col_w + INSPECTOR_ACTION_GAP),
+        inspector_actions_origin_y(bounds)
+            + row as f32 * (INSPECTOR_ACTION_BUTTON_H + INSPECTOR_ACTION_GAP),
+        col_w,
+        INSPECTOR_ACTION_BUTTON_H,
     )
 }
 
-fn inspector_open_folder_button_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
-    sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(7_497))
+fn inspector_actions_height(action_count: usize) -> f32 {
+    if action_count == 0 {
+        return 0.0;
+    }
+    let rows = action_count.div_ceil(2) as f32;
+    rows * INSPECTOR_ACTION_BUTTON_H + (rows - 1.0) * INSPECTOR_ACTION_GAP
+}
+
+fn inspector_action_button_widget_id(
+    parent: sui::WidgetId,
+    action: InspectorAction,
+) -> sui::WidgetId {
+    let salt = match action {
+        InspectorAction::OpenFolder => 7_497,
+        InspectorAction::Copy => 7_511,
+        InspectorAction::Move => 7_523,
+        InspectorAction::Rename => 7_541,
+        InspectorAction::Delete => 7_553,
+        InspectorAction::RefreshPlacement => 7_571,
+    };
+    sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(salt))
 }
 
 fn inspector_task_panel_rect(bounds: Rect) -> Rect {
@@ -3741,18 +3837,40 @@ impl Widget for InspectorView {
                 return;
             }
 
-            let selected_dir_path = {
+            let selected_action = {
                 let files = self.shared.files();
-                files
-                    .selected_entry()
-                    .filter(|entry| entry.is_dir)
-                    .map(|entry| entry.path.clone())
+                files.selected_entry().cloned().and_then(|entry| {
+                    inspector_actions(files.source, &entry)
+                        .into_iter()
+                        .enumerate()
+                        .find(|(index, _)| {
+                            inspector_action_button_rect(ctx.bounds(), *index)
+                                .contains(pointer.position)
+                        })
+                        .map(|(_, action)| (action, entry.path))
+                })
             };
-            if let Some(path) = selected_dir_path
-                && inspector_open_folder_button_rect(ctx.bounds()).contains(pointer.position)
-            {
-                self.shared.files_mut().navigate(path);
-                ctx.request_measure();
+            if let Some((action, path)) = selected_action {
+                match action {
+                    InspectorAction::OpenFolder => {
+                        self.shared.files_mut().navigate(path);
+                        ctx.request_measure();
+                    }
+                    InspectorAction::RefreshPlacement => {
+                        let waker = { self.shared.borrow().waker.clone() };
+                        self.shared.files_mut().start_placement_refresh(waker);
+                        request_files_overlay_rebuild(ctx);
+                    }
+                    InspectorAction::Copy
+                    | InspectorAction::Move
+                    | InspectorAction::Rename
+                    | InspectorAction::Delete => {
+                        if let Some(kind) = action.prompt_kind() {
+                            self.shared.files_mut().open_action_prompt(kind);
+                            request_files_overlay_rebuild(ctx);
+                        }
+                    }
+                }
                 ctx.request_paint();
                 ctx.request_semantics();
                 ctx.set_handled();
@@ -3905,9 +4023,12 @@ impl Widget for InspectorView {
         );
         y += 34.0;
 
-        if entry.is_dir {
-            self.open_folder_button(ctx, &theme, &pal, inspector_open_folder_button_rect(bounds));
-            y += INSPECTOR_OPEN_BUTTON_H + 12.0;
+        let actions = inspector_actions(files.source, entry);
+        if !actions.is_empty() {
+            self.action_buttons(ctx, &theme, &pal, bounds, &actions);
+            y = (inspector_actions_origin_y(bounds) + inspector_actions_height(actions.len()))
+                .max(y)
+                + 12.0;
         }
 
         y = self.info_row(ctx, &theme, &pal, x, y, w, "Path", &entry.path);
@@ -4240,10 +4361,11 @@ impl Widget for InspectorView {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let (selected_directory, details_open, tasks) = {
+        let (selected_entry, source, details_open, tasks) = {
             let files = self.shared.files();
             (
-                files.selected_entry().filter(|entry| entry.is_dir).cloned(),
+                files.selected_entry().cloned(),
+                files.source,
                 (files.loading || files.error.is_some() || files.selected_entry().is_some())
                     .then_some(files.inspector_details_open),
                 files.tasks.clone(),
@@ -4268,17 +4390,28 @@ impl Widget for InspectorView {
             ctx.push(node);
         }
 
-        if let Some(entry) = selected_directory {
-            let mut node = SemanticsNode::new(
-                inspector_open_folder_button_widget_id(ctx.widget_id()),
-                SemanticsRole::Button,
-                inspector_open_folder_button_rect(ctx.bounds()),
-            );
-            node.parent = Some(ctx.widget_id());
-            node.name = Some("Open folder".to_string());
-            node.description = Some(format!("Open {}", entry.path));
-            node.actions = vec![SemanticsAction::Activate];
-            ctx.push(node);
+        if let Some(entry) = &selected_entry {
+            for (index, action) in inspector_actions(source, entry).into_iter().enumerate() {
+                let mut node = SemanticsNode::new(
+                    inspector_action_button_widget_id(ctx.widget_id(), action),
+                    SemanticsRole::Button,
+                    inspector_action_button_rect(ctx.bounds(), index),
+                );
+                node.parent = Some(ctx.widget_id());
+                node.name = Some(action.semantic_name(entry));
+                node.description = Some(match action {
+                    InspectorAction::OpenFolder => format!("Open {}", entry.path),
+                    InspectorAction::RefreshPlacement => {
+                        format!("Refresh SIFS placement metadata for {}", entry.path)
+                    }
+                    InspectorAction::Copy => format!("Copy {}", entry.path),
+                    InspectorAction::Move => format!("Move {}", entry.path),
+                    InspectorAction::Rename => format!("Rename {}", entry.path),
+                    InspectorAction::Delete => format!("Delete {}", entry.path),
+                });
+                node.actions = vec![SemanticsAction::Activate];
+                ctx.push(node);
+            }
         }
 
         let Some(details_open) = details_open else {
@@ -4436,21 +4569,49 @@ impl InspectorView {
         badge.max_y()
     }
 
-    fn open_folder_button(
+    fn action_buttons(
+        &self,
+        ctx: &mut PaintCtx,
+        theme: &sui::DefaultTheme,
+        pal: &Palette,
+        bounds: Rect,
+        actions: &[InspectorAction],
+    ) {
+        for (index, action) in actions.iter().copied().enumerate() {
+            self.action_button(
+                ctx,
+                theme,
+                pal,
+                inspector_action_button_rect(bounds, index),
+                action,
+            );
+        }
+    }
+
+    fn action_button(
         &self,
         ctx: &mut PaintCtx,
         theme: &sui::DefaultTheme,
         pal: &Palette,
         rect: Rect,
+        action: InspectorAction,
     ) {
-        widgets::round_panel(ctx, rect, pal.accent, pal.accent, 7.0);
-        let icon = Rect::new(rect.x() + 10.0, rect.y() + 7.0, 14.0, 14.0);
-        draw_glyph(ctx, IconGlyph::Folder, icon, pal.on_accent);
+        let (fill, border, text, icon) = match action {
+            InspectorAction::OpenFolder => (pal.accent, pal.accent, pal.on_accent, pal.on_accent),
+            InspectorAction::Delete => (pal.field, pal.border, pal.warn, pal.warn),
+            InspectorAction::RefreshPlacement => (pal.field, pal.border, pal.accent, pal.accent),
+            InspectorAction::Copy | InspectorAction::Move | InspectorAction::Rename => {
+                (pal.field, pal.border, pal.text, pal.text_muted)
+            }
+        };
+        widgets::round_panel(ctx, rect, fill, border, 7.0);
+        let icon_rect = Rect::new(rect.x() + 9.0, rect.y() + 7.0, 14.0, 14.0);
+        draw_glyph(ctx, action.glyph(), icon_rect, icon);
         widgets::draw_text_in(
             ctx,
             Rect::new(rect.x() + 30.0, rect.y() + 5.0, rect.width() - 38.0, 18.0),
-            "Open folder",
-            pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.on_accent),
+            action.label(),
+            pal.text_style(theme, 11.5, FontWeight::MEDIUM, text),
         );
     }
 
@@ -5653,12 +5814,12 @@ mod tests {
 
         assert_eq!(
             inspector.summary(),
-            "error|/|device authorization was denied|false"
+            "error|Sifs|/|device authorization was denied|false"
         );
         shared.files_mut().inspector_details_open = true;
         assert_eq!(
             inspector.summary(),
-            "error|/|device authorization was denied|true"
+            "error|Sifs|/|device authorization was denied|true"
         );
     }
 
@@ -5672,20 +5833,20 @@ mod tests {
             files.path = "/services".to_string();
         }
         let inspector = InspectorView::new(shared.clone());
-        assert_eq!(inspector.summary(), "loading|/services|false");
+        assert_eq!(inspector.summary(), "loading|Sifs|/services|false");
 
         {
             let mut files = shared.files_mut();
             files.inspector_details_open = true;
         }
-        assert_eq!(inspector.summary(), "loading|/services|true");
+        assert_eq!(inspector.summary(), "loading|Sifs|/services|true");
 
         {
             let mut files = shared.files_mut();
             files.loading = false;
             files.entries.clear();
         }
-        assert_eq!(inspector.summary(), "unselected|/services|0");
+        assert_eq!(inspector.summary(), "unselected|Sifs|/services|0");
     }
 
     #[test]
@@ -6718,9 +6879,12 @@ mod tests {
 
         let runtime = sui::Application::new()
             .window(
-                sui::WindowBuilder::new()
-                    .title("Files row actions")
-                    .root(view(shared.clone())),
+                sui::WindowBuilder::new().title("Files row actions").root(
+                    SizedBox::new()
+                        .width(520.0)
+                        .height(720.0)
+                        .with_child(view(shared.clone())),
+                ),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
@@ -6897,6 +7061,84 @@ mod tests {
         let files = shared.files();
         assert_eq!(files.path, "/dir");
         assert_eq!(files.selected, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn selected_file_inspector_exposes_management_actions() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let (tx, rx) = mpsc::channel();
+        let (_result_tx, result_rx) = mpsc::channel();
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/services".to_string();
+            files.node_id = "node-a".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/services/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.selected = Some(0);
+            files.worker_tx = Some(tx);
+            files.worker_rx = Some(result_rx);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files inspector selected file actions")
+                    .root(
+                        SizedBox::new()
+                            .width(INSPECTOR_W)
+                            .height(720.0)
+                            .with_child(InspectorView::new(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Copy artifact.txt")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("copy prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::Copy);
+            assert_eq!(
+                prompt.target_path.as_deref(),
+                Some("/services/artifact.txt")
+            );
+        }
+        shared.files_mut().close_action_prompt();
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Refresh placement artifact.txt")
+            .click()?;
+
+        assert_eq!(shared.files().tasks[0].title, "Refresh placement");
+        match rx.try_recv().expect("placement refresh command") {
+            FilesWorkerCommand::Operation {
+                request_id,
+                source,
+                operation,
+            } => {
+                assert_eq!(request_id, shared.files().tasks[0].id);
+                assert_eq!(source, FilesSourceKind::Sifs);
+                assert_eq!(operation.kind, FilesOperationKind::RefreshPlacement);
+                assert_eq!(operation.path, "/services/artifact.txt");
+            }
+            FilesWorkerCommand::List { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+        }
 
         Ok(())
     }
