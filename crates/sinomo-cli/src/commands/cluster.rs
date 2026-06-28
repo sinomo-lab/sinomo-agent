@@ -2033,16 +2033,18 @@ pub(crate) fn cluster_status() -> Result<(), CliError> {
 
 pub(crate) fn cluster_health() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
-    if let Some(status) = default_main_daemon_status()?
-        && let Ok(rows) =
-            cli_fetch_cluster_health_rows(&status.address, CLUSTER_HEALTH_COMMAND_TIMEOUT)
-    {
+    if let Some(rows) = try_fetch_daemon_cluster_health_rows()? {
         print_cluster_health_rows(rows);
         return Ok(());
     }
-    refresh_cluster_kv_from_local_daemon(&paths)?;
-    let state = read_cluster_state(&paths)?;
-    let rows = cluster_health_rows_for_cli(&paths, &state)?;
+    let state = match read_cluster_state(&paths) {
+        Ok(state) => state,
+        Err(_) => {
+            refresh_cluster_kv_from_local_daemon(&paths)?;
+            read_cluster_state(&paths)?
+        }
+    };
+    let rows = cluster_health_rows_from_local_state(&paths, &state)?;
     print_cluster_health_rows(rows);
     Ok(())
 }
@@ -2206,20 +2208,31 @@ fn cluster_health_rows_for_cli(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Vec<ClusterHealthRow>, CliError> {
-    if let Some(status) = default_main_daemon_status()?
-        && let Ok(rows) =
-            cli_fetch_cluster_health_rows(&status.address, CLUSTER_HEALTH_COMMAND_TIMEOUT)
-    {
+    if let Some(rows) = try_fetch_daemon_cluster_health_rows()? {
         return Ok(rows);
     }
+    cluster_health_rows_from_local_state(paths, state)
+}
+
+fn cluster_health_rows_from_local_state(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Vec<ClusterHealthRow>, CliError> {
     network::cluster_health_rows_with_probe(
         paths,
         state,
         &CliClusterStatusProbe { paths },
-        true,
+        false,
         OffsetDateTime::now_utc(),
     )
     .map_err(Into::into)
+}
+
+fn try_fetch_daemon_cluster_health_rows() -> Result<Option<Vec<ClusterHealthRow>>, CliError> {
+    let Some(status) = default_main_daemon_status()? else {
+        return Ok(None);
+    };
+    Ok(cli_fetch_cluster_health_rows(&status.address, CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT).ok())
 }
 
 pub(crate) fn cluster_peers() -> Result<(), CliError> {

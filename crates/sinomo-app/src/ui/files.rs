@@ -19,7 +19,8 @@
 //! when it changes. The selection (which only repaints the highlight and updates
 //! the inspector) stays reactive via `ListView::selected_when` + the live-reading
 //! [`InspectorView`] — so selecting a file does *not* rebuild the list (the scroll
-//! position is preserved), only navigation does.
+//! position is preserved), only navigation does. Directory rows also expose an inline inspect
+//! action so object placement remains reachable without changing paths.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -30,10 +31,10 @@ use std::time::Duration;
 
 use sui::{
     Alignment, ArrangeCtx, Breadcrumb, BreadcrumbItem, Constraints, DefaultTheme, Event, EventCtx,
-    FontWeight, IconButton, IconGlyph, ListItem, ListView, MeasureCtx, PaintCtx, PointerButton,
-    PointerEventKind, Rect, ScrollState, ScrollView, SemanticsAction, SemanticsCtx, SemanticsNode,
-    SemanticsRole, Separator, Size, SizedBox, Stack, Widget, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, WindowEvent, draw_glyph,
+    FontWeight, IconButton, IconGlyph, KeyState, ListItem, ListView, MeasureCtx, PaintCtx, Point,
+    PointerButton, PointerEventKind, Rect, ScrollState, ScrollView, SemanticsAction, SemanticsCtx,
+    SemanticsNode, SemanticsRole, Separator, Size, SizedBox, Stack, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, draw_glyph,
 };
 
 use sinomo_cli::app_api::{SifsBrowser, SifsEntry};
@@ -359,6 +360,15 @@ impl FilesState {
         self.selected.and_then(|i| self.entries.get(i))
     }
 
+    fn select_entry(&mut self, index: usize) -> bool {
+        if index >= self.entries.len() {
+            return false;
+        }
+        let changed = self.selected != Some(index);
+        self.selected = Some(index);
+        changed
+    }
+
     /// Click a listing row: navigate into a directory, otherwise select the file. Returns whether
     /// the navigation changed the *path* (so the caller can relayout the rebuilt list/breadcrumb).
     fn activate_row(&mut self, index: usize) -> bool {
@@ -368,7 +378,7 @@ impl FilesState {
             self.navigate(target);
             true
         } else {
-            self.selected = Some(index);
+            self.select_entry(index);
             false
         }
     }
@@ -586,13 +596,274 @@ fn entry_meta(entry: &SifsEntry) -> String {
     }
 }
 
-fn entry_glyph(entry: &SifsEntry) -> &'static str {
+fn entry_kind_label(entry: &SifsEntry) -> &'static str {
     if entry.is_dir {
-        "▸"
+        "Folder"
     } else if entry.is_link {
-        "↪"
+        "Link"
     } else {
-        "•"
+        "File"
+    }
+}
+
+fn entry_icon(entry: &SifsEntry) -> IconGlyph {
+    if entry.is_dir {
+        IconGlyph::Folder
+    } else if entry.is_link {
+        IconGlyph::Link
+    } else {
+        IconGlyph::File
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SifsEntryRowHit {
+    Row,
+    Inspect,
+}
+
+struct SifsEntryRow {
+    shared: Shared,
+    index: usize,
+    entry: SifsEntry,
+    hovered: bool,
+    pressed: Option<SifsEntryRowHit>,
+}
+
+impl SifsEntryRow {
+    fn new(shared: Shared, index: usize, entry: SifsEntry) -> Self {
+        Self {
+            shared,
+            index,
+            entry,
+            hovered: false,
+            pressed: None,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.shared.files().selected == Some(self.index)
+    }
+
+    fn show_inspect_button(&self) -> bool {
+        self.hovered || self.active()
+    }
+
+    fn inspect_rect(&self, bounds: Rect) -> Rect {
+        let side = 24.0_f32.min(bounds.height()).max(0.0);
+        Rect::new(
+            bounds.max_x() - side - 2.0,
+            bounds.y() + (bounds.height() - side) * 0.5,
+            side,
+            side,
+        )
+    }
+
+    fn hit_at(&self, bounds: Rect, position: Point) -> Option<SifsEntryRowHit> {
+        if !bounds.contains(position) {
+            return None;
+        }
+        if self.inspect_rect(bounds).contains(position) {
+            Some(SifsEntryRowHit::Inspect)
+        } else {
+            Some(SifsEntryRowHit::Row)
+        }
+    }
+
+    fn inspect_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
+        sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(8_317))
+    }
+}
+
+impl Widget for SifsEntryRow {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        match event {
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
+                let hovered = ctx.bounds().contains(pointer.position);
+                if self.hovered != hovered {
+                    self.hovered = hovered;
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Down
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                let Some(hit) = self.hit_at(ctx.bounds(), pointer.position) else {
+                    return;
+                };
+                self.pressed = Some(hit);
+                ctx.request_focus();
+                ctx.request_pointer_capture(pointer.pointer_id);
+                ctx.request_paint();
+                ctx.set_handled();
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Up
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                let hit = self.hit_at(ctx.bounds(), pointer.position);
+                if let (Some(pressed), Some(hit)) = (self.pressed.take(), hit)
+                    && pressed == hit
+                {
+                    match hit {
+                        SifsEntryRowHit::Row => {
+                            self.shared.files_mut().activate_row(self.index);
+                        }
+                        SifsEntryRowHit::Inspect => {
+                            self.shared.files_mut().select_entry(self.index);
+                        }
+                    }
+                    ctx.request_measure();
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+                ctx.release_pointer_capture(pointer.pointer_id);
+                ctx.set_handled();
+            }
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Leave => {
+                if self.hovered {
+                    self.hovered = false;
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Cancel => {
+                if self.pressed.take().is_some() {
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    ctx.request_paint();
+                    ctx.set_handled();
+                }
+                if self.hovered {
+                    self.hovered = false;
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            Event::Keyboard(key)
+                if ctx.is_focused()
+                    && key.state == KeyState::Pressed
+                    && matches!(key.key.as_str(), "Enter" | " ") =>
+            {
+                self.shared.files_mut().activate_row(self.index);
+                ctx.request_measure();
+                ctx.request_paint();
+                ctx.request_semantics();
+                ctx.set_handled();
+            }
+            _ => {}
+        }
+    }
+
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        constraints.clamp(Size::new(
+            if constraints.max.width.is_finite() {
+                constraints.max.width
+            } else {
+                260.0
+            },
+            24.0,
+        ))
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let pal = palette(&self.shared);
+        let bounds = ctx.bounds();
+        let active = self.active();
+        let show_inspect = self.show_inspect_button();
+        let inspect = self.inspect_rect(bounds);
+        let icon_color = if active { pal.accent } else { pal.text_faint };
+        let label_color = if active { pal.text } else { pal.text_muted };
+        let title_style = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, label_color);
+        let meta_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
+
+        let leading = Rect::new(bounds.x() + 2.0, bounds.y(), 20.0, bounds.height());
+        let icon_side = 15.0;
+        draw_glyph(
+            ctx,
+            entry_icon(&self.entry),
+            Rect::new(
+                leading.x() + 1.0,
+                leading.y() + (leading.height() - icon_side) * 0.5,
+                icon_side,
+                icon_side,
+            ),
+            icon_color,
+        );
+
+        if show_inspect {
+            let fill = if self.pressed == Some(SifsEntryRowHit::Inspect) {
+                pal.selected
+            } else if active {
+                pal.field
+            } else {
+                pal.hover
+            };
+            widgets::fill_round_rect(ctx, inspect, fill, 6.0);
+            draw_glyph(
+                ctx,
+                IconGlyph::Search,
+                inspect.inflate(-5.0, -5.0),
+                if active { pal.accent } else { pal.text_muted },
+            );
+        }
+
+        let inspect_gap = if show_inspect { 30.0 } else { 0.0 };
+        let meta_w = 74.0_f32.min(bounds.width() * 0.36).max(0.0);
+        let meta_rect = Rect::new(
+            (bounds.max_x() - inspect_gap - meta_w).max(bounds.x()),
+            bounds.y(),
+            meta_w,
+            bounds.height(),
+        );
+        widgets::draw_text_in(ctx, meta_rect, &entry_meta(&self.entry), meta_style);
+
+        let title_x = leading.max_x() + 5.0;
+        let title_right = meta_rect.x() - 6.0;
+        let title_rect = Rect::new(
+            title_x,
+            bounds.y(),
+            (title_right - title_x).max(0.0),
+            bounds.height(),
+        );
+        ctx.push_clip_rect(title_rect);
+        widgets::draw_text_in(ctx, title_rect, &self.entry.name, title_style);
+        ctx.pop_clip();
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let row_id = ctx.widget_id();
+        let mut node = SemanticsNode::new(row_id, SemanticsRole::ListItem, ctx.bounds());
+        node.name = Some(self.entry.name.clone());
+        node.description = Some(format!(
+            "{}, SIFS path {}",
+            entry_kind_label(&self.entry),
+            self.entry.path
+        ));
+        node.state.focused = ctx.is_focused();
+        node.state.hovered = self.hovered;
+        node.state.selected = self.active();
+        node.actions = vec![SemanticsAction::Focus, SemanticsAction::Activate];
+        ctx.push(node);
+
+        let mut inspect = SemanticsNode::new(
+            Self::inspect_widget_id(row_id),
+            SemanticsRole::Button,
+            self.inspect_rect(ctx.bounds()),
+        );
+        inspect.parent = Some(row_id);
+        inspect.name = Some(format!("Inspect {}", self.entry.name));
+        inspect.description = Some("Show SIFS placement and metadata".to_string());
+        inspect.actions = vec![SemanticsAction::Activate];
+        inspect.state.hovered = self.hovered;
+        inspect.state.selected = self.active();
+        ctx.push(inspect);
+    }
+
+    fn accepts_focus(&self) -> bool {
+        true
     }
 }
 
@@ -646,7 +917,8 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 // ---------------------------------------------------------------------------
 
 /// Build the file-list body for the *current* listing: an error/empty placeholder, or a `ListView`
-/// of the entries wrapped in a `ScrollView`. Directory rows navigate; file rows select.
+/// of the entries wrapped in a `ScrollView`. Directory rows navigate; the inline inspect action
+/// selects either files or directories for the SIFS inspector without changing the path.
 fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
     let (loading, error, is_empty, entries): (bool, Option<String>, bool, Vec<SifsEntry>) = {
         let files = shared.files();
@@ -712,13 +984,18 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         );
     }
 
-    // Build the row items: icon + name on the left, compact metadata on the right.
+    // Build the row items: icon + name on the left, compact metadata and inspect action on the
+    // right. The child row handles pointer hit-testing while `ListView` keeps selection and scroll.
     let items: Vec<ListItem> = entries
         .iter()
-        .map(|entry| {
-            ListItem::new(entry.name.clone())
-                .leading_text(entry_glyph(entry))
-                .trailing(entry_meta(entry))
+        .cloned()
+        .enumerate()
+        .map(|(index, entry)| {
+            ListItem::new(entry.name.clone()).with_child(SifsEntryRow::new(
+                shared.clone(),
+                index,
+                entry,
+            ))
         })
         .collect();
 
@@ -735,9 +1012,8 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
                 move || s.files().selected
             })
             .on_change(move |index, _label| {
-                // Directory → navigate (path changes → RebuildOnChange rebuilds the list/breadcrumb);
-                // file → select (handled reactively above). We don't relayout here: the host's
-                // relayout-on-pointer-up (and the redraw diff) drives the rebuild after navigation.
+                // Fallback for keyboard-driven ListView activation when no row child receives focus:
+                // directory -> navigate, file -> select. Row children handle pointer activation.
                 s.files_mut().activate_row(index);
             })
     };
@@ -1779,6 +2055,32 @@ mod tests {
         let path_changed = state.activate_row(1);
         assert!(!path_changed, "selecting a file does not change the path");
         assert_eq!(state.selected, Some(1));
+
+        let path_changed = state.activate_row(0);
+        assert!(path_changed, "activating a directory navigates");
+        assert_eq!(state.path, "/dir");
+        assert_eq!(state.selected, None);
+    }
+
+    #[test]
+    fn select_entry_allows_directory_inspection_without_navigation() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.path = "/".to_string();
+        state.entries = vec![SifsEntry {
+            name: "dir".to_string(),
+            path: "/dir".to_string(),
+            is_dir: true,
+            is_link: false,
+            size: None,
+        }];
+
+        assert!(state.select_entry(0));
+        assert_eq!(state.path, "/");
+        assert_eq!(state.selected, Some(0));
+        assert!(state.selected_entry().is_some_and(|entry| entry.is_dir));
+        assert!(!state.select_entry(99));
+        assert_eq!(state.selected, Some(0));
     }
 
     #[test]
@@ -2120,6 +2422,49 @@ mod tests {
         assert!(files.entries.is_empty());
         assert_eq!(files.selected, None);
         assert_eq!(files.path, "/services");
+
+        Ok(())
+    }
+
+    #[test]
+    fn directory_inspect_button_selects_without_navigation() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.node_id = "node-a".to_string();
+            files.entries = vec![SifsEntry {
+                name: "dir".to_string(),
+                path: "/dir".to_string(),
+                is_dir: true,
+                is_link: false,
+                size: None,
+            }];
+            files.selected = None;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files inspect directory")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Inspect dir")
+            .click()?;
+
+        let files = shared.files();
+        assert_eq!(files.path, "/");
+        assert_eq!(files.selected, Some(0));
+        assert!(files.selected_entry().is_some_and(|entry| entry.is_dir));
 
         Ok(())
     }

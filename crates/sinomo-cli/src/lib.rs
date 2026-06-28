@@ -352,10 +352,21 @@ fn cli_probe_member_daemon_status(
         return Some(status);
     }
     let trace = std::env::var_os("SINOMO_CLUSTER_HEALTH_TRACE").is_some();
-    for endpoint in network::ClusterEndpointSelector::new(paths, state)
+    let mut endpoints = network::ClusterEndpointSelector::new(paths, state)
         .select(network::ClusterEndpointSelectionPurpose::MemberDaemonStatus)
         .into_iter()
         .filter(|endpoint| endpoint.node_id == member.node_id)
+        .collect::<Vec<_>>();
+    endpoints.sort_by_key(|endpoint| {
+        (
+            cluster_health_cli_endpoint_probe_rank(endpoint),
+            endpoint.priority,
+            endpoint.address.clone(),
+        )
+    });
+    for endpoint in endpoints
+        .into_iter()
+        .take(CLUSTER_HEALTH_CLI_MAX_ENDPOINTS_PER_MEMBER)
     {
         if trace {
             eprintln!(
@@ -363,20 +374,21 @@ fn cli_probe_member_daemon_status(
                 member.node_id, endpoint.address, endpoint.transport
             );
         }
-        let status =
-            match daemon_fetch_daemon_status_from_endpoint(&endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT)
-            {
-                Ok(status) => status,
-                Err(error) => {
-                    if trace {
-                        eprintln!(
-                            "cluster health trace: {} {} failed: {error}",
-                            member.node_id, endpoint.address
-                        );
-                    }
-                    continue;
+        let status = match daemon_fetch_daemon_status_from_endpoint(
+            &endpoint,
+            CLUSTER_HEALTH_CLI_ENDPOINT_PROBE_TIMEOUT,
+        ) {
+            Ok(status) => status,
+            Err(error) => {
+                if trace {
+                    eprintln!(
+                        "cluster health trace: {} {} failed: {error}",
+                        member.node_id, endpoint.address
+                    );
                 }
-            };
+                continue;
+            }
+        };
         let Some(cluster) = status.cluster.as_ref() else {
             if trace {
                 eprintln!(
@@ -433,6 +445,19 @@ fn cli_probe_member_daemon_status(
         return Some(status);
     }
     None
+}
+
+fn cluster_health_cli_endpoint_probe_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+    match &endpoint.transport {
+        ClusterTransportKind::LanTcp => 0,
+        ClusterTransportKind::LanQuic => 1,
+        ClusterTransportKind::HttpsRelay
+        | ClusterTransportKind::TurnRelay
+        | ClusterTransportKind::WebRtc => 2,
+        ClusterTransportKind::Iroh => 3,
+        ClusterTransportKind::Loopback => 4,
+        ClusterTransportKind::InProcess => 5,
+    }
 }
 
 fn cli_probe_member_status_via_shadow_endpoint(
@@ -3331,7 +3356,9 @@ const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const DAEMON_CLUSTER_KV_TXN_TIMEOUT: Duration = Duration::from_secs(15);
 const IROH_DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-const CLUSTER_HEALTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT: Duration = Duration::from_millis(1500);
+const CLUSTER_HEALTH_CLI_ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const CLUSTER_HEALTH_CLI_MAX_ENDPOINTS_PER_MEMBER: usize = 2;
 const CLUSTER_HEALTH_PEER_ROWS_TIMEOUT: Duration = Duration::from_secs(8);
 const DAEMON_AGENT_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]

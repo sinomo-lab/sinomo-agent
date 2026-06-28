@@ -13,7 +13,7 @@ use sinomo_runtime::core::{
 use sinomo_runtime::network::{
     self, ClusterConnectivityRecord, ClusterConnectivityState, ClusterHealthRow, ClusterPaths,
 };
-use sinomo_runtime::node::cluster_member_expected_daemon_process;
+use sinomo_runtime::node::{cluster_member_expected_daemon_process, cluster_node_is_local_process};
 use time::OffsetDateTime;
 
 use crate::backend::{Backend, Connection};
@@ -116,12 +116,17 @@ impl Backend {
             }
         };
 
-        let rows = match state.as_ref() {
+        let mut live_node_ids = BTreeSet::new();
+        let mut rows = match state.as_ref() {
             Some(state) => {
                 let cached_rows = rows_from_state(&paths, state, observed_at, &mut warnings);
                 match self.connection.daemon_address() {
                     Some(address) => match fetch_local_health_rows(address) {
-                        Ok(live_rows) => merge_health_rows(cached_rows, live_rows),
+                        Ok(live_rows) => {
+                            live_node_ids
+                                .extend(live_rows.iter().map(|row| row.member.node_id.to_string()));
+                            merge_health_rows(cached_rows, live_rows)
+                        }
                         Err(error) => {
                             warnings.push(format!("daemon health unavailable: {error}"));
                             cached_rows
@@ -135,6 +140,7 @@ impl Backend {
                     Ok(rows) => {
                         warnings
                             .retain(|warning| !warning.starts_with("cluster state unavailable:"));
+                        live_node_ids.extend(rows.iter().map(|row| row.member.node_id.to_string()));
                         rows
                     }
                     Err(error) => {
@@ -153,6 +159,10 @@ impl Backend {
                 Vec::new()
             }
         };
+
+        if let Some(state) = state.as_ref() {
+            reconcile_cached_remote_availability(state, &mut rows, &connectivity, &live_node_ids);
+        }
 
         snapshot_from_parts(
             state.as_ref(),
@@ -231,6 +241,51 @@ fn merge_health_rows(
     }
     rows.sort_by(|left, right| left.member.node_id.cmp(&right.member.node_id));
     rows
+}
+
+fn reconcile_cached_remote_availability(
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+    rows: &mut [ClusterHealthRow],
+    connectivity: &[ClusterConnectivityRecord],
+    live_node_ids: &BTreeSet<String>,
+) {
+    for row in rows {
+        if cluster_node_is_local_process(state, &row.member.node_id)
+            || live_node_ids.contains(row.member.node_id.as_str())
+        {
+            continue;
+        }
+
+        if matches!(
+            local_connectivity_reachability(state, &row.member.node_id, connectivity),
+            Some(false)
+        ) {
+            row.availability = ClusterNodeAvailability::Offline;
+            row.status.availability = ClusterNodeAvailability::Offline;
+        }
+    }
+}
+
+fn local_connectivity_reachability(
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+    target_node_id: &sinomo_runtime::core::Id,
+    connectivity: &[ClusterConnectivityRecord],
+) -> Option<bool> {
+    let mut saw_local_record = false;
+    for record in connectivity.iter().filter(|record| {
+        record.target_node_id.as_str() == target_node_id.as_str()
+            && cluster_node_is_local_process(state, &record.source_node_id)
+    }) {
+        saw_local_record = true;
+        if matches!(
+            record.state,
+            ClusterConnectivityState::Healthy | ClusterConnectivityState::Degraded
+        ) {
+            return Some(true);
+        }
+    }
+
+    saw_local_record.then_some(false)
 }
 
 fn snapshot_from_parts(
@@ -473,7 +528,9 @@ fn is_public_ip(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_runtime::core::{ClusterMemberRecord, Id};
+    use sinomo_runtime::core::{
+        ClusterBootstrapState, ClusterMemberRecord, ClusterTransportKind, Id,
+    };
 
     fn id(name: &str) -> Id {
         Id::from_legacy_named(name).expect("test id")
@@ -515,6 +572,48 @@ mod tests {
             },
             member,
             availability,
+        }
+    }
+
+    fn state_with_remote(
+        cluster_id: &Id,
+        local_node_id: &Id,
+        remote: ClusterMemberRecord,
+    ) -> ClusterBootstrapState {
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "app cluster",
+            local_node_id.clone(),
+            "local",
+            "local-key",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        state.members.push(remote);
+        state
+    }
+
+    fn connectivity(
+        cluster_id: &Id,
+        source_node_id: &Id,
+        target_node_id: &Id,
+        state: ClusterConnectivityState,
+    ) -> ClusterConnectivityRecord {
+        let unreachable = matches!(state, ClusterConnectivityState::Unreachable);
+        ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: source_node_id.clone(),
+            target_node_id: target_node_id.clone(),
+            endpoint_id: id("endpoint_app_cluster_connectivity"),
+            transport: ClusterTransportKind::LanTcp,
+            address: "192.0.2.42:21353".to_string(),
+            state,
+            latency_ms: (!unreachable).then_some(12),
+            consecutive_failures: if unreachable { 3 } else { 0 },
+            last_success_at: (!unreachable).then_some("2026-05-06T00:00:00Z".to_string()),
+            last_failure_at: unreachable.then_some("2026-05-06T00:00:00Z".to_string()),
+            failure_reason: None,
+            observed_at: OffsetDateTime::UNIX_EPOCH,
+            expires_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
     }
 
@@ -562,5 +661,71 @@ mod tests {
                 .iter()
                 .any(|warning| warning == "1 cluster node(s) offline")
         );
+    }
+
+    #[test]
+    fn cached_remote_online_is_reconciled_offline_when_local_connectivity_fails() {
+        let cluster_id = id("cluster_app_reconcile_offline");
+        let local_node_id = id("node_app_reconcile_local");
+        let remote_node_id = id("node_app_reconcile_remote");
+        let remote = member(&cluster_id, &remote_node_id, "remote");
+        let state = state_with_remote(&cluster_id, &local_node_id, remote.clone());
+        let mut rows = vec![row(remote, ClusterNodeAvailability::Online, "cached", 10)];
+        let records = vec![connectivity(
+            &cluster_id,
+            &local_node_id,
+            &remote_node_id,
+            ClusterConnectivityState::Unreachable,
+        )];
+
+        reconcile_cached_remote_availability(&state, &mut rows, &records, &BTreeSet::new());
+
+        assert_eq!(rows[0].availability, ClusterNodeAvailability::Offline);
+        assert_eq!(
+            rows[0].status.availability,
+            ClusterNodeAvailability::Offline
+        );
+    }
+
+    #[test]
+    fn cached_remote_online_remains_online_when_local_connectivity_is_healthy() {
+        let cluster_id = id("cluster_app_reconcile_healthy");
+        let local_node_id = id("node_app_reconcile_healthy_local");
+        let remote_node_id = id("node_app_reconcile_healthy_remote");
+        let remote = member(&cluster_id, &remote_node_id, "remote");
+        let state = state_with_remote(&cluster_id, &local_node_id, remote.clone());
+        let mut rows = vec![row(remote, ClusterNodeAvailability::Online, "cached", 10)];
+        let records = vec![connectivity(
+            &cluster_id,
+            &local_node_id,
+            &remote_node_id,
+            ClusterConnectivityState::Healthy,
+        )];
+
+        reconcile_cached_remote_availability(&state, &mut rows, &records, &BTreeSet::new());
+
+        assert_eq!(rows[0].availability, ClusterNodeAvailability::Online);
+    }
+
+    #[test]
+    fn live_remote_row_is_not_downgraded_by_stale_connectivity() {
+        let cluster_id = id("cluster_app_reconcile_live");
+        let local_node_id = id("node_app_reconcile_live_local");
+        let remote_node_id = id("node_app_reconcile_live_remote");
+        let remote = member(&cluster_id, &remote_node_id, "remote");
+        let state = state_with_remote(&cluster_id, &local_node_id, remote.clone());
+        let mut rows = vec![row(remote, ClusterNodeAvailability::Online, "live", 20)];
+        let records = vec![connectivity(
+            &cluster_id,
+            &local_node_id,
+            &remote_node_id,
+            ClusterConnectivityState::Unreachable,
+        )];
+        let live_node_ids = BTreeSet::from([remote_node_id.to_string()]);
+
+        reconcile_cached_remote_availability(&state, &mut rows, &records, &live_node_ids);
+
+        assert_eq!(rows[0].availability, ClusterNodeAvailability::Online);
+        assert_eq!(rows[0].status.commit.as_deref(), Some("live"));
     }
 }
