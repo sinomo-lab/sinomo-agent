@@ -163,6 +163,22 @@ impl Backend {
     /// real daemon).
     pub fn local_fallback() -> Self {
         let (data_dir, _test_data_dir_cleanup) = local_fallback_data_dir();
+        #[cfg(test)]
+        {
+            let mut backend = Self::local_fallback_for_data_dir(data_dir);
+            backend._test_data_dir_cleanup = _test_data_dir_cleanup;
+            backend
+        }
+        #[cfg(not(test))]
+        {
+            Self::local_fallback_for_data_dir(data_dir)
+        }
+    }
+
+    /// Build a daemonless backend around an explicit data directory. This is intended for
+    /// headless tooling and integration visual fixtures that need isolated SIFS-backed state
+    /// without mutating the operator's default data directory.
+    pub fn local_fallback_for_data_dir(data_dir: SinomoDataDir) -> Self {
         let _ = data_dir.ensure_root_layout();
         let data_dir = Arc::new(data_dir);
         let app_runtime = build_app_runtime();
@@ -183,7 +199,7 @@ impl Backend {
             agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry::new(),
             _daemon: None,
             #[cfg(test)]
-            _test_data_dir_cleanup: _test_data_dir_cleanup,
+            _test_data_dir_cleanup: None,
         }
     }
 

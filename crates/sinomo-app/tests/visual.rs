@@ -29,6 +29,43 @@ fn shots_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir())
 }
 
+struct VisualTempDataDir {
+    root: std::path::PathBuf,
+}
+
+impl Drop for VisualTempDataDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn visual_temp_data_dir(slug: &str) -> (sinomo_runtime::local::SinomoDataDir, VisualTempDataDir) {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-app-visual-{slug}-{}-{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    (
+        sinomo_runtime::local::SinomoDataDir::new(root.clone()),
+        VisualTempDataDir { root },
+    )
+}
+
+fn boot_with_visual_data_dir(
+    initial_tab: Tab,
+    slug: &str,
+) -> (sinomo_app::state::Shared, VisualTempDataDir) {
+    let (data_dir, cleanup) = visual_temp_data_dir(slug);
+    let backend = sinomo_app::backend::Backend::local_fallback_for_data_dir(data_dir);
+    let mut state = sinomo_app::state::AppState::ready(backend);
+    state.active_tab = initial_tab;
+    (sinomo_app::state::Shared::new(state), cleanup)
+}
+
 #[test]
 fn capture_tabs() {
     let dir = shots_dir();
@@ -1072,6 +1109,42 @@ fn capture_chat_composed() {
         chat.scroll = f32::MAX;
     };
 
+    let seed_sidebar_sessions = |shared: &sinomo_app::state::Shared| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs() as i64;
+        let mut chat = shared.chat_mut();
+        chat.sessions = vec![
+            SessionRef {
+                id: "visual-roadmap-review".to_string(),
+                title: "Roadmap review".to_string(),
+                kind: ConversationKind::Chat,
+                updated_unix: now - 5 * 60,
+                participant_count: 1,
+                participant_names: Vec::new(),
+            },
+            SessionRef {
+                id: "visual-release-triage".to_string(),
+                title: "Release triage".to_string(),
+                kind: ConversationKind::Channel,
+                updated_unix: now - 2 * 60 * 60,
+                participant_count: 2,
+                participant_names: vec!["main-agent".to_string(), "coding-agent".to_string()],
+            },
+            SessionRef {
+                id: "visual-provider-setup".to_string(),
+                title: "Provider setup notes".to_string(),
+                kind: ConversationKind::Chat,
+                updated_unix: now - 26 * 60 * 60,
+                participant_count: 1,
+                participant_names: Vec::new(),
+            },
+        ];
+        chat.session_id = "visual-roadmap-review".to_string();
+        chat.models_loading = false;
+    };
+
     // Empty state, dark: "Chat with {agent}" + hint.
     {
         let shared = boot(Tab::Sinomo);
@@ -1092,6 +1165,18 @@ fn capture_chat_composed() {
         app.run_until_idle()
             .expect("settle chat-empty-light layout");
         capture("chat-composed-empty-light", &window);
+    }
+
+    // Sidebar sessions: several chats plus a channel, with the compact row treatment visible.
+    {
+        let shared = boot(Tab::Sinomo);
+        seed_sidebar_sessions(&shared);
+        let runtime = build_runtime(shared).expect("build runtime");
+        let app = TestApp::from_runtime(runtime).expect("headless test app");
+        let window = app.main_window().expect("main window");
+        app.run_until_idle()
+            .expect("settle chat-sidebar-sessions layout");
+        capture("chat-composed-sidebar-sessions", &window);
     }
 
     // Populated transcript: a few user/agent bubbles, not streaming.
@@ -1210,14 +1295,15 @@ fn capture_chat_composed() {
         capture("chat-composed-edit-dialog", &window);
     }
 
-    // Channel edit popup: seed a real SIFS-backed channel so the dialog shows the editable agent
-    // list, not just the empty placeholder.
+    // Channel edit popup: seed a real channel in an isolated SIFS data dir so the dialog shows the
+    // editable agent list without mutating the operator's channel index during a visual capture.
     {
         use sinomo_agent::{AgentChannel, AgentChannelStore};
         use sinomo_cli::app_api::SifsAgentChannelStore;
         use sinomo_runtime::events::SessionId;
 
-        let shared = boot(Tab::Sinomo);
+        let (shared, _visual_data_dir_cleanup) =
+            boot_with_visual_data_dir(Tab::Sinomo, "channel-edit");
         let data_dir = shared.borrow().data_dir.clone();
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Release triage");
@@ -1232,13 +1318,17 @@ fn capture_chat_composed() {
             .expect("visual channel persisted");
         assert_eq!(stored.enabled_participants_in_order().len(), 2);
         {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_secs() as i64;
             let mut chat = shared.chat_mut();
             let session_id = channel_id.to_string();
             chat.sessions = vec![SessionRef {
                 id: session_id.clone(),
                 title: "Release triage".to_string(),
                 kind: ConversationKind::Channel,
-                updated_unix: 1,
+                updated_unix: now - 2 * 60 * 60,
                 participant_count: 2,
                 participant_names: vec!["main-agent".to_string(), "coding-agent".to_string()],
             }];

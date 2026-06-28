@@ -3552,24 +3552,17 @@ fn dialog_section_label(shared: &Shared, text: impl Into<String>) -> Label {
 fn session_meta_label(session: &SessionRef) -> String {
     let updated = session_updated_label(session.updated_unix);
     match session.kind {
-        ConversationKind::Chat => format!("Chat · {updated}"),
+        ConversationKind::Chat => updated,
         ConversationKind::Channel => {
             format!("{} · {updated}", plural_agents(session.participant_count))
         }
     }
 }
 
-fn session_kind_badge_label(kind: ConversationKind) -> &'static str {
+fn session_kind_icon_description(kind: ConversationKind) -> &'static str {
     match kind {
-        ConversationKind::Chat => "Chat",
-        ConversationKind::Channel => "Channel",
-    }
-}
-
-fn session_kind_badge_width(kind: ConversationKind) -> f32 {
-    match kind {
-        ConversationKind::Chat => 42.0,
-        ConversationKind::Channel => 62.0,
+        ConversationKind::Chat => "Direct chat",
+        ConversationKind::Channel => "Shared channel",
     }
 }
 
@@ -4312,30 +4305,34 @@ impl Widget for ChatSessionRow {
         let label_color = if active { pal.text } else { pal.text_muted };
         let title_style = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, label_color);
         let meta_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
-        let badge_style = pal.text_style(
-            &theme,
-            9.5,
-            FontWeight::SEMIBOLD,
-            if active { pal.accent } else { pal.text_faint },
-        );
-        let badge = Rect::new(
-            bounds.x() + 2.0,
-            bounds.y() + 7.0,
-            session_kind_badge_width(self.session.kind),
-            18.0,
-        );
-        let badge_fill = if active { pal.selected } else { pal.field };
-        let badge_border = if active {
-            pal.accent.with_alpha(0.42)
-        } else {
-            pal.border.with_alpha(0.72)
+        let icon_panel = Rect::new(bounds.x() + 4.0, bounds.y() + 8.0, 18.0, 18.0);
+        let (icon_fill, icon_border, icon_color) = match self.session.kind {
+            ConversationKind::Chat => {
+                let fill = if active { pal.selected } else { pal.field };
+                let border = if active {
+                    pal.accent.with_alpha(0.36)
+                } else {
+                    pal.border.with_alpha(0.68)
+                };
+                let glyph = if active { pal.accent } else { pal.text_faint };
+                (fill, border, glyph)
+            }
+            ConversationKind::Channel => {
+                let fill = if active {
+                    pal.selected
+                } else {
+                    pal.accent.with_alpha(0.10)
+                };
+                let border = pal.accent.with_alpha(if active { 0.48 } else { 0.30 });
+                (fill, border, pal.accent)
+            }
         };
-        widgets::round_panel(ctx, badge, badge_fill, badge_border, 5.0);
-        widgets::draw_text_in(
+        widgets::round_panel(ctx, icon_panel, icon_fill, icon_border, 5.0);
+        draw_glyph(
             ctx,
-            Rect::new(badge.x() + 7.0, badge.y() + 1.0, badge.width() - 12.0, 15.0),
-            session_kind_badge_label(self.session.kind),
-            badge_style,
+            IconGlyph::Chat,
+            icon_panel.inflate(-4.0, -4.0),
+            icon_color,
         );
 
         if show_edit {
@@ -4358,7 +4355,7 @@ impl Widget for ChatSessionRow {
         }
 
         let edit_gap = if show_edit { 28.0 } else { 0.0 };
-        let title_x = badge.max_x() + 8.0;
+        let title_x = icon_panel.max_x() + 7.0;
         let title_right = bounds.max_x() - edit_gap - 5.0;
         let title_rect = Rect::new(
             title_x,
@@ -4391,9 +4388,13 @@ impl Widget for ChatSessionRow {
         let mut node = SemanticsNode::new(row_id, SemanticsRole::ListItem, ctx.bounds());
         node.name = Some(self.session.title.clone());
         node.description = Some(match self.session.kind {
-            ConversationKind::Chat => "Chat".to_string(),
+            ConversationKind::Chat => session_kind_icon_description(self.session.kind).to_string(),
             ConversationKind::Channel => {
-                format!("Channel, {} agents", self.session.participant_count)
+                format!(
+                    "{}, {} agents",
+                    session_kind_icon_description(self.session.kind),
+                    self.session.participant_count
+                )
             }
         });
         node.state.focused = ctx.is_focused();
@@ -8346,7 +8347,7 @@ mod tests {
     }
 
     #[test]
-    fn session_meta_label_exposes_kind_agents_and_save_state() {
+    fn session_meta_label_exposes_agents_and_save_state() {
         let channel = SessionRef {
             id: "channel-meta".to_string(),
             title: "Release triage".to_string(),
@@ -8365,13 +8366,12 @@ mod tests {
         };
 
         assert_eq!(session_meta_label(&channel), "2 agents · not saved");
-        assert_eq!(session_meta_label(&chat), "Chat · not saved");
-        assert_eq!(session_kind_badge_label(channel.kind), "Channel");
-        assert_eq!(session_kind_badge_label(chat.kind), "Chat");
-        assert!(
-            session_kind_badge_width(channel.kind) > session_kind_badge_width(chat.kind),
-            "channel badge needs extra width for its longer label"
+        assert_eq!(session_meta_label(&chat), "not saved");
+        assert_eq!(
+            session_kind_icon_description(channel.kind),
+            "Shared channel"
         );
+        assert_eq!(session_kind_icon_description(chat.kind), "Direct chat");
     }
 
     #[test]
@@ -9363,7 +9363,7 @@ mod tests {
         window
             .get_by_role(SemanticsRole::ListItem)
             .with_name("Target chat")
-            .with_description("Chat")
+            .with_description("Direct chat")
             .click()?;
 
         assert_eq!(shared.chat().session_id, second_id);
@@ -9433,7 +9433,7 @@ mod tests {
         window
             .get_by_role(SemanticsRole::ListItem)
             .with_name("Release triage")
-            .with_description("Channel, 2 agents")
+            .with_description("Shared channel, 2 agents")
             .click()?;
 
         assert_eq!(shared.chat().session_id, second_id);
@@ -9513,7 +9513,7 @@ mod tests {
         window
             .get_by_role(SemanticsRole::ListItem)
             .with_name("Release triage")
-            .with_description("Channel, 2 agents")
+            .with_description("Shared channel, 2 agents")
             .click()?;
 
         assert_eq!(shared.chat().session_id, second_id);
@@ -9763,7 +9763,7 @@ mod tests {
         window
             .get_by_role(SemanticsRole::ListItem)
             .with_name("Scrollable chat 10")
-            .with_description("Chat")
+            .with_description("Direct chat")
             .click()?;
         let selected_y = chat_sessions_list_y(&window)?;
         assert_eq!(shared.chat().session_id, selected_id);
