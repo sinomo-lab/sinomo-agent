@@ -886,13 +886,10 @@ fn node_detail_lines(node: &ClusterNodeInfo, diagnostics_open: bool) -> Vec<Stri
         .filter(|endpoint| endpoint.reachable)
         .count();
     let mut lines = vec![
-        if node.display_name.is_empty() {
-            short(&node.node_id, 18)
-        } else {
-            node.display_name.clone()
-        },
+        node_heading(node),
         format!("node: {}", short(&node.node_id, 26)),
         format!("health: {}", node.availability),
+        format!("platform: {}", platform_summary(node.platform.as_deref())),
         format!("process: {}", node.process),
         format!("role: {} {}", node.member_role, node.member_state),
         format!("address: {}", node.address.as_deref().unwrap_or("-")),
@@ -923,10 +920,6 @@ fn node_detail_lines(node: &ClusterNodeInfo, diagnostics_open: bool) -> Vec<Stri
             } else {
                 "not observed"
             }
-        ));
-        lines.push(format!(
-            "platform: {}",
-            node.platform.as_deref().unwrap_or("-")
         ));
         lines.push(format!("version: {}", node.daemon_version));
     } else if !node.endpoints.is_empty() {
@@ -1115,13 +1108,14 @@ fn graph_rect(bounds: Rect) -> Rect {
 }
 
 fn build_topology(snapshot: &ClusterSnapshot) -> Topology {
+    let display_counts = node_display_name_counts(&snapshot.nodes);
     let mut vertices = snapshot
         .nodes
         .iter()
         .map(|node| GraphVertex {
             id: node.node_id.clone(),
-            label: node_label(node),
-            detail: node.availability.clone(),
+            label: node_graph_label(node, &display_counts),
+            detail: node_graph_detail(node),
             kind: GraphVertexKind::Node,
             availability: node.availability.clone(),
             public_reachable: node.public_reachable,
@@ -1378,12 +1372,64 @@ fn best_state<'a>(left: &'a str, right: &'a str) -> &'a str {
     }
 }
 
-fn node_label(node: &ClusterNodeInfo) -> String {
-    if node.display_name.is_empty() {
-        short(&node.node_id, 11)
-    } else {
-        short(&node.display_name, 18)
+fn node_display_name_counts(nodes: &[ClusterNodeInfo]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for node in nodes {
+        let name = node.display_name.trim();
+        if !name.is_empty() {
+            *counts.entry(name.to_string()).or_insert(0) += 1;
+        }
     }
+    counts
+}
+
+fn node_graph_label(node: &ClusterNodeInfo, display_counts: &BTreeMap<String, usize>) -> String {
+    let name = node.display_name.trim();
+    if name.is_empty() {
+        short(&node.node_id, 11)
+    } else if display_counts.get(name).copied().unwrap_or_default() > 1 {
+        let suffix = node_id_suffix(&node.node_id, 6);
+        let base_max = 17usize.saturating_sub(suffix.chars().count());
+        format!("{} {suffix}", short(name, base_max.max(6)))
+    } else {
+        short(name, 18)
+    }
+}
+
+fn node_graph_detail(node: &ClusterNodeInfo) -> String {
+    let platform = platform_summary(node.platform.as_deref());
+    if platform == "-" {
+        node.availability.clone()
+    } else {
+        short(&format!("{} / {platform}", node.availability), 24)
+    }
+}
+
+fn node_heading(node: &ClusterNodeInfo) -> String {
+    let name = node.display_name.trim();
+    if name.is_empty() {
+        short(&node.node_id, 18)
+    } else {
+        let suffix = node_id_suffix(&node.node_id, 6);
+        format!("{} {suffix}", short(name, 24))
+    }
+}
+
+fn node_id_suffix(node_id: &str, count: usize) -> String {
+    let len = node_id.chars().count();
+    node_id
+        .chars()
+        .skip(len.saturating_sub(count))
+        .collect::<String>()
+}
+
+fn platform_summary(platform: Option<&str>) -> String {
+    let Some(platform) = platform.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "-".to_string();
+    };
+    platform
+        .replace("x86_64", "x64")
+        .replace("aarch64", "arm64")
 }
 
 fn short(value: &str, max: usize) -> String {
@@ -1740,6 +1786,50 @@ mod tests {
 
         assert_eq!(fill, unknown_node_color(&pal));
         assert_ne!(fill, pal.field);
+    }
+
+    #[test]
+    fn duplicate_display_names_are_disambiguated_in_graph_labels() {
+        let mut left = node("01kr4w089vqgdxpb84t6bq1qxn");
+        left.display_name = "sinomo-node".to_string();
+        left.platform = Some("linux/aarch64".to_string());
+        left.availability = "offline".to_string();
+        let mut right = node("01kr3d54d45zkm0p0xgps8k7mt");
+        right.display_name = "sinomo-node".to_string();
+        right.platform = Some("linux/x86_64".to_string());
+        let snapshot = ClusterSnapshot {
+            nodes: vec![left, right],
+            ..ClusterSnapshot::default()
+        };
+
+        let topology = build_topology(&snapshot);
+        let labels = topology
+            .vertices
+            .iter()
+            .map(|vertex| vertex.label.as_str())
+            .collect::<Vec<_>>();
+        let details = topology
+            .vertices
+            .iter()
+            .map(|vertex| vertex.detail.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(labels.contains(&"sinomo-node bq1qxn"));
+        assert!(labels.contains(&"sinomo-node s8k7mt"));
+        assert!(details.contains(&"offline / linux/arm64"));
+        assert!(details.contains(&"online / linux/x64"));
+    }
+
+    #[test]
+    fn node_detail_surfaces_short_identity_and_platform_before_diagnostics() {
+        let mut node = node("01kr4w089vqgdxpb84t6bq1qxn");
+        node.display_name = "sinomo-node".to_string();
+        node.platform = Some("linux/aarch64".to_string());
+
+        let closed = node_detail_lines(&node, false);
+
+        assert_eq!(closed[0], "sinomo-node bq1qxn");
+        assert!(closed.iter().any(|line| line == "platform: linux/arm64"));
     }
 
     #[test]
