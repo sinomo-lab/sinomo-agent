@@ -702,10 +702,6 @@ impl SifsEntryRow {
         self.shared.files().selected == Some(self.index)
     }
 
-    fn show_inspect_button(&self) -> bool {
-        self.hovered || self.active()
-    }
-
     fn inspect_rect(&self, bounds: Rect) -> Rect {
         let side = 24.0_f32.min(bounds.height()).max(0.0);
         Rect::new(
@@ -829,7 +825,6 @@ impl Widget for SifsEntryRow {
         let pal = palette(&self.shared);
         let bounds = ctx.bounds();
         let active = self.active();
-        let show_inspect = self.show_inspect_button();
         let inspect = self.inspect_rect(bounds);
         let icon_color = if active { pal.accent } else { pal.text_faint };
         let label_color = if active { pal.text } else { pal.text_muted };
@@ -850,13 +845,15 @@ impl Widget for SifsEntryRow {
             icon_color,
         );
 
-        if show_inspect {
+        {
             let fill = if self.pressed == Some(SifsEntryRowHit::Inspect) {
                 pal.selected
             } else if active {
                 pal.field
-            } else {
+            } else if self.hovered {
                 pal.hover
+            } else {
+                pal.panel
             };
             widgets::fill_round_rect(ctx, inspect, fill, 6.0);
             draw_glyph(
@@ -867,7 +864,7 @@ impl Widget for SifsEntryRow {
             );
         }
 
-        let inspect_gap = if show_inspect { 30.0 } else { 0.0 };
+        let inspect_gap = 30.0;
         let meta_w = 74.0_f32.min(bounds.width() * 0.36).max(0.0);
         let meta_rect = Rect::new(
             (bounds.max_x() - inspect_gap - meta_w).max(bounds.x()),
