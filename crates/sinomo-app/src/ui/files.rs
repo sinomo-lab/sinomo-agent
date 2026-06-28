@@ -23,9 +23,10 @@
 //! action so object placement remains reachable without changing paths.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -106,6 +107,7 @@ struct FileActionPrompt {
 enum FilesTaskState {
     Running,
     CancelRequested,
+    Cancelled,
     Completed,
     Failed,
 }
@@ -115,6 +117,7 @@ impl FilesTaskState {
         match self {
             Self::Running => "running",
             Self::CancelRequested => "cancelling",
+            Self::Cancelled => "cancelled",
             Self::Completed => "done",
             Self::Failed => "failed",
         }
@@ -156,6 +159,14 @@ struct FilesOperationOutcome {
     message: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FilesOperationFailure {
+    Cancelled(String),
+    Error(String),
+}
+
+type FilesOperationResult = Result<FilesOperationOutcome, FilesOperationFailure>;
+
 // ---------------------------------------------------------------------------
 // State (data layer) — SIFS-backed browser snapshot + async load worker.
 // ---------------------------------------------------------------------------
@@ -187,6 +198,7 @@ pub struct FilesState {
     worker_rx: Option<Receiver<FilesWorkerResult>>,
     worker_result_tx: Option<Sender<FilesWorkerResult>>,
     worker_waker: Option<sui::UiHandle>,
+    worker_cancellations: Arc<Mutex<BTreeSet<u64>>>,
     next_request_id: u64,
     pending_request_id: Option<u64>,
     pending_details_request_id: Option<u64>,
@@ -220,6 +232,7 @@ impl FilesState {
             worker_rx: None,
             worker_result_tx: None,
             worker_waker: None,
+            worker_cancellations: Arc::new(Mutex::new(BTreeSet::new())),
             next_request_id: 0,
             pending_request_id: None,
             pending_details_request_id: None,
@@ -381,6 +394,7 @@ impl FilesState {
         self.worker_rx = None;
         self.worker_result_tx = None;
         self.worker_waker = None;
+        clear_all_cancelled_operations(&self.worker_cancellations);
         self.list_revision = self.list_revision.wrapping_add(1);
     }
 
@@ -393,6 +407,7 @@ impl FilesState {
         let data_dir = self.data_dir.clone();
         let daemon_address = self.daemon_address.clone();
         let app_runtime = self.app_runtime.clone();
+        let cancellations = self.worker_cancellations.clone();
         let timeout_tx = result_tx.clone();
         let timeout_waker = waker.clone();
         match thread::Builder::new()
@@ -404,6 +419,7 @@ impl FilesState {
                     app_runtime,
                     command_rx,
                     result_tx,
+                    cancellations,
                     waker,
                 )
             }) {
@@ -744,6 +760,7 @@ impl FilesState {
         }
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
+        clear_cancelled_operation(&self.worker_cancellations, request_id);
         self.tasks.insert(
             0,
             FilesTask {
@@ -776,7 +793,8 @@ impl FilesState {
             .browser
             .as_ref()
             .ok_or_else(|| "SIFS browser is not open".to_string())
-            .and_then(|browser| execute_files_operation(browser, operation, &self.path));
+            .and_then(|browser| execute_files_operation(browser, operation, &self.path))
+            .map_err(FilesOperationFailure::Error);
         self.apply_operation_result(request_id, result);
     }
 
@@ -788,6 +806,7 @@ impl FilesState {
         {
             task.state = FilesTaskState::CancelRequested;
             task.detail = "cancel requested; waiting for DFS call to return".to_string();
+            mark_cancelled_operation(&self.worker_cancellations, task_id);
         }
     }
 
@@ -806,16 +825,13 @@ impl FilesState {
         }
     }
 
-    fn apply_operation_result(
-        &mut self,
-        request_id: u64,
-        result: Result<FilesOperationOutcome, String>,
-    ) -> bool {
+    fn apply_operation_result(&mut self, request_id: u64, result: FilesOperationResult) -> bool {
         let cancel_requested = self
             .tasks
             .iter()
             .find(|task| task.id == request_id)
             .is_some_and(|task| task.state == FilesTaskState::CancelRequested);
+        clear_cancelled_operation(&self.worker_cancellations, request_id);
         match result {
             Ok(outcome) => {
                 let detail = if cancel_requested {
@@ -831,7 +847,10 @@ impl FilesState {
                 self.pending_select_path = outcome.select_path;
                 self.refresh(None);
             }
-            Err(error) => {
+            Err(FilesOperationFailure::Cancelled(detail)) => {
+                self.finish_task(request_id, FilesTaskState::Cancelled, detail);
+            }
+            Err(FilesOperationFailure::Error(error)) => {
                 self.finish_task(request_id, FilesTaskState::Failed, error);
             }
         }
@@ -885,7 +904,7 @@ enum FilesWorkerResult {
     },
     Operation {
         request_id: u64,
-        result: Result<FilesOperationOutcome, String>,
+        result: FilesOperationResult,
     },
 }
 
@@ -910,6 +929,7 @@ fn files_worker_loop(
     app_runtime: tokio::runtime::Handle,
     command_rx: Receiver<FilesWorkerCommand>,
     result_tx: Sender<FilesWorkerResult>,
+    cancellations: Arc<Mutex<BTreeSet<u64>>>,
     waker: sui::UiHandle,
 ) {
     let mut browser: Option<SifsBrowser> = None;
@@ -1013,8 +1033,12 @@ fn files_worker_loop(
                         }
                     })
                     .unwrap_or_else(|| "/".to_string());
-                let result = if let Some(error) = &open_error {
-                    Err(error.clone())
+                let result = if operation_cancelled(&cancellations, request_id) {
+                    Err(FilesOperationFailure::Cancelled(
+                        files_operation_cancelled_detail(&operation),
+                    ))
+                } else if let Some(error) = &open_error {
+                    Err(FilesOperationFailure::Error(error.clone()))
                 } else {
                     if browser.is_none() {
                         match daemon_address.as_deref() {
@@ -1034,16 +1058,44 @@ fn files_worker_loop(
                     match (&browser, &open_error) {
                         (Some(browser), _) => {
                             execute_files_operation(browser, operation, &current_path)
+                                .map_err(FilesOperationFailure::Error)
                         }
-                        (None, Some(error)) => Err(error.clone()),
-                        (None, None) => Err("SIFS browser did not start".to_string()),
+                        (None, Some(error)) => Err(FilesOperationFailure::Error(error.clone())),
+                        (None, None) => Err(FilesOperationFailure::Error(
+                            "SIFS browser did not start".to_string(),
+                        )),
                     }
                 };
+                clear_cancelled_operation(&cancellations, request_id);
                 let _ = result_tx.send(FilesWorkerResult::Operation { request_id, result });
             }
         }
         waker.wake();
     }
+}
+
+fn mark_cancelled_operation(cancellations: &Arc<Mutex<BTreeSet<u64>>>, request_id: u64) {
+    if let Ok(mut cancellations) = cancellations.lock() {
+        cancellations.insert(request_id);
+    }
+}
+
+fn clear_cancelled_operation(cancellations: &Arc<Mutex<BTreeSet<u64>>>, request_id: u64) {
+    if let Ok(mut cancellations) = cancellations.lock() {
+        cancellations.remove(&request_id);
+    }
+}
+
+fn clear_all_cancelled_operations(cancellations: &Arc<Mutex<BTreeSet<u64>>>) {
+    if let Ok(mut cancellations) = cancellations.lock() {
+        cancellations.clear();
+    }
+}
+
+fn operation_cancelled(cancellations: &Arc<Mutex<BTreeSet<u64>>>, request_id: u64) -> bool {
+    cancellations
+        .lock()
+        .is_ok_and(|cancellations| cancellations.contains(&request_id))
 }
 
 fn normalize_path(path: &str) -> String {
@@ -1144,6 +1196,19 @@ fn execute_files_operation(
                 message: format!("deleted {}", operation.path),
             })
         }
+    }
+}
+
+fn files_operation_cancelled_detail(operation: &FilesOperation) -> String {
+    match operation.kind {
+        FilesOperationKind::CreateFile | FilesOperationKind::CreateFolder => {
+            format!("cancelled before creating {}", operation.path)
+        }
+        FilesOperationKind::Rename => {
+            let target = operation.target.as_deref().unwrap_or("target");
+            format!("cancelled before renaming {} to {target}", operation.path)
+        }
+        FilesOperationKind::Delete => format!("cancelled before deleting {}", operation.path),
     }
 }
 
@@ -2079,6 +2144,11 @@ fn files_task_status(files: &FilesState) -> String {
         .iter()
         .filter(|task| task.state == FilesTaskState::Failed)
         .count();
+    let cancelled = files
+        .tasks
+        .iter()
+        .filter(|task| task.state == FilesTaskState::Cancelled)
+        .count();
     if running > 0 {
         if running == 1 {
             "1 task running".to_string()
@@ -2096,6 +2166,12 @@ fn files_task_status(files: &FilesState) -> String {
             "1 task failed".to_string()
         } else {
             format!("{failed} tasks failed")
+        }
+    } else if cancelled > 0 {
+        if cancelled == 1 {
+            "1 task cancelled".to_string()
+        } else {
+            format!("{cancelled} tasks cancelled")
         }
     } else {
         "idle".to_string()
@@ -2342,7 +2418,7 @@ impl Widget for FilesTaskStrip {
             let text_w = (text_right - bounds.x() - CONTENT_PAD).max(0.0);
             let tone = match task.state {
                 FilesTaskState::Running | FilesTaskState::CancelRequested => pal.accent,
-                FilesTaskState::Completed => pal.good,
+                FilesTaskState::Completed | FilesTaskState::Cancelled => pal.good,
                 FilesTaskState::Failed => pal.warn,
             };
             let dot = Rect::new(bounds.x() + CONTENT_PAD, row_y + 5.0, 6.0, 6.0);
@@ -2424,7 +2500,7 @@ fn task_progress_fraction(state: FilesTaskState) -> f32 {
     match state {
         FilesTaskState::Running => 0.45,
         FilesTaskState::CancelRequested => 0.75,
-        FilesTaskState::Completed | FilesTaskState::Failed => 1.0,
+        FilesTaskState::Cancelled | FilesTaskState::Completed | FilesTaskState::Failed => 1.0,
     }
 }
 
@@ -4369,6 +4445,12 @@ mod tests {
             files_status_summary(&state),
             "Local SIFS | Path /cluster-tests | 1 entry | selected /cluster-tests/artifact.txt | 1 task running"
         );
+
+        state.tasks[0].state = FilesTaskState::Cancelled;
+        assert_eq!(
+            files_status_summary(&state),
+            "Local SIFS | Path /cluster-tests | 1 entry | selected /cluster-tests/artifact.txt | 1 task cancelled"
+        );
     }
 
     #[test]
@@ -4521,6 +4603,39 @@ mod tests {
                 .map(|details| details.policy.as_str()),
             Some("replicated-eventual")
         );
+    }
+
+    #[test]
+    fn cancelled_operation_result_marks_task_cancelled() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.loaded = true;
+        state.loading = false;
+        state.path = "/services".to_string();
+        state.tasks = vec![FilesTask {
+            id: 12,
+            title: "Delete".to_string(),
+            detail: "/services/artifact.txt".to_string(),
+            state: FilesTaskState::CancelRequested,
+        }];
+        mark_cancelled_operation(&state.worker_cancellations, 12);
+
+        let changed = state.apply_operation_result(
+            12,
+            Err(FilesOperationFailure::Cancelled(
+                "cancelled before deleting /services/artifact.txt".to_string(),
+            )),
+        );
+
+        assert!(changed);
+        assert_eq!(state.tasks[0].state, FilesTaskState::Cancelled);
+        assert_eq!(
+            state.tasks[0].detail,
+            "cancelled before deleting /services/artifact.txt"
+        );
+        assert_eq!(state.path, "/services");
+        assert!(!operation_cancelled(&state.worker_cancellations, 12));
+        assert_eq!(files_task_status(&state), "1 task cancelled");
     }
 
     #[test]
@@ -5023,6 +5138,10 @@ mod tests {
             shared.files().tasks[0].state,
             FilesTaskState::CancelRequested
         );
+        assert!(operation_cancelled(
+            &shared.files().worker_cancellations,
+            77
+        ));
 
         Ok(())
     }
