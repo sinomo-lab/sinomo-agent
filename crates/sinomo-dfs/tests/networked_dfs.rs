@@ -964,7 +964,7 @@ fn networked_dfs_fetches_lost_stage_blob_from_durable_replica_before_commit() {
         dfs.add_object_metadata(metadata.clone()).expect("object");
     }
 
-    let bytes = chunked_test_bytes(4_464);
+    let bytes = chunked_test_bytes(20 * 1024);
     let hash = content_hash(&bytes);
     let write = owner_dfs
         .write_distributed_eventual(
@@ -2161,7 +2161,7 @@ fn networked_dfs_repair_fetch_rotates_after_durable_source_misses_blob() {
         dfs.add_object_metadata(metadata.clone()).expect("object");
     }
 
-    let bytes = chunked_test_bytes(4_464);
+    let bytes = chunked_test_bytes(20 * 1024);
     let hash = content_hash(&bytes);
     let write = owner_dfs
         .write_distributed_eventual(
@@ -2205,21 +2205,65 @@ fn networked_dfs_repair_fetch_rotates_after_durable_source_misses_blob() {
         &mut target_control,
         "drop repair target commit before repair",
     );
+    missing_dfs
+        .process_incoming()
+        .expect("first durable source commits before blob loss");
+    found_dfs
+        .process_incoming()
+        .expect("second durable source commits before blob loss");
+    owner_dfs
+        .process_incoming()
+        .expect("owner observes durable source commit acks");
     fs::remove_file(blob_path_for_hash(&root.join("owner"), &hash)).expect("remove owner blob");
     fs::remove_file(blob_path_for_hash(&root.join("missing"), &hash))
         .expect("remove first durable source blob");
 
-    assert!(
-        owner_dfs
+    let mut missing_events = Vec::new();
+    let mut found_probe_events = Vec::new();
+    for _ in 0..6 {
+        let scheduled = owner_dfs
             .retry_pending_repairs()
-            .expect("request fetch from first durable source")
-            .is_empty()
+            .expect("advance repair retry toward first durable source fetch");
+        assert!(
+            scheduled.is_empty(),
+            "expected fetch request or retry wait instead of direct repair, scheduled: {scheduled:?}"
+        );
+        missing_events.extend(
+            missing_dfs
+                .process_incoming()
+                .expect("first durable source checks for repair fetch"),
+        );
+        if missing_events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::BlobFetchRejected { intent_id: event_intent, .. }
+                    if event_intent == &intent_id
+            )
+        }) {
+            break;
+        }
+        found_probe_events.extend(
+            found_dfs
+                .process_incoming()
+                .expect("second durable source should not be selected before first miss"),
+        );
+        assert!(
+            !found_probe_events.iter().any(|event| matches!(
+                event,
+                NetworkedDfsServiceEvent::BlobFetched { intent_id: event_intent, .. }
+                    if event_intent == &intent_id
+            )),
+            "second durable source was selected before first source miss: {found_probe_events:?}"
+        );
+    }
+    assert!(
+        missing_events.iter().any(|event| matches!(
+            event,
+            NetworkedDfsServiceEvent::BlobFetchRejected { intent_id: event_intent, .. }
+                if event_intent == &intent_id
+        )),
+        "expected first durable source to reject fetch for {intent_id}, missing events: {missing_events:?}, found events: {found_probe_events:?}"
     );
-    assert!(missing_dfs
-        .process_incoming()
-        .expect("first durable source misses repair blob")
-        .iter()
-        .any(|event| matches!(event, NetworkedDfsServiceEvent::BlobFetchRejected { intent_id: event_intent, .. } if event_intent == &intent_id)));
     owner_dfs
         .process_incoming()
         .expect("owner records first repair source miss");
@@ -4875,7 +4919,7 @@ fn networked_dfs_threshold_commit_stages_missing_desired_replica() {
     owner_dfs.process_incoming().expect("stage response");
     let owner_metrics = owner_dfs.operational_metrics().expect("owner metrics");
     assert_eq!(owner_metrics.repair_job_count, 0);
-    assert_eq!(owner_metrics.pending_write_count, 0);
+    assert_eq!(owner_metrics.pending_write_count, 1);
     let read = replica_dfs
         .read_local_object(&object_id)
         .expect("read")
@@ -8973,7 +9017,7 @@ fn networked_dfs_chunked_repair_auth_failure_notifies_sender() {
 }
 
 #[test]
-fn networked_dfs_chunked_stage_accepts_out_of_order_chunks() {
+fn networked_dfs_chunked_stage_rejects_out_of_order_initial_chunk_then_accepts_retry() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_replica").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
@@ -9037,23 +9081,41 @@ fn networked_dfs_chunked_stage_accepts_out_of_order_chunks() {
         &mut owner_transport,
         &owner,
         &replica,
-        DfsNetworkMessage::StageBlobChunk(second),
+        DfsNetworkMessage::StageBlobChunk(second.clone()),
     );
-    assert!(
-        replica_dfs
-            .process_incoming()
-            .expect("second chunk starts transfer")
-            .is_empty()
-    );
+    let rejected = replica_dfs
+        .process_incoming()
+        .expect("second chunk rejects sparse transfer");
+    assert!(rejected.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::BlobStageRejected { intent_id, reason, .. }
+                if intent_id == "intent_stage_out_of_order"
+                    && reason.contains("started at chunk")
+                    && reason.contains("without earlier chunks")
+        )
+    }));
     send_dfs_test_message(
         &mut owner_transport,
         &owner,
         &replica,
         DfsNetworkMessage::StageBlobChunk(first),
     );
+    assert!(
+        replica_dfs
+            .process_incoming()
+            .expect("first chunk starts transfer")
+            .is_empty()
+    );
+    send_dfs_test_message(
+        &mut owner_transport,
+        &owner,
+        &replica,
+        DfsNetworkMessage::StageBlobChunk(second),
+    );
     let events = replica_dfs
         .process_incoming()
-        .expect("first chunk completes out-of-order stage");
+        .expect("second ordered chunk completes stage");
     assert!(events.iter().any(|event| {
         matches!(
             event,
@@ -9069,7 +9131,7 @@ fn networked_dfs_chunked_stage_accepts_out_of_order_chunks() {
 }
 
 #[test]
-fn networked_dfs_chunked_repair_accepts_out_of_order_chunks() {
+fn networked_dfs_chunked_repair_rejects_out_of_order_initial_chunk_then_accepts_retry() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_replica").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
@@ -9133,23 +9195,41 @@ fn networked_dfs_chunked_repair_accepts_out_of_order_chunks() {
         &mut owner_transport,
         &owner,
         &replica,
-        DfsNetworkMessage::RepairReplicaChunk(second),
+        DfsNetworkMessage::RepairReplicaChunk(second.clone()),
     );
-    assert!(
-        replica_dfs
-            .process_incoming()
-            .expect("second chunk starts repair transfer")
-            .is_empty()
-    );
+    let rejected = replica_dfs
+        .process_incoming()
+        .expect("second chunk rejects sparse repair transfer");
+    assert!(rejected.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RepairRejected { intent_id, reason, .. }
+                if intent_id == "intent_repair_out_of_order"
+                    && reason.contains("started at chunk")
+                    && reason.contains("without earlier chunks")
+        )
+    }));
     send_dfs_test_message(
         &mut owner_transport,
         &owner,
         &replica,
         DfsNetworkMessage::RepairReplicaChunk(first),
     );
+    assert!(
+        replica_dfs
+            .process_incoming()
+            .expect("first chunk starts repair transfer")
+            .is_empty()
+    );
+    send_dfs_test_message(
+        &mut owner_transport,
+        &owner,
+        &replica,
+        DfsNetworkMessage::RepairReplicaChunk(second),
+    );
     let events = replica_dfs
         .process_incoming()
-        .expect("first chunk completes out-of-order repair");
+        .expect("second ordered chunk completes repair");
     assert!(events.iter().any(|event| {
         matches!(
             event,
@@ -10858,9 +10938,9 @@ fn networked_dfs_retries_offline_repair_when_replica_appears() {
         .operational_metrics()
         .expect("owner metrics after repair");
     assert_eq!(owner_metrics.repair_job_count, 0);
-    assert_eq!(owner_metrics.pending_write_count, 0);
-    assert_eq!(owner_metrics.repair_attempt_count, 0);
-    assert_eq!(owner_metrics.repair_retry_count, 0);
+    assert_eq!(owner_metrics.pending_write_count, 1);
+    assert_eq!(owner_metrics.repair_attempt_count, 1);
+    assert_eq!(owner_metrics.repair_retry_count, 1);
     assert_eq!(owner_metrics.repair_inflight_count, 0);
     assert_eq!(owner_metrics.repair_window_resume_count, 0);
     assert_eq!(owner_metrics.repair_window_resume_bytes, 0);
