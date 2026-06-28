@@ -116,8 +116,9 @@ use crate::rollout::{
 };
 use crate::{
     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE, DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
-    DAEMON_DFS_BROWSER_LIST_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
-    DAEMON_DFS_BROWSER_READ_FILES_ROUTE, DAEMON_DFS_BROWSER_ROUTES,
+    DAEMON_DFS_BROWSER_DELETE_ROUTE, DAEMON_DFS_BROWSER_LIST_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILE_ROUTE, DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
+    DAEMON_DFS_BROWSER_RENAME_ROUTE, DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE,
     DAEMON_DFS_BROWSER_STATUS_ROUTE, DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_RPC_CATEGORY,
     DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
 };
@@ -1337,6 +1338,19 @@ impl DaemonDfsBrowserBackend {
         })
     }
 
+    fn stat(
+        &self,
+        request: crate::DaemonDfsBrowserStatRequest,
+    ) -> Result<crate::DaemonDfsBrowserStatResponse, ServiceError> {
+        let path = normalize_sifs_browser_path(&request.path)?;
+        let mut service = self.lock_service()?;
+        self.refresh_endpoint_targets(&mut service);
+        let stat = service
+            .posix_stat_distributed(&path)
+            .map_err(dfs_browser_service_error)?;
+        Ok(daemon_dfs_browser_stat_response(stat))
+    }
+
     fn read_file(
         &self,
         request: crate::DaemonDfsBrowserReadFileRequest,
@@ -1413,6 +1427,39 @@ impl DaemonDfsBrowserBackend {
         Ok(crate::DaemonDfsBrowserCreateDirAllResponse)
     }
 
+    fn rename(
+        &self,
+        request: crate::DaemonDfsBrowserRenameRequest,
+    ) -> Result<crate::DaemonDfsBrowserRenameResponse, ServiceError> {
+        let from = normalize_sifs_browser_path(&request.from)?;
+        let to = normalize_sifs_browser_path(&request.to)?;
+        let mut service = self.lock_service()?;
+        service
+            .posix_rename(&from, &to)
+            .map_err(dfs_browser_service_error)?;
+        self.flush_after_mutation(&mut service)?;
+        Ok(crate::DaemonDfsBrowserRenameResponse)
+    }
+
+    fn delete(
+        &self,
+        request: crate::DaemonDfsBrowserDeleteRequest,
+    ) -> Result<crate::DaemonDfsBrowserDeleteResponse, ServiceError> {
+        let path = normalize_sifs_browser_path(&request.path)?;
+        let mut service = self.lock_service()?;
+        if request.directory {
+            service
+                .posix_rmdir(&path)
+                .map_err(dfs_browser_service_error)?;
+        } else {
+            service
+                .posix_unlink(&path)
+                .map_err(dfs_browser_service_error)?;
+        }
+        self.flush_after_mutation(&mut service)?;
+        Ok(crate::DaemonDfsBrowserDeleteResponse)
+    }
+
     fn flush_after_mutation(
         &self,
         service: &mut sinomo_dfs::MountedSifsService,
@@ -1482,6 +1529,15 @@ impl Service for DaemonDfsBrowserService {
                         .await?;
                     ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_LIST_ROUTE, &result)?
                 }
+                DAEMON_DFS_BROWSER_STAT_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let result =
+                        run_blocking_service_task(route.clone(), "DFS browser stat", move || {
+                            DaemonDfsBrowserBackend::for_data_dir(data_dir)?.stat(payload)
+                        })
+                        .await?;
+                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_STAT_ROUTE, &result)?
+                }
                 DAEMON_DFS_BROWSER_READ_FILE_ROUTE => {
                     let payload = request.decode_body()?;
                     let result = run_blocking_service_task(
@@ -1541,11 +1597,65 @@ impl Service for DaemonDfsBrowserService {
                         &result,
                     )?
                 }
+                DAEMON_DFS_BROWSER_RENAME_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let backend_data_dir = Arc::clone(&data_dir);
+                    let publish_data_dir = Arc::clone(&data_dir);
+                    let result =
+                        run_blocking_service_task(route.clone(), "DFS browser rename", move || {
+                            DaemonDfsBrowserBackend::for_data_dir(backend_data_dir)?.rename(payload)
+                        })
+                        .await?;
+                    publish_daemon_sifs_metadata(publish_data_dir.as_ref(), runtime.as_ref())
+                        .await?;
+                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_RENAME_ROUTE, &result)?
+                }
+                DAEMON_DFS_BROWSER_DELETE_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let backend_data_dir = Arc::clone(&data_dir);
+                    let publish_data_dir = Arc::clone(&data_dir);
+                    let result =
+                        run_blocking_service_task(route.clone(), "DFS browser delete", move || {
+                            DaemonDfsBrowserBackend::for_data_dir(backend_data_dir)?.delete(payload)
+                        })
+                        .await?;
+                    publish_daemon_sifs_metadata(publish_data_dir.as_ref(), runtime.as_ref())
+                        .await?;
+                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_DELETE_ROUTE, &result)?
+                }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
             ctx.respond(response)?;
             Ok(ServiceDisposition::Continue)
         })
+    }
+}
+
+fn daemon_dfs_browser_stat_response(
+    stat: sinomo_dfs::DfsStat,
+) -> crate::DaemonDfsBrowserStatResponse {
+    crate::DaemonDfsBrowserStatResponse {
+        file_system_id: stat.file_system_id.to_string(),
+        object_id: stat.object_id.to_string(),
+        path: stat.path,
+        kind: stat.kind,
+        version: stat.version.to_string(),
+        content_hash: stat.content_hash,
+        size_bytes: stat.size_bytes,
+        link_count: stat.link_count,
+        mode: stat.mode,
+        uid: stat.uid,
+        gid: stat.gid,
+        accessed_at_unix_nanos: stat.accessed_at_unix_nanos,
+        modified_at_unix_nanos: stat.modified_at_unix_nanos,
+        created_at_unix_nanos: stat.created_at_unix_nanos,
+        changed_at_unix_nanos: stat.changed_at_unix_nanos,
+        policy: stat.policy,
+        current_locations: stat
+            .current_locations
+            .into_iter()
+            .map(|node_id| node_id.to_string())
+            .collect(),
     }
 }
 

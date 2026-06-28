@@ -18,18 +18,24 @@ pub const DAEMON_STATUS_ROUTE: &str = "/daemon/status";
 pub const DAEMON_SHUTDOWN_ROUTE: &str = "/daemon/shutdown";
 pub const DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE: &str = "/daemon/cluster/maintenance-refresh";
 pub const DAEMON_DFS_BROWSER_STATUS_ROUTE: &str = "/daemon/dfs/browser/status";
+pub const DAEMON_DFS_BROWSER_STAT_ROUTE: &str = "/daemon/dfs/browser/stat";
 pub const DAEMON_DFS_BROWSER_LIST_ROUTE: &str = "/daemon/dfs/browser/list";
 pub const DAEMON_DFS_BROWSER_READ_FILE_ROUTE: &str = "/daemon/dfs/browser/read-file";
 pub const DAEMON_DFS_BROWSER_READ_FILES_ROUTE: &str = "/daemon/dfs/browser/read-files";
 pub const DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE: &str = "/daemon/dfs/browser/write-file";
 pub const DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE: &str = "/daemon/dfs/browser/create-dir-all";
+pub const DAEMON_DFS_BROWSER_RENAME_ROUTE: &str = "/daemon/dfs/browser/rename";
+pub const DAEMON_DFS_BROWSER_DELETE_ROUTE: &str = "/daemon/dfs/browser/delete";
 pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_STATUS_ROUTE,
+    DAEMON_DFS_BROWSER_STAT_ROUTE,
     DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
     DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
     DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
+    DAEMON_DFS_BROWSER_RENAME_ROUTE,
+    DAEMON_DFS_BROWSER_DELETE_ROUTE,
 ];
 
 pub(crate) fn cluster_join_trace(args: std::fmt::Arguments<'_>) {
@@ -70,6 +76,32 @@ pub struct DaemonDfsBrowserEntry {
     pub path: String,
     pub kind: sinomo_dfs::DfsObjectKind,
     pub size: Option<u64>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserStatRequest {
+    pub path: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserStatResponse {
+    pub file_system_id: String,
+    pub object_id: String,
+    pub path: String,
+    pub kind: sinomo_dfs::DfsObjectKind,
+    pub version: String,
+    pub content_hash: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub link_count: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub accessed_at_unix_nanos: u64,
+    pub modified_at_unix_nanos: u64,
+    pub created_at_unix_nanos: u64,
+    pub changed_at_unix_nanos: u64,
+    pub policy: sinomo_core::DfsObjectPolicy,
+    pub current_locations: Vec<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
@@ -115,6 +147,24 @@ pub struct DaemonDfsBrowserCreateDirAllRequest {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserCreateDirAllResponse;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserRenameRequest {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserRenameResponse;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserDeleteRequest {
+    pub path: String,
+    pub directory: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserDeleteResponse;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonClusterMaintenanceRefreshRequest;

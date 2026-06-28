@@ -1965,6 +1965,28 @@ pub struct SifsEntry {
     pub size: Option<u64>,
 }
 
+/// SIFS metadata for a selected object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SifsObjectDetails {
+    pub file_system_id: String,
+    pub object_id: String,
+    pub path: String,
+    pub kind: String,
+    pub version: String,
+    pub content_hash: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub link_count: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub accessed_at_unix_nanos: u64,
+    pub modified_at_unix_nanos: u64,
+    pub created_at_unix_nanos: u64,
+    pub changed_at_unix_nanos: u64,
+    pub policy: String,
+    pub current_locations: Vec<String>,
+}
+
 /// A handle to browse SIFS (the distributed filesystem).
 pub struct SifsBrowser {
     backend: SifsBrowserBackend,
@@ -2078,6 +2100,15 @@ impl SifsBrowser {
         Ok(sort_sifs_entries(entries))
     }
 
+    pub fn stat(&self, path: &str) -> Result<SifsObjectDetails, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => {
+                backend.dfs_stat(path).map(sifs_details_from_stat)
+            }
+            SifsBrowserBackend::Remote(remote) => remote.stat(path),
+        }
+    }
+
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
         match &self.backend {
             SifsBrowserBackend::Local(backend) => backend.read_file(path),
@@ -2115,6 +2146,40 @@ impl SifsBrowser {
         match &self.backend {
             SifsBrowserBackend::Local(backend) => backend.create_dir_all(path),
             SifsBrowserBackend::Remote(remote) => remote.create_dir_all(path),
+        }
+    }
+
+    pub fn create_file(&self, path: &str) -> Result<(), String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.create_file(path),
+            SifsBrowserBackend::Remote(remote) => remote.write_file(path, &[]),
+        }
+    }
+
+    pub fn create_dir(&self, path: &str) -> Result<(), String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.create_dir(path),
+            SifsBrowserBackend::Remote(remote) => remote.create_dir_all(path),
+        }
+    }
+
+    pub fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.rename(from, to),
+            SifsBrowserBackend::Remote(remote) => remote.rename(from, to),
+        }
+    }
+
+    pub fn delete(&self, path: &str, directory: bool) -> Result<(), String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => {
+                if directory {
+                    backend.delete_dir(path)
+                } else {
+                    backend.delete_file(path)
+                }
+            }
+            SifsBrowserBackend::Remote(remote) => remote.delete(path, directory),
         }
     }
 
@@ -2183,6 +2248,16 @@ impl RemoteSifsBrowser {
             .collect())
     }
 
+    fn stat(&self, path: &str) -> Result<SifsObjectDetails, String> {
+        let response: sinomo_runtime::daemon::DaemonDfsBrowserStatResponse = self.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_STAT_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserStatRequest {
+                path: path.to_string(),
+            },
+        )?;
+        Ok(sifs_details_from_rpc(response))
+    }
+
     fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
         let response: sinomo_runtime::daemon::DaemonDfsBrowserReadFileResponse = self.rpc(
             sinomo_runtime::daemon::DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
@@ -2237,6 +2312,28 @@ impl RemoteSifsBrowser {
         )?;
         Ok(())
     }
+
+    fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+        let _: sinomo_runtime::daemon::DaemonDfsBrowserRenameResponse = self.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_RENAME_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserRenameRequest {
+                from: from.to_string(),
+                to: to.to_string(),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn delete(&self, path: &str, directory: bool) -> Result<(), String> {
+        let _: sinomo_runtime::daemon::DaemonDfsBrowserDeleteResponse = self.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_DELETE_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserDeleteRequest {
+                path: path.to_string(),
+                directory,
+            },
+        )?;
+        Ok(())
+    }
 }
 
 fn sifs_entry_from_file_manager(entry: crate::file_manager::FileManagerEntry) -> SifsEntry {
@@ -2256,6 +2353,78 @@ fn sifs_entry_from_rpc(entry: sinomo_runtime::daemon::DaemonDfsBrowserEntry) -> 
         is_dir: matches!(entry.kind, sinomo_runtime::dfs::DfsObjectKind::Directory),
         is_link: matches!(entry.kind, sinomo_runtime::dfs::DfsObjectKind::Symlink),
         size: entry.size,
+    }
+}
+
+fn sifs_details_from_stat(stat: sinomo_runtime::dfs::DfsStat) -> SifsObjectDetails {
+    SifsObjectDetails {
+        file_system_id: stat.file_system_id.to_string(),
+        object_id: stat.object_id.to_string(),
+        path: stat.path,
+        kind: sifs_kind_label(&stat.kind).to_string(),
+        version: stat.version.to_string(),
+        content_hash: stat.content_hash,
+        size_bytes: stat.size_bytes,
+        link_count: stat.link_count,
+        mode: stat.mode,
+        uid: stat.uid,
+        gid: stat.gid,
+        accessed_at_unix_nanos: stat.accessed_at_unix_nanos,
+        modified_at_unix_nanos: stat.modified_at_unix_nanos,
+        created_at_unix_nanos: stat.created_at_unix_nanos,
+        changed_at_unix_nanos: stat.changed_at_unix_nanos,
+        policy: sifs_policy_label(&stat.policy).to_string(),
+        current_locations: stat
+            .current_locations
+            .into_iter()
+            .map(|node_id| node_id.to_string())
+            .collect(),
+    }
+}
+
+fn sifs_details_from_rpc(
+    response: sinomo_runtime::daemon::DaemonDfsBrowserStatResponse,
+) -> SifsObjectDetails {
+    SifsObjectDetails {
+        file_system_id: response.file_system_id,
+        object_id: response.object_id,
+        path: response.path,
+        kind: sifs_kind_label(&response.kind).to_string(),
+        version: response.version,
+        content_hash: response.content_hash,
+        size_bytes: response.size_bytes,
+        link_count: response.link_count,
+        mode: response.mode,
+        uid: response.uid,
+        gid: response.gid,
+        accessed_at_unix_nanos: response.accessed_at_unix_nanos,
+        modified_at_unix_nanos: response.modified_at_unix_nanos,
+        created_at_unix_nanos: response.created_at_unix_nanos,
+        changed_at_unix_nanos: response.changed_at_unix_nanos,
+        policy: sifs_policy_label(&response.policy).to_string(),
+        current_locations: response.current_locations,
+    }
+}
+
+fn sifs_kind_label(kind: &sinomo_runtime::dfs::DfsObjectKind) -> &'static str {
+    match kind {
+        sinomo_runtime::dfs::DfsObjectKind::Directory => "directory",
+        sinomo_runtime::dfs::DfsObjectKind::File => "file",
+        sinomo_runtime::dfs::DfsObjectKind::Symlink => "symlink",
+        sinomo_runtime::dfs::DfsObjectKind::Hardlink => "hardlink",
+        sinomo_runtime::dfs::DfsObjectKind::Artifact => "artifact",
+        sinomo_runtime::dfs::DfsObjectKind::Mount => "mount",
+        sinomo_runtime::dfs::DfsObjectKind::Tombstone => "tombstone",
+    }
+}
+
+fn sifs_policy_label(policy: &sinomo_runtime::core::DfsObjectPolicy) -> &'static str {
+    match policy {
+        sinomo_runtime::core::DfsObjectPolicy::LocalOwned => "local-owned",
+        sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed => "replicated-confirmed",
+        sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual => "replicated-eventual",
+        sinomo_runtime::core::DfsObjectPolicy::AppendOnly => "append-only",
+        sinomo_runtime::core::DfsObjectPolicy::EphemeralLocal => "ephemeral-local",
     }
 }
 

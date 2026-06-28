@@ -33,12 +33,13 @@ use sui::{
     Alignment, ArrangeCtx, Breadcrumb, BreadcrumbItem, Constraints, DefaultTheme, Event, EventCtx,
     FontWeight, IconButton, IconGlyph, KeyState, ListItem, ListView, MeasureCtx, PaintCtx, Point,
     PointerButton, PointerEventKind, Rect, ScrollState, ScrollView, SemanticsAction, SemanticsCtx,
-    SemanticsNode, SemanticsRole, Separator, Size, SizedBox, Stack, Widget, WidgetPod,
-    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, draw_glyph,
+    SemanticsNode, SemanticsRole, Separator, Size, SizedBox, Stack, StackHostOptions, Widget,
+    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, draw_glyph,
 };
 
-use sinomo_cli::app_api::{SifsBrowser, SifsEntry};
+use sinomo_cli::app_api::{SifsBrowser, SifsEntry, SifsObjectDetails};
 use sinomo_runtime::local::SinomoDataDir;
+use time::format_description::well_known::Rfc3339;
 
 use crate::backend::Backend;
 use crate::state::{Shared, Tab};
@@ -57,6 +58,98 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as `settings.rs`.)
 type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileActionPromptKind {
+    NewFile,
+    NewFolder,
+    Rename,
+    Delete,
+}
+
+impl FileActionPromptKind {
+    fn title(self) -> &'static str {
+        match self {
+            Self::NewFile => "New file",
+            Self::NewFolder => "New folder",
+            Self::Rename => "Rename",
+            Self::Delete => "Delete",
+        }
+    }
+
+    fn primary_label(self) -> &'static str {
+        match self {
+            Self::NewFile => "Create file",
+            Self::NewFolder => "Create folder",
+            Self::Rename => "Rename",
+            Self::Delete => "Delete",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileActionPrompt {
+    kind: FileActionPromptKind,
+    input: String,
+    target_name: String,
+    target_path: Option<String>,
+    target_is_dir: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FilesTaskState {
+    Running,
+    CancelRequested,
+    Completed,
+    Failed,
+}
+
+impl FilesTaskState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::CancelRequested => "cancelling",
+            Self::Completed => "done",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn can_cancel(self) -> bool {
+        self == Self::Running
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FilesTask {
+    id: u64,
+    title: String,
+    detail: String,
+    state: FilesTaskState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FilesOperationKind {
+    CreateFile,
+    CreateFolder,
+    Rename,
+    Delete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FilesOperation {
+    kind: FilesOperationKind,
+    path: String,
+    target: Option<String>,
+    directory: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FilesOperationOutcome {
+    refresh_path: String,
+    select_path: Option<String>,
+    message: String,
+}
 
 // ---------------------------------------------------------------------------
 // State (data layer) — SIFS-backed browser snapshot + async load worker.
@@ -77,6 +170,12 @@ pub struct FilesState {
     pub path: String,
     pub entries: Vec<SifsEntry>,
     pub selected: Option<usize>,
+    pub selected_details: Option<SifsObjectDetails>,
+    pub details_loading: bool,
+    pub details_error: Option<String>,
+    action_prompt: Option<FileActionPrompt>,
+    tasks: Vec<FilesTask>,
+    pending_select_path: Option<String>,
     pub scroll: f32,
     pub inspector_details_open: bool,
     worker_tx: Option<Sender<FilesWorkerCommand>>,
@@ -85,6 +184,7 @@ pub struct FilesState {
     worker_waker: Option<sui::UiHandle>,
     next_request_id: u64,
     pending_request_id: Option<u64>,
+    pending_details_request_id: Option<u64>,
 }
 
 impl FilesState {
@@ -103,6 +203,12 @@ impl FilesState {
             path: "/".to_string(),
             entries: Vec::new(),
             selected: None,
+            selected_details: None,
+            details_loading: false,
+            details_error: None,
+            action_prompt: None,
+            tasks: Vec::new(),
+            pending_select_path: None,
             scroll: 0.0,
             inspector_details_open: false,
             worker_tx: None,
@@ -111,6 +217,7 @@ impl FilesState {
             worker_waker: None,
             next_request_id: 0,
             pending_request_id: None,
+            pending_details_request_id: None,
         }
     }
 
@@ -161,7 +268,7 @@ impl FilesState {
 
     fn reload_sync(&mut self) {
         self.selected = None;
-        self.scroll = 0.0;
+        self.clear_selected_details();
         self.loading = false;
         let path = self.path.clone();
         let listing = self.browser.as_ref().map(|b| b.list_shallow(&path));
@@ -169,6 +276,15 @@ impl FilesState {
             Some(Ok(entries)) => {
                 self.entries = entries;
                 self.error = None;
+                if let Some(select_path) = self.pending_select_path.take()
+                    && let Some(index) = self
+                        .entries
+                        .iter()
+                        .position(|entry| entry.path == select_path)
+                {
+                    self.selected = Some(index);
+                    self.request_selected_details();
+                }
             }
             Some(Err(error)) => {
                 self.entries.clear();
@@ -187,7 +303,7 @@ impl FilesState {
         self.next_request_id = self.next_request_id.wrapping_add(1);
         self.pending_request_id = Some(request_id);
         self.selected = None;
-        self.scroll = 0.0;
+        self.clear_selected_details();
         self.loading = true;
         self.error = None;
         self.entries.clear();
@@ -210,7 +326,7 @@ impl FilesState {
                 .name("sinomo-app-files-timeout".to_string())
                 .spawn(move || {
                     thread::sleep(LOAD_TIMEOUT);
-                    let _ = result_tx.send(FilesWorkerResult {
+                    let _ = result_tx.send(FilesWorkerResult::List {
                         request_id,
                         path,
                         result: Err(format!(
@@ -249,11 +365,13 @@ impl FilesState {
         self.error = None;
         self.entries.clear();
         self.selected = None;
+        self.clear_selected_details();
         self.node_id.clear();
         self.inspector_details_open = false;
         self.loaded = false;
         self.loading = false;
         self.pending_request_id = None;
+        self.pending_details_request_id = None;
         self.worker_tx = None;
         self.worker_rx = None;
         self.worker_result_tx = None;
@@ -313,6 +431,13 @@ impl FilesState {
                         self.list_revision = self.list_revision.wrapping_add(1);
                         changed = true;
                     }
+                    if self.details_loading {
+                        self.details_loading = false;
+                        self.pending_details_request_id = None;
+                        self.selected_details = None;
+                        self.details_error = Some("SIFS browser worker stopped".to_string());
+                        changed = true;
+                    }
                     self.worker_rx = None;
                     self.worker_tx = None;
                     self.worker_result_tx = None;
@@ -328,25 +453,71 @@ impl FilesState {
     }
 
     fn apply_worker_result(&mut self, result: FilesWorkerResult) -> bool {
-        if self.pending_request_id != Some(result.request_id) {
-            return false;
-        }
-        self.pending_request_id = None;
-        self.loading = false;
-        self.path = result.path;
-        match result.result {
-            Ok(listing) => {
-                self.node_id = listing.node_id;
-                self.entries = listing.entries;
-                self.error = None;
+        match result {
+            FilesWorkerResult::List {
+                request_id,
+                path,
+                result,
+            } => {
+                if self.pending_request_id != Some(request_id) {
+                    return false;
+                }
+                self.pending_request_id = None;
+                self.loading = false;
+                self.path = path;
+                match result {
+                    Ok(listing) => {
+                        self.node_id = listing.node_id;
+                        self.entries = listing.entries;
+                        self.error = None;
+                        if let Some(select_path) = self.pending_select_path.take()
+                            && let Some(index) = self
+                                .entries
+                                .iter()
+                                .position(|entry| entry.path == select_path)
+                        {
+                            self.selected = Some(index);
+                            self.request_selected_details();
+                        }
+                    }
+                    Err(error) => {
+                        self.entries.clear();
+                        self.error = Some(error);
+                    }
+                }
+                self.list_revision = self.list_revision.wrapping_add(1);
+                true
             }
-            Err(error) => {
-                self.entries.clear();
-                self.error = Some(error);
+            FilesWorkerResult::Details {
+                request_id,
+                path,
+                result,
+            } => {
+                if self.pending_details_request_id != Some(request_id) {
+                    return false;
+                }
+                self.pending_details_request_id = None;
+                self.details_loading = false;
+                let selected_path = self.selected_entry().map(|entry| entry.path.as_str());
+                if selected_path != Some(path.as_str()) {
+                    return false;
+                }
+                match result {
+                    Ok(details) => {
+                        self.selected_details = Some(details);
+                        self.details_error = None;
+                    }
+                    Err(error) => {
+                        self.selected_details = None;
+                        self.details_error = Some(error);
+                    }
+                }
+                true
+            }
+            FilesWorkerResult::Operation { request_id, result } => {
+                self.apply_operation_result(request_id, result)
             }
         }
-        self.list_revision = self.list_revision.wrapping_add(1);
-        true
     }
 
     fn navigate(&mut self, path: String) {
@@ -370,8 +541,47 @@ impl FilesState {
         }
     }
 
+    fn clear_selected_details(&mut self) {
+        self.selected_details = None;
+        self.details_loading = false;
+        self.details_error = None;
+        self.pending_details_request_id = None;
+    }
+
     fn selected_entry(&self) -> Option<&SifsEntry> {
         self.selected.and_then(|i| self.entries.get(i))
+    }
+
+    fn request_selected_details(&mut self) {
+        let Some(path) = self.selected_entry().map(|entry| entry.path.clone()) else {
+            self.clear_selected_details();
+            return;
+        };
+        self.selected_details = None;
+        self.details_error = None;
+        if let Some(tx) = self.worker_tx.clone() {
+            let request_id = self.next_request_id;
+            self.next_request_id = self.next_request_id.wrapping_add(1);
+            self.pending_details_request_id = Some(request_id);
+            self.details_loading = true;
+            if tx
+                .send(FilesWorkerCommand::Details { request_id, path })
+                .is_err()
+            {
+                self.pending_details_request_id = None;
+                self.details_loading = false;
+                self.details_error = Some("SIFS browser worker stopped".to_string());
+            }
+            return;
+        }
+
+        self.pending_details_request_id = None;
+        self.details_loading = false;
+        match self.browser.as_ref().map(|browser| browser.stat(&path)) {
+            Some(Ok(details)) => self.selected_details = Some(details),
+            Some(Err(error)) => self.details_error = Some(error),
+            None => {}
+        }
     }
 
     fn select_entry(&mut self, index: usize) -> bool {
@@ -380,7 +590,247 @@ impl FilesState {
         }
         let changed = self.selected != Some(index);
         self.selected = Some(index);
+        if changed || self.selected_details.is_none() {
+            self.request_selected_details();
+        }
         changed
+    }
+
+    fn open_action_prompt(&mut self, kind: FileActionPromptKind) {
+        let selected = self.selected_entry().cloned();
+        let (target_path, target_name, target_is_dir) = match selected {
+            Some(entry) => (Some(entry.path), entry.name, entry.is_dir),
+            None => (None, String::new(), false),
+        };
+        let input = match kind {
+            FileActionPromptKind::NewFile => "untitled.txt".to_string(),
+            FileActionPromptKind::NewFolder => "New folder".to_string(),
+            FileActionPromptKind::Rename => target_name.clone(),
+            FileActionPromptKind::Delete => String::new(),
+        };
+        let error = match kind {
+            FileActionPromptKind::Rename | FileActionPromptKind::Delete
+                if target_path.is_none() =>
+            {
+                Some("select an item first".to_string())
+            }
+            _ => None,
+        };
+        self.action_prompt = Some(FileActionPrompt {
+            kind,
+            input,
+            target_name,
+            target_path,
+            target_is_dir,
+            error,
+        });
+    }
+
+    fn close_action_prompt(&mut self) {
+        self.action_prompt = None;
+    }
+
+    fn set_action_prompt_input(&mut self, input: String) {
+        if let Some(prompt) = &mut self.action_prompt {
+            prompt.input = input;
+            prompt.error = None;
+        }
+    }
+
+    fn submit_action_prompt(&mut self, waker: Option<sui::UiHandle>) {
+        let Some(prompt) = self.action_prompt.clone() else {
+            return;
+        };
+        match self.operation_from_prompt(&prompt) {
+            Ok((operation, title, detail)) => {
+                self.action_prompt = None;
+                self.start_operation(operation, title, detail, waker);
+            }
+            Err(error) => {
+                if let Some(current) = &mut self.action_prompt {
+                    current.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn operation_from_prompt(
+        &self,
+        prompt: &FileActionPrompt,
+    ) -> Result<(FilesOperation, String, String), String> {
+        match prompt.kind {
+            FileActionPromptKind::NewFile => {
+                let path = join_sifs_child(&self.path, &prompt.input)?;
+                Ok((
+                    FilesOperation {
+                        kind: FilesOperationKind::CreateFile,
+                        path: path.clone(),
+                        target: None,
+                        directory: false,
+                    },
+                    "Create file".to_string(),
+                    path,
+                ))
+            }
+            FileActionPromptKind::NewFolder => {
+                let path = join_sifs_child(&self.path, &prompt.input)?;
+                Ok((
+                    FilesOperation {
+                        kind: FilesOperationKind::CreateFolder,
+                        path: path.clone(),
+                        target: None,
+                        directory: true,
+                    },
+                    "Create folder".to_string(),
+                    path,
+                ))
+            }
+            FileActionPromptKind::Rename => {
+                let from = prompt
+                    .target_path
+                    .clone()
+                    .ok_or_else(|| "select an item first".to_string())?;
+                let to = join_sifs_child(&self.path, &prompt.input)?;
+                if from == to {
+                    return Err("new name matches the current name".to_string());
+                }
+                Ok((
+                    FilesOperation {
+                        kind: FilesOperationKind::Rename,
+                        path: from.clone(),
+                        target: Some(to.clone()),
+                        directory: prompt.target_is_dir,
+                    },
+                    "Rename".to_string(),
+                    format!("{from} -> {to}"),
+                ))
+            }
+            FileActionPromptKind::Delete => {
+                let path = prompt
+                    .target_path
+                    .clone()
+                    .ok_or_else(|| "select an item first".to_string())?;
+                if prompt.input.trim() != "DELETE" {
+                    return Err(format!("type DELETE to remove {}", prompt.target_name));
+                }
+                Ok((
+                    FilesOperation {
+                        kind: FilesOperationKind::Delete,
+                        path: path.clone(),
+                        target: None,
+                        directory: prompt.target_is_dir,
+                    },
+                    "Delete".to_string(),
+                    path,
+                ))
+            }
+        }
+    }
+
+    fn start_operation(
+        &mut self,
+        operation: FilesOperation,
+        title: String,
+        detail: String,
+        waker: Option<sui::UiHandle>,
+    ) {
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.tasks.insert(
+            0,
+            FilesTask {
+                id: request_id,
+                title,
+                detail,
+                state: FilesTaskState::Running,
+            },
+        );
+        self.trim_tasks();
+
+        if let Some(tx) = self.worker_tx.clone() {
+            if tx
+                .send(FilesWorkerCommand::Operation {
+                    request_id,
+                    operation,
+                })
+                .is_err()
+            {
+                self.finish_task(
+                    request_id,
+                    FilesTaskState::Failed,
+                    "worker stopped".to_string(),
+                );
+            }
+            return;
+        }
+
+        let result = self
+            .browser
+            .as_ref()
+            .ok_or_else(|| "SIFS browser is not open".to_string())
+            .and_then(|browser| execute_files_operation(browser, operation, &self.path));
+        self.apply_operation_result(request_id, result);
+    }
+
+    fn cancel_task(&mut self, task_id: u64) {
+        if let Some(task) = self
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id && task.state == FilesTaskState::Running)
+        {
+            task.state = FilesTaskState::CancelRequested;
+            task.detail = "cancel requested; waiting for DFS call to return".to_string();
+        }
+    }
+
+    fn finish_task(&mut self, task_id: u64, state: FilesTaskState, detail: String) {
+        if let Some(task) = self.tasks.iter_mut().find(|task| task.id == task_id) {
+            task.state = state;
+            task.detail = detail;
+        }
+        self.trim_tasks();
+    }
+
+    fn trim_tasks(&mut self) {
+        const MAX_TASKS: usize = 6;
+        if self.tasks.len() > MAX_TASKS {
+            self.tasks.truncate(MAX_TASKS);
+        }
+    }
+
+    fn apply_operation_result(
+        &mut self,
+        request_id: u64,
+        result: Result<FilesOperationOutcome, String>,
+    ) -> bool {
+        let cancel_requested = self
+            .tasks
+            .iter()
+            .find(|task| task.id == request_id)
+            .is_some_and(|task| task.state == FilesTaskState::CancelRequested);
+        match result {
+            Ok(outcome) => {
+                let detail = if cancel_requested {
+                    format!(
+                        "completed before cancellation could stop it: {}",
+                        outcome.message
+                    )
+                } else {
+                    outcome.message.clone()
+                };
+                self.finish_task(request_id, FilesTaskState::Completed, detail);
+                self.path = outcome.refresh_path;
+                self.pending_select_path = outcome.select_path;
+                self.refresh(None);
+            }
+            Err(error) => {
+                self.finish_task(request_id, FilesTaskState::Failed, error);
+            }
+        }
+        true
     }
 
     /// Click a listing row: navigate into a directory, otherwise select the file. Returns whether
@@ -417,14 +867,36 @@ struct FilesListing {
     entries: Vec<SifsEntry>,
 }
 
-struct FilesWorkerResult {
-    request_id: u64,
-    path: String,
-    result: Result<FilesListing, String>,
+enum FilesWorkerResult {
+    List {
+        request_id: u64,
+        path: String,
+        result: Result<FilesListing, String>,
+    },
+    Details {
+        request_id: u64,
+        path: String,
+        result: Result<SifsObjectDetails, String>,
+    },
+    Operation {
+        request_id: u64,
+        result: Result<FilesOperationOutcome, String>,
+    },
 }
 
 enum FilesWorkerCommand {
-    List { request_id: u64, path: String },
+    List {
+        request_id: u64,
+        path: String,
+    },
+    Details {
+        request_id: u64,
+        path: String,
+    },
+    Operation {
+        request_id: u64,
+        operation: FilesOperation,
+    },
 }
 
 fn files_worker_loop(
@@ -440,46 +912,131 @@ fn files_worker_loop(
         .is_none()
         .then(|| "SIFS browsing requires a daemon connection".to_string());
     while let Ok(command) = command_rx.recv() {
-        let FilesWorkerCommand::List { request_id, path } = command;
-        let requested_path = normalize_path(&path);
-        let (path, result) = if let Some(error) = &open_error {
-            (requested_path, Err(error.clone()))
-        } else {
-            if browser.is_none() {
-                match daemon_address.as_deref() {
-                    Some(address) => {
-                        match SifsBrowser::open_daemon_on_runtime(address, &app_runtime) {
-                            Ok(opened) => browser = Some(opened),
-                            Err(error) => open_error = Some(error),
+        match command {
+            FilesWorkerCommand::List { request_id, path } => {
+                let requested_path = normalize_path(&path);
+                let (path, result) = if let Some(error) = &open_error {
+                    (requested_path, Err(error.clone()))
+                } else {
+                    if browser.is_none() {
+                        match daemon_address.as_deref() {
+                            Some(address) => {
+                                match SifsBrowser::open_daemon_on_runtime(address, &app_runtime) {
+                                    Ok(opened) => browser = Some(opened),
+                                    Err(error) => open_error = Some(error),
+                                }
+                            }
+                            None => {
+                                let _ = &data_dir;
+                                open_error =
+                                    Some("SIFS browsing requires a daemon connection".to_string());
+                            }
                         }
                     }
-                    None => {
-                        let _ = &data_dir;
-                        open_error = Some("SIFS browsing requires a daemon connection".to_string());
+                    match (&browser, &open_error) {
+                        (Some(browser), _) => {
+                            let path = browser.normalize(&requested_path);
+                            let result = browser.list_shallow(&path).map(|entries| FilesListing {
+                                node_id: browser.node_id().to_string(),
+                                entries,
+                            });
+                            (path, result)
+                        }
+                        (None, Some(error)) => (requested_path, Err(error.clone())),
+                        (None, None) => (
+                            requested_path,
+                            Err("SIFS browser did not start".to_string()),
+                        ),
                     }
-                }
+                };
+                let _ = result_tx.send(FilesWorkerResult::List {
+                    request_id,
+                    path,
+                    result,
+                });
             }
-            match (&browser, &open_error) {
-                (Some(browser), _) => {
-                    let path = browser.normalize(&requested_path);
-                    let result = browser.list_shallow(&path).map(|entries| FilesListing {
-                        node_id: browser.node_id().to_string(),
-                        entries,
-                    });
-                    (path, result)
-                }
-                (None, Some(error)) => (requested_path, Err(error.clone())),
-                (None, None) => (
-                    requested_path,
-                    Err("SIFS browser did not start".to_string()),
-                ),
+            FilesWorkerCommand::Details { request_id, path } => {
+                let requested_path = normalize_path(&path);
+                let (path, result) = if let Some(error) = &open_error {
+                    (requested_path, Err(error.clone()))
+                } else {
+                    if browser.is_none() {
+                        match daemon_address.as_deref() {
+                            Some(address) => {
+                                match SifsBrowser::open_daemon_on_runtime(address, &app_runtime) {
+                                    Ok(opened) => browser = Some(opened),
+                                    Err(error) => open_error = Some(error),
+                                }
+                            }
+                            None => {
+                                let _ = &data_dir;
+                                open_error =
+                                    Some("SIFS browsing requires a daemon connection".to_string());
+                            }
+                        }
+                    }
+                    match (&browser, &open_error) {
+                        (Some(browser), _) => {
+                            let path = browser.normalize(&requested_path);
+                            let result = browser.stat(&path);
+                            (path, result)
+                        }
+                        (None, Some(error)) => (requested_path, Err(error.clone())),
+                        (None, None) => (
+                            requested_path,
+                            Err("SIFS browser did not start".to_string()),
+                        ),
+                    }
+                };
+                let _ = result_tx.send(FilesWorkerResult::Details {
+                    request_id,
+                    path,
+                    result,
+                });
             }
-        };
-        let _ = result_tx.send(FilesWorkerResult {
-            request_id,
-            path,
-            result,
-        });
+            FilesWorkerCommand::Operation {
+                request_id,
+                operation,
+            } => {
+                let current_path = normalize_path(&operation.path)
+                    .rsplit_once('/')
+                    .map(|(parent, _)| {
+                        if parent.is_empty() {
+                            "/".to_string()
+                        } else {
+                            parent.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "/".to_string());
+                let result = if let Some(error) = &open_error {
+                    Err(error.clone())
+                } else {
+                    if browser.is_none() {
+                        match daemon_address.as_deref() {
+                            Some(address) => {
+                                match SifsBrowser::open_daemon_on_runtime(address, &app_runtime) {
+                                    Ok(opened) => browser = Some(opened),
+                                    Err(error) => open_error = Some(error),
+                                }
+                            }
+                            None => {
+                                let _ = &data_dir;
+                                open_error =
+                                    Some("SIFS browsing requires a daemon connection".to_string());
+                            }
+                        }
+                    }
+                    match (&browser, &open_error) {
+                        (Some(browser), _) => {
+                            execute_files_operation(browser, operation, &current_path)
+                        }
+                        (None, Some(error)) => Err(error.clone()),
+                        (None, None) => Err("SIFS browser did not start".to_string()),
+                    }
+                };
+                let _ = result_tx.send(FilesWorkerResult::Operation { request_id, result });
+            }
+        }
         waker.wake();
     }
 }
@@ -514,6 +1071,75 @@ fn parent_path(path: &str) -> Option<String> {
     } else {
         parent.to_string()
     })
+}
+
+fn validate_child_name(name: &str) -> Result<&str, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("name cannot be empty".to_string());
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Err("name must be a child item".to_string());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.bytes().any(|byte| byte == 0) {
+        return Err("name cannot contain path separators".to_string());
+    }
+    Ok(trimmed)
+}
+
+fn join_sifs_child(parent: &str, name: &str) -> Result<String, String> {
+    let name = validate_child_name(name)?;
+    let parent = normalize_path(parent);
+    Ok(if parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{parent}/{name}")
+    })
+}
+
+fn execute_files_operation(
+    browser: &SifsBrowser,
+    operation: FilesOperation,
+    current_path: &str,
+) -> Result<FilesOperationOutcome, String> {
+    match operation.kind {
+        FilesOperationKind::CreateFile => {
+            browser.create_file(&operation.path)?;
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: Some(operation.path.clone()),
+                message: format!("created {}", operation.path),
+            })
+        }
+        FilesOperationKind::CreateFolder => {
+            browser.create_dir(&operation.path)?;
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: Some(operation.path.clone()),
+                message: format!("created {}", operation.path),
+            })
+        }
+        FilesOperationKind::Rename => {
+            let target = operation
+                .target
+                .clone()
+                .ok_or_else(|| "rename target is missing".to_string())?;
+            browser.rename(&operation.path, &target)?;
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: Some(target.clone()),
+                message: format!("renamed {} to {target}", operation.path),
+            })
+        }
+        FilesOperationKind::Delete => {
+            browser.delete(&operation.path, operation.directory)?;
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: None,
+                message: format!("deleted {}", operation.path),
+            })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -670,6 +1296,39 @@ fn entry_icon(entry: &SifsEntry) -> IconGlyph {
         IconGlyph::Link
     } else {
         IconGlyph::File
+    }
+}
+
+fn details_size(entry: &SifsEntry, details: Option<&SifsObjectDetails>) -> String {
+    human_size(
+        details
+            .and_then(|details| details.size_bytes)
+            .or(entry.size),
+    )
+}
+
+fn details_locations(details: &SifsObjectDetails) -> String {
+    if details.current_locations.is_empty() {
+        "none recorded".to_string()
+    } else {
+        details
+            .current_locations
+            .iter()
+            .map(|node| short(node, 20))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn unix_nanos_label(nanos: u64) -> String {
+    if nanos == 0 {
+        return "not recorded".to_string();
+    }
+    match time::OffsetDateTime::from_unix_timestamp_nanos(nanos as i128) {
+        Ok(timestamp) => timestamp
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| format!("{nanos} ns since epoch")),
+        Err(_) => format!("{nanos} ns since epoch"),
     }
 }
 
@@ -978,12 +1637,80 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             })
     };
 
+    let new_file = {
+        let s = shared.clone();
+        sui::Button::new("New file")
+            .icon(IconGlyph::File)
+            .min_width(96.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.files().loading
+            })
+            .on_press(move || {
+                s.files_mut()
+                    .open_action_prompt(FileActionPromptKind::NewFile);
+            })
+    };
+
+    let new_folder = {
+        let s = shared.clone();
+        sui::Button::new("New folder")
+            .icon(IconGlyph::Folder)
+            .min_width(112.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.files().loading
+            })
+            .on_press(move || {
+                s.files_mut()
+                    .open_action_prompt(FileActionPromptKind::NewFolder);
+            })
+    };
+
+    let rename = {
+        let s = shared.clone();
+        sui::Button::new("Rename")
+            .icon(IconGlyph::MoreHorizontal)
+            .min_width(88.0)
+            .theme_when(secondary_button_theme(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.files().loading && s.files().selected_entry().is_some()
+            })
+            .on_press(move || {
+                s.files_mut()
+                    .open_action_prompt(FileActionPromptKind::Rename);
+            })
+    };
+
+    let delete = {
+        let s = shared.clone();
+        sui::Button::new("Delete")
+            .icon(IconGlyph::Trash)
+            .min_width(82.0)
+            .theme_when(secondary_button_theme(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.files().loading && s.files().selected_entry().is_some()
+            })
+            .on_press(move || {
+                s.files_mut()
+                    .open_action_prompt(FileActionPromptKind::Delete);
+            })
+    };
+
     Stack::horizontal()
         .spacing(8.0)
         .alignment(Alignment::Center)
         .with_child(up)
         .with_child(breadcrumb)
         .with_child(refresh)
+        .with_child(new_file)
+        .with_child(new_folder)
+        .with_child(rename)
+        .with_child(delete)
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,8 +1890,18 @@ impl InspectorView {
         }
         match files.selected_entry() {
             Some(entry) => format!(
-                "{}|{}|{}|{}",
-                entry.path, entry.is_dir, entry.is_link, files.clustered
+                "{}|{}|{}|{}|{}|{}|{}",
+                entry.path,
+                entry.is_dir,
+                entry.is_link,
+                files.clustered,
+                files.details_loading,
+                files.details_error.as_deref().unwrap_or(""),
+                files
+                    .selected_details
+                    .as_ref()
+                    .map(|details| details.version.as_str())
+                    .unwrap_or("")
             ),
             None => format!("unselected|{}|{}", files.path, files.entries.len()),
         }
@@ -1177,6 +1914,9 @@ const INSPECTOR_DETAIL_BUTTON_W: f32 = 104.0;
 const INSPECTOR_DETAIL_BUTTON_H: f32 = 24.0;
 const INSPECTOR_OPEN_BUTTON_W: f32 = 128.0;
 const INSPECTOR_OPEN_BUTTON_H: f32 = 28.0;
+const INSPECTOR_TASK_PANEL_H: f32 = 128.0;
+const INSPECTOR_TASK_ROW_H: f32 = 28.0;
+const INSPECTOR_TASK_CANCEL_W: f32 = 58.0;
 
 fn sifs_loading_rows(path: &str, details_open: bool) -> Vec<(&'static str, String)> {
     let mut rows = vec![("Status", "Connecting to SIFS".to_string())];
@@ -1234,12 +1974,65 @@ fn inspector_open_folder_button_widget_id(parent: sui::WidgetId) -> sui::WidgetI
     sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(7_497))
 }
 
+fn inspector_task_panel_rect(bounds: Rect) -> Rect {
+    let content_x = bounds.x() + INSPECTOR_PAD;
+    let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
+    Rect::new(
+        content_x,
+        bounds.max_y() - INSPECTOR_PAD - INSPECTOR_TASK_PANEL_H,
+        content_w,
+        INSPECTOR_TASK_PANEL_H,
+    )
+}
+
+fn inspector_task_cancel_rect(bounds: Rect, row_index: usize) -> Rect {
+    let panel = inspector_task_panel_rect(bounds);
+    Rect::new(
+        panel.max_x() - INSPECTOR_TASK_CANCEL_W - 10.0,
+        panel.y() + 34.0 + row_index as f32 * INSPECTOR_TASK_ROW_H + 3.0,
+        INSPECTOR_TASK_CANCEL_W,
+        22.0,
+    )
+}
+
+fn inspector_task_cancel_widget_id(parent: sui::WidgetId, task_id: u64) -> sui::WidgetId {
+    sui::WidgetId::new(
+        parent
+            .get()
+            .wrapping_mul(43)
+            .wrapping_add(9_101)
+            .wrapping_add(task_id),
+    )
+}
+
 impl Widget for InspectorView {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
         if let Event::Pointer(pointer) = event
             && pointer.kind == PointerEventKind::Up
             && pointer.button == Some(PointerButton::Primary)
         {
+            let task_to_cancel = {
+                let files = self.shared.files();
+                files
+                    .tasks
+                    .iter()
+                    .take(3)
+                    .enumerate()
+                    .find(|(index, task)| {
+                        task.state.can_cancel()
+                            && inspector_task_cancel_rect(ctx.bounds(), *index)
+                                .contains(pointer.position)
+                    })
+                    .map(|(_, task)| task.id)
+            };
+            if let Some(task_id) = task_to_cancel {
+                self.shared.files_mut().cancel_task(task_id);
+                ctx.request_paint();
+                ctx.request_semantics();
+                ctx.set_handled();
+                return;
+            }
+
             let selected_dir_path = {
                 let files = self.shared.files();
                 files
@@ -1306,6 +2099,9 @@ impl Widget for InspectorView {
         let header = pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
         widgets::draw_text_in(ctx, Rect::new(x, y, w, 18.0), "INSPECTOR", header);
         y += 30.0;
+        if !files.tasks.is_empty() {
+            self.task_panel(ctx, &theme, &pal, bounds, &files.tasks);
+        }
 
         if files.loading {
             let details_open = files.inspector_details_open;
@@ -1365,23 +2161,29 @@ impl Widget for InspectorView {
             return;
         };
 
+        let details = files.selected_details.as_ref();
+
         // Name + kind.
         let name_style = pal.text_style(&theme, 16.0, FontWeight::SEMIBOLD, pal.text);
         let display_name = middle_short(&entry.name, 36);
         widgets::draw_text_in(ctx, Rect::new(x, y, w, 24.0), &display_name, name_style);
         y += 26.0;
-        let kind = if entry.is_dir {
-            "Directory"
-        } else if entry.is_link {
-            "Symlink"
-        } else {
-            "File"
-        };
+        let kind = details
+            .map(|details| details.kind.as_str())
+            .unwrap_or_else(|| {
+                if entry.is_dir {
+                    "directory"
+                } else if entry.is_link {
+                    "symlink"
+                } else {
+                    "file"
+                }
+            });
         let kind_style = pal.text_style(&theme, 12.5, FontWeight::NORMAL, pal.text_muted);
         widgets::draw_text_in(
             ctx,
             Rect::new(x, y, w, 20.0),
-            &format!("{kind} · {}", human_size(entry.size)),
+            &format!("{kind} · {}", details_size(entry, details)),
             kind_style,
         );
         y += 34.0;
@@ -1442,32 +2244,131 @@ impl Widget for InspectorView {
 
         let row_label = pal.text_style(&theme, 12.5, FontWeight::NORMAL, pal.text_muted);
         let row_val = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, pal.text);
+        let metadata_status = if files.details_loading {
+            "loading metadata".to_string()
+        } else if let Some(error) = &files.details_error {
+            format!("metadata unavailable: {error}")
+        } else if details.is_some() {
+            "metadata current".to_string()
+        } else {
+            "select item to load metadata".to_string()
+        };
         widgets::draw_text_in(
             ctx,
             Rect::new(x, y, 130.0, 20.0),
-            "Replication",
+            "Status",
             row_label.clone(),
         );
-        let repl = if files.clustered {
-            "cluster policy"
-        } else {
-            "1 (single node)"
-        };
         widgets::draw_text_in(
             ctx,
             Rect::new(x + 130.0, y, w - 130.0, 20.0),
-            repl,
+            &metadata_status,
             row_val.clone(),
         );
         y += 24.0;
-        widgets::draw_text_in(ctx, Rect::new(x, y, 130.0, 20.0), "Mode", row_label);
-        let mode = if files.clustered {
-            "replicated"
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x, y, 130.0, 20.0),
+            "Policy",
+            row_label.clone(),
+        );
+        let policy = details
+            .map(|details| details.policy.as_str())
+            .unwrap_or(if files.clustered {
+                "cluster policy"
+            } else {
+                "local-owned"
+            });
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x + 130.0, y, w - 130.0, 20.0),
+            policy,
+            row_val.clone(),
+        );
+        y += 24.0;
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x, y, 130.0, 20.0),
+            "Locations",
+            row_label.clone(),
+        );
+        let locations = details
+            .map(details_locations)
+            .unwrap_or_else(|| node_label.clone());
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x + 130.0, y, w - 130.0, 20.0),
+            &locations,
+            row_val.clone(),
+        );
+        y += 24.0;
+
+        if let Some(details) = details {
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x, y, 130.0, 20.0),
+                "Object",
+                row_label.clone(),
+            );
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x + 130.0, y, w - 130.0, 20.0),
+                &short(&details.object_id, 28),
+                row_val.clone(),
+            );
+            y += 24.0;
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x, y, 130.0, 20.0),
+                "Version",
+                row_label.clone(),
+            );
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x + 130.0, y, w - 130.0, 20.0),
+                &short(&details.version, 28),
+                row_val.clone(),
+            );
+            y += 24.0;
+            widgets::draw_text_in(ctx, Rect::new(x, y, 130.0, 20.0), "Mode", row_label.clone());
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x + 130.0, y, w - 130.0, 20.0),
+                &format!("{:o} · {} links", details.mode, details.link_count),
+                row_val.clone(),
+            );
+            y += 24.0;
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x, y, 130.0, 20.0),
+                "Modified",
+                row_label.clone(),
+            );
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x + 130.0, y, w - 130.0, 20.0),
+                &unix_nanos_label(details.modified_at_unix_nanos),
+                row_val.clone(),
+            );
+            y += 24.0;
+            if let Some(hash) = &details.content_hash {
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(x, y, 130.0, 20.0),
+                    "Content",
+                    row_label.clone(),
+                );
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(x + 130.0, y, w - 130.0, 20.0),
+                    &short(hash, 28),
+                    row_val.clone(),
+                );
+                y += 24.0;
+            }
         } else {
-            "local-owned"
-        };
-        widgets::draw_text_in(ctx, Rect::new(x + 130.0, y, w - 130.0, 20.0), mode, row_val);
-        y += 34.0;
+            y += 10.0;
+        }
 
         if !files.clustered {
             let note = pal.text_style(&theme, 11.5, FontWeight::NORMAL, pal.text_faint);
@@ -1487,13 +2388,32 @@ impl Widget for InspectorView {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let (selected_directory, details_open) = {
+        let (selected_directory, details_open, tasks) = {
             let files = self.shared.files();
             (
                 files.selected_entry().filter(|entry| entry.is_dir).cloned(),
                 (files.loading || files.error.is_some()).then_some(files.inspector_details_open),
+                files.tasks.clone(),
             )
         };
+
+        for (index, task) in tasks
+            .iter()
+            .take(3)
+            .enumerate()
+            .filter(|(_, task)| task.state.can_cancel())
+        {
+            let mut node = SemanticsNode::new(
+                inspector_task_cancel_widget_id(ctx.widget_id(), task.id),
+                SemanticsRole::Button,
+                inspector_task_cancel_rect(ctx.bounds(), index),
+            );
+            node.parent = Some(ctx.widget_id());
+            node.name = Some(format!("Cancel {}", task.title));
+            node.description = Some(task.detail.clone());
+            node.actions = vec![SemanticsAction::Activate];
+            ctx.push(node);
+        }
 
         if let Some(entry) = selected_directory {
             let mut node = SemanticsNode::new(
@@ -1646,6 +2566,68 @@ impl InspectorView {
             "Open folder",
             pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.on_accent),
         );
+    }
+
+    fn task_panel(
+        &self,
+        ctx: &mut PaintCtx,
+        theme: &sui::DefaultTheme,
+        pal: &Palette,
+        bounds: Rect,
+        tasks: &[FilesTask],
+    ) {
+        let panel = inspector_task_panel_rect(bounds);
+        widgets::round_panel(ctx, panel, pal.panel, pal.border, 8.0);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(
+                panel.x() + 12.0,
+                panel.y() + 10.0,
+                panel.width() - 24.0,
+                18.0,
+            ),
+            "TASKS",
+            pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint),
+        );
+
+        let title_style = pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.text);
+        let detail_style = pal.text_style(theme, 10.5, FontWeight::NORMAL, pal.text_faint);
+        for (index, task) in tasks.iter().take(3).enumerate() {
+            let y = panel.y() + 34.0 + index as f32 * INSPECTOR_TASK_ROW_H;
+            let cancel = inspector_task_cancel_rect(bounds, index);
+            let text_w = if task.state.can_cancel() {
+                cancel.x() - panel.x() - 20.0
+            } else {
+                panel.width() - 24.0
+            }
+            .max(0.0);
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(panel.x() + 12.0, y, text_w, 14.0),
+                &format!("{} · {}", task.title, task.state.label()),
+                title_style.clone(),
+            );
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(panel.x() + 12.0, y + 13.0, text_w, 13.0),
+                &middle_short(&task.detail, 42),
+                detail_style.clone(),
+            );
+            if task.state.can_cancel() {
+                widgets::round_panel(ctx, cancel, pal.field, pal.border, 7.0);
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(
+                        cancel.x() + 8.0,
+                        cancel.y() + 3.0,
+                        cancel.width() - 16.0,
+                        16.0,
+                    ),
+                    "Cancel",
+                    pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text),
+                );
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2041,6 +3023,201 @@ fn narrow_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState)
     )
 }
 
+fn files_action_dialog_signature(shared: &Shared) -> String {
+    let files = shared.files();
+    match &files.action_prompt {
+        Some(prompt) => format!(
+            "{:?}|{}|{}|{}",
+            prompt.kind,
+            prompt.input,
+            prompt.target_path.as_deref().unwrap_or(""),
+            prompt.error.as_deref().unwrap_or("")
+        ),
+        None => "closed".to_string(),
+    }
+}
+
+fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+    let prompt = shared.files().action_prompt.clone()?;
+    let title = prompt.kind.title();
+    let description = match prompt.kind {
+        FileActionPromptKind::NewFile => format!("Create a file in {}", shared.files().path),
+        FileActionPromptKind::NewFolder => format!("Create a folder in {}", shared.files().path),
+        FileActionPromptKind::Rename => prompt
+            .target_path
+            .as_deref()
+            .map(|path| format!("Rename {path}"))
+            .unwrap_or_else(|| "Select an item to rename".to_string()),
+        FileActionPromptKind::Delete => prompt
+            .target_path
+            .as_deref()
+            .map(|path| format!("Delete {path}"))
+            .unwrap_or_else(|| "Select an item to delete".to_string()),
+    };
+    let input_label = if prompt.kind == FileActionPromptKind::Delete {
+        "Type DELETE"
+    } else {
+        "Name"
+    };
+    let input = {
+        let s = shared.clone();
+        sui::TextInput::new(format!("files-action-input-{title}"))
+            .value(prompt.input.clone())
+            .placeholder(input_label)
+            .min_width(320.0)
+            .theme_when(clone_reader(reader))
+            .on_change(move |value| {
+                s.files_mut().set_action_prompt_input(value);
+            })
+    };
+    let dialog_theme = shared.theme();
+    let mut body = Stack::vertical()
+        .spacing(10.0)
+        .alignment(Alignment::Stretch)
+        .with_child(sui::Label::new(description).theme(dialog_theme.clone()))
+        .with_child(input);
+    if let Some(error) = prompt.error {
+        body = body.with_child(sui::Label::new(error).theme(dialog_theme.clone()));
+    }
+
+    let submit = {
+        let s = shared.clone();
+        move || {
+            let waker = { s.borrow().waker.clone() };
+            s.files_mut().submit_action_prompt(waker);
+        }
+    };
+    let cancel = {
+        let s = shared.clone();
+        move || {
+            s.files_mut().close_action_prompt();
+        }
+    };
+    let dismiss = {
+        let s = shared.clone();
+        move || {
+            s.files_mut().close_action_prompt();
+        }
+    };
+
+    Some(WidgetPod::new(
+        sui::Dialog::new(title, body)
+            .theme(dialog_theme)
+            .description(input_label)
+            .max_width(460.0)
+            .dismiss_on_scrim(true)
+            .on_dismiss(dismiss)
+            .primary_action(prompt.kind.primary_label(), submit)
+            .secondary_action("Cancel", cancel),
+    ))
+}
+
+struct FilesDialogHost {
+    shared: Shared,
+    reader: ThemeReader,
+    body: WidgetPod,
+    dialog: Option<WidgetPod>,
+    dialog_signature: String,
+}
+
+impl FilesDialogHost {
+    fn new<W>(body: W, shared: Shared, reader: ThemeReader) -> Self
+    where
+        W: Widget + 'static,
+    {
+        let mut host = Self {
+            shared,
+            reader,
+            body: WidgetPod::new(body),
+            dialog: None,
+            dialog_signature: String::new(),
+        };
+        host.sync_dialog();
+        host
+    }
+
+    fn sync_dialog(&mut self) {
+        let signature = files_action_dialog_signature(&self.shared);
+        if signature == self.dialog_signature {
+            return;
+        }
+        self.dialog_signature = signature;
+        self.dialog = files_action_dialog(&self.shared, &self.reader);
+    }
+}
+
+impl Widget for FilesDialogHost {
+    fn event(&mut self, ctx: &mut EventCtx, _event: &Event) {
+        let signature = files_action_dialog_signature(&self.shared);
+        if signature != self.dialog_signature {
+            ctx.request_measure();
+            ctx.request_paint();
+            ctx.request_semantics();
+        }
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.sync_dialog();
+        let size = constraints.clamp(Size::new(
+            if constraints.max.width.is_finite() {
+                constraints.max.width
+            } else {
+                920.0
+            },
+            if constraints.max.height.is_finite() {
+                constraints.max.height
+            } else {
+                640.0
+            },
+        ));
+        let tight = Constraints::tight(size);
+        self.body.measure(ctx, tight);
+        if let Some(dialog) = &mut self.dialog {
+            dialog.measure(ctx, tight);
+        }
+        size
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.body.arrange(ctx, bounds);
+        if let Some(dialog) = &mut self.dialog {
+            dialog.arrange(ctx, bounds);
+        }
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.body.paint(ctx);
+        if let Some(dialog) = &self.dialog {
+            dialog.paint(ctx);
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.body.semantics(ctx);
+        if let Some(dialog) = &self.dialog {
+            dialog.semantics(ctx);
+        }
+    }
+
+    fn stack_host_options(&self) -> Option<StackHostOptions> {
+        Some(StackHostOptions::default())
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.body);
+        if let Some(dialog) = &self.dialog {
+            visitor.visit(dialog);
+        }
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.body);
+        if let Some(dialog) = &mut self.dialog {
+            visitor.visit(dialog);
+        }
+    }
+}
+
 /// The files tab: a thin responsive host owning two pre-built pods (wide split / narrow list-only)
 /// and delegating to the one chosen by the available width. The choice is made in `measure`
 /// (constraints-driven) and cached so `arrange`/`paint`/event routing all stay in sync. Mirrors the
@@ -2140,7 +3317,11 @@ impl Widget for FilesView {
 
 /// Build the files tab content.
 pub fn view(shared: Shared) -> impl Widget {
-    FilesView::new(shared)
+    let reader: ThemeReader = {
+        let s = shared.clone();
+        Rc::new(move || s.theme())
+    };
+    FilesDialogHost::new(FilesView::new(shared.clone()), shared, reader)
 }
 
 #[cfg(test)]
@@ -2434,7 +3615,7 @@ mod tests {
         state.pending_request_id = Some(7);
         state.path = "/".to_string();
 
-        let changed = state.apply_worker_result(FilesWorkerResult {
+        let changed = state.apply_worker_result(FilesWorkerResult::List {
             request_id: 7,
             path: "/services".to_string(),
             result: Ok(FilesListing {
@@ -2472,7 +3653,7 @@ mod tests {
             size: Some(1),
         }];
 
-        let changed = state.apply_worker_result(FilesWorkerResult {
+        let changed = state.apply_worker_result(FilesWorkerResult::List {
             request_id: 9,
             path: "/".to_string(),
             result: Err("timed out".to_string()),
@@ -2483,6 +3664,57 @@ mod tests {
         assert_eq!(state.pending_request_id, None);
         assert_eq!(state.error.as_deref(), Some("timed out"));
         assert!(state.entries.is_empty());
+    }
+
+    #[test]
+    fn worker_result_updates_selected_sifs_details() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.entries = vec![SifsEntry {
+            name: "artifact.txt".to_string(),
+            path: "/services/artifact.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: None,
+        }];
+        state.selected = Some(0);
+        state.details_loading = true;
+        state.pending_details_request_id = Some(11);
+
+        let changed = state.apply_worker_result(FilesWorkerResult::Details {
+            request_id: 11,
+            path: "/services/artifact.txt".to_string(),
+            result: Ok(SifsObjectDetails {
+                file_system_id: "sifs".to_string(),
+                object_id: "obj_artifact".to_string(),
+                path: "/services/artifact.txt".to_string(),
+                kind: "file".to_string(),
+                version: "v2".to_string(),
+                content_hash: Some("blake3:abc".to_string()),
+                size_bytes: Some(5),
+                link_count: 1,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                accessed_at_unix_nanos: 0,
+                modified_at_unix_nanos: 0,
+                created_at_unix_nanos: 0,
+                changed_at_unix_nanos: 0,
+                policy: "replicated-eventual".to_string(),
+                current_locations: vec!["node-a".to_string(), "node-b".to_string()],
+            }),
+        });
+
+        assert!(changed);
+        assert!(!state.details_loading);
+        assert_eq!(state.pending_details_request_id, None);
+        assert_eq!(
+            state
+                .selected_details
+                .as_ref()
+                .map(|details| details.policy.as_str()),
+            Some("replicated-eventual")
+        );
     }
 
     #[test]
@@ -2559,6 +3791,8 @@ mod tests {
                 assert_eq!(request_id, 0);
                 assert_eq!(path, "/services");
             }
+            FilesWorkerCommand::Details { .. } => panic!("expected list command"),
+            FilesWorkerCommand::Operation { .. } => panic!("expected list command"),
         }
     }
 
