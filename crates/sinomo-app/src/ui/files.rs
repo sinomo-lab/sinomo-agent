@@ -60,6 +60,7 @@ const INSPECTOR_W: f32 = 340.0;
 const ROW_H: f32 = 34.0;
 const ROW_ACTION_SIDE: f32 = 24.0;
 const ROW_ACTION_GAP: f32 = 4.0;
+const ROW_ACTION_COUNT: f32 = 6.0;
 const CONTENT_PAD: f32 = 16.0;
 const HEADER_H: f32 = 46.0;
 const FILES_STATUS_H: f32 = 38.0;
@@ -4509,6 +4510,7 @@ enum SifsEntryRowHit {
     Row,
     Inspect,
     Copy,
+    Transfer,
     Move,
     Rename,
     Delete,
@@ -4563,6 +4565,7 @@ impl SifsEntryRow {
         for action in [
             SifsEntryRowHit::Inspect,
             SifsEntryRowHit::Copy,
+            SifsEntryRowHit::Transfer,
             SifsEntryRowHit::Move,
             SifsEntryRowHit::Rename,
             SifsEntryRowHit::Delete,
@@ -4581,6 +4584,7 @@ impl SifsEntryRow {
         let salt = match action {
             SifsEntryRowHit::Inspect => 8_317,
             SifsEntryRowHit::Copy => 8_329,
+            SifsEntryRowHit::Transfer => 8_333,
             SifsEntryRowHit::Move => 8_341,
             SifsEntryRowHit::Rename => 8_351,
             SifsEntryRowHit::Delete => 8_389,
@@ -4594,10 +4598,43 @@ fn row_action_slot(action: SifsEntryRowHit) -> Option<usize> {
     match action {
         SifsEntryRowHit::Inspect => Some(0),
         SifsEntryRowHit::Copy => Some(1),
-        SifsEntryRowHit::Move => Some(2),
-        SifsEntryRowHit::Rename => Some(3),
-        SifsEntryRowHit::Delete => Some(4),
+        SifsEntryRowHit::Transfer => Some(2),
+        SifsEntryRowHit::Move => Some(3),
+        SifsEntryRowHit::Rename => Some(4),
+        SifsEntryRowHit::Delete => Some(5),
         SifsEntryRowHit::Row => None,
+    }
+}
+
+fn row_actions_width() -> f32 {
+    ROW_ACTION_SIDE * ROW_ACTION_COUNT + ROW_ACTION_GAP * (ROW_ACTION_COUNT - 1.0) + 8.0
+}
+
+fn row_transfer_prompt_kind(source: FilesSourceKind) -> FileActionPromptKind {
+    match source {
+        FilesSourceKind::Sifs => FileActionPromptKind::CopyToLocal,
+        FilesSourceKind::Local => FileActionPromptKind::CopyToSifs,
+    }
+}
+
+fn row_transfer_glyph(source: FilesSourceKind) -> IconGlyph {
+    match source {
+        FilesSourceKind::Sifs => IconGlyph::Download,
+        FilesSourceKind::Local => IconGlyph::Storage,
+    }
+}
+
+fn row_transfer_label(source: FilesSourceKind, name: &str) -> String {
+    match source {
+        FilesSourceKind::Sifs => format!("Download {name}"),
+        FilesSourceKind::Local => format!("Copy to SIFS {name}"),
+    }
+}
+
+fn row_transfer_description(source: FilesSourceKind, path: &str) -> String {
+    match source {
+        FilesSourceKind::Sifs => format!("Download SIFS {path} to a local path"),
+        FilesSourceKind::Local => format!("Copy local {path} into SIFS"),
     }
 }
 
@@ -4645,6 +4682,13 @@ impl Widget for SifsEntryRow {
                             let mut files = self.shared.files_mut();
                             files.select_entry(self.index);
                             files.open_action_prompt(FileActionPromptKind::Copy);
+                            request_files_overlay_rebuild(ctx);
+                        }
+                        SifsEntryRowHit::Transfer => {
+                            let mut files = self.shared.files_mut();
+                            files.select_entry(self.index);
+                            let prompt_kind = row_transfer_prompt_kind(files.source);
+                            files.open_action_prompt(prompt_kind);
                             request_files_overlay_rebuild(ctx);
                         }
                         SifsEntryRowHit::Move => {
@@ -4727,6 +4771,7 @@ impl Widget for SifsEntryRow {
         let label_color = if active { pal.text } else { pal.text_muted };
         let title_style = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, label_color);
         let meta_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
+        let source = self.shared.files().source;
 
         let leading = Rect::new(bounds.x() + 2.0, bounds.y(), 20.0, bounds.height());
         let icon_side = 15.0;
@@ -4750,6 +4795,11 @@ impl Widget for SifsEntryRow {
                 if active { pal.accent } else { pal.text_muted },
             ),
             (SifsEntryRowHit::Copy, IconGlyph::Restore, pal.text_muted),
+            (
+                SifsEntryRowHit::Transfer,
+                row_transfer_glyph(source),
+                pal.accent,
+            ),
             (
                 SifsEntryRowHit::Move,
                 IconGlyph::ChevronRight,
@@ -4779,7 +4829,7 @@ impl Widget for SifsEntryRow {
             }
         }
 
-        let actions_w = ROW_ACTION_SIDE * 5.0 + ROW_ACTION_GAP * 4.0 + 8.0;
+        let actions_w = row_actions_width();
         let meta_w = 74.0_f32.min(bounds.width() * 0.36).max(0.0);
         let meta_rect = Rect::new(
             (bounds.max_x() - actions_w - meta_w).max(bounds.x()),
@@ -4834,6 +4884,11 @@ impl Widget for SifsEntryRow {
                     self.entry.path,
                     source.operation_scope()
                 ),
+            ),
+            (
+                SifsEntryRowHit::Transfer,
+                row_transfer_label(source, &self.entry.name),
+                row_transfer_description(source, &self.entry.path),
             ),
             (
                 SifsEntryRowHit::Move,
@@ -5878,7 +5933,7 @@ impl Widget for FilesListHeader {
         let x = bounds.x() + CONTENT_PAD;
         let y = bounds.y() + 8.0;
         let content_w = (bounds.width() - CONTENT_PAD * 2.0).max(0.0);
-        let action_w = ROW_ACTION_SIDE * 5.0 + ROW_ACTION_GAP * 4.0 + 8.0;
+        let action_w = row_actions_width();
         let meta_w = 88.0_f32.min(content_w * 0.28).max(0.0);
         let action_x = bounds.max_x() - CONTENT_PAD - action_w;
         let meta_x = (action_x - meta_w).max(x + 120.0);
@@ -6963,7 +7018,7 @@ impl InspectorAction {
             Self::OpenFolder => IconGlyph::Folder,
             Self::Copy => IconGlyph::Restore,
             Self::CopyToSifs => IconGlyph::Storage,
-            Self::CopyToLocal => IconGlyph::Restore,
+            Self::CopyToLocal => IconGlyph::Download,
             Self::Move => IconGlyph::ChevronRight,
             Self::Rename => IconGlyph::MoreHorizontal,
             Self::Delete => IconGlyph::Trash,
@@ -12045,7 +12100,7 @@ mod tests {
     }
 
     #[test]
-    fn row_action_buttons_open_copy_move_rename_and_delete_prompts() -> sui::Result<()> {
+    fn row_action_buttons_open_copy_transfer_move_rename_and_delete_prompts() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -12086,6 +12141,25 @@ mod tests {
             assert_eq!(prompt.kind, FileActionPromptKind::Copy);
             assert_eq!(prompt.target_path.as_deref(), Some("/artifact.txt"));
             assert_eq!(prompt.input, "artifact copy.txt");
+            assert_eq!(files.selected, Some(0));
+        }
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel")
+            .click()?;
+        assert!(shared.files().action_prompt.is_none());
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Download artifact.txt")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("download prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::CopyToLocal);
+            assert_eq!(prompt.target_path.as_deref(), Some("/artifact.txt"));
+            assert!(prompt.input.ends_with("artifact.txt"));
             assert_eq!(files.selected, Some(0));
         }
 
@@ -12146,6 +12220,66 @@ mod tests {
             assert_eq!(files.selected, Some(0));
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn local_row_action_exposes_copy_to_sifs_prompt() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let root = files_test_temp_dir("row-copy-to-sifs");
+        let artifact = root.join("artifact.txt");
+        fs::write(&artifact, b"hello").expect("write local artifact");
+        let root_label = display_local_path(root.to_string_lossy().into_owned());
+        let artifact_label = display_local_path(artifact.to_string_lossy().into_owned());
+        {
+            let mut files = shared.files_mut();
+            files.source = FilesSourceKind::Local;
+            files.loaded = true;
+            files.loading = false;
+            files.path = root_label.clone();
+            files.local_path = root_label;
+            files.sifs_path = "/services".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: artifact_label.clone(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.selected = None;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files local row transfer")
+                    .root(
+                        SizedBox::new()
+                            .width(520.0)
+                            .height(720.0)
+                            .with_child(view(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Copy to SIFS artifact.txt")
+            .click()?;
+
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("copy to SIFS prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::CopyToSifs);
+            assert_eq!(prompt.target_path.as_deref(), Some(artifact_label.as_str()));
+            assert_eq!(prompt.input, "/services/artifact.txt");
+            assert_eq!(files.selected, Some(0));
+        }
+
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 

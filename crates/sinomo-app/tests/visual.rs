@@ -515,7 +515,7 @@ fn open_chat_provider_select(window: &sui_testing::TestWindow) -> sui::Rect {
 }
 
 /// Deterministic captures for the rebuilt (composed) Files tab: the root listing + empty inspector
-/// in dark and light, a selected-entry state with the inspector populated, and a narrow width where
+/// in dark and light, a selected-entry state with the inspector populated, and narrow widths where
 /// the inspector collapses away. Drives selection via the public `FilesState::selected` field and a
 /// pointer click for navigation, so the captures stay stable as the composed layout evolves.
 #[test]
@@ -663,6 +663,23 @@ fn capture_files_composed() {
             .expect("resize narrow");
         app.run_until_idle().expect("settle narrow layout");
         capture("files-composed-narrow", &window);
+    }
+
+    // Narrow selected: row actions must stay reachable when the inspector is hidden.
+    {
+        let shared = boot(Tab::Files);
+        seed_selected_file(&shared);
+        let runtime = build_runtime(shared).expect("build runtime");
+        let app = TestApp::from_runtime(runtime).expect("headless test app");
+        let window = app.main_window().expect("main window");
+        app.run_until_idle()
+            .expect("settle initial selected layout");
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(520.0, 720.0))))
+            .expect("resize narrow selected");
+        app.run_until_idle().expect("settle narrow selected layout");
+        capture("files-composed-narrow-selected", &window);
     }
 }
 
