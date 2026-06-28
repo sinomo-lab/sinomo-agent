@@ -2685,6 +2685,52 @@ fn composer_control_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 
     }
 }
 
+fn secondary_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || {
+        let mut theme = reader();
+        theme.palette.accent = theme.palette.control;
+        theme.palette.accent_hover = theme.palette.control_hover;
+        theme.palette.accent_pressed = theme.palette.control_active;
+        theme.palette.accent_border = theme.palette.border;
+        theme.palette.accent_border_hover = theme.palette.border_hover;
+        theme.palette.accent_border_focus = theme.palette.border_focus;
+        theme.palette.accent_text = theme.palette.text;
+        theme
+    }
+}
+
+fn danger_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || {
+        let mut theme = reader();
+        let danger = theme.palette.danger;
+        let contrast = theme.palette.danger_text;
+        let border = theme.palette.border;
+        theme.palette.accent = danger;
+        theme.palette.accent_hover = mix_color(danger, contrast, 0.08);
+        theme.palette.accent_pressed = mix_color(danger, contrast, 0.16);
+        theme.palette.accent_border = mix_color(danger, border, 0.12);
+        theme.palette.accent_border_hover = mix_color(danger, border, 0.20);
+        theme.palette.accent_border_focus = danger;
+        theme.palette.accent_text = contrast;
+        theme.palette.focus_ring = danger.with_alpha(theme.palette.focus_ring.alpha);
+        theme
+    }
+}
+
+fn mix_color(base: Color, toward: Color, amount: f32) -> Color {
+    let amount = amount.clamp(0.0, 1.0);
+    Color::new(
+        base.space,
+        base.red + (toward.red - base.red) * amount,
+        base.green + (toward.green - base.green) * amount,
+        base.blue + (toward.blue - base.blue) * amount,
+        base.alpha + (toward.alpha - base.alpha) * amount,
+    )
+    .clamped()
+}
+
 /// Resolve the app chrome palette for the current theme (used by the `Label` color readers and the
 /// bespoke painters so muted/accent text matches the chrome).
 fn palette(shared: &Shared) -> Palette {
@@ -3078,6 +3124,19 @@ fn heading(shared: &Shared, text: &str) -> Label {
 fn muted_label(shared: &Shared, text: impl Into<String>) -> Label {
     let s = shared.clone();
     Label::new(text).color_when(move || palette(&s).text_muted)
+}
+
+fn dialog_section_label(shared: &Shared, text: impl Into<String>) -> Label {
+    let s = shared.clone();
+    let theme = shared.theme();
+    Label::new(text)
+        .style(sui::TextStyle {
+            font_size: 12.0,
+            line_height: 18.0,
+            weight: FontWeight::SEMIBOLD,
+            ..theme.body_text_style()
+        })
+        .color_when(move || palette(&s).text_muted)
 }
 
 fn session_meta_label(session: &SessionRef) -> String {
@@ -3618,7 +3677,7 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         let s = shared.clone();
         sui::Button::new("Done")
             .icon(IconGlyph::Close)
-            .theme_when(clone_reader(reader))
+            .theme_when(secondary_button_theme(reader))
             .on_press_with_ctx(move |ctx| {
                 s.chat_mut().close_session_edit();
                 ctx.request_measure();
@@ -3629,13 +3688,15 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     let mut body = Stack::vertical()
         .spacing(10.0)
         .alignment(Alignment::Stretch)
+        .with_child(dialog_section_label(shared, "Name"))
         .with_child(SizedBox::new().height(32.0).with_child(input))
         .with_child(
-            Stack::horizontal()
-                .spacing(6.0)
-                .alignment(Alignment::Start)
-                .with_child(save)
-                .with_child(done),
+            Flex::horizontal()
+                .gap(6.0)
+                .align_items(Alignment::Center)
+                .spacer()
+                .with_child(done)
+                .with_child(save),
         );
 
     if is_channel {
@@ -3651,13 +3712,18 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     }
 
     body = body.with_child(Separator::horizontal().theme_when(clone_reader(reader)));
+    let delete_label = if is_channel {
+        "Delete channel"
+    } else {
+        "Delete chat"
+    };
     if confirming_delete {
         let confirm_title = compact_line(&session.title, 34);
         let confirm = {
             let s = shared.clone();
-            sui::Button::new("Delete")
+            sui::Button::new(delete_label)
                 .icon(IconGlyph::Trash)
-                .theme_when(clone_reader(reader))
+                .theme_when(danger_button_theme(reader))
                 .on_press_with_ctx(move |ctx| {
                     let waker = s.borrow().waker.clone();
                     s.chat_mut().confirm_delete_session(waker);
@@ -3669,7 +3735,7 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             let s = shared.clone();
             sui::Button::new("Cancel")
                 .icon(IconGlyph::Close)
-                .theme_when(clone_reader(reader))
+                .theme_when(secondary_button_theme(reader))
                 .on_press_with_ctx(move |ctx| {
                     s.chat_mut().cancel_delete_session();
                     ctx.request_measure();
@@ -3677,21 +3743,26 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 })
         };
         body = body
-            .with_child(muted_label(shared, format!("Delete \"{confirm_title}\"?")))
+            .with_child(dialog_section_label(shared, "Danger zone"))
+            .with_child(muted_label(
+                shared,
+                format!("Delete \"{confirm_title}\" from SIFS?"),
+            ))
             .with_child(
-                Stack::horizontal()
-                    .spacing(6.0)
-                    .alignment(Alignment::Start)
-                    .with_child(confirm)
-                    .with_child(cancel),
+                Flex::horizontal()
+                    .gap(6.0)
+                    .align_items(Alignment::Center)
+                    .with_child(cancel)
+                    .spacer()
+                    .with_child(confirm),
             );
     } else {
         let delete_session_id = session.id.clone();
         let delete = {
             let s = shared.clone();
-            sui::Button::new("Delete")
+            sui::Button::new(delete_label)
                 .icon(IconGlyph::Trash)
-                .theme_when(clone_reader(reader))
+                .theme_when(danger_button_theme(reader))
                 .enabled_when({
                     let s = s.clone();
                     move || {
@@ -3707,12 +3778,21 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                     ctx.request_paint();
                 })
         };
-        body = body.with_child(
-            Stack::horizontal()
-                .spacing(6.0)
-                .alignment(Alignment::Start)
-                .with_child(delete),
-        );
+        let delete_hint = if is_channel {
+            "Removes this channel timeline and its channel membership record."
+        } else {
+            "Removes this chat timeline from the SIFS-backed chat list."
+        };
+        body = body
+            .with_child(dialog_section_label(shared, "Danger zone"))
+            .with_child(muted_label(shared, delete_hint))
+            .with_child(
+                Flex::horizontal()
+                    .gap(6.0)
+                    .align_items(Alignment::Center)
+                    .spacer()
+                    .with_child(delete),
+            );
     }
 
     let s = shared.clone();
@@ -3730,22 +3810,21 @@ fn channel_agents_editor(
     participants: Vec<ChannelAgentRef>,
     agent_options: Vec<String>,
 ) -> impl Widget + use<> {
-    let theme = shared.theme();
-    let pal = palette(shared);
+    let participant_count = participants.len();
     let mut list = Stack::vertical()
         .spacing(4.0)
         .alignment(Alignment::Stretch)
         .with_child(
-            Label::new("Agents")
-                .style(pal.text_style(&theme, 12.0, FontWeight::SEMIBOLD, pal.text_muted))
-                .color_when({
-                    let s = shared.clone();
-                    move || palette(&s).text_muted
-                }),
+            Flex::horizontal()
+                .gap(8.0)
+                .align_items(Alignment::Center)
+                .with_child(dialog_section_label(shared, "Agents"))
+                .spacer()
+                .with_child(muted_label(shared, format!("{} active", participant_count))),
         );
 
     if participants.is_empty() {
-        list = list.with_child(muted_label(shared, "No agents"));
+        list = list.with_child(muted_label(shared, "No agents assigned yet."));
     } else {
         for participant in participants {
             let row_channel_id = channel_id.clone();
@@ -3815,9 +3894,10 @@ fn channel_agents_editor(
         .with_child(list)
         .with_child(SizedBox::new().height(SELECTOR_H).with_child(picker))
         .with_child(
-            Stack::horizontal()
-                .spacing(6.0)
-                .alignment(Alignment::Start)
+            Flex::horizontal()
+                .gap(6.0)
+                .align_items(Alignment::Center)
+                .spacer()
                 .with_child(add),
         )
 }
@@ -3829,9 +3909,10 @@ struct ChannelAgentRow {
 }
 
 impl ChannelAgentRow {
-    const HEIGHT: f32 = 28.0;
+    const HEIGHT: f32 = 32.0;
     const REMOVE_SIZE: f32 = 26.0;
     const GAP: f32 = 8.0;
+    const ICON_SIZE: f32 = 15.0;
 
     fn new<W>(shared: Shared, label: String, remove: W) -> Self
     where
@@ -3875,11 +3956,20 @@ impl Widget for ChannelAgentRow {
     fn paint(&self, ctx: &mut PaintCtx) {
         let theme = self.shared.theme();
         let pal = palette(&self.shared);
+        let bounds = ctx.bounds();
+        widgets::fill_round_rect(ctx, bounds, pal.field, 6.0);
+        let icon_rect = Rect::new(
+            bounds.x() + 9.0,
+            bounds.y() + (bounds.height() - Self::ICON_SIZE) * 0.5,
+            Self::ICON_SIZE,
+            Self::ICON_SIZE,
+        );
+        draw_glyph(ctx, IconGlyph::Sparkles, icon_rect, pal.accent);
         let label_rect = Rect::new(
-            ctx.bounds().x(),
-            ctx.bounds().y(),
-            (ctx.bounds().width() - Self::REMOVE_SIZE - Self::GAP).max(0.0),
-            ctx.bounds().height(),
+            icon_rect.max_x() + 7.0,
+            bounds.y(),
+            (bounds.max_x() - icon_rect.max_x() - Self::REMOVE_SIZE - Self::GAP - 7.0).max(0.0),
+            bounds.height(),
         );
         let style = pal.text_style(&theme, 12.5, FontWeight::NORMAL, pal.text);
         ctx.push_clip_rect(label_rect);
@@ -3907,6 +3997,7 @@ struct SessionEditPopup {
     body: WidgetPod,
     panel_rect: Rect,
     body_rect: Rect,
+    close_hovered: bool,
     on_dismiss: Option<Box<dyn FnMut()>>,
 }
 
@@ -3918,6 +4009,7 @@ impl SessionEditPopup {
     const TITLE_HEIGHT: f32 = 26.0;
     const BODY_GAP: f32 = 12.0;
     const CORNER_RADIUS: f32 = 10.0;
+    const CLOSE_SIZE: f32 = 28.0;
 
     fn new<W>(title: impl Into<String>, body: W, theme: DefaultTheme) -> Self
     where
@@ -3929,6 +4021,7 @@ impl SessionEditPopup {
             body: WidgetPod::new(body),
             panel_rect: Rect::ZERO,
             body_rect: Rect::ZERO,
+            close_hovered: false,
             on_dismiss: None,
         }
     }
@@ -3959,17 +4052,53 @@ impl SessionEditPopup {
             ..self.theme.body_text_style()
         }
     }
+
+    fn close_rect(&self) -> Rect {
+        Rect::new(
+            self.panel_rect.max_x() - Self::PANEL_PADDING - Self::CLOSE_SIZE,
+            self.panel_rect.y() + Self::PANEL_PADDING - 2.0,
+            Self::CLOSE_SIZE,
+            Self::CLOSE_SIZE,
+        )
+    }
 }
 
 impl Widget for SessionEditPopup {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
         match event {
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
+                let hovered = self.close_rect().contains(pointer.position);
+                if self.close_hovered != hovered {
+                    self.close_hovered = hovered;
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Down
+                    && pointer.button == Some(PointerButton::Primary)
+                    && self.close_rect().contains(pointer.position) =>
+            {
+                self.dismiss(ctx);
+            }
             Event::Pointer(pointer)
                 if pointer.kind == PointerEventKind::Down
                     && pointer.button == Some(PointerButton::Primary)
                     && !self.panel_rect.contains(pointer.position) =>
             {
                 self.dismiss(ctx);
+            }
+            Event::Pointer(pointer)
+                if matches!(
+                    pointer.kind,
+                    PointerEventKind::Leave | PointerEventKind::Cancel
+                ) =>
+            {
+                if self.close_hovered {
+                    self.close_hovered = false;
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
             }
             Event::Keyboard(key) if key.state == KeyState::Pressed && key.key == "Escape" => {
                 self.dismiss(ctx);
@@ -4065,17 +4194,40 @@ impl Widget for SessionEditPopup {
         let title_rect = Rect::new(
             panel.x() + Self::PANEL_PADDING,
             panel.y() + Self::PANEL_PADDING,
-            (panel.width() - Self::PANEL_PADDING * 2.0).max(0.0),
+            (panel.width() - Self::PANEL_PADDING * 2.0 - Self::CLOSE_SIZE - 8.0).max(0.0),
             Self::TITLE_HEIGHT,
         );
         widgets::draw_text_in(ctx, title_rect, &self.title, self.title_style());
+        let close = self.close_rect();
+        if self.close_hovered {
+            widgets::fill_round_rect(ctx, close, self.theme.palette.control_hover, 6.0);
+        }
+        draw_glyph(
+            ctx,
+            IconGlyph::Close,
+            close.inflate(-6.0, -6.0),
+            self.theme.palette.text_muted,
+        );
         self.body.paint(ctx);
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::Dialog, self.panel_rect);
+        let dialog_id = ctx.widget_id();
+        let mut node = SemanticsNode::new(dialog_id, SemanticsRole::Dialog, self.panel_rect);
         node.name = Some(self.title.clone());
         ctx.push(node);
+        let mut close = SemanticsNode::new(
+            sui::WidgetId::new(dialog_id.get().wrapping_mul(41).wrapping_add(7_133)),
+            SemanticsRole::Button,
+            self.close_rect(),
+        );
+        close.parent = Some(dialog_id);
+        close.name = Some("Close edit dialog".to_string());
+        close.description =
+            Some("Dismiss this editor without saving pending title changes".to_string());
+        close.actions = vec![SemanticsAction::Activate];
+        close.state.hovered = self.close_hovered;
+        ctx.push(close);
         self.body.semantics(ctx);
     }
 
@@ -7289,6 +7441,49 @@ mod tests {
     }
 
     #[test]
+    fn session_edit_dialog_close_button_closes_in_rendered_view() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let session_id = SessionId::generate().to_string();
+        {
+            let mut chat = shared.chat_mut();
+            chat.sessions = vec![SessionRef {
+                id: session_id.clone(),
+                title: "Closable chat".to_string(),
+                kind: ConversationKind::Chat,
+                updated_unix: 1,
+                participant_count: 1,
+            }];
+            chat.session_id = session_id.clone();
+            chat.session_edit_id = Some(session_id.clone());
+            chat.session_title_draft = "Closable chat".to_string();
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat dialog close")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Close edit dialog")
+            .click()?;
+
+        assert!(
+            shared.chat().session_edit_id.is_none(),
+            "close button should dismiss the edit dialog"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn rendered_session_edit_button_opens_dialog() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -7373,7 +7568,12 @@ mod tests {
         app.run_until_idle()?;
         let snapshot = window.snapshot()?;
 
-        for label in ["Remove main-agent", "Remove coding-agent"] {
+        for label in [
+            "Close edit dialog",
+            "Delete channel",
+            "Remove main-agent",
+            "Remove coding-agent",
+        ] {
             assert!(
                 snapshot.accessibility.nodes.iter().any(|node| {
                     node.role == SemanticsRole::Button && node.name.as_deref() == Some(label)
@@ -7381,6 +7581,14 @@ mod tests {
                 "{label} control should be visible in the channel edit dialog"
             );
         }
+        assert!(
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .any(|node| node.name.as_deref() == Some("2 active")),
+            "channel edit dialog should show the active-agent count"
+        );
 
         Ok(())
     }
