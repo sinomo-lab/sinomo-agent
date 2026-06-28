@@ -67,7 +67,7 @@ const HEADER_COMMAND_GAP: f32 = 8.0;
 const HEADER_ROW_GAP: f32 = 6.0;
 const FILES_STATUS_H: f32 = 38.0;
 const LIST_HEADER_H: f32 = 36.0;
-const LIST_FILTER_H: f32 = 42.0;
+const LIST_FILTER_H: f32 = 72.0;
 const LIST_TASK_STRIP_H: f32 = 88.0;
 const PLACES_W: f32 = 190.0;
 const PLACE_ROW_H: f32 = 42.0;
@@ -5791,10 +5791,27 @@ fn files_clear_marks_button(shared: &Shared, reader: &ThemeReader) -> impl Widge
         })
 }
 
+fn files_marked_summary_label(shared: &Shared) -> impl Widget + use<> {
+    let s = shared.clone();
+    sui::Label::dynamic("No selection", move || {
+        let count = s.files().marked_count();
+        if count == 0 {
+            "No selection".to_string()
+        } else {
+            selected_entries_label(count)
+        }
+    })
+    .semantic_name("Files marked selection")
+    .font_size(11.0)
+    .line_height(16.0)
+}
+
 fn files_copy_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
-    IconButton::new(IconGlyph::Restore, "Copy marked entries")
-        .size(30.0)
+    sui::Button::new("Copy marked")
+        .icon(IconGlyph::Restore)
+        .min_width(106.0)
+        .min_height(28.0)
         .theme_when(clone_reader(reader))
         .enabled_when({
             let s = s.clone();
@@ -5809,12 +5826,14 @@ fn files_copy_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widge
 
 fn files_transfer_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
-    let (glyph, label) = match shared.files().source {
-        FilesSourceKind::Sifs => (IconGlyph::Download, "Download marked entries"),
-        FilesSourceKind::Local => (IconGlyph::Storage, "Copy marked entries to SIFS"),
+    let (glyph, label, width) = match shared.files().source {
+        FilesSourceKind::Sifs => (IconGlyph::Download, "Download marked", 132.0),
+        FilesSourceKind::Local => (IconGlyph::Storage, "Copy to SIFS", 112.0),
     };
-    IconButton::new(glyph, label)
-        .size(30.0)
+    sui::Button::new(label)
+        .icon(glyph)
+        .min_width(width)
+        .min_height(28.0)
         .theme_when(clone_reader(reader))
         .enabled_when({
             let s = s.clone();
@@ -5829,8 +5848,10 @@ fn files_transfer_marked_button(shared: &Shared, reader: &ThemeReader) -> impl W
 
 fn files_move_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
-    IconButton::new(IconGlyph::ChevronRight, "Move marked entries")
-        .size(30.0)
+    sui::Button::new("Move marked")
+        .icon(IconGlyph::ChevronRight)
+        .min_width(106.0)
+        .min_height(28.0)
         .theme_when(clone_reader(reader))
         .enabled_when({
             let s = s.clone();
@@ -5845,8 +5866,10 @@ fn files_move_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widge
 
 fn files_delete_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
-    IconButton::new(IconGlyph::Trash, "Delete marked entries")
-        .size(30.0)
+    sui::Button::new("Delete marked")
+        .icon(IconGlyph::Trash)
+        .min_width(112.0)
+        .min_height(28.0)
         .theme_when(clone_reader(reader))
         .enabled_when({
             let s = s.clone();
@@ -5860,7 +5883,7 @@ fn files_delete_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Wid
 }
 
 fn files_filter_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    Stack::horizontal()
+    let filters = Stack::horizontal()
         .spacing(8.0)
         .alignment(Alignment::Center)
         .with_child(
@@ -5876,11 +5899,27 @@ fn files_filter_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
                 .with_child(files_sort_select(shared, reader)),
         )
         .with_child(files_mark_visible_button(shared, reader))
-        .with_child(files_clear_marks_button(shared, reader))
+        .with_child(files_clear_marks_button(shared, reader));
+
+    let marked_actions = Stack::horizontal()
+        .spacing(8.0)
+        .alignment(Alignment::Center)
+        .with_child(
+            SizedBox::new()
+                .width(116.0)
+                .height(28.0)
+                .with_child(files_marked_summary_label(shared)),
+        )
         .with_child(files_copy_marked_button(shared, reader))
         .with_child(files_transfer_marked_button(shared, reader))
         .with_child(files_move_marked_button(shared, reader))
-        .with_child(files_delete_marked_button(shared, reader))
+        .with_child(files_delete_marked_button(shared, reader));
+
+    Stack::vertical()
+        .spacing(6.0)
+        .alignment(Alignment::Stretch)
+        .with_child(SizedBox::new().height(30.0).with_child(filters))
+        .with_child(SizedBox::new().height(28.0).with_child(marked_actions))
 }
 
 fn files_list_body_signature(shared: &Shared) -> (u64, String, FileSortMode) {
@@ -13111,9 +13150,16 @@ mod tests {
         assert_eq!(shared.files().marked_count(), 1);
         assert!(shared.files().entry_marked(0));
 
+        let snapshot = window.snapshot()?;
+        assert!(snapshot.accessibility.nodes.iter().any(|node| {
+            node.role == sui::SemanticsRole::Text
+                && node.name.as_deref() == Some("Files marked selection")
+                && node.value == Some(sui::SemanticsValue::Text("1 selected entry".to_string()))
+        }));
+
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Copy marked entries")
+            .with_name("Copy marked")
             .click()?;
         {
             let files = shared.files();
@@ -13130,7 +13176,7 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Download marked entries")
+            .with_name("Download marked")
             .click()?;
         {
             let files = shared.files();
@@ -13150,7 +13196,7 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Move marked entries")
+            .with_name("Move marked")
             .click()?;
         {
             let files = shared.files();
@@ -13167,7 +13213,7 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Delete marked entries")
+            .with_name("Delete marked")
             .click()?;
         {
             let files = shared.files();
