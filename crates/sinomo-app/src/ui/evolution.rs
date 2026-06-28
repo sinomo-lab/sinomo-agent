@@ -48,7 +48,7 @@ const DECISION_SECTION_H: f32 = 146.0;
 const DECISION_BUTTON_H: f32 = 32.0;
 const READINESS_DETAIL_BUTTON_W: f32 = 136.0;
 const OBJECTIVE_PLACEHOLDER: &str = "Describe the improvement or task";
-const SCOPE_PLACEHOLDER: &str = "Optional: crates/sinomo-dfs/**, docs/**";
+const SCOPE_PLACEHOLDER: &str = "Optional: path globs, comma-separated";
 const EVOLUTION_EMPTY_SUBTITLE: &str = "Describe an objective above, then Start.";
 
 pub struct EvolutionState {
@@ -67,6 +67,7 @@ pub struct EvolutionState {
     pub decision_error: Option<String>,
     decision_action: Option<EvolutionDecisionAction>,
     decision_rx: Option<Receiver<EvolutionDecisionEvent>>,
+    scope_revision: u64,
 }
 
 impl EvolutionState {
@@ -89,6 +90,7 @@ impl EvolutionState {
             decision_error: None,
             decision_action: None,
             decision_rx: None,
+            scope_revision: 0,
         }
     }
 
@@ -122,8 +124,13 @@ impl EvolutionState {
 
     fn apply_starter_objective(&mut self, objective: EvolutionStarterObjective) {
         self.objective_draft = objective.prompt().to_string();
+        self.scope_draft = objective.scope().to_string();
+        self.target_ring_index = target_ring_index_for_value(objective.target_ring());
+        self.start_advanced_open = true;
         self.start_error = None;
+        self.start_status = None;
         self.objective_revision = self.objective_revision.wrapping_add(1);
+        self.scope_revision = self.scope_revision.wrapping_add(1);
     }
 
     pub fn set_scope_draft(&mut self, value: String) {
@@ -320,6 +327,13 @@ const EVOLUTION_TARGET_RINGS: [TargetRingOption; 3] = [
     },
 ];
 
+fn target_ring_index_for_value(value: &str) -> usize {
+    EVOLUTION_TARGET_RINGS
+        .iter()
+        .position(|ring| ring.value == value)
+        .unwrap_or(1)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EvolutionStarterObjective {
     PolishApp,
@@ -349,6 +363,23 @@ impl EvolutionStarterObjective {
             Self::CheckCluster => {
                 "Check the local cluster status, fix any blocking connection issue, and only roll out if the runtime change requires it."
             }
+        }
+    }
+
+    fn scope(self) -> &'static str {
+        match self {
+            Self::PolishApp => "crates/sinomo-app/**",
+            Self::FixCheck => "crates/**, docs/**",
+            Self::CheckCluster => {
+                "crates/sinomo-app/**, crates/sinomo-daemon/**, crates/sinomo-cli/**, crates/sinomo-network/**, docs/clustering-architecture.md"
+            }
+        }
+    }
+
+    fn target_ring(self) -> &'static str {
+        match self {
+            Self::PolishApp => "r2",
+            Self::FixCheck | Self::CheckCluster => "r1",
         }
     }
 
@@ -660,13 +691,25 @@ impl StartControls {
 
         let scope = {
             let s = shared.clone();
-            TextInput::new("evolution-scope")
-                .value(shared.evolution().scope_draft.clone())
-                .placeholder(SCOPE_PLACEHOLDER)
-                .theme_when(clone_reader(&reader))
-                .on_change(move |value| {
-                    s.evolution_mut().set_scope_draft(value);
-                })
+            let r = Rc::clone(&reader);
+            RebuildOnChange::new(
+                {
+                    let s = s.clone();
+                    move || s.evolution().scope_revision
+                },
+                move |_revision| {
+                    let s_for_change = s.clone();
+                    WidgetPod::new(
+                        TextInput::new("evolution-scope")
+                            .value(s.evolution().scope_draft.clone())
+                            .placeholder(SCOPE_PLACEHOLDER)
+                            .theme_when(clone_reader(&r))
+                            .on_change(move |value| {
+                                s_for_change.evolution_mut().set_scope_draft(value);
+                            }),
+                    )
+                },
+            )
         };
 
         let target = {
@@ -2716,6 +2759,7 @@ mod tests {
         {
             let mut evolution = shared.evolution_mut();
             evolution.start_error = Some("old validation error".to_string());
+            evolution.start_status = Some("old worker status".to_string());
             evolution.dashboard = EvolutionDashboard::default();
             evolution.selected = None;
         }
@@ -2739,16 +2783,75 @@ mod tests {
         {
             let evolution = shared.evolution();
             assert_eq!(evolution.objective_draft, expected);
+            assert_eq!(
+                evolution.scope_draft,
+                EvolutionStarterObjective::CheckCluster.scope()
+            );
+            assert_eq!(
+                evolution.target_ring_index,
+                target_ring_index_for_value(EvolutionStarterObjective::CheckCluster.target_ring())
+            );
+            assert!(evolution.start_advanced_open);
             assert!(evolution.can_start());
             assert!(evolution.start_error.is_none());
+            assert!(evolution.start_status.is_none());
             assert!(evolution.start_rx.is_none());
             assert_eq!(evolution.objective_revision, 1);
+            assert_eq!(evolution.scope_revision, 1);
         }
         window
             .get_by_role(sui::SemanticsRole::TextInput)
             .with_name("evolution-objective")
             .expect()
             .to_have_value(expected)?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("evolution-scope")
+            .expect()
+            .to_have_value(EvolutionStarterObjective::CheckCluster.scope())?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn polish_app_starter_uses_app_scope() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Evolution app starter scope")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Polish app")
+            .click()?;
+
+        {
+            let evolution = shared.evolution();
+            assert_eq!(
+                evolution.objective_draft,
+                EvolutionStarterObjective::PolishApp.prompt()
+            );
+            assert_eq!(evolution.scope_draft, "crates/sinomo-app/**");
+            assert_eq!(
+                evolution.target_ring_index,
+                target_ring_index_for_value("r2")
+            );
+            assert!(evolution.start_advanced_open);
+            assert!(evolution.start_rx.is_none());
+        }
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("evolution-scope")
+            .expect()
+            .to_have_value("crates/sinomo-app/**")?;
 
         Ok(())
     }
