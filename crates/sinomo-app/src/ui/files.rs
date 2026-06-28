@@ -6349,6 +6349,33 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     );
     push_unique_place(
         &mut places,
+        "Cluster nodes",
+        "remote node files",
+        FilesSourceKind::Sifs,
+        "/sinomo/nodes",
+        IconGlyph::Storage,
+    );
+    if !files.node_id.trim().is_empty() {
+        push_unique_place(
+            &mut places,
+            "This node files",
+            "local-owned SIFS",
+            FilesSourceKind::Sifs,
+            format!("/sinomo/nodes/{}/files", files.node_id),
+            IconGlyph::Folder,
+        );
+    }
+    push_unique_place_with_action(
+        &mut places,
+        "SIFS path",
+        "cluster path",
+        FilesSourceKind::Sifs,
+        files.sifs_path.clone(),
+        IconGlyph::Search,
+        FilePlaceAction::OpenPathPrompt,
+    );
+    push_unique_place(
+        &mut places,
         "Current local",
         "host filesystem",
         FilesSourceKind::Local,
@@ -6658,6 +6685,14 @@ impl FilesPlacesRail {
         )
     }
 
+    fn content_height(shared: &Shared) -> f32 {
+        let count = {
+            let files = shared.files();
+            files_places(&files).len()
+        };
+        48.0 + count as f32 * PLACE_ROW_H + 8.0
+    }
+
     fn place_at(&self, bounds: Rect, position: Point) -> Option<usize> {
         let places = {
             let files = self.shared.files();
@@ -6715,7 +6750,7 @@ impl Widget for FilesPlacesRail {
     }
 
     fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        constraints.clamp(Size::new(PLACES_W, 220.0))
+        constraints.clamp(Size::new(PLACES_W, Self::content_height(&self.shared)))
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
@@ -9386,10 +9421,13 @@ fn wide_pod(
     shared: &Shared,
     reader: &ThemeReader,
     scroll_state: &ScrollState,
+    places_scroll_state: &ScrollState,
     inspector_scroll_state: &ScrollState,
 ) -> WidgetPod {
+    let places = ScrollView::vertical(FilesPlacesRail::new(shared.clone()))
+        .state(places_scroll_state.clone());
     let list_with_places = FixedLeftSplit::new(
-        FilesPlacesRail::new(shared.clone()),
+        places,
         list_column(shared, reader, scroll_state),
         PLACES_W,
         reader,
@@ -9448,7 +9486,9 @@ fn files_action_dialog_signature(shared: &Shared) -> String {
 
 fn go_to_path_description(source: FilesSourceKind) -> &'static str {
     match source {
-        FilesSourceKind::Sifs => "Open a SIFS path, e.g. /services or /users",
+        FilesSourceKind::Sifs => {
+            "Open a SIFS path, e.g. /services, /users, or /sinomo/nodes/<node>/files"
+        }
         FilesSourceKind::Local => {
             "Open drive, UNC, or mounted path, e.g. C:\\Users or \\\\server\\share"
         }
@@ -9748,11 +9788,13 @@ impl FilesView {
         // swap. The inspector owns a separate scroll state because expanded technical details are
         // independent of the directory listing.
         let scroll_state = ScrollState::new();
+        let places_scroll_state = ScrollState::new();
         let inspector_scroll_state = ScrollState::new();
         let wide = wide_pod(
             &shared,
             &theme_reader,
             &scroll_state,
+            &places_scroll_state,
             &inspector_scroll_state,
         );
         let narrow = narrow_pod(&shared, &theme_reader, &scroll_state);
@@ -10108,6 +10150,8 @@ mod tests {
         let backend = Backend::local_fallback();
         let mut state = FilesState::new(&backend);
         state.local_path = root.to_string_lossy().into_owned();
+        state.sifs_path = "/services".to_string();
+        state.node_id = "node-desktop".to_string();
 
         let places = files_places(&state);
 
@@ -10118,6 +10162,23 @@ mod tests {
             place.label == "Services"
                 && place.source == FilesSourceKind::Sifs
                 && place.path == "/services"
+        }));
+        assert!(places.iter().any(|place| {
+            place.label == "Cluster nodes"
+                && place.source == FilesSourceKind::Sifs
+                && place.path == "/sinomo/nodes"
+        }));
+        assert!(places.iter().any(|place| {
+            place.label == "This node files"
+                && place.detail == "local-owned SIFS"
+                && place.source == FilesSourceKind::Sifs
+                && place.path == "/sinomo/nodes/node-desktop/files"
+        }));
+        assert!(places.iter().any(|place| {
+            place.label == "SIFS path"
+                && place.source == FilesSourceKind::Sifs
+                && place.path == "/services"
+                && place.action == FilePlaceAction::OpenPathPrompt
         }));
         assert!(places.iter().any(|place| {
             place.label == "Current local"
@@ -12507,7 +12568,7 @@ mod tests {
     fn go_to_path_dialog_copy_explains_supported_path_forms() {
         assert_eq!(
             go_to_path_description(FilesSourceKind::Sifs),
-            "Open a SIFS path, e.g. /services or /users"
+            "Open a SIFS path, e.g. /services, /users, or /sinomo/nodes/<node>/files"
         );
         assert_eq!(go_to_path_placeholder(FilesSourceKind::Sifs), "/services");
         assert!(go_to_path_description(FilesSourceKind::Local).contains("UNC"));
