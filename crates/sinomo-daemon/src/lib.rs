@@ -108,6 +108,19 @@ pub struct DaemonDfsBrowserStatResponse {
     pub changed_at_unix_nanos: u64,
     pub policy: sinomo_core::DfsObjectPolicy,
     pub current_locations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<DaemonDfsBrowserObjectHealth>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserObjectHealth {
+    pub agent_state: sinomo_dfs::DfsAgentObjectState,
+    pub version_count: usize,
+    pub receipt_count: usize,
+    pub intent_count: usize,
+    pub open_conflict_count: usize,
+    pub pending_repair_count: usize,
+    pub missing_replica_nodes: Vec<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]

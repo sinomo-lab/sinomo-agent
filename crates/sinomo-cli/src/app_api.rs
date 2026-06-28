@@ -1998,6 +1998,19 @@ pub struct SifsObjectDetails {
     pub changed_at_unix_nanos: u64,
     pub policy: String,
     pub current_locations: Vec<String>,
+    pub health: Option<SifsObjectHealth>,
+}
+
+/// Operator-facing DFS health for a selected SIFS object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SifsObjectHealth {
+    pub agent_state: String,
+    pub version_count: usize,
+    pub receipt_count: usize,
+    pub intent_count: usize,
+    pub open_conflict_count: usize,
+    pub pending_repair_count: usize,
+    pub missing_replica_nodes: Vec<String>,
 }
 
 /// Bounded bytes read for a file preview or lightweight inspection.
@@ -2475,6 +2488,7 @@ fn sifs_details_from_stat(stat: sinomo_runtime::dfs::DfsStat) -> SifsObjectDetai
             .into_iter()
             .map(|node_id| node_id.to_string())
             .collect(),
+        health: None,
     }
 }
 
@@ -2499,6 +2513,21 @@ fn sifs_details_from_rpc(
         changed_at_unix_nanos: response.changed_at_unix_nanos,
         policy: sifs_policy_label(&response.policy).to_string(),
         current_locations: response.current_locations,
+        health: response.health.map(sifs_health_from_rpc),
+    }
+}
+
+fn sifs_health_from_rpc(
+    health: sinomo_runtime::daemon::DaemonDfsBrowserObjectHealth,
+) -> SifsObjectHealth {
+    SifsObjectHealth {
+        agent_state: sifs_agent_state_label(&health.agent_state).to_string(),
+        version_count: health.version_count,
+        receipt_count: health.receipt_count,
+        intent_count: health.intent_count,
+        open_conflict_count: health.open_conflict_count,
+        pending_repair_count: health.pending_repair_count,
+        missing_replica_nodes: health.missing_replica_nodes,
     }
 }
 
@@ -2521,6 +2550,16 @@ fn sifs_policy_label(policy: &sinomo_runtime::core::DfsObjectPolicy) -> &'static
         sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual => "replicated-eventual",
         sinomo_runtime::core::DfsObjectPolicy::AppendOnly => "append-only",
         sinomo_runtime::core::DfsObjectPolicy::EphemeralLocal => "ephemeral-local",
+    }
+}
+
+fn sifs_agent_state_label(state: &sinomo_runtime::dfs::DfsAgentObjectState) -> &'static str {
+    match state {
+        sinomo_runtime::dfs::DfsAgentObjectState::Current => "current",
+        sinomo_runtime::dfs::DfsAgentObjectState::PendingWrite => "pending-write",
+        sinomo_runtime::dfs::DfsAgentObjectState::PendingRepair => "pending-repair",
+        sinomo_runtime::dfs::DfsAgentObjectState::Conflicted => "conflicted",
+        sinomo_runtime::dfs::DfsAgentObjectState::MetadataOnly => "metadata-only",
     }
 }
 

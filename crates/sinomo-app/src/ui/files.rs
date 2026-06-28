@@ -42,7 +42,9 @@ use sui::{
     WindowEvent, draw_glyph,
 };
 
-use sinomo_cli::app_api::{SifsBrowser, SifsEntry, SifsFileRead, SifsObjectDetails};
+use sinomo_cli::app_api::{
+    SifsBrowser, SifsEntry, SifsFileRead, SifsObjectDetails, SifsObjectHealth,
+};
 use sinomo_runtime::local::SinomoDataDir;
 use time::format_description::well_known::Rfc3339;
 
@@ -194,6 +196,7 @@ enum FilesOperationKind {
     Rename,
     Delete,
     RefreshPlacement,
+    RepairReplicas,
     PinContent,
     UnpinContent,
 }
@@ -1297,6 +1300,26 @@ impl FilesState {
                 directory: entry.is_dir,
             },
             "Refresh placement".to_string(),
+            entry.path,
+            waker,
+        );
+    }
+
+    fn start_replica_repair(&mut self, waker: Option<sui::UiHandle>) {
+        if self.source != FilesSourceKind::Sifs {
+            return;
+        }
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+        self.start_operation(
+            FilesOperation {
+                kind: FilesOperationKind::RepairReplicas,
+                path: entry.path.clone(),
+                target: None,
+                directory: entry.is_dir,
+            },
+            "Repair replicas".to_string(),
             entry.path,
             waker,
         );
@@ -2413,6 +2436,17 @@ fn execute_sifs_operation(
                 message: format!("requested placement refresh for {}", operation.path),
             })
         }
+        FilesOperationKind::RepairReplicas => {
+            browser
+                .request_maintenance_refresh()
+                .map_err(FilesOperationFailure::Error)?;
+            let _ = browser.stat(&operation.path);
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: Some(operation.path.clone()),
+                message: format!("requested replica repair for {}", operation.path),
+            })
+        }
         FilesOperationKind::PinContent => {
             let node_id = browser
                 .pin_content(&operation.path)
@@ -2553,6 +2587,9 @@ fn execute_local_operation_with_progress(
         }
         FilesOperationKind::RefreshPlacement => Err(FilesOperationFailure::Error(
             "placement refresh is only available for SIFS".to_string(),
+        )),
+        FilesOperationKind::RepairReplicas => Err(FilesOperationFailure::Error(
+            "replica repair is only available for SIFS".to_string(),
         )),
         FilesOperationKind::PinContent | FilesOperationKind::UnpinContent => Err(
             FilesOperationFailure::Error("content pinning is only available for SIFS".to_string()),
@@ -3071,6 +3108,9 @@ fn files_operation_cancelled_detail(operation: &FilesOperation) -> String {
                 operation.path
             )
         }
+        FilesOperationKind::RepairReplicas => {
+            format!("cancelled before repairing replicas for {}", operation.path)
+        }
         FilesOperationKind::PinContent => {
             format!("cancelled before pinning content for {}", operation.path)
         }
@@ -3105,6 +3145,9 @@ fn operation_progress_label(
         FilesOperationKind::Delete => format!("{phase} delete in {scope}: {}", operation.path),
         FilesOperationKind::RefreshPlacement => {
             format!("{phase} placement refresh in {scope}: {}", operation.path)
+        }
+        FilesOperationKind::RepairReplicas => {
+            format!("{phase} replica repair in {scope}: {}", operation.path)
         }
         FilesOperationKind::PinContent => {
             format!("{phase} content pin in {scope}: {}", operation.path)
@@ -3443,6 +3486,45 @@ fn sifs_replication_summary(details: Option<&SifsObjectDetails>, clustered: bool
     }
 }
 
+fn sifs_health_summary(details: Option<&SifsObjectDetails>) -> String {
+    let Some(health) = details.and_then(|details| details.health.as_ref()) else {
+        return "operator health unavailable".to_string();
+    };
+    if health.open_conflict_count > 0 {
+        return format!(
+            "{}; {} open",
+            health.agent_state,
+            plural(health.open_conflict_count, "conflict")
+        );
+    }
+    if health.pending_repair_count > 0 {
+        return format!(
+            "{}; {}",
+            health.agent_state,
+            plural(health.pending_repair_count, "missing replica")
+        );
+    }
+    if health.intent_count > 0 && health.agent_state == "pending-write" {
+        return format!(
+            "pending write; {} tracked",
+            plural(health.intent_count, "intent")
+        );
+    }
+    format!("{}; no repair backlog", health.agent_state)
+}
+
+fn sifs_missing_replica_summary(health: &SifsObjectHealth) -> String {
+    if health.missing_replica_nodes.is_empty() {
+        return "none".to_string();
+    }
+    health
+        .missing_replica_nodes
+        .iter()
+        .map(|node| short(node, 20))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn sifs_placement_next_step(details: Option<&SifsObjectDetails>, clustered: bool) -> String {
     if !clustered {
         return "join a cluster to enable multi-node placement".to_string();
@@ -3457,6 +3539,13 @@ fn sifs_placement_next_step(details: Option<&SifsObjectDetails>, clustered: bool
         return "copy into durable SIFS storage before relying on this object".to_string();
     }
     if details.policy.starts_with("replicated") {
+        if details
+            .health
+            .as_ref()
+            .is_some_and(|health| health.pending_repair_count > 0)
+        {
+            return "repair replicas, then refresh placement".to_string();
+        }
         return match details.current_locations.len() {
             0 => "refresh metadata; no durable replica receipt is recorded yet".to_string(),
             1 => "keep peers online and refresh after replica repair settles".to_string(),
@@ -3489,11 +3578,28 @@ fn sifs_inspector_next_step(
 fn sifs_details_signature(details: Option<&SifsObjectDetails>) -> String {
     details
         .map(|details| {
+            let health = details
+                .health
+                .as_ref()
+                .map(|health| {
+                    format!(
+                        "{}|{}|{}|{}|{}|{}|{}",
+                        health.agent_state,
+                        health.version_count,
+                        health.receipt_count,
+                        health.intent_count,
+                        health.open_conflict_count,
+                        health.pending_repair_count,
+                        health.missing_replica_nodes.join(",")
+                    )
+                })
+                .unwrap_or_default();
             format!(
-                "{}|{}|{}",
+                "{}|{}|{}|{}",
                 details.version,
                 details.policy,
-                details.current_locations.join(",")
+                details.current_locations.join(","),
+                health
             )
         })
         .unwrap_or_default()
@@ -5911,6 +6017,7 @@ enum InspectorAction {
     Rename,
     Delete,
     RefreshPlacement,
+    RepairReplicas,
     PinContent,
     UnpinContent,
 }
@@ -5924,6 +6031,7 @@ impl InspectorAction {
             Self::Rename => "Rename",
             Self::Delete => "Delete",
             Self::RefreshPlacement => "Refresh placement",
+            Self::RepairReplicas => "Repair replicas",
             Self::PinContent => "Pin content",
             Self::UnpinContent => "Unpin content",
         }
@@ -5937,6 +6045,7 @@ impl InspectorAction {
             Self::Rename => IconGlyph::MoreHorizontal,
             Self::Delete => IconGlyph::Trash,
             Self::RefreshPlacement => IconGlyph::Storage,
+            Self::RepairReplicas => IconGlyph::Redo,
             Self::PinContent => IconGlyph::Lock,
             Self::UnpinContent => IconGlyph::Unlock,
         }
@@ -5948,9 +6057,11 @@ impl InspectorAction {
             Self::Move => Some(FileActionPromptKind::Move),
             Self::Rename => Some(FileActionPromptKind::Rename),
             Self::Delete => Some(FileActionPromptKind::Delete),
-            Self::OpenFolder | Self::RefreshPlacement | Self::PinContent | Self::UnpinContent => {
-                None
-            }
+            Self::OpenFolder
+            | Self::RefreshPlacement
+            | Self::RepairReplicas
+            | Self::PinContent
+            | Self::UnpinContent => None,
         }
     }
 
@@ -5958,6 +6069,7 @@ impl InspectorAction {
         match self {
             Self::OpenFolder => "Open folder".to_string(),
             Self::RefreshPlacement => format!("Refresh placement {}", entry.name),
+            Self::RepairReplicas => format!("Repair replicas {}", entry.name),
             Self::PinContent => format!("Pin content {}", entry.name),
             Self::UnpinContent => format!("Unpin content {}", entry.name),
             Self::Copy | Self::Move | Self::Rename | Self::Delete => {
@@ -5968,7 +6080,7 @@ impl InspectorAction {
 }
 
 fn inspector_actions(source: FilesSourceKind, entry: &SifsEntry) -> Vec<InspectorAction> {
-    let mut actions = Vec::with_capacity(6);
+    let mut actions = Vec::with_capacity(8);
     if entry.is_dir {
         actions.push(InspectorAction::OpenFolder);
     }
@@ -5978,6 +6090,7 @@ fn inspector_actions(source: FilesSourceKind, entry: &SifsEntry) -> Vec<Inspecto
     actions.push(InspectorAction::Delete);
     if source == FilesSourceKind::Sifs {
         actions.push(InspectorAction::RefreshPlacement);
+        actions.push(InspectorAction::RepairReplicas);
         if !entry.is_dir && !entry.is_link {
             actions.push(InspectorAction::PinContent);
             actions.push(InspectorAction::UnpinContent);
@@ -6072,6 +6185,7 @@ fn inspector_action_button_widget_id(
         InspectorAction::Rename => 7_541,
         InspectorAction::Delete => 7_553,
         InspectorAction::RefreshPlacement => 7_571,
+        InspectorAction::RepairReplicas => 7_579,
         InspectorAction::PinContent => 7_587,
         InspectorAction::UnpinContent => 7_599,
     };
@@ -6159,6 +6273,11 @@ impl Widget for InspectorView {
                     InspectorAction::RefreshPlacement => {
                         let waker = { self.shared.borrow().waker.clone() };
                         self.shared.files_mut().start_placement_refresh(waker);
+                        request_files_overlay_rebuild(ctx);
+                    }
+                    InspectorAction::RepairReplicas => {
+                        let waker = { self.shared.borrow().waker.clone() };
+                        self.shared.files_mut().start_replica_repair(waker);
                         request_files_overlay_rebuild(ctx);
                     }
                     InspectorAction::PinContent => {
@@ -6536,6 +6655,8 @@ impl Widget for InspectorView {
             });
         let placement = sifs_replication_summary(details, files.clustered);
         y = self.info_row(ctx, &theme, &pal, x, y + 10.0, w, "Placement", &placement);
+        let health = sifs_health_summary(details);
+        y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Health", &health);
         let next_step = sifs_inspector_next_step(
             details,
             files.clustered,
@@ -6581,6 +6702,57 @@ impl Widget for InspectorView {
             }
 
             y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Policy", policy);
+            if let Some(health) = details.and_then(|details| details.health.as_ref()) {
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y + 4.0,
+                    w,
+                    "Agent state",
+                    &health.agent_state,
+                );
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y + 4.0,
+                    w,
+                    "Operator counts",
+                    &format!(
+                        "{} · {} · {}",
+                        plural(health.version_count, "version"),
+                        plural(health.receipt_count, "receipt"),
+                        plural(health.intent_count, "intent")
+                    ),
+                );
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y + 4.0,
+                    w,
+                    "Repair backlog",
+                    &format!(
+                        "{} · {}",
+                        plural(health.pending_repair_count, "missing replica"),
+                        plural(health.open_conflict_count, "conflict")
+                    ),
+                );
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y + 4.0,
+                    w,
+                    "Missing nodes",
+                    &sifs_missing_replica_summary(health),
+                );
+            }
             let locations = details
                 .map(details_locations)
                 .unwrap_or_else(|| node_label.clone());
@@ -6731,6 +6903,9 @@ impl Widget for InspectorView {
                     InspectorAction::OpenFolder => format!("Open {}", entry.path),
                     InspectorAction::RefreshPlacement => {
                         format!("Refresh SIFS placement metadata for {}", entry.path)
+                    }
+                    InspectorAction::RepairReplicas => {
+                        format!("Request SIFS replica repair for {}", entry.path)
                     }
                     InspectorAction::PinContent => {
                         format!("Pin SIFS content on this node for {}", entry.path)
@@ -6926,6 +7101,7 @@ impl InspectorView {
             InspectorAction::OpenFolder => (pal.accent, pal.accent, pal.on_accent, pal.on_accent),
             InspectorAction::Delete => (pal.field, pal.border, pal.warn, pal.warn),
             InspectorAction::RefreshPlacement
+            | InspectorAction::RepairReplicas
             | InspectorAction::PinContent
             | InspectorAction::UnpinContent => (pal.field, pal.border, pal.accent, pal.accent),
             InspectorAction::Copy | InspectorAction::Move | InspectorAction::Rename => {
@@ -8846,6 +9022,7 @@ mod tests {
             changed_at_unix_nanos: 0,
             policy: "replicated-eventual".to_string(),
             current_locations: vec!["node-a".to_string()],
+            health: None,
         };
         assert_eq!(
             sifs_metadata_status_label(false, None, Some(&details)),
@@ -8879,6 +9056,7 @@ mod tests {
             changed_at_unix_nanos: 0,
             policy: "replicated-eventual".to_string(),
             current_locations: vec!["node-a".to_string()],
+            health: None,
         };
         assert_eq!(
             sifs_replication_summary(Some(&details), true),
@@ -8894,6 +9072,61 @@ mod tests {
             sifs_replication_summary(Some(&details), true),
             "local placement policy"
         );
+    }
+
+    #[test]
+    fn sifs_health_summary_uses_operator_repair_state() {
+        assert_eq!(sifs_health_summary(None), "operator health unavailable");
+
+        let mut details = SifsObjectDetails {
+            file_system_id: "sifs".to_string(),
+            object_id: "obj".to_string(),
+            path: "/artifact.txt".to_string(),
+            kind: "file".to_string(),
+            version: "v1".to_string(),
+            content_hash: None,
+            size_bytes: Some(5),
+            link_count: 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            policy: "replicated-eventual".to_string(),
+            current_locations: vec!["node-a".to_string()],
+            health: Some(SifsObjectHealth {
+                agent_state: "pending-repair".to_string(),
+                version_count: 2,
+                receipt_count: 1,
+                intent_count: 1,
+                open_conflict_count: 0,
+                pending_repair_count: 1,
+                missing_replica_nodes: vec!["node-b-long-identifier".to_string()],
+            }),
+        };
+
+        assert_eq!(
+            sifs_health_summary(Some(&details)),
+            "pending-repair; 1 missing replica"
+        );
+        assert_eq!(
+            sifs_placement_next_step(Some(&details), true),
+            "repair replicas, then refresh placement"
+        );
+        assert_eq!(
+            details
+                .health
+                .as_ref()
+                .map(sifs_missing_replica_summary)
+                .as_deref(),
+            Some("…e-b-long-identifier")
+        );
+
+        let first = sifs_details_signature(Some(&details));
+        details.health.as_mut().unwrap().pending_repair_count = 0;
+        assert_ne!(sifs_details_signature(Some(&details)), first);
     }
 
     #[test]
@@ -8925,6 +9158,7 @@ mod tests {
             changed_at_unix_nanos: 0,
             policy: "replicated-eventual".to_string(),
             current_locations: Vec::new(),
+            health: None,
         };
 
         assert_eq!(
@@ -8988,6 +9222,7 @@ mod tests {
             changed_at_unix_nanos: 0,
             policy: "replicated-eventual".to_string(),
             current_locations: vec!["node-a".to_string()],
+            health: None,
         };
         let first = sifs_details_signature(Some(&details));
 
@@ -9311,6 +9546,7 @@ mod tests {
                 changed_at_unix_nanos: 0,
                 policy: "replicated-eventual".to_string(),
                 current_locations: vec!["node-a".to_string(), "node-b".to_string()],
+                health: None,
             })),
         });
 
@@ -10626,6 +10862,28 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Repair replicas artifact.txt")
+            .click()?;
+
+        assert_eq!(shared.files().tasks[0].title, "Repair replicas");
+        match rx.try_recv().expect("replica repair command") {
+            FilesWorkerCommand::Operation {
+                request_id,
+                source,
+                operation,
+            } => {
+                assert_eq!(request_id, shared.files().tasks[0].id);
+                assert_eq!(source, FilesSourceKind::Sifs);
+                assert_eq!(operation.kind, FilesOperationKind::RepairReplicas);
+                assert_eq!(operation.path, "/services/artifact.txt");
+            }
+            FilesWorkerCommand::List { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+        }
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
             .with_name("Pin content artifact.txt")
             .click()?;
 
@@ -10797,6 +11055,7 @@ mod tests {
                 changed_at_unix_nanos: 0,
                 policy: "replicated-eventual".to_string(),
                 current_locations: vec!["node-a".to_string(), "node-b".to_string()],
+                health: None,
             });
         }
         let scroll_state = ScrollState::new();

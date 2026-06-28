@@ -1350,7 +1350,8 @@ impl DaemonDfsBrowserBackend {
         let stat = service
             .posix_stat_distributed(&path)
             .map_err(dfs_browser_service_error)?;
-        Ok(daemon_dfs_browser_stat_response(stat))
+        let health = daemon_dfs_browser_object_health(&service, &stat.object_id);
+        Ok(daemon_dfs_browser_stat_response(stat, health))
     }
 
     fn read_file(
@@ -1746,6 +1747,7 @@ impl Service for DaemonDfsBrowserService {
 
 fn daemon_dfs_browser_stat_response(
     stat: sinomo_dfs::DfsStat,
+    health: Option<crate::DaemonDfsBrowserObjectHealth>,
 ) -> crate::DaemonDfsBrowserStatResponse {
     crate::DaemonDfsBrowserStatResponse {
         file_system_id: stat.file_system_id.to_string(),
@@ -1769,7 +1771,33 @@ fn daemon_dfs_browser_stat_response(
             .into_iter()
             .map(|node_id| node_id.to_string())
             .collect(),
+        health,
     }
+}
+
+fn daemon_dfs_browser_object_health(
+    service: &sinomo_dfs::MountedSifsService,
+    object_id: &sinomo_dfs::DfsObjectId,
+) -> Option<crate::DaemonDfsBrowserObjectHealth> {
+    let backend = service.metadata_backend()?;
+    let view = sinomo_dfs::DfsOperatorInspector::new(backend)
+        .object(object_id)
+        .ok()
+        .flatten()?;
+    let missing_replica_nodes = view
+        .repairs
+        .iter()
+        .map(|repair| repair.missing_replica_node_id.to_string())
+        .collect();
+    Some(crate::DaemonDfsBrowserObjectHealth {
+        agent_state: view.agent_state,
+        version_count: view.versions.len(),
+        receipt_count: view.receipts.len(),
+        intent_count: view.intents.len(),
+        open_conflict_count: view.conflicts.len(),
+        pending_repair_count: view.repairs.len(),
+        missing_replica_nodes,
+    })
 }
 
 async fn publish_daemon_sifs_metadata(
