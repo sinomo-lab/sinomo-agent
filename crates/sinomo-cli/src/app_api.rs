@@ -2000,6 +2000,13 @@ pub struct SifsObjectDetails {
     pub current_locations: Vec<String>,
 }
 
+/// Bounded bytes read for a file preview or lightweight inspection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SifsFileRead {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
 /// A handle to browse SIFS (the distributed filesystem).
 pub struct SifsBrowser {
     backend: SifsBrowserBackend,
@@ -2126,6 +2133,19 @@ impl SifsBrowser {
         match &self.backend {
             SifsBrowserBackend::Local(backend) => backend.read_file(path),
             SifsBrowserBackend::Remote(remote) => remote.read_file(path),
+        }
+    }
+
+    pub fn read_file_prefix(&self, path: &str, max_bytes: u64) -> Result<SifsFileRead, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => {
+                let read = backend.read_file_prefix(path, max_bytes)?;
+                Ok(SifsFileRead {
+                    bytes: read.bytes,
+                    truncated: read.truncated,
+                })
+            }
+            SifsBrowserBackend::Remote(remote) => remote.read_file_prefix(path, max_bytes),
         }
     }
 
@@ -2300,6 +2320,20 @@ impl RemoteSifsBrowser {
             },
         )?;
         Ok(response.bytes)
+    }
+
+    fn read_file_prefix(&self, path: &str, max_bytes: u64) -> Result<SifsFileRead, String> {
+        let response: sinomo_runtime::daemon::DaemonDfsBrowserReadFilePrefixResponse = self.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserReadFilePrefixRequest {
+                path: path.to_string(),
+                max_bytes,
+            },
+        )?;
+        Ok(SifsFileRead {
+            bytes: response.bytes,
+            truncated: response.truncated,
+        })
     }
 
     fn read_files(

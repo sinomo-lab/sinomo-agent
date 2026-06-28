@@ -42,7 +42,7 @@ use sui::{
     WindowEvent, draw_glyph,
 };
 
-use sinomo_cli::app_api::{SifsBrowser, SifsEntry, SifsObjectDetails};
+use sinomo_cli::app_api::{SifsBrowser, SifsEntry, SifsFileRead, SifsObjectDetails};
 use sinomo_runtime::local::SinomoDataDir;
 use time::format_description::well_known::Rfc3339;
 
@@ -65,6 +65,8 @@ const LIST_HEADER_H: f32 = 36.0;
 const LIST_TASK_STRIP_H: f32 = 88.0;
 const PLACES_W: f32 = 190.0;
 const PLACE_ROW_H: f32 = 42.0;
+const FILE_PREVIEW_MAX_BYTES: u64 = 32 * 1024;
+const FILE_PREVIEW_MAX_LINES: usize = 8;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
@@ -237,6 +239,14 @@ struct FilePlace {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct FilesPreview {
+    title: String,
+    lines: Vec<String>,
+    truncated: bool,
+    binary: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum FilesOperationFailure {
     Cancelled(String),
     Error(String),
@@ -270,6 +280,9 @@ pub struct FilesState {
     selected_local_details: Option<LocalObjectDetails>,
     pub details_loading: bool,
     pub details_error: Option<String>,
+    selected_preview: Option<FilesPreview>,
+    preview_loading: bool,
+    preview_error: Option<String>,
     action_prompt: Option<FileActionPrompt>,
     tasks: Vec<FilesTask>,
     pending_select_path: Option<String>,
@@ -283,6 +296,7 @@ pub struct FilesState {
     next_request_id: u64,
     pending_request_id: Option<u64>,
     pending_details_request_id: Option<u64>,
+    pending_preview_request_id: Option<u64>,
 }
 
 impl FilesState {
@@ -309,6 +323,9 @@ impl FilesState {
             selected_local_details: None,
             details_loading: false,
             details_error: None,
+            selected_preview: None,
+            preview_loading: false,
+            preview_error: None,
             action_prompt: None,
             tasks: Vec::new(),
             pending_select_path: None,
@@ -322,6 +339,7 @@ impl FilesState {
             next_request_id: 0,
             pending_request_id: None,
             pending_details_request_id: None,
+            pending_preview_request_id: None,
         }
     }
 
@@ -493,6 +511,7 @@ impl FilesState {
         self.loading = false;
         self.pending_request_id = None;
         self.pending_details_request_id = None;
+        self.pending_preview_request_id = None;
         self.worker_tx = None;
         self.worker_rx = None;
         self.worker_result_tx = None;
@@ -560,6 +579,13 @@ impl FilesState {
                         self.pending_details_request_id = None;
                         self.selected_details = None;
                         self.details_error = Some("SIFS browser worker stopped".to_string());
+                        changed = true;
+                    }
+                    if self.preview_loading {
+                        self.preview_loading = false;
+                        self.pending_preview_request_id = None;
+                        self.selected_preview = None;
+                        self.preview_error = Some("SIFS browser worker stopped".to_string());
                         changed = true;
                     }
                     self.worker_rx = None;
@@ -654,6 +680,36 @@ impl FilesState {
                 }
                 true
             }
+            FilesWorkerResult::Preview {
+                request_id,
+                source,
+                path,
+                result,
+            } => {
+                if self.pending_preview_request_id != Some(request_id) {
+                    return false;
+                }
+                if self.source != source {
+                    return false;
+                }
+                self.pending_preview_request_id = None;
+                self.preview_loading = false;
+                let selected_path = self.selected_entry().map(|entry| entry.path.as_str());
+                if selected_path != Some(path.as_str()) {
+                    return false;
+                }
+                match result {
+                    Ok(preview) => {
+                        self.selected_preview = Some(preview);
+                        self.preview_error = None;
+                    }
+                    Err(error) => {
+                        self.selected_preview = None;
+                        self.preview_error = Some(error);
+                    }
+                }
+                true
+            }
             FilesWorkerResult::TaskProgress {
                 request_id,
                 detail,
@@ -717,6 +773,7 @@ impl FilesState {
         self.loading = false;
         self.pending_request_id = None;
         self.pending_details_request_id = None;
+        self.pending_preview_request_id = None;
         self.list_revision = self.list_revision.wrapping_add(1);
         if let Some(waker) = waker {
             self.ensure_worker(waker);
@@ -738,6 +795,10 @@ impl FilesState {
         self.details_loading = false;
         self.details_error = None;
         self.pending_details_request_id = None;
+        self.selected_preview = None;
+        self.preview_loading = false;
+        self.preview_error = None;
+        self.pending_preview_request_id = None;
     }
 
     fn selected_entry(&self) -> Option<&SifsEntry> {
@@ -745,10 +806,11 @@ impl FilesState {
     }
 
     fn request_selected_details(&mut self) {
-        let Some(path) = self.selected_entry().map(|entry| entry.path.clone()) else {
+        let Some(entry) = self.selected_entry().cloned() else {
             self.clear_selected_details();
             return;
         };
+        let path = entry.path.clone();
         self.selected_details = None;
         self.details_error = None;
         if let Some(tx) = self.worker_tx.clone() {
@@ -768,6 +830,7 @@ impl FilesState {
                 self.details_loading = false;
                 self.details_error = Some("SIFS browser worker stopped".to_string());
             }
+            self.request_selected_preview(entry);
             return;
         }
 
@@ -784,6 +847,55 @@ impl FilesState {
                 Ok(details) => self.selected_local_details = Some(details),
                 Err(error) => self.details_error = Some(error),
             },
+        }
+        self.request_selected_preview(entry);
+    }
+
+    fn request_selected_preview(&mut self, entry: SifsEntry) {
+        self.selected_preview = None;
+        self.preview_error = None;
+        self.pending_preview_request_id = None;
+        if entry.is_dir {
+            self.preview_loading = false;
+            return;
+        }
+        if let Some(tx) = self.worker_tx.clone() {
+            let request_id = self.next_request_id;
+            self.next_request_id = self.next_request_id.wrapping_add(1);
+            self.pending_preview_request_id = Some(request_id);
+            self.preview_loading = true;
+            if tx
+                .send(FilesWorkerCommand::Preview {
+                    request_id,
+                    source: self.source,
+                    path: entry.path,
+                })
+                .is_err()
+            {
+                self.pending_preview_request_id = None;
+                self.preview_loading = false;
+                self.preview_error = Some("SIFS browser worker stopped".to_string());
+            }
+            return;
+        }
+
+        self.preview_loading = false;
+        let result = match self.source {
+            FilesSourceKind::Sifs => self
+                .browser
+                .as_ref()
+                .ok_or_else(|| "SIFS browser is not open".to_string())
+                .and_then(|browser| {
+                    browser
+                        .read_file_prefix(&entry.path, FILE_PREVIEW_MAX_BYTES)
+                        .map(|read| preview_from_read(&entry.name, read))
+                }),
+            FilesSourceKind::Local => local_read_file_prefix(&entry.path, FILE_PREVIEW_MAX_BYTES)
+                .map(|read| preview_from_read(&entry.name, read)),
+        };
+        match result {
+            Ok(preview) => self.selected_preview = Some(preview),
+            Err(error) => self.preview_error = Some(error),
         }
     }
 
@@ -1282,6 +1394,12 @@ enum FilesWorkerResult {
         path: String,
         result: Result<FilesObjectDetails, String>,
     },
+    Preview {
+        request_id: u64,
+        source: FilesSourceKind,
+        path: String,
+        result: Result<FilesPreview, String>,
+    },
     TaskProgress {
         request_id: u64,
         detail: String,
@@ -1300,6 +1418,11 @@ enum FilesWorkerCommand {
         path: String,
     },
     Details {
+        request_id: u64,
+        source: FilesSourceKind,
+        path: String,
+    },
+    Preview {
         request_id: u64,
         source: FilesSourceKind,
         path: String,
@@ -1472,6 +1595,81 @@ fn files_worker_loop(
                     }
                 };
                 let _ = result_tx.send(FilesWorkerResult::Details {
+                    request_id,
+                    source,
+                    path,
+                    result,
+                });
+            }
+            FilesWorkerCommand::Preview {
+                request_id,
+                source,
+                path,
+            } => {
+                let requested_path = normalize_source_path(source, &path);
+                let (path, result) = if source == FilesSourceKind::Local {
+                    let path = requested_path.unwrap_or_else(|error| {
+                        let _ = result_tx.send(FilesWorkerResult::Preview {
+                            request_id,
+                            source,
+                            path: path.clone(),
+                            result: Err(error),
+                        });
+                        String::new()
+                    });
+                    if path.is_empty() {
+                        waker.wake();
+                        continue;
+                    }
+                    let name = Path::new(&path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(&path)
+                        .to_string();
+                    let result = local_read_file_prefix(&path, FILE_PREVIEW_MAX_BYTES)
+                        .map(|read| preview_from_read(&name, read));
+                    (path, result)
+                } else if let Some(error) = &open_error {
+                    let requested_path = requested_path.unwrap_or_else(|_| normalize_path(&path));
+                    (requested_path, Err(error.clone()))
+                } else {
+                    let requested_path = requested_path.unwrap_or_else(|_| normalize_path(&path));
+                    if browser.is_none() {
+                        match daemon_address.as_deref() {
+                            Some(address) => {
+                                match SifsBrowser::open_daemon_on_runtime(address, &app_runtime) {
+                                    Ok(opened) => browser = Some(opened),
+                                    Err(error) => open_error = Some(error),
+                                }
+                            }
+                            None => {
+                                let _ = &data_dir;
+                                open_error =
+                                    Some("SIFS browsing requires a daemon connection".to_string());
+                            }
+                        }
+                    }
+                    match (&browser, &open_error) {
+                        (Some(browser), _) => {
+                            let path = browser.normalize(&requested_path);
+                            let name = path
+                                .rsplit('/')
+                                .find(|part| !part.is_empty())
+                                .unwrap_or(&path)
+                                .to_string();
+                            let result = browser
+                                .read_file_prefix(&path, FILE_PREVIEW_MAX_BYTES)
+                                .map(|read| preview_from_read(&name, read));
+                            (path, result)
+                        }
+                        (None, Some(error)) => (requested_path, Err(error.clone())),
+                        (None, None) => (
+                            requested_path,
+                            Err("SIFS browser did not start".to_string()),
+                        ),
+                    }
+                };
+                let _ = result_tx.send(FilesWorkerResult::Preview {
                     request_id,
                     source,
                     path,
@@ -1878,6 +2076,21 @@ fn local_details(path: &str) -> Result<LocalObjectDetails, String> {
         modified_at_unix_nanos: metadata.modified().ok().and_then(system_time_unix_nanos),
         created_at_unix_nanos: metadata.created().ok().and_then(system_time_unix_nanos),
     })
+}
+
+fn local_read_file_prefix(path: &str, max_bytes: u64) -> Result<SifsFileRead, String> {
+    let file = fs::File::open(path).map_err(|error| format!("cannot open {path}: {error}"))?;
+    let truncated = file
+        .metadata()
+        .ok()
+        .map(|metadata| metadata.len() > max_bytes)
+        .unwrap_or(false);
+    let mut reader = file.take(max_bytes);
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {path}: {error}"))?;
+    Ok(SifsFileRead { bytes, truncated })
 }
 
 fn system_time_unix_nanos(time: std::time::SystemTime) -> Option<u64> {
@@ -3129,6 +3342,90 @@ fn local_details_signature(details: Option<&LocalObjectDetails>) -> String {
             )
         })
         .unwrap_or_default()
+}
+
+fn files_preview_signature(preview: Option<&FilesPreview>) -> String {
+    preview
+        .map(|preview| {
+            format!(
+                "{}|{}|{}|{}",
+                preview.title,
+                preview.truncated,
+                preview.binary,
+                preview.lines.join("\n")
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn preview_from_read(name: &str, read: SifsFileRead) -> FilesPreview {
+    if read.bytes.is_empty() {
+        return FilesPreview {
+            title: format!("Preview {}", name),
+            lines: vec!["Empty file".to_string()],
+            truncated: read.truncated,
+            binary: false,
+        };
+    }
+    if !preview_bytes_are_text(&read.bytes) {
+        return FilesPreview {
+            title: format!("Binary preview {}", name),
+            lines: binary_preview_lines(&read.bytes),
+            truncated: read.truncated,
+            binary: true,
+        };
+    }
+    let text = String::from_utf8_lossy(&read.bytes).replace("\r\n", "\n");
+    let mut lines = text
+        .lines()
+        .take(FILE_PREVIEW_MAX_LINES)
+        .map(|line| {
+            if line.trim().is_empty() {
+                "(blank line)".to_string()
+            } else {
+                middle_short(line, 140)
+            }
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push("(no visible text)".to_string());
+    }
+    let line_truncated = text.lines().nth(FILE_PREVIEW_MAX_LINES).is_some();
+    FilesPreview {
+        title: format!("Preview {}", name),
+        lines,
+        truncated: read.truncated || line_truncated,
+        binary: false,
+    }
+}
+
+fn preview_bytes_are_text(bytes: &[u8]) -> bool {
+    if bytes.contains(&0) {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    !text
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+}
+
+fn binary_preview_lines(bytes: &[u8]) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{} loaded for inspection",
+        human_size(Some(bytes.len() as u64))
+    )];
+    let hex = bytes
+        .iter()
+        .take(24)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !hex.is_empty() {
+        lines.push(hex);
+    }
+    lines
 }
 
 fn unix_nanos_label(nanos: u64) -> String {
@@ -4872,7 +5169,7 @@ impl InspectorView {
         }
         match files.selected_entry() {
             Some(entry) => format!(
-                "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 files.source,
                 entry.path,
                 entry.is_dir,
@@ -4880,9 +5177,12 @@ impl InspectorView {
                 files.clustered,
                 files.details_loading,
                 files.details_error.as_deref().unwrap_or(""),
+                files.preview_loading,
+                files.preview_error.as_deref().unwrap_or(""),
                 files.inspector_details_open,
                 sifs_details_signature(files.selected_details.as_ref()),
-                local_details_signature(files.selected_local_details.as_ref())
+                local_details_signature(files.selected_local_details.as_ref()),
+                files_preview_signature(files.selected_preview.as_ref())
             ),
             None => format!(
                 "unselected|{:?}|{}|{}",
@@ -4922,8 +5222,10 @@ impl InspectorView {
         let Some(entry) = files.selected_entry() else {
             let status = if files.entries.is_empty() {
                 "No entries in this directory"
-            } else {
+            } else if files.source == FilesSourceKind::Sifs {
                 "Select an object to inspect placement"
+            } else {
+                "Select an object to inspect metadata"
             };
             let rows = [
                 ("Path", files.path.clone()),
@@ -4944,6 +5246,15 @@ impl InspectorView {
         }
 
         y += Self::info_row_height(w, &entry.path);
+        if !entry.is_dir {
+            y += 10.0
+                + Self::preview_section_height(
+                    w,
+                    files.preview_loading,
+                    files.preview_error.as_deref(),
+                    files.selected_preview.as_ref(),
+                );
+        }
 
         if files.source == FilesSourceKind::Local {
             y += 10.0 + 24.0;
@@ -5083,6 +5394,40 @@ impl InspectorView {
             .map(|line| line.chars().count().max(1).div_ceil(chars_per_line))
             .sum::<usize>()
             .max(1)
+    }
+
+    fn preview_section_height(
+        w: f32,
+        loading: bool,
+        error: Option<&str>,
+        preview: Option<&FilesPreview>,
+    ) -> f32 {
+        let inner_w = (w - 24.0).max(0.0);
+        let mut height = 42.0;
+        if loading {
+            return height + 18.0 + 12.0;
+        }
+        if let Some(error) = error {
+            let lines = Self::estimated_line_count(error, inner_w, 7.0).min(3);
+            return height + lines as f32 * 17.0 + 12.0;
+        }
+        let Some(preview) = preview else {
+            return height + 18.0 + 12.0;
+        };
+
+        if preview.binary {
+            let value = preview.lines.join(" ");
+            let lines = Self::estimated_line_count(&value, inner_w, 7.0).min(3);
+            height += lines as f32 * 17.0;
+        } else {
+            for line in preview.lines.iter().take(FILE_PREVIEW_MAX_LINES) {
+                height += Self::estimated_line_count(line, inner_w, 7.0).min(2) as f32 * 17.0;
+            }
+        }
+        if preview.truncated {
+            height += 17.0;
+        }
+        height + 12.0
     }
 }
 
@@ -5476,8 +5821,10 @@ impl Widget for InspectorView {
         let Some(entry) = files.selected_entry() else {
             let status = if files.entries.is_empty() {
                 "No entries in this directory"
-            } else {
+            } else if files.source == FilesSourceKind::Sifs {
                 "Select an object to inspect placement"
+            } else {
+                "Select an object to inspect metadata"
             };
             self.state_panel(
                 ctx,
@@ -5486,7 +5833,7 @@ impl Widget for InspectorView {
                 x,
                 y,
                 w,
-                "SIFS browser",
+                files.source.label(),
                 &[
                     ("Path", files.path.clone()),
                     ("Entries", files.entries.len().to_string()),
@@ -5542,6 +5889,20 @@ impl Widget for InspectorView {
         }
 
         y = self.info_row(ctx, &theme, &pal, x, y, w, "Path", &entry.path);
+        if !entry.is_dir {
+            y += 10.0;
+            y = self.preview_section(
+                ctx,
+                &theme,
+                &pal,
+                x,
+                y,
+                w,
+                files.preview_loading,
+                files.preview_error.as_deref(),
+                files.selected_preview.as_ref(),
+            );
+        }
 
         if files.source == FilesSourceKind::Local {
             y += 10.0;
@@ -6235,6 +6596,131 @@ impl InspectorView {
             y += 17.0;
         }
         y + 6.0
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn preview_section(
+        &self,
+        ctx: &mut PaintCtx,
+        theme: &sui::DefaultTheme,
+        pal: &Palette,
+        x: f32,
+        y: f32,
+        w: f32,
+        loading: bool,
+        error: Option<&str>,
+        preview: Option<&FilesPreview>,
+    ) -> f32 {
+        let height = Self::preview_section_height(w, loading, error, preview);
+        let panel = Rect::new(x, y, w, height);
+        widgets::round_panel(ctx, panel, pal.panel, pal.border, 8.0);
+
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(
+                panel.x() + 12.0,
+                panel.y() + 10.0,
+                panel.width() - 24.0,
+                16.0,
+            ),
+            "PREVIEW",
+            pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint),
+        );
+
+        let mut row_y = panel.y() + 34.0;
+        let inner_w = (panel.width() - 24.0).max(0.0);
+        let value_style = pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text);
+        let muted_style = pal.text_style(theme, 10.8, FontWeight::NORMAL, pal.text_faint);
+
+        if loading {
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(panel.x() + 12.0, row_y, inner_w, 18.0),
+                "Reading bounded preview",
+                value_style,
+            );
+            return panel.max_y();
+        }
+
+        if let Some(error) = error {
+            for line in widgets::wrap_lines(error, inner_w, |s| {
+                ctx.measure_text(s, value_style.clone())
+                    .map(|m| m.width)
+                    .unwrap_or(0.0)
+            })
+            .into_iter()
+            .take(3)
+            {
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(panel.x() + 12.0, row_y, inner_w, 18.0),
+                    &line,
+                    value_style.clone(),
+                );
+                row_y += 17.0;
+            }
+            return panel.max_y();
+        }
+
+        let Some(preview) = preview else {
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(panel.x() + 12.0, row_y, inner_w, 18.0),
+                "Select a file to load a bounded preview",
+                value_style,
+            );
+            return panel.max_y();
+        };
+
+        if preview.binary {
+            let value = preview.lines.join(" ");
+            for line in widgets::wrap_lines(&value, inner_w, |s| {
+                ctx.measure_text(s, value_style.clone())
+                    .map(|m| m.width)
+                    .unwrap_or(0.0)
+            })
+            .into_iter()
+            .take(3)
+            {
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(panel.x() + 12.0, row_y, inner_w, 18.0),
+                    &line,
+                    value_style.clone(),
+                );
+                row_y += 17.0;
+            }
+        } else {
+            for line in preview.lines.iter().take(FILE_PREVIEW_MAX_LINES) {
+                for wrapped in widgets::wrap_lines(line, inner_w, |s| {
+                    ctx.measure_text(s, value_style.clone())
+                        .map(|m| m.width)
+                        .unwrap_or(0.0)
+                })
+                .into_iter()
+                .take(2)
+                {
+                    widgets::draw_text_in(
+                        ctx,
+                        Rect::new(panel.x() + 12.0, row_y, inner_w, 18.0),
+                        &wrapped,
+                        value_style.clone(),
+                    );
+                    row_y += 17.0;
+                }
+            }
+        }
+
+        if preview.truncated {
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(panel.x() + 12.0, row_y, inner_w, 18.0),
+                &format!("Preview truncated to {} KB.", FILE_PREVIEW_MAX_BYTES / 1024),
+                muted_style,
+            );
+        }
+
+        panel.max_y()
     }
 }
 
@@ -7715,12 +8201,12 @@ mod tests {
 
         let inspector = InspectorView::new(shared.clone());
         assert!(inspector.summary().contains(
-            "/artifact.txt|false|false|true|false|device authorization was denied|false|"
+            "/artifact.txt|false|false|true|false|device authorization was denied|false||false|"
         ));
 
         shared.files_mut().inspector_details_open = true;
         assert!(inspector.summary().contains(
-            "/artifact.txt|false|false|true|false|device authorization was denied|true|"
+            "/artifact.txt|false|false|true|false|device authorization was denied|false||true|"
         ));
     }
 
@@ -8190,6 +8676,111 @@ mod tests {
     }
 
     #[test]
+    fn local_read_file_prefix_caps_large_files() {
+        let root = files_test_temp_dir("preview-prefix");
+        let path = root.join("large.txt");
+        fs::write(&path, b"abcdef").expect("write file");
+
+        let read = local_read_file_prefix(&path.to_string_lossy(), 3).expect("prefix read");
+
+        assert_eq!(read.bytes, b"abc");
+        assert!(read.truncated);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preview_from_read_formats_text_empty_and_binary_files() {
+        let text = preview_from_read(
+            "notes.txt",
+            SifsFileRead {
+                bytes: b"alpha\n\nbeta\n".to_vec(),
+                truncated: false,
+            },
+        );
+        assert_eq!(text.title, "Preview notes.txt");
+        assert_eq!(text.lines, vec!["alpha", "(blank line)", "beta"]);
+        assert!(!text.binary);
+        assert!(!text.truncated);
+
+        let empty = preview_from_read(
+            "empty.txt",
+            SifsFileRead {
+                bytes: Vec::new(),
+                truncated: false,
+            },
+        );
+        assert_eq!(empty.lines, vec!["Empty file"]);
+        assert!(!empty.binary);
+
+        let binary = preview_from_read(
+            "image.bin",
+            SifsFileRead {
+                bytes: vec![0, 1, 2, 3],
+                truncated: true,
+            },
+        );
+        assert_eq!(binary.title, "Binary preview image.bin");
+        assert!(binary.binary);
+        assert!(binary.truncated);
+        assert!(binary.lines.iter().any(|line| line.contains("00 01 02 03")));
+    }
+
+    #[test]
+    fn worker_result_updates_selected_preview_and_ignores_stale_preview() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.entries = vec![SifsEntry {
+            name: "artifact.txt".to_string(),
+            path: "/services/artifact.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(5),
+        }];
+        state.selected = Some(0);
+        state.preview_loading = true;
+        state.pending_preview_request_id = Some(22);
+
+        let changed = state.apply_worker_result(FilesWorkerResult::Preview {
+            request_id: 22,
+            source: FilesSourceKind::Sifs,
+            path: "/services/artifact.txt".to_string(),
+            result: Ok(preview_from_read(
+                "artifact.txt",
+                SifsFileRead {
+                    bytes: b"hello".to_vec(),
+                    truncated: false,
+                },
+            )),
+        });
+
+        assert!(changed);
+        assert!(!state.preview_loading);
+        assert_eq!(state.pending_preview_request_id, None);
+        assert_eq!(
+            state
+                .selected_preview
+                .as_ref()
+                .map(|preview| preview.lines.as_slice()),
+            Some(&["hello".to_string()][..])
+        );
+
+        state.preview_loading = true;
+        state.pending_preview_request_id = Some(23);
+        let changed = state.apply_worker_result(FilesWorkerResult::Preview {
+            request_id: 22,
+            source: FilesSourceKind::Sifs,
+            path: "/services/artifact.txt".to_string(),
+            result: Err("late error".to_string()),
+        });
+
+        assert!(!changed);
+        assert!(state.preview_loading);
+        assert_eq!(state.pending_preview_request_id, Some(23));
+        assert_eq!(state.preview_error, None);
+    }
+
+    #[test]
     fn worker_progress_updates_running_task_detail_and_fraction() {
         let backend = Backend::local_fallback();
         let mut state = FilesState::new(&backend);
@@ -8338,6 +8929,7 @@ mod tests {
                 assert_eq!(path, "/services");
             }
             FilesWorkerCommand::Details { .. } => panic!("expected list command"),
+            FilesWorkerCommand::Preview { .. } => panic!("expected list command"),
             FilesWorkerCommand::Operation { .. } => panic!("expected list command"),
         }
     }
@@ -8379,6 +8971,7 @@ mod tests {
             }
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
         }
     }
 
@@ -9217,6 +9810,7 @@ mod tests {
             }
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
         }
 
         window
@@ -9238,6 +9832,7 @@ mod tests {
             }
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
         }
 
         window
@@ -9259,6 +9854,7 @@ mod tests {
             }
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),
             FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
         }
 
         Ok(())
