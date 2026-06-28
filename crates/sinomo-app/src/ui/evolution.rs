@@ -32,6 +32,9 @@ const CONTROL_LABEL_H: f32 = 14.0;
 const CONTROL_LABEL_GAP: f32 = 5.0;
 const CONTROL_H: f32 = 38.0;
 const CONTROL_GAP: f32 = 8.0;
+const STARTER_ACTION_COUNT: usize = 3;
+const STARTER_ACTION_H: f32 = 30.0;
+const STARTER_ACTION_GAP: f32 = 8.0;
 const START_OPTIONS_W: f32 = 112.0;
 const START_BUTTON_W: f32 = 112.0;
 const START_TARGET_W: f32 = 138.0;
@@ -58,6 +61,7 @@ pub struct EvolutionState {
     pub readiness_details_open: bool,
     pub start_status: Option<String>,
     pub start_error: Option<String>,
+    objective_revision: u64,
     start_rx: Option<Receiver<EvolutionStartEvent>>,
     pub decision_status: Option<String>,
     pub decision_error: Option<String>,
@@ -79,6 +83,7 @@ impl EvolutionState {
             readiness_details_open: false,
             start_status: None,
             start_error: None,
+            objective_revision: 0,
             start_rx: None,
             decision_status: None,
             decision_error: None,
@@ -113,6 +118,12 @@ impl EvolutionState {
     pub fn set_objective_draft(&mut self, value: String) {
         self.objective_draft = value;
         self.start_error = None;
+    }
+
+    fn apply_starter_objective(&mut self, objective: EvolutionStarterObjective) {
+        self.objective_draft = objective.prompt().to_string();
+        self.start_error = None;
+        self.objective_revision = self.objective_revision.wrapping_add(1);
     }
 
     pub fn set_scope_draft(&mut self, value: String) {
@@ -309,6 +320,55 @@ const EVOLUTION_TARGET_RINGS: [TargetRingOption; 3] = [
     },
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EvolutionStarterObjective {
+    PolishApp,
+    FixCheck,
+    CheckCluster,
+}
+
+impl EvolutionStarterObjective {
+    const ALL: [Self; STARTER_ACTION_COUNT] = [Self::PolishApp, Self::FixCheck, Self::CheckCluster];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::PolishApp => "Polish app",
+            Self::FixCheck => "Fix check",
+            Self::CheckCluster => "Check cluster",
+        }
+    }
+
+    fn prompt(self) -> &'static str {
+        match self {
+            Self::PolishApp => {
+                "Improve one sinomo-app workflow for clarity, verify the behavior, and keep low-level details behind explicit controls."
+            }
+            Self::FixCheck => {
+                "Find the next failing focused check in this repository, fix it, and verify with the smallest relevant cargo command."
+            }
+            Self::CheckCluster => {
+                "Check the local cluster status, fix any blocking connection issue, and only roll out if the runtime change requires it."
+            }
+        }
+    }
+
+    fn icon(self) -> IconGlyph {
+        match self {
+            Self::PolishApp => IconGlyph::Sparkles,
+            Self::FixCheck => IconGlyph::Check,
+            Self::CheckCluster => IconGlyph::Storage,
+        }
+    }
+
+    fn width(self) -> f32 {
+        match self {
+            Self::PolishApp => 122.0,
+            Self::FixCheck => 108.0,
+            Self::CheckCluster => 130.0,
+        }
+    }
+}
+
 fn parse_scope_paths(value: &str) -> Vec<String> {
     value
         .split(|ch: char| ch == ',' || ch == '\n' || ch == ';')
@@ -328,6 +388,90 @@ fn theme_reader(shared: &Shared) -> ThemeReader {
 fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     let reader = Rc::clone(reader);
     move || reader()
+}
+
+struct RebuildOnChange<K: PartialEq + Clone> {
+    key_fn: Box<dyn Fn() -> K>,
+    build: Box<dyn Fn(&K) -> WidgetPod>,
+    last_key: K,
+    child: WidgetPod,
+}
+
+impl<K: PartialEq + Clone> RebuildOnChange<K> {
+    fn new<KF, BF>(key_fn: KF, build: BF) -> Self
+    where
+        KF: Fn() -> K + 'static,
+        BF: Fn(&K) -> WidgetPod + 'static,
+    {
+        let last_key = key_fn();
+        let child = build(&last_key);
+        Self {
+            key_fn: Box::new(key_fn),
+            build: Box::new(build),
+            last_key,
+            child,
+        }
+    }
+
+    fn refresh(&mut self) -> bool {
+        let key = (self.key_fn)();
+        if key != self.last_key {
+            self.child = (self.build)(&key);
+            self.last_key = key;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl<K: PartialEq + Clone + 'static> Widget for RebuildOnChange<K> {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        let pointer_up = matches!(
+            event,
+            Event::Pointer(pointer) if matches!(pointer.kind, PointerEventKind::Up)
+        );
+        if pointer_up && self.refresh() {
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_paint();
+        }
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.refresh();
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+fn request_window_relayout(ctx: &mut EventCtx) {
+    use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
+
+    let window = InvalidationTarget::Window(ctx.window_id());
+    ctx.request(InvalidationRequest::new(window, InvalidationKind::Measure));
+    ctx.request(InvalidationRequest::new(window, InvalidationKind::Arrange));
+    ctx.request_paint();
+    ctx.request_semantics();
 }
 
 fn ready_backend(shared: &Shared) -> Option<Backend> {
@@ -467,6 +611,7 @@ struct StartControlsLayout {
     options_label: Rect,
     scope_label: Rect,
     target_label: Rect,
+    starter_actions: [Rect; STARTER_ACTION_COUNT],
     objective: Rect,
     options: Rect,
     scope: Rect,
@@ -481,6 +626,7 @@ struct StartControls {
     scope: WidgetPod,
     target: WidgetPod,
     start: WidgetPod,
+    starter_actions: [WidgetPod; STARTER_ACTION_COUNT],
 }
 
 impl StartControls {
@@ -489,13 +635,14 @@ impl StartControls {
 
         let objective = {
             let s = shared.clone();
-            TextInput::new("evolution-objective")
-                .value(shared.evolution().objective_draft.clone())
-                .placeholder(OBJECTIVE_PLACEHOLDER)
-                .theme_when(clone_reader(&reader))
-                .on_change(move |value| {
-                    s.evolution_mut().set_objective_draft(value);
-                })
+            let r = Rc::clone(&reader);
+            RebuildOnChange::new(
+                {
+                    let s = s.clone();
+                    move || s.evolution().objective_revision
+                },
+                move |_revision| WidgetPod::new(objective_input(&s, &r)),
+            )
         };
 
         let options = {
@@ -554,6 +701,23 @@ impl StartControls {
                     s.evolution_mut().start();
                 })
         };
+        let starter_actions = std::array::from_fn(|index| {
+            let action = EvolutionStarterObjective::ALL[index];
+            let s = shared.clone();
+            let enabled_shared = shared.clone();
+            let reader = Rc::clone(&reader);
+            WidgetPod::new(
+                Button::new(action.label())
+                    .icon(action.icon())
+                    .min_height(STARTER_ACTION_H)
+                    .enabled_when(move || !enabled_shared.evolution().is_starting())
+                    .theme_when(clone_reader(&reader))
+                    .on_press_with_ctx(move |ctx| {
+                        s.evolution_mut().apply_starter_objective(action);
+                        request_window_relayout(ctx);
+                    }),
+            )
+        });
 
         Self {
             shared,
@@ -562,8 +726,20 @@ impl StartControls {
             scope: WidgetPod::new(scope),
             target: WidgetPod::new(target),
             start: WidgetPod::new(start),
+            starter_actions,
         }
     }
+}
+
+fn objective_input(shared: &Shared, reader: &ThemeReader) -> TextInput {
+    let s = shared.clone();
+    TextInput::new("evolution-objective")
+        .value(shared.evolution().objective_draft.clone())
+        .placeholder(OBJECTIVE_PLACEHOLDER)
+        .theme_when(clone_reader(reader))
+        .on_change(move |value| {
+            s.evolution_mut().set_objective_draft(value);
+        })
 }
 
 impl Widget for StartControls {
@@ -571,6 +747,12 @@ impl Widget for StartControls {
         let bounds = Rect::new(0.0, 0.0, constraints.max.width, constraints.max.height);
         let advanced_open = self.shared.evolution().start_advanced_open;
         let layout = start_controls_layout(bounds, advanced_open);
+        for (index, action) in self.starter_actions.iter_mut().enumerate() {
+            action.measure(
+                ctx,
+                Constraints::tight(rect_size(layout.starter_actions[index])),
+            );
+        }
         self.objective
             .measure(ctx, Constraints::tight(rect_size(layout.objective)));
         self.options
@@ -592,6 +774,9 @@ impl Widget for StartControls {
     fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
         let advanced_open = self.shared.evolution().start_advanced_open;
         let layout = start_controls_layout(bounds, advanced_open);
+        for (index, action) in self.starter_actions.iter_mut().enumerate() {
+            action.arrange(ctx, layout.starter_actions[index]);
+        }
         self.objective.arrange(ctx, layout.objective);
         self.options.arrange(ctx, layout.options);
         if advanced_open {
@@ -606,6 +791,9 @@ impl Widget for StartControls {
 
     fn paint(&self, ctx: &mut PaintCtx) {
         let advanced_open = self.shared.evolution().start_advanced_open;
+        for action in &self.starter_actions {
+            action.paint(ctx);
+        }
         self.objective.paint(ctx);
         self.options.paint(ctx);
         if advanced_open {
@@ -617,6 +805,9 @@ impl Widget for StartControls {
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         let advanced_open = self.shared.evolution().start_advanced_open;
+        for action in &self.starter_actions {
+            action.semantics(ctx);
+        }
         self.objective.semantics(ctx);
         self.options.semantics(ctx);
         if advanced_open {
@@ -627,6 +818,9 @@ impl Widget for StartControls {
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        for action in &self.starter_actions {
+            visitor.visit(action);
+        }
         visitor.visit(&self.objective);
         visitor.visit(&self.options);
         visitor.visit(&self.scope);
@@ -635,6 +829,9 @@ impl Widget for StartControls {
     }
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        for action in &mut self.starter_actions {
+            visitor.visit(action);
+        }
         visitor.visit(&mut self.objective);
         visitor.visit(&mut self.options);
         visitor.visit(&mut self.scope);
@@ -645,6 +842,10 @@ impl Widget for StartControls {
 
 fn start_controls_layout(bounds: Rect, advanced_open: bool) -> StartControlsLayout {
     let block_h = control_block_height();
+    let starter_row_h = starter_actions_height_for(bounds.width());
+    let starter_bounds = Rect::new(bounds.x(), bounds.y(), bounds.width(), starter_row_h);
+    let starter_actions = starter_action_rects(starter_bounds);
+    let controls_y = starter_bounds.max_y() + CONTROL_GAP;
     if bounds.width() >= START_BREAKPOINT {
         let fixed_w = if advanced_open {
             START_OPTIONS_W + START_BUTTON_W + START_TARGET_W + CONTROL_GAP * 4.0
@@ -652,7 +853,8 @@ fn start_controls_layout(bounds: Rect, advanced_open: bool) -> StartControlsLayo
             START_OPTIONS_W + START_BUTTON_W + CONTROL_GAP * 2.0
         };
         let flexible_w = (bounds.width() - fixed_w).max(0.0);
-        let label_y = bounds.y() + (bounds.height() - block_h).max(0.0) / 2.0;
+        let controls_h = (bounds.max_y() - controls_y).max(0.0);
+        let label_y = controls_y + (controls_h - block_h).max(0.0) / 2.0;
         let y = label_y + CONTROL_LABEL_H + CONTROL_LABEL_GAP;
         let mut x = bounds.x();
         let (objective_w, scope_w) = if advanced_open {
@@ -693,6 +895,7 @@ fn start_controls_layout(bounds: Rect, advanced_open: bool) -> StartControlsLayo
             } else {
                 Rect::ZERO
             },
+            starter_actions,
             objective,
             options,
             scope,
@@ -700,7 +903,7 @@ fn start_controls_layout(bounds: Rect, advanced_open: bool) -> StartControlsLayo
             start,
         }
     } else {
-        let label_y = bounds.y();
+        let label_y = controls_y;
         let row1_y = label_y + CONTROL_LABEL_H + CONTROL_LABEL_GAP;
         let row2_label_y = row1_y + CONTROL_H + CONTROL_GAP;
         let row2_y = row2_label_y + CONTROL_LABEL_H + CONTROL_LABEL_GAP;
@@ -721,6 +924,7 @@ fn start_controls_layout(bounds: Rect, advanced_open: bool) -> StartControlsLayo
                 options_label: label_rect(options, row3_label_y),
                 scope_label: label_rect(scope, row2_label_y),
                 target_label: label_rect(target, row3_label_y),
+                starter_actions,
                 objective,
                 options,
                 scope,
@@ -738,6 +942,7 @@ fn start_controls_layout(bounds: Rect, advanced_open: bool) -> StartControlsLayo
                 options_label: label_rect(options, row2_label_y),
                 scope_label: Rect::ZERO,
                 target_label: Rect::ZERO,
+                starter_actions,
                 objective,
                 options,
                 scope: Rect::ZERO,
@@ -750,6 +955,51 @@ fn start_controls_layout(bounds: Rect, advanced_open: bool) -> StartControlsLayo
 
 fn control_block_height() -> f32 {
     CONTROL_LABEL_H + CONTROL_LABEL_GAP + CONTROL_H
+}
+
+fn starter_actions_height_for(width: f32) -> f32 {
+    let row_w = EvolutionStarterObjective::ALL
+        .iter()
+        .map(|action| action.width())
+        .sum::<f32>()
+        + STARTER_ACTION_GAP * (STARTER_ACTION_COUNT.saturating_sub(1) as f32);
+    if row_w <= width {
+        STARTER_ACTION_H
+    } else {
+        STARTER_ACTION_H * STARTER_ACTION_COUNT as f32
+            + STARTER_ACTION_GAP * (STARTER_ACTION_COUNT.saturating_sub(1) as f32)
+    }
+}
+
+fn starter_action_rects(bounds: Rect) -> [Rect; STARTER_ACTION_COUNT] {
+    let mut rects = [Rect::ZERO; STARTER_ACTION_COUNT];
+    let row_w = EvolutionStarterObjective::ALL
+        .iter()
+        .map(|action| action.width())
+        .sum::<f32>()
+        + STARTER_ACTION_GAP * (STARTER_ACTION_COUNT.saturating_sub(1) as f32);
+
+    if row_w <= bounds.width() {
+        let mut x = bounds.x() + (bounds.width() - row_w).max(0.0) / 2.0;
+        for (index, action) in EvolutionStarterObjective::ALL.iter().enumerate() {
+            let width = action.width();
+            rects[index] = Rect::new(x, bounds.y(), width, STARTER_ACTION_H);
+            x += width + STARTER_ACTION_GAP;
+        }
+    } else {
+        let width = bounds.width().min(220.0).max(0.0);
+        let x = bounds.x() + (bounds.width() - width).max(0.0) / 2.0;
+        for (index, _) in EvolutionStarterObjective::ALL.iter().enumerate() {
+            rects[index] = Rect::new(
+                x,
+                bounds.y() + index as f32 * (STARTER_ACTION_H + STARTER_ACTION_GAP),
+                width,
+                STARTER_ACTION_H,
+            );
+        }
+    }
+
+    rects
 }
 
 fn label_rect(control: Rect, y: f32) -> Rect {
@@ -1100,22 +1350,25 @@ fn readiness_detail_toggle_visible(
 }
 
 fn start_height_for(width: f32, advanced_open: bool) -> f32 {
-    if width >= START_BREAKPOINT {
-        START_WIDE_H
+    let controls_w = (width - PAD * 2.0).max(0.0);
+    let starter_extra = starter_actions_height_for(controls_w) + CONTROL_GAP;
+    if controls_w >= START_BREAKPOINT {
+        START_WIDE_H + starter_extra
     } else if advanced_open {
-        START_NARROW_EXPANDED_H
+        START_NARROW_EXPANDED_H + starter_extra
     } else {
-        START_NARROW_COLLAPSED_H
+        START_NARROW_COLLAPSED_H + starter_extra
     }
 }
 
 fn start_controls_height_for(width: f32, advanced_open: bool) -> f32 {
+    let starter_extra = starter_actions_height_for(width) + CONTROL_GAP;
     if width >= START_BREAKPOINT {
-        control_block_height()
+        starter_extra + control_block_height()
     } else if advanced_open {
-        control_block_height() * 3.0 + CONTROL_GAP * 2.0
+        starter_extra + control_block_height() * 3.0 + CONTROL_GAP * 2.0
     } else {
-        control_block_height() * 2.0 + CONTROL_GAP
+        starter_extra + control_block_height() * 2.0 + CONTROL_GAP
     }
 }
 
@@ -2452,6 +2705,50 @@ mod tests {
             .with_name("evolution-scope")
             .expect()
             .to_have_value("")?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn starter_objective_button_fills_objective_without_starting_job() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut evolution = shared.evolution_mut();
+            evolution.start_error = Some("old validation error".to_string());
+            evolution.dashboard = EvolutionDashboard::default();
+            evolution.selected = None;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Evolution starter objective")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Check cluster")
+            .click()?;
+
+        let expected = EvolutionStarterObjective::CheckCluster.prompt();
+        {
+            let evolution = shared.evolution();
+            assert_eq!(evolution.objective_draft, expected);
+            assert!(evolution.can_start());
+            assert!(evolution.start_error.is_none());
+            assert!(evolution.start_rx.is_none());
+            assert_eq!(evolution.objective_revision, 1);
+        }
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("evolution-objective")
+            .expect()
+            .to_have_value(expected)?;
 
         Ok(())
     }
