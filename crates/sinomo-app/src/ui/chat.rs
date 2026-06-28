@@ -359,6 +359,15 @@ impl ChatQuickAction {
             Self::ManageChannel => "Open channel agents and settings",
         }
     }
+
+    fn subtitle(self) -> &'static str {
+        match self {
+            Self::PlanChange => "Safest first step",
+            Self::CheckCluster => "Daemon health",
+            Self::ReviewRepo => "Highest-risk issue",
+            Self::ManageChannel => "Agents and title",
+        }
+    }
 }
 
 impl RuntimeRecoveryTarget {
@@ -3366,7 +3375,7 @@ fn activity_button_label(chat: &ChatState) -> &'static str {
     match chat.runtime_health().tone {
         ActivityTone::Bad | ActivityTone::Warn => "Review",
         ActivityTone::Running => "Monitor",
-        ActivityTone::Good | ActivityTone::Neutral => "Details",
+        ActivityTone::Good | ActivityTone::Neutral => "Activity",
     }
 }
 
@@ -3374,7 +3383,7 @@ fn activity_button_description(chat: &ChatState) -> String {
     let health = chat.runtime_health();
     let status = activity_status_summary(&health.detail);
     format!(
-        "Show or hide runtime details. {}: {}. {}",
+        "Show or hide runtime activity and details. {}: {}. {}",
         health.label,
         compact_line(&status, 72),
         activity_work_summary(chat)
@@ -6159,11 +6168,15 @@ impl TranscriptView {
 
     fn quick_action_width(action: ChatQuickAction) -> f32 {
         match action {
-            ChatQuickAction::PlanChange => 138.0,
-            ChatQuickAction::CheckCluster => 128.0,
-            ChatQuickAction::ReviewRepo => 116.0,
-            ChatQuickAction::ManageChannel => 136.0,
+            ChatQuickAction::PlanChange => 176.0,
+            ChatQuickAction::CheckCluster => 178.0,
+            ChatQuickAction::ReviewRepo => 166.0,
+            ChatQuickAction::ManageChannel => 176.0,
         }
+    }
+
+    fn quick_action_height(area: Rect) -> f32 {
+        if area.width() < 460.0 { 44.0 } else { 58.0 }
     }
 
     fn quick_actions(chat: &ChatState) -> &'static [ChatQuickAction] {
@@ -6179,18 +6192,18 @@ impl TranscriptView {
             return Vec::new();
         }
         let (_, cy) = Self::empty_state_center(area);
-        let gap = 8.0;
-        let button_h = 30.0;
+        let gap = 10.0;
+        let button_h = Self::quick_action_height(area);
         let widths = actions
             .iter()
             .map(|action| Self::quick_action_width(*action))
             .collect::<Vec<_>>();
         let row_w = widths.iter().sum::<f32>() + gap * actions.len().saturating_sub(1) as f32;
-        let max_w = (area.width() - PAD * 4.0).max(0.0).min(520.0);
+        let max_w = (area.width() - PAD * 4.0).max(0.0).min(560.0);
 
         if row_w <= max_w {
             let mut x = area.x() + (area.width() - row_w) * 0.5;
-            let y = cy + 58.0;
+            let y = cy + 62.0;
             return actions
                 .into_iter()
                 .zip(widths)
@@ -6202,7 +6215,7 @@ impl TranscriptView {
                 .collect();
         }
 
-        let width = max_w.clamp(180.0, 240.0);
+        let width = max_w.clamp(206.0, 280.0);
         let stack_h =
             button_h * actions.len() as f32 + gap * actions.len().saturating_sub(1) as f32;
         let x = area.x() + (area.width() - width) * 0.5;
@@ -6970,6 +6983,10 @@ impl TranscriptView {
     ) {
         let hovered = self.hovered_quick_action.get() == Some(action);
         let pressed = self.pressed_quick_action.get() == Some(action);
+        let primary = matches!(
+            action,
+            ChatQuickAction::PlanChange | ChatQuickAction::ManageChannel
+        );
         let fill = if pressed {
             pal.selected
         } else if hovered {
@@ -6977,27 +6994,41 @@ impl TranscriptView {
         } else {
             pal.panel
         };
-        widgets::round_panel(ctx, rect, fill, pal.border, 8.0);
-        let icon_side = 14.0;
-        let icon = Rect::new(
-            rect.x() + 10.0,
-            rect.y() + (rect.height() - icon_side) * 0.5,
-            icon_side,
-            icon_side,
-        );
-        let icon_color = if hovered { pal.accent } else { pal.text_muted };
+        let border = if primary { pal.accent } else { pal.border };
+        widgets::round_panel(ctx, rect, fill, border, 8.0);
+        let icon_side = if rect.height() > 46.0 { 17.0 } else { 14.0 };
+        let icon = Rect::new(rect.x() + 12.0, rect.y() + 12.0, icon_side, icon_side);
+        let icon_color = if hovered || primary {
+            pal.accent
+        } else {
+            pal.text_muted
+        };
         draw_glyph(ctx, action.icon(), icon, icon_color);
+        let title_color = if primary { pal.text } else { pal.text_muted };
         widgets::draw_text_in(
             ctx,
             Rect::new(
-                icon.max_x() + 6.0,
-                rect.y(),
-                (rect.width() - icon_side - 26.0).max(0.0),
-                rect.height(),
+                icon.max_x() + 8.0,
+                rect.y() + 8.0,
+                (rect.width() - icon_side - 32.0).max(0.0),
+                18.0,
             ),
             action.label(),
-            pal.text_style(theme, 10.5, FontWeight::SEMIBOLD, pal.text_muted),
+            pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, title_color),
         );
+        if rect.height() > 46.0 {
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(
+                    icon.max_x() + 8.0,
+                    rect.y() + 29.0,
+                    (rect.width() - icon_side - 32.0).max(0.0),
+                    18.0,
+                ),
+                action.subtitle(),
+                pal.text_style(theme, 10.5, FontWeight::NORMAL, pal.text_faint),
+            );
+        }
     }
 }
 
@@ -9995,7 +10026,7 @@ mod tests {
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Details")
+            .with_name("Activity")
             .click()?;
         assert!(
             shared.chat().activity_panel_visible(),
@@ -10004,7 +10035,7 @@ mod tests {
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Details")
+            .with_name("Activity")
             .click()?;
         assert!(
             !shared.chat().activity_panel_visible(),
@@ -10023,7 +10054,7 @@ mod tests {
         state.info.model = "gpt-5".to_string();
         state.models_loading = false;
 
-        assert_eq!(activity_button_label(&state), "Details");
+        assert_eq!(activity_button_label(&state), "Activity");
         assert!(
             activity_button_description(&state).contains("READY"),
             "quiet runtime description should include the readiness state"
