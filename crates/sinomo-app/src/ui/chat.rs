@@ -3355,6 +3355,13 @@ fn session_meta_label(session: &SessionRef) -> String {
     }
 }
 
+fn session_kind_badge_label(kind: ConversationKind) -> &'static str {
+    match kind {
+        ConversationKind::Chat => "CHAT",
+        ConversationKind::Channel => "CHANNEL",
+    }
+}
+
 fn normalized_session_filter(filter: &str) -> String {
     filter.trim().to_ascii_lowercase()
 }
@@ -3532,7 +3539,7 @@ fn session_create_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget 
         sui::Button::new("New channel")
             .icon(IconGlyph::Add)
             .min_height(32.0)
-            .theme_when(clone_reader(reader))
+            .theme_when(secondary_button_theme(reader))
             .on_press(move || {
                 let waker = { s.borrow().waker.clone() };
                 s.chat_mut().new_channel(waker);
@@ -3784,26 +3791,29 @@ impl Widget for ChatSessionRow {
         let active = self.active();
         let show_edit = self.show_edit_button();
         let edit = self.edit_rect(bounds);
-        let icon_color = if active { pal.accent } else { pal.text_faint };
         let label_color = if active { pal.text } else { pal.text_muted };
         let title_style = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, label_color);
         let meta_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
-
-        let leading = Rect::new(bounds.x() + 2.0, bounds.y(), 18.0, bounds.height());
-        match self.session.kind {
-            ConversationKind::Chat => {
-                let side = 14.0;
-                draw_glyph(
-                    ctx,
-                    IconGlyph::Chat,
-                    Rect::new(leading.x() + 1.0, leading.y() + 7.0, side, side),
-                    icon_color,
-                );
-            }
-            ConversationKind::Channel => {
-                widgets::draw_text_in(ctx, leading, "#", title_style.clone());
-            }
-        }
+        let badge_style = pal.text_style(
+            &theme,
+            8.5,
+            FontWeight::SEMIBOLD,
+            if active { pal.accent } else { pal.text_faint },
+        );
+        let badge = Rect::new(bounds.x() + 2.0, bounds.y() + 7.0, 54.0, 18.0);
+        let badge_fill = if active { pal.selected } else { pal.field };
+        let badge_border = if active {
+            pal.accent.with_alpha(0.42)
+        } else {
+            pal.border.with_alpha(0.72)
+        };
+        widgets::round_panel(ctx, badge, badge_fill, badge_border, 5.0);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(badge.x() + 6.0, badge.y() + 1.0, badge.width() - 8.0, 15.0),
+            session_kind_badge_label(self.session.kind),
+            badge_style,
+        );
 
         if show_edit {
             let (fill, border, glyph_color) = if self.pressed == Some(ChatSessionRowHit::Edit) {
@@ -3825,7 +3835,7 @@ impl Widget for ChatSessionRow {
         }
 
         let edit_gap = if show_edit { 28.0 } else { 0.0 };
-        let title_x = leading.max_x() + 5.0;
+        let title_x = badge.max_x() + 8.0;
         let title_right = bounds.max_x() - edit_gap - 5.0;
         let title_rect = Rect::new(
             title_x,
@@ -7552,6 +7562,8 @@ mod tests {
 
         assert_eq!(session_meta_label(&channel), "2 agents · not saved");
         assert_eq!(session_meta_label(&chat), "Chat · not saved");
+        assert_eq!(session_kind_badge_label(channel.kind), "CHANNEL");
+        assert_eq!(session_kind_badge_label(chat.kind), "CHAT");
     }
 
     #[test]
