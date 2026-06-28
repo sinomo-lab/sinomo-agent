@@ -434,6 +434,7 @@ pub struct ChatState {
     /// True while a provider's model list is being fetched from sinomo-lm.
     pub models_loading: bool,
     pub sessions: Vec<SessionRef>,
+    session_filter: String,
     pending_session_reset: Option<String>,
     session_edit_id: Option<String>,
     session_title_draft: String,
@@ -518,6 +519,7 @@ impl ChatState {
             effort_idx,
             models_loading: false,
             sessions,
+            session_filter: String::new(),
             pending_session_reset: None,
             session_edit_id: None,
             session_title_draft: String::new(),
@@ -1482,6 +1484,10 @@ impl ChatState {
 
     fn set_session_title_draft(&mut self, title: String) {
         self.session_title_draft = title;
+    }
+
+    fn set_session_filter(&mut self, filter: String) {
+        self.session_filter = filter;
     }
 
     fn can_save_session_title(&self) -> bool {
@@ -3136,6 +3142,20 @@ fn heading(shared: &Shared, text: &str) -> Label {
         .color_when(move || palette(&s).text_faint)
 }
 
+fn chats_heading(shared: &Shared) -> impl Widget + use<> {
+    let s = shared.clone();
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || {
+                let chat = s.chat();
+                chats_heading_text(&chat)
+            }
+        },
+        move |text| WidgetPod::new(heading(&s, text)),
+    )
+}
+
 fn muted_label(shared: &Shared, text: impl Into<String>) -> Label {
     let s = shared.clone();
     Label::new(text).color_when(move || palette(&s).text_muted)
@@ -3161,6 +3181,51 @@ fn session_meta_label(session: &SessionRef) -> String {
         ConversationKind::Channel => {
             format!("{} · {updated}", plural_agents(session.participant_count))
         }
+    }
+}
+
+fn normalized_session_filter(filter: &str) -> String {
+    filter.trim().to_ascii_lowercase()
+}
+
+fn session_kind_filter_label(kind: ConversationKind) -> &'static str {
+    match kind {
+        ConversationKind::Chat => "chat",
+        ConversationKind::Channel => "channel",
+    }
+}
+
+fn session_matches_filter(session: &SessionRef, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    session.title.to_ascii_lowercase().contains(filter)
+        || session_meta_label(session)
+            .to_ascii_lowercase()
+            .contains(filter)
+        || session_kind_filter_label(session.kind).contains(filter)
+}
+
+fn filtered_session_indices(sessions: &[SessionRef], filter: &str) -> Vec<usize> {
+    sessions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, session)| session_matches_filter(session, filter).then_some(index))
+        .collect()
+}
+
+fn chats_heading_text(chat: &ChatState) -> String {
+    let total = chat.sessions.len();
+    let filter = normalized_session_filter(&chat.session_filter);
+    if filter.is_empty() {
+        format!("CHATS · {total}")
+    } else {
+        let shown = chat
+            .sessions
+            .iter()
+            .filter(|session| session_matches_filter(session, &filter))
+            .count();
+        format!("CHATS · {shown}/{total}")
     }
 }
 
@@ -3223,16 +3288,36 @@ fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 
 /// Build the CHATS ListView: new-chat/new-channel actions followed by stored chats/channels.
 fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let (sessions, filter, loading) = {
+        let chat = shared.chat();
+        (
+            chat.sessions.clone(),
+            normalized_session_filter(&chat.session_filter),
+            chat.session_list_loading,
+        )
+    };
+    let visible_indices = filtered_session_indices(&sessions, &filter);
     let mut items = vec![
         ListItem::new("New chat").leading_text("+"),
         ListItem::new("New channel").leading_text("#"),
     ];
-    items.extend(shared.chat().sessions.iter().cloned().map(|session| {
+    items.extend(visible_indices.iter().map(|index| {
+        let session = sessions[*index].clone();
         ListItem::new(session.title.clone())
             .with_child(ChatSessionRow::new(shared.clone(), session))
     }));
-    if shared.chat().session_list_loading && shared.chat().sessions.is_empty() {
-        items.push(ListItem::new("Loading chats...").leading_text("..."));
+    if loading && sessions.is_empty() {
+        items.push(
+            ListItem::new("Loading chats...")
+                .leading_text("...")
+                .disabled(),
+        );
+    } else if !filter.is_empty() && visible_indices.is_empty() {
+        items.push(
+            ListItem::new("No matching chats")
+                .leading_text(" ")
+                .disabled(),
+        );
     }
     let s = shared.clone();
     ListView::new("chat-sessions")
@@ -3241,9 +3326,10 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             let s = s.clone();
             move || {
                 let chat = s.chat();
-                chat.sessions
-                    .iter()
-                    .position(|session| session.id == chat.session_id)
+                let filter = normalized_session_filter(&chat.session_filter);
+                filtered_session_indices(&chat.sessions, &filter)
+                    .into_iter()
+                    .position(|session_index| chat.sessions[session_index].id == chat.session_id)
                     .map(|index| index + 2)
             }
         })
@@ -3256,9 +3342,47 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             } else if index == 1 {
                 chat.new_channel();
             } else {
-                chat.open_session(index - 2);
+                let filter = normalized_session_filter(&chat.session_filter);
+                let visible_indices = filtered_session_indices(&chat.sessions, &filter);
+                if let Some(session_index) = visible_indices.get(index - 2) {
+                    chat.open_session(*session_index);
+                }
             }
         })
+}
+
+fn session_filter_input(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let value = shared.chat().session_filter.clone();
+    TextInput::new("chat-session-filter")
+        .value(value)
+        .placeholder("Search chats")
+        .theme_when(clone_reader(reader))
+        .on_change(move |value| {
+            s.chat_mut().set_session_filter(value);
+        })
+}
+
+fn sessions_scroll_signature(
+    shared: &Shared,
+) -> (String, String, String, String, String, String, usize, bool) {
+    let chat = shared.chat();
+    let sessions = chat
+        .sessions
+        .iter()
+        .map(|s| format!("{}:{:?}:{}:{}", s.id, s.kind, s.title, s.participant_count))
+        .collect::<Vec<_>>()
+        .join("\u{1f}");
+    (
+        sessions,
+        chat.session_filter.clone(),
+        chat.session_id.clone(),
+        chat.session_edit_id.clone().unwrap_or_default(),
+        chat.session_delete_confirm_id.clone().unwrap_or_default(),
+        chat.pending_delete_id.clone().unwrap_or_default(),
+        chat.channel_agent_idx,
+        chat.session_list_loading,
+    )
 }
 
 fn sessions_scroll(
@@ -3270,6 +3394,23 @@ fn sessions_scroll(
         .name("chat-sessions-scroll")
         .state(scroll_state.clone())
         .theme(shared.theme())
+}
+
+fn sessions_scroll_rebuild(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_state: &ScrollState,
+) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    let sessions_scroll_state = scroll_state.clone();
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || sessions_scroll_signature(&s)
+        },
+        move |_sig| WidgetPod::new(sessions_scroll(&s, &r, &sessions_scroll_state)),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3584,10 +3725,17 @@ fn sidebar(
                 .with_child(SizedBox::new().height(2.0))
                 .with_child(InsetX::new(agents_list(&s, &r), 8.0))
                 .with_child(SizedBox::new().height(16.0))
-                .with_child(InsetX::new(heading(&s, "CHATS"), 18.0))
-                .with_child(SizedBox::new().height(2.0))
+                .with_child(InsetX::new(chats_heading(&s), 18.0))
+                .with_child(SizedBox::new().height(6.0))
+                .with_child(InsetX::new(
+                    SizedBox::new()
+                        .height(30.0)
+                        .with_child(session_filter_input(&s, &r)),
+                    8.0,
+                ))
+                .with_child(SizedBox::new().height(6.0))
                 .with_item(
-                    InsetX::new(sessions_scroll(&s, &r, &sessions_scroll_state), 8.0),
+                    InsetX::new(sessions_scroll_rebuild(&s, &r, &sessions_scroll_state), 8.0),
                     FlexItem::flex(1.0).min_height(0.0),
                 );
             WidgetPod::new(Surface::sidebar(column).fill().theme_when(clone_reader(&r)))
@@ -7023,6 +7171,45 @@ mod tests {
         assert_eq!(session_meta_label(&chat), "Chat · not saved");
     }
 
+    #[test]
+    fn session_filter_matches_title_kind_and_metadata() {
+        let channel = SessionRef {
+            id: "channel-filter".to_string(),
+            title: "Release triage".to_string(),
+            kind: ConversationKind::Channel,
+            updated_unix: 0,
+            participant_count: 2,
+        };
+        let chat = SessionRef {
+            id: "chat-filter".to_string(),
+            title: "Old question".to_string(),
+            kind: ConversationKind::Chat,
+            updated_unix: 0,
+            participant_count: 1,
+        };
+
+        assert!(session_matches_filter(
+            &channel,
+            &normalized_session_filter("release")
+        ));
+        assert!(session_matches_filter(
+            &channel,
+            &normalized_session_filter("channel")
+        ));
+        assert!(session_matches_filter(
+            &channel,
+            &normalized_session_filter("2 agents")
+        ));
+        assert!(session_matches_filter(
+            &chat,
+            &normalized_session_filter("chat")
+        ));
+        assert!(!session_matches_filter(
+            &chat,
+            &normalized_session_filter("release")
+        ));
+    }
+
     fn isolated_chat_state(_slug: &str) -> (Backend, ChatState) {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
@@ -7650,6 +7837,74 @@ mod tests {
             .get_by_role(SemanticsRole::ListItem)
             .with_name("Target chat")
             .with_description("Chat")
+            .click()?;
+
+        assert_eq!(shared.chat().session_id, second_id);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_chat_session_filter_opens_matching_session() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let first_id = SessionId::generate().to_string();
+        let second_id = SessionId::generate().to_string();
+        {
+            let mut chat = shared.chat_mut();
+            chat.sessions = vec![
+                SessionRef {
+                    id: first_id.clone(),
+                    title: "Current chat".to_string(),
+                    kind: ConversationKind::Chat,
+                    updated_unix: 1,
+                    participant_count: 1,
+                },
+                SessionRef {
+                    id: second_id.clone(),
+                    title: "Release triage".to_string(),
+                    kind: ConversationKind::Channel,
+                    updated_unix: 2,
+                    participant_count: 2,
+                },
+            ];
+            chat.session_id = first_id;
+            chat.session_filter = "release".to_string();
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat filtered rows")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let snapshot = window.snapshot()?;
+
+        assert!(
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .any(|node| node.name.as_deref() == Some("CHATS · 1/2")),
+            "chat heading should show filtered and total counts"
+        );
+        assert!(
+            !snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .any(|node| node.name.as_deref() == Some("Current chat")),
+            "non-matching chats should not be rendered in the filtered list"
+        );
+
+        window
+            .get_by_role(SemanticsRole::ListItem)
+            .with_name("Release triage")
+            .with_description("Channel, 2 agents")
             .click()?;
 
         assert_eq!(shared.chat().session_id, second_id);
