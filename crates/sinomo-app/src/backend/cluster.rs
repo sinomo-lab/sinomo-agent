@@ -135,6 +135,7 @@ impl Backend {
         };
 
         let mut live_node_ids = BTreeSet::new();
+        let mut health_limited_to_local = false;
         let mut rows = match state.as_ref() {
             Some(state) => {
                 let cached_rows = rows_from_state(&paths, state, observed_at, &mut warnings);
@@ -142,6 +143,8 @@ impl Backend {
                     Some(address) => match fetch_daemon_health_rows(address, health_scope) {
                         Ok((live_rows, warning)) => {
                             if let Some(warning) = warning {
+                                health_limited_to_local =
+                                    matches!(health_scope, ClusterHealthScope::Full);
                                 warnings.push(warning);
                             }
                             live_node_ids
@@ -160,6 +163,8 @@ impl Backend {
                 Some(address) => match fetch_daemon_health_rows(address, health_scope) {
                     Ok((rows, warning)) => {
                         if let Some(warning) = warning {
+                            health_limited_to_local =
+                                matches!(health_scope, ClusterHealthScope::Full);
                             warnings.push(warning);
                         }
                         warnings
@@ -186,6 +191,9 @@ impl Backend {
 
         if let Some(state) = state.as_ref() {
             reconcile_cached_remote_availability(state, &mut rows, &connectivity, &live_node_ids);
+            if health_limited_to_local {
+                mark_unobserved_remote_health_unknown(state, &mut rows, &live_node_ids);
+            }
         }
 
         snapshot_from_parts(
@@ -344,6 +352,24 @@ fn local_connectivity_reachability(
     }
 
     saw_local_record.then_some(false)
+}
+
+fn mark_unobserved_remote_health_unknown(
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+    rows: &mut [ClusterHealthRow],
+    live_node_ids: &BTreeSet<String>,
+) {
+    for row in rows {
+        if cluster_node_is_local_process(state, &row.member.node_id)
+            || live_node_ids.contains(row.member.node_id.as_str())
+            || row.availability == ClusterNodeAvailability::Offline
+        {
+            continue;
+        }
+
+        row.availability = ClusterNodeAvailability::Unknown;
+        row.status.availability = ClusterNodeAvailability::Unknown;
+    }
 }
 
 fn snapshot_from_parts(
@@ -763,6 +789,30 @@ mod tests {
         reconcile_cached_remote_availability(&state, &mut rows, &records, &BTreeSet::new());
 
         assert_eq!(rows[0].availability, ClusterNodeAvailability::Online);
+    }
+
+    #[test]
+    fn unobserved_remote_health_becomes_unknown_when_full_refresh_falls_back_local() {
+        let cluster_id = id("cluster_app_reconcile_local_only");
+        let local_node_id = id("node_app_reconcile_local_only_local");
+        let remote_node_id = id("node_app_reconcile_local_only_remote");
+        let remote = member(&cluster_id, &remote_node_id, "remote");
+        let state = state_with_remote(&cluster_id, &local_node_id, remote.clone());
+        let local = member(&cluster_id, &local_node_id, "local");
+        let mut rows = vec![
+            row(local, ClusterNodeAvailability::Online, "live-local", 20),
+            row(remote, ClusterNodeAvailability::Online, "cached-remote", 10),
+        ];
+        let live_node_ids = BTreeSet::from([local_node_id.to_string()]);
+
+        mark_unobserved_remote_health_unknown(&state, &mut rows, &live_node_ids);
+
+        assert_eq!(rows[0].availability, ClusterNodeAvailability::Online);
+        assert_eq!(rows[1].availability, ClusterNodeAvailability::Unknown);
+        assert_eq!(
+            rows[1].status.availability,
+            ClusterNodeAvailability::Unknown
+        );
     }
 
     #[test]
