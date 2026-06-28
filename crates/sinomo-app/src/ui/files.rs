@@ -3327,6 +3327,23 @@ fn sifs_details_signature(details: Option<&SifsObjectDetails>) -> String {
         .unwrap_or_default()
 }
 
+fn unselected_inspector_title(source: FilesSourceKind) -> &'static str {
+    match source {
+        FilesSourceKind::Sifs => "SIFS browser",
+        FilesSourceKind::Local => "Local files",
+    }
+}
+
+fn unselected_inspector_status(source: FilesSourceKind, entries_empty: bool) -> &'static str {
+    if entries_empty {
+        return "No entries in this directory";
+    }
+    match source {
+        FilesSourceKind::Sifs => "Select an object to inspect placement",
+        FilesSourceKind::Local => "Select an object to inspect metadata",
+    }
+}
+
 fn local_details_signature(details: Option<&LocalObjectDetails>) -> String {
     details
         .map(|details| {
@@ -5220,17 +5237,13 @@ impl InspectorView {
         }
 
         let Some(entry) = files.selected_entry() else {
-            let status = if files.entries.is_empty() {
-                "No entries in this directory"
-            } else if files.source == FilesSourceKind::Sifs {
-                "Select an object to inspect placement"
-            } else {
-                "Select an object to inspect metadata"
-            };
             let rows = [
                 ("Path", files.path.clone()),
                 ("Entries", files.entries.len().to_string()),
-                ("Status", status.to_string()),
+                (
+                    "Status",
+                    unselected_inspector_status(files.source, files.entries.is_empty()).to_string(),
+                ),
             ];
             let panel_h = Self::state_panel_height(w, &rows);
             return finish(y + panel_h, !files.tasks.is_empty());
@@ -5518,8 +5531,10 @@ fn inspector_actions(source: FilesSourceKind, entry: &SifsEntry) -> Vec<Inspecto
     actions.push(InspectorAction::Delete);
     if source == FilesSourceKind::Sifs {
         actions.push(InspectorAction::RefreshPlacement);
-        actions.push(InspectorAction::PinContent);
-        actions.push(InspectorAction::UnpinContent);
+        if !entry.is_dir && !entry.is_link {
+            actions.push(InspectorAction::PinContent);
+            actions.push(InspectorAction::UnpinContent);
+        }
     }
     actions
 }
@@ -5819,13 +5834,6 @@ impl Widget for InspectorView {
         }
 
         let Some(entry) = files.selected_entry() else {
-            let status = if files.entries.is_empty() {
-                "No entries in this directory"
-            } else if files.source == FilesSourceKind::Sifs {
-                "Select an object to inspect placement"
-            } else {
-                "Select an object to inspect metadata"
-            };
             self.state_panel(
                 ctx,
                 &theme,
@@ -5833,11 +5841,15 @@ impl Widget for InspectorView {
                 x,
                 y,
                 w,
-                files.source.label(),
+                unselected_inspector_title(files.source),
                 &[
                     ("Path", files.path.clone()),
                     ("Entries", files.entries.len().to_string()),
-                    ("Status", status.to_string()),
+                    (
+                        "Status",
+                        unselected_inspector_status(files.source, files.entries.is_empty())
+                            .to_string(),
+                    ),
                 ],
                 None,
             );
@@ -8211,6 +8223,30 @@ mod tests {
     }
 
     #[test]
+    fn unselected_inspector_copy_is_source_specific() {
+        assert_eq!(
+            unselected_inspector_title(FilesSourceKind::Sifs),
+            "SIFS browser"
+        );
+        assert_eq!(
+            unselected_inspector_status(FilesSourceKind::Sifs, false),
+            "Select an object to inspect placement"
+        );
+        assert_eq!(
+            unselected_inspector_title(FilesSourceKind::Local),
+            "Local files"
+        );
+        assert_eq!(
+            unselected_inspector_status(FilesSourceKind::Local, false),
+            "Select an object to inspect metadata"
+        );
+        assert_eq!(
+            unselected_inspector_status(FilesSourceKind::Local, true),
+            "No entries in this directory"
+        );
+    }
+
+    #[test]
     fn sifs_unavailable_rows_hide_diagnostics_until_expanded() {
         let loading = sifs_loading_rows("/services", false);
         assert!(
@@ -9723,6 +9759,22 @@ mod tests {
                 .count()?
                 >= 1,
             "selected directories should expose recursive copy"
+        );
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Pin content dir")
+                .count()?,
+            0,
+            "directories do not have file content pins"
+        );
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Unpin content dir")
+                .count()?,
+            0,
+            "directories do not have file content pins"
         );
 
         window
