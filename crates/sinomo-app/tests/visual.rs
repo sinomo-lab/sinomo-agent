@@ -274,6 +274,86 @@ fn cluster_node_click_opens_detail_selection() {
 }
 
 #[test]
+fn capture_cluster_node_diagnostics() {
+    use sinomo_app::backend::cluster::{ClusterEndpointInfo, ClusterNodeInfo, ClusterSnapshot};
+    use sinomo_app::theme::AppThemeMode;
+    use sinomo_app::ui::cluster::ClusterSelection;
+
+    fn node(id: &str, availability: &str, endpoint: &str) -> ClusterNodeInfo {
+        ClusterNodeInfo {
+            node_id: id.to_string(),
+            display_name: "sinomo-node".to_string(),
+            process: "daemon-main".to_string(),
+            node_role: "workstation".to_string(),
+            member_role: "voter".to_string(),
+            member_state: "voter".to_string(),
+            availability: availability.to_string(),
+            daemon_version: "test".to_string(),
+            commit: None,
+            platform: Some("linux/aarch64".to_string()),
+            pid: None,
+            address: Some("127.0.0.1:21353".to_string()),
+            bind_address: None,
+            rollout: None,
+            observed_at: "now".to_string(),
+            public_reachable: false,
+            endpoints: vec![ClusterEndpointInfo {
+                endpoint_id: format!("{id}-lan"),
+                transport: "lan-tcp".to_string(),
+                address: endpoint.to_string(),
+                source: "cluster-connectivity".to_string(),
+                privacy: "lan".to_string(),
+                priority: 10,
+                latency_ms: None,
+                public_ip: false,
+                reachable: availability == "online",
+            }],
+        }
+    }
+
+    let dir = target_shots_dir();
+    std::fs::create_dir_all(&dir).expect("create shots dir");
+
+    let shared = boot(Tab::Cluster);
+    shared.borrow_mut().theme_mode = AppThemeMode::Light;
+    {
+        let mut cluster = shared.cluster_mut();
+        cluster.snapshot = ClusterSnapshot {
+            nodes: vec![
+                node(
+                    "01kr4w089vqgdxpb84t6bq1qxn",
+                    "offline",
+                    "iroh://e6e7579b45088dc226274eadd8dec9782eb042c1c753ba5be249c96c1c8c0e2e?relay=https://use1-1.relay.no.iroh-canary.iroh.link/",
+                ),
+                node("01kr3d54d45zkm0p0xgps8k7mt", "online", "10.0.0.5:21353"),
+            ],
+            source: "daemon connected".to_string(),
+            observed_at: "now".to_string(),
+            ..ClusterSnapshot::default()
+        };
+        cluster.selected = Some(ClusterSelection::Node(
+            "01kr4w089vqgdxpb84t6bq1qxn".to_string(),
+        ));
+        cluster.diagnostics_open = true;
+    }
+
+    let runtime = build_runtime(shared).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    app.run_until_idle()
+        .expect("settle cluster diagnostics layout");
+    let shot = window.capture_screenshot().expect("capture screenshot");
+    let path = dir.join("sinomo-app-cluster-node-diagnostics.png");
+    shot.write_png(&path).expect("write png");
+    println!(
+        "wrote {} ({}x{})",
+        path.display(),
+        shot.width(),
+        shot.height()
+    );
+}
+
+#[test]
 fn capture_settings_responsive() {
     use sui::{Event, Size, WindowEvent};
 

@@ -23,7 +23,10 @@ const NODE_R: f32 = 22.0;
 const LAN_R: f32 = 18.0;
 const PANEL_W: f32 = 360.0;
 const PANEL_PAD: f32 = 16.0;
+const DETAIL_PANEL_H: f32 = 440.0;
 const DETAIL_BUTTON_H: f32 = 28.0;
+const DETAIL_ROW_LINE_H: f32 = 18.0;
+const DETAIL_ROW_GAP: f32 = 5.0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClusterSelection {
@@ -637,6 +640,106 @@ fn unknown_node_color(pal: &Palette) -> Color {
     }
 }
 
+enum DetailRowLayout {
+    Hint(Vec<String>),
+    KeyValue { label: String, lines: Vec<String> },
+    Value(Vec<String>),
+}
+
+fn detail_row_layout(
+    ctx: &mut PaintCtx,
+    line: &str,
+    value_w: f32,
+    full_w: f32,
+    value_style: &sui::TextStyle,
+    hint_style: &sui::TextStyle,
+) -> Option<DetailRowLayout> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    if let Some(hint) = line.strip_prefix("hint:") {
+        let lines = wrap_detail_text(ctx, hint.trim(), full_w, hint_style);
+        return Some(DetailRowLayout::Hint(lines));
+    }
+    if let Some((label, value)) = line.split_once(':') {
+        let lines = wrap_detail_text(ctx, value.trim(), value_w, value_style);
+        return Some(DetailRowLayout::KeyValue {
+            label: label.to_string(),
+            lines,
+        });
+    }
+    Some(DetailRowLayout::Value(wrap_detail_text(
+        ctx,
+        line,
+        full_w,
+        value_style,
+    )))
+}
+
+fn wrap_detail_text(
+    ctx: &mut PaintCtx,
+    text: &str,
+    width: f32,
+    style: &sui::TextStyle,
+) -> Vec<String> {
+    let lines = widgets::wrap_lines(text, width, |s| measure_detail_text(ctx, s, style));
+    let mut wrapped = Vec::new();
+    for line in lines {
+        if line.is_empty() || measure_detail_text(ctx, &line, style) <= width {
+            wrapped.push(line);
+        } else {
+            wrapped.extend(break_detail_line(ctx, &line, width, style));
+        }
+    }
+    if wrapped.is_empty() {
+        vec![String::new()]
+    } else {
+        wrapped
+    }
+}
+
+fn measure_detail_text(ctx: &PaintCtx, text: &str, style: &sui::TextStyle) -> f32 {
+    ctx.measure_text(text, style.clone())
+        .map(|m| m.width)
+        .unwrap_or(0.0)
+}
+
+fn break_detail_line(
+    ctx: &mut PaintCtx,
+    text: &str,
+    width: f32,
+    style: &sui::TextStyle,
+) -> Vec<String> {
+    if width <= 0.0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        let mut candidate = current.clone();
+        candidate.push(ch);
+        if !current.is_empty() && measure_detail_text(ctx, &candidate, style) > width {
+            lines.push(current);
+            current = ch.to_string();
+        } else {
+            current = candidate;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn detail_row_height(row: &DetailRowLayout) -> f32 {
+    let line_count = match row {
+        DetailRowLayout::Hint(lines)
+        | DetailRowLayout::KeyValue { lines, .. }
+        | DetailRowLayout::Value(lines) => lines.len().max(1),
+    };
+    DETAIL_ROW_LINE_H * line_count as f32
+}
+
 fn paint_detail_panel(
     ctx: &mut PaintCtx,
     theme: &sui::DefaultTheme,
@@ -648,10 +751,7 @@ fn paint_detail_panel(
     diagnostics_open: bool,
     refreshing: bool,
 ) {
-    let panel_w = PANEL_W.min((bounds.width() - PAD * 2.0).max(220.0));
-    let x = bounds.max_x() - panel_w - PAD;
-    let y = bounds.y() + HEADER_H + 18.0;
-    let panel = Rect::new(x, y, panel_w, 312.0);
+    let panel = detail_panel_rect(bounds);
     widgets::round_panel(ctx, panel, pal.panel.with_alpha(0.96), pal.border, 8.0);
 
     let lines = selection
@@ -684,61 +784,62 @@ fn paint_detail_panel(
         } else {
             panel.max_y() - PANEL_PAD
         };
+        let label_w = 104.0;
+        let value_x = panel.x() + PANEL_PAD + 108.0;
+        let value_w = (panel.width() - PANEL_PAD * 2.0 - 108.0).max(0.0);
+        let full_w = (panel.width() - PANEL_PAD * 2.0).max(0.0);
         for line in rest {
-            if cy + 18.0 > content_bottom {
+            let Some(row) =
+                detail_row_layout(ctx, line, value_w, full_w, &value_style, &hint_style)
+            else {
+                continue;
+            };
+            let row_h = detail_row_height(&row);
+            if cy + row_h > content_bottom {
                 break;
             }
-            if let Some(hint) = line.strip_prefix("hint:") {
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(
-                        panel.x() + PANEL_PAD,
-                        cy,
-                        panel.width() - PANEL_PAD * 2.0,
-                        18.0,
-                    ),
-                    hint.trim(),
-                    hint_style.clone(),
-                );
-                cy += 22.0;
-                continue;
+            match row {
+                DetailRowLayout::Hint(lines) => {
+                    for line in lines {
+                        widgets::draw_text_in(
+                            ctx,
+                            Rect::new(panel.x() + PANEL_PAD, cy, full_w, DETAIL_ROW_LINE_H),
+                            &line,
+                            hint_style.clone(),
+                        );
+                        cy += DETAIL_ROW_LINE_H;
+                    }
+                }
+                DetailRowLayout::KeyValue { label, lines } => {
+                    widgets::draw_text_in(
+                        ctx,
+                        Rect::new(panel.x() + PANEL_PAD, cy, label_w, DETAIL_ROW_LINE_H),
+                        &label,
+                        label_style.clone(),
+                    );
+                    for line in lines {
+                        widgets::draw_text_in(
+                            ctx,
+                            Rect::new(value_x, cy, value_w, DETAIL_ROW_LINE_H),
+                            &line,
+                            value_style.clone(),
+                        );
+                        cy += DETAIL_ROW_LINE_H;
+                    }
+                }
+                DetailRowLayout::Value(lines) => {
+                    for line in lines {
+                        widgets::draw_text_in(
+                            ctx,
+                            Rect::new(panel.x() + PANEL_PAD, cy, full_w, DETAIL_ROW_LINE_H),
+                            &line,
+                            value_style.clone(),
+                        );
+                        cy += DETAIL_ROW_LINE_H;
+                    }
+                }
             }
-            let (label, value) = line
-                .split_once(':')
-                .map(|(label, value)| (label, value.trim()))
-                .unwrap_or(("", line.as_str()));
-            if !label.is_empty() {
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(panel.x() + PANEL_PAD, cy, 104.0, 18.0),
-                    label,
-                    label_style.clone(),
-                );
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(
-                        panel.x() + PANEL_PAD + 108.0,
-                        cy,
-                        panel.width() - PANEL_PAD * 2.0 - 108.0,
-                        18.0,
-                    ),
-                    value,
-                    value_style.clone(),
-                );
-            } else {
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(
-                        panel.x() + PANEL_PAD,
-                        cy,
-                        panel.width() - PANEL_PAD * 2.0,
-                        18.0,
-                    ),
-                    line,
-                    value_style.clone(),
-                );
-            }
-            cy += 21.0;
+            cy += DETAIL_ROW_GAP;
         }
     }
     if selection.is_some() {
@@ -1052,11 +1153,13 @@ fn overview_detail_toggle_visible(
 
 fn detail_panel_rect(bounds: Rect) -> Rect {
     let panel_w = PANEL_W.min((bounds.width() - PAD * 2.0).max(220.0));
+    let y = bounds.y() + HEADER_H + 18.0;
+    let available_h = (bounds.max_y() - y - PAD).max(312.0);
     Rect::new(
         bounds.max_x() - panel_w - PAD,
-        bounds.y() + HEADER_H + 18.0,
+        y,
         panel_w,
-        312.0,
+        DETAIL_PANEL_H.min(available_h),
     )
 }
 
