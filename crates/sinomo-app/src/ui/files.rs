@@ -3607,8 +3607,8 @@ fn sifs_details_signature(details: Option<&SifsObjectDetails>) -> String {
 
 fn unselected_inspector_title(source: FilesSourceKind) -> &'static str {
     match source {
-        FilesSourceKind::Sifs => "SIFS browser",
-        FilesSourceKind::Local => "Local files",
+        FilesSourceKind::Sifs => "Current SIFS location",
+        FilesSourceKind::Local => "Current folder",
     }
 }
 
@@ -3620,6 +3620,62 @@ fn unselected_inspector_status(source: FilesSourceKind, entries_empty: bool) -> 
         FilesSourceKind::Sifs => "Select an object to inspect placement",
         FilesSourceKind::Local => "Select an object to inspect metadata",
     }
+}
+
+fn unselected_inspector_scope(files: &FilesState) -> String {
+    match files.source {
+        FilesSourceKind::Sifs => {
+            if files.clustered {
+                "cluster-backed SIFS namespace".to_string()
+            } else {
+                "local SIFS namespace".to_string()
+            }
+        }
+        FilesSourceKind::Local => "host filesystem".to_string(),
+    }
+}
+
+fn unselected_inspector_management(files: &FilesState) -> String {
+    match files.source {
+        FilesSourceKind::Sifs => {
+            if files.entries.is_empty() {
+                if files.clustered {
+                    "Create a file or folder here; created SIFS objects expose placement and replica actions after selection.".to_string()
+                } else {
+                    "Create a file or folder here; join a cluster to manage multi-node replicas."
+                        .to_string()
+                }
+            } else if files.clustered {
+                "Select an object to refresh placement, repair replicas, or pin content on this node."
+                    .to_string()
+            } else {
+                "Select an object for local SIFS metadata; cluster join enables replica management."
+                    .to_string()
+            }
+        }
+        FilesSourceKind::Local => {
+            if files.entries.is_empty() {
+                "Create a file or folder here, or switch places to browse another filesystem."
+                    .to_string()
+            } else {
+                "Select an object to preview, copy, move, rename, delete, or inspect metadata."
+                    .to_string()
+            }
+        }
+    }
+}
+
+fn unselected_inspector_rows(files: &FilesState) -> Vec<(&'static str, String)> {
+    vec![
+        ("Path", files.path.clone()),
+        ("Entries", files.entries.len().to_string()),
+        ("Scope", unselected_inspector_scope(files)),
+        (
+            "Status",
+            unselected_inspector_status(files.source, files.entries.is_empty()).to_string(),
+        ),
+        ("Next step", unselected_inspector_management(files)),
+    ]
 }
 
 fn local_details_signature(details: Option<&LocalObjectDetails>) -> String {
@@ -5755,9 +5811,10 @@ impl InspectorView {
                 files_preview_signature(files.selected_preview.as_ref())
             ),
             None => format!(
-                "unselected|{:?}|{}|{}",
+                "unselected|{:?}|{}|{}|{}",
                 files.source,
                 files.path,
+                files.clustered,
                 files.entries.len()
             ),
         }
@@ -5790,14 +5847,7 @@ impl InspectorView {
         }
 
         let Some(entry) = files.selected_entry() else {
-            let rows = [
-                ("Path", files.path.clone()),
-                ("Entries", files.entries.len().to_string()),
-                (
-                    "Status",
-                    unselected_inspector_status(files.source, files.entries.is_empty()).to_string(),
-                ),
-            ];
+            let rows = unselected_inspector_rows(&files);
             let panel_h = Self::state_panel_height(w, &rows);
             return finish(y + panel_h, !files.tasks.is_empty());
         };
@@ -6400,6 +6450,7 @@ impl Widget for InspectorView {
         }
 
         let Some(entry) = files.selected_entry() else {
+            let rows = unselected_inspector_rows(&files);
             self.state_panel(
                 ctx,
                 &theme,
@@ -6408,15 +6459,7 @@ impl Widget for InspectorView {
                 y,
                 w,
                 unselected_inspector_title(files.source),
-                &[
-                    ("Path", files.path.clone()),
-                    ("Entries", files.entries.len().to_string()),
-                    (
-                        "Status",
-                        unselected_inspector_status(files.source, files.entries.is_empty())
-                            .to_string(),
-                    ),
-                ],
+                &rows,
                 None,
             );
             return;
@@ -8890,7 +8933,7 @@ mod tests {
             files.loading = false;
             files.entries.clear();
         }
-        assert_eq!(inspector.summary(), "unselected|Sifs|/services|0");
+        assert_eq!(inspector.summary(), "unselected|Sifs|/services|false|0");
     }
 
     #[test]
@@ -8928,7 +8971,7 @@ mod tests {
     fn unselected_inspector_copy_is_source_specific() {
         assert_eq!(
             unselected_inspector_title(FilesSourceKind::Sifs),
-            "SIFS browser"
+            "Current SIFS location"
         );
         assert_eq!(
             unselected_inspector_status(FilesSourceKind::Sifs, false),
@@ -8936,7 +8979,7 @@ mod tests {
         );
         assert_eq!(
             unselected_inspector_title(FilesSourceKind::Local),
-            "Local files"
+            "Current folder"
         );
         assert_eq!(
             unselected_inspector_status(FilesSourceKind::Local, false),
@@ -8946,6 +8989,51 @@ mod tests {
             unselected_inspector_status(FilesSourceKind::Local, true),
             "No entries in this directory"
         );
+    }
+
+    #[test]
+    fn unselected_inspector_rows_explain_current_location_management() {
+        let backend = Backend::local_fallback();
+        let mut files = FilesState::new(&backend);
+        files.loaded = true;
+        files.loading = false;
+        files.source = FilesSourceKind::Sifs;
+        files.path = "/cluster-tests".to_string();
+        files.clustered = true;
+        files.entries.clear();
+
+        let rows = unselected_inspector_rows(&files);
+        assert!(rows.iter().any(|(label, value)| {
+            *label == "Scope" && value == "cluster-backed SIFS namespace"
+        }));
+        assert!(rows.iter().any(|(label, value)| {
+            *label == "Next step"
+                && value.contains("created SIFS objects expose placement and replica actions")
+        }));
+
+        files.entries = vec![SifsEntry {
+            name: "artifact.txt".to_string(),
+            path: "/cluster-tests/artifact.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(5),
+        }];
+        let rows = unselected_inspector_rows(&files);
+        assert!(rows.iter().any(|(label, value)| {
+            *label == "Next step" && value.contains("refresh placement, repair replicas")
+        }));
+
+        files.source = FilesSourceKind::Local;
+        files.clustered = false;
+        files.entries.clear();
+        let rows = unselected_inspector_rows(&files);
+        assert!(
+            rows.iter()
+                .any(|(label, value)| *label == "Scope" && value == "host filesystem")
+        );
+        assert!(rows.iter().any(|(label, value)| {
+            *label == "Next step" && value.contains("switch places to browse another filesystem")
+        }));
     }
 
     #[test]
