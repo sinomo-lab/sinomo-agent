@@ -437,6 +437,8 @@ impl Widget for Shell {
                 let (changed, became_ready) = self.shared.pump_connect();
                 if became_ready {
                     self.build_content();
+                    let waker = { self.shared.borrow().waker.clone() };
+                    self.shared.chat_mut().start_session_list_load(waker);
                     ctx.request_measure();
                     ctx.request_arrange();
                     ctx.request_semantics();
@@ -453,7 +455,10 @@ impl Widget for Shell {
                     false
                 };
                 let chat_changed = if self.shared.is_ready() {
-                    self.shared.chat_mut().pump_delete()
+                    let mut chat = self.shared.chat_mut();
+                    let list_changed = chat.pump_session_list();
+                    let delete_changed = chat.pump_delete();
+                    list_changed || delete_changed
                 } else {
                     false
                 };

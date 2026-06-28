@@ -435,6 +435,8 @@ pub struct ChatState {
     session_delete_confirm_id: Option<String>,
     pending_delete_id: Option<String>,
     delete_rx: Option<Receiver<DeleteWorkerResult>>,
+    session_list_rx: Option<Receiver<SessionListWorkerResult>>,
+    session_list_loading: bool,
     channel_agent_idx: usize,
 }
 
@@ -442,6 +444,11 @@ struct DeleteWorkerResult {
     session: SessionRef,
     kind: ConversationKind,
     result: Result<(), String>,
+}
+
+struct SessionListWorkerResult {
+    sessions: Vec<SessionRef>,
+    error: Option<String>,
 }
 
 impl ChatState {
@@ -464,8 +471,11 @@ impl ChatState {
         let effort_idx = efforts.iter().position(|e| e == "medium").unwrap_or(0);
         let sifs_daemon = daemon_address
             .map(|address| sessions::SifsDaemonAccess::new(address, backend.app_runtime.handle()));
-        let (sessions, session_list_error) =
-            list_conversations_with_error(&backend.data_dir, sifs_daemon.as_ref());
+        let (sessions, session_list_error) = if sifs_daemon.is_some() {
+            (Vec::new(), None)
+        } else {
+            list_conversations_with_error(&backend.data_dir, None)
+        };
 
         let mut state = Self {
             data_dir: backend.data_dir.clone(),
@@ -499,6 +509,8 @@ impl ChatState {
             session_delete_confirm_id: None,
             pending_delete_id: None,
             delete_rx: None,
+            session_list_rx: None,
+            session_list_loading: false,
             channel_agent_idx: 0,
         };
         if let Some(detail) = session_list_error {
@@ -561,6 +573,67 @@ impl ChatState {
     fn refresh_sessions(&mut self) {
         let (sessions, error) =
             list_conversations_with_error(&self.data_dir, self.sifs_daemon.as_ref());
+        self.apply_session_list_result(SessionListWorkerResult { sessions, error });
+    }
+
+    pub fn start_session_list_load(&mut self, waker: Option<sui::UiHandle>) {
+        if self.sifs_daemon.is_none() {
+            self.refresh_sessions();
+            return;
+        }
+        if self.session_list_loading {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let data_dir = self.data_dir.clone();
+        let sifs_daemon = self.sifs_daemon.clone();
+        let worker_waker = waker.clone();
+        let spawn_result = thread::Builder::new()
+            .name("sinomo-app-chat-list".to_string())
+            .spawn(move || {
+                let (sessions, error) =
+                    list_conversations_with_error(&data_dir, sifs_daemon.as_ref());
+                let _ = tx.send(SessionListWorkerResult { sessions, error });
+                if let Some(waker) = worker_waker {
+                    waker.wake();
+                }
+            });
+
+        if let Err(error) = spawn_result {
+            let detail = error.to_string();
+            self.notice = Some(format!("chat list failed: {detail}"));
+            self.push_activity("chat list", detail, ActivityTone::Warn);
+            return;
+        }
+
+        self.session_list_rx = Some(rx);
+        self.session_list_loading = true;
+    }
+
+    pub fn pump_session_list(&mut self) -> bool {
+        let result = match self.session_list_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(result)) => result,
+            Some(Err(TryRecvError::Empty)) | None => return false,
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.session_list_rx = None;
+                self.session_list_loading = false;
+                self.notice = Some("chat list failed: worker stopped".to_string());
+                self.push_activity(
+                    "chat list",
+                    "worker stopped before loading chats from SIFS".to_string(),
+                    ActivityTone::Warn,
+                );
+                return true;
+            }
+        };
+        self.session_list_rx = None;
+        self.session_list_loading = false;
+        self.apply_session_list_result(result);
+        true
+    }
+
+    fn apply_session_list_result(&mut self, result: SessionListWorkerResult) {
+        let SessionListWorkerResult { sessions, error } = result;
         self.sessions = sessions;
         match error {
             Some(detail) => {
@@ -580,8 +653,13 @@ impl ChatState {
         }
     }
 
+    #[cfg(test)]
     fn retry_chat_list(&mut self) {
         self.refresh_sessions();
+    }
+
+    fn retry_chat_list_with_waker(&mut self, waker: Option<sui::UiHandle>) {
+        self.start_session_list_load(waker);
     }
 
     fn save_chat_record(
@@ -2900,6 +2978,9 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         ListItem::new(session.title.clone())
             .with_child(ChatSessionRow::new(shared.clone(), session))
     }));
+    if shared.chat().session_list_loading && shared.chat().sessions.is_empty() {
+        items.push(ListItem::new("Loading chats...").leading_text("..."));
+    }
     let s = shared.clone();
     ListView::new("chat-sessions")
         .items(items)
@@ -3266,7 +3347,7 @@ fn sidebar(
 
 /// A signature of the sidebar's list contents (agents are static; sessions + the active agent
 /// change). Used to drive the sidebar [`RebuildOnChange`].
-fn sidebar_signature(shared: &Shared) -> (String, String, String, String, String, usize) {
+fn sidebar_signature(shared: &Shared) -> (String, String, String, String, String, usize, bool) {
     let chat = shared.chat();
     let active = chat
         .agents
@@ -3288,6 +3369,7 @@ fn sidebar_signature(shared: &Shared) -> (String, String, String, String, String
         chat.session_edit_id.clone().unwrap_or_default(),
         chat.session_delete_confirm_id.clone().unwrap_or_default(),
         chat.channel_agent_idx,
+        chat.session_list_loading,
     )
 }
 
@@ -4872,7 +4954,10 @@ impl TranscriptView {
 
     fn activate_recovery_action(&self, action: RecoveryCardAction) {
         match action {
-            RecoveryCardAction::RetryChatList => self.shared.chat_mut().retry_chat_list(),
+            RecoveryCardAction::RetryChatList => {
+                let waker = { self.shared.borrow().waker.clone() };
+                self.shared.chat_mut().retry_chat_list_with_waker(waker);
+            }
             RecoveryCardAction::CheckSifs => open_files_tab(&self.shared),
             RecoveryCardAction::OpenConnectionSettings => {
                 open_settings_section(&self.shared, SettingsSection::Connection)
@@ -5540,7 +5625,10 @@ fn retry_chat_list_button(shared: &Shared, reader: &ThemeReader) -> Option<Sized
                 .icon(IconGlyph::Redo)
                 .min_width(132.0)
                 .theme_when(composer_control_reader(reader))
-                .on_press(move || s.chat_mut().retry_chat_list()),
+                .on_press(move || {
+                    let waker = { s.borrow().waker.clone() };
+                    s.chat_mut().retry_chat_list_with_waker(waker);
+                }),
         ),
     )
 }
@@ -5872,7 +5960,9 @@ impl ChatView {
             for event in events {
                 chat.apply_event(event);
             }
-            chat.pump_delete()
+            let list_changed = chat.pump_session_list();
+            let delete_changed = chat.pump_delete();
+            list_changed || delete_changed
         };
         let had = had_events || delete_changed;
         let streaming = self.shared.chat().streaming;
@@ -5919,6 +6009,7 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.effort_visible().hash(&mut h);
     chat.streaming.hash(&mut h);
     chat.models_loading.hash(&mut h);
+    chat.session_list_loading.hash(&mut h);
     chat.runtime_recovery_target()
         .map(RuntimeRecoveryTarget::key)
         .unwrap_or("none")
