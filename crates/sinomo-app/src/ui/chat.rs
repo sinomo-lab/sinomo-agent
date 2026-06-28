@@ -3856,7 +3856,8 @@ fn session_filter_input(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
     let value = shared.chat().session_filter.clone();
     TextInput::new("chat-session-filter")
         .value(value)
-        .placeholder("Search chats")
+        .placeholder("Search conversations")
+        .leading_icon(IconGlyph::Search)
         .theme_when(clone_reader(reader))
         .on_change(move |value| {
             s.chat_mut().set_session_filter(value);
