@@ -3570,6 +3570,18 @@ fn session_kind_filter_count(sessions: &[SessionRef], kind_filter: SessionKindFi
         .count()
 }
 
+fn session_kind_filter_count_label(
+    sessions: &[SessionRef],
+    kind_filter: SessionKindFilter,
+    loading: bool,
+) -> String {
+    if loading && sessions.is_empty() {
+        "...".to_string()
+    } else {
+        session_kind_filter_count(sessions, kind_filter).to_string()
+    }
+}
+
 fn filtered_session_indices(
     sessions: &[SessionRef],
     filter: &str,
@@ -3588,12 +3600,15 @@ fn filtered_session_indices(
 
 fn chats_heading_text(chat: &ChatState) -> String {
     let kind_filter = chat.session_kind_filter;
+    let filter = normalized_session_filter(&chat.session_filter);
+    if chat.session_list_loading && chat.sessions.is_empty() {
+        return format!("{} · loading", kind_filter.heading());
+    }
     let total = chat
         .sessions
         .iter()
         .filter(|session| session_matches_kind_filter(session, kind_filter))
         .count();
-    let filter = normalized_session_filter(&chat.session_filter);
     if filter.is_empty() {
         format!("{} · {total}", kind_filter.heading())
     } else {
@@ -4010,7 +4025,10 @@ impl Widget for SessionKindFilterControl {
         let theme = self.shared.theme();
         let pal = palette(&self.shared);
         let bounds = ctx.bounds();
-        let sessions = { self.shared.chat().sessions.clone() };
+        let (sessions, loading) = {
+            let chat = self.shared.chat();
+            (chat.sessions.clone(), chat.session_list_loading)
+        };
         let active = self.active();
         widgets::round_panel(ctx, bounds, pal.field, pal.border.with_alpha(0.72), 7.0);
         for (slot, filter) in SessionKindFilter::ALL.iter().copied().enumerate() {
@@ -4034,7 +4052,7 @@ impl Widget for SessionKindFilterControl {
             let label = format!(
                 "{} {}",
                 filter.label(),
-                session_kind_filter_count(&sessions, filter)
+                session_kind_filter_count_label(&sessions, filter, loading)
             );
             let text_color = if selected { pal.accent } else { pal.text_muted };
             ctx.push_clip_rect(rect);
@@ -4049,7 +4067,10 @@ impl Widget for SessionKindFilterControl {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let sessions = { self.shared.chat().sessions.clone() };
+        let (sessions, loading) = {
+            let chat = self.shared.chat();
+            (chat.sessions.clone(), chat.session_list_loading)
+        };
         let active = self.active();
         for (slot, filter) in SessionKindFilter::ALL.iter().copied().enumerate() {
             let mut node = SemanticsNode::new(
@@ -4059,10 +4080,14 @@ impl Widget for SessionKindFilterControl {
             );
             node.parent = Some(ctx.widget_id());
             node.name = Some(filter.semantic_name().to_string());
-            node.description = Some(format!(
-                "{} visible conversation(s)",
-                session_kind_filter_count(&sessions, filter)
-            ));
+            node.description = Some(if loading && sessions.is_empty() {
+                "Loading conversations".to_string()
+            } else {
+                format!(
+                    "{} visible conversation(s)",
+                    session_kind_filter_count(&sessions, filter)
+                )
+            });
             node.actions = vec![SemanticsAction::Activate];
             node.state.hovered = self.hovered == Some(filter);
             node.state.selected = active == filter;
@@ -8316,6 +8341,46 @@ mod tests {
                 SessionKindFilter::Chats,
             ),
             vec![2]
+        );
+    }
+
+    #[test]
+    fn chat_session_counts_distinguish_empty_loading_from_empty_loaded() {
+        let (_backend, mut state) = isolated_chat_state("chat-list-loading-label");
+
+        state.session_list_loading = true;
+        assert_eq!(chats_heading_text(&state), "CONVERSATIONS · loading");
+        assert_eq!(
+            session_kind_filter_count_label(&state.sessions, SessionKindFilter::All, true),
+            "..."
+        );
+
+        state.session_filter = "release".to_string();
+        state.session_kind_filter = SessionKindFilter::Channels;
+        assert_eq!(chats_heading_text(&state), "CHANNELS · loading");
+
+        state.session_list_loading = false;
+        assert_eq!(chats_heading_text(&state), "CHANNELS · 0/0");
+        assert_eq!(
+            session_kind_filter_count_label(&state.sessions, SessionKindFilter::Channels, false),
+            "0"
+        );
+
+        state.session_filter.clear();
+        state.session_kind_filter = SessionKindFilter::All;
+        state.session_list_loading = true;
+        state.sessions.push(SessionRef {
+            id: "chat-known-during-refresh".to_string(),
+            title: "Known chat".to_string(),
+            kind: ConversationKind::Chat,
+            updated_unix: 0,
+            participant_count: 1,
+            participant_names: Vec::new(),
+        });
+        assert_eq!(chats_heading_text(&state), "CONVERSATIONS · 1");
+        assert_eq!(
+            session_kind_filter_count_label(&state.sessions, SessionKindFilter::All, true),
+            "1"
         );
     }
 

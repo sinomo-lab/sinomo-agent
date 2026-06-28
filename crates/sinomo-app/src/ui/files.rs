@@ -68,6 +68,7 @@ const PLACE_ROW_H: f32 = 42.0;
 const FILE_PREVIEW_MAX_BYTES: u64 = 32 * 1024;
 const FILE_PREVIEW_MAX_LINES: usize = 8;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_NAV_HISTORY: usize = 64;
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as `settings.rs`.)
@@ -205,6 +206,12 @@ struct FilesOperation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct FilesLocation {
+    source: FilesSourceKind,
+    path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct FilesOperationOutcome {
     refresh_path: String,
     select_path: Option<String>,
@@ -281,6 +288,8 @@ pub struct FilesState {
     pub path: String,
     sifs_path: String,
     local_path: String,
+    history_back: Vec<FilesLocation>,
+    history_forward: Vec<FilesLocation>,
     pub entries: Vec<SifsEntry>,
     pub selected: Option<usize>,
     pub selected_details: Option<SifsObjectDetails>,
@@ -324,6 +333,8 @@ impl FilesState {
             path: "/".to_string(),
             sifs_path: "/".to_string(),
             local_path,
+            history_back: Vec::new(),
+            history_forward: Vec::new(),
             entries: Vec::new(),
             selected: None,
             selected_details: None,
@@ -728,25 +739,104 @@ impl FilesState {
         }
     }
 
-    fn navigate(&mut self, path: String) {
-        let normalized = match self.source {
-            FilesSourceKind::Sifs => self
+    fn current_location(&self) -> FilesLocation {
+        FilesLocation {
+            source: self.source,
+            path: self.path.clone(),
+        }
+    }
+
+    fn can_go_back(&self) -> bool {
+        !self.history_back.is_empty()
+    }
+
+    fn can_go_forward(&self) -> bool {
+        !self.history_forward.is_empty()
+    }
+
+    fn push_history(stack: &mut Vec<FilesLocation>, location: FilesLocation) {
+        if stack.last() == Some(&location) {
+            return;
+        }
+        stack.push(location);
+        if stack.len() > MAX_NAV_HISTORY {
+            stack.remove(0);
+        }
+    }
+
+    fn record_navigation_origin(&mut self) {
+        let location = self.current_location();
+        Self::push_history(&mut self.history_back, location);
+        self.history_forward.clear();
+    }
+
+    fn normalize_location_path(
+        &self,
+        source: FilesSourceKind,
+        path: &str,
+    ) -> Result<String, String> {
+        match source {
+            FilesSourceKind::Sifs => Ok(self
                 .browser
                 .as_ref()
-                .map(|b| b.normalize(&path))
-                .unwrap_or_else(|| normalize_path(&path)),
-            FilesSourceKind::Local => match normalize_local_path(&path) {
-                Ok(path) => path,
-                Err(error) => {
-                    self.error = Some(error);
-                    self.list_revision = self.list_revision.wrapping_add(1);
-                    return;
-                }
-            },
-        };
-        self.path = normalized;
+                .map(|b| b.normalize(path))
+                .unwrap_or_else(|| normalize_path(path))),
+            FilesSourceKind::Local => normalize_local_path(path),
+        }
+    }
+
+    fn apply_location(
+        &mut self,
+        source: FilesSourceKind,
+        path: String,
+        waker: Option<sui::UiHandle>,
+    ) {
+        if self.source != source {
+            self.store_active_path();
+            self.source = source;
+            self.error = None;
+            self.entries.clear();
+            self.selected = None;
+            self.clear_selected_details();
+            self.loading = false;
+            self.pending_request_id = None;
+            self.pending_details_request_id = None;
+            self.pending_preview_request_id = None;
+            self.list_revision = self.list_revision.wrapping_add(1);
+            if let Some(waker) = waker {
+                self.ensure_worker(waker);
+            }
+            self.loaded = true;
+        }
+        self.path = path;
         self.store_active_path();
         self.reload();
+    }
+
+    fn open_location(
+        &mut self,
+        source: FilesSourceKind,
+        path: String,
+        waker: Option<sui::UiHandle>,
+    ) {
+        let normalized = match self.normalize_location_path(source, &path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.error = Some(error);
+                self.list_revision = self.list_revision.wrapping_add(1);
+                return;
+            }
+        };
+        if self.source == source && self.path == normalized {
+            self.reload();
+            return;
+        }
+        self.record_navigation_origin();
+        self.apply_location(source, normalized, waker);
+    }
+
+    fn navigate(&mut self, path: String) {
+        self.open_location(self.source, path, None);
     }
 
     fn go_up(&mut self) {
@@ -763,30 +853,37 @@ impl FilesState {
         }
     }
 
+    fn go_back(&mut self, waker: Option<sui::UiHandle>) {
+        let Some(location) = self.history_back.pop() else {
+            return;
+        };
+        let current = self.current_location();
+        if current != location {
+            Self::push_history(&mut self.history_forward, current);
+        }
+        self.apply_location(location.source, location.path, waker);
+    }
+
+    fn go_forward(&mut self, waker: Option<sui::UiHandle>) {
+        let Some(location) = self.history_forward.pop() else {
+            return;
+        };
+        let current = self.current_location();
+        if current != location {
+            Self::push_history(&mut self.history_back, current);
+        }
+        self.apply_location(location.source, location.path, waker);
+    }
+
     fn switch_source(&mut self, source: FilesSourceKind, waker: Option<sui::UiHandle>) {
         if self.source == source {
             return;
         }
-        self.store_active_path();
-        self.source = source;
-        self.path = match source {
+        let path = match source {
             FilesSourceKind::Sifs => self.sifs_path.clone(),
             FilesSourceKind::Local => self.local_path.clone(),
         };
-        self.error = None;
-        self.entries.clear();
-        self.selected = None;
-        self.clear_selected_details();
-        self.loading = false;
-        self.pending_request_id = None;
-        self.pending_details_request_id = None;
-        self.pending_preview_request_id = None;
-        self.list_revision = self.list_revision.wrapping_add(1);
-        if let Some(waker) = waker {
-            self.ensure_worker(waker);
-        }
-        self.loaded = true;
-        self.reload();
+        self.open_location(source, path, waker);
     }
 
     fn store_active_path(&mut self) {
@@ -3861,12 +3958,42 @@ impl Widget for SifsEntryRow {
 // Breadcrumb header (path bar) — rebuilt on navigation by `RebuildOnChange`.
 // ---------------------------------------------------------------------------
 
-/// Build the header: an up `IconButton` + a `Breadcrumb` over the current path segments. Each
+/// Build the header: navigation buttons + a `Breadcrumb` over the current path segments. Each
 /// segment activates a navigate-to-that-segment; the up button goes to the parent.
 fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let crumbs = shared.files().crumbs();
     let current = crumbs.len().saturating_sub(1);
     let targets: Vec<String> = crumbs.iter().map(|(_, target)| target.clone()).collect();
+
+    let back = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::ChevronLeft, "Back")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || s.files().can_go_back()
+            })
+            .on_press(move || {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut().go_back(waker);
+            })
+    };
+
+    let forward = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::ChevronRight, "Forward")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || s.files().can_go_forward()
+            })
+            .on_press(move || {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut().go_forward(waker);
+            })
+    };
 
     let up = {
         let s = shared.clone();
@@ -4079,6 +4206,8 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     Stack::horizontal()
         .spacing(8.0)
         .alignment(Alignment::Center)
+        .with_child(back)
+        .with_child(forward)
         .with_child(up)
         .with_child(SizedBox::new().width(118.0).height(30.0).with_child(source))
         .with_child(breadcrumb)
@@ -4628,12 +4757,14 @@ fn open_file_place(shared: &Shared, place: FilePlace, ctx: &mut EventCtx) {
     let waker = { shared.borrow().waker.clone() };
     {
         let mut files = shared.files_mut();
-        if files.source != place.source {
-            files.switch_source(place.source, waker);
-        }
         match place.action {
-            FilePlaceAction::OpenPath => files.navigate(place.path),
-            FilePlaceAction::OpenPathPrompt => files.open_action_prompt(FileActionPromptKind::GoTo),
+            FilePlaceAction::OpenPath => files.open_location(place.source, place.path, waker),
+            FilePlaceAction::OpenPathPrompt => {
+                if files.source != place.source {
+                    files.switch_source(place.source, waker);
+                }
+                files.open_action_prompt(FileActionPromptKind::GoTo);
+            }
         }
     }
     request_files_overlay_rebuild(ctx);
@@ -7279,17 +7410,26 @@ impl Widget for InsetX {
 // Composed pods (wide split / narrow list-only) + responsive host.
 // ---------------------------------------------------------------------------
 
-/// The header bar wrapped so it rebuilds (breadcrumb segments) whenever the path changes. A
-/// fixed-height titlebar surface (up button + breadcrumb) over a hairline separator.
+/// The header bar wrapped so it rebuilds (breadcrumb segments and history affordances) whenever
+/// navigation state changes. A fixed-height titlebar surface over a hairline separator.
 fn header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
     let r = Rc::clone(reader);
     let rebuilt = RebuildOnChange::new(
         {
             let s = s.clone();
-            move || s.files().path.clone()
+            move || {
+                let files = s.files();
+                (
+                    files.source,
+                    files.path.clone(),
+                    files.history_back.len(),
+                    files.history_forward.len(),
+                    files.loading,
+                )
+            }
         },
-        move |_path| WidgetPod::new(header(&s, &r)),
+        move |_key| WidgetPod::new(header(&s, &r)),
     );
     InsetX::new(rebuilt, CONTENT_PAD)
 }
@@ -7831,6 +7971,51 @@ mod tests {
         assert!(path_changed, "activating a directory navigates");
         assert_eq!(state.path, "/dir");
         assert_eq!(state.selected, None);
+    }
+
+    #[test]
+    fn navigation_history_tracks_paths_and_sources() {
+        let root = files_test_temp_dir("navigation-history");
+        fs::create_dir(root.join("nested")).expect("create nested dir");
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.loaded = true;
+        state.loading = false;
+        state.path = "/".to_string();
+        state.sifs_path = "/".to_string();
+        state.local_path = display_local_path(root.to_string_lossy().into_owned());
+
+        state.navigate("/services".to_string());
+        assert_eq!(state.path, "/services");
+        assert!(state.can_go_back());
+        assert!(!state.can_go_forward());
+
+        state.navigate("/users".to_string());
+        assert_eq!(state.path, "/users");
+
+        state.go_back(None);
+        assert_eq!(state.source, FilesSourceKind::Sifs);
+        assert_eq!(state.path, "/services");
+        assert!(state.can_go_back());
+        assert!(state.can_go_forward());
+
+        state.switch_source(FilesSourceKind::Local, None);
+        assert_eq!(state.source, FilesSourceKind::Local);
+        assert_eq!(state.path, state.local_path);
+        assert!(state.can_go_back());
+        assert!(!state.can_go_forward());
+
+        state.go_back(None);
+        assert_eq!(state.source, FilesSourceKind::Sifs);
+        assert_eq!(state.path, "/services");
+        assert!(state.can_go_forward());
+
+        state.go_forward(None);
+        assert_eq!(state.source, FilesSourceKind::Local);
+        assert_eq!(state.path, state.local_path);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -9334,6 +9519,20 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Back")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Forward")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
                 .with_name("Refresh SIFS")
                 .count()?,
             1
@@ -9345,6 +9544,57 @@ mod tests {
                 .count()?,
             1
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn header_back_forward_buttons_navigate_history() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/services".to_string();
+            files.sifs_path = "/services".to_string();
+            files.history_back.push(FilesLocation {
+                source: FilesSourceKind::Sifs,
+                path: "/".to_string(),
+            });
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/services/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(4),
+            }];
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files history")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Back")
+            .click()?;
+        assert_eq!(shared.files().source, FilesSourceKind::Sifs);
+        assert_eq!(shared.files().path, "/");
+        assert!(shared.files().can_go_forward());
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Forward")
+            .click()?;
+        assert_eq!(shared.files().source, FilesSourceKind::Sifs);
+        assert_eq!(shared.files().path, "/services");
 
         Ok(())
     }
