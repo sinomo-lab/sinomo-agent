@@ -443,6 +443,7 @@ pub struct ChatState {
     session_list_rx: Option<Receiver<SessionListWorkerResult>>,
     session_list_loading: bool,
     session_list_started_at: Option<Instant>,
+    session_list_slow_notice_shown: bool,
     channel_agent_idx: usize,
 }
 
@@ -526,11 +527,12 @@ impl ChatState {
             session_list_rx: None,
             session_list_loading: false,
             session_list_started_at: None,
+            session_list_slow_notice_shown: false,
             channel_agent_idx: 0,
         };
         if let Some(detail) = session_list_error {
             state.notice = Some(format!("chat list failed: {detail}"));
-            state.push_activity("chat list", detail, ActivityTone::Warn);
+            state.replace_activity("chat list", detail, ActivityTone::Warn);
         }
         // Eagerly fetch the default/initial provider's models so the model picker is populated
         // without requiring a manual provider toggle. (Results arrive async via `ChatEvent::Models`;
@@ -599,6 +601,7 @@ impl ChatState {
         if self.session_list_loading {
             return;
         }
+        self.session_list_slow_notice_shown = false;
         let (tx, rx) = mpsc::channel();
         let data_dir = self.data_dir.clone();
         let sifs_daemon = self.sifs_daemon.clone();
@@ -617,10 +620,11 @@ impl ChatState {
         if let Err(error) = spawn_result {
             let detail = error.to_string();
             self.notice = Some(format!("chat list failed: {detail}"));
-            self.push_activity("chat list", detail, ActivityTone::Warn);
+            self.replace_activity("chat list", detail, ActivityTone::Warn);
             self.session_list_rx = None;
             self.session_list_loading = false;
             self.session_list_started_at = None;
+            self.session_list_slow_notice_shown = false;
             return;
         }
 
@@ -638,18 +642,17 @@ impl ChatState {
             Some(Ok(result)) => result,
             Some(Err(TryRecvError::Empty)) => {
                 if self.session_list_loading
+                    && !self.session_list_slow_notice_shown
                     && self
                         .session_list_started_at
                         .is_some_and(|started| started.elapsed() >= SESSION_LIST_UI_TIMEOUT)
                 {
-                    self.session_list_loading = false;
-                    self.session_list_started_at = None;
                     let detail = format!(
-                        "SIFS chat list has not returned after {} seconds; cluster connection is still pending",
+                        "SIFS chat list is still loading after {} seconds",
                         SESSION_LIST_UI_TIMEOUT.as_secs()
                     );
-                    self.notice = Some(format!("chat list failed: {detail}"));
-                    self.push_activity("chat list", detail, ActivityTone::Warn);
+                    self.session_list_slow_notice_shown = true;
+                    self.replace_activity("chat list", detail, ActivityTone::Running);
                     return true;
                 }
                 return false;
@@ -659,8 +662,9 @@ impl ChatState {
                 self.session_list_rx = None;
                 self.session_list_loading = false;
                 self.session_list_started_at = None;
+                self.session_list_slow_notice_shown = false;
                 self.notice = Some("chat list failed: worker stopped".to_string());
-                self.push_activity(
+                self.replace_activity(
                     "chat list",
                     "worker stopped before loading chats from SIFS".to_string(),
                     ActivityTone::Warn,
@@ -671,6 +675,7 @@ impl ChatState {
         self.session_list_rx = None;
         self.session_list_loading = false;
         self.session_list_started_at = None;
+        self.session_list_slow_notice_shown = false;
         self.apply_session_list_result(result);
         true
     }
@@ -690,7 +695,7 @@ impl ChatState {
         match error {
             Some(detail) => {
                 self.notice = Some(format!("chat list failed: {detail}"));
-                self.push_activity("chat list", detail, ActivityTone::Warn);
+                self.replace_activity("chat list", detail, ActivityTone::Warn);
             }
             None => {
                 if self
@@ -835,6 +840,17 @@ impl ChatState {
         if excess > 0 {
             self.activity.drain(0..excess);
         }
+    }
+
+    fn replace_activity(
+        &mut self,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        tone: ActivityTone,
+    ) {
+        let title = title.into();
+        self.activity.retain(|entry| entry.title != title);
+        self.push_activity(title, detail, tone);
     }
 
     fn record_tool_call(
@@ -2446,8 +2462,11 @@ fn list_conversations_with_error(
         })
         .collect::<Vec<_>>();
 
-    let channel_result = open_agent_channel_store(data_dir, sifs_daemon)
-        .and_then(|store| store.list_channels().map_err(channel_store_io_error));
+    let channel_result = open_agent_channel_store(data_dir, sifs_daemon).and_then(|store| {
+        store
+            .list_channel_summaries()
+            .map_err(channel_store_io_error)
+    });
     let channel_error = match channel_result {
         Ok(channels) => {
             let mut seen_channel_ids = BTreeSet::new();
@@ -2471,11 +2490,7 @@ fn list_conversations_with_error(
                     },
                     kind: ConversationKind::Channel,
                     updated_unix: channel.updated_at.unix_timestamp(),
-                    participant_count: channel
-                        .participants
-                        .iter()
-                        .filter(|participant| participant.enabled)
-                        .count(),
+                    participant_count: channel.enabled_participant_count,
                 });
             }
             None
@@ -8178,20 +8193,39 @@ mod tests {
                 .checked_sub(SESSION_LIST_UI_TIMEOUT + Duration::from_millis(1))
                 .expect("past timestamp"),
         );
+        state.session_list_slow_notice_shown = false;
 
         assert!(
             state.pump_session_list(),
-            "timeout should mutate visible state"
+            "slow load should mutate visible state once"
         );
-        assert!(!state.session_list_loading);
+        assert!(state.session_list_loading);
+        assert!(state.session_list_slow_notice_shown);
+        assert!(state.notice.is_none());
+        assert!(state.connection_attention_detail().is_none());
+        let chat_list_statuses = state
+            .activity
+            .iter()
+            .filter(|entry| entry.title == "chat list")
+            .collect::<Vec<_>>();
+        assert_eq!(chat_list_statuses.len(), 1);
+        assert_eq!(chat_list_statuses[0].tone, ActivityTone::Running);
         assert!(
-            state
-                .notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("SIFS chat list")),
-            "timeout should surface an actionable SIFS warning"
+            chat_list_statuses[0].detail.contains("still loading"),
+            "slow load should be a running status, not a failure"
         );
-        assert!(state.activity_panel_visible());
+        assert!(
+            !state.pump_session_list(),
+            "slow status should not duplicate while the worker is still pending"
+        );
+        assert_eq!(
+            state
+                .activity
+                .iter()
+                .filter(|entry| entry.title == "chat list")
+                .count(),
+            1
+        );
 
         let session_id = SessionId::generate().to_string();
         tx.send(SessionListWorkerResult {
@@ -8212,6 +8246,8 @@ mod tests {
         );
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(state.sessions[0].id, session_id);
+        assert!(!state.session_list_loading);
+        assert!(!state.session_list_slow_notice_shown);
         assert!(state.notice.is_none());
         assert!(
             state

@@ -29,6 +29,7 @@ use sinomo_runtime::events::{InMemoryEventStore, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{ClusterPaths, ObjectRpcRequest};
 use sinomo_runtime::node::NodeId;
+use std::collections::BTreeSet;
 use time::format_description::well_known::Rfc3339;
 
 use crate::commands::{
@@ -47,6 +48,51 @@ const APP_CHAT_RUNTIME_START_TIMEOUT: Duration = Duration::from_secs(5);
 const APP_CHAT_RUNTIME_SILENCE_TIMEOUT: Duration = Duration::from_secs(45);
 const STRUCTURED_AGENT_JSON_STREAM: &str = "__sinomo_structured_agent_json_stream__";
 pub const SIFS_AGENT_CHANNELS_ROOT: &str = "/services/sinomo-agent/channels";
+const SIFS_AGENT_CHANNEL_INDEX_PATH: &str = "/services/sinomo-agent/channel-index.json";
+const SIFS_AGENT_CHANNEL_INDEX_SCHEMA_VERSION: u32 = 1;
+
+/// Lightweight channel metadata for list views.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentChannelSummary {
+    pub channel_id: SessionId,
+    pub title: String,
+    #[serde(default)]
+    pub channel_kind: AgentChannelKind,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub deleted_at: Option<time::OffsetDateTime>,
+    #[serde(default)]
+    pub enabled_participant_count: usize,
+}
+
+impl AgentChannelSummary {
+    fn from_channel(channel: &AgentChannel) -> Self {
+        Self {
+            channel_id: channel.channel_id.clone(),
+            title: channel.title.clone(),
+            channel_kind: channel.channel_kind,
+            updated_at: channel.updated_at,
+            deleted_at: channel.deleted_at,
+            enabled_participant_count: channel
+                .participants
+                .iter()
+                .filter(|participant| participant.enabled)
+                .count(),
+        }
+    }
+
+    fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SifsAgentChannelIndex {
+    schema_version: u32,
+    #[serde(default)]
+    channels: Vec<AgentChannelSummary>,
+}
 
 /// The active agent / model selection, as plain strings.
 #[derive(Clone, Debug, Default)]
@@ -325,6 +371,17 @@ impl SifsAgentChannelStore {
         format!("{}/events.jsonl", Self::channel_dir(channel_id))
     }
 
+    fn sorted_visible_summaries(
+        summaries: impl IntoIterator<Item = AgentChannelSummary>,
+    ) -> Vec<AgentChannelSummary> {
+        let mut summaries = summaries
+            .into_iter()
+            .filter(|summary| !summary.is_deleted())
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        summaries
+    }
+
     fn ensure_parent(&self, path: &str) -> Result<(), AgentChannelStoreError> {
         if let Some(parent) = self.browser.parent(path) {
             self.browser
@@ -363,6 +420,119 @@ impl SifsAgentChannelStore {
         bytes.push(b'\n');
         self.write_file(path, &bytes)
     }
+
+    fn channel_ids_from_sifs(&self) -> Result<BTreeSet<SessionId>, AgentChannelStoreError> {
+        let entries = self
+            .browser
+            .list_if_exists(SIFS_AGENT_CHANNELS_ROOT)
+            .map_err(|detail| channel_store_io(SIFS_AGENT_CHANNELS_ROOT, detail))?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| entry.is_dir)
+            .filter_map(|entry| entry.name.parse::<SessionId>().ok())
+            .collect())
+    }
+
+    fn read_channel_index(&self) -> Result<Option<SifsAgentChannelIndex>, AgentChannelStoreError> {
+        let bytes = match self.browser.read_file(SIFS_AGENT_CHANNEL_INDEX_PATH) {
+            Ok(bytes) => bytes,
+            Err(detail) if sifs_error_is_not_found(&detail) => return Ok(None),
+            Err(detail) => return Err(channel_store_io(SIFS_AGENT_CHANNEL_INDEX_PATH, detail)),
+        };
+        let Ok(index) = serde_json::from_slice::<SifsAgentChannelIndex>(&bytes) else {
+            return Ok(None);
+        };
+        if index.schema_version != SIFS_AGENT_CHANNEL_INDEX_SCHEMA_VERSION {
+            return Ok(None);
+        }
+        Ok(Some(index))
+    }
+
+    fn write_channel_index(
+        &self,
+        summaries: &[AgentChannelSummary],
+    ) -> Result<(), AgentChannelStoreError> {
+        let index = SifsAgentChannelIndex {
+            schema_version: SIFS_AGENT_CHANNEL_INDEX_SCHEMA_VERSION,
+            channels: summaries.to_vec(),
+        };
+        let bytes = serde_json::to_vec_pretty(&index).map_err(|source| {
+            AgentChannelStoreError::Serialization {
+                detail: source.to_string(),
+            }
+        })?;
+        self.write_file(SIFS_AGENT_CHANNEL_INDEX_PATH, &bytes)
+    }
+
+    fn rebuild_channel_index(
+        &self,
+        ids: &BTreeSet<SessionId>,
+    ) -> Result<Vec<AgentChannelSummary>, AgentChannelStoreError> {
+        let mut summaries = Vec::new();
+        let paths = ids.iter().map(Self::snapshot_path).collect::<Vec<_>>();
+        for (path, result) in self
+            .browser
+            .read_files(&paths)
+            .map_err(|detail| channel_store_io(SIFS_AGENT_CHANNELS_ROOT, detail))?
+        {
+            let bytes = match result {
+                Ok(bytes) => bytes,
+                Err(detail) if sifs_error_is_not_found(&detail) => continue,
+                Err(detail) => return Err(channel_store_io(&path, detail)),
+            };
+            let snapshot = serde_json::from_slice::<OwnedSifsAgentChannelSnapshot>(&bytes)
+                .map_err(|source| AgentChannelStoreError::Serialization {
+                    detail: source.to_string(),
+                })?;
+            if snapshot.schema_version != AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION {
+                return Err(AgentChannelStoreError::Serialization {
+                    detail: format!(
+                        "unsupported agent channel snapshot schema version {}",
+                        snapshot.schema_version
+                    ),
+                });
+            }
+            summaries.push(AgentChannelSummary::from_channel(&snapshot.channel));
+        }
+        summaries.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        self.write_channel_index(&summaries)?;
+        Ok(summaries)
+    }
+
+    fn update_channel_index(&self, channel: &AgentChannel) -> Result<(), AgentChannelStoreError> {
+        let mut summaries = match self.read_channel_index()? {
+            Some(index) => index.channels,
+            None => {
+                let ids = self.channel_ids_from_sifs()?;
+                self.rebuild_channel_index(&ids)?
+            }
+        };
+        let summary = AgentChannelSummary::from_channel(channel);
+        match summaries
+            .iter_mut()
+            .find(|existing| existing.channel_id == summary.channel_id)
+        {
+            Some(existing) => *existing = summary,
+            None => summaries.push(summary),
+        }
+        summaries.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        self.write_channel_index(&summaries)
+    }
+
+    pub fn list_channel_summaries(
+        &self,
+    ) -> Result<Vec<AgentChannelSummary>, AgentChannelStoreError> {
+        if let Some(index) = self.read_channel_index()? {
+            return Ok(Self::sorted_visible_summaries(index.channels));
+        }
+        let ids = self.channel_ids_from_sifs()?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(Self::sorted_visible_summaries(
+            self.rebuild_channel_index(&ids)?,
+        ))
+    }
 }
 
 impl AgentChannelStore for SifsAgentChannelStore {
@@ -376,7 +546,8 @@ impl AgentChannelStore for SifsAgentChannelStore {
                 detail: source.to_string(),
             }
         })?;
-        self.write_file(&Self::snapshot_path(&channel.channel_id), &bytes)
+        self.write_file(&Self::snapshot_path(&channel.channel_id), &bytes)?;
+        self.update_channel_index(channel)
     }
 
     fn load_channel(
@@ -407,15 +578,8 @@ impl AgentChannelStore for SifsAgentChannelStore {
     }
 
     fn list_channels(&self) -> Result<Vec<AgentChannel>, AgentChannelStoreError> {
-        let entries = self
-            .browser
-            .list_if_exists(SIFS_AGENT_CHANNELS_ROOT)
-            .map_err(|detail| channel_store_io(SIFS_AGENT_CHANNELS_ROOT, detail))?;
         let mut channels = Vec::new();
-        for entry in entries.into_iter().filter(|entry| entry.is_dir) {
-            let Ok(channel_id) = entry.name.parse::<SessionId>() else {
-                continue;
-            };
+        for channel_id in self.channel_ids_from_sifs()? {
             if let Some(channel) = self.load_channel(&channel_id)? {
                 if !channel.is_deleted() {
                     channels.push(channel);
@@ -1907,6 +2071,25 @@ impl SifsBrowser {
         }
     }
 
+    pub fn read_files(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<(String, Result<Vec<u8>, String>)>, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => Ok(paths
+                .iter()
+                .map(|path| (path.clone(), backend.read_file(path)))
+                .collect()),
+            SifsBrowserBackend::Remote(remote) => match remote.read_files(paths) {
+                Ok(files) => Ok(files),
+                Err(_) => Ok(paths
+                    .iter()
+                    .map(|path| (path.clone(), remote.read_file(path)))
+                    .collect()),
+            },
+        }
+    }
+
     pub fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
         match &self.backend {
             SifsBrowserBackend::Local(backend) => backend.write_file(path, bytes),
@@ -1994,6 +2177,30 @@ impl RemoteSifsBrowser {
             },
         )?;
         Ok(response.bytes)
+    }
+
+    fn read_files(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<(String, Result<Vec<u8>, String>)>, String> {
+        let response: sinomo_runtime::daemon::DaemonDfsBrowserReadFilesResponse = self.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserReadFilesRequest {
+                paths: paths.to_vec(),
+            },
+        )?;
+        Ok(response
+            .files
+            .into_iter()
+            .map(|file| {
+                let result = match (file.bytes, file.error) {
+                    (Some(bytes), _) => Ok(bytes),
+                    (_, Some(error)) => Err(error),
+                    (None, None) => Err("daemon returned no bytes".to_string()),
+                };
+                (file.path, result)
+            })
+            .collect())
     }
 
     fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
@@ -2373,6 +2580,45 @@ mod tests {
         assert_eq!(
             participant.agent_session_id,
             participant_session_id.to_string()
+        );
+    }
+
+    #[test]
+    fn sifs_channel_summaries_track_indexed_channel_metadata() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-summaries");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Team channel");
+        channel.ensure_user(AgentChannelUser::app_local());
+        channel.ensure_participant("main-agent", "main-agent");
+        store.save_channel(&channel).expect("save channel");
+
+        let summaries = store.list_channel_summaries().expect("list summaries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].channel_id, channel_id);
+        assert_eq!(summaries[0].title, "Team channel");
+        assert_eq!(summaries[0].channel_kind, AgentChannelKind::Channel);
+        assert_eq!(summaries[0].enabled_participant_count, 1);
+
+        channel.rename("Release triage");
+        store.save_channel(&channel).expect("save renamed channel");
+        let summaries = store
+            .list_channel_summaries()
+            .expect("list renamed summary");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].title, "Release triage");
+
+        channel.tombstone();
+        store
+            .save_channel(&channel)
+            .expect("save tombstoned channel");
+        assert!(
+            store
+                .list_channel_summaries()
+                .expect("list tombstoned summaries")
+                .is_empty(),
+            "deleted channels should remain in SIFS but stay hidden from summaries"
         );
     }
 

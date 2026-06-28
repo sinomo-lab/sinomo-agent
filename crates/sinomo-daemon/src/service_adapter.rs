@@ -116,7 +116,8 @@ use crate::rollout::{
 };
 use crate::{
     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE, DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
-    DAEMON_DFS_BROWSER_LIST_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_ROUTE, DAEMON_DFS_BROWSER_ROUTES,
+    DAEMON_DFS_BROWSER_LIST_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILES_ROUTE, DAEMON_DFS_BROWSER_ROUTES,
     DAEMON_DFS_BROWSER_STATUS_ROUTE, DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_RPC_CATEGORY,
     DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
 };
@@ -1349,6 +1350,37 @@ impl DaemonDfsBrowserBackend {
         Ok(crate::DaemonDfsBrowserReadFileResponse { bytes })
     }
 
+    fn read_files(
+        &self,
+        request: crate::DaemonDfsBrowserReadFilesRequest,
+    ) -> Result<crate::DaemonDfsBrowserReadFilesResponse, ServiceError> {
+        let paths = request
+            .paths
+            .into_iter()
+            .map(|path| normalize_sifs_browser_path(&path).map(|normalized| (path, normalized)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut service = self.lock_service()?;
+        self.refresh_endpoint_targets(&mut service);
+        let files = paths
+            .into_iter()
+            .map(
+                |(requested_path, path)| match service.posix_read_file_distributed(&path) {
+                    Ok(bytes) => crate::DaemonDfsBrowserFileRead {
+                        path: requested_path,
+                        bytes: Some(bytes),
+                        error: None,
+                    },
+                    Err(error) => crate::DaemonDfsBrowserFileRead {
+                        path: requested_path,
+                        bytes: None,
+                        error: Some(error.to_string()),
+                    },
+                },
+            )
+            .collect();
+        Ok(crate::DaemonDfsBrowserReadFilesResponse { files })
+    }
+
     fn write_file(
         &self,
         request: crate::DaemonDfsBrowserWriteFileRequest,
@@ -1459,6 +1491,18 @@ impl Service for DaemonDfsBrowserService {
                     )
                     .await?;
                     ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_READ_FILE_ROUTE, &result)?
+                }
+                DAEMON_DFS_BROWSER_READ_FILES_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS browser read files",
+                        move || {
+                            DaemonDfsBrowserBackend::for_data_dir(data_dir)?.read_files(payload)
+                        },
+                    )
+                    .await?;
+                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_READ_FILES_ROUTE, &result)?
                 }
                 DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE => {
                     let payload = request.decode_body()?;

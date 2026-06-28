@@ -20,12 +20,14 @@ pub const DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE: &str = "/daemon/cluster/main
 pub const DAEMON_DFS_BROWSER_STATUS_ROUTE: &str = "/daemon/dfs/browser/status";
 pub const DAEMON_DFS_BROWSER_LIST_ROUTE: &str = "/daemon/dfs/browser/list";
 pub const DAEMON_DFS_BROWSER_READ_FILE_ROUTE: &str = "/daemon/dfs/browser/read-file";
+pub const DAEMON_DFS_BROWSER_READ_FILES_ROUTE: &str = "/daemon/dfs/browser/read-files";
 pub const DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE: &str = "/daemon/dfs/browser/write-file";
 pub const DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE: &str = "/daemon/dfs/browser/create-dir-all";
 pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_STATUS_ROUTE,
     DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
     DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
     DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
 ];
@@ -78,6 +80,23 @@ pub struct DaemonDfsBrowserReadFileRequest {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserReadFileResponse {
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserReadFilesRequest {
+    pub paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserReadFilesResponse {
+    pub files: Vec<DaemonDfsBrowserFileRead>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserFileRead {
+    pub path: String,
+    pub bytes: Option<Vec<u8>>,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
