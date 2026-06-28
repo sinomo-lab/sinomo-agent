@@ -252,9 +252,35 @@ impl Widget for ClusterView {
                     return;
                 }
 
+                let (selected, selected_warning_action) = {
+                    let cluster = self.shared.cluster();
+                    let selected = cluster.selected.clone();
+                    let selected_warning_action = selected_node_needs_connection_settings(
+                        &cluster.snapshot,
+                        selected.as_ref(),
+                    );
+                    (selected, selected_warning_action)
+                };
+                if selected.is_some()
+                    && selected_refresh_action_rect(ctx.bounds()).contains(pointer.position)
+                {
+                    request_refresh(&self.shared);
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                    ctx.set_handled();
+                    return;
+                }
+                if selected_warning_action
+                    && selected_warning_action_rect(ctx.bounds()).contains(pointer.position)
+                {
+                    self.open_connection_settings();
+                    ctx.request_paint();
+                    ctx.set_handled();
+                    return;
+                }
+
                 let snapshot = self.shared.cluster().snapshot.clone();
                 let topology = build_topology(&snapshot);
-                let selected = self.shared.cluster().selected.clone();
                 if overview_detail_toggle_visible(&snapshot, selected.as_ref())
                     && overview_detail_toggle_rect(ctx.bounds(), overview_warning_action)
                         .contains(pointer.position)
@@ -348,15 +374,42 @@ impl Widget for ClusterView {
         node.name = Some("Cluster topology. Select a node or LAN segment for details.".to_string());
         ctx.push(node);
 
-        let (show_warning_action, show_overview_details, diagnostics_open) = {
+        let (
+            show_warning_action,
+            show_overview_details,
+            diagnostics_open,
+            selected,
+            selected_warning_action,
+            refreshing,
+        ) = {
             let cluster = self.shared.cluster();
+            let selected = cluster.selected.clone();
             (
                 cluster.selected.is_none() && !cluster.snapshot.warnings.is_empty(),
                 overview_detail_toggle_visible(&cluster.snapshot, cluster.selected.as_ref()),
                 cluster.diagnostics_open,
+                selected.clone(),
+                selected_node_needs_connection_settings(&cluster.snapshot, selected.as_ref()),
+                cluster.refreshing,
             )
         };
-        if show_overview_details {
+        if selected.is_some() {
+            let mut action = SemanticsNode::new(
+                cluster_refresh_action_widget_id(ctx.widget_id()),
+                SemanticsRole::Button,
+                selected_refresh_action_rect(ctx.bounds()),
+            );
+            action.parent = Some(ctx.widget_id());
+            action.name = Some(if refreshing {
+                "Refreshing".to_string()
+            } else {
+                "Refresh".to_string()
+            });
+            action.description = Some("Refresh cluster health and topology".to_string());
+            action.actions = vec![SemanticsAction::Activate];
+            action.state.selected = refreshing;
+            ctx.push(action);
+        } else if show_overview_details {
             let cluster = self.shared.cluster();
             let mut action = SemanticsNode::new(
                 cluster_refresh_action_widget_id(ctx.widget_id()),
@@ -374,7 +427,19 @@ impl Widget for ClusterView {
             action.state.selected = cluster.refreshing;
             ctx.push(action);
         }
-        if show_warning_action {
+        if selected_warning_action {
+            let mut action = SemanticsNode::new(
+                cluster_warning_action_widget_id(ctx.widget_id()),
+                SemanticsRole::Button,
+                selected_warning_action_rect(ctx.bounds()),
+            );
+            action.parent = Some(ctx.widget_id());
+            action.name = Some("Connection settings".to_string());
+            action.description =
+                Some("Open connection settings for selected cluster node".to_string());
+            action.actions = vec![SemanticsAction::Activate];
+            ctx.push(action);
+        } else if show_warning_action {
             let mut action = SemanticsNode::new(
                 cluster_warning_action_widget_id(ctx.widget_id()),
                 SemanticsRole::Button,
@@ -386,11 +451,15 @@ impl Widget for ClusterView {
             action.actions = vec![SemanticsAction::Activate];
             ctx.push(action);
         }
-        if show_overview_details {
+        if selected.is_some() || show_overview_details {
             let mut action = SemanticsNode::new(
                 cluster_detail_toggle_widget_id(ctx.widget_id()),
                 SemanticsRole::Button,
-                overview_detail_toggle_rect(ctx.bounds(), show_warning_action),
+                if selected.is_some() {
+                    detail_toggle_rect(ctx.bounds())
+                } else {
+                    overview_detail_toggle_rect(ctx.bounds(), show_warning_action)
+                },
             );
             action.parent = Some(ctx.widget_id());
             action.name = Some(if diagnostics_open {
@@ -759,6 +828,7 @@ fn paint_detail_panel(
         .unwrap_or_else(|| overview_lines(snapshot, topology, diagnostics_open));
     let show_warning_action = selection.is_none() && !snapshot.warnings.is_empty();
     let show_overview_details = overview_detail_toggle_visible(snapshot, selection);
+    let selected_warning_action = selected_node_needs_connection_settings(snapshot, selection);
     let title_style = pal.text_style(theme, 15.0, FontWeight::SEMIBOLD, pal.text);
     let label_style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text_muted);
     let value_style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text);
@@ -778,7 +848,7 @@ fn paint_detail_panel(
         );
         cy += 32.0;
         let content_bottom = if selection.is_some() {
-            detail_toggle_rect(bounds).y() - 8.0
+            selected_action_row_y(bounds) - 8.0
         } else if show_warning_action || show_overview_details {
             overview_action_row_y(bounds) - 8.0
         } else {
@@ -843,6 +913,16 @@ fn paint_detail_panel(
         }
     }
     if selection.is_some() {
+        paint_cluster_refresh_action(
+            ctx,
+            theme,
+            pal,
+            selected_refresh_action_rect(bounds),
+            refreshing,
+        );
+        if selected_warning_action {
+            paint_cluster_warning_action(ctx, theme, pal, selected_warning_action_rect(bounds));
+        }
         paint_detail_toggle(
             ctx,
             theme,
@@ -1151,6 +1231,32 @@ fn overview_detail_toggle_visible(
     selection.is_none()
 }
 
+fn selected_node_needs_connection_settings(
+    snapshot: &ClusterSnapshot,
+    selection: Option<&ClusterSelection>,
+) -> bool {
+    let Some(ClusterSelection::Node(id)) = selection else {
+        return false;
+    };
+    snapshot
+        .nodes
+        .iter()
+        .find(|node| &node.node_id == id)
+        .is_some_and(node_needs_connection_settings)
+}
+
+fn node_needs_connection_settings(node: &ClusterNodeInfo) -> bool {
+    let availability = node.availability.to_ascii_lowercase();
+    let reachable_endpoints = node
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.reachable)
+        .count();
+    matches!(availability.as_str(), "offline" | "unavailable" | "unknown")
+        || node.endpoints.is_empty()
+        || reachable_endpoints == 0
+}
+
 fn detail_panel_rect(bounds: Rect) -> Rect {
     let panel_w = PANEL_W.min((bounds.width() - PAD * 2.0).max(220.0));
     let y = bounds.y() + HEADER_H + 18.0;
@@ -1169,6 +1275,30 @@ fn detail_toggle_rect(bounds: Rect) -> Rect {
         panel.x() + PANEL_PAD,
         panel.max_y() - PANEL_PAD - DETAIL_BUTTON_H,
         144.0,
+        DETAIL_BUTTON_H,
+    )
+}
+
+fn selected_action_row_y(bounds: Rect) -> f32 {
+    detail_toggle_rect(bounds).y() - DETAIL_BUTTON_H - 8.0
+}
+
+fn selected_refresh_action_rect(bounds: Rect) -> Rect {
+    let panel = detail_panel_rect(bounds);
+    Rect::new(
+        panel.x() + PANEL_PAD,
+        selected_action_row_y(bounds),
+        92.0,
+        DETAIL_BUTTON_H,
+    )
+}
+
+fn selected_warning_action_rect(bounds: Rect) -> Rect {
+    let refresh = selected_refresh_action_rect(bounds);
+    Rect::new(
+        refresh.max_x() + 8.0,
+        selected_action_row_y(bounds),
+        132.0,
         DETAIL_BUTTON_H,
     )
 }
@@ -1981,6 +2111,91 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn selected_offline_node_exposes_recovery_actions() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let mut offline = node("node-offline");
+        offline.availability = "offline".to_string();
+        offline.endpoints = vec![endpoint("127.0.0.1:21353", false)];
+        {
+            let mut cluster = shared.cluster_mut();
+            cluster.snapshot = ClusterSnapshot {
+                source: "daemon 127.0.0.1:21353".to_string(),
+                nodes: vec![offline],
+                ..ClusterSnapshot::default()
+            };
+            cluster.selected = Some(ClusterSelection::Node("node-offline".to_string()));
+            cluster.diagnostics_open = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Cluster selected node actions")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Refresh")
+                .with_description("Refresh cluster health and topology")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Show diagnostics")
+                .with_description("Show technical cluster source and identifier details")
+                .count()?,
+            1
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Connection settings")
+            .with_description("Open connection settings for selected cluster node")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn selected_node_connection_action_requires_attention() {
+        let mut healthy = node("node-healthy");
+        healthy.endpoints = vec![endpoint("127.0.0.1:21353", true)];
+        let mut offline = node("node-offline");
+        offline.availability = "offline".to_string();
+        let snapshot = ClusterSnapshot {
+            nodes: vec![healthy, offline],
+            ..ClusterSnapshot::default()
+        };
+
+        assert!(!selected_node_needs_connection_settings(
+            &snapshot,
+            Some(&ClusterSelection::Node("node-healthy".to_string()))
+        ));
+        assert!(selected_node_needs_connection_settings(
+            &snapshot,
+            Some(&ClusterSelection::Node("node-offline".to_string()))
+        ));
+        assert!(!selected_node_needs_connection_settings(
+            &snapshot,
+            Some(&ClusterSelection::LanSegment("lan-segment-1".to_string()))
+        ));
     }
 
     #[test]
