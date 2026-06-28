@@ -2530,6 +2530,8 @@ pub fn wait_for_local_shadow_rollout_completion(
     let main_paths = DaemonPaths::with_root(data_dir.join("daemon"));
     let deadline = Instant::now() + wait_timeout;
     let mut next_restart_nudge = Instant::now() + Duration::from_secs(2);
+    let deferred_finalization_at = Instant::now() + Duration::from_secs(5);
+    let mut attempted_deferred_finalization = false;
     while Instant::now() < deadline {
         let pending_main = rollout_main_activation_path(&rollout_paths).exists();
         let pending_shadow = rollout_shadow_finalize_path(&rollout_paths).exists();
@@ -2541,6 +2543,25 @@ pub fn wait_for_local_shadow_rollout_completion(
             )
         {
             return Ok(());
+        }
+        if pending_shadow
+            && !pending_main
+            && !attempted_deferred_finalization
+            && Instant::now() >= deferred_finalization_at
+        {
+            attempted_deferred_finalization = true;
+            match handle_deferred_shadow_rollout_completion(&main_paths) {
+                Ok(response) => {
+                    tracing::info!(
+                        "sinomo rollout wait completed deferred shadow finalization: {response}"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "sinomo rollout wait deferred shadow finalization failed: {error}"
+                    );
+                }
+            }
         }
         if pending_main && Instant::now() >= next_restart_nudge {
             if let DaemonProbeStatus::Running(status) =
