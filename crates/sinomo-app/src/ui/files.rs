@@ -70,6 +70,8 @@ enum FileActionPromptKind {
     GoTo,
     NewFile,
     NewFolder,
+    Copy,
+    Move,
     Rename,
     Delete,
 }
@@ -80,6 +82,8 @@ impl FileActionPromptKind {
             Self::GoTo => "Go to path",
             Self::NewFile => "New file",
             Self::NewFolder => "New folder",
+            Self::Copy => "Copy to",
+            Self::Move => "Move to",
             Self::Rename => "Rename",
             Self::Delete => "Delete",
         }
@@ -90,6 +94,8 @@ impl FileActionPromptKind {
             Self::GoTo => "Open path",
             Self::NewFile => "Create file",
             Self::NewFolder => "Create folder",
+            Self::Copy => "Copy",
+            Self::Move => "Move",
             Self::Rename => "Rename",
             Self::Delete => "Delete",
         }
@@ -143,6 +149,8 @@ struct FilesTask {
 enum FilesOperationKind {
     CreateFile,
     CreateFolder,
+    Copy,
+    Move,
     Rename,
     Delete,
 }
@@ -630,11 +638,22 @@ impl FilesState {
             FileActionPromptKind::GoTo => self.path.clone(),
             FileActionPromptKind::NewFile => "untitled.txt".to_string(),
             FileActionPromptKind::NewFolder => "New folder".to_string(),
+            FileActionPromptKind::Copy => {
+                if target_name.is_empty() {
+                    String::new()
+                } else {
+                    suggested_copy_name(&target_name)
+                }
+            }
+            FileActionPromptKind::Move => target_name.clone(),
             FileActionPromptKind::Rename => target_name.clone(),
             FileActionPromptKind::Delete => String::new(),
         };
         let error = match kind {
-            FileActionPromptKind::Rename | FileActionPromptKind::Delete
+            FileActionPromptKind::Copy
+            | FileActionPromptKind::Move
+            | FileActionPromptKind::Rename
+            | FileActionPromptKind::Delete
                 if target_path.is_none() =>
             {
                 Some("select an item first".to_string())
@@ -726,6 +745,52 @@ impl FilesState {
                     },
                     "Create folder".to_string(),
                     path,
+                ))
+            }
+            FileActionPromptKind::Copy => {
+                let from = prompt
+                    .target_path
+                    .clone()
+                    .ok_or_else(|| "select an item first".to_string())?;
+                if prompt.target_is_dir {
+                    return Err(
+                        "folder copy is not available yet; move folders or create a new folder"
+                            .to_string(),
+                    );
+                }
+                let to = resolve_sifs_destination_path(&self.path, &prompt.input)?;
+                if from == to {
+                    return Err("copy destination matches the source path".to_string());
+                }
+                Ok((
+                    FilesOperation {
+                        kind: FilesOperationKind::Copy,
+                        path: from.clone(),
+                        target: Some(to.clone()),
+                        directory: false,
+                    },
+                    "Copy".to_string(),
+                    format!("{from} -> {to}"),
+                ))
+            }
+            FileActionPromptKind::Move => {
+                let from = prompt
+                    .target_path
+                    .clone()
+                    .ok_or_else(|| "select an item first".to_string())?;
+                let to = resolve_sifs_destination_path(&self.path, &prompt.input)?;
+                if from == to {
+                    return Err("move destination matches the source path".to_string());
+                }
+                Ok((
+                    FilesOperation {
+                        kind: FilesOperationKind::Move,
+                        path: from.clone(),
+                        target: Some(to.clone()),
+                        directory: prompt.target_is_dir,
+                    },
+                    "Move".to_string(),
+                    format!("{from} -> {to}"),
                 ))
             }
             FileActionPromptKind::Rename => {
@@ -1176,6 +1241,45 @@ fn join_sifs_child(parent: &str, name: &str) -> Result<String, String> {
     })
 }
 
+fn resolve_sifs_destination_path(current_path: &str, input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("destination cannot be empty".to_string());
+    }
+    if trimmed.bytes().any(|byte| byte == 0) {
+        return Err("destination cannot contain NUL bytes".to_string());
+    }
+    let candidate = if trimmed.starts_with('/') || trimmed.starts_with('\\') {
+        trimmed.to_string()
+    } else {
+        let parent = normalize_path(current_path);
+        if parent == "/" {
+            format!("/{trimmed}")
+        } else {
+            format!("{parent}/{trimmed}")
+        }
+    };
+    let normalized = normalize_path(&candidate);
+    if normalized == "/" {
+        return Err("destination must name a file or folder".to_string());
+    }
+    Ok(normalized)
+}
+
+fn suggested_copy_name(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return "copy".to_string();
+    }
+    if let Some((stem, ext)) = trimmed.rsplit_once('.')
+        && !stem.is_empty()
+        && !ext.is_empty()
+    {
+        return format!("{stem} copy.{ext}");
+    }
+    format!("{trimmed} copy")
+}
+
 fn normalize_jump_path(path: &str) -> Result<String, String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -1209,6 +1313,34 @@ fn execute_files_operation(
                 message: format!("created {}", operation.path),
             })
         }
+        FilesOperationKind::Copy => {
+            if operation.directory {
+                return Err("folder copy is not available yet".to_string());
+            }
+            let target = operation
+                .target
+                .clone()
+                .ok_or_else(|| "copy target is missing".to_string())?;
+            let bytes = browser.read_file(&operation.path)?;
+            browser.write_file(&target, &bytes)?;
+            Ok(FilesOperationOutcome {
+                refresh_path: parent_path(&target).unwrap_or_else(|| current_path.to_string()),
+                select_path: Some(target.clone()),
+                message: format!("copied {} to {target}", operation.path),
+            })
+        }
+        FilesOperationKind::Move => {
+            let target = operation
+                .target
+                .clone()
+                .ok_or_else(|| "move target is missing".to_string())?;
+            browser.rename(&operation.path, &target)?;
+            Ok(FilesOperationOutcome {
+                refresh_path: parent_path(&target).unwrap_or_else(|| current_path.to_string()),
+                select_path: Some(target.clone()),
+                message: format!("moved {} to {target}", operation.path),
+            })
+        }
         FilesOperationKind::Rename => {
             let target = operation
                 .target
@@ -1236,6 +1368,14 @@ fn files_operation_cancelled_detail(operation: &FilesOperation) -> String {
     match operation.kind {
         FilesOperationKind::CreateFile | FilesOperationKind::CreateFolder => {
             format!("cancelled before creating {}", operation.path)
+        }
+        FilesOperationKind::Copy => {
+            let target = operation.target.as_deref().unwrap_or("target");
+            format!("cancelled before copying {} to {target}", operation.path)
+        }
+        FilesOperationKind::Move => {
+            let target = operation.target.as_deref().unwrap_or("target");
+            format!("cancelled before moving {} to {target}", operation.path)
         }
         FilesOperationKind::Rename => {
             let target = operation.target.as_deref().unwrap_or("target");
@@ -1536,6 +1676,8 @@ fn unix_nanos_label(nanos: u64) -> String {
 enum SifsEntryRowHit {
     Row,
     Inspect,
+    Copy,
+    Move,
     Rename,
     Delete,
 }
@@ -1577,15 +1719,24 @@ impl SifsEntryRow {
         )
     }
 
+    fn action_enabled(&self, action: SifsEntryRowHit) -> bool {
+        action != SifsEntryRowHit::Copy || !self.entry.is_dir
+    }
+
     fn hit_at(&self, bounds: Rect, position: Point) -> Option<SifsEntryRowHit> {
         if !bounds.contains(position) {
             return None;
         }
         for action in [
             SifsEntryRowHit::Inspect,
+            SifsEntryRowHit::Copy,
+            SifsEntryRowHit::Move,
             SifsEntryRowHit::Rename,
             SifsEntryRowHit::Delete,
         ] {
+            if !self.action_enabled(action) {
+                continue;
+            }
             if self.action_rect(bounds, action).contains(position) {
                 return Some(action);
             }
@@ -1596,6 +1747,8 @@ impl SifsEntryRow {
     fn action_widget_id(parent: sui::WidgetId, action: SifsEntryRowHit) -> sui::WidgetId {
         let salt = match action {
             SifsEntryRowHit::Inspect => 8_317,
+            SifsEntryRowHit::Copy => 8_329,
+            SifsEntryRowHit::Move => 8_341,
             SifsEntryRowHit::Rename => 8_351,
             SifsEntryRowHit::Delete => 8_389,
             SifsEntryRowHit::Row => 8_401,
@@ -1607,8 +1760,10 @@ impl SifsEntryRow {
 fn row_action_slot(action: SifsEntryRowHit) -> Option<usize> {
     match action {
         SifsEntryRowHit::Inspect => Some(0),
-        SifsEntryRowHit::Rename => Some(1),
-        SifsEntryRowHit::Delete => Some(2),
+        SifsEntryRowHit::Copy => Some(1),
+        SifsEntryRowHit::Move => Some(2),
+        SifsEntryRowHit::Rename => Some(3),
+        SifsEntryRowHit::Delete => Some(4),
         SifsEntryRowHit::Row => None,
     }
 }
@@ -1652,6 +1807,18 @@ impl Widget for SifsEntryRow {
                         }
                         SifsEntryRowHit::Inspect => {
                             self.shared.files_mut().select_entry(self.index);
+                        }
+                        SifsEntryRowHit::Copy => {
+                            let mut files = self.shared.files_mut();
+                            files.select_entry(self.index);
+                            files.open_action_prompt(FileActionPromptKind::Copy);
+                            request_files_overlay_rebuild(ctx);
+                        }
+                        SifsEntryRowHit::Move => {
+                            let mut files = self.shared.files_mut();
+                            files.select_entry(self.index);
+                            files.open_action_prompt(FileActionPromptKind::Move);
+                            request_files_overlay_rebuild(ctx);
                         }
                         SifsEntryRowHit::Rename => {
                             let mut files = self.shared.files_mut();
@@ -1749,6 +1916,12 @@ impl Widget for SifsEntryRow {
                 IconGlyph::Search,
                 if active { pal.accent } else { pal.text_muted },
             ),
+            (SifsEntryRowHit::Copy, IconGlyph::Restore, pal.text_muted),
+            (
+                SifsEntryRowHit::Move,
+                IconGlyph::ChevronRight,
+                pal.text_muted,
+            ),
             (
                 SifsEntryRowHit::Rename,
                 IconGlyph::MoreHorizontal,
@@ -1756,6 +1929,9 @@ impl Widget for SifsEntryRow {
             ),
             (SifsEntryRowHit::Delete, IconGlyph::Trash, pal.warn),
         ] {
+            if !self.action_enabled(action) {
+                continue;
+            }
             let rect = self.action_rect(bounds, action);
             if show_actions {
                 let fill = if self.pressed == Some(action) {
@@ -1770,7 +1946,7 @@ impl Widget for SifsEntryRow {
             }
         }
 
-        let actions_w = ROW_ACTION_SIDE * 3.0 + ROW_ACTION_GAP * 2.0 + 8.0;
+        let actions_w = ROW_ACTION_SIDE * 5.0 + ROW_ACTION_GAP * 4.0 + 8.0;
         let meta_w = 74.0_f32.min(bounds.width() * 0.36).max(0.0);
         let meta_rect = Rect::new(
             (bounds.max_x() - actions_w - meta_w).max(bounds.x()),
@@ -1815,6 +1991,16 @@ impl Widget for SifsEntryRow {
                 "Show SIFS placement and metadata".to_string(),
             ),
             (
+                SifsEntryRowHit::Copy,
+                format!("Copy {}", self.entry.name),
+                format!("Copy {} to another SIFS path", self.entry.path),
+            ),
+            (
+                SifsEntryRowHit::Move,
+                format!("Move {}", self.entry.name),
+                format!("Move {} to another SIFS path", self.entry.path),
+            ),
+            (
                 SifsEntryRowHit::Rename,
                 format!("Rename {}", self.entry.name),
                 format!("Rename {}", self.entry.path),
@@ -1825,6 +2011,9 @@ impl Widget for SifsEntryRow {
                 format!("Delete {}", self.entry.path),
             ),
         ] {
+            if !self.action_enabled(action) {
+                continue;
+            }
             let mut node = SemanticsNode::new(
                 Self::action_widget_id(row_id, action),
                 SemanticsRole::Button,
@@ -1951,6 +2140,41 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             })
     };
 
+    let copy = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Restore, "Copy to")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || {
+                    !s.files().loading
+                        && s.files()
+                            .selected_entry()
+                            .is_some_and(|entry| !entry.is_dir)
+                }
+            })
+            .on_press_with_ctx(move |ctx| {
+                s.files_mut().open_action_prompt(FileActionPromptKind::Copy);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+
+    let move_to = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::ChevronRight, "Move to")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.files().loading && s.files().selected_entry().is_some()
+            })
+            .on_press_with_ctx(move |ctx| {
+                s.files_mut().open_action_prompt(FileActionPromptKind::Move);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+
     let rename = {
         let s = shared.clone();
         sui::Button::new("Rename")
@@ -1994,6 +2218,8 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .with_child(go_to)
         .with_child(new_file)
         .with_child(new_folder)
+        .with_child(copy)
+        .with_child(move_to)
         .with_child(rename)
         .with_child(delete)
 }
@@ -3853,6 +4079,16 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         FileActionPromptKind::GoTo => "Open a SIFS path, such as /services".to_string(),
         FileActionPromptKind::NewFile => format!("Create a file in {}", shared.files().path),
         FileActionPromptKind::NewFolder => format!("Create a folder in {}", shared.files().path),
+        FileActionPromptKind::Copy => prompt
+            .target_path
+            .as_deref()
+            .map(|path| format!("Copy {path} to another SIFS path"))
+            .unwrap_or_else(|| "Select a file to copy".to_string()),
+        FileActionPromptKind::Move => prompt
+            .target_path
+            .as_deref()
+            .map(|path| format!("Move {path} to another SIFS path"))
+            .unwrap_or_else(|| "Select an item to move".to_string()),
         FileActionPromptKind::Rename => prompt
             .target_path
             .as_deref()
@@ -3866,6 +4102,7 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     };
     let input_label = match prompt.kind {
         FileActionPromptKind::GoTo => "Path",
+        FileActionPromptKind::Copy | FileActionPromptKind::Move => "Destination",
         FileActionPromptKind::Delete => "Type DELETE",
         _ => "Name",
     };
@@ -4296,6 +4533,104 @@ mod tests {
             state.selected_entry().map(|e| e.name.as_str()),
             Some("a.txt")
         );
+    }
+
+    #[test]
+    fn copy_move_prompts_resolve_destination_paths() {
+        assert_eq!(
+            suggested_copy_name("artifact.txt"),
+            "artifact copy.txt".to_string()
+        );
+        assert_eq!(suggested_copy_name("artifact"), "artifact copy".to_string());
+        assert_eq!(
+            resolve_sifs_destination_path("/services", "archive/artifact.txt"),
+            Ok("/services/archive/artifact.txt".to_string())
+        );
+        assert_eq!(
+            resolve_sifs_destination_path("/services", "/users/alice/artifact.txt"),
+            Ok("/users/alice/artifact.txt".to_string())
+        );
+
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.path = "/services".to_string();
+        state.entries = vec![SifsEntry {
+            name: "artifact.txt".to_string(),
+            path: "/services/artifact.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(5),
+        }];
+        state.selected = Some(0);
+
+        state.open_action_prompt(FileActionPromptKind::Copy);
+        let prompt = state.action_prompt.as_ref().expect("copy prompt").clone();
+        assert_eq!(prompt.input, "artifact copy.txt");
+        let (operation, title, detail) = state
+            .operation_from_prompt(&prompt)
+            .expect("copy operation");
+        assert_eq!(operation.kind, FilesOperationKind::Copy);
+        assert_eq!(operation.path, "/services/artifact.txt");
+        assert_eq!(
+            operation.target.as_deref(),
+            Some("/services/artifact copy.txt")
+        );
+        assert_eq!(title, "Copy");
+        assert_eq!(
+            detail,
+            "/services/artifact.txt -> /services/artifact copy.txt"
+        );
+
+        state.open_action_prompt(FileActionPromptKind::Move);
+        state.set_action_prompt_input("/users/alice/artifact.txt".to_string());
+        let prompt = state.action_prompt.as_ref().expect("move prompt").clone();
+        let (operation, title, detail) = state
+            .operation_from_prompt(&prompt)
+            .expect("move operation");
+        assert_eq!(operation.kind, FilesOperationKind::Move);
+        assert_eq!(
+            operation.target.as_deref(),
+            Some("/users/alice/artifact.txt")
+        );
+        assert_eq!(title, "Move");
+        assert_eq!(
+            detail,
+            "/services/artifact.txt -> /users/alice/artifact.txt"
+        );
+    }
+
+    #[test]
+    fn copy_prompt_rejects_directories_but_move_allows_them() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.path = "/services".to_string();
+        state.entries = vec![SifsEntry {
+            name: "logs".to_string(),
+            path: "/services/logs".to_string(),
+            is_dir: true,
+            is_link: false,
+            size: None,
+        }];
+        state.selected = Some(0);
+
+        state.open_action_prompt(FileActionPromptKind::Copy);
+        let prompt = state.action_prompt.as_ref().expect("copy prompt").clone();
+        assert!(
+            state
+                .operation_from_prompt(&prompt)
+                .expect_err("directory copy is not supported yet")
+                .contains("folder copy")
+        );
+
+        state.open_action_prompt(FileActionPromptKind::Move);
+        state.set_action_prompt_input("/users/logs".to_string());
+        let prompt = state.action_prompt.as_ref().expect("move prompt").clone();
+        let (operation, _, _) = state
+            .operation_from_prompt(&prompt)
+            .expect("directory move operation");
+        assert_eq!(operation.kind, FilesOperationKind::Move);
+        assert!(operation.directory);
+        assert_eq!(operation.target.as_deref(), Some("/users/logs"));
     }
 
     #[test]
@@ -5311,7 +5646,7 @@ mod tests {
     }
 
     #[test]
-    fn row_action_buttons_open_rename_and_delete_prompts() -> sui::Result<()> {
+    fn row_action_buttons_open_copy_move_rename_and_delete_prompts() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -5338,6 +5673,44 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Copy artifact.txt")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("copy prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::Copy);
+            assert_eq!(prompt.target_path.as_deref(), Some("/artifact.txt"));
+            assert_eq!(prompt.input, "artifact copy.txt");
+            assert_eq!(files.selected, Some(0));
+        }
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel")
+            .click()?;
+        assert!(shared.files().action_prompt.is_none());
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Move artifact.txt")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("move prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::Move);
+            assert_eq!(prompt.target_path.as_deref(), Some("/artifact.txt"));
+            assert_eq!(prompt.input, "artifact.txt");
+            assert_eq!(files.selected, Some(0));
+        }
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel")
+            .click()?;
+        assert!(shared.files().action_prompt.is_none());
 
         window
             .get_by_role(sui::SemanticsRole::Button)
