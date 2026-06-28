@@ -491,6 +491,7 @@ pub struct ChatState {
     session_delete_confirm_id: Option<String>,
     pending_delete_id: Option<String>,
     delete_rx: Option<Receiver<DeleteWorkerResult>>,
+    channel_create_rx: Option<Receiver<ChannelCreateWorkerResult>>,
     session_list_rx: Option<Receiver<SessionListWorkerResult>>,
     session_list_loading: bool,
     session_list_started_at: Option<Instant>,
@@ -502,6 +503,11 @@ struct DeleteWorkerResult {
     session: SessionRef,
     kind: ConversationKind,
     result: Result<(), String>,
+}
+
+struct ChannelCreateWorkerResult {
+    session: SessionRef,
+    result: Result<SessionListWorkerResult, String>,
 }
 
 struct SessionListWorkerResult {
@@ -577,6 +583,7 @@ impl ChatState {
             session_delete_confirm_id: None,
             pending_delete_id: None,
             delete_rx: None,
+            channel_create_rx: None,
             session_list_rx: None,
             session_list_loading: false,
             session_list_started_at: None,
@@ -761,6 +768,12 @@ impl ChatState {
                 self.activity.retain(|entry| entry.title != "chat list");
             }
         }
+    }
+
+    fn upsert_session_ref(&mut self, session: SessionRef) {
+        self.sessions.retain(|existing| existing.id != session.id);
+        self.sessions.push(session);
+        sort_conversations(&mut self.sessions);
     }
 
     #[cfg(test)]
@@ -1746,6 +1759,55 @@ impl ChatState {
         changed
     }
 
+    pub fn pump_channel_create(&mut self) -> bool {
+        let result = match self.channel_create_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(result)) => result,
+            Some(Err(TryRecvError::Empty)) | None => return false,
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.channel_create_rx = None;
+                self.notice = Some("channel create failed: worker stopped".to_string());
+                self.push_activity(
+                    "channel create",
+                    "worker stopped before saving the channel to SIFS".to_string(),
+                    ActivityTone::Warn,
+                );
+                return true;
+            }
+        };
+
+        self.channel_create_rx = None;
+        match result.result {
+            Ok(list_result) => {
+                let session = result.session;
+                self.apply_session_list_result(list_result);
+                if !self
+                    .sessions
+                    .iter()
+                    .any(|existing| existing.id == session.id)
+                {
+                    self.upsert_session_ref(session);
+                }
+                if self
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice == "creating channel...")
+                {
+                    self.notice = None;
+                }
+                self.replace_activity(
+                    "channel create",
+                    "Saved channel to SIFS".to_string(),
+                    ActivityTone::Good,
+                );
+            }
+            Err(detail) => {
+                self.notice = Some(format!("channel create failed: {detail}"));
+                self.push_activity("channel create", detail, ActivityTone::Warn);
+            }
+        }
+        true
+    }
+
     fn apply_delete_result(&mut self, result: DeleteWorkerResult) -> bool {
         if self.pending_delete_id.as_deref() != Some(result.session.id.as_str()) {
             return false;
@@ -2273,7 +2335,11 @@ impl ChatState {
     }
 
     /// Start a fresh explicit channel from the sidebar "New channel" action.
-    fn new_channel(&mut self) {
+    fn new_channel(&mut self, waker: Option<sui::UiHandle>) {
+        if self.channel_create_rx.is_some() {
+            self.notice = Some("wait for the current channel to finish creating".to_string());
+            return;
+        }
         self.persist();
         let interrupted_session_id = self.session_id.clone();
         let session_id = SessionId::generate().to_string();
@@ -2292,25 +2358,58 @@ impl ChatState {
         channel.ensure_user(sinomo_agent::AgentChannelUser::app_local());
         let (agent_key, agent_name) = self.default_channel_agent();
         channel.ensure_participant(agent_key, agent_name);
-        let store = match self.agent_channel_store() {
-            Ok(store) => store,
-            Err(error) => {
-                let detail = error.to_string();
-                self.notice = Some(format!("channel create failed: {detail}"));
-                self.push_activity("channel create", detail, ActivityTone::Warn);
-                return;
+        let session_ref = session_ref_for_channel(&channel);
+
+        self.reset_visible_session(session_id.clone());
+        self.pending_session_reset = Some(session_id.clone());
+        self.upsert_session_ref(session_ref.clone());
+        self.session_edit_id = Some(session_id.clone());
+        self.session_title_draft = session_ref.title.clone();
+        self.session_delete_confirm_id = None;
+        self.channel_agent_idx = 0;
+        self.notice = Some("creating channel...".to_string());
+        self.replace_activity(
+            "channel create",
+            "Saving channel to SIFS".to_string(),
+            ActivityTone::Running,
+        );
+        self.handle
+            .send_command(ChatCommand::NewSession { session_id });
+
+        let (tx, rx) = mpsc::channel();
+        let data_dir = self.data_dir.clone();
+        let sifs_daemon = self.sifs_daemon.clone();
+        let worker_channel = channel;
+        let worker_session = session_ref;
+        let worker_waker = waker.clone();
+        let spawn_result = thread::Builder::new()
+            .name("sinomo-app-channel-create".to_string())
+            .spawn(move || {
+                let result = open_agent_channel_store(&data_dir, sifs_daemon.as_ref())
+                    .and_then(|store| {
+                        store
+                            .save_channel(&worker_channel)
+                            .map_err(channel_store_io_error)?;
+                        let (sessions, error) =
+                            list_conversations_with_error(&data_dir, sifs_daemon.as_ref());
+                        Ok(SessionListWorkerResult { sessions, error })
+                    })
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(ChannelCreateWorkerResult {
+                    session: worker_session,
+                    result,
+                });
+                if let Some(waker) = worker_waker {
+                    waker.wake();
+                }
+            });
+
+        match spawn_result {
+            Ok(_) => {
+                self.channel_create_rx = Some(rx);
             }
-        };
-        match store.save_channel(&channel) {
-            Ok(()) => {
-                self.reset_visible_session(session_id.clone());
-                self.pending_session_reset = Some(session_id.clone());
-                self.refresh_sessions();
-                self.begin_edit_session(&session_id);
-                self.handle
-                    .send_command(ChatCommand::NewSession { session_id });
-            }
             Err(error) => {
+                self.channel_create_rx = None;
                 let detail = error.to_string();
                 self.notice = Some(format!("channel create failed: {detail}"));
                 self.push_activity("channel create", detail, ActivityTone::Warn);
@@ -2567,6 +2666,20 @@ fn list_conversations_with_error(
         .filter(|_| conversations.is_empty())
         .or_else(|| channel_error.filter(|_| conversations.is_empty()));
     (conversations, error)
+}
+
+fn session_ref_for_channel(channel: &AgentChannel) -> SessionRef {
+    SessionRef {
+        id: channel.channel_id.to_string(),
+        title: if channel.title.trim().is_empty() {
+            "New channel".to_string()
+        } else {
+            channel.title.clone()
+        },
+        kind: ConversationKind::Channel,
+        updated_unix: channel.updated_at.unix_timestamp(),
+        participant_count: channel.enabled_participants_in_order().len(),
+    }
 }
 
 fn list_chat_metas_with_error(
@@ -3421,7 +3534,8 @@ fn session_create_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget 
             .min_height(32.0)
             .theme_when(clone_reader(reader))
             .on_press(move || {
-                s.chat_mut().new_channel();
+                let waker = { s.borrow().waker.clone() };
+                s.chat_mut().new_channel(waker);
             })
     };
 
@@ -6874,7 +6988,8 @@ impl ChatView {
             let worker_changed = chat.pump_worker_events();
             let list_changed = chat.pump_session_list();
             let delete_changed = chat.pump_delete();
-            worker_changed || list_changed || delete_changed
+            let channel_create_changed = chat.pump_channel_create();
+            worker_changed || list_changed || delete_changed || channel_create_changed
         };
         let streaming = self.shared.chat().streaming;
 
@@ -7737,9 +7852,9 @@ mod tests {
         let (_backend, mut state) = isolated_chat_state("new-channel");
         seed_test_agents(&mut state);
 
-        state.new_channel();
+        state.new_channel(None);
         wait_for(&mut state, Duration::from_secs(5), |state| {
-            state.pending_session_reset.is_none()
+            state.pending_session_reset.is_none() && state.channel_create_rx.is_none()
         });
 
         let channel_id = state.session_id.clone();
@@ -7781,9 +7896,9 @@ mod tests {
     fn channel_config_adds_selected_agent_and_updates_sidebar_count() {
         let (_backend, mut state) = isolated_chat_state("channel-add-agent");
         seed_test_agents(&mut state);
-        state.new_channel();
+        state.new_channel(None);
         wait_for(&mut state, Duration::from_secs(5), |state| {
-            state.pending_session_reset.is_none()
+            state.pending_session_reset.is_none() && state.channel_create_rx.is_none()
         });
         let channel_id = state.session_id.clone();
 
@@ -7826,9 +7941,9 @@ mod tests {
     fn channel_config_removes_agent_and_updates_sidebar_count() {
         let (_backend, mut state) = isolated_chat_state("channel-remove-agent");
         seed_test_agents(&mut state);
-        state.new_channel();
+        state.new_channel(None);
         wait_for(&mut state, Duration::from_secs(5), |state| {
-            state.pending_session_reset.is_none()
+            state.pending_session_reset.is_none() && state.channel_create_rx.is_none()
         });
         let channel_id = state.session_id.clone();
         state.set_channel_agent_idx(1);
@@ -10352,6 +10467,8 @@ mod tests {
             for event in events {
                 state.apply_event(event);
             }
+            state.pump_session_list();
+            state.pump_channel_create();
             state.pump_delete();
             if predicate(state) {
                 return;
