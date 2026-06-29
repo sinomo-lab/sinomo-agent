@@ -1226,6 +1226,10 @@ impl ChatState {
         self.activity_panel_open = !self.activity_panel_open;
     }
 
+    fn close_activity_panel(&mut self) {
+        self.activity_panel_open = false;
+    }
+
     fn runtime_degraded_detail(&self) -> Option<String> {
         if let Some(notice) = self.notice.as_deref()
             && text_mentions_runtime_problem(notice)
@@ -5884,6 +5888,8 @@ fn context_lane_summary(label: &str, bytes: usize, total: usize) -> String {
 
 struct ActivityRail {
     shared: Shared,
+    close_hovered: Cell<bool>,
+    close_pressed: Cell<bool>,
     detail_expanded: Cell<bool>,
     detail_hovered: Cell<bool>,
     detail_pressed: Cell<bool>,
@@ -5893,10 +5899,20 @@ impl ActivityRail {
     fn new(shared: Shared) -> Self {
         Self {
             shared,
+            close_hovered: Cell::new(false),
+            close_pressed: Cell::new(false),
             detail_expanded: Cell::new(false),
             detail_hovered: Cell::new(false),
             detail_pressed: Cell::new(false),
         }
+    }
+
+    fn close_rect(bounds: Rect) -> Rect {
+        Rect::new(bounds.max_x() - 38.0, bounds.y() + 10.0, 24.0, 24.0)
+    }
+
+    fn can_close(chat: &ChatState) -> bool {
+        chat.activity_panel_open && !chat.activity_panel_needs_attention()
     }
 
     fn status_card_rect(bounds: Rect) -> Rect {
@@ -5949,7 +5965,14 @@ impl ActivityRail {
         has_detail && Self::detail_toggle_rect(Self::status_card_rect(bounds)).contains(position)
     }
 
-    fn request_detail_refresh(ctx: &mut EventCtx) {
+    fn close_hit(&self, bounds: Rect, position: Point) -> bool {
+        let chat = self.shared.chat();
+        Self::can_close(&chat) && Self::close_rect(bounds).contains(position)
+    }
+
+    fn request_activity_refresh(ctx: &mut EventCtx) {
+        ctx.request_measure();
+        ctx.request_arrange();
         ctx.request_paint();
         ctx.request_semantics();
     }
@@ -5959,20 +5982,30 @@ impl Widget for ActivityRail {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
         match event {
             Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
-                let hovered = self.detail_toggle_hit(ctx.bounds(), pointer.position);
-                if self.detail_hovered.get() != hovered {
-                    self.detail_hovered.set(hovered);
-                    Self::request_detail_refresh(ctx);
+                let close_hovered = self.close_hit(ctx.bounds(), pointer.position);
+                let detail_hovered =
+                    !close_hovered && self.detail_toggle_hit(ctx.bounds(), pointer.position);
+                if self.close_hovered.get() != close_hovered
+                    || self.detail_hovered.get() != detail_hovered
+                {
+                    self.close_hovered.set(close_hovered);
+                    self.detail_hovered.set(detail_hovered);
+                    Self::request_activity_refresh(ctx);
                 }
             }
             Event::Pointer(pointer)
                 if pointer.kind == PointerEventKind::Down
                     && pointer.button == Some(PointerButton::Primary) =>
             {
-                if self.detail_toggle_hit(ctx.bounds(), pointer.position) {
+                if self.close_hit(ctx.bounds(), pointer.position) {
+                    self.close_pressed.set(true);
+                    ctx.request_pointer_capture(pointer.pointer_id);
+                    Self::request_activity_refresh(ctx);
+                    ctx.set_handled();
+                } else if self.detail_toggle_hit(ctx.bounds(), pointer.position) {
                     self.detail_pressed.set(true);
                     ctx.request_pointer_capture(pointer.pointer_id);
-                    Self::request_detail_refresh(ctx);
+                    Self::request_activity_refresh(ctx);
                     ctx.set_handled();
                 }
             }
@@ -5980,12 +6013,19 @@ impl Widget for ActivityRail {
                 if pointer.kind == PointerEventKind::Up
                     && pointer.button == Some(PointerButton::Primary) =>
             {
-                if self.detail_pressed.take() {
+                if self.close_pressed.take() {
+                    if self.close_hit(ctx.bounds(), pointer.position) {
+                        self.shared.chat_mut().close_activity_panel();
+                    }
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    Self::request_activity_refresh(ctx);
+                    ctx.set_handled();
+                } else if self.detail_pressed.take() {
                     if self.detail_toggle_hit(ctx.bounds(), pointer.position) {
                         self.detail_expanded.set(!self.detail_expanded.get());
                     }
                     ctx.release_pointer_capture(pointer.pointer_id);
-                    Self::request_detail_refresh(ctx);
+                    Self::request_activity_refresh(ctx);
                     ctx.set_handled();
                 }
             }
@@ -5995,10 +6035,13 @@ impl Widget for ActivityRail {
                     PointerEventKind::Leave | PointerEventKind::Cancel
                 ) =>
             {
-                let had_state = self.detail_hovered.replace(false) || self.detail_pressed.take();
+                let had_state = self.close_hovered.replace(false)
+                    || self.close_pressed.take()
+                    || self.detail_hovered.replace(false)
+                    || self.detail_pressed.take();
                 if had_state {
                     ctx.release_pointer_capture(pointer.pointer_id);
-                    Self::request_detail_refresh(ctx);
+                    Self::request_activity_refresh(ctx);
                     ctx.set_handled();
                 }
             }
@@ -6025,10 +6068,19 @@ impl Widget for ActivityRail {
         let detail_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
         widgets::draw_text_in(
             ctx,
-            Rect::new(x, bounds.y() + 14.0, w, 16.0),
+            Rect::new(x, bounds.y() + 14.0, (w - 34.0).max(0.0), 16.0),
             "ACTIVITY",
             heading_style.clone(),
         );
+        if Self::can_close(&chat) {
+            draw_activity_close_button(
+                ctx,
+                &pal,
+                Self::close_rect(bounds),
+                self.close_hovered.get(),
+                self.close_pressed.get(),
+            );
+        }
 
         let mut y = bounds.y() + 42.0;
         let bottom = bounds.y() + bounds.height();
@@ -6241,11 +6293,27 @@ impl Widget for ActivityRail {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let has_detail = {
+        let (can_close, has_detail) = {
             let chat = self.shared.chat();
             let health = chat.runtime_health();
-            Self::detail_entry(&chat, &health).is_some()
+            (
+                Self::can_close(&chat),
+                Self::detail_entry(&chat, &health).is_some(),
+            )
         };
+        if can_close {
+            let mut close = SemanticsNode::new(
+                sui::WidgetId::new(ctx.widget_id().get().wrapping_mul(43).wrapping_add(11_997)),
+                SemanticsRole::Button,
+                Self::close_rect(ctx.bounds()),
+            );
+            close.parent = Some(ctx.widget_id());
+            close.name = Some("Close activity".to_string());
+            close.description = Some("Hide the runtime activity panel".to_string());
+            close.actions = vec![SemanticsAction::Activate];
+            close.state.hovered = self.close_hovered.get();
+            ctx.push(close);
+        }
         if !has_detail {
             return;
         }
@@ -6268,6 +6336,33 @@ impl Widget for ActivityRail {
         node.state.selected = self.detail_expanded.get();
         ctx.push(node);
     }
+}
+
+fn draw_activity_close_button(
+    ctx: &mut PaintCtx,
+    pal: &Palette,
+    rect: Rect,
+    hovered: bool,
+    pressed: bool,
+) {
+    let fill = if pressed {
+        pal.selected
+    } else if hovered {
+        pal.hover
+    } else {
+        pal.sidebar
+    };
+    widgets::round_panel(ctx, rect, fill, pal.border.with_alpha(0.60), 6.0);
+    draw_glyph(
+        ctx,
+        IconGlyph::Close,
+        rect.inflate(-6.0, -6.0),
+        if hovered || pressed {
+            pal.text
+        } else {
+            pal.text_muted
+        },
+    );
 }
 
 fn draw_activity_status_card(
@@ -10585,6 +10680,47 @@ mod tests {
         assert!(
             !shared.chat().activity_panel_visible(),
             "Activity button should close the idle activity rail"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_activity_rail_close_button_hides_idle_panel() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.info.provider = "openai".to_string();
+            chat.info.model = "gpt-5".to_string();
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat activity close")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Activity")
+            .click()?;
+        assert!(shared.chat().activity_panel_visible());
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Close activity")
+            .with_description("Hide the runtime activity panel")
+            .click()?;
+        assert!(
+            !shared.chat().activity_panel_visible(),
+            "Close activity should hide a manually-opened idle activity rail"
         );
 
         Ok(())
