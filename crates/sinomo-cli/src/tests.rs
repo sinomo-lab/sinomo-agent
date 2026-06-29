@@ -7182,6 +7182,22 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
     ));
     assert!(matches!(
         parse_dfs_command(&[
+            "pin".to_string(),
+            "remove".to_string(),
+            "--filesystem".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d0".to_string(),
+            "--path".to_string(),
+            "src/lib.rs".to_string(),
+            "--mode".to_string(),
+            "metadata".to_string(),
+        ])
+        .expect("dfs pin remove"),
+        DfsCliCommand::Pin(DfsPinCliCommand::Remove(options))
+            if options.mode == Some(sinomo_runtime::dfs::DfsPinMode::Metadata)
+                && options.path == "src/lib.rs"
+    ));
+    assert!(matches!(
+        parse_dfs_command(&[
             "expose".to_string(),
             "add".to_string(),
             "--source".to_string(),

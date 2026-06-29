@@ -1110,11 +1110,20 @@ pub struct DfsPinRecord {
     pub created_at: OffsetDateTime,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsPinMode {
     Metadata,
     Content,
+}
+
+impl std::fmt::Display for DfsPinMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Metadata => formatter.write_str("metadata"),
+            Self::Content => formatter.write_str("content"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1138,7 +1147,21 @@ impl LocalDfsPinStore {
     }
 
     pub fn put_pin(&self, record: &DfsPinRecord) -> Result<(), DfsPinStoreError> {
-        write_object_atomic(&self.pin_path(record), record)
+        let path = self.pin_path(record);
+        write_object_atomic(&path, record)?;
+        let legacy_path = self.legacy_pin_path(record);
+        if legacy_path != path && legacy_path.is_file() {
+            let legacy_record: Result<DfsPinRecord, DfsPinStoreError> = read_object(&legacy_path);
+            if legacy_record.is_ok_and(|legacy_record| {
+                legacy_record.file_system_id == record.file_system_id
+                    && normalize_path(&legacy_record.path) == normalize_path(&record.path)
+                    && legacy_record.pinned_by_node_id == record.pinned_by_node_id
+                    && legacy_record.mode == record.mode
+            }) {
+                let _ = fs::remove_file(&legacy_path);
+            }
+        }
+        Ok(())
     }
 
     pub fn remove_pin(
@@ -1146,18 +1169,24 @@ impl LocalDfsPinStore {
         file_system_id: &DfsFileSystemId,
         path: &str,
         node_id: Option<&NodeId>,
+        mode: Option<&DfsPinMode>,
     ) -> Result<bool, DfsPinStoreError> {
         let mut removed = false;
-        for record in self.list_pins(Some(file_system_id))? {
+        for (record_path, record) in self.list_pin_files(Some(file_system_id))? {
             if normalize_path(&record.path) != normalize_path(path) {
                 continue;
             }
             if node_id.is_some_and(|expected| &record.pinned_by_node_id != expected) {
                 continue;
             }
-            let path = self.pin_path(&record);
-            if path.is_file() {
-                fs::remove_file(&path).map_err(|source| DfsPinStoreError::Io { path, source })?;
+            if mode.is_some_and(|expected| &record.mode != expected) {
+                continue;
+            }
+            if record_path.is_file() {
+                fs::remove_file(&record_path).map_err(|source| DfsPinStoreError::Io {
+                    path: record_path,
+                    source,
+                })?;
                 removed = true;
             }
         }
@@ -1168,6 +1197,17 @@ impl LocalDfsPinStore {
         &self,
         file_system_id: Option<&DfsFileSystemId>,
     ) -> Result<Vec<DfsPinRecord>, DfsPinStoreError> {
+        Ok(self
+            .list_pin_files(file_system_id)?
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect())
+    }
+
+    fn list_pin_files(
+        &self,
+        file_system_id: Option<&DfsFileSystemId>,
+    ) -> Result<Vec<(PathBuf, DfsPinRecord)>, DfsPinStoreError> {
         if !self.root.exists() {
             return Ok(Vec::new());
         }
@@ -1179,14 +1219,17 @@ impl LocalDfsPinStore {
             }
             let record: DfsPinRecord = read_object(&path)?;
             if file_system_id.is_none_or(|expected| &record.file_system_id == expected) {
-                records.push(record);
+                records.push((path, record));
             }
         }
         records.sort_by(|left, right| {
-            left.file_system_id
-                .cmp(&right.file_system_id)
-                .then_with(|| left.path.cmp(&right.path))
-                .then_with(|| left.pinned_by_node_id.cmp(&right.pinned_by_node_id))
+            left.1
+                .file_system_id
+                .cmp(&right.1.file_system_id)
+                .then_with(|| left.1.path.cmp(&right.1.path))
+                .then_with(|| left.1.pinned_by_node_id.cmp(&right.1.pinned_by_node_id))
+                .then_with(|| left.1.mode.cmp(&right.1.mode))
+                .then_with(|| left.0.cmp(&right.0))
         });
         Ok(records)
     }
@@ -1205,6 +1248,16 @@ impl LocalDfsPinStore {
     }
 
     fn pin_path(&self, record: &DfsPinRecord) -> PathBuf {
+        self.root.join(format!(
+            "{}-{}-{}-{}.sobj",
+            key_segment(&record.file_system_id),
+            path_hash(&record.path),
+            key_segment(&record.pinned_by_node_id),
+            key_segment(&record.mode)
+        ))
+    }
+
+    fn legacy_pin_path(&self, record: &DfsPinRecord) -> PathBuf {
         self.root.join(format!(
             "{}-{}-{}.sobj",
             key_segment(&record.file_system_id),
@@ -2022,7 +2075,12 @@ mod tests {
         assert_eq!(store.list_pins(None).expect("pins"), vec![record.clone()]);
         assert!(
             store
-                .remove_pin(&file_system_id(), "src/lib.rs", Some(&node("node_laptop")))
+                .remove_pin(
+                    &file_system_id(),
+                    "src/lib.rs",
+                    Some(&node("node_laptop")),
+                    None,
+                )
                 .expect("remove")
         );
         assert!(store.list_pins(None).expect("pins").is_empty());
@@ -2062,10 +2120,78 @@ mod tests {
         );
         assert!(
             store
-                .remove_pin(&file_system_id(), "src/a.txt", Some(&owner))
+                .remove_pin(&file_system_id(), "src/a.txt", Some(&owner), None)
                 .expect("remove slash")
         );
         assert_eq!(store.list_pins(None).expect("pins"), vec![backslash]);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn local_pin_store_removes_only_matching_mode_when_requested() {
+        let root = temp_root("local_pin_store_removes_only_matching_mode");
+        let store = LocalDfsPinStore::new(&root);
+        let owner = node("node_laptop");
+        for mode in [DfsPinMode::Metadata, DfsPinMode::Content] {
+            store
+                .add_pin(DfsPinAddRequest {
+                    file_system_id: file_system_id(),
+                    path: "src/lib.rs".to_string(),
+                    object_id: Some(object_id()),
+                    pinned_by_node_id: owner.clone(),
+                    mode,
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                })
+                .expect("add pin");
+        }
+
+        assert!(
+            store
+                .remove_pin(
+                    &file_system_id(),
+                    "src/lib.rs",
+                    Some(&owner),
+                    Some(&DfsPinMode::Metadata),
+                )
+                .expect("remove metadata pin")
+        );
+        let pins = store.list_pins(None).expect("pins");
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].mode, DfsPinMode::Content);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn local_pin_store_removes_matching_legacy_pin_by_mode() {
+        let root = temp_root("local_pin_store_removes_matching_legacy_pin_by_mode");
+        let store = LocalDfsPinStore::new(&root);
+        let owner = node("node_laptop");
+        let record = DfsPinRecord {
+            file_system_id: file_system_id(),
+            path: "src/lib.rs".to_string(),
+            object_id: Some(object_id()),
+            pinned_by_node_id: owner.clone(),
+            mode: DfsPinMode::Content,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let legacy_path = store.legacy_pin_path(&record);
+        write_object_atomic(&legacy_path, &record).expect("write legacy pin");
+
+        assert_eq!(store.list_pins(None).expect("pins"), vec![record]);
+        assert!(
+            store
+                .remove_pin(
+                    &file_system_id(),
+                    "src/lib.rs",
+                    Some(&owner),
+                    Some(&DfsPinMode::Content),
+                )
+                .expect("remove legacy content pin")
+        );
+        assert!(!legacy_path.exists());
+        assert!(store.list_pins(None).expect("pins").is_empty());
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

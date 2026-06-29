@@ -1603,8 +1603,9 @@ pub fn remove_local_dfs_pin(
     file_system_id: &DfsFileSystemId,
     path: &str,
     node_id: Option<&NodeId>,
+    mode: Option<&DfsPinMode>,
 ) -> Result<bool, DfsPinStoreError> {
-    LocalDfsPinStore::new(root).remove_pin(file_system_id, path, node_id)
+    LocalDfsPinStore::new(root).remove_pin(file_system_id, path, node_id, mode)
 }
 
 pub fn open_root_local_metadata_backend(

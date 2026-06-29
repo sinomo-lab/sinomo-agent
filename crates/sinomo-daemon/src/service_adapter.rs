@@ -117,10 +117,11 @@ use crate::rollout::{
 use crate::{
     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE, DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
     DAEMON_DFS_BROWSER_DELETE_ROUTE, DAEMON_DFS_BROWSER_LIST_ROUTE,
-    DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
-    DAEMON_DFS_BROWSER_READ_FILE_ROUTE, DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
-    DAEMON_DFS_BROWSER_RENAME_ROUTE, DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE,
-    DAEMON_DFS_BROWSER_STATUS_ROUTE, DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
+    DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILES_ROUTE, DAEMON_DFS_BROWSER_RENAME_ROUTE,
+    DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE, DAEMON_DFS_BROWSER_STATUS_ROUTE,
+    DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
     DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
     DAEMON_STATUS_ROUTE,
 };
@@ -1486,11 +1487,12 @@ impl DaemonDfsBrowserBackend {
         Ok(crate::DaemonDfsBrowserDeleteResponse)
     }
 
-    fn pin_content(
+    fn pin_path_mode(
         &self,
-        request: crate::DaemonDfsBrowserPinContentRequest,
-    ) -> Result<crate::DaemonDfsBrowserPinContentResponse, ServiceError> {
-        let path = normalize_sifs_browser_path(&request.path)?;
+        path: &str,
+        mode: sinomo_dfs::DfsPinMode,
+    ) -> Result<String, ServiceError> {
+        let path = normalize_sifs_browser_path(path)?;
         let mut service = self.lock_service()?;
         self.refresh_endpoint_targets(&mut service);
         let stat = service
@@ -1505,34 +1507,65 @@ impl DaemonDfsBrowserBackend {
                 path: stat.path,
                 object_id: Some(stat.object_id),
                 pinned_by_node_id: node_id.clone(),
-                mode: sinomo_dfs::DfsPinMode::Content,
+                mode,
                 created_at: time::OffsetDateTime::now_utc(),
             },
         )
         .map_err(dfs_browser_service_error)?;
-        Ok(crate::DaemonDfsBrowserPinContentResponse {
-            node_id: node_id.to_string(),
-        })
+        Ok(node_id.to_string())
     }
 
-    fn unpin_content(
+    fn unpin_path_mode(
         &self,
-        request: crate::DaemonDfsBrowserUnpinContentRequest,
-    ) -> Result<crate::DaemonDfsBrowserUnpinContentResponse, ServiceError> {
-        let path = normalize_sifs_browser_path(&request.path)?;
+        path: &str,
+        mode: sinomo_dfs::DfsPinMode,
+    ) -> Result<bool, ServiceError> {
+        let path = normalize_sifs_browser_path(path)?;
         let mut service = self.lock_service()?;
         let stat = service
             .posix_stat_distributed(&path)
             .map_err(dfs_browser_service_error)?;
         let node_id = service.node_id().clone();
         drop(service);
-        let removed = sinomo_dfs::remove_local_dfs_pin(
+        sinomo_dfs::remove_local_dfs_pin(
             sinomo_dfs::default_dfs_pin_root(&self.data_dir),
             &stat.file_system_id,
             &stat.path,
             Some(&node_id),
+            Some(&mode),
         )
-        .map_err(dfs_browser_service_error)?;
+        .map_err(dfs_browser_service_error)
+    }
+
+    fn pin_metadata(
+        &self,
+        request: crate::DaemonDfsBrowserPinMetadataRequest,
+    ) -> Result<crate::DaemonDfsBrowserPinMetadataResponse, ServiceError> {
+        let node_id = self.pin_path_mode(&request.path, sinomo_dfs::DfsPinMode::Metadata)?;
+        Ok(crate::DaemonDfsBrowserPinMetadataResponse { node_id })
+    }
+
+    fn unpin_metadata(
+        &self,
+        request: crate::DaemonDfsBrowserUnpinMetadataRequest,
+    ) -> Result<crate::DaemonDfsBrowserUnpinMetadataResponse, ServiceError> {
+        let removed = self.unpin_path_mode(&request.path, sinomo_dfs::DfsPinMode::Metadata)?;
+        Ok(crate::DaemonDfsBrowserUnpinMetadataResponse { removed })
+    }
+
+    fn pin_content(
+        &self,
+        request: crate::DaemonDfsBrowserPinContentRequest,
+    ) -> Result<crate::DaemonDfsBrowserPinContentResponse, ServiceError> {
+        let node_id = self.pin_path_mode(&request.path, sinomo_dfs::DfsPinMode::Content)?;
+        Ok(crate::DaemonDfsBrowserPinContentResponse { node_id })
+    }
+
+    fn unpin_content(
+        &self,
+        request: crate::DaemonDfsBrowserUnpinContentRequest,
+    ) -> Result<crate::DaemonDfsBrowserUnpinContentResponse, ServiceError> {
+        let removed = self.unpin_path_mode(&request.path, sinomo_dfs::DfsPinMode::Content)?;
         Ok(crate::DaemonDfsBrowserUnpinContentResponse { removed })
     }
 
@@ -1714,6 +1747,33 @@ impl Service for DaemonDfsBrowserService {
                     publish_daemon_sifs_metadata(publish_data_dir.as_ref(), runtime.as_ref())
                         .await?;
                     ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_DELETE_ROUTE, &result)?
+                }
+                DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS browser pin metadata",
+                        move || {
+                            DaemonDfsBrowserBackend::for_data_dir(data_dir)?.pin_metadata(payload)
+                        },
+                    )
+                    .await?;
+                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE, &result)?
+                }
+                DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS browser unpin metadata",
+                        move || {
+                            DaemonDfsBrowserBackend::for_data_dir(data_dir)?.unpin_metadata(payload)
+                        },
+                    )
+                    .await?;
+                    ObjectRpcResponse::encode_body(
+                        DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
+                        &result,
+                    )?
                 }
                 DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE => {
                     let payload = request.decode_body()?;

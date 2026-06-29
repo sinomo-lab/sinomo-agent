@@ -2262,6 +2262,20 @@ impl SifsBrowser {
         }
     }
 
+    pub fn pin_metadata(&self, path: &str) -> Result<String, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.pin_metadata(path),
+            SifsBrowserBackend::Remote(remote) => remote.pin_metadata(path),
+        }
+    }
+
+    pub fn unpin_metadata(&self, path: &str) -> Result<bool, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.unpin_metadata(path),
+            SifsBrowserBackend::Remote(remote) => remote.unpin_metadata(path),
+        }
+    }
+
     pub fn parent(&self, path: &str) -> Option<String> {
         match &self.backend {
             SifsBrowserBackend::Local(backend) => backend.parent_path(path),
@@ -2450,6 +2464,26 @@ impl RemoteSifsBrowser {
         let response: sinomo_runtime::daemon::DaemonDfsBrowserUnpinContentResponse = self.rpc(
             sinomo_runtime::daemon::DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
             &sinomo_runtime::daemon::DaemonDfsBrowserUnpinContentRequest {
+                path: path.to_string(),
+            },
+        )?;
+        Ok(response.removed)
+    }
+
+    fn pin_metadata(&self, path: &str) -> Result<String, String> {
+        let response: sinomo_runtime::daemon::DaemonDfsBrowserPinMetadataResponse = self.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserPinMetadataRequest {
+                path: path.to_string(),
+            },
+        )?;
+        Ok(response.node_id)
+    }
+
+    fn unpin_metadata(&self, path: &str) -> Result<bool, String> {
+        let response: sinomo_runtime::daemon::DaemonDfsBrowserUnpinMetadataResponse = self.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserUnpinMetadataRequest {
                 path: path.to_string(),
             },
         )?;

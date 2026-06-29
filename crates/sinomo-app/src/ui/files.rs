@@ -275,6 +275,8 @@ enum FilesOperationKind {
     Delete,
     RefreshPlacement,
     RepairReplicas,
+    PinMetadata,
+    UnpinMetadata,
     PinContent,
     UnpinContent,
 }
@@ -1730,6 +1732,46 @@ impl FilesState {
         );
     }
 
+    fn start_pin_metadata(&mut self, waker: Option<sui::UiHandle>) {
+        if self.source != FilesSourceKind::Sifs {
+            return;
+        }
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+        self.start_operation(
+            FilesOperation {
+                kind: FilesOperationKind::PinMetadata,
+                path: entry.path.clone(),
+                target: None,
+                directory: entry.is_dir,
+            },
+            "Pin metadata".to_string(),
+            entry.path,
+            waker,
+        );
+    }
+
+    fn start_unpin_metadata(&mut self, waker: Option<sui::UiHandle>) {
+        if self.source != FilesSourceKind::Sifs {
+            return;
+        }
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+        self.start_operation(
+            FilesOperation {
+                kind: FilesOperationKind::UnpinMetadata,
+                path: entry.path.clone(),
+                target: None,
+                directory: entry.is_dir,
+            },
+            "Unpin metadata".to_string(),
+            entry.path,
+            waker,
+        );
+    }
+
     fn start_pin_content(&mut self, waker: Option<sui::UiHandle>) {
         if self.source != FilesSourceKind::Sifs {
             return;
@@ -2973,6 +3015,30 @@ fn execute_sifs_operation(
                 message: format!("requested replica repair for {}", operation.path),
             })
         }
+        FilesOperationKind::PinMetadata => {
+            let node_id = browser
+                .pin_metadata(&operation.path)
+                .map_err(FilesOperationFailure::Error)?;
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: Some(operation.path.clone()),
+                message: format!("pinned metadata for {} on {node_id}", operation.path),
+            })
+        }
+        FilesOperationKind::UnpinMetadata => {
+            let removed = browser
+                .unpin_metadata(&operation.path)
+                .map_err(FilesOperationFailure::Error)?;
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: Some(operation.path.clone()),
+                message: if removed {
+                    format!("removed metadata pin for {}", operation.path)
+                } else {
+                    format!("no metadata pin was recorded for {}", operation.path)
+                },
+            })
+        }
         FilesOperationKind::PinContent => {
             let node_id = browser
                 .pin_content(&operation.path)
@@ -3195,9 +3261,12 @@ fn execute_local_operation_with_progress(
         FilesOperationKind::RepairReplicas => Err(FilesOperationFailure::Error(
             "replica repair is only available for SIFS".to_string(),
         )),
-        FilesOperationKind::PinContent | FilesOperationKind::UnpinContent => Err(
-            FilesOperationFailure::Error("content pinning is only available for SIFS".to_string()),
-        ),
+        FilesOperationKind::PinMetadata
+        | FilesOperationKind::UnpinMetadata
+        | FilesOperationKind::PinContent
+        | FilesOperationKind::UnpinContent => Err(FilesOperationFailure::Error(
+            "pin management is only available for SIFS".to_string(),
+        )),
     }
 }
 
@@ -4096,6 +4165,12 @@ fn files_operation_cancelled_detail(operation: &FilesOperation) -> String {
         FilesOperationKind::RepairReplicas => {
             format!("cancelled before repairing replicas for {}", operation.path)
         }
+        FilesOperationKind::PinMetadata => {
+            format!("cancelled before pinning metadata for {}", operation.path)
+        }
+        FilesOperationKind::UnpinMetadata => {
+            format!("cancelled before unpinning metadata for {}", operation.path)
+        }
         FilesOperationKind::PinContent => {
             format!("cancelled before pinning content for {}", operation.path)
         }
@@ -4141,6 +4216,12 @@ fn operation_progress_label(
         }
         FilesOperationKind::RepairReplicas => {
             format!("{phase} replica repair in {scope}: {}", operation.path)
+        }
+        FilesOperationKind::PinMetadata => {
+            format!("{phase} metadata pin in {scope}: {}", operation.path)
+        }
+        FilesOperationKind::UnpinMetadata => {
+            format!("{phase} metadata unpin in {scope}: {}", operation.path)
         }
         FilesOperationKind::PinContent => {
             format!("{phase} content pin in {scope}: {}", operation.path)
@@ -7989,6 +8070,8 @@ enum InspectorAction {
     Delete,
     RefreshPlacement,
     RepairReplicas,
+    PinMetadata,
+    UnpinMetadata,
     PinContent,
     UnpinContent,
     ConnectionSettings,
@@ -8006,6 +8089,8 @@ impl InspectorAction {
             Self::Delete => "Delete",
             Self::RefreshPlacement => "Refresh placement",
             Self::RepairReplicas => "Repair replicas",
+            Self::PinMetadata => "Pin metadata",
+            Self::UnpinMetadata => "Unpin metadata",
             Self::PinContent => "Pin content",
             Self::UnpinContent => "Unpin content",
             Self::ConnectionSettings => "Connection settings",
@@ -8023,6 +8108,8 @@ impl InspectorAction {
             Self::Delete => IconGlyph::Trash,
             Self::RefreshPlacement => IconGlyph::Storage,
             Self::RepairReplicas => IconGlyph::Redo,
+            Self::PinMetadata => IconGlyph::Lock,
+            Self::UnpinMetadata => IconGlyph::Unlock,
             Self::PinContent => IconGlyph::Lock,
             Self::UnpinContent => IconGlyph::Unlock,
             Self::ConnectionSettings => IconGlyph::Alert,
@@ -8040,6 +8127,8 @@ impl InspectorAction {
             Self::OpenFolder
             | Self::RefreshPlacement
             | Self::RepairReplicas
+            | Self::PinMetadata
+            | Self::UnpinMetadata
             | Self::PinContent
             | Self::UnpinContent
             | Self::ConnectionSettings => None,
@@ -8051,6 +8140,8 @@ impl InspectorAction {
             Self::OpenFolder => "Open folder".to_string(),
             Self::RefreshPlacement => format!("Refresh placement {}", entry.name),
             Self::RepairReplicas => format!("Repair replicas {}", entry.name),
+            Self::PinMetadata => format!("Pin metadata {}", entry.name),
+            Self::UnpinMetadata => format!("Unpin metadata {}", entry.name),
             Self::PinContent => format!("Pin content {}", entry.name),
             Self::UnpinContent => format!("Unpin content {}", entry.name),
             Self::ConnectionSettings => "Connection settings".to_string(),
@@ -8086,6 +8177,8 @@ fn inspector_actions(files: &FilesState, entry: &SifsEntry) -> Vec<InspectorActi
         }
         actions.push(InspectorAction::RefreshPlacement);
         actions.push(InspectorAction::RepairReplicas);
+        actions.push(InspectorAction::PinMetadata);
+        actions.push(InspectorAction::UnpinMetadata);
         if !entry.is_dir && !entry.is_link {
             actions.push(InspectorAction::PinContent);
             actions.push(InspectorAction::UnpinContent);
@@ -8187,6 +8280,8 @@ fn inspector_action_button_widget_id(
         InspectorAction::Delete => 7_553,
         InspectorAction::RefreshPlacement => 7_571,
         InspectorAction::RepairReplicas => 7_579,
+        InspectorAction::PinMetadata => 7_583,
+        InspectorAction::UnpinMetadata => 7_585,
         InspectorAction::PinContent => 7_587,
         InspectorAction::UnpinContent => 7_599,
         InspectorAction::ConnectionSettings => 7_603,
@@ -8307,6 +8402,16 @@ impl Widget for InspectorView {
                     InspectorAction::RepairReplicas => {
                         let waker = { self.shared.borrow().waker.clone() };
                         self.shared.files_mut().start_replica_repair(waker);
+                        request_files_overlay_rebuild(ctx);
+                    }
+                    InspectorAction::PinMetadata => {
+                        let waker = { self.shared.borrow().waker.clone() };
+                        self.shared.files_mut().start_pin_metadata(waker);
+                        request_files_overlay_rebuild(ctx);
+                    }
+                    InspectorAction::UnpinMetadata => {
+                        let waker = { self.shared.borrow().waker.clone() };
+                        self.shared.files_mut().start_unpin_metadata(waker);
                         request_files_overlay_rebuild(ctx);
                     }
                     InspectorAction::PinContent => {
@@ -9032,6 +9137,12 @@ impl Widget for InspectorView {
                     InspectorAction::RepairReplicas => {
                         format!("Request SIFS replica repair for {}", entry.path)
                     }
+                    InspectorAction::PinMetadata => {
+                        format!("Pin SIFS metadata on this node for {}", entry.path)
+                    }
+                    InspectorAction::UnpinMetadata => {
+                        format!("Remove this node's SIFS metadata pin for {}", entry.path)
+                    }
                     InspectorAction::PinContent => {
                         format!("Pin SIFS content on this node for {}", entry.path)
                     }
@@ -9237,6 +9348,8 @@ impl InspectorView {
             InspectorAction::Delete => (pal.field, pal.border, pal.warn, pal.warn),
             InspectorAction::RefreshPlacement
             | InspectorAction::RepairReplicas
+            | InspectorAction::PinMetadata
+            | InspectorAction::UnpinMetadata
             | InspectorAction::PinContent
             | InspectorAction::UnpinContent
             | InspectorAction::ConnectionSettings => {
@@ -14749,6 +14862,50 @@ mod tests {
                 assert_eq!(request_id, shared.files().tasks[0].id);
                 assert_eq!(source, FilesSourceKind::Sifs);
                 assert_eq!(operation.kind, FilesOperationKind::RepairReplicas);
+                assert_eq!(operation.path, "/services/artifact.txt");
+            }
+            FilesWorkerCommand::List { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+        }
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Pin metadata artifact.txt")
+            .click()?;
+
+        assert_eq!(shared.files().tasks[0].title, "Pin metadata");
+        match rx.try_recv().expect("metadata pin command") {
+            FilesWorkerCommand::Operation {
+                request_id,
+                source,
+                operation,
+            } => {
+                assert_eq!(request_id, shared.files().tasks[0].id);
+                assert_eq!(source, FilesSourceKind::Sifs);
+                assert_eq!(operation.kind, FilesOperationKind::PinMetadata);
+                assert_eq!(operation.path, "/services/artifact.txt");
+            }
+            FilesWorkerCommand::List { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+        }
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Unpin metadata artifact.txt")
+            .click()?;
+
+        assert_eq!(shared.files().tasks[0].title, "Unpin metadata");
+        match rx.try_recv().expect("metadata unpin command") {
+            FilesWorkerCommand::Operation {
+                request_id,
+                source,
+                operation,
+            } => {
+                assert_eq!(request_id, shared.files().tasks[0].id);
+                assert_eq!(source, FilesSourceKind::Sifs);
+                assert_eq!(operation.kind, FilesOperationKind::UnpinMetadata);
                 assert_eq!(operation.path, "/services/artifact.txt");
             }
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),

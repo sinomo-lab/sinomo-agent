@@ -380,10 +380,18 @@ impl SifsFileManagerBackend {
     }
 
     pub(crate) fn pin_content(&self, path: &str) -> Result<String, String> {
+        self.pin_path_mode(path, DfsPinMode::Content, "content")
+    }
+
+    pub(crate) fn pin_metadata(&self, path: &str) -> Result<String, String> {
+        self.pin_path_mode(path, DfsPinMode::Metadata, "metadata")
+    }
+
+    fn pin_path_mode(&self, path: &str, mode: DfsPinMode, label: &str) -> Result<String, String> {
         let stat = self.dfs_stat(path)?;
         let node_id = self.node_label();
         let node = NodeId::new(&node_id).map_err(|error| {
-            format!("cannot pin SIFS content on invalid local node id {node_id}: {error}")
+            format!("cannot pin SIFS {label} on invalid local node id {node_id}: {error}")
         })?;
         sinomo_runtime::dfs::add_local_dfs_pin(
             default_dfs_pin_root(&self.data_dir),
@@ -392,27 +400,36 @@ impl SifsFileManagerBackend {
                 path: stat.path,
                 object_id: Some(stat.object_id),
                 pinned_by_node_id: node,
-                mode: DfsPinMode::Content,
+                mode,
                 created_at: time::OffsetDateTime::now_utc(),
             },
         )
-        .map_err(|error| format!("cannot pin SIFS content {path}: {error}"))?;
+        .map_err(|error| format!("cannot pin SIFS {label} {path}: {error}"))?;
         Ok(node_id)
     }
 
     pub(crate) fn unpin_content(&self, path: &str) -> Result<bool, String> {
+        self.unpin_path_mode(path, DfsPinMode::Content, "content")
+    }
+
+    pub(crate) fn unpin_metadata(&self, path: &str) -> Result<bool, String> {
+        self.unpin_path_mode(path, DfsPinMode::Metadata, "metadata")
+    }
+
+    fn unpin_path_mode(&self, path: &str, mode: DfsPinMode, label: &str) -> Result<bool, String> {
         let stat = self.dfs_stat(path)?;
         let node_id = self.node_label();
         let node = NodeId::new(&node_id).map_err(|error| {
-            format!("cannot unpin SIFS content on invalid local node id {node_id}: {error}")
+            format!("cannot unpin SIFS {label} on invalid local node id {node_id}: {error}")
         })?;
         sinomo_runtime::dfs::remove_local_dfs_pin(
             default_dfs_pin_root(&self.data_dir),
             &stat.file_system_id,
             &stat.path,
             Some(&node),
+            Some(&mode),
         )
-        .map_err(|error| format!("cannot unpin SIFS content {path}: {error}"))
+        .map_err(|error| format!("cannot unpin SIFS {label} {path}: {error}"))
     }
 }
 

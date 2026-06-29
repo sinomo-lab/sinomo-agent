@@ -121,6 +121,7 @@ pub(crate) struct DfsPinRemoveOptions {
     pub(crate) file_system_id: DfsFileSystemId,
     pub(crate) path: String,
     pub(crate) node_id: Option<NodeId>,
+    pub(crate) mode: Option<DfsPinMode>,
     pub(crate) json: bool,
 }
 
@@ -498,6 +499,7 @@ pub(crate) fn parse_dfs_pin_remove_options(
     let mut file_system_id = None;
     let mut path = None;
     let mut node_id = None;
+    let mut mode = None;
     let mut json = false;
     let mut index = 0;
     while index < args.len() {
@@ -523,6 +525,10 @@ pub(crate) fn parse_dfs_pin_remove_options(
                 index += 1;
                 node_id = Some(parse_node_id(args.get(index).ok_or(CliError::Usage)?)?);
             }
+            "--mode" => {
+                index += 1;
+                mode = Some(parse_dfs_pin_mode(args.get(index).ok_or(CliError::Usage)?)?);
+            }
             "--json" => json = true,
             _ => return Err(CliError::Usage),
         }
@@ -533,6 +539,7 @@ pub(crate) fn parse_dfs_pin_remove_options(
         file_system_id: file_system_id.unwrap_or_else(default_dfs_file_system_id),
         path: path.ok_or(CliError::Usage)?,
         node_id,
+        mode,
         json,
     })
 }
@@ -1957,6 +1964,7 @@ pub(crate) fn run_dfs_pin_command(command: DfsPinCliCommand) -> Result<(), CliEr
                 &options.file_system_id,
                 &options.path,
                 options.node_id.as_ref(),
+                options.mode.as_ref(),
             )?;
             if options.json {
                 print_json(
@@ -1964,6 +1972,7 @@ pub(crate) fn run_dfs_pin_command(command: DfsPinCliCommand) -> Result<(), CliEr
                     &serde_json::json!({
                         "file_system_id": options.file_system_id,
                         "path": options.path,
+                        "mode": options.mode,
                         "removed": removed,
                     }),
                 )?;
