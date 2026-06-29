@@ -153,6 +153,10 @@ pub(super) fn print_cluster_help() {
     println!(
         "      Plan migration from the current initialized cluster into another cluster without mutating local state."
     );
+    println!("  sinomo cluster rename <node-id> <name>");
+    println!("      Change a node display name in quorum-backed cluster membership.");
+    println!("  sinomo cluster rename-hostnames");
+    println!("      Rename inferable cluster members to their advertised hostnames.");
     println!("  sinomo cluster role <node-id> <workstation|mobile|server|sensor|test>");
     println!("      Change the documented node role in quorum-backed cluster membership.");
     println!("  sinomo cluster state-authority <node-id> <authority|replica|observer>");

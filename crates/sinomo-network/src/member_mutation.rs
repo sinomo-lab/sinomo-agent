@@ -48,6 +48,14 @@ pub struct ClusterNodeRoleUpdate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterNodeNameUpdate {
+    pub node_id: NodeId,
+    pub previous_name: String,
+    pub name: String,
+    pub changed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterStateAuthorityUpdate {
     pub node_id: NodeId,
     pub previous_role: ClusterMemberRole,
@@ -299,6 +307,41 @@ pub fn update_cluster_node_role_with_host(
     })
 }
 
+pub fn update_cluster_node_name_with_host(
+    paths: &ClusterPaths,
+    mut state: ClusterBootstrapState,
+    node_id: NodeId,
+    name: String,
+    now: OffsetDateTime,
+    host: &mut impl ClusterMemberMutationHost,
+) -> Result<ClusterNodeNameUpdate, NetworkError> {
+    let store = host.current_cluster_kv_store(paths, &state)?;
+    let member_key = cluster_member_key(&node_id);
+    let Some(member_entry) = store.get(&member_key).cloned() else {
+        return Err(NetworkError::InvalidClusterCommand {
+            detail: format!("cluster member `{node_id}` was not found"),
+        });
+    };
+    let mut member: ClusterMemberRecord = member_entry.decode()?;
+    let previous_name = member.display_name.clone();
+    let changed = previous_name != name;
+    if changed {
+        apply_cluster_node_name(&mut member, name.clone(), now);
+        host.commit_cluster_kv_txn_with_quorum(
+            paths,
+            &mut state,
+            cluster_member_update_txn_from_store(&store, member_entry, &member)?,
+        )?;
+    }
+    update_local_cluster_node_name_if_present(paths, &node_id, name.clone(), now)?;
+    Ok(ClusterNodeNameUpdate {
+        node_id,
+        previous_name,
+        name,
+        changed,
+    })
+}
+
 fn update_local_cluster_node_role_if_present(
     paths: &ClusterPaths,
     node_id: &NodeId,
@@ -320,6 +363,45 @@ fn update_local_cluster_node_role_if_present(
     state.updated_at = now;
     write_cluster_state(paths, &state)?;
     Ok(())
+}
+
+fn update_local_cluster_node_name_if_present(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    name: String,
+    now: OffsetDateTime,
+) -> Result<(), NetworkError> {
+    let mut state = read_cluster_state_without_kv(paths)?;
+    let mut changed = false;
+    if state.local_node_id == *node_id && state.local_node_display_name != name {
+        state.local_node_display_name = name.clone();
+        changed = true;
+    }
+    let Some(member) = state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == *node_id)
+    else {
+        if changed {
+            state.updated_at = now;
+            write_cluster_state(paths, &state)?;
+        }
+        return Ok(());
+    };
+    if member.display_name != name {
+        apply_cluster_node_name(member, name, now);
+        changed = true;
+    }
+    if changed {
+        state.updated_at = now;
+        write_cluster_state(paths, &state)?;
+    }
+    Ok(())
+}
+
+fn apply_cluster_node_name(member: &mut ClusterMemberRecord, name: String, now: OffsetDateTime) {
+    member.display_name = name;
+    member.updated_at = now;
 }
 
 pub fn update_cluster_state_authority_with_host(
