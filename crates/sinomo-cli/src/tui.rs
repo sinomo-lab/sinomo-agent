@@ -6179,6 +6179,7 @@ where
     runtime_control_registry: sinomo_agent::AgentRuntimeControlRegistry,
     runtime_cursor: AgentRuntimeEventCursor,
     agent_definition: AgentDefinition,
+    skill_catalog: sinomo_agent::SkillCatalog,
     tool_registry: sinomo_agent::AgentToolRegistry,
     thinking: ThinkingControl,
     provider: String,
@@ -6270,6 +6271,7 @@ where
                 last_event_id: None,
             },
             agent_definition: AgentDefinition::main(),
+            skill_catalog: sinomo_agent::SkillCatalog::default(),
             tool_registry: sinomo_agent::AgentToolRegistry::new(),
             thinking,
             provider: provider.into(),
@@ -6282,6 +6284,11 @@ where
 
     pub fn with_tool_registry(mut self, registry: sinomo_agent::AgentToolRegistry) -> Self {
         self.tool_registry = registry;
+        self
+    }
+
+    pub fn with_skill_catalog(mut self, catalog: sinomo_agent::SkillCatalog) -> Self {
+        self.skill_catalog = catalog;
         self
     }
 
@@ -6316,8 +6323,11 @@ where
     fn build_runtime(&self, model: M, session: AgentSession) -> AgentSessionRuntime<M> {
         let mut session = session;
         session.role = self.agent_definition.role.clone();
-        let agent = Agent::new(model, self.provider.clone(), self.model_name.clone())
+        let config = sinomo_agent::AgentConfig::new(self.provider.clone(), self.model_name.clone())
             .with_agent_definition(self.agent_definition.clone())
+            .with_skill_catalog(self.skill_catalog.clone());
+        let agent = Agent::new(model, self.provider.clone(), self.model_name.clone())
+            .with_config(config)
             .with_tool_registry(self.tool_registry.clone());
         AgentSessionRuntime::with_storage(agent, session, self.runtime_storage.clone())
     }
@@ -6496,9 +6506,11 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             runtime_config,
             thinking.clone(),
         );
+        let skill_catalog = best_effort_reconciled_skill_catalog(data_dir);
         Ok(
             Self::with_thinking(model, runtime_info.provider, runtime_info.model, thinking)
                 .with_runtime_storage(AgentRuntimeStorage::from_data_dir(data_dir))
+                .with_skill_catalog(skill_catalog)
                 .with_tool_registry(main_agent_config_tool_registry(data_dir)?),
         )
     }
@@ -6522,6 +6534,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         let account =
             provider_account_config(&config, &resolved.provider, Some(&resolved.account)).cloned();
         let options = provider_options_for_model(account.as_ref(), &resolved.model);
+        let skill_catalog = best_effort_reconciled_skill_catalog(data_dir);
         Ok(Self::with_thinking(
             DefaultMainAgentChatModel::configured(
                 data_dir,
@@ -6535,6 +6548,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             thinking,
         )
         .with_runtime_storage(AgentRuntimeStorage::from_data_dir(data_dir))
+        .with_skill_catalog(skill_catalog)
         .with_tool_registry(tool_registry)
         .with_account_and_options(Some(resolved.account), options))
     }

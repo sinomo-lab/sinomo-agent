@@ -1,11 +1,13 @@
 use crate::{AgentSkillDescriptor, AgentSkillSource};
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::module::{
-    ModuleDeclarativeResourceExport, ModuleDeclarativeResourceKind, ModuleRegistration,
+    DeclarativeModuleLoaderState, ModuleBackendRegistration, ModuleDeclarativeResourceExport,
+    ModuleDeclarativeResourceKind, ModuleRegistration, declarative_module_payload_cache_path,
+    read_declarative_module_loader_states, read_declarative_module_registrations,
 };
 use sinomo_runtime::object::{LengthMode, serde_ext};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use thiserror::Error;
 
@@ -717,6 +719,373 @@ impl SkillCatalogWrite {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SkillCatalogReconcileReport {
+    pub scanned: usize,
+    pub materialized: usize,
+    pub activated: usize,
+    pub unchanged: usize,
+    pub conflicts: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkillCatalogReconcileSkip>,
+}
+
+impl SkillCatalogReconcileReport {
+    pub fn merge(&mut self, other: Self) {
+        self.scanned = self.scanned.saturating_add(other.scanned);
+        self.materialized = self.materialized.saturating_add(other.materialized);
+        self.activated = self.activated.saturating_add(other.activated);
+        self.unchanged = self.unchanged.saturating_add(other.unchanged);
+        self.conflicts = self.conflicts.saturating_add(other.conflicts);
+        self.skipped.extend(other.skipped);
+    }
+
+    pub fn skipped(mut self, item: impl Into<String>, reason: impl Into<String>) -> Self {
+        self.skipped.push(SkillCatalogReconcileSkip {
+            item: item.into(),
+            reason: reason.into(),
+        });
+        self
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SkillCatalogReconcileSkip {
+    pub item: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuiltInSkillDefinition {
+    pub skill_id: String,
+    pub version: String,
+    pub description: String,
+    pub text: String,
+    pub target_agents: Vec<String>,
+    pub model_families: Vec<String>,
+    pub activation_tags: Vec<String>,
+    pub required_capabilities: Vec<String>,
+}
+
+impl BuiltInSkillDefinition {
+    pub fn new(
+        skill_id: impl Into<String>,
+        version: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            skill_id: skill_id.into(),
+            version: version.into(),
+            description: String::new(),
+            text: text.into(),
+            target_agents: Vec::new(),
+            model_families: Vec::new(),
+            activation_tags: Vec::new(),
+            required_capabilities: Vec::new(),
+        }
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    pub fn with_target_agent(mut self, target_agent: impl Into<String>) -> Self {
+        self.target_agents.push(target_agent.into());
+        self
+    }
+
+    pub fn with_model_family(mut self, model_family: impl Into<String>) -> Self {
+        self.model_families.push(model_family.into());
+        self
+    }
+
+    pub fn with_activation_tag(mut self, tag: impl Into<String>) -> Self {
+        self.activation_tags.push(tag.into());
+        self
+    }
+
+    pub fn with_required_capability(mut self, capability: impl Into<String>) -> Self {
+        self.required_capabilities.push(capability.into());
+        self
+    }
+
+    pub fn to_catalog_write(&self) -> SkillCatalogWrite {
+        let entry = SkillCatalogEntry::new(
+            self.skill_id.clone(),
+            self.version.clone(),
+            SkillCatalogSource::sinomo(self.version.clone()),
+            &self.text,
+        )
+        .with_description(self.description.clone())
+        .with_target_agents(self.target_agents.clone())
+        .with_model_families(self.model_families.clone())
+        .with_activation_tags(self.activation_tags.clone())
+        .with_required_capabilities(self.required_capabilities.clone());
+        SkillCatalogWrite::new(entry, self.text.clone())
+    }
+}
+
+pub fn reconcile_builtin_skills_to_catalog<S: SkillCatalogStore>(
+    store: &S,
+    definitions: &[BuiltInSkillDefinition],
+    activate_scope: Option<&str>,
+    activated_by: &str,
+    reason: &str,
+) -> Result<SkillCatalogReconcileReport, SkillCatalogError> {
+    let mut report = SkillCatalogReconcileReport::default();
+    for definition in definitions {
+        report.scanned = report.scanned.saturating_add(1);
+        let outcome = reconcile_skill_catalog_write(
+            store,
+            definition.to_catalog_write(),
+            activate_scope,
+            activated_by,
+            reason,
+        )?;
+        report.apply_outcome(outcome);
+    }
+    Ok(report)
+}
+
+pub fn reconcile_module_skills_to_catalog<S: SkillCatalogStore>(
+    store: &S,
+    registration: &ModuleRegistration,
+    payload_root: Option<&Path>,
+    activate_scope: Option<&str>,
+    activated_by: &str,
+    reason: &str,
+) -> Result<SkillCatalogReconcileReport, SkillCatalogError> {
+    let mut report = SkillCatalogReconcileReport::default();
+    for resource in &registration.surfaces.declarative_resources {
+        if resource.kind != ModuleDeclarativeResourceKind::Skill {
+            continue;
+        }
+        report.scanned = report.scanned.saturating_add(1);
+        let Some(write) =
+            module_resource_catalog_write(registration, resource, payload_root, &mut report)?
+        else {
+            continue;
+        };
+        let outcome =
+            reconcile_skill_catalog_write(store, write, activate_scope, activated_by, reason)?;
+        report.apply_outcome(outcome);
+    }
+    Ok(report)
+}
+
+pub fn reconcile_active_declarative_module_skills_to_catalog<S: SkillCatalogStore>(
+    store: &S,
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
+) -> Result<SkillCatalogReconcileReport, SkillCatalogError> {
+    let root = data_dir.root();
+    let states = read_declarative_module_loader_states(&root).map_err(|source| {
+        SkillCatalogError::Store {
+            path: root.join("module/loader/declarative").display().to_string(),
+            detail: source.to_string(),
+        }
+    })?;
+    let active_states = states
+        .into_iter()
+        .filter(|state| state.active)
+        .map(|state| (state.module_id.to_string(), state))
+        .collect::<BTreeMap<_, _>>();
+    if active_states.is_empty() {
+        return Ok(SkillCatalogReconcileReport::default());
+    }
+
+    let registrations = read_declarative_module_registrations(&root).map_err(|source| {
+        SkillCatalogError::Store {
+            path: root
+                .join("module/catalog/declarative")
+                .display()
+                .to_string(),
+            detail: source.to_string(),
+        }
+    })?;
+    let mut report = SkillCatalogReconcileReport::default();
+    for registration in registrations {
+        let module_id = registration.module_id().to_string();
+        let Some(state) = active_states.get(&module_id) else {
+            continue;
+        };
+        if !declarative_registration_matches_loader_state(&registration, state) {
+            report = report.skipped(
+                module_id,
+                "declarative registration does not match the active loader state",
+            );
+            continue;
+        }
+        let payload_path = declarative_module_payload_cache_path(
+            &root,
+            &state.module_id,
+            &state.version,
+            &state.content_hash,
+        );
+        let module_report = reconcile_module_skills_to_catalog(
+            store,
+            &registration,
+            Some(&payload_path),
+            Some(SkillActivationScope::Cluster.as_str()),
+            &format!("module:{}", registration.module_id()),
+            "active declarative module skill reconciliation",
+        )?;
+        report.merge(module_report);
+    }
+    Ok(report)
+}
+
+pub fn reconcile_active_declarative_module_skills_to_sifs(
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
+) -> Result<SkillCatalogReconcileReport, SkillCatalogError> {
+    let store = SkillCatalogSifsStore::open(Some(data_dir.root()))?;
+    reconcile_active_declarative_module_skills_to_catalog(&store, data_dir)
+}
+
+pub fn load_skill_catalog_from_sifs(
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
+) -> Result<SkillCatalog, SkillCatalogError> {
+    SkillCatalogSifsStore::open(Some(data_dir.root()))?.load_catalog()
+}
+
+pub fn load_reconciled_skill_catalog_from_sifs(
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
+) -> Result<SkillCatalog, SkillCatalogError> {
+    let store = SkillCatalogSifsStore::open(Some(data_dir.root()))?;
+    reconcile_active_declarative_module_skills_to_catalog(&store, data_dir)?;
+    store.load_catalog()
+}
+
+impl SkillCatalogReconcileReport {
+    fn apply_outcome(&mut self, outcome: SkillCatalogReconcileOutcome) {
+        match outcome {
+            SkillCatalogReconcileOutcome::Materialized { activated } => {
+                self.materialized = self.materialized.saturating_add(1);
+                if activated {
+                    self.activated = self.activated.saturating_add(1);
+                }
+            }
+            SkillCatalogReconcileOutcome::Unchanged => {
+                self.unchanged = self.unchanged.saturating_add(1);
+            }
+            SkillCatalogReconcileOutcome::Conflict => {
+                self.materialized = self.materialized.saturating_add(1);
+                self.conflicts = self.conflicts.saturating_add(1);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SkillCatalogReconcileOutcome {
+    Materialized { activated: bool },
+    Unchanged,
+    Conflict,
+}
+
+fn reconcile_skill_catalog_write<S: SkillCatalogStore>(
+    store: &S,
+    write: SkillCatalogWrite,
+    activate_scope: Option<&str>,
+    activated_by: &str,
+    reason: &str,
+) -> Result<SkillCatalogReconcileOutcome, SkillCatalogError> {
+    let Some(scope) = activate_scope else {
+        store.write_skill_version(write)?;
+        return Ok(SkillCatalogReconcileOutcome::Materialized { activated: false });
+    };
+    let catalog = store.load_catalog()?;
+    let decision = catalog
+        .active_entry_for_scope(scope, &write.entry.skill_id)
+        .map(|active| catalog.upstream_update_decision(active, &write.entry))
+        .transpose()?
+        .unwrap_or(SkillUpstreamUpdateDecision::AutoReplace);
+    match decision {
+        SkillUpstreamUpdateDecision::AutoReplace => {
+            store.write_skill_version(write.activate_for_scope(scope, activated_by, reason))?;
+            Ok(SkillCatalogReconcileOutcome::Materialized { activated: true })
+        }
+        SkillUpstreamUpdateDecision::Noop => {
+            store.write_skill_version(write)?;
+            Ok(SkillCatalogReconcileOutcome::Unchanged)
+        }
+        SkillUpstreamUpdateDecision::AttemptThreeWayMerge { conflict }
+        | SkillUpstreamUpdateDecision::Conflict { conflict } => {
+            store.write_skill_version(write)?;
+            store.record_conflict(conflict)?;
+            Ok(SkillCatalogReconcileOutcome::Conflict)
+        }
+    }
+}
+
+fn module_resource_catalog_write(
+    registration: &ModuleRegistration,
+    resource: &ModuleDeclarativeResourceExport,
+    payload_root: Option<&Path>,
+    report: &mut SkillCatalogReconcileReport,
+) -> Result<Option<SkillCatalogWrite>, SkillCatalogError> {
+    if let Some(write) = SkillCatalogWrite::from_embedded_module_resource(registration, resource)? {
+        return Ok(Some(write));
+    }
+    let Some(payload_root) = payload_root else {
+        report.skipped.push(SkillCatalogReconcileSkip {
+            item: resource.id.clone(),
+            reason: "path-backed module skill has no payload root".to_string(),
+        });
+        return Ok(None);
+    };
+    let path = module_payload_resource_path(payload_root, &resource.path)?;
+    let bytes = std::fs::read(&path).map_err(|source| SkillCatalogError::Store {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let text = String::from_utf8(bytes).map_err(|source| SkillCatalogError::InvalidSkillText {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    SkillCatalogWrite::from_module_resource(registration, resource, text).map(Some)
+}
+
+fn module_payload_resource_path(
+    payload_root: &Path,
+    resource_path: &str,
+) -> Result<PathBuf, SkillCatalogError> {
+    let candidate = Path::new(resource_path);
+    if candidate.is_absolute() {
+        return Err(SkillCatalogError::InvalidCatalog {
+            detail: format!("module skill resource path `{resource_path}` must be relative"),
+        });
+    }
+    for component in candidate.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(SkillCatalogError::InvalidCatalog {
+                    detail: format!(
+                        "module skill resource path `{resource_path}` must stay inside payload root"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(payload_root.join(candidate))
+}
+
+fn declarative_registration_matches_loader_state(
+    registration: &ModuleRegistration,
+    state: &DeclarativeModuleLoaderState,
+) -> bool {
+    if registration.module_id() != &state.module_id
+        || registration.manifest.version != state.version
+    {
+        return false;
+    }
+    match &registration.backend {
+        ModuleBackendRegistration::Declarative { payload_ref } => payload_ref == &state.payload_ref,
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 pub struct SkillCatalogSifsStore {
     root: String,
@@ -1270,6 +1639,211 @@ mod tests {
         assert_eq!(write.entry.activation_tags, vec!["debug"]);
         assert!(write.entry.sifs_path.contains("/sources/modules/"));
         assert_eq!(write.entry.content_hash, skill_content_hash(&write.text));
+    }
+
+    #[test]
+    fn reconciliation_materializes_path_backed_module_skill() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-skill-catalog-module-reconcile");
+        let store = LocalSkillCatalogStore::new(root.path().join("catalog"));
+        let payload_root = root.path().join("payload");
+        let skill_path = payload_root.join("skills").join("debug.md");
+        std::fs::create_dir_all(skill_path.parent().expect("skill parent"))
+            .expect("create payload");
+        std::fs::write(&skill_path, "# Module skill\nUse module-specific steps.")
+            .expect("write payload skill");
+        let module_id =
+            sinomo_runtime::core::Id::from_legacy_named("module.skill.test").expect("module id");
+        let registration = ModuleRegistration::native_rust(
+            module_id.clone(),
+            "2.0.0",
+            "skill-module",
+            "sinomo-module-test",
+            "module-api",
+            sinomo_runtime::core::TrustRing::R1TrustedRuntime,
+            "module.skill.test",
+        )
+        .with_surfaces(
+            sinomo_runtime::module::ModuleSurfaces::default().with_declarative_resource(
+                ModuleDeclarativeResourceExport::skill("skill.module.debug", "skills/debug.md")
+                    .with_description("Debug with module guidance.")
+                    .with_target_agent("coding-agent")
+                    .with_activation_tag("debug"),
+            ),
+        );
+
+        let report = reconcile_module_skills_to_catalog(
+            &store,
+            &registration,
+            Some(&payload_root),
+            Some(SkillActivationScope::Cluster.as_str()),
+            "test",
+            "module reconciliation",
+        )
+        .expect("reconcile");
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.materialized, 1);
+        assert_eq!(report.activated, 1);
+        assert_eq!(report.conflicts, 0);
+        let catalog = store.load_catalog().expect("catalog");
+        let active = catalog
+            .active_entry_for_scope(SkillActivationScope::Cluster.as_str(), "skill.module.debug")
+            .expect("active module skill");
+        assert_eq!(active.version, "2.0.0");
+        assert_eq!(active.source.source_id.as_deref(), Some(module_id.as_str()));
+        assert_eq!(active.target_agents, vec!["coding-agent"]);
+        let text = store
+            .read_skill_text(active)
+            .expect("read skill")
+            .expect("skill text");
+        assert_eq!(text, "# Module skill\nUse module-specific steps.");
+    }
+
+    #[test]
+    fn active_declarative_module_reconciliation_scans_loader_state() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-skill-catalog-module-scan");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(root.path().join("data"));
+        let store = LocalSkillCatalogStore::new(root.path().join("catalog"));
+        let module_id = "module.skill.scan";
+        let version = "3.0.0";
+        let content_hash =
+            "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let parsed_module_id =
+            sinomo_runtime::core::Id::from_legacy_named(module_id).expect("module id");
+        let payload_ref = sinomo_runtime::module::declarative_module_payload_ref(
+            &parsed_module_id,
+            version,
+            content_hash,
+        );
+        let registration = sinomo_runtime::module::DeclarativeModulePackageManifest {
+            module_id: module_id.to_string(),
+            version: version.to_string(),
+            owner: "skill-module".to_string(),
+            api_version: "sinomo.module.declarative.v1".to_string(),
+            target_ring: sinomo_runtime::core::TrustRing::R3SandboxedModule,
+            capabilities: sinomo_runtime::core::ModuleCapabilities::default(),
+            surfaces: sinomo_runtime::module::ModuleSurfaces::default().with_declarative_resource(
+                ModuleDeclarativeResourceExport::skill("skill.module.scan", "skills/scan.md"),
+            ),
+            resources: Vec::new(),
+        }
+        .into_registration(payload_ref.clone())
+        .expect("registration");
+        let payload_path = sinomo_runtime::module::declarative_module_payload_cache_path(
+            &data_dir.root(),
+            &parsed_module_id,
+            version,
+            content_hash,
+        );
+        let skill_path = payload_path.join("skills").join("scan.md");
+        std::fs::create_dir_all(skill_path.parent().expect("skill parent"))
+            .expect("create payload");
+        std::fs::write(
+            &skill_path,
+            "# Declarative module skill\nFollow scan steps.",
+        )
+        .expect("write payload skill");
+        sinomo_runtime::module::write_declarative_module_registration(
+            &data_dir.root(),
+            &registration,
+        )
+        .expect("write registration");
+        sinomo_runtime::module::write_declarative_module_loader_state(
+            &data_dir.root(),
+            &DeclarativeModuleLoaderState {
+                module_id: parsed_module_id,
+                version: version.to_string(),
+                content_hash: content_hash.to_string(),
+                payload_ref,
+                active: true,
+                installed_at: "test".to_string(),
+                source: "test".to_string(),
+            },
+        )
+        .expect("write state");
+
+        let report = reconcile_active_declarative_module_skills_to_catalog(&store, &data_dir)
+            .expect("reconcile active modules");
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.materialized, 1);
+        assert_eq!(report.activated, 1);
+        assert_eq!(report.conflicts, 0);
+        let catalog = store.load_catalog().expect("catalog");
+        let active = catalog
+            .active_entry_for_scope(SkillActivationScope::Cluster.as_str(), "skill.module.scan")
+            .expect("active module skill");
+        assert_eq!(active.version, version);
+    }
+
+    #[test]
+    fn reconciliation_records_conflict_without_replacing_evolved_skill() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-skill-catalog-module-conflict");
+        let store = LocalSkillCatalogStore::new(root.path().join("catalog"));
+        let base_text = "# Module skill\nBase guidance.";
+        let evolved_text = "# Module skill\nEvolved guidance.";
+        let evolved = SkillCatalogEntry::new(
+            "skill.module.debug",
+            "1.0.0-evolved",
+            SkillCatalogSource::evolution("evojob_1"),
+            evolved_text,
+        )
+        .with_base_hash(skill_content_hash(base_text));
+        store
+            .write_skill_version(
+                SkillCatalogWrite::new(evolved.clone(), evolved_text).activate_for_scope(
+                    SkillActivationScope::Cluster.as_str(),
+                    "evolution",
+                    "test override",
+                ),
+            )
+            .expect("write evolved skill");
+        let module_id =
+            sinomo_runtime::core::Id::from_legacy_named("module.skill.test").expect("module id");
+        let registration = ModuleRegistration::native_rust(
+            module_id,
+            "1.1.0",
+            "skill-module",
+            "sinomo-module-test",
+            "module-api",
+            sinomo_runtime::core::TrustRing::R1TrustedRuntime,
+            "module.skill.test",
+        )
+        .with_surfaces(
+            sinomo_runtime::module::ModuleSurfaces::default().with_declarative_resource(
+                ModuleDeclarativeResourceExport::skill("skill.module.debug", "skills/debug.md")
+                    .with_embedded_text("# Module skill\nUpstream changed."),
+            ),
+        );
+
+        let report = reconcile_module_skills_to_catalog(
+            &store,
+            &registration,
+            None,
+            Some(SkillActivationScope::Cluster.as_str()),
+            "test",
+            "module reconciliation",
+        )
+        .expect("reconcile");
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.materialized, 1);
+        assert_eq!(report.activated, 0);
+        assert_eq!(report.conflicts, 1);
+        let catalog = store.load_catalog().expect("catalog");
+        let active = catalog
+            .active_entry_for_scope(SkillActivationScope::Cluster.as_str(), "skill.module.debug")
+            .expect("active skill");
+        assert_eq!(active.source.kind, SkillCatalogSourceKind::Evolution);
+        assert_eq!(active.version, "1.0.0-evolved");
+        assert!(
+            catalog
+                .entry("skill.module.debug", "1.1.0")
+                .is_some_and(|entry| entry.source.kind == SkillCatalogSourceKind::Module)
+        );
+        assert_eq!(catalog.conflicts.len(), 1);
+        assert_eq!(catalog.conflicts[0].current_version, "1.0.0-evolved");
+        assert_eq!(catalog.conflicts[0].incoming_version, "1.1.0");
     }
 
     #[test]
