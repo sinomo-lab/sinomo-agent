@@ -5837,6 +5837,7 @@ fn raft_command_targets_prefer_reachable_voter_over_unreachable_voter() {
                 commit: None,
                 target_os: Some("test-os".to_string()),
                 target_arch: Some("test-arch".to_string()),
+                hostname: None,
                 pid: Some(42),
                 address: Some("127.0.0.1:21353".to_string()),
                 bind_address: Some("0.0.0.0:21353".to_string()),
@@ -6169,6 +6170,7 @@ fn dfs_data_targets_include_kv_main_daemon_endpoints() {
             commit: None,
             target_os: Some("test-os".to_string()),
             target_arch: Some("test-arch".to_string()),
+            hostname: None,
             pid: Some(42),
             address: Some("127.0.0.1:21353".to_string()),
             bind_address: Some("0.0.0.0:21353".to_string()),
@@ -8922,6 +8924,7 @@ fn cleanup_legacy_shadow_daemon_members_removes_only_shadow_only_records() {
         commit: None,
         target_os: None,
         target_arch: None,
+        hostname: None,
         pid: None,
         address: None,
         bind_address: None,
@@ -10504,6 +10507,7 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
         commit: None,
         target_os: Some("test-os".to_string()),
         target_arch: Some("test-arch".to_string()),
+        hostname: None,
         pid: Some(42),
         address: Some("127.0.0.1:21353".to_string()),
         bind_address: None,
@@ -13943,6 +13947,7 @@ fn join_state_authority_targets_do_not_filter_offline_status_during_bootstrap() 
             commit: None,
             target_os: Some("test-os".to_string()),
             target_arch: Some("test-arch".to_string()),
+            hostname: None,
             pid: Some(42),
             address: Some("node1:21353".to_string()),
             bind_address: Some("0.0.0.0:21353".to_string()),
@@ -16712,18 +16717,9 @@ fn cluster_member_publish_txn_from_snapshot_skips_stable_member_records() {
     let renamed_txn =
         cluster_member_publish_txn_from_snapshot(&snapshot, &[renamed]).expect("renamed txn");
     assert!(
-        renamed_txn
-            .success
-            .iter()
-            .any(|op| matches!(op, KvOp::Put { key, .. } if key == &member_key)),
-        "changed member record should still be published"
-    );
-    assert!(
-        renamed_txn
-            .success
-            .iter()
-            .all(|op| !matches!(op, KvOp::Put { key, .. } if key == &policy_key)),
-        "unchanged capability policy should not be re-put"
+        renamed_txn.success.is_empty(),
+        "member publish should preserve operator-managed display names: {:?}",
+        renamed_txn.success
     );
 
     let mut recapped = member;
@@ -16739,6 +16735,20 @@ fn cluster_member_publish_txn_from_snapshot_skips_stable_member_records() {
             .iter()
             .any(|op| matches!(op, KvOp::Put { key, .. } if key == &member_key)),
         "changed member capabilities should publish the member record"
+    );
+    let published_member = recapped_txn
+        .success
+        .iter()
+        .find_map(|op| match op {
+            KvOp::Put { key, value, .. } if key == &member_key => {
+                Some(sinomo_kv::decode_kv_value::<ClusterMemberRecord>(value).expect("member put"))
+            }
+            _ => None,
+        })
+        .expect("published member put");
+    assert_eq!(
+        published_member.display_name, "member publish stable",
+        "publish-owned updates must retain the stored display name"
     );
     assert!(
         recapped_txn
@@ -17770,6 +17780,7 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
         commit: None,
         target_os: Some("test-os".to_string()),
         target_arch: Some("test-arch".to_string()),
+        hostname: None,
         pid: Some(42),
         address: Some("127.0.0.1:21353".to_string()),
         bind_address: Some("0.0.0.0:21353".to_string()),
@@ -17851,6 +17862,7 @@ fn cluster_node_status_storage_keeps_processes_distinct_for_same_node() {
         commit: None,
         target_os: Some("test-os".to_string()),
         target_arch: Some("test-arch".to_string()),
+        hostname: None,
         pid: Some(42),
         address: Some("127.0.0.1:21353".to_string()),
         bind_address: Some("0.0.0.0:21353".to_string()),
@@ -18354,6 +18366,7 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
             commit: None,
             target_os: Some("test-os".to_string()),
             target_arch: Some("test-arch".to_string()),
+            hostname: None,
             pid: Some(42),
             address: Some(format!("{}:21353", node_id.as_str())),
             bind_address: None,
@@ -18735,6 +18748,7 @@ fn cluster_health_rows_select_member_process_status() {
         commit: None,
         target_os: Some("test-os".to_string()),
         target_arch: Some("test-arch".to_string()),
+        hostname: None,
         pid: Some(43),
         address: Some("127.0.0.1:21354".to_string()),
         bind_address: Some("0.0.0.0:21354".to_string()),
@@ -19307,6 +19321,7 @@ fn node_status_quorum_publish_driver_delegates_and_cleans_rollout_sidecar() {
         commit: None,
         target_os: Some("test-os".to_string()),
         target_arch: Some("test-arch".to_string()),
+        hostname: None,
         pid: Some(42),
         address: Some("127.0.0.1:21353".to_string()),
         bind_address: Some("0.0.0.0:21353".to_string()),
@@ -19386,6 +19401,7 @@ fn node_status_async_quorum_publish_driver_delegates() {
         commit: None,
         target_os: Some("test-os".to_string()),
         target_arch: Some("test-arch".to_string()),
+        hostname: None,
         pid: Some(42),
         address: Some("127.0.0.1:21353".to_string()),
         bind_address: Some("0.0.0.0:21353".to_string()),
@@ -19589,6 +19605,7 @@ fn stable_status_and_network_info_sync_do_not_append_raft_log_entries() {
         commit: None,
         target_os: Some("test-os".to_string()),
         target_arch: Some("test-arch".to_string()),
+        hostname: None,
         pid: Some(42),
         address: Some("127.0.0.1:21353".to_string()),
         bind_address: Some("0.0.0.0:21353".to_string()),
@@ -22310,6 +22327,7 @@ fn cluster_kv_metadata_reads_are_empty_without_materialized_snapshot() {
         commit: None,
         target_os: Some("test-os".to_string()),
         target_arch: Some("test-arch".to_string()),
+        hostname: None,
         pid: Some(42),
         address: Some("127.0.0.1:21353".to_string()),
         bind_address: Some("0.0.0.0:21353".to_string()),

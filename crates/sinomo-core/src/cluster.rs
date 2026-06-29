@@ -393,6 +393,8 @@ pub struct ClusterNodeStatusRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_arch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,

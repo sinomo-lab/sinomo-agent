@@ -96,7 +96,7 @@ pub(crate) fn cluster_member_publish_matches_kv(
 ) -> Result<bool, NetworkError> {
     let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     for member in members {
-        let mut member = member.clone();
+        let mut member = cluster_member_publish_record_for_snapshot(Some(&snapshot), member);
         cleanup_member_iroh_endpoints(&mut member);
         member
             .endpoints
@@ -619,7 +619,7 @@ fn cluster_member_publish_txn_with_snapshot(
 ) -> Result<KvTxn, NetworkError> {
     let mut success = Vec::new();
     for member in members {
-        let mut member = member.clone();
+        let mut member = cluster_member_publish_record_for_snapshot(snapshot, member);
         cleanup_member_iroh_endpoints(&mut member);
         push_snapshot_member_diff_put_op(
             snapshot,
@@ -659,6 +659,21 @@ fn cluster_member_publish_txn_with_snapshot(
         success,
         failure: Vec::new(),
     })
+}
+
+fn cluster_member_publish_record_for_snapshot(
+    snapshot: Option<&KvSnapshot>,
+    member: &ClusterMemberRecord,
+) -> ClusterMemberRecord {
+    let mut member = member.clone();
+    let Some(existing) = snapshot
+        .and_then(|snapshot| snapshot.get(&cluster_member_key(&member.node_id)))
+        .and_then(|entry| entry.decode::<ClusterMemberRecord>().ok())
+    else {
+        return member;
+    };
+    member.display_name = existing.display_name;
+    member
 }
 
 fn push_snapshot_member_diff_put_op(

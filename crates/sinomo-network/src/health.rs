@@ -635,6 +635,7 @@ pub fn unknown_cluster_node_status(
         commit: None,
         target_os: None,
         target_arch: None,
+        hostname: None,
         pid: None,
         address: member
             .endpoints
