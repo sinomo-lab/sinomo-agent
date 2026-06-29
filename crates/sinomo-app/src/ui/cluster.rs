@@ -969,7 +969,8 @@ fn overview_lines(
         "Cluster overview".to_string(),
         format!("source: {}", source_summary(&snapshot.source)),
         format!("health: {}", cluster_health_summary(snapshot)),
-        format!("reach: {}", public_reachability_summary(snapshot)),
+        format!("public route: {}", public_reachability_summary(snapshot)),
+        format!("mode: {}", cluster_route_mode_summary(snapshot)),
         format!("topology: {direct_edges} edges"),
         format!("LAN: {} segments", topology.lan_segments.len()),
     ];
@@ -1060,10 +1061,27 @@ fn public_reachability_summary(snapshot: &ClusterSnapshot) -> String {
         .iter()
         .filter(|node| node.public_reachable)
         .count();
-    format!(
-        "{public} / {} nodes publicly reachable",
-        snapshot.nodes.len()
-    )
+    format!("{public} / {} nodes", snapshot.nodes.len())
+}
+
+fn cluster_route_mode_summary(snapshot: &ClusterSnapshot) -> &'static str {
+    let counts = availability_counts(snapshot);
+    if counts.total == 0 {
+        return "unknown until nodes report endpoints";
+    }
+
+    let public = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.public_reachable)
+        .count();
+    if public > 0 {
+        return "public and private routing";
+    }
+    if counts.online == counts.total {
+        return "private/LAN; public ingress not required";
+    }
+    "private or unverified routing"
 }
 
 fn cluster_attention_summary(snapshot: &ClusterSnapshot, warning: &str) -> String {
@@ -1931,10 +1949,11 @@ mod tests {
 
         assert_eq!(lines[0], "Cluster overview");
         assert!(lines.iter().any(|line| line == "health: 2 / 2 online"));
+        assert!(lines.iter().any(|line| line == "public route: 1 / 2 nodes"));
         assert!(
             lines
                 .iter()
-                .any(|line| line == "reach: 1 / 2 nodes publicly reachable")
+                .any(|line| line == "mode: public and private routing")
         );
         assert!(lines.iter().any(|line| line == "topology: 1 edges"));
         assert!(lines.iter().any(|line| line == "source: daemon connected"));
@@ -1963,6 +1982,26 @@ mod tests {
                 .any(|line| line == "cluster: cluster-test-123456789")
         );
         assert!(open.iter().any(|line| line == "local: node-public"));
+    }
+
+    #[test]
+    fn overview_private_cluster_explains_lan_only_routing() {
+        let snapshot = ClusterSnapshot {
+            source: "daemon 127.0.0.1:21353".to_string(),
+            nodes: vec![node("node-a"), node("node-b"), node("node-c")],
+            ..ClusterSnapshot::default()
+        };
+        let topology = build_topology(&snapshot);
+        let lines = overview_lines(&snapshot, &topology, false);
+
+        assert!(lines.iter().any(|line| line == "health: 3 / 3 online"));
+        assert!(lines.iter().any(|line| line == "public route: 0 / 3 nodes"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "mode: private/LAN; public ingress not required")
+        );
+        assert!(!lines.iter().any(|line| line.contains("attention:")));
     }
 
     #[test]
