@@ -287,13 +287,18 @@ pub fn rollout_build_dev_native_dylib_module(
 }
 
 fn rollout_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> Vec<String> {
-    let mut args = vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
+    let mut args = vec![
+        "build".to_string(),
+        "--locked".to_string(),
+        "-p".to_string(),
+        "sinomo".to_string(),
+    ];
     append_native_dylib_module_build_args(&mut args, modules);
     args
 }
 
 fn rollout_module_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> Vec<String> {
-    let mut args = vec!["build".to_string()];
+    let mut args = vec!["build".to_string(), "--locked".to_string()];
     append_native_dylib_module_build_args(&mut args, modules);
     args
 }
@@ -301,6 +306,7 @@ fn rollout_module_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> V
 fn rollout_single_module_build_args(module: &SelfRolloutNativeDylibModuleBuild) -> Vec<String> {
     let mut args = vec![
         "build".to_string(),
+        "--locked".to_string(),
         "-p".to_string(),
         module.package.clone(),
     ];
@@ -1226,6 +1232,56 @@ mod tests {
         assert!(source_heads_match(Some("abcdef12"), "abcdef123456"));
         assert!(!source_heads_match(Some("abcdef12"), "12345678"));
         assert!(!source_heads_match(None, "abcdef12"));
+    }
+
+    #[test]
+    fn rollout_build_args_use_locked_source() {
+        let module = SelfRolloutNativeDylibModuleBuild {
+            package: "sinomo-test-module".to_string(),
+            features: vec!["sinomo-test-module/test-feature".to_string()],
+            module_id: "module.test".to_string(),
+            interface_version: "test.v1".to_string(),
+            cache_key: "module/test".to_string(),
+            library_name: "libsinomo_test_module.so".to_string(),
+            built_library: PathBuf::from("target/debug/libsinomo_test_module.so"),
+            source: "test".to_string(),
+        };
+
+        assert_eq!(
+            rollout_build_args(std::slice::from_ref(&module)),
+            vec![
+                "build",
+                "--locked",
+                "-p",
+                "sinomo",
+                "-p",
+                "sinomo-test-module",
+                "--features",
+                "sinomo-test-module/test-feature",
+            ]
+        );
+        assert_eq!(
+            rollout_module_build_args(std::slice::from_ref(&module)),
+            vec![
+                "build",
+                "--locked",
+                "-p",
+                "sinomo-test-module",
+                "--features",
+                "sinomo-test-module/test-feature",
+            ]
+        );
+        assert_eq!(
+            rollout_single_module_build_args(&module),
+            vec![
+                "build",
+                "--locked",
+                "-p",
+                "sinomo-test-module",
+                "--features",
+                "sinomo-test-module/test-feature",
+            ]
+        );
     }
 
     #[test]
