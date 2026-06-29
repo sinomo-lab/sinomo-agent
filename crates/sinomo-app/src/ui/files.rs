@@ -7819,6 +7819,31 @@ impl FilesTaskStrip {
         task.source == FilesSourceKind::Sifs && task.state == FilesTaskState::Failed
     }
 
+    fn hidden_task_count(tasks: &[FilesTask]) -> usize {
+        tasks.len().saturating_sub(2)
+    }
+
+    fn overflow_label(hidden: usize) -> String {
+        if hidden == 1 {
+            "1 more in inspector".to_string()
+        } else {
+            format!("{hidden} more in inspector")
+        }
+    }
+
+    fn strip_summary(tasks: &[FilesTask]) -> String {
+        let base = files_task_queue_summary(tasks);
+        let hidden = Self::hidden_task_count(tasks);
+        if hidden == 0 {
+            return base;
+        }
+        format!(
+            "{base}; showing 2 of {}; {} in inspector",
+            tasks.len(),
+            plural(hidden, "more task")
+        )
+    }
+
     fn detail_display(task: &FilesTask, width: f32) -> String {
         let detail = files_task_detail_display(task);
         let detail = if Self::task_has_recovery(task) {
@@ -7987,6 +8012,26 @@ impl Widget for FilesTaskStrip {
             "TASKS",
             pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint),
         );
+        let hidden = Self::hidden_task_count(&files.tasks);
+        if hidden > 0 {
+            let label = Self::overflow_label(hidden);
+            let clear_left = if Self::has_finished_tasks(&files) {
+                Self::clear_rect(bounds).x() - 8.0
+            } else {
+                bounds.max_x() - CONTENT_PAD
+            };
+            let label_x = bounds.x() + CONTENT_PAD + 46.0;
+            let label_w = (clear_left - label_x).max(0.0);
+            if label_w > 36.0 {
+                let label = display_name_for_width(&label, label_w, 5.8);
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(label_x, bounds.y() + 10.0, label_w, 16.0),
+                    &label,
+                    pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text_muted),
+                );
+            }
+        }
         if Self::has_finished_tasks(&files) {
             let clear = Self::clear_rect(bounds);
             let fill = if self.hovered_clear {
@@ -8105,6 +8150,11 @@ impl Widget for FilesTaskStrip {
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         let files = self.shared.files();
+        let mut root = SemanticsNode::new(ctx.widget_id(), SemanticsRole::Text, ctx.bounds());
+        root.name = Some("File task strip".to_string());
+        root.description = Some(Self::strip_summary(&files.tasks));
+        ctx.push(root);
+
         if Self::has_finished_tasks(&files) {
             let mut node = SemanticsNode::new(
                 Self::clear_widget_id(ctx.widget_id()),
@@ -15277,6 +15327,68 @@ mod tests {
         assert_eq!(files.tasks.len(), 1);
         assert_eq!(files.tasks[0].id, 78);
         assert_eq!(files.tasks[0].state, FilesTaskState::Running);
+
+        Ok(())
+    }
+
+    #[test]
+    fn task_strip_announces_overflow_tasks() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.tasks = (0..4)
+                .map(|index| FilesTask {
+                    id: 90 + index,
+                    source: FilesSourceKind::Sifs,
+                    title: format!("Copy batch {}", index + 1),
+                    detail: format!("/artifact-{index}.bin -> /archive/artifact-{index}.bin"),
+                    state: FilesTaskState::Running,
+                    progress: Some((index as f32 + 1.0) / 10.0),
+                })
+                .collect();
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files task strip overflow")
+                    .root(
+                        SizedBox::new()
+                            .width(520.0)
+                            .height(720.0)
+                            .with_child(view(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Text)
+                .with_name("File task strip")
+                .with_description("4 active; showing 2 of 4; 2 more tasks in inspector")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Cancel Copy batch 4")
+                .count()?,
+            0
+        );
 
         Ok(())
     }
