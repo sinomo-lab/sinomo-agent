@@ -4359,7 +4359,7 @@ fn sifs_metadata_status_label(
     } else if details.is_some() {
         "Metadata current"
     } else {
-        "Metadata pending"
+        "Metadata not loaded"
     }
 }
 
@@ -4392,7 +4392,7 @@ fn local_metadata_status_label(
     } else if details.is_some() {
         "Metadata current"
     } else {
-        "Metadata pending"
+        "Metadata not loaded"
     }
 }
 
@@ -4476,7 +4476,7 @@ fn details_locations(details: &SifsObjectDetails) -> String {
 
 fn sifs_pin_summary(details: Option<&SifsObjectDetails>) -> String {
     let Some(details) = details else {
-        return "pin state unavailable".to_string();
+        return "pin state not loaded".to_string();
     };
     if details.local_pins.is_empty() {
         return "not pinned on this node".to_string();
@@ -4523,7 +4523,7 @@ fn short_node_label(node_id: &str) -> String {
 fn sifs_replication_summary(details: Option<&SifsObjectDetails>, clustered: bool) -> String {
     let Some(details) = details else {
         return if clustered {
-            "waiting for SIFS metadata".to_string()
+            "metadata not loaded; refresh placement to retry".to_string()
         } else {
             "local node only".to_string()
         };
@@ -4548,7 +4548,7 @@ fn sifs_replication_summary(details: Option<&SifsObjectDetails>, clustered: bool
 
 fn sifs_health_summary(details: Option<&SifsObjectDetails>) -> String {
     let Some(health) = details.and_then(|details| details.health.as_ref()) else {
-        return "operator health unavailable".to_string();
+        return "operator health not loaded".to_string();
     };
     if health.open_conflict_count > 0 {
         return format!(
@@ -4700,7 +4700,7 @@ fn sifs_inspector_next_step(
         return sifs_metadata_error_next_step(error);
     }
     if details.is_none() && clustered {
-        return "refresh placement to load durable-node metadata".to_string();
+        return "use Refresh placement to load durable-node metadata".to_string();
     }
     sifs_placement_next_step(details, clustered)
 }
@@ -7749,20 +7749,18 @@ impl InspectorView {
                 y += 4.0 + Self::info_row_height(w, "SIFS through daemon");
             } else if files.details_loading {
                 y += Self::info_row_height(w, "Waiting for daemon metadata");
+            } else if details.is_none() {
+                y += Self::info_row_height(w, "Metadata has not returned for this object yet");
+                y += 4.0 + Self::info_row_height(w, "SIFS through daemon");
             }
 
-            let policy =
-                details
-                    .map(|details| details.policy.as_str())
-                    .unwrap_or(if files.clustered {
-                        "cluster policy"
-                    } else {
-                        "local-owned"
-                    });
+            let policy = details
+                .map(|details| details.policy.as_str())
+                .unwrap_or("not loaded");
             y += 4.0 + Self::info_row_height(w, policy);
             let locations = details
                 .map(details_locations)
-                .unwrap_or_else(|| short_node_label(&files.node_id));
+                .unwrap_or_else(|| "not reported".to_string());
             y += 4.0 + Self::info_row_height(w, &locations);
 
             if let Some(details) = details {
@@ -8588,11 +8586,7 @@ impl Widget for InspectorView {
 
         let policy = details
             .map(|details| details.policy.as_str())
-            .unwrap_or(if files.clustered {
-                "cluster policy"
-            } else {
-                "local-owned"
-            });
+            .unwrap_or("not loaded");
         let placement = sifs_replication_summary(details, files.clustered);
         y = self.info_row(ctx, &theme, &pal, x, y + 10.0, w, "Placement", &placement);
         let health = sifs_health_summary(details);
@@ -8640,6 +8634,27 @@ impl Widget for InspectorView {
                     w,
                     "Status",
                     "Waiting for daemon metadata",
+                );
+            } else if details.is_none() {
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y,
+                    w,
+                    "Status",
+                    "Metadata has not returned for this object yet",
+                );
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y + 4.0,
+                    w,
+                    "Authority",
+                    "SIFS through daemon",
                 );
             }
 
@@ -8697,7 +8712,7 @@ impl Widget for InspectorView {
             }
             let locations = details
                 .map(details_locations)
-                .unwrap_or_else(|| node_label.clone());
+                .unwrap_or_else(|| "not reported".to_string());
             y = self.info_row(
                 ctx,
                 &theme,
@@ -11487,7 +11502,7 @@ mod tests {
         );
         assert_eq!(
             sifs_metadata_status_label(false, None, None),
-            "Metadata pending"
+            "Metadata not loaded"
         );
 
         let details = SifsObjectDetails {
@@ -11521,7 +11536,7 @@ mod tests {
     fn sifs_replication_summary_uses_user_facing_status() {
         assert_eq!(
             sifs_replication_summary(None, true),
-            "waiting for SIFS metadata"
+            "metadata not loaded; refresh placement to retry"
         );
         assert_eq!(sifs_replication_summary(None, false), "local node only");
 
@@ -11564,7 +11579,7 @@ mod tests {
 
     #[test]
     fn sifs_health_summary_uses_operator_repair_state() {
-        assert_eq!(sifs_health_summary(None), "operator health unavailable");
+        assert_eq!(sifs_health_summary(None), "operator health not loaded");
 
         let mut details = SifsObjectDetails {
             file_system_id: "sifs".to_string(),
@@ -11757,7 +11772,7 @@ mod tests {
         );
         assert_eq!(
             sifs_inspector_next_step(None, true, false, None),
-            "refresh placement to load durable-node metadata"
+            "use Refresh placement to load durable-node metadata"
         );
         assert_eq!(
             sifs_inspector_next_step(None, false, false, None),
