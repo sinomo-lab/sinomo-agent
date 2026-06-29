@@ -318,6 +318,8 @@ pub struct DaemonStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_arch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout: Option<ClusterNodeRolloutStatus>,
@@ -345,6 +347,7 @@ impl DaemonStatus {
             commit: daemon_git_commit(),
             target_os: Some(std::env::consts::OS.to_string()),
             target_arch: Some(std::env::consts::ARCH.to_string()),
+            hostname: daemon_hostname(),
             executable: std::env::current_exe().ok(),
             rollout: None,
             started_at: OffsetDateTime::now_utc()
@@ -369,6 +372,44 @@ pub fn daemon_git_commit() -> Option<String> {
         Some(commit) if !commit.is_empty() && commit != "unknown" => Some(commit.to_string()),
         _ => None,
     }
+}
+
+pub fn daemon_hostname() -> Option<String> {
+    for key in ["HOSTNAME", "COMPUTERNAME"] {
+        if let Ok(value) = std::env::var(key)
+            && let Some(hostname) = clean_daemon_hostname(&value)
+        {
+            return Some(hostname);
+        }
+    }
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|hostname| clean_daemon_hostname(&hostname))
+        .or_else(|| {
+            ["/proc/sys/kernel/hostname", "/etc/hostname"]
+                .into_iter()
+                .find_map(|path| {
+                    std::fs::read_to_string(path)
+                        .ok()
+                        .and_then(|hostname| clean_daemon_hostname(&hostname))
+                })
+        })
+}
+
+fn clean_daemon_hostname(hostname: &str) -> Option<String> {
+    let hostname = hostname.trim().trim_end_matches('.');
+    if hostname.is_empty()
+        || hostname.eq_ignore_ascii_case("localhost")
+        || hostname.eq_ignore_ascii_case("localhost.localdomain")
+        || hostname.eq_ignore_ascii_case("(none)")
+        || hostname.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(hostname.to_string())
 }
 
 pub fn daemon_connect_address(host: &str, port: u16) -> String {
@@ -449,6 +490,7 @@ pub fn cluster_node_status_from_daemon_status(
         commit: status.commit.clone(),
         target_os: status.target_os.clone(),
         target_arch: status.target_arch.clone(),
+        hostname: status.hostname.clone(),
         pid: Some(status.pid),
         address: Some(status.address.clone()),
         bind_address: Some(daemon_bind_address(status)),

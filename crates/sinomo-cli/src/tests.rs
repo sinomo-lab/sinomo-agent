@@ -75,10 +75,10 @@ use sinomo_runtime::core::{
     CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
     ClusterEndpointSource, ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole,
     ClusterMemberState, ClusterMigrationMode, ClusterMigrationPhase, ClusterMigrationRecord,
-    ClusterNodeAvailability, ClusterNodeRole, ClusterTransportKind, Confidence, DfsObjectPolicy,
-    EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind, Id, LatencyClass,
-    PrivacyClass, RollbackPolicy, RollbackTrigger, RolloutPlan, RolloutStrategy, RoutingMetadata,
-    RoutingScope, Salience, Source, TrustDomain, TrustRing,
+    ClusterNodeAvailability, ClusterNodeRole, ClusterNodeStatusRecord, ClusterTransportKind,
+    Confidence, DfsObjectPolicy, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind,
+    Id, LatencyClass, PrivacyClass, RollbackPolicy, RollbackTrigger, RolloutPlan, RolloutStrategy,
+    RoutingMetadata, RoutingScope, Salience, Source, TrustDomain, TrustRing,
 };
 use sinomo_runtime::daemon::daemon_status_matches_options;
 use sinomo_runtime::dfs::{
@@ -6851,6 +6851,7 @@ fn install_detects_daemon_option_mismatch() {
         commit: None,
         target_os: Some(std::env::consts::OS.to_string()),
         target_arch: Some(std::env::consts::ARCH.to_string()),
+        hostname: None,
         executable: None,
         rollout: None,
         started_at: "2026-05-04T00:00:00Z".to_string(),
@@ -7637,7 +7638,7 @@ fn cluster_hostname_targets_prefer_local_hostname_and_remote_hostname_endpoint()
     )];
     state.members.push(shadow);
 
-    let targets = super::cluster_hostname_rename_targets(&state, Some("local-host"));
+    let targets = super::cluster_hostname_rename_targets(&state, Some("local-host"), &[]);
 
     assert_eq!(
         targets
@@ -7654,6 +7655,65 @@ fn cluster_hostname_targets_prefer_local_hostname_and_remote_hostname_endpoint()
         Some("node.example.test".to_string())
     );
     assert_eq!(super::cluster_endpoint_hostname("10.0.0.1:21353"), None);
+}
+
+#[test]
+fn cluster_hostname_targets_use_node_status_hostname() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_hostname_status_targets").expect("cluster");
+    let local_node = NodeId::from_legacy_named("node_hostname_status_local").expect("node");
+    let remote_node = NodeId::from_legacy_named("node_hostname_status_remote").expect("node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "hostname status targets",
+        local_node,
+        "old-local",
+        "pk-local",
+        now,
+    );
+    let mut remote = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        remote_node.clone(),
+        "old-remote",
+        "pk-remote",
+        now,
+    );
+    remote.endpoints = vec![daemon_lan_endpoint(
+        &remote_node,
+        "10.0.0.20:21353".to_string(),
+        20,
+    )];
+    state.members.push(remote);
+
+    let status = ClusterNodeStatusRecord {
+        cluster_id,
+        node_id: remote_node.clone(),
+        process: sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+        availability: ClusterNodeAvailability::Online,
+        daemon_version: "0.1.0-test".to_string(),
+        commit: None,
+        target_os: Some("test-os".to_string()),
+        target_arch: Some("test-arch".to_string()),
+        hostname: Some("remote-status-host".to_string()),
+        pid: Some(42),
+        address: Some("127.0.0.1:21353".to_string()),
+        bind_address: Some("0.0.0.0:21353".to_string()),
+        executable: Some("sinomo".to_string()),
+        rollout: None,
+        daemon_started_at: Some("2026-06-29T00:00:00Z".to_string()),
+        observed_at: now,
+    };
+
+    let targets = super::cluster_hostname_rename_targets(&state, None, &[status]);
+
+    assert_eq!(
+        targets
+            .iter()
+            .map(|target| (target.node_id.clone(), target.name.clone()))
+            .collect::<Vec<_>>(),
+        vec![(remote_node, "remote-status-host".to_string())]
+    );
 }
 
 #[test]
@@ -10607,6 +10667,7 @@ fn daemon_node_status_publishes_version_and_rollout_to_kv() {
         commit: None,
         target_os: Some(std::env::consts::OS.to_string()),
         target_arch: Some(std::env::consts::ARCH.to_string()),
+        hostname: None,
         executable: None,
         rollout: None,
         started_at: "2026-05-04T00:00:00Z".to_string(),
@@ -13089,6 +13150,7 @@ fn cui_loop_uses_connected_daemon_cluster_node_when_available() {
         commit: None,
         target_os: Some(std::env::consts::OS.to_string()),
         target_arch: Some(std::env::consts::ARCH.to_string()),
+        hostname: None,
         executable: None,
         rollout: None,
         started_at: "2026-05-04T00:00:00Z".to_string(),

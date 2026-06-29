@@ -350,6 +350,7 @@ mod tests {
             commit: Some("abcdef0".to_string()),
             target_os: Some("linux".to_string()),
             target_arch: Some("x86_64".to_string()),
+            hostname: None,
             pid: Some(42),
             address: Some("127.0.0.1:21354".to_string()),
             bind_address: Some("0.0.0.0:21354".to_string()),
@@ -410,6 +411,7 @@ mod tests {
             commit: Some("abcdef0".to_string()),
             target_os: Some("linux".to_string()),
             target_arch: Some("x86_64".to_string()),
+            hostname: Some("node-a".to_string()),
             pid: Some(100),
             address: Some("127.0.0.1:21353".to_string()),
             bind_address: Some("0.0.0.0:21353".to_string()),
@@ -424,6 +426,10 @@ mod tests {
 
         assert!(cluster_node_status_stable_eq(&left, &right));
 
+        right.hostname = Some("node-b".to_string());
+        assert!(!cluster_node_status_stable_eq(&left, &right));
+
+        right = left.clone();
         right.address = Some("127.0.0.1:21354".to_string());
         assert!(!cluster_node_status_stable_eq(&left, &right));
     }

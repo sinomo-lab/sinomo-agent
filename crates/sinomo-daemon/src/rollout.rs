@@ -3888,6 +3888,7 @@ mod tests {
             commit: Some("test".to_string()),
             target_os: Some(std::env::consts::OS.to_string()),
             target_arch: Some(std::env::consts::ARCH.to_string()),
+            hostname: None,
             executable: None,
             rollout: None,
             started_at: "2026-05-08T00:00:00Z".to_string(),

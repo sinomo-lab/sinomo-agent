@@ -246,6 +246,7 @@ pub fn cluster_node_status_stable_eq(
         && left.commit == right.commit
         && left.target_os == right.target_os
         && left.target_arch == right.target_arch
+        && left.hostname == right.hostname
         && left.address == right.address
         && left.bind_address == right.bind_address
         && left.executable == right.executable

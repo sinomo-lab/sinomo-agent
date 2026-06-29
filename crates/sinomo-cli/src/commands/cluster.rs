@@ -631,6 +631,7 @@ pub(crate) struct ClusterHostnameRenameTarget {
 pub(crate) fn cluster_hostname_rename_targets(
     state: &ClusterBootstrapState,
     local_hostname: Option<&str>,
+    statuses: &[ClusterNodeStatusRecord],
 ) -> Vec<ClusterHostnameRenameTarget> {
     let local_hostname = local_hostname.and_then(clean_cluster_hostname);
     state
@@ -644,9 +645,11 @@ pub(crate) fn cluster_hostname_rename_targets(
             let name = if member.node_id == state.local_node_id {
                 local_hostname
                     .clone()
+                    .or_else(|| cluster_node_status_hostname(statuses, &member.node_id))
                     .or_else(|| cluster_member_hostname_from_endpoints(member))
             } else {
-                cluster_member_hostname_from_endpoints(member)
+                cluster_node_status_hostname(statuses, &member.node_id)
+                    .or_else(|| cluster_member_hostname_from_endpoints(member))
             }?;
             Some(ClusterHostnameRenameTarget {
                 node_id: member.node_id.clone(),
@@ -654,6 +657,24 @@ pub(crate) fn cluster_hostname_rename_targets(
             })
         })
         .collect()
+}
+
+fn cluster_node_status_hostname(
+    statuses: &[ClusterNodeStatusRecord],
+    node_id: &NodeId,
+) -> Option<String> {
+    statuses
+        .iter()
+        .filter(|status| status.node_id == *node_id)
+        .find(|status| status.process == sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE)
+        .and_then(|status| status.hostname.as_deref())
+        .and_then(clean_cluster_hostname)
+        .or_else(|| {
+            statuses
+                .iter()
+                .filter(|status| status.node_id == *node_id)
+                .find_map(|status| status.hostname.as_deref().and_then(clean_cluster_hostname))
+        })
 }
 
 pub(crate) fn cluster_member_hostname_from_endpoints(
@@ -2452,7 +2473,14 @@ pub(crate) fn cluster_rename_hostnames() -> Result<(), CliError> {
     refresh_cluster_kv_from_local_daemon(&paths)?;
     let mut state = read_cluster_state(&paths)?;
     let local_hostname = local_hostname();
-    let targets = cluster_hostname_rename_targets(&state, local_hostname.as_deref());
+    let statuses = match network::read_cluster_node_statuses_from_kv(&paths) {
+        Ok(statuses) => statuses,
+        Err(error) => {
+            eprintln!("warning: cluster node-status hostname lookup skipped: {error}");
+            Vec::new()
+        }
+    };
+    let targets = cluster_hostname_rename_targets(&state, local_hostname.as_deref(), &statuses);
     if targets.is_empty() {
         println!("no cluster member hostnames could be inferred");
         return Ok(());

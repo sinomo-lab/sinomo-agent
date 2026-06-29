@@ -663,6 +663,7 @@ mod tests {
                 commit: Some(commit.to_string()),
                 target_os: Some("windows".to_string()),
                 target_arch: Some("x86_64".to_string()),
+                hostname: None,
                 pid: Some(pid),
                 address: Some("127.0.0.1:21353".to_string()),
                 bind_address: None,
