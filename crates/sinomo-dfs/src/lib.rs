@@ -8082,7 +8082,7 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                 });
             }
             DfsMetadataJournalBatchResult::Rejected { reason } => {
-                if metadata_journal_rejection_is_sequence_conflict(&reason) {
+                if metadata_journal_rejection_allows_snapshot_repair(&reason) {
                     execute_prepared_dfs_metadata_snapshot_repair_async(
                         data_dir,
                         local_node_id,
@@ -8750,7 +8750,7 @@ fn handle_dfs_metadata_journal_batch_response(
             })
         }
         DfsMetadataJournalBatchResult::Rejected { reason } => {
-            if metadata_journal_rejection_is_sequence_conflict(&reason) {
+            if metadata_journal_rejection_allows_snapshot_repair(&reason) {
                 let command = dfs_metadata_snapshot_install_command(
                     backend,
                     local_node_id,
@@ -9004,9 +9004,10 @@ pub fn replicate_dfs_metadata_shard_to_target(
     Ok(outcomes)
 }
 
-fn metadata_journal_rejection_is_sequence_conflict(reason: &str) -> bool {
-    reason.contains("metadata journal sequence")
-        && reason.contains("already exists with a different entry")
+fn metadata_journal_rejection_allows_snapshot_repair(reason: &str) -> bool {
+    (reason.contains("metadata journal sequence")
+        && reason.contains("already exists with a different entry"))
+        || reason.contains("failed to decode segmented journal entry")
 }
 
 fn metadata_replication_rejection_is_topology_mismatch(reason: &str) -> bool {
@@ -17228,7 +17229,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(backend) = self.metadata_backend.as_mut() {
             if let Err(error) = backend.apply_journal_batch(batch) {
                 let reason = error.to_string();
-                if metadata_journal_rejection_is_sequence_conflict(&reason) {
+                if metadata_journal_rejection_allows_snapshot_repair(&reason) {
                     self.request_metadata_snapshot_repair_from_primary(
                         primary_node_id,
                         &batch.shard_id,
@@ -18724,7 +18725,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .remove(&response.request_id);
         let Some(pending) = pending else {
             if let DfsMetadataJournalBatchResult::Rejected { reason } = &response.result
-                && metadata_journal_rejection_is_sequence_conflict(reason)
+                && metadata_journal_rejection_allows_snapshot_repair(reason)
             {
                 self.send_metadata_snapshot_repair(
                     &source_node_id,
@@ -18772,7 +18773,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 })
             }
             DfsMetadataJournalBatchResult::Rejected { reason } => {
-                if metadata_journal_rejection_is_sequence_conflict(&reason) {
+                if metadata_journal_rejection_allows_snapshot_repair(&reason) {
                     self.send_metadata_snapshot_repair(
                         &source_node_id,
                         &response.shard_id,

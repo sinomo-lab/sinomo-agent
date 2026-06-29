@@ -10078,7 +10078,12 @@ fn replay_metadata_table_batches(
                     })?;
                 break;
             }
-            Err(source) => return Err(MetadataBackendError::Serde(source.to_string())),
+            Err(source) => {
+                return Err(MetadataBackendError::Serde(format!(
+                    "failed to decode metadata table batch at {}: {source}",
+                    path.display()
+                )));
+            }
         };
         materialized_through_sequence =
             max_optional_sequence(materialized_through_sequence, Some(batch.sequence));
@@ -10555,6 +10560,11 @@ fn current_next_journal_sequence(root: &Path) -> Result<u64> {
     let head_next_sequence =
         read_sobj_optional::<DfsMetadataJournalHead>(&journal_dir.join("head.sobj"))?
             .and_then(|head| (head.next_sequence > 0).then_some(head.next_sequence));
+    if let Some(head_next_sequence) = head_next_sequence
+        && journal_head_matches_local_materialization_cursor(root, head_next_sequence)?
+    {
+        return Ok(head_next_sequence);
+    }
     let mut max_sequence = head_next_sequence
         .map(|next_sequence| next_sequence.saturating_sub(1))
         .unwrap_or(0);
@@ -10575,6 +10585,11 @@ fn recover_next_journal_sequence(root: &Path) -> Result<u64> {
     let head_path = journal_dir.join("head.sobj");
     let head_next_sequence =
         read_sobj_optional::<DfsMetadataJournalHead>(&head_path)?.map(|head| head.next_sequence);
+    if let Some(head_next_sequence) = head_next_sequence
+        && journal_head_matches_local_materialization_cursor(root, head_next_sequence)?
+    {
+        return Ok(head_next_sequence);
+    }
     let mut max_sequence = head_next_sequence
         .map(|next_sequence| next_sequence.saturating_sub(1))
         .unwrap_or(0);
@@ -10589,6 +10604,23 @@ fn recover_next_journal_sequence(root: &Path) -> Result<u64> {
         write_sobj_atomic(&head_path, &DfsMetadataJournalHead { next_sequence })?;
     }
     Ok(next_sequence)
+}
+
+fn journal_head_matches_local_materialization_cursor(
+    root: &Path,
+    head_next_sequence: u64,
+) -> Result<bool> {
+    if head_next_sequence <= 1 {
+        return Ok(false);
+    }
+    let cursor_path = root
+        .join("records")
+        .join("local-materialization")
+        .join("cursor.sobj");
+    let Some(cursor) = read_sobj_optional::<DfsMetadataReplayCursor>(&cursor_path)? else {
+        return Ok(false);
+    };
+    Ok(cursor.last_sequence == head_next_sequence.saturating_sub(1))
 }
 
 fn highest_segmented_journal_path(root: &Path) -> Result<Option<PathBuf>> {
@@ -11015,7 +11047,12 @@ fn read_next_segmented_journal_entry(
                 })?;
             return Ok(None);
         }
-        Err(source) => return Err(MetadataBackendError::Serde(source.to_string())),
+        Err(source) => {
+            return Err(MetadataBackendError::Serde(format!(
+                "failed to decode segmented journal entry at {}: {source}",
+                path.display()
+            )));
+        }
     };
     Ok(Some(entry))
 }
@@ -11087,8 +11124,9 @@ fn read_sobj<T>(path: &Path) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    sinomo_object_serde::from_bytes(&read_file(path)?)
-        .map_err(|source| MetadataBackendError::Serde(source.to_string()))
+    sinomo_object_serde::from_bytes(&read_file(path)?).map_err(|source| {
+        MetadataBackendError::Serde(format!("failed to decode {}: {source}", path.display()))
+    })
 }
 
 fn read_sobj_optional<T>(path: &Path) -> Result<Option<T>>
@@ -13725,6 +13763,28 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_reports_corrupt_snapshot_path() {
+        let root = temp_root("local_backend_reports_corrupt_snapshot_path");
+        let snapshot_path = metadata_table_snapshot_path(&root);
+        fs::create_dir_all(snapshot_path.parent().expect("snapshot parent"))
+            .expect("snapshot parent");
+        fs::write(&snapshot_path, [0x1f, 0x8b, 0x08]).expect("truncated snapshot");
+
+        let error = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect_err("corrupt snapshot should fail to open");
+        let message = error.to_string();
+        assert!(
+            message.contains(snapshot_path.to_string_lossy().as_ref()),
+            "error should name the corrupt snapshot path: {message}"
+        );
+        assert!(
+            message.contains("failed to decode"),
+            "error should describe the decode failure: {message}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_migrates_legacy_op_snapshot_to_structured_snapshot() {
         let root = temp_root("local_backend_migrates_legacy_op_snapshot");
         let shard_id = DfsMetadataShardId::new("shard-root");
@@ -14208,6 +14268,56 @@ mod tests {
             reopened
                 .journal_since(high_sequence)
                 .expect("journal after head")
+                .is_empty()
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_reopen_uses_matching_head_and_cursor_for_corrupt_current_segment() {
+        let root = temp_root("local_backend_reopen_with_corrupt_current_segment");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let file_system = file_system();
+        let object = object(version("version_1"));
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("object");
+        backend
+            .compact_metadata_table_log_if_needed(1)
+            .expect("compact table snapshot");
+        write_sobj_atomic(
+            &root.join("journal").join("head.sobj"),
+            &DfsMetadataJournalHead { next_sequence: 3 },
+        )
+        .expect("journal head");
+        write_sobj_atomic(
+            &backend.local_materialization_cursor_path(),
+            &DfsMetadataReplayCursor {
+                shard_id: shard_id.clone(),
+                last_sequence: 2,
+            },
+        )
+        .expect("local cursor");
+        fs::write(
+            root.join("journal")
+                .join("segments")
+                .join("00000000000000000001.slog"),
+            [1_u8, 0, 0, 0, 0xff],
+        )
+        .expect("corrupt consumed current segment");
+        drop(backend);
+
+        let reopened = LocalSobjMetadataBackend::new(shard_id, &root)
+            .expect("reopen should trust matching head and cursor");
+        assert_eq!(
+            reopened.get_object(&object.object_id).expect("object"),
+            Some(object)
+        );
+        assert!(
+            reopened
+                .journal_since(2)
+                .expect("journal after cursor")
                 .is_empty()
         );
 

@@ -2,6 +2,8 @@ use super::*;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 
+const DFS_CLUSTER_STATUS_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum DfsCliCommand {
     Help,
@@ -1666,7 +1668,7 @@ fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
         started_at,
         format_args!("remote probes={}", remote_node_ids.len()),
     );
-    let remote_timeout = std::time::Duration::from_secs(5);
+    let remote_timeout = DFS_CLUSTER_STATUS_REMOTE_TIMEOUT;
     let mut probes = Vec::new();
     for node_id in remote_node_ids {
         probes.push(spawn_dfs_status_probe(

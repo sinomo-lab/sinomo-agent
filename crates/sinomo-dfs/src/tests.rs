@@ -3270,14 +3270,23 @@ struct SequenceConflictMetadataJournalTransport {
     target_node_id: NodeId,
     batches: usize,
     snapshot_installs: usize,
+    rejection_reason: String,
 }
 
 impl SequenceConflictMetadataJournalTransport {
     fn new(target_node_id: NodeId) -> Self {
+        Self::new_with_reason(
+            target_node_id,
+            "metadata journal sequence 1 already exists with a different entry",
+        )
+    }
+
+    fn new_with_reason(target_node_id: NodeId, rejection_reason: impl Into<String>) -> Self {
         Self {
             target_node_id,
             batches: 0,
             snapshot_installs: 0,
+            rejection_reason: rejection_reason.into(),
         }
     }
 }
@@ -3303,8 +3312,7 @@ impl DfsMetadataJournalReplicationTransport for SequenceConflictMetadataJournalT
             next_after_sequence: command.batch.next_after_sequence,
             applied_entries: 0,
             result: DfsMetadataJournalBatchResult::Rejected {
-                reason: "metadata journal sequence 1 already exists with a different entry"
-                    .to_string(),
+                reason: self.rejection_reason.clone(),
             },
         })
     }
@@ -6258,6 +6266,61 @@ fn metadata_journal_replication_repairs_sequence_conflict_with_snapshot() {
         },
     )
     .expect("replicate metadata journal with snapshot repair");
+
+    let next_after_sequence = backend.journal_last_sequence();
+    assert_eq!(transport.batches, 1);
+    assert_eq!(transport.snapshot_installs, 1);
+    assert_eq!(
+        outcomes,
+        vec![DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
+            target_node_id: replica.clone(),
+            shard_id: shard_id.clone(),
+            next_after_sequence,
+            archived_existing: true,
+        }]
+    );
+    assert_eq!(
+        backend
+            .metadata_replication_cursor(&replica, &shard_id)
+            .expect("replication cursor"),
+        next_after_sequence
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn metadata_journal_replication_repairs_corrupt_local_journal_with_snapshot() {
+    let root = temp_root("metadata-journal-helper-corrupt-journal-repair");
+    let primary =
+        NodeId::from_legacy_named("node_meta_corrupt_journal_repair_primary").expect("primary");
+    let replica =
+        NodeId::from_legacy_named("node_meta_corrupt_journal_repair_replica").expect("replica");
+    let shard_id = DfsMetadataShardId::new("root");
+    let file_system = file_system(primary.clone());
+    let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("metadata"))
+        .expect("metadata backend");
+    backend
+        .put_file_system(&file_system)
+        .expect("filesystem metadata");
+
+    let mut transport = SequenceConflictMetadataJournalTransport::new_with_reason(
+        replica.clone(),
+        "metadata serialization error: failed to decode segmented journal entry at /home/ix/.sinomo/dfs/metadata/services/journal/segments/00000000000000000001.slog: unexpected end of input",
+    );
+    let outcomes = replicate_dfs_metadata_shard_to_target(
+        &mut backend,
+        &primary,
+        &replica,
+        &shard_id,
+        0,
+        &mut transport,
+        DfsMetadataJournalReplicationOptions {
+            max_batches_per_target: 1,
+            ..DfsMetadataJournalReplicationOptions::default()
+        },
+    )
+    .expect("replicate metadata journal with corrupt-journal snapshot repair");
 
     let next_after_sequence = backend.journal_last_sequence();
     assert_eq!(transport.batches, 1);
