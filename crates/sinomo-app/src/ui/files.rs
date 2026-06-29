@@ -5211,7 +5211,9 @@ fn unselected_inspector_rows(files: &FilesState) -> Vec<(&'static str, String)> 
     if let Some(health) = unselected_inspector_health(files) {
         rows.push(("DFS health", health));
     }
-    rows.push(("Next step", unselected_inspector_management(files)));
+    if unselected_inspector_actions(files).len() <= 1 {
+        rows.push(("Next step", unselected_inspector_management(files)));
+    }
     rows
 }
 
@@ -8315,7 +8317,13 @@ impl InspectorView {
         let Some(entry) = files.selected_entry() else {
             let rows = unselected_inspector_rows(&files);
             let panel_h = Self::state_panel_height(w, &rows);
-            return finish(y + panel_h);
+            let actions = unselected_inspector_actions(&files);
+            let actions_h = if actions.is_empty() {
+                0.0
+            } else {
+                10.0 + inspector_actions_height(actions.len())
+            };
+            return finish(y + panel_h + actions_h);
         };
 
         y += 26.0;
@@ -8561,6 +8569,62 @@ fn inspector_min_content_h(tasks: &[FilesTask]) -> f32 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootInspectorAction {
+    RefreshFolder,
+    OpenCluster,
+    ConnectionSettings,
+}
+
+impl RootInspectorAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::RefreshFolder => "Refresh folder",
+            Self::OpenCluster => "Open Cluster",
+            Self::ConnectionSettings => "Connection settings",
+        }
+    }
+
+    fn glyph(self) -> IconGlyph {
+        match self {
+            Self::RefreshFolder => IconGlyph::Redo,
+            Self::OpenCluster => IconGlyph::Storage,
+            Self::ConnectionSettings => IconGlyph::Alert,
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::RefreshFolder => "Reload the current file listing and SIFS health summary",
+            Self::OpenCluster => "Open Cluster health and routing diagnostics",
+            Self::ConnectionSettings => "Open Connection settings for daemon and SIFS recovery",
+        }
+    }
+}
+
+fn unselected_inspector_actions(files: &FilesState) -> Vec<RootInspectorAction> {
+    if files.loading || files.error.is_some() || files.selected_entry().is_some() {
+        return Vec::new();
+    }
+
+    let mut actions = vec![RootInspectorAction::RefreshFolder];
+    if files.source == FilesSourceKind::Sifs {
+        if files.sifs_health.as_ref().is_some_and(|health| {
+            sifs_health_has_attention(health) || sifs_health_has_activity(health)
+        }) {
+            actions.push(RootInspectorAction::OpenCluster);
+        }
+        if files.sifs_health_error.is_some() {
+            actions.push(RootInspectorAction::ConnectionSettings);
+        }
+    }
+    actions
+}
+
+fn open_cluster_tab(shared: &Shared) {
+    shared.borrow_mut().active_tab = Tab::Cluster;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InspectorAction {
     OpenFolder,
     Copy,
@@ -8777,6 +8841,27 @@ fn inspector_action_button_rect(bounds: Rect, tasks: &[FilesTask], index: usize)
     )
 }
 
+fn root_inspector_action_button_rect(
+    bounds: Rect,
+    tasks: &[FilesTask],
+    rows: &[(&'static str, String)],
+    index: usize,
+) -> Rect {
+    let content_x = bounds.x() + INSPECTOR_PAD;
+    let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
+    let col_w = ((content_w - INSPECTOR_ACTION_GAP) * 0.5).max(0.0);
+    let panel_y = bounds.y() + inspector_state_panel_y(tasks);
+    let action_y = panel_y + InspectorView::state_panel_height(content_w, rows) + 10.0;
+    let col = index % 2;
+    let row = index / 2;
+    Rect::new(
+        content_x + col as f32 * (col_w + INSPECTOR_ACTION_GAP),
+        action_y + row as f32 * (INSPECTOR_ACTION_BUTTON_H + INSPECTOR_ACTION_GAP),
+        col_w,
+        INSPECTOR_ACTION_BUTTON_H,
+    )
+}
+
 fn inspector_actions_height(action_count: usize) -> f32 {
     if action_count == 0 {
         return 0.0;
@@ -8805,6 +8890,18 @@ fn inspector_action_button_widget_id(
         InspectorAction::PinContent => 7_587,
         InspectorAction::UnpinContent => 7_599,
         InspectorAction::ConnectionSettings => 7_603,
+    };
+    sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(salt))
+}
+
+fn root_inspector_action_button_widget_id(
+    parent: sui::WidgetId,
+    action: RootInspectorAction,
+) -> sui::WidgetId {
+    let salt = match action {
+        RootInspectorAction::RefreshFolder => 7_701,
+        RootInspectorAction::OpenCluster => 7_703,
+        RootInspectorAction::ConnectionSettings => 7_707,
     };
     sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(salt))
 }
@@ -8889,6 +8986,48 @@ impl Widget for InspectorView {
             };
             if let Some(task_id) = task_to_cancel {
                 self.shared.files_mut().cancel_task(task_id);
+                ctx.request_paint();
+                ctx.request_semantics();
+                ctx.set_handled();
+                return;
+            }
+
+            let root_action = {
+                let files = self.shared.files();
+                if files.selected_entry().is_none() && !files.loading && files.error.is_none() {
+                    let rows = unselected_inspector_rows(&files);
+                    unselected_inspector_actions(&files)
+                        .into_iter()
+                        .enumerate()
+                        .find(|(index, _)| {
+                            root_inspector_action_button_rect(
+                                ctx.bounds(),
+                                &files.tasks,
+                                &rows,
+                                *index,
+                            )
+                            .contains(pointer.position)
+                        })
+                        .map(|(_, action)| action)
+                } else {
+                    None
+                }
+            };
+            if let Some(action) = root_action {
+                match action {
+                    RootInspectorAction::RefreshFolder => {
+                        self.shared.files_mut().reload();
+                        request_files_overlay_rebuild(ctx);
+                    }
+                    RootInspectorAction::OpenCluster => {
+                        open_cluster_tab(&self.shared);
+                        ctx.request_measure();
+                    }
+                    RootInspectorAction::ConnectionSettings => {
+                        open_settings_section(&self.shared, SettingsSection::Connection);
+                        ctx.request_measure();
+                    }
+                }
                 ctx.request_paint();
                 ctx.request_semantics();
                 ctx.set_handled();
@@ -9067,6 +9206,7 @@ impl Widget for InspectorView {
 
         let Some(entry) = files.selected_entry() else {
             let rows = unselected_inspector_rows(&files);
+            let actions = unselected_inspector_actions(&files);
             self.state_panel(
                 ctx,
                 &theme,
@@ -9079,6 +9219,9 @@ impl Widget for InspectorView {
                 &files.tasks,
                 None,
             );
+            if !actions.is_empty() {
+                self.root_action_buttons(ctx, &theme, &pal, bounds, &files.tasks, &rows, &actions);
+            }
             return;
         };
 
@@ -9613,16 +9756,29 @@ impl Widget for InspectorView {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let (selected_entry, selected_actions, details_open, tasks) = {
+        let (selected_entry, selected_actions, root_actions, root_rows, details_open, tasks) = {
             let files = self.shared.files();
             let selected_entry = files.selected_entry().cloned();
             let selected_actions = selected_entry
                 .as_ref()
                 .map(|entry| inspector_actions(&files, entry))
                 .unwrap_or_default();
+            let root_actions =
+                if selected_entry.is_none() && !files.loading && files.error.is_none() {
+                    unselected_inspector_actions(&files)
+                } else {
+                    Vec::new()
+                };
+            let root_rows = if root_actions.is_empty() {
+                Vec::new()
+            } else {
+                unselected_inspector_rows(&files)
+            };
             (
                 selected_entry,
                 selected_actions,
+                root_actions,
+                root_rows,
                 (files.loading || files.error.is_some() || files.selected_entry().is_some())
                     .then_some(files.inspector_details_open),
                 files.tasks.clone(),
@@ -9720,6 +9876,21 @@ impl Widget for InspectorView {
                     InspectorAction::Rename => format!("Rename {}", entry.path),
                     InspectorAction::Delete => format!("Delete {}", entry.path),
                 });
+                node.actions = vec![SemanticsAction::Activate];
+                ctx.push(node);
+            }
+        }
+
+        if selected_entry.is_none() {
+            for (index, action) in root_actions.into_iter().enumerate() {
+                let mut node = SemanticsNode::new(
+                    root_inspector_action_button_widget_id(ctx.widget_id(), action),
+                    SemanticsRole::Button,
+                    root_inspector_action_button_rect(ctx.bounds(), &tasks, &root_rows, index),
+                );
+                node.parent = Some(ctx.widget_id());
+                node.name = Some(action.label().to_string());
+                node.description = Some(action.description().to_string());
                 node.actions = vec![SemanticsAction::Activate];
                 ctx.push(node);
             }
@@ -9891,6 +10062,55 @@ impl InspectorView {
                 action,
             );
         }
+    }
+
+    fn root_action_buttons(
+        &self,
+        ctx: &mut PaintCtx,
+        theme: &sui::DefaultTheme,
+        pal: &Palette,
+        bounds: Rect,
+        tasks: &[FilesTask],
+        rows: &[(&'static str, String)],
+        actions: &[RootInspectorAction],
+    ) {
+        for (index, action) in actions.iter().copied().enumerate() {
+            self.root_action_button(
+                ctx,
+                theme,
+                pal,
+                root_inspector_action_button_rect(bounds, tasks, rows, index),
+                action,
+            );
+        }
+    }
+
+    fn root_action_button(
+        &self,
+        ctx: &mut PaintCtx,
+        theme: &sui::DefaultTheme,
+        pal: &Palette,
+        rect: Rect,
+        action: RootInspectorAction,
+    ) {
+        let (fill, border, text, icon) = match action {
+            RootInspectorAction::RefreshFolder => (pal.field, pal.border, pal.text, pal.accent),
+            RootInspectorAction::OpenCluster => (pal.field, pal.border, pal.text, pal.accent),
+            RootInspectorAction::ConnectionSettings => (pal.field, pal.warn, pal.warn, pal.warn),
+        };
+        widgets::round_panel(ctx, rect, fill, border, 7.0);
+        draw_glyph(
+            ctx,
+            action.glyph(),
+            Rect::new(rect.x() + 9.0, rect.y() + 7.0, 13.0, 13.0),
+            icon,
+        );
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(rect.x() + 28.0, rect.y() + 5.0, rect.width() - 36.0, 18.0),
+            action.label(),
+            pal.text_style(theme, 11.0, FontWeight::MEDIUM, text),
+        );
     }
 
     fn action_button(
@@ -11194,6 +11414,21 @@ mod tests {
         }
     }
 
+    fn degraded_sifs_health() -> SifsHealthSummary {
+        SifsHealthSummary {
+            file_system_count: 1,
+            object_count: 776,
+            version_count: 2482,
+            pending_write_count: 43,
+            open_conflict_count: 21,
+            pending_repair_count: 18,
+            pending_namespace_job_count: 0,
+            failed_namespace_job_count: 0,
+            metadata_shard_count: 3,
+            repair_attempt_count: 18,
+        }
+    }
+
     #[test]
     fn crumbs_start_at_root_and_split_on_segments() {
         let backend = Backend::local_fallback();
@@ -12283,18 +12518,7 @@ mod tests {
         files.source = FilesSourceKind::Sifs;
         files.clustered = true;
         files.path = "/".to_string();
-        files.sifs_health = Some(SifsHealthSummary {
-            file_system_count: 1,
-            object_count: 776,
-            version_count: 2482,
-            pending_write_count: 43,
-            open_conflict_count: 21,
-            pending_repair_count: 18,
-            pending_namespace_job_count: 0,
-            failed_namespace_job_count: 0,
-            metadata_shard_count: 3,
-            repair_attempt_count: 18,
-        });
+        files.sifs_health = Some(degraded_sifs_health());
 
         let rows = unselected_inspector_rows(&files);
         assert!(rows.iter().any(|(label, value)| {
@@ -12307,6 +12531,163 @@ mod tests {
         assert!(rows.iter().any(|(label, value)| {
             *label == "DFS health" && value == "DFS health unavailable: metadata root missing"
         }));
+    }
+
+    #[test]
+    fn unselected_sifs_inspector_actions_refresh_current_folder() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let (tx, rx) = mpsc::channel();
+        let (_result_tx, result_rx) = mpsc::channel();
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.source = FilesSourceKind::Sifs;
+            files.clustered = true;
+            files.path = "/cluster-tests".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/cluster-tests/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.sifs_health = Some(degraded_sifs_health());
+            files.worker_tx = Some(tx);
+            files.worker_rx = Some(result_rx);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files root refresh action")
+                    .root(
+                        SizedBox::new()
+                            .width(INSPECTOR_W)
+                            .height(720.0)
+                            .with_child(InspectorView::new(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Refresh folder")
+            .click()?;
+
+        match rx.try_recv().expect("folder refresh command") {
+            FilesWorkerCommand::List {
+                source,
+                path,
+                request_id,
+            } => {
+                assert_eq!(source, FilesSourceKind::Sifs);
+                assert_eq!(path, "/cluster-tests");
+                assert_eq!(shared.files().pending_request_id, Some(request_id));
+            }
+            FilesWorkerCommand::Operation { .. } => panic!("expected list command"),
+            FilesWorkerCommand::Details { .. } => panic!("expected list command"),
+            FilesWorkerCommand::Preview { .. } => panic!("expected list command"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn unselected_sifs_inspector_action_opens_cluster() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.source = FilesSourceKind::Sifs;
+            files.clustered = true;
+            files.path = "/".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.sifs_health = Some(degraded_sifs_health());
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files root recovery actions")
+                    .root(
+                        SizedBox::new()
+                            .width(INSPECTOR_W)
+                            .height(720.0)
+                            .with_child(InspectorView::new(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open Cluster")
+            .click()?;
+        assert_eq!(shared.borrow().active_tab, Tab::Cluster);
+
+        Ok(())
+    }
+
+    #[test]
+    fn unselected_sifs_inspector_action_opens_connection_settings() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.source = FilesSourceKind::Sifs;
+            files.clustered = true;
+            files.path = "/".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.sifs_health_error = Some("metadata root missing".to_string());
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files root connection action")
+                    .root(
+                        SizedBox::new()
+                            .width(INSPECTOR_W)
+                            .height(720.0)
+                            .with_child(InspectorView::new(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Connection settings")
+            .click()?;
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
+
+        Ok(())
     }
 
     #[test]
