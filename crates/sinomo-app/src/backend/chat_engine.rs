@@ -19,9 +19,9 @@ use sinomo_agent::{
     AgentTaskSnapshot,
 };
 use sinomo_cli::app_api::{
-    AgentChat, AgentChatSifsStorage, ChatContextSnapshot, ChatControlState, ChatControlStatus,
-    ChatHistoryMessage, ChatProcessSnapshot, ChatRuntimeInfo, ChatSpeaker, ChatStreamEvent,
-    ChatTaskSnapshot, ChatToolCallSnapshot, ChatUsageSnapshot,
+    AgentChat, AgentChatSifsStorage, ChatAttachmentInput, ChatContextSnapshot, ChatControlState,
+    ChatControlStatus, ChatHistoryMessage, ChatProcessSnapshot, ChatRuntimeInfo, ChatSpeaker,
+    ChatStreamEvent, ChatTaskSnapshot, ChatToolCallSnapshot, ChatUsageSnapshot,
 };
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
@@ -83,6 +83,7 @@ pub enum ChatCommand {
     Send {
         session_id: String,
         text: String,
+        attachments: Vec<ChatAttachmentInput>,
     },
     Steer {
         session_id: String,
@@ -590,7 +591,11 @@ fn worker(
 
     while let Ok(command) = cmd_rx.recv() {
         match command {
-            ChatCommand::Send { session_id, text } => {
+            ChatCommand::Send {
+                session_id,
+                text,
+                attachments,
+            } => {
                 let session_id = if session_id.trim().is_empty() {
                     chat.session_id()
                 } else if chat.session_id() == session_id {
@@ -612,7 +617,7 @@ fn worker(
                 };
                 let tx = evt_tx.clone();
                 let event_session_id = session_id.clone();
-                let result = chat.send(&text, &mut |event| {
+                let result = chat.send_with_attachments(&text, &attachments, &mut |event| {
                     let mapped = match event {
                         ChatStreamEvent::Token(text) => Some(ChatEvent::Token {
                             session_id: event_session_id.clone(),

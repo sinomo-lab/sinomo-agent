@@ -5999,6 +5999,24 @@ impl<S: EventStore, H: InteractionEventHandler> InteractionRuntime<S, H> {
             .handle_event_streaming(&mut self.store, &self.session, &event, emit)
     }
 
+    pub fn ingest_user_input_with_context_attachments_streaming(
+        &mut self,
+        text: &str,
+        context_attachments: Vec<sinomo_agent::AgentContextAttachment>,
+        emit: &mut dyn FnMut(InteractionOutput),
+    ) -> Result<Vec<InteractionOutput>, CliError> {
+        let mut event = user_interaction_input_event(&self.session, text);
+        if !context_attachments.is_empty() {
+            event.payload["context_attachments"] = serde_json::to_value(&context_attachments)
+                .map_err(|source| CliError::Parse {
+                    detail: format!("serialize context attachments failed: {source}"),
+                })?;
+        }
+        self.store.append(event.clone())?;
+        self.handler
+            .handle_event_streaming(&mut self.store, &self.session, &event, emit)
+    }
+
     pub fn append_session_context(&mut self, event: EventEnvelope) -> Result<(), CliError> {
         self.store.append(event)?;
         Ok(())
@@ -6783,6 +6801,19 @@ where
             .get("text")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
+        let context_attachments = match event.payload.get("context_attachments") {
+            Some(value) => {
+                let attachments =
+                    serde_json::from_value::<Vec<sinomo_agent::AgentContextAttachment>>(
+                        value.clone(),
+                    )
+                    .map_err(|source| CliError::Parse {
+                        detail: format!("parse context attachments failed: {source}"),
+                    })?;
+                attachments
+            }
+            None => Vec::new(),
+        };
 
         if let Some(args) = parse_slash_command(text)? {
             if let Some(output) =
@@ -6799,6 +6830,7 @@ where
             serde_json::json!({
                 "input_event_id": event.event_id,
                 "text": text,
+                "context_attachments": context_attachments.clone(),
                 "state": "received",
                 "delivery": "event-stream"
             }),
@@ -6810,7 +6842,7 @@ where
             session: session.clone(),
             latest_event: message.clone(),
             async_update: None,
-            context_attachments: Vec::new(),
+            context_attachments,
             tool_specs: Vec::new(),
         };
         let requested = interaction_event(

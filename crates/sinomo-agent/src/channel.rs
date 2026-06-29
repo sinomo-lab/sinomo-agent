@@ -181,6 +181,23 @@ impl AgentChannel {
         content: impl Into<String>,
         source: AgentChannelSource,
     ) -> AgentChannelMessage {
+        self.append_user_message_with_attachments(
+            user_id,
+            display_name,
+            content,
+            source,
+            Vec::new(),
+        )
+    }
+
+    pub fn append_user_message_with_attachments(
+        &mut self,
+        user_id: impl Into<String>,
+        display_name: impl Into<String>,
+        content: impl Into<String>,
+        source: AgentChannelSource,
+        attachments: Vec<AgentChannelAttachment>,
+    ) -> AgentChannelMessage {
         let message = self.next_message(
             AgentChannelAuthor::User {
                 user_id: user_id.into(),
@@ -189,6 +206,7 @@ impl AgentChannel {
             AgentChannelMessageKind::Normal,
             content,
             source,
+            attachments,
         );
         self.transcript.push(message.clone());
         self.touch();
@@ -211,6 +229,7 @@ impl AgentChannel {
             AgentChannelMessageKind::Normal,
             content,
             source,
+            Vec::new(),
         );
         self.transcript.push(message.clone());
         self.touch();
@@ -239,7 +258,13 @@ impl AgentChannel {
         content: impl Into<String>,
         source: AgentChannelSource,
     ) -> AgentChannelMessage {
-        let message = self.next_message(AgentChannelAuthor::System, message_kind, content, source);
+        let message = self.next_message(
+            AgentChannelAuthor::System,
+            message_kind,
+            content,
+            source,
+            Vec::new(),
+        );
         self.transcript.push(message.clone());
         self.touch();
         message
@@ -251,6 +276,7 @@ impl AgentChannel {
         message_kind: AgentChannelMessageKind,
         content: impl Into<String>,
         source: AgentChannelSource,
+        attachments: Vec<AgentChannelAttachment>,
     ) -> AgentChannelMessage {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
@@ -262,6 +288,7 @@ impl AgentChannel {
             content: content.into(),
             created_at: time::OffsetDateTime::now_utc(),
             source,
+            attachments,
         }
     }
 
@@ -322,6 +349,43 @@ pub struct AgentChannelMessage {
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
     pub source: AgentChannelSource,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AgentChannelAttachment>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentChannelAttachment {
+    pub attachment_id: TaskId,
+    pub file_name: String,
+    pub original_path: String,
+    pub stored_path: String,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+    pub source: AgentChannelSource,
+}
+
+impl AgentChannelAttachment {
+    pub fn new(
+        file_name: impl Into<String>,
+        original_path: impl Into<String>,
+        stored_path: impl Into<String>,
+        size_bytes: u64,
+        source: AgentChannelSource,
+    ) -> Self {
+        Self {
+            attachment_id: TaskId::generate(),
+            file_name: file_name.into(),
+            original_path: original_path.into(),
+            stored_path: stored_path.into(),
+            size_bytes,
+            content_type: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            source,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -459,6 +523,13 @@ pub trait AgentChannelStore: Send + Sync {
         channel_id: &SessionId,
         turn: &AgentChannelTurn,
     ) -> Result<(), AgentChannelStoreError>;
+    fn save_attachment(
+        &self,
+        channel_id: &SessionId,
+        attachment_id: &TaskId,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<String, AgentChannelStoreError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -481,6 +552,18 @@ impl FileAgentChannelStore {
 
     fn channel_dir(&self, channel_id: &SessionId) -> PathBuf {
         self.paths.channel_dir_for_channel(channel_id)
+    }
+
+    fn attachment_path(
+        &self,
+        channel_id: &SessionId,
+        attachment_id: &TaskId,
+        file_name: &str,
+    ) -> PathBuf {
+        self.channel_dir(channel_id)
+            .join("attachments")
+            .join(attachment_id.to_string())
+            .join(safe_agent_channel_attachment_file_name(file_name))
     }
 }
 
@@ -599,6 +682,52 @@ impl AgentChannelStore for FileAgentChannelStore {
     ) -> Result<(), AgentChannelStoreError> {
         append_json_line(self.paths.channel_events_path_for_channel(channel_id), turn)
     }
+
+    fn save_attachment(
+        &self,
+        channel_id: &SessionId,
+        attachment_id: &TaskId,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<String, AgentChannelStoreError> {
+        let path = self.attachment_path(channel_id, attachment_id, file_name);
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|source| AgentChannelStoreError::Io {
+                path: parent.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+        fs::write(&path, bytes).map_err(|source| AgentChannelStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        Ok(path.display().to_string())
+    }
+}
+
+pub fn safe_agent_channel_attachment_file_name(file_name: &str) -> String {
+    let trimmed = file_name.trim();
+    let mut safe = String::new();
+    for ch in trimmed.chars() {
+        let disallowed = matches!(
+            ch,
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0'
+        ) || ch.is_control();
+        if disallowed {
+            safe.push('_');
+        } else {
+            safe.push(ch);
+        }
+    }
+    let safe = safe.trim_matches(['.', ' ']).to_string();
+    if safe.is_empty() {
+        "attachment".to_string()
+    } else {
+        safe
+    }
 }
 
 #[derive(Serialize)]
@@ -661,16 +790,17 @@ pub fn sync_participant_session(
         .iter()
         .filter(|message| message.sequence > observed_start)
     {
-        if message.content.trim().is_empty() {
+        if message.content.trim().is_empty() && message.attachments.is_empty() {
             participant.observed_through_sequence =
                 participant.observed_through_sequence.max(message.sequence);
             continue;
         }
+        let content = channel_message_content_for_agent(message);
         let item = match &message.author {
             AgentChannelAuthor::User { display_name, .. } => AgentItem::UserMessage {
                 item_id: TaskId::generate(),
                 step_index: next_step,
-                content: format!("{display_name}: {}", message.content),
+                content: format!("{display_name}: {content}"),
                 event_id: None,
             },
             AgentChannelAuthor::Agent {
@@ -680,18 +810,18 @@ pub fn sync_participant_session(
             } if participant_id == &participant.participant_id => AgentItem::AssistantText {
                 item_id: TaskId::generate(),
                 step_index: next_step,
-                content: message.content.clone(),
+                content,
             },
             AgentChannelAuthor::Agent { agent_name, .. } => AgentItem::UserMessage {
                 item_id: TaskId::generate(),
                 step_index: next_step,
-                content: format!("{agent_name}: {}", message.content),
+                content: format!("{agent_name}: {content}"),
                 event_id: None,
             },
             AgentChannelAuthor::System => AgentItem::UserMessage {
                 item_id: TaskId::generate(),
                 step_index: next_step,
-                content: format!("System: {}", message.content),
+                content: format!("System: {content}"),
                 event_id: None,
             },
         };
@@ -841,7 +971,32 @@ fn render_gate_message(message: &AgentChannelMessage) -> String {
         AgentChannelAuthor::Agent { agent_name, .. } => agent_name.as_str(),
         AgentChannelAuthor::System => "System",
     };
-    format!("[{}] {author}: {}", message.sequence, message.content)
+    format!(
+        "[{}] {author}: {}",
+        message.sequence,
+        channel_message_content_for_agent(message)
+    )
+}
+
+fn channel_message_content_for_agent(message: &AgentChannelMessage) -> String {
+    if message.attachments.is_empty() {
+        return message.content.clone();
+    }
+    let mut content = message.content.clone();
+    if !content.trim().is_empty() {
+        content.push_str("\n\n");
+    }
+    content.push_str("Attachments:\n");
+    for attachment in &message.attachments {
+        content.push_str("- ");
+        content.push_str(&attachment.file_name);
+        content.push_str(" at ");
+        content.push_str(&attachment.stored_path);
+        content.push_str(" (");
+        content.push_str(&attachment.size_bytes.to_string());
+        content.push_str(" bytes)\n");
+    }
+    content.trim_end().to_string()
 }
 
 pub trait AgentChannelTurnExecutor {
@@ -1296,6 +1451,21 @@ mod tests {
             self.turns.lock().expect("turns lock").push(turn.clone());
             Ok(())
         }
+
+        fn save_attachment(
+            &self,
+            channel_id: &SessionId,
+            attachment_id: &TaskId,
+            file_name: &str,
+            _bytes: &[u8],
+        ) -> Result<String, AgentChannelStoreError> {
+            Ok(format!(
+                "memory://{}/attachments/{}/{}",
+                channel_id,
+                attachment_id,
+                safe_agent_channel_attachment_file_name(file_name)
+            ))
+        }
     }
 
     struct ScriptExecutor {
@@ -1718,6 +1888,58 @@ mod tests {
         deleted.tombstone();
         store.save_channel(&deleted).expect("save tombstone");
         assert!(store.list_channels().expect("list hidden").is_empty());
+    }
+
+    #[test]
+    fn file_channel_store_saves_attachment_and_round_trips_metadata() {
+        let data_dir = temp_data_dir("agent-channel-attachment");
+        let store = FileAgentChannelStore::for_data_dir(&data_dir);
+        let mut channel = AgentChannel::new(SessionId::generate(), "Attachments");
+        let attachment_id = TaskId::generate();
+        let stored_path = store
+            .save_attachment(
+                &channel.channel_id,
+                &attachment_id,
+                "..\\unsafe:name.txt",
+                b"hello",
+            )
+            .expect("save attachment");
+        assert_eq!(
+            std::fs::read(&stored_path).expect("read attachment"),
+            b"hello"
+        );
+        assert!(stored_path.contains("unsafe_name.txt"));
+
+        let attachment = AgentChannelAttachment {
+            attachment_id,
+            file_name: "unsafe:name.txt".to_string(),
+            original_path: "C:\\input\\unsafe:name.txt".to_string(),
+            stored_path,
+            size_bytes: 5,
+            content_type: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            source: AgentChannelSource::app(),
+        };
+        channel.append_user_message_with_attachments(
+            AGENT_CHANNEL_APP_USER_ID,
+            "User",
+            "see attached",
+            AgentChannelSource::app(),
+            vec![attachment],
+        );
+        store.save_channel(&channel).expect("save channel");
+
+        let loaded = store
+            .load_channel(&channel.channel_id)
+            .expect("load channel")
+            .expect("channel exists");
+        let loaded_attachment = &loaded.transcript[0].attachments[0];
+        assert_eq!(loaded_attachment.file_name, "unsafe:name.txt");
+        assert_eq!(loaded_attachment.size_bytes, 5);
+        assert_eq!(
+            loaded_attachment.original_path,
+            "C:\\input\\unsafe:name.txt"
+        );
     }
 
     fn temp_data_dir(slug: &str) -> SinomoDataDir {
