@@ -36,6 +36,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -55,9 +56,9 @@ use sinomo_agent::{
     AgentChannel, AgentChannelAuthor, AgentChannelKind, AgentChannelMessageKind, AgentChannelStore,
 };
 use sinomo_cli::app_api::{
-    AgentChatSifsStorage, AgentSummary, ChatContextSnapshot, ChatHistoryMessage,
-    ChatProcessSnapshot, ChatTaskSnapshot, ChatToolCallSnapshot, ChatUsageSnapshot,
-    ProviderSummary, SifsAgentChannelStore, agent_summaries, reasoning_efforts,
+    AgentChatSifsStorage, AgentSummary, ChatAttachmentInput, ChatContextSnapshot,
+    ChatHistoryMessage, ChatProcessSnapshot, ChatTaskSnapshot, ChatToolCallSnapshot,
+    ChatUsageSnapshot, ProviderSummary, SifsAgentChannelStore, agent_summaries, reasoning_efforts,
 };
 use sinomo_runtime::{events::SessionId, local::SinomoDataDir};
 
@@ -76,10 +77,13 @@ const WIDE_THRESHOLD: f32 = 620.0;
 const SIDEBAR_W: f32 = 250.0;
 const ACTIVITY_RAIL_W: f32 = 286.0;
 const OVERVIEW_H: f32 = 86.0;
-const COMPOSER_H: f32 = 132.0;
+const COMPOSER_H: f32 = 196.0;
 const PAD: f32 = 16.0;
 const SIDEBAR_ROW_H: f32 = 36.0;
 const SELECTOR_H: f32 = 30.0;
+const ATTACHMENT_AREA_H: f32 = 56.0;
+const ATTACHMENT_ENTRY_H: f32 = 30.0;
+const ATTACHMENT_CHIPS_H: f32 = 22.0;
 const COMPOSER_PAD_Y: f32 = 12.0;
 const COMPOSER_SECTION_GAP: f32 = 10.0;
 const INPUT_ACTION_GAP: f32 = 10.0;
@@ -520,6 +524,13 @@ enum ChannelAgentsStoreStatus {
     Failed(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingChatAttachment {
+    path: PathBuf,
+    file_name: String,
+    size_bytes: u64,
+}
+
 /// State backing the chat tab.
 pub struct ChatState {
     pub data_dir: Arc<SinomoDataDir>,
@@ -531,6 +542,8 @@ pub struct ChatState {
     pub input: String,
     pub cursor: usize,
     draft_revision: u64,
+    attachment_path_input: String,
+    attachments: Vec<PendingChatAttachment>,
     pub streaming: bool,
     pub notice: Option<String>,
     pub context: Option<ChatContextSnapshot>,
@@ -626,6 +639,8 @@ impl ChatState {
             input: String::new(),
             cursor: 0,
             draft_revision: 0,
+            attachment_path_input: String::new(),
+            attachments: Vec::new(),
             streaming: false,
             notice: None,
             context: None,
@@ -2341,7 +2356,8 @@ impl ChatState {
 
     fn submit(&mut self) {
         let text = self.input.trim().to_string();
-        if text.is_empty() {
+        let attachments = self.attachment_inputs();
+        if text.is_empty() && attachments.is_empty() {
             return;
         }
         if self.providers.is_empty() {
@@ -2350,6 +2366,10 @@ impl ChatState {
         }
         let session_id = self.ensure_visible_session_id();
         if self.streaming {
+            if !attachments.is_empty() {
+                self.notice = Some("send attachments after the current response".to_string());
+                return;
+            }
             self.handle.send_command(ChatCommand::FollowUp {
                 session_id: session_id.clone(),
                 message: text.clone(),
@@ -2363,7 +2383,8 @@ impl ChatState {
             self.persist();
             return;
         }
-        self.messages.push(ChatMessage::user(text.clone()));
+        let visible_text = visible_user_message_text(&text, &self.attachments);
+        self.messages.push(ChatMessage::user(visible_text));
         self.messages.push(ChatMessage::model(String::new()));
         self.context = None;
         self.usage = None;
@@ -2372,13 +2393,18 @@ impl ChatState {
         self.control.active_turn = true;
         self.input.clear();
         self.cursor = 0;
+        self.attachment_path_input.clear();
+        self.attachments.clear();
         self.streaming = true;
         self.stick_bottom = true;
         self.scroll = f32::MAX;
         self.notice = Some("thinking…".to_string());
         self.persist();
-        self.handle
-            .send_command(ChatCommand::Send { session_id, text });
+        self.handle.send_command(ChatCommand::Send {
+            session_id,
+            text,
+            attachments,
+        });
     }
 
     fn interrupt_turn(&mut self) {
@@ -2396,7 +2422,8 @@ impl ChatState {
 
     /// Whether the composer has a non-empty draft that can be submitted.
     fn can_send(&self) -> bool {
-        !self.input.trim().is_empty() && !self.providers.is_empty()
+        (!self.input.trim().is_empty() || !self.attachments.is_empty())
+            && !self.providers.is_empty()
     }
 
     /// Replace the configured provider-account list after Settings changes it.
@@ -2435,12 +2462,83 @@ impl ChatState {
     }
 
     fn clear_draft(&mut self) {
-        if self.input.is_empty() {
+        if self.input.is_empty()
+            && self.attachments.is_empty()
+            && self.attachment_path_input.is_empty()
+        {
             return;
         }
         self.input.clear();
         self.cursor = 0;
+        self.attachment_path_input.clear();
+        self.attachments.clear();
         self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    fn set_attachment_path_input(&mut self, value: String) {
+        self.attachment_path_input = value;
+    }
+
+    fn add_attachment_from_path_input(&mut self) {
+        let value = self.attachment_path_input.clone();
+        match self.queue_attachment_path(&value) {
+            Ok(()) => {
+                self.attachment_path_input.clear();
+                self.draft_revision = self.draft_revision.wrapping_add(1);
+            }
+            Err(error) => {
+                self.notice = Some(error);
+            }
+        }
+    }
+
+    fn queue_attachment_path(&mut self, value: &str) -> Result<(), String> {
+        let normalized = normalize_attachment_path(value)
+            .ok_or_else(|| "paste a file path before attaching".to_string())?;
+        let path = PathBuf::from(normalized);
+        let metadata =
+            std::fs::metadata(&path).map_err(|error| format!("attachment unavailable: {error}"))?;
+        if !metadata.is_file() {
+            return Err("attachment must be a file".to_string());
+        }
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        if self
+            .attachments
+            .iter()
+            .any(|attachment| attachment.path == path)
+        {
+            return Ok(());
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "attachment".to_string());
+        self.attachments.push(PendingChatAttachment {
+            path,
+            file_name,
+            size_bytes: metadata.len(),
+        });
+        Ok(())
+    }
+
+    fn remove_attachment(&mut self, index: usize) {
+        if index >= self.attachments.len() {
+            return;
+        }
+        self.attachments.remove(index);
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    fn attachment_inputs(&self) -> Vec<ChatAttachmentInput> {
+        self.attachments
+            .iter()
+            .map(|attachment| ChatAttachmentInput {
+                path: attachment.path.clone(),
+            })
+            .collect()
     }
 
     fn apply_quick_action(&mut self, action: ChatQuickAction) {
@@ -2975,29 +3073,111 @@ fn channel_messages(channel: &AgentChannel) -> Vec<ChatMessage> {
         .transcript
         .iter()
         .filter_map(|message| {
-            if message.content.trim().is_empty() {
+            if message.content.trim().is_empty() && message.attachments.is_empty() {
                 return None;
             }
+            let content = visible_channel_message_text(message);
             match &message.author {
-                AgentChannelAuthor::User { .. } => Some(ChatMessage::user(message.content.clone())),
+                AgentChannelAuthor::User { .. } => Some(ChatMessage::user(content)),
                 AgentChannelAuthor::Agent { agent_name, .. } => {
                     let label = if agent_name.trim().is_empty() {
                         "Agent"
                     } else {
                         agent_name
                     };
-                    Some(ChatMessage::model(format!("{label}: {}", message.content)))
+                    Some(ChatMessage::model(format!("{label}: {content}")))
                 }
                 AgentChannelAuthor::System => {
                     if message.message_kind == AgentChannelMessageKind::Error {
-                        Some(ChatMessage::system_error(message.content.clone()))
+                        Some(ChatMessage::system_error(content))
                     } else {
-                        Some(ChatMessage::system_info(message.content.clone()))
+                        Some(ChatMessage::system_info(content))
                     }
                 }
             }
         })
         .collect()
+}
+
+fn visible_channel_message_text(message: &sinomo_agent::AgentChannelMessage) -> String {
+    if message.attachments.is_empty() {
+        return message.content.clone();
+    }
+    let mut text = message.content.clone();
+    append_visible_attachment_summary(
+        &mut text,
+        message.attachments.iter().map(|attachment| {
+            (
+                attachment.file_name.as_str(),
+                attachment.size_bytes,
+                Some(attachment.stored_path.as_str()),
+            )
+        }),
+    );
+    text
+}
+
+fn visible_user_message_text(text: &str, attachments: &[PendingChatAttachment]) -> String {
+    let mut visible = text.to_string();
+    append_visible_attachment_summary(
+        &mut visible,
+        attachments
+            .iter()
+            .map(|attachment| (attachment.file_name.as_str(), attachment.size_bytes, None)),
+    );
+    visible
+}
+
+fn append_visible_attachment_summary<'a>(
+    text: &mut String,
+    attachments: impl IntoIterator<Item = (&'a str, u64, Option<&'a str>)>,
+) {
+    let attachments = attachments.into_iter().collect::<Vec<_>>();
+    if attachments.is_empty() {
+        return;
+    }
+    if !text.trim().is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str("Attachments:\n");
+    for (name, size_bytes, stored_path) in attachments {
+        text.push_str("- ");
+        text.push_str(name);
+        text.push_str(" (");
+        text.push_str(&format_bytes(size_bytes.min(usize::MAX as u64) as usize));
+        text.push(')');
+        if let Some(stored_path) = stored_path {
+            text.push_str(" at ");
+            text.push_str(stored_path);
+        }
+        text.push('\n');
+    }
+    while text.ends_with('\n') {
+        text.pop();
+    }
+}
+
+fn normalize_attachment_path(value: &str) -> Option<String> {
+    let mut path = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+    if path.is_empty() {
+        return None;
+    }
+    if let Some(rest) = path.strip_prefix("file://") {
+        path = rest.to_string();
+        #[cfg(windows)]
+        if path.len() >= 3 && path.as_bytes().first() == Some(&b'/') && path.as_bytes()[2] == b':' {
+            path.remove(0);
+        }
+    }
+    if path.trim().is_empty() {
+        None
+    } else {
+        Some(path)
+    }
 }
 
 fn open_agent_channel_store(
@@ -7668,12 +7848,112 @@ fn open_provider_setup(shared: &Shared) {
     }
 }
 
+fn attachment_signature(shared: &Shared) -> (u64, usize) {
+    let chat = shared.chat();
+    (chat.draft_revision, chat.attachments.len())
+}
+
+fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let path_input = {
+        let s = shared.clone();
+        TextInput::new("chat-attachment-path")
+            .value(shared.chat().attachment_path_input.clone())
+            .placeholder("File path")
+            .leading_icon(IconGlyph::File)
+            .theme_when(composer_control_reader(reader))
+            .on_change(move |value| {
+                s.chat_mut().set_attachment_path_input(value);
+            })
+    };
+
+    let add = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Add, "Attach file")
+            .size(ATTACHMENT_ENTRY_H)
+            .icon_size(15.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.chat().attachment_path_input.trim().is_empty()
+            })
+            .on_press(move || {
+                s.chat_mut().add_attachment_from_path_input();
+            })
+    };
+
+    let entry = ComposerInputRow::new(
+        WidgetPod::new(path_input),
+        WidgetPod::new(
+            Flex::horizontal()
+                .align_items(Alignment::Center)
+                .spacer()
+                .with_child(add),
+        ),
+        ATTACHMENT_ENTRY_H,
+        ATTACHMENT_ENTRY_H,
+        8.0,
+    );
+
+    let mut chips = Stack::horizontal()
+        .spacing(6.0)
+        .alignment(Alignment::Center);
+    for (index, attachment) in shared.chat().attachments.iter().take(3).enumerate() {
+        let label = format!(
+            "{} · {}",
+            compact_line(&attachment.file_name, 22),
+            format_bytes(attachment.size_bytes.min(usize::MAX as u64) as usize)
+        );
+        let remove = {
+            let s = shared.clone();
+            IconButton::new(IconGlyph::Close, format!("Remove {}", attachment.file_name))
+                .size(ATTACHMENT_CHIPS_H)
+                .icon_size(12.0)
+                .theme_when(secondary_button_theme(reader))
+                .on_press(move || {
+                    s.chat_mut().remove_attachment(index);
+                })
+        };
+        chips = chips
+            .with_child(SizedBox::new().height(ATTACHMENT_CHIPS_H).with_child(
+                Label::new(label).font_size(11.0).color_when({
+                    let s = shared.clone();
+                    move || palette(&s).text_muted
+                }),
+            ))
+            .with_child(remove);
+    }
+    if shared.chat().attachments.len() > 3 {
+        let extra = shared.chat().attachments.len() - 3;
+        let s = shared.clone();
+        chips = chips.with_child(
+            SizedBox::new().height(ATTACHMENT_CHIPS_H).with_child(
+                Label::new(format!("+{extra}"))
+                    .font_size(11.0)
+                    .color_when(move || palette(&s).text_faint),
+            ),
+        );
+    }
+
+    WidgetPod::new(
+        Stack::vertical()
+            .spacing(4.0)
+            .alignment(Alignment::Stretch)
+            .with_child(SizedBox::new().height(ATTACHMENT_ENTRY_H).with_child(entry))
+            .with_child(SizedBox::new().height(ATTACHMENT_CHIPS_H).with_child(chips)),
+    )
+}
+
 /// The composer's bottom row: a flexible message `TextArea` and a fixed-size action slot. The input
 /// is bound to the draft via `on_change`; Enter submits normally, or queues a follow-up during an
 /// active stream. The action control swaps from Send to Interrupt while streaming.
 fn composer_action_signature(shared: &Shared) -> (bool, bool) {
     let chat = shared.chat();
-    (chat.streaming, !chat.input.is_empty())
+    (
+        chat.streaming,
+        !chat.input.is_empty()
+            || !chat.attachments.is_empty()
+            || !chat.attachment_path_input.is_empty(),
+    )
 }
 
 fn composer_actions(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -7849,13 +8129,35 @@ fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         )
     };
 
-    let input_h =
-        (COMPOSER_H - (COMPOSER_PAD_Y * 2.0) - SELECTOR_H - COMPOSER_SECTION_GAP).max(48.0);
+    let attachment_host = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::new(
+            {
+                let s = s.clone();
+                move || attachment_signature(&s)
+            },
+            move |_sig| attachment_controls(&s, &r),
+        )
+    };
+
+    let input_h = (COMPOSER_H
+        - (COMPOSER_PAD_Y * 2.0)
+        - SELECTOR_H
+        - ATTACHMENT_AREA_H
+        - (COMPOSER_SECTION_GAP * 2.0))
+        .max(48.0);
     let body = Stack::vertical()
         .spacing(0.0)
         .alignment(Alignment::Stretch)
         .with_child(SizedBox::new().height(COMPOSER_PAD_Y))
         .with_child(InsetX::new(selector_host, PAD))
+        .with_child(SizedBox::new().height(COMPOSER_SECTION_GAP))
+        .with_child(
+            SizedBox::new()
+                .height(ATTACHMENT_AREA_H)
+                .with_child(InsetX::new(attachment_host, PAD)),
+        )
         .with_child(SizedBox::new().height(COMPOSER_SECTION_GAP))
         .with_child(
             SizedBox::new()
@@ -8082,6 +8384,9 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.current_models().len().hash(&mut h);
     chat.effort_visible().hash(&mut h);
     chat.streaming.hash(&mut h);
+    chat.draft_revision.hash(&mut h);
+    chat.attachments.len().hash(&mut h);
+    chat.attachment_path_input.is_empty().hash(&mut h);
     chat.models_loading.hash(&mut h);
     chat.activity_panel_visible().hash(&mut h);
     chat.session_list_loading.hash(&mut h);
@@ -8590,6 +8895,32 @@ mod tests {
             },
         ];
         state.info.agent = "main-agent".to_string();
+    }
+
+    struct TempAttachmentFile {
+        path: PathBuf,
+        dir: PathBuf,
+    }
+
+    impl Drop for TempAttachmentFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn temp_attachment_file(slug: &str, file_name: &str, contents: &[u8]) -> TempAttachmentFile {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "sinomo-app-chat-attachment-{slug}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp attachment dir");
+        let path = dir.join(file_name);
+        std::fs::write(&path, contents).expect("write temp attachment");
+        TempAttachmentFile { path, dir }
     }
 
     #[test]
@@ -11986,6 +12317,56 @@ mod tests {
             state.can_send(),
             "a pending new-session ack must not disable the Send button"
         );
+    }
+
+    #[test]
+    fn attachments_can_be_queued_removed_and_sent_without_text() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let attachment = temp_attachment_file("queue", "report.txt", b"hello");
+
+        state
+            .queue_attachment_path(&format!("\"{}\"", attachment.path.display()))
+            .expect("queue attachment");
+        assert_eq!(state.attachments.len(), 1);
+        assert_eq!(state.attachments[0].file_name, "report.txt");
+        assert!(!state.can_send(), "provider setup is still required");
+
+        seed_default_provider(&mut state);
+        assert!(
+            state.can_send(),
+            "a queued attachment can be sent without text"
+        );
+
+        let visible = visible_user_message_text("", &state.attachments);
+        assert!(visible.contains("Attachments:"));
+        assert!(visible.contains("report.txt"));
+
+        state.remove_attachment(0);
+        assert!(state.attachments.is_empty());
+        assert!(
+            !state.can_send(),
+            "removing the only attachment disables send"
+        );
+    }
+
+    #[test]
+    fn submit_sends_file_only_attachment_turn() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        let attachment = temp_attachment_file("submit", "image.png", b"png");
+        state
+            .queue_attachment_path(attachment.path.to_str().expect("utf8 path"))
+            .expect("queue attachment");
+
+        state.submit();
+
+        assert!(state.streaming, "attachment-only submit starts a turn");
+        assert!(state.input.is_empty());
+        assert!(state.attachments.is_empty());
+        assert_eq!(state.messages.len(), 2);
+        assert!(state.messages[0].text.contains("image.png"));
     }
 
     #[test]

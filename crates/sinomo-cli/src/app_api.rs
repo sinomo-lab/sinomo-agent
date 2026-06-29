@@ -6,20 +6,23 @@
 //! never depends on `tui` internals.
 
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use sinomo_agent::{
     AGENT_CHANNEL_APP_USER_ID, AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION, AgentCatalog, AgentChannel,
-    AgentChannelAuthor, AgentChannelKind, AgentChannelMessage, AgentChannelMessageKind,
-    AgentChannelParticipant, AgentChannelSource, AgentChannelStore, AgentChannelStoreError,
-    AgentChannelTurn, AgentChannelUser, AgentDefinition, AgentItem, AgentModelEvent,
-    AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentRuntimeEvent,
-    AgentRuntimeEventPayload, AgentSessionControlResult, AgentSessionFollowUpRequest,
-    AgentSessionInterruptRequest, AgentSessionReattachState, AgentSessionResumeRequest,
-    AgentSessionResumeResponse, AgentSessionSteerRequest, AgentTaskLifecycleStatus,
-    AgentTaskSnapshot, AgentToolProgressEvent, ContextAssemblyReport, InteractionOutput,
-    InteractionSession, InteractionSurface, InteractionSurfaceKind, TaskId,
+    AgentChannelAttachment, AgentChannelAuthor, AgentChannelKind, AgentChannelMessage,
+    AgentChannelMessageKind, AgentChannelParticipant, AgentChannelSource, AgentChannelStore,
+    AgentChannelStoreError, AgentChannelTurn, AgentChannelUser, AgentContextAttachment,
+    AgentDefinition, AgentItem, AgentModelEvent, AgentRuntimeControlHost,
+    AgentRuntimeControlRegistry, AgentRuntimeEvent, AgentRuntimeEventPayload,
+    AgentSessionControlResult, AgentSessionFollowUpRequest, AgentSessionInterruptRequest,
+    AgentSessionReattachState, AgentSessionResumeRequest, AgentSessionResumeResponse,
+    AgentSessionSteerRequest, AgentTaskLifecycleStatus, AgentTaskSnapshot, AgentToolProgressEvent,
+    ContextAssemblyReport, InteractionOutput, InteractionSession, InteractionSurface,
+    InteractionSurfaceKind, TaskId, safe_agent_channel_attachment_file_name,
 };
 use sinomo_lm::{
     AnthropicConfig, CLAUDE_DEFAULT_MODEL, ClaudeCodeConfig, CodexCliConfig, GeminiConfig,
@@ -249,6 +252,12 @@ pub struct ChatHistoryMessage {
     pub text: String,
 }
 
+/// A local file selected by the GUI for upload into the chat/channel attachment store.
+#[derive(Clone, Debug)]
+pub struct ChatAttachmentInput {
+    pub path: PathBuf,
+}
+
 /// Outcome of a live chat-runtime control operation.
 #[derive(Clone, Debug, Default)]
 pub struct ChatControlStatus {
@@ -373,6 +382,15 @@ impl SifsAgentChannelStore {
 
     fn turns_path(channel_id: &SessionId) -> String {
         format!("{}/events.jsonl", Self::channel_dir(channel_id))
+    }
+
+    fn attachment_path(channel_id: &SessionId, attachment_id: &TaskId, file_name: &str) -> String {
+        format!(
+            "{}/attachments/{}/{}",
+            Self::channel_dir(channel_id),
+            attachment_id,
+            safe_agent_channel_attachment_file_name(file_name)
+        )
     }
 
     fn sorted_visible_summaries(
@@ -552,6 +570,18 @@ impl AgentChannelStore for SifsAgentChannelStore {
         turn: &AgentChannelTurn,
     ) -> Result<(), AgentChannelStoreError> {
         self.append_json_line(&Self::turns_path(channel_id), turn)
+    }
+
+    fn save_attachment(
+        &self,
+        channel_id: &SessionId,
+        attachment_id: &TaskId,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<String, AgentChannelStoreError> {
+        let path = Self::attachment_path(channel_id, attachment_id, file_name);
+        self.write_file(&path, bytes)?;
+        Ok(path)
     }
 }
 
@@ -787,13 +817,32 @@ impl AgentChat {
         text: &str,
         on_event: &mut dyn FnMut(ChatStreamEvent),
     ) -> Result<(), CliError> {
+        self.send_with_attachments(text, &[], on_event)
+    }
+
+    /// Send a user message with local files copied into the channel attachment store.
+    pub fn send_with_attachments(
+        &mut self,
+        text: &str,
+        attachments: &[ChatAttachmentInput],
+        on_event: &mut dyn FnMut(ChatStreamEvent),
+    ) -> Result<(), CliError> {
         self.reload_current_channel_best_effort();
         let speaker = self.primary_speaker();
-        let user_message = self.channel.append_user_message(
+        let attachments = self.store_chat_attachments(attachments)?;
+        let mut source = AgentChannelSource::app();
+        if !attachments.is_empty() {
+            source.metadata = serde_json::json!({
+                "attachment_count": attachments.len()
+            });
+        }
+        let context_attachments = agent_context_attachments_from_channel_attachments(&attachments);
+        let user_message = self.channel.append_user_message_with_attachments(
             AGENT_CHANNEL_APP_USER_ID,
             "User",
             text,
-            AgentChannelSource::app(),
+            source,
+            attachments,
         );
         let _ = self
             .channel_store
@@ -818,7 +867,13 @@ impl AgentChat {
 
         let result = (|| {
             let mut emit = |output: InteractionOutput| forward_output(output, &mut wrapped_event);
-            let trailing = self.runtime.ingest_user_input_streaming(text, &mut emit)?;
+            let trailing = self
+                .runtime
+                .ingest_user_input_with_context_attachments_streaming(
+                    text,
+                    context_attachments.clone(),
+                    &mut emit,
+                )?;
             for output in trailing {
                 forward_output(output, &mut wrapped_event);
             }
@@ -888,6 +943,54 @@ impl AgentChat {
             }
         }
         Ok(())
+    }
+
+    fn store_chat_attachments(
+        &self,
+        attachments: &[ChatAttachmentInput],
+    ) -> Result<Vec<AgentChannelAttachment>, CliError> {
+        let mut stored = Vec::new();
+        for attachment in attachments {
+            let path = attachment.path.as_path();
+            let metadata = fs::metadata(path).map_err(|source| CliError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            if !metadata.is_file() {
+                return Err(CliError::Parse {
+                    detail: format!("attachment is not a file: {}", path.display()),
+                });
+            }
+            let bytes = fs::read(path).map_err(|source| CliError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            let file_name = attachment_file_name(path);
+            let attachment_id = TaskId::generate();
+            let stored_path = self
+                .channel_store
+                .save_attachment(&self.channel.channel_id, &attachment_id, &file_name, &bytes)
+                .map_err(|source| CliError::Parse {
+                    detail: format!("save attachment failed: {source}"),
+                })?;
+            stored.push(AgentChannelAttachment {
+                attachment_id,
+                file_name,
+                original_path: path.display().to_string(),
+                stored_path,
+                size_bytes: metadata.len(),
+                content_type: None,
+                created_at: time::OffsetDateTime::now_utc(),
+                source: AgentChannelSource {
+                    metadata: serde_json::json!({
+                        "ingress": "local-file",
+                        "original_path": path.display().to_string()
+                    }),
+                    ..AgentChannelSource::app()
+                },
+            });
+        }
+        Ok(stored)
     }
 
     /// Switch the active provider/model/account; returns the new selection.
@@ -1107,27 +1210,84 @@ fn agent_transcript_from_channel(
     }
     let mut transcript = sinomo_agent::AgentTranscript::new();
     for (index, message) in channel.transcript.iter().enumerate() {
-        if message.content.trim().is_empty()
+        if (message.content.trim().is_empty() && message.attachments.is_empty())
             || message.message_kind != AgentChannelMessageKind::Normal
         {
             continue;
         }
+        let content = channel_message_content_for_agent(message);
         match &message.author {
             AgentChannelAuthor::User { .. } => transcript.push(AgentItem::UserMessage {
                 item_id: TaskId::generate(),
                 step_index: index,
-                content: message.content.clone(),
+                content,
                 event_id: None,
             }),
             AgentChannelAuthor::Agent { .. } => transcript.push(AgentItem::AssistantText {
                 item_id: TaskId::generate(),
                 step_index: index,
-                content: message.content.clone(),
+                content,
             }),
             AgentChannelAuthor::System => {}
         }
     }
     transcript
+}
+
+fn channel_message_content_for_agent(message: &AgentChannelMessage) -> String {
+    if message.attachments.is_empty() {
+        return message.content.clone();
+    }
+    let mut content = message.content.clone();
+    if !content.trim().is_empty() {
+        content.push_str("\n\n");
+    }
+    content.push_str("Attachments:\n");
+    for attachment in &message.attachments {
+        content.push_str("- ");
+        content.push_str(&attachment.file_name);
+        content.push_str(" at ");
+        content.push_str(&attachment.stored_path);
+        content.push_str(" (");
+        content.push_str(&attachment.size_bytes.to_string());
+        content.push_str(" bytes)\n");
+    }
+    content.trim_end().to_string()
+}
+
+fn agent_context_attachments_from_channel_attachments(
+    attachments: &[AgentChannelAttachment],
+) -> Vec<AgentContextAttachment> {
+    attachments
+        .iter()
+        .map(|attachment| AgentContextAttachment {
+            kind: "chat_file_attachment".to_string(),
+            summary: format!(
+                "{} at {} ({} bytes)",
+                attachment.file_name, attachment.stored_path, attachment.size_bytes
+            ),
+            payload_json: serde_json::json!({
+                "attachment_id": attachment.attachment_id,
+                "file_name": attachment.file_name,
+                "original_path": attachment.original_path,
+                "stored_path": attachment.stored_path,
+                "size_bytes": attachment.size_bytes,
+                "content_type": attachment.content_type,
+                "channel_source": attachment.source
+            }),
+            payload_original_bytes: Some(attachment.size_bytes.min(usize::MAX as u64) as usize),
+            payload_model_visible_truncated: false,
+        })
+        .collect()
+}
+
+fn attachment_file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "attachment".to_string())
 }
 
 fn legacy_channel_from_history(
