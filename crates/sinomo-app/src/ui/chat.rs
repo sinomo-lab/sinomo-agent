@@ -3356,6 +3356,9 @@ fn detail_should_offer_sifs_check(text: &str) -> bool {
     [
         "sifs",
         "dfs",
+        "chat list",
+        "chat save",
+        "chat history",
         "session store",
         "channel store",
         "device authorization",
@@ -10726,6 +10729,19 @@ mod tests {
         assert!(!channel.contains("storage"));
 
         assert!(connection_recovery_display_detail("provider unavailable").is_none());
+    }
+
+    #[test]
+    fn chat_history_storage_failures_offer_sifs_diagnostics() {
+        assert!(detail_should_offer_sifs_check(
+            "chat list failed: The local cluster service is not reachable."
+        ));
+        assert!(detail_should_offer_sifs_check(
+            "chat save failed: daemon not reachable"
+        ));
+        assert!(!detail_should_offer_sifs_check(
+            "provider unavailable: missing API key"
+        ));
     }
 
     #[test]
