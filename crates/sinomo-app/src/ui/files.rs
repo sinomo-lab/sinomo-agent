@@ -5735,12 +5735,29 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         } else {
             None
         };
+        let browse_local = if source == FilesSourceKind::Sifs {
+            let s = shared.clone();
+            Some(
+                IconButton::new(IconGlyph::Folder, "Browse local files")
+                    .size(30.0)
+                    .theme_when(secondary_button_theme(reader))
+                    .on_press(move || {
+                        let waker = { s.borrow().waker.clone() };
+                        s.files_mut().switch_source(FilesSourceKind::Local, waker);
+                    }),
+            )
+        } else {
+            None
+        };
         let mut actions = Stack::horizontal()
             .spacing(8.0)
             .alignment(Alignment::Center)
             .with_child(retry);
         if let Some(settings) = settings {
             actions = actions.with_child(settings);
+        }
+        if let Some(browse_local) = browse_local {
+            actions = actions.with_child(browse_local);
         }
         let body = centered_note(
             shared,
@@ -7868,7 +7885,7 @@ fn sifs_unavailable_rows(error: &str, details_open: bool) -> Vec<(&'static str, 
         ("Status", sifs_unavailable_summary(error).to_string()),
         (
             "Next",
-            "Retry SIFS, then open connection settings".to_string(),
+            "Retry SIFS, open Connection, or browse local files".to_string(),
         ),
     ];
     if details_open {
@@ -11148,12 +11165,12 @@ mod tests {
 
         assert_eq!(
             inspector.summary(),
-            "error|Sifs|/|device authorization was denied|false"
+            "error|Sifs|/|device authorization was denied|false|"
         );
         shared.files_mut().inspector_details_open = true;
         assert_eq!(
             inspector.summary(),
-            "error|Sifs|/|device authorization was denied|true"
+            "error|Sifs|/|device authorization was denied|true|"
         );
     }
 
@@ -11167,20 +11184,20 @@ mod tests {
             files.path = "/services".to_string();
         }
         let inspector = InspectorView::new(shared.clone());
-        assert_eq!(inspector.summary(), "loading|Sifs|/services|false");
+        assert_eq!(inspector.summary(), "loading|Sifs|/services|false|");
 
         {
             let mut files = shared.files_mut();
             files.inspector_details_open = true;
         }
-        assert_eq!(inspector.summary(), "loading|Sifs|/services|true");
+        assert_eq!(inspector.summary(), "loading|Sifs|/services|true|");
 
         {
             let mut files = shared.files_mut();
             files.loading = false;
             files.entries.clear();
         }
-        assert_eq!(inspector.summary(), "unselected|Sifs|/services|false|0");
+        assert_eq!(inspector.summary(), "unselected|Sifs|/services|false|0|");
     }
 
     #[test]
@@ -11302,6 +11319,11 @@ mod tests {
             *label == "Status" && value == "SIFS access needs authorization."
         }));
         assert!(collapsed.iter().any(|(label, _)| *label == "Next"));
+        assert!(
+            collapsed
+                .iter()
+                .any(|(label, value)| { *label == "Next" && value.contains("browse local files") })
+        );
         assert!(
             !collapsed
                 .iter()
@@ -12768,7 +12790,7 @@ mod tests {
                 "{name} should be disabled while the current SIFS location is unavailable"
             );
         }
-        for name in ["Retry SIFS", "Connection settings"] {
+        for name in ["Retry SIFS", "Connection settings", "Browse local files"] {
             assert!(
                 snapshot.accessibility.nodes.iter().any(|node| {
                     node.role == sui::SemanticsRole::Button
@@ -12789,6 +12811,46 @@ mod tests {
             shared.settings().selected,
             Some(SettingsSection::Connection)
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_placeholder_browses_local_files() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let local_path = shared.files().local_path.clone();
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/services".to_string();
+            files.sifs_path = "/services".to_string();
+            files.error = Some("SIFS browsing requires a daemon connection".to_string());
+            files.entries.clear();
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files unavailable local fallback")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Browse local files")
+            .click()?;
+
+        let files = shared.files();
+        assert_eq!(files.source, FilesSourceKind::Local);
+        assert_eq!(files.path, local_path);
+        assert!(files.loaded);
+        assert!(!files.loading);
+        assert_eq!(files.sifs_path, "/services");
 
         Ok(())
     }
