@@ -15315,7 +15315,7 @@ fn cluster_invite_publish_targets_use_connectivity_graph_for_fallback() {
 }
 
 #[test]
-fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
+fn member_daemon_status_targets_use_connectivity_before_static_transport_rank() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-status-route-connectivity");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -15417,9 +15417,9 @@ fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
             .map(|endpoint| endpoint.endpoint_id.clone())
             .collect::<Vec<_>>(),
         vec![
-            lan.endpoint_id.clone(),
             public.endpoint_id.clone(),
             iroh.endpoint_id.clone(),
+            lan.endpoint_id.clone(),
         ]
     );
 
@@ -15682,6 +15682,91 @@ fn member_daemon_status_targets_include_fresh_kv_iroh_endpoint() {
             .any(|endpoint| endpoint.endpoint_id == stale_lan.endpoint_id),
         "stale LAN endpoints should remain as fallbacks after the healthy KV Iroh endpoint"
     );
+}
+
+#[test]
+fn member_daemon_status_targets_prefer_healthy_iroh_over_unknown_stale_lan() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-status-healthy-iroh-before-stale-lan");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_status_healthy_iroh_before_stale_lan")
+            .expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_status_healthy_iroh_before_stale_lan_local")
+            .expect("local");
+    let remote =
+        NodeId::from_legacy_named("node_status_healthy_iroh_before_stale_lan_remote")
+            .expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "status healthy iroh before stale lan",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let stale_lan = (10..=24)
+        .map(|octet| daemon_lan_endpoint(&remote, format!("172.{octet}.0.1:21353"), 10))
+        .collect::<Vec<_>>();
+    let fresh_iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&remote, "iroh_public_key_status_healthy_first"),
+        node_id: remote.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_status_healthy_first?relay=https://relay.example./"
+            .to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote.clone(), "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = stale_lan;
+    state.members.push(member.clone());
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    append_cluster_raft_command(
+        &paths,
+        &local,
+        KvCommand::Op(
+            KvOp::put_serde(
+                cluster_endpoint_key(&remote, &fresh_iroh),
+                &fresh_iroh,
+                None,
+            )
+            .expect("fresh iroh endpoint op"),
+        ),
+    )
+    .expect("publish fresh iroh endpoint");
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local,
+        vec![cluster_connectivity_record(
+            &state,
+            &fresh_iroh,
+            ClusterConnectivityState::Healthy,
+            Some(25),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            60,
+        )],
+    )
+    .expect("connectivity records");
+
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::MemberDaemonStatus)
+        .into_iter()
+        .filter(|endpoint| endpoint.node_id == member.node_id)
+        .collect::<Vec<_>>();
+
+    assert_eq!(targets[0].endpoint_id, fresh_iroh.endpoint_id);
 }
 
 #[test]

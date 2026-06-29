@@ -352,18 +352,11 @@ fn cli_probe_member_daemon_status(
         return Some(status);
     }
     let trace = std::env::var_os("SINOMO_CLUSTER_HEALTH_TRACE").is_some();
-    let mut endpoints = network::ClusterEndpointSelector::new(paths, state)
+    let endpoints = network::ClusterEndpointSelector::new(paths, state)
         .select(network::ClusterEndpointSelectionPurpose::MemberDaemonStatus)
         .into_iter()
         .filter(|endpoint| endpoint.node_id == member.node_id)
         .collect::<Vec<_>>();
-    endpoints.sort_by_key(|endpoint| {
-        (
-            cluster_health_cli_endpoint_probe_rank(endpoint),
-            endpoint.priority,
-            endpoint.address.clone(),
-        )
-    });
     for endpoint in endpoints
         .into_iter()
         .take(CLUSTER_HEALTH_CLI_MAX_ENDPOINTS_PER_MEMBER)
@@ -445,19 +438,6 @@ fn cli_probe_member_daemon_status(
         return Some(status);
     }
     None
-}
-
-fn cluster_health_cli_endpoint_probe_rank(endpoint: &ClusterEndpointRecord) -> u8 {
-    match &endpoint.transport {
-        ClusterTransportKind::LanTcp => 0,
-        ClusterTransportKind::LanQuic => 1,
-        ClusterTransportKind::HttpsRelay
-        | ClusterTransportKind::TurnRelay
-        | ClusterTransportKind::WebRtc => 2,
-        ClusterTransportKind::Iroh => 3,
-        ClusterTransportKind::Loopback => 4,
-        ClusterTransportKind::InProcess => 5,
-    }
 }
 
 fn cli_probe_member_status_via_shadow_endpoint(

@@ -1296,14 +1296,14 @@ fn cluster_member_daemon_status_endpoint_cmp(
     right: &ClusterEndpointRecord,
 ) -> Ordering {
     (
-        graph.unavailability_rank(left),
+        cluster_endpoint_connectivity_attempt_rank(graph, left),
         cluster_endpoint_static_fallback_rank(left),
         graph.quality_rank(left),
         left.priority,
         left.address.as_str(),
     )
         .cmp(&(
-            graph.unavailability_rank(right),
+            cluster_endpoint_connectivity_attempt_rank(graph, right),
             cluster_endpoint_static_fallback_rank(right),
             graph.quality_rank(right),
             right.priority,

@@ -21,7 +21,7 @@ use super::{
     build_cluster_raft_append_request_from_next_index, cli_command_is_help,
     cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
     cli_invocation_force_local_mode, cluster_doctor_findings, cluster_has_local_quorum,
-    cluster_health_cli_endpoint_probe_rank, cluster_init_with_paths, cluster_invite_with_paths,
+    cluster_init_with_paths, cluster_invite_with_paths,
     cluster_join_with_paths, cluster_kv_state_authority_id, cluster_leave_with_paths,
     cluster_migration_plan_with_paths, cluster_node_status_from_daemon_status,
     cluster_peer_members, cluster_state_sync_txn, compact_default_invite_introducers,
@@ -5936,32 +5936,6 @@ fn cluster_sync_targets_skip_remote_local_only_endpoints() {
 
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].address, "192.168.1.10:21353");
-}
-
-#[test]
-fn cluster_health_probe_rank_prefers_direct_transport_over_iroh() {
-    let node_id = NodeId::from_legacy_named("node_cluster_health_probe_rank").expect("node");
-    let mut lan = ClusterEndpointRecord::loopback(node_id.clone(), "10.0.0.41:21353");
-    lan.transport = ClusterTransportKind::LanTcp;
-    lan.privacy = ClusterEndpointPrivacy::Lan;
-    let iroh = ClusterEndpointRecord {
-        endpoint_id: ClusterEndpointId::from_legacy_named(
-            "endpoint_cluster_health_probe_rank_iroh",
-        )
-        .expect("endpoint"),
-        node_id,
-        transport: ClusterTransportKind::Iroh,
-        address: "iroh://probe_rank?relay=https://relay.example/".to_string(),
-        source: ClusterEndpointSource::Rendezvous,
-        privacy: ClusterEndpointPrivacy::InternetDirect,
-        priority: 0,
-        last_observed_latency_ms: None,
-    };
-
-    assert!(
-        cluster_health_cli_endpoint_probe_rank(&lan)
-            < cluster_health_cli_endpoint_probe_rank(&iroh)
-    );
 }
 
 #[test]
