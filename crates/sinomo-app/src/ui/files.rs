@@ -61,7 +61,7 @@ const INSPECTOR_W: f32 = 340.0;
 const ROW_H: f32 = 34.0;
 const ROW_ACTION_SIDE: f32 = 24.0;
 const ROW_ACTION_GAP: f32 = 4.0;
-const ROW_ACTION_COUNT: f32 = 7.0;
+const ROW_ACTION_COUNT: f32 = 4.0;
 const CONTENT_PAD: f32 = 16.0;
 const HEADER_H: f32 = 78.0;
 const HEADER_COMMAND_GAP: f32 = 8.0;
@@ -5417,10 +5417,14 @@ enum SifsEntryRowHit {
     Inspect,
     Copy,
     Transfer,
-    Move,
-    Rename,
-    Delete,
 }
+
+const ROW_INLINE_ACTIONS: [SifsEntryRowHit; 4] = [
+    SifsEntryRowHit::Select,
+    SifsEntryRowHit::Inspect,
+    SifsEntryRowHit::Copy,
+    SifsEntryRowHit::Transfer,
+];
 
 struct SifsEntryRow {
     shared: Shared,
@@ -5472,15 +5476,7 @@ impl SifsEntryRow {
         if !bounds.contains(position) {
             return None;
         }
-        for action in [
-            SifsEntryRowHit::Select,
-            SifsEntryRowHit::Inspect,
-            SifsEntryRowHit::Copy,
-            SifsEntryRowHit::Transfer,
-            SifsEntryRowHit::Move,
-            SifsEntryRowHit::Rename,
-            SifsEntryRowHit::Delete,
-        ] {
+        for action in ROW_INLINE_ACTIONS {
             if !self.action_enabled(action) {
                 continue;
             }
@@ -5497,9 +5493,6 @@ impl SifsEntryRow {
             SifsEntryRowHit::Inspect => 8_317,
             SifsEntryRowHit::Copy => 8_329,
             SifsEntryRowHit::Transfer => 8_333,
-            SifsEntryRowHit::Move => 8_341,
-            SifsEntryRowHit::Rename => 8_351,
-            SifsEntryRowHit::Delete => 8_389,
             SifsEntryRowHit::Row => 8_401,
         };
         sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(salt))
@@ -5512,9 +5505,6 @@ fn row_action_slot(action: SifsEntryRowHit) -> Option<usize> {
         SifsEntryRowHit::Inspect => Some(1),
         SifsEntryRowHit::Copy => Some(2),
         SifsEntryRowHit::Transfer => Some(3),
-        SifsEntryRowHit::Move => Some(4),
-        SifsEntryRowHit::Rename => Some(5),
-        SifsEntryRowHit::Delete => Some(6),
         SifsEntryRowHit::Row => None,
     }
 }
@@ -5623,24 +5613,6 @@ impl Widget for SifsEntryRow {
                             files.open_action_prompt(prompt_kind);
                             request_files_overlay_rebuild(ctx);
                         }
-                        SifsEntryRowHit::Move => {
-                            let mut files = self.shared.files_mut();
-                            files.select_entry(self.index);
-                            files.open_action_prompt(FileActionPromptKind::Move);
-                            request_files_overlay_rebuild(ctx);
-                        }
-                        SifsEntryRowHit::Rename => {
-                            let mut files = self.shared.files_mut();
-                            files.select_entry(self.index);
-                            files.open_action_prompt(FileActionPromptKind::Rename);
-                            request_files_overlay_rebuild(ctx);
-                        }
-                        SifsEntryRowHit::Delete => {
-                            let mut files = self.shared.files_mut();
-                            files.select_entry(self.index);
-                            files.open_action_prompt(FileActionPromptKind::Delete);
-                            request_files_overlay_rebuild(ctx);
-                        }
                     }
                     ctx.request_measure();
                     ctx.request_paint();
@@ -5740,17 +5712,6 @@ impl Widget for SifsEntryRow {
                 row_transfer_glyph(source),
                 pal.accent,
             ),
-            (
-                SifsEntryRowHit::Move,
-                IconGlyph::ChevronRight,
-                pal.text_muted,
-            ),
-            (
-                SifsEntryRowHit::Rename,
-                IconGlyph::MoreHorizontal,
-                pal.text_muted,
-            ),
-            (SifsEntryRowHit::Delete, IconGlyph::Trash, pal.warn),
         ] {
             if !self.action_enabled(action) {
                 continue;
@@ -5855,25 +5816,6 @@ impl Widget for SifsEntryRow {
                 SifsEntryRowHit::Transfer,
                 row_transfer_label(source, &self.entry.name),
                 row_transfer_description(source, &self.entry.path),
-            ),
-            (
-                SifsEntryRowHit::Move,
-                format!("Move {}", self.entry.name),
-                format!(
-                    "Move {} to another {} path",
-                    self.entry.path,
-                    source.operation_scope()
-                ),
-            ),
-            (
-                SifsEntryRowHit::Rename,
-                format!("Rename {}", self.entry.name),
-                format!("Rename {}", self.entry.path),
-            ),
-            (
-                SifsEntryRowHit::Delete,
-                format!("Delete {}", self.entry.name),
-                format!("Delete {}", self.entry.path),
             ),
         ] {
             if !self.action_enabled(action) {
@@ -15151,7 +15093,7 @@ mod tests {
     }
 
     #[test]
-    fn row_action_buttons_open_copy_transfer_move_rename_and_delete_prompts() -> sui::Result<()> {
+    fn row_action_buttons_expose_quick_copy_and_transfer_only() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -15220,55 +15162,19 @@ mod tests {
             .click()?;
         assert!(shared.files().action_prompt.is_none());
 
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Move artifact.txt")
-            .click()?;
-        {
-            let files = shared.files();
-            let prompt = files.action_prompt.as_ref().expect("move prompt");
-            assert_eq!(prompt.kind, FileActionPromptKind::Move);
-            assert_eq!(prompt.target_path.as_deref(), Some("/artifact.txt"));
-            assert_eq!(prompt.input, "artifact.txt");
-            assert_eq!(files.selected, Some(0));
-        }
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Cancel")
-            .click()?;
-        assert!(shared.files().action_prompt.is_none());
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Rename artifact.txt")
-            .click()?;
-        {
-            let files = shared.files();
-            let prompt = files.action_prompt.as_ref().expect("rename prompt");
-            assert_eq!(prompt.kind, FileActionPromptKind::Rename);
-            assert_eq!(prompt.target_path.as_deref(), Some("/artifact.txt"));
-            assert_eq!(prompt.input, "artifact.txt");
-            assert_eq!(files.selected, Some(0));
-        }
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Cancel")
-            .click()?;
-        assert!(shared.files().action_prompt.is_none());
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Delete artifact.txt")
-            .click()?;
-        {
-            let files = shared.files();
-            let prompt = files.action_prompt.as_ref().expect("delete prompt");
-            assert_eq!(prompt.kind, FileActionPromptKind::Delete);
-            assert_eq!(prompt.target_path.as_deref(), Some("/artifact.txt"));
-            assert_eq!(prompt.target_name, "artifact.txt");
-            assert_eq!(files.selected, Some(0));
+        let snapshot = window.snapshot()?;
+        for hidden_name in [
+            "Move artifact.txt",
+            "Rename artifact.txt",
+            "Delete artifact.txt",
+        ] {
+            assert!(
+                !snapshot.accessibility.nodes.iter().any(|node| {
+                    node.role == sui::SemanticsRole::Button
+                        && node.name.as_deref() == Some(hidden_name)
+                }),
+                "{hidden_name} should stay in the labeled inspector actions, not the compact row"
+            );
         }
 
         Ok(())
