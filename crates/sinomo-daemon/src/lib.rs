@@ -21,6 +21,8 @@ pub const DAEMON_DFS_BROWSER_STATUS_ROUTE: &str = "/daemon/dfs/browser/status";
 pub const DAEMON_DFS_BROWSER_STAT_ROUTE: &str = "/daemon/dfs/browser/stat";
 pub const DAEMON_DFS_BROWSER_LIST_ROUTE: &str = "/daemon/dfs/browser/list";
 pub const DAEMON_DFS_BROWSER_READ_FILE_ROUTE: &str = "/daemon/dfs/browser/read-file";
+pub const DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE: &str =
+    "/daemon/dfs/browser/read-object-version";
 pub const DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE: &str = "/daemon/dfs/browser/read-file-prefix";
 pub const DAEMON_DFS_BROWSER_READ_FILES_ROUTE: &str = "/daemon/dfs/browser/read-files";
 pub const DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE: &str = "/daemon/dfs/browser/write-file";
@@ -38,6 +40,7 @@ pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_STAT_ROUTE,
     DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+    DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
     DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
@@ -194,6 +197,20 @@ pub struct DaemonDfsBrowserReadFileRequest {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserReadFileResponse {
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserReadObjectVersionRequest {
+    pub object_id: String,
+    pub version: String,
+    pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserReadObjectVersionResponse {
     pub bytes: Vec<u8>,
 }
 

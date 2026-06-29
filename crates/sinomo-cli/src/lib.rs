@@ -174,9 +174,10 @@ use sinomo_runtime::daemon::{
 };
 use sinomo_runtime::dfs::{DaemonDfsInspectionRequest, DaemonDfsInspectionResponse};
 use sinomo_runtime::dfs::{
-    DfsConflictRecord, DfsFileSystemId, DfsMetadataShardConfig, DfsObjectId,
-    DfsOperatorInspectionCursor, DfsOperatorInspector, DfsOperatorRepairView,
-    LocalShardedMetadataBackend, LocalSobjMetadataBackend,
+    DfsConflictRecord, DfsFileSystemId, DfsMetadataBackend, DfsMetadataShardConfig, DfsObjectId,
+    DfsOperatorConflictVersionView, DfsOperatorConflictVersionsReport, DfsOperatorInspectionCursor,
+    DfsOperatorInspector, DfsOperatorRepairView, DfsVersion, LocalShardedMetadataBackend,
+    LocalSobjMetadataBackend,
 };
 use sinomo_runtime::dfs::{
     DfsExposeAddRequest, DfsPinAddRequest, DfsPinMode, add_dfs_expose_entry, add_local_dfs_pin,

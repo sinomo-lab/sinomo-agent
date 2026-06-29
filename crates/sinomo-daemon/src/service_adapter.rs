@@ -119,11 +119,12 @@ use crate::{
     DAEMON_DFS_BROWSER_DELETE_ROUTE, DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
-    DAEMON_DFS_BROWSER_READ_FILES_ROUTE, DAEMON_DFS_BROWSER_RENAME_ROUTE,
-    DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE, DAEMON_DFS_BROWSER_STATUS_ROUTE,
-    DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE, DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
-    DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE, DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
-    DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILES_ROUTE, DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
+    DAEMON_DFS_BROWSER_RENAME_ROUTE, DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE,
+    DAEMON_DFS_BROWSER_STATUS_ROUTE, DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
+    DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
+    DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
+    DAEMON_STATUS_ROUTE,
 };
 
 static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
@@ -1479,6 +1480,27 @@ impl DaemonDfsBrowserBackend {
         Ok(crate::DaemonDfsBrowserReadFileResponse { bytes })
     }
 
+    fn read_object_version(
+        &self,
+        request: crate::DaemonDfsBrowserReadObjectVersionRequest,
+    ) -> Result<crate::DaemonDfsBrowserReadObjectVersionResponse, ServiceError> {
+        let object_id = sinomo_dfs::DfsObjectId::new(&request.object_id)
+            .map_err(|source| ServiceError::Service(source.to_string()))?;
+        let version = sinomo_dfs::DfsVersion::new(&request.version)
+            .map_err(|source| ServiceError::Service(source.to_string()))?;
+        let mut service = self.lock_service()?;
+        self.refresh_endpoint_targets(&mut service);
+        let bytes = service
+            .read_object_version_content(
+                &object_id,
+                &version,
+                &request.content_hash,
+                request.size_bytes,
+            )
+            .map_err(dfs_browser_service_error)?;
+        Ok(crate::DaemonDfsBrowserReadObjectVersionResponse { bytes })
+    }
+
     fn read_file_prefix(
         &self,
         request: crate::DaemonDfsBrowserReadFilePrefixRequest,
@@ -1861,6 +1883,22 @@ impl Service for DaemonDfsBrowserService {
                     )
                     .await?;
                     ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_READ_FILE_ROUTE, &result)?
+                }
+                DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS browser read object version",
+                        move || {
+                            DaemonDfsBrowserBackend::for_data_dir(data_dir)?
+                                .read_object_version(payload)
+                        },
+                    )
+                    .await?;
+                    ObjectRpcResponse::encode_body(
+                        DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
+                        &result,
+                    )?
                 }
                 DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE => {
                     let payload = request.decode_body()?;

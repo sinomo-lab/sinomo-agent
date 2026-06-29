@@ -67,10 +67,13 @@ pub use namespace::{
 };
 pub use operator::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsAgentFileSystemSummary,
-    DfsAgentObjectState, DfsAgentObjectSummary, DfsOperatorConflictPage, DfsOperatorFileSystemView,
+    DfsAgentObjectState, DfsAgentObjectSummary, DfsOperatorConflictPage,
+    DfsOperatorConflictResolutionReport, DfsOperatorConflictVersionRole,
+    DfsOperatorConflictVersionView, DfsOperatorConflictVersionsReport, DfsOperatorFileSystemView,
     DfsOperatorInspectionCursor, DfsOperatorInspectionItemCursor, DfsOperatorInspector,
     DfsOperatorObjectView, DfsOperatorRepairPage, DfsOperatorRepairView, DfsOperatorStatus,
-    DfsPinAddRequest, DfsPinMode, DfsPinRecord, DfsPinStoreError, LocalDfsPinStore,
+    DfsOperatorUseConflictVersionReport, DfsPinAddRequest, DfsPinMode, DfsPinRecord,
+    DfsPinStoreError, LocalDfsPinStore, resolve_dfs_conflicts, use_dfs_conflict_version,
 };
 pub use posix::{
     DfsDirEntry, DfsDirEntryPage, DfsNamespaceJobFailure, DfsNamespaceJobMaintenanceReport,
@@ -1750,7 +1753,7 @@ pub fn inspect_cluster_aware_dfs(
     cluster_paths: &ClusterPaths,
     request: DaemonDfsInspectionRequest,
 ) -> Result<DaemonDfsInspectionResponse, DfsError> {
-    let metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+    let mut metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
     let inspector = DfsOperatorInspector::new(metadata.as_ref());
     Ok(match request {
         DaemonDfsInspectionRequest::Status => {
@@ -1789,6 +1792,36 @@ pub fn inspect_cluster_aware_dfs(
                 next_cursor: page.next_cursor,
             }
         }
+        DaemonDfsInspectionRequest::ResolveConflicts {
+            file_system_id,
+            object_id,
+            conflict_ids,
+        } => DaemonDfsInspectionResponse::ResolveConflicts {
+            report: resolve_dfs_conflicts(
+                metadata.as_mut(),
+                file_system_id.as_ref(),
+                object_id.as_ref(),
+                &conflict_ids,
+            )?,
+        },
+        DaemonDfsInspectionRequest::ConflictVersions {
+            object_id,
+            conflict_ids,
+        } => DaemonDfsInspectionResponse::ConflictVersions {
+            report: inspector.conflict_versions(&object_id, &conflict_ids)?,
+        },
+        DaemonDfsInspectionRequest::UseConflictVersion {
+            object_id,
+            version,
+            conflict_ids,
+        } => DaemonDfsInspectionResponse::UseConflictVersion {
+            report: use_dfs_conflict_version(
+                metadata.as_mut(),
+                &object_id,
+                &version,
+                &conflict_ids,
+            )?,
+        },
         DaemonDfsInspectionRequest::Repair {
             file_system_id,
             object_id,
@@ -2230,6 +2263,19 @@ impl DfsMetadataStore {
             .entry(conflict.object_id.clone())
             .or_default()
             .insert(conflict.conflict_id.clone(), conflict);
+    }
+
+    pub fn remove_conflict(
+        &mut self,
+        object_id: &DfsObjectId,
+        conflict_id: &str,
+    ) -> Option<DfsConflictRecord> {
+        let conflicts = self.conflicts.get_mut(object_id)?;
+        let removed = conflicts.remove(conflict_id);
+        if conflicts.is_empty() {
+            self.conflicts.remove(object_id);
+        }
+        removed
     }
 
     pub fn conflicts_for_object(&self, object_id: &DfsObjectId) -> Vec<DfsConflictRecord> {
@@ -12859,6 +12905,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .flatten();
                 if let Some(conflict) = conflict {
                     self.metadata.add_conflict(conflict);
+                } else {
+                    self.metadata.remove_conflict(object_id, conflict_id);
                 }
             }
             DfsMetadataMutation::ApplyNamespaceTransaction { transaction_id, .. } => {
@@ -25450,6 +25498,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let size_bytes = reader.size_bytes();
         Ok((size_bytes, ObjectVersionReader::from_blob(reader)))
+    }
+
+    pub fn read_object_version_content(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        content_hash: &str,
+        expected_size_bytes: Option<u64>,
+    ) -> Result<Vec<u8>, DfsError> {
+        let (size_bytes, mut reader) =
+            self.open_content_hash_stream(object_id, version, content_hash, expected_size_bytes)?;
+        let mut bytes = Vec::with_capacity(usize::try_from(size_bytes).unwrap_or(0));
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|source| DfsError::ContentStore {
+                message: format!("cannot read DFS object {object_id} version {version}: {source}"),
+            })?;
+        Ok(bytes)
     }
 
     fn open_content_hash_range_stream(

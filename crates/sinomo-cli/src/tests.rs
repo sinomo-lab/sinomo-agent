@@ -9,36 +9,38 @@ use super::{
     ClusterRenameOptions, ClusterRoleOptions, ClusterRolloutBuildRequest,
     ClusterStateAuthorityOptions, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
     DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DebugCliCommand, DfsCliCommand,
-    DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
-    DfsMetadataShardTransferPrimaryOptions, DfsMountOptions, DfsPinCliCommand, InstallLayout,
-    InstallOptions, InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions,
-    ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand,
-    ProviderCliCommand, ProviderCommandOptions, ProviderName, RolloutAdvanceOptions,
-    RolloutCliCommand, RolloutMainActivation, RolloutModuleNativeDylibOptions, RolloutOptions,
-    RolloutProgressExpectation, RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler,
-    SelfRolloutPaths, TestCliCommand, UninstallOptions, apply_cluster_node_role,
-    apply_cluster_raft_role, authenticate_daemon_control_request,
-    build_cluster_raft_append_request_from_next_index, cli_command_is_help,
-    cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
-    cli_invocation_force_local_mode, cluster_doctor_findings, cluster_has_local_quorum,
-    cluster_init_with_paths, cluster_invite_with_paths, cluster_join_with_paths,
-    cluster_kv_state_authority_id, cluster_leave_with_paths, cluster_migration_plan_with_paths,
+    DfsCommonOptions, DfsConflictResolveOptions, DfsConflictSaveVersionOptions,
+    DfsConflictUseVersionOptions, DfsConflictVersionsOptions, DfsExposeCliCommand,
+    DfsFilterOptions, DfsMetadataShardTransferPrimaryOptions, DfsMountOptions, DfsPinCliCommand,
+    InstallLayout, InstallOptions, InteractionModel, InteractionRuntime, InteractionSession,
+    InteractionSurface, InteractionSurfaceKind, ModelOptionValueUpdate, ModelOptionsCliCommand,
+    ModelOptionsSetOptions, ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions,
+    ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName,
+    RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation,
+    RolloutModuleNativeDylibOptions, RolloutOptions, RolloutProgressExpectation,
+    RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
+    TestCliCommand, UninstallOptions, apply_cluster_node_role, apply_cluster_raft_role,
+    authenticate_daemon_control_request, build_cluster_raft_append_request_from_next_index,
+    cli_command_is_help, cli_command_requires_cluster_state,
+    cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
+    cluster_doctor_findings, cluster_has_local_quorum, cluster_init_with_paths,
+    cluster_invite_with_paths, cluster_join_with_paths, cluster_kv_state_authority_id,
+    cluster_leave_with_paths, cluster_migration_plan_with_paths,
     cluster_node_status_from_daemon_status, cluster_peer_members, cluster_state_sync_txn,
     compact_default_invite_introducers, daemon_advertised_endpoints_for_state,
     daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
-    data_dir_storage_contract_findings, decode_cluster_join_invite, encode_cluster_join_invite,
-    ensure_rollout_layout, expire_cluster_network_records_in_kv, format_rollout_progress_line,
-    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_txn_request,
-    handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
-    invite_channels_for_join_registration, invite_communication_channels,
-    invite_introducer_endpoint, invite_introducer_endpoint_from_state,
-    load_tui_model_runtime_config, main_agent_config_tool_registry,
-    main_agent_handler_for_tui_with_data_dir, managed_source_status, model_config_uses_cluster,
-    models_default_with_data_dir, normalize_model_provider,
-    open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
-    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-    parse_dfs_command, parse_install_options, parse_model_default_options,
+    data_dir_storage_contract_findings, decode_cluster_join_invite, default_dfs_file_system_id,
+    encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
+    format_rollout_progress_line, handle_daemon_cluster_join_request,
+    handle_daemon_cluster_kv_txn_request, handle_daemon_rollout_build_request,
+    install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
+    invite_communication_channels, invite_introducer_endpoint,
+    invite_introducer_endpoint_from_state, load_tui_model_runtime_config,
+    main_agent_config_tool_registry, main_agent_handler_for_tui_with_data_dir,
+    managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
+    normalize_model_provider, open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command,
+    parse_cli_invocation, parse_cluster_command, parse_cluster_join_invite_argument,
+    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
     parse_provider_command, parse_rollout_command, parse_slash_command, parse_test_command,
     parse_uninstall_options, parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
@@ -7102,6 +7104,113 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
             ),
             limit: Some(128),
             cursor: None,
+        })
+    );
+    assert_eq!(
+        parse_dfs_command(&[
+            "conflicts".to_string(),
+            "resolve".to_string(),
+            "--path".to_string(),
+            "/services/sinomo-app-chat-sessions-index.json".to_string(),
+            "--filesystem".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d0".to_string(),
+            "--id".to_string(),
+            "conflict_a".to_string(),
+            "--delete-file".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("dfs conflicts resolve"),
+        DfsCliCommand::ResolveConflicts(DfsConflictResolveOptions {
+            common: DfsCommonOptions {
+                metadata_root: None,
+                cluster: false,
+                json: true,
+            },
+            file_system_id: sinomo_runtime::dfs::DfsFileSystemId::new("01hxy6qa9k0t9vr4g9n8d3q5d0")
+                .expect("filesystem"),
+            path: Some("/services/sinomo-app-chat-sessions-index.json".to_string()),
+            object_id: None,
+            conflict_ids: vec!["conflict_a".to_string()],
+            delete_file: true,
+        })
+    );
+    assert_eq!(
+        parse_dfs_command(&[
+            "conflicts".to_string(),
+            "versions".to_string(),
+            "--path".to_string(),
+            "/services/sinomo-app-chat-sessions-index.json".to_string(),
+            "--id".to_string(),
+            "conflict_a".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("dfs conflicts versions"),
+        DfsCliCommand::ConflictVersions(DfsConflictVersionsOptions {
+            common: DfsCommonOptions {
+                metadata_root: None,
+                cluster: false,
+                json: true,
+            },
+            file_system_id: default_dfs_file_system_id(),
+            path: Some("/services/sinomo-app-chat-sessions-index.json".to_string()),
+            object_id: None,
+            conflict_ids: vec!["conflict_a".to_string()],
+        })
+    );
+    assert_eq!(
+        parse_dfs_command(&[
+            "conflicts".to_string(),
+            "use-version".to_string(),
+            "--object".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d1".to_string(),
+            "--version".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d3".to_string(),
+            "--id".to_string(),
+            "conflict_a".to_string(),
+        ])
+        .expect("dfs conflicts use-version"),
+        DfsCliCommand::UseConflictVersion(DfsConflictUseVersionOptions {
+            common: DfsCommonOptions::default(),
+            file_system_id: default_dfs_file_system_id(),
+            path: None,
+            object_id: Some(
+                sinomo_runtime::dfs::DfsObjectId::new("01hxy6qa9k0t9vr4g9n8d3q5d1")
+                    .expect("object")
+            ),
+            version: sinomo_runtime::dfs::DfsVersion::new("01hxy6qa9k0t9vr4g9n8d3q5d3")
+                .expect("version"),
+            conflict_ids: vec!["conflict_a".to_string()],
+        })
+    );
+    assert_eq!(
+        parse_dfs_command(&[
+            "conflicts".to_string(),
+            "save-version".to_string(),
+            "--object".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d1".to_string(),
+            "--version".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d3".to_string(),
+            "--to".to_string(),
+            "/services/recovered/chat-sessions-index.remote.json".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("dfs conflicts save-version"),
+        DfsCliCommand::SaveConflictVersion(DfsConflictSaveVersionOptions {
+            common: DfsCommonOptions {
+                metadata_root: None,
+                cluster: false,
+                json: true,
+            },
+            file_system_id: default_dfs_file_system_id(),
+            path: None,
+            object_id: Some(
+                sinomo_runtime::dfs::DfsObjectId::new("01hxy6qa9k0t9vr4g9n8d3q5d1")
+                    .expect("object")
+            ),
+            version: sinomo_runtime::dfs::DfsVersion::new("01hxy6qa9k0t9vr4g9n8d3q5d3")
+                .expect("version"),
+            conflict_ids: Vec::new(),
+            destination_path: "/services/recovered/chat-sessions-index.remote.json".to_string(),
         })
     );
     assert!(matches!(

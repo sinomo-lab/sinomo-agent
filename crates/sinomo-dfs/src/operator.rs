@@ -8,6 +8,7 @@ use crate::{
 };
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sinomo_events::EventId;
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,6 +47,23 @@ pub enum DaemonDfsInspectionRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<DfsOperatorInspectionCursor>,
     },
+    ResolveConflicts {
+        file_system_id: Option<DfsFileSystemId>,
+        object_id: Option<DfsObjectId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        conflict_ids: Vec<String>,
+    },
+    ConflictVersions {
+        object_id: DfsObjectId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        conflict_ids: Vec<String>,
+    },
+    UseConflictVersion {
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        conflict_ids: Vec<String>,
+    },
     Repair {
         file_system_id: Option<DfsFileSystemId>,
         object_id: Option<DfsObjectId>,
@@ -76,6 +94,15 @@ pub enum DaemonDfsInspectionResponse {
         conflicts: Vec<DfsConflictRecord>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next_cursor: Option<DfsOperatorInspectionCursor>,
+    },
+    ResolveConflicts {
+        report: DfsOperatorConflictResolutionReport,
+    },
+    ConflictVersions {
+        report: Option<DfsOperatorConflictVersionsReport>,
+    },
+    UseConflictVersion {
+        report: DfsOperatorUseConflictVersionReport,
     },
     Repair {
         repairs: Vec<DfsOperatorRepairView>,
@@ -138,6 +165,55 @@ pub struct DfsOperatorConflictPage {
     pub conflicts: Vec<DfsConflictRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<DfsOperatorInspectionCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsOperatorConflictResolutionReport {
+    pub removed: Vec<DfsConflictRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_found_conflict_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsOperatorConflictVersionsReport {
+    pub object: DfsObjectMetadata,
+    pub conflicts: Vec<DfsConflictRecord>,
+    pub versions: Vec<DfsOperatorConflictVersionView>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsOperatorConflictVersionView {
+    pub version: DfsVersion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<NodeId>,
+    pub visible: bool,
+    pub current: bool,
+    pub stored: bool,
+    pub roles: Vec<DfsOperatorConflictVersionRole>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsOperatorConflictVersionRole {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_id: Option<String>,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsOperatorUseConflictVersionReport {
+    pub previous_object: DfsObjectMetadata,
+    pub committed_object: DfsObjectMetadata,
+    pub selected_version: DfsObjectVersionRecord,
+    pub changed: bool,
+    pub removed: Vec<DfsConflictRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_found_conflict_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -284,6 +360,30 @@ impl<'a> DfsOperatorInspector<'a> {
             return Ok(None);
         };
         self.object(&object.object_id)
+    }
+
+    pub fn conflict_versions(
+        &self,
+        object_id: &DfsObjectId,
+        conflict_ids: &[String],
+    ) -> Result<Option<DfsOperatorConflictVersionsReport>, MetadataBackendError> {
+        let Some(object) = self.backend.get_object(object_id)? else {
+            return Ok(None);
+        };
+        let requested_ids: BTreeSet<String> = conflict_ids.iter().cloned().collect();
+        let conflicts: Vec<DfsConflictRecord> =
+            conflicts_for_object_from_backend(self.backend, &object.object_id)?
+                .into_iter()
+                .filter(|conflict| {
+                    requested_ids.is_empty() || requested_ids.contains(&conflict.conflict_id)
+                })
+                .collect();
+        let versions = conflict_version_views(self.backend, &object, &conflicts)?;
+        Ok(Some(DfsOperatorConflictVersionsReport {
+            object,
+            conflicts,
+            versions,
+        }))
     }
 
     pub fn conflicts(
@@ -778,6 +878,258 @@ impl<'a> DfsOperatorInspector<'a> {
         output.extend(candidates.into_values().take(limit));
         Ok(has_remaining)
     }
+}
+
+pub fn resolve_dfs_conflicts(
+    backend: &mut dyn DfsMetadataBackend,
+    file_system_id: Option<&DfsFileSystemId>,
+    object_id: Option<&DfsObjectId>,
+    conflict_ids: &[String],
+) -> Result<DfsOperatorConflictResolutionReport, MetadataBackendError> {
+    let requested_ids: BTreeSet<String> = conflict_ids.iter().cloned().collect();
+    let conflicts = {
+        let inspector = DfsOperatorInspector::new(backend);
+        inspector.conflicts(file_system_id, object_id)?
+    };
+    let mut removed = Vec::new();
+    for conflict in conflicts {
+        if !requested_ids.is_empty() && !requested_ids.contains(&conflict.conflict_id) {
+            continue;
+        }
+        if let Some(removed_conflict) =
+            backend.remove_conflict(&conflict.object_id, &conflict.conflict_id)?
+        {
+            removed.push(removed_conflict);
+        }
+    }
+    removed.sort_by(|left, right| {
+        left.object_id
+            .cmp(&right.object_id)
+            .then_with(|| left.conflict_id.cmp(&right.conflict_id))
+    });
+    let removed_ids: BTreeSet<String> = removed
+        .iter()
+        .map(|conflict| conflict.conflict_id.clone())
+        .collect();
+    let not_found_conflict_ids = requested_ids
+        .into_iter()
+        .filter(|conflict_id| !removed_ids.contains(conflict_id))
+        .collect();
+    Ok(DfsOperatorConflictResolutionReport {
+        removed,
+        not_found_conflict_ids,
+    })
+}
+
+pub fn use_dfs_conflict_version(
+    backend: &mut dyn DfsMetadataBackend,
+    object_id: &DfsObjectId,
+    version: &DfsVersion,
+    conflict_ids: &[String],
+) -> Result<DfsOperatorUseConflictVersionReport, MetadataBackendError> {
+    let previous_object =
+        backend
+            .get_object(object_id)?
+            .ok_or_else(|| MetadataBackendError::UnknownObject {
+                object_id: object_id.clone(),
+            })?;
+    let mut selected_version = backend.get_version(object_id, version)?.ok_or_else(|| {
+        MetadataBackendError::Serde(format!(
+            "DFS object {object_id} version {version} was not found"
+        ))
+    })?;
+
+    normalize_node_locations(&mut selected_version.locations);
+    selected_version.visible = true;
+
+    let mut committed_object = previous_object.clone();
+    committed_object.version = selected_version.version.clone();
+    committed_object.content_hash = selected_version.content_hash.clone();
+    committed_object.content_size_bytes = selected_version.size_bytes;
+    committed_object.current_locations = selected_version.locations.clone();
+
+    let changed = committed_object.version != previous_object.version
+        || committed_object.content_hash != previous_object.content_hash
+        || committed_object.content_size_bytes != previous_object.content_size_bytes
+        || normalized_nodes(&committed_object.current_locations)
+            != normalized_nodes(&previous_object.current_locations);
+    if changed {
+        let now = now_unix_nanos();
+        committed_object.modified_at_unix_nanos = now;
+        committed_object.changed_at_unix_nanos = now;
+        committed_object.last_modified_by_event_id = Some(EventId::generate());
+        backend.commit_visible_version(
+            &previous_object.version,
+            &committed_object,
+            &selected_version,
+            &[],
+        )?;
+    }
+
+    let requested_ids: BTreeSet<String> = conflict_ids.iter().cloned().collect();
+    let conflicts = conflicts_for_object_from_backend(backend, object_id)?;
+    let mut removed = Vec::new();
+    for conflict in conflicts {
+        if !requested_ids.is_empty() && !requested_ids.contains(&conflict.conflict_id) {
+            continue;
+        }
+        if let Some(removed_conflict) =
+            backend.remove_conflict(&conflict.object_id, &conflict.conflict_id)?
+        {
+            removed.push(removed_conflict);
+        }
+    }
+    removed.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
+    let removed_ids: BTreeSet<String> = removed
+        .iter()
+        .map(|conflict| conflict.conflict_id.clone())
+        .collect();
+    let not_found_conflict_ids = requested_ids
+        .into_iter()
+        .filter(|conflict_id| !removed_ids.contains(conflict_id))
+        .collect();
+
+    Ok(DfsOperatorUseConflictVersionReport {
+        previous_object,
+        committed_object,
+        selected_version,
+        changed,
+        removed,
+        not_found_conflict_ids,
+    })
+}
+
+#[derive(Debug, Default)]
+struct ConflictVersionViewBuilder {
+    content_hash: Option<String>,
+    version_record: Option<DfsObjectVersionRecord>,
+    current: bool,
+    roles: Vec<DfsOperatorConflictVersionRole>,
+}
+
+fn conflict_version_views(
+    backend: &dyn DfsMetadataBackend,
+    object: &DfsObjectMetadata,
+    conflicts: &[DfsConflictRecord],
+) -> Result<Vec<DfsOperatorConflictVersionView>, MetadataBackendError> {
+    let mut views = BTreeMap::<DfsVersion, ConflictVersionViewBuilder>::new();
+    add_conflict_version_role(
+        &mut views,
+        object.version.clone(),
+        DfsOperatorConflictVersionRole {
+            conflict_id: None,
+            role: "current".to_string(),
+            content_hash: object.content_hash.clone(),
+        },
+    );
+    if let Some(view) = views.get_mut(&object.version) {
+        view.current = true;
+    }
+
+    for conflict in conflicts {
+        if let Some(base_version) = conflict.base_version.clone() {
+            add_conflict_version_role(
+                &mut views,
+                base_version,
+                DfsOperatorConflictVersionRole {
+                    conflict_id: Some(conflict.conflict_id.clone()),
+                    role: "base".to_string(),
+                    content_hash: None,
+                },
+            );
+        }
+        add_conflict_version_role(
+            &mut views,
+            conflict.local_version.clone(),
+            DfsOperatorConflictVersionRole {
+                conflict_id: Some(conflict.conflict_id.clone()),
+                role: "local".to_string(),
+                content_hash: conflict.local_content_hash.clone(),
+            },
+        );
+        add_conflict_version_role(
+            &mut views,
+            conflict.remote_version.clone(),
+            DfsOperatorConflictVersionRole {
+                conflict_id: Some(conflict.conflict_id.clone()),
+                role: "remote".to_string(),
+                content_hash: conflict.remote_content_hash.clone(),
+            },
+        );
+    }
+
+    for (version, view) in &mut views {
+        let version_record = backend.get_version(&object.object_id, version)?;
+        if let Some(version_record) = version_record {
+            if view.content_hash.is_none() {
+                view.content_hash = version_record.content_hash.clone();
+            }
+            view.version_record = Some(version_record);
+        }
+    }
+
+    Ok(views
+        .into_iter()
+        .map(|(version, view)| {
+            let stored = view.version_record.is_some();
+            let visible = view
+                .version_record
+                .as_ref()
+                .map(|record| record.visible)
+                .unwrap_or(false);
+            let size_bytes = view
+                .version_record
+                .as_ref()
+                .and_then(|record| record.size_bytes);
+            let locations = view
+                .version_record
+                .as_ref()
+                .map(|record| normalized_nodes(&record.locations))
+                .unwrap_or_default();
+            DfsOperatorConflictVersionView {
+                version,
+                content_hash: view.content_hash,
+                size_bytes,
+                locations,
+                visible,
+                current: view.current,
+                stored,
+                roles: view.roles,
+            }
+        })
+        .collect())
+}
+
+fn add_conflict_version_role(
+    views: &mut BTreeMap<DfsVersion, ConflictVersionViewBuilder>,
+    version: DfsVersion,
+    role: DfsOperatorConflictVersionRole,
+) {
+    let view = views.entry(version).or_default();
+    if view.content_hash.is_none() {
+        view.content_hash = role.content_hash.clone();
+    }
+    if !view.roles.contains(&role) {
+        view.roles.push(role);
+    }
+}
+
+fn normalized_nodes(nodes: &[NodeId]) -> Vec<NodeId> {
+    let mut nodes = nodes.to_vec();
+    normalize_node_locations(&mut nodes);
+    nodes
+}
+
+fn normalize_node_locations(nodes: &mut Vec<NodeId>) {
+    nodes.sort();
+    nodes.dedup();
+}
+
+fn now_unix_nanos() -> u64 {
+    OffsetDateTime::now_utc()
+        .unix_timestamp_nanos()
+        .try_into()
+        .unwrap_or(1_000_000_000)
 }
 
 enum OperatorResumeState {
@@ -2453,6 +2805,134 @@ mod tests {
         assert_eq!(file_system.object_count, 2);
         assert_eq!(file_system.open_conflict_count, 1);
         assert_eq!(file_system.pending_repair_count, 1);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn operator_conflict_versions_can_be_viewed_and_selected() {
+        let root = temp_root("operator_conflict_versions_can_be_viewed_and_selected");
+        let mut backend =
+            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = DfsFileSystem {
+            file_system_id: file_system_id(),
+            display_name: "repo".to_string(),
+            owner_node_id: node("node_owner"),
+            subtree_policies: Vec::new(),
+        };
+        let object = DfsObjectMetadata {
+            object_id: object_id(),
+            file_system_id: file_system_id(),
+            path: "artifact.bin".to_string(),
+            kind: DfsObjectKind::Artifact,
+            owner_node_id: node("node_owner"),
+            current_locations: vec![node("node_owner")],
+            content_hash: Some("blake3:local".to_string()),
+            content_size_bytes: Some(5),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: version("version_local"),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("object");
+        for (version_id, hash, size, visible) in [
+            (version("version_base"), "blake3:base", 4, false),
+            (version("version_local"), "blake3:local", 5, true),
+            (version("version_remote"), "blake3:remote", 6, false),
+        ] {
+            backend
+                .put_version(&DfsObjectVersionRecord {
+                    file_system_id: file_system_id(),
+                    object_id: object_id(),
+                    version: version_id,
+                    content_hash: Some(hash.to_string()),
+                    size_bytes: Some(size),
+                    locations: vec![node("node_owner")],
+                    created_by_event_id: None,
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    visible,
+                })
+                .expect("version");
+        }
+        backend
+            .put_conflict(&DfsConflictRecord {
+                conflict_id: "conflict_a".to_string(),
+                file_system_id: file_system_id(),
+                object_id: object_id(),
+                path: "artifact.bin".to_string(),
+                base_version: Some(version("version_base")),
+                local_version: version("version_local"),
+                remote_version: version("version_remote"),
+                detected_by_node_id: node("node_owner"),
+                reason: "manual test conflict".to_string(),
+                local_content_hash: Some("blake3:local".to_string()),
+                remote_content_hash: Some("blake3:remote".to_string()),
+                created_by_intent_id: None,
+                strategy: Some("branch".to_string()),
+                status: DfsConflictStatus::Open,
+                detected_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("conflict");
+
+        let report = DfsOperatorInspector::new(&backend)
+            .conflict_versions(&object_id(), &[])
+            .expect("versions")
+            .expect("report");
+        assert_eq!(report.versions.len(), 3);
+        let remote = report
+            .versions
+            .iter()
+            .find(|candidate| candidate.version == version("version_remote"))
+            .expect("remote version");
+        assert!(remote.stored);
+        assert_eq!(remote.content_hash.as_deref(), Some("blake3:remote"));
+        assert!(remote.roles.iter().any(|role| role.role == "remote"));
+        let current = report
+            .versions
+            .iter()
+            .find(|candidate| candidate.version == version("version_local"))
+            .expect("current version");
+        assert!(current.current);
+        assert!(current.roles.iter().any(|role| role.role == "current"));
+
+        let use_report = use_dfs_conflict_version(
+            &mut backend,
+            &object_id(),
+            &version("version_remote"),
+            &["conflict_a".to_string()],
+        )
+        .expect("use version");
+        assert!(use_report.changed);
+        assert_eq!(
+            use_report.committed_object.version,
+            version("version_remote")
+        );
+        assert_eq!(
+            use_report.committed_object.content_hash.as_deref(),
+            Some("blake3:remote")
+        );
+        assert_eq!(use_report.removed.len(), 1);
+        assert!(
+            backend
+                .get_conflict(&object_id(), "conflict_a")
+                .expect("conflict lookup")
+                .is_none()
+        );
+        let committed = backend
+            .get_object(&object_id())
+            .expect("object lookup")
+            .expect("object");
+        assert_eq!(committed.version, version("version_remote"));
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

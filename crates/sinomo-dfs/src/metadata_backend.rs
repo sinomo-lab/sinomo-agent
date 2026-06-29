@@ -1961,6 +1961,11 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         after: Option<&DfsConflictPageCursor>,
         max_entries: usize,
     ) -> Result<DfsConflictPage>;
+    fn remove_conflict(
+        &mut self,
+        object_id: &DfsObjectId,
+        conflict_id: &str,
+    ) -> Result<Option<DfsConflictRecord>>;
     fn update_conflict_status(
         &mut self,
         object_id: &DfsObjectId,
@@ -2352,6 +2357,12 @@ impl DfsMetadataTables {
                     conflict,
                 );
             }
+            DfsMetadataTableOp::RemoveConflict {
+                object_id,
+                conflict_id,
+            } => {
+                self.conflicts.remove(&(object_id, conflict_id));
+            }
             DfsMetadataTableOp::PutVisibleCommit {
                 object_id,
                 version,
@@ -2635,6 +2646,14 @@ impl DfsMetadataTableRollback {
                 &tables.conflicts,
                 (conflict.object_id.clone(), conflict.conflict_id.clone()),
             ),
+            DfsMetadataTableOp::RemoveConflict {
+                object_id,
+                conflict_id,
+            } => record_rollback_value(
+                &mut self.conflicts,
+                &tables.conflicts,
+                (object_id.clone(), conflict_id.clone()),
+            ),
             DfsMetadataTableOp::PutVisibleCommit {
                 object_id, version, ..
             } => record_rollback_value(
@@ -2839,6 +2858,10 @@ enum DfsMetadataTableOp {
     },
     PutConflict {
         conflict: DfsConflictRecord,
+    },
+    RemoveConflict {
+        object_id: DfsObjectId,
+        conflict_id: String,
     },
     PutVisibleCommit {
         object_id: DfsObjectId,
@@ -5064,6 +5087,18 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .conflicts_for_object_page(object_id, after, max_entries)
     }
 
+    fn remove_conflict(
+        &mut self,
+        object_id: &DfsObjectId,
+        conflict_id: &str,
+    ) -> Result<Option<DfsConflictRecord>> {
+        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
+            return Ok(None);
+        };
+        self.shard_backend_mut(&shard_id)?
+            .remove_conflict(object_id, conflict_id)
+    }
+
     fn update_conflict_status(
         &mut self,
         object_id: &DfsObjectId,
@@ -5692,8 +5727,11 @@ impl LocalSobjMetadataBackend {
                 conflict,
                 ..
             } => {
-                let conflict = required_replay_payload(entry, "put-conflict", conflict.as_ref())?;
-                if self.get_conflict(object_id, conflict_id)?.as_ref() == Some(conflict) {
+                if let Some(conflict) = conflict.as_ref() {
+                    if self.get_conflict(object_id, conflict_id)?.as_ref() == Some(conflict) {
+                        return Ok(false);
+                    }
+                } else if self.get_conflict(object_id, conflict_id)?.is_none() {
                     return Ok(false);
                 }
                 self.materialize_local_journal_entry(entry)?;
@@ -5934,17 +5972,30 @@ impl LocalSobjMetadataBackend {
                 conflict,
                 ..
             } => {
-                let conflict = required_replay_payload(entry, "put-conflict", conflict.as_ref())?;
-                if self.get_conflict(object_id, conflict_id)?.as_ref() == Some(conflict) {
-                    return Ok(false);
+                if let Some(conflict) = conflict.as_ref() {
+                    if self.get_conflict(object_id, conflict_id)?.as_ref() == Some(conflict) {
+                        return Ok(false);
+                    }
+                    self.plan_preapplied_table_op(
+                        DfsMetadataTableOp::PutConflict {
+                            conflict: conflict.clone(),
+                        },
+                        table_ops,
+                        rollback,
+                    );
+                } else {
+                    if self.get_conflict(object_id, conflict_id)?.is_none() {
+                        return Ok(false);
+                    }
+                    self.plan_preapplied_table_op(
+                        DfsMetadataTableOp::RemoveConflict {
+                            object_id: object_id.clone(),
+                            conflict_id: conflict_id.clone(),
+                        },
+                        table_ops,
+                        rollback,
+                    );
                 }
-                self.plan_preapplied_table_op(
-                    DfsMetadataTableOp::PutConflict {
-                        conflict: conflict.clone(),
-                    },
-                    table_ops,
-                    rollback,
-                );
                 Ok(true)
             }
             DfsMetadataMutation::ApplyNamespaceTransaction {
@@ -6411,6 +6462,20 @@ impl LocalSobjMetadataBackend {
             }
             DfsMetadataMutation::PutConflict { conflict, .. } => {
                 let Some(conflict) = conflict.as_ref() else {
+                    if let DfsMetadataMutation::PutConflict {
+                        object_id,
+                        conflict_id,
+                        ..
+                    } = &entry.mutation
+                    {
+                        return self.append_and_apply_table_ops(
+                            entry.sequence,
+                            vec![DfsMetadataTableOp::RemoveConflict {
+                                object_id: object_id.clone(),
+                                conflict_id: conflict_id.clone(),
+                            }],
+                        );
+                    }
                     return Ok(());
                 };
                 self.append_and_apply_table_ops(
@@ -8384,6 +8449,32 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             conflicts,
             next_cursor: has_more.then_some(last_cursor).flatten(),
         })
+    }
+
+    fn remove_conflict(
+        &mut self,
+        object_id: &DfsObjectId,
+        conflict_id: &str,
+    ) -> Result<Option<DfsConflictRecord>> {
+        let Some(existing) = self.get_conflict(object_id, conflict_id)? else {
+            return Ok(None);
+        };
+        let _lock = self.begin_metadata_write()?;
+        let entry = self.write_journal_unlocked(DfsMetadataMutation::PutConflict {
+            file_system_id: existing.file_system_id.clone(),
+            object_id: object_id.clone(),
+            conflict_id: conflict_id.to_string(),
+            conflict: None,
+        })?;
+        self.append_and_apply_table_ops(
+            entry.sequence,
+            vec![DfsMetadataTableOp::RemoveConflict {
+                object_id: object_id.clone(),
+                conflict_id: conflict_id.to_string(),
+            }],
+        )?;
+        self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
+        Ok(Some(existing))
     }
 
     fn update_conflict_status(
@@ -17550,6 +17641,51 @@ mod tests {
                 .expect("conflict")
                 .status,
             DfsConflictStatus::Resolved
+        );
+        assert_eq!(
+            backend
+                .remove_conflict(&conflict.object_id, &conflict.conflict_id)
+                .expect("remove resolved conflict")
+                .as_ref()
+                .map(|conflict| conflict.status.clone()),
+            Some(DfsConflictStatus::Resolved)
+        );
+        assert_eq!(
+            backend
+                .remove_conflict(&conflict_b.object_id, &conflict_b.conflict_id)
+                .expect("remove second conflict"),
+            Some(conflict_b.clone())
+        );
+        assert_eq!(
+            backend
+                .get_conflict(&conflict.object_id, &conflict.conflict_id)
+                .expect("resolved conflict removed"),
+            None
+        );
+        assert!(
+            backend
+                .all_conflicts()
+                .expect("all conflicts after removal")
+                .is_empty()
+        );
+        let journal = backend.journal_since(0).expect("journal after removals");
+        assert!(matches!(
+            journal.last().map(|entry| &entry.mutation),
+            Some(DfsMetadataMutation::PutConflict {
+                conflict_id,
+                conflict: None,
+                ..
+            }) if conflict_id == &conflict_b.conflict_id
+        ));
+        drop(backend);
+
+        let reopened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("reopen backend after conflict removals");
+        assert!(
+            reopened
+                .all_conflicts()
+                .expect("reopened all conflicts")
+                .is_empty()
         );
 
         cleanup(&root);

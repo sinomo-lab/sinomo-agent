@@ -305,6 +305,24 @@ pub(super) fn print_dfs_help() {
     );
     println!("      List conflict records.");
     println!(
+        "  sinomo dfs conflicts resolve (--path <path>|--object <object_id>) [--filesystem <file_system_id>] [--id <conflict_id>] [--delete-file] [--metadata-root <path>] [--json]"
+    );
+    println!("      Delete matching conflict records; optionally unlink the DFS file.");
+    println!(
+        "  sinomo dfs conflicts versions (--path <path>|--object <object_id>) [--filesystem <file_system_id>] [--id <conflict_id>] [--metadata-root <path>] [--json]"
+    );
+    println!("      Show the stored candidate versions for a conflicted DFS object.");
+    println!(
+        "  sinomo dfs conflicts use-version (--path <path>|--object <object_id>) --version <version> [--filesystem <file_system_id>] [--id <conflict_id>] [--metadata-root <path>] [--json]"
+    );
+    println!(
+        "      Make one stored conflict version visible and remove matching conflict records."
+    );
+    println!(
+        "  sinomo dfs conflicts save-version (--path <path>|--object <object_id>) --version <version> --to <path> [--filesystem <file_system_id>] [--id <conflict_id>] [--json]"
+    );
+    println!("      Copy one stored conflict version to a new DFS file for manual merge.");
+    println!(
         "  sinomo dfs repair [--filesystem <file_system_id>] [--object <object_id>] [--metadata-root <path>] [--json]"
     );
     println!("      List inferred missing replica repairs.");

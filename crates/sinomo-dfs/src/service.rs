@@ -30,7 +30,8 @@ use crate::{
     default_dfs_repair_attempt_snapshot_path, dfs_module_surfaces, dfs_route_is_message_data_plane,
     ensure_default_cluster_aware_dfs_expose_config, handle_dfs_direct_read_rpc_request,
     metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    read_dfs_repair_attempt_snapshot, sifs_file_system_id,
+    read_dfs_repair_attempt_snapshot, resolve_dfs_conflicts, sifs_file_system_id,
+    use_dfs_conflict_version,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
@@ -347,7 +348,7 @@ fn dfs_inspection(
     request: DaemonDfsInspectionRequest,
 ) -> Result<DaemonDfsInspectionResponse, ServiceError> {
     data_dir.ensure_root_layout().map_err(service_error)?;
-    let metadata = open_metadata_backend(data_dir)?;
+    let mut metadata = open_metadata_backend(data_dir)?;
     let inspector = DfsOperatorInspector::new(metadata.as_ref());
     let response = match request {
         DaemonDfsInspectionRequest::Status => {
@@ -391,6 +392,38 @@ fn dfs_inspection(
                 conflicts: page.conflicts,
                 next_cursor: page.next_cursor,
             }
+        }
+        DaemonDfsInspectionRequest::ResolveConflicts {
+            file_system_id,
+            object_id,
+            conflict_ids,
+        } => {
+            let report = resolve_dfs_conflicts(
+                metadata.as_mut(),
+                file_system_id.as_ref(),
+                object_id.as_ref(),
+                &conflict_ids,
+            )
+            .map_err(service_error)?;
+            DaemonDfsInspectionResponse::ResolveConflicts { report }
+        }
+        DaemonDfsInspectionRequest::ConflictVersions {
+            object_id,
+            conflict_ids,
+        } => DaemonDfsInspectionResponse::ConflictVersions {
+            report: inspector
+                .conflict_versions(&object_id, &conflict_ids)
+                .map_err(service_error)?,
+        },
+        DaemonDfsInspectionRequest::UseConflictVersion {
+            object_id,
+            version,
+            conflict_ids,
+        } => {
+            let report =
+                use_dfs_conflict_version(metadata.as_mut(), &object_id, &version, &conflict_ids)
+                    .map_err(service_error)?;
+            DaemonDfsInspectionResponse::UseConflictVersion { report }
         }
         DaemonDfsInspectionRequest::Repair {
             file_system_id,

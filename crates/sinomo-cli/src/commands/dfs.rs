@@ -22,6 +22,10 @@ pub(crate) enum DfsCliCommand {
         options: DfsCommonOptions,
     },
     Conflicts(DfsFilterOptions),
+    ResolveConflicts(DfsConflictResolveOptions),
+    ConflictVersions(DfsConflictVersionsOptions),
+    UseConflictVersion(DfsConflictUseVersionOptions),
+    SaveConflictVersion(DfsConflictSaveVersionOptions),
     Repair(DfsFilterOptions),
     Smoke {
         json: bool,
@@ -55,6 +59,46 @@ pub(crate) struct DfsFilterOptions {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct DfsConflictResolveOptions {
+    pub(crate) common: DfsCommonOptions,
+    pub(crate) file_system_id: DfsFileSystemId,
+    pub(crate) path: Option<String>,
+    pub(crate) object_id: Option<DfsObjectId>,
+    pub(crate) conflict_ids: Vec<String>,
+    pub(crate) delete_file: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct DfsConflictVersionsOptions {
+    pub(crate) common: DfsCommonOptions,
+    pub(crate) file_system_id: DfsFileSystemId,
+    pub(crate) path: Option<String>,
+    pub(crate) object_id: Option<DfsObjectId>,
+    pub(crate) conflict_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct DfsConflictUseVersionOptions {
+    pub(crate) common: DfsCommonOptions,
+    pub(crate) file_system_id: DfsFileSystemId,
+    pub(crate) path: Option<String>,
+    pub(crate) object_id: Option<DfsObjectId>,
+    pub(crate) version: DfsVersion,
+    pub(crate) conflict_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct DfsConflictSaveVersionOptions {
+    pub(crate) common: DfsCommonOptions,
+    pub(crate) file_system_id: DfsFileSystemId,
+    pub(crate) path: Option<String>,
+    pub(crate) object_id: Option<DfsObjectId>,
+    pub(crate) version: DfsVersion,
+    pub(crate) conflict_ids: Vec<String>,
+    pub(crate) destination_path: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct DfsMountOptions {
     pub(crate) mount_point: PathBuf,
     pub(crate) root_path: String,
@@ -79,6 +123,42 @@ struct DfsConflictCliPage {
     conflicts: Vec<DfsConflictRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DfsConflictResolveCliReport {
+    file_system_id: DfsFileSystemId,
+    object_id: DfsObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    deleted_file: bool,
+    removed: Vec<DfsConflictRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    not_found_conflict_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DfsConflictUseVersionCliReport {
+    file_system_id: DfsFileSystemId,
+    object_id: DfsObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    version: DfsVersion,
+    changed: bool,
+    removed: Vec<DfsConflictRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    not_found_conflict_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DfsConflictSaveVersionCliReport {
+    file_system_id: DfsFileSystemId,
+    object_id: DfsObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_path: Option<String>,
+    version: DfsVersion,
+    destination_path: String,
+    bytes_written: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -110,6 +190,13 @@ impl DfsInspectionMetadata {
         match self {
             Self::Root(backend) => DfsOperatorInspector::new(backend),
             Self::Sharded(backend) => DfsOperatorInspector::new(backend),
+        }
+    }
+
+    pub(crate) fn backend_mut(&mut self) -> &mut dyn DfsMetadataBackend {
+        match self {
+            Self::Root(backend) => backend,
+            Self::Sharded(backend) => backend,
         }
     }
 }
@@ -205,9 +292,7 @@ pub(crate) fn parse_dfs_command(args: &[String]) -> Result<DfsCliCommand, CliErr
                 options: parse_dfs_common_options(rest)?,
             })
         }
-        Some((command, rest)) if command == "conflicts" => {
-            Ok(DfsCliCommand::Conflicts(parse_dfs_filter_options(rest)?))
-        }
+        Some((command, rest)) if command == "conflicts" => parse_dfs_conflicts_command(rest),
         Some((command, rest)) if command == "repair" => {
             Ok(DfsCliCommand::Repair(parse_dfs_filter_options(rest)?))
         }
@@ -282,6 +367,24 @@ pub(crate) fn parse_dfs_path_command(args: &[String]) -> Result<DfsCliCommand, C
     })
 }
 
+pub(crate) fn parse_dfs_conflicts_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
+    match args.split_first() {
+        Some((command, rest)) if command == "resolve" => Ok(DfsCliCommand::ResolveConflicts(
+            parse_dfs_conflict_resolve_options(rest)?,
+        )),
+        Some((command, rest)) if command == "versions" => Ok(DfsCliCommand::ConflictVersions(
+            parse_dfs_conflict_versions_options(rest)?,
+        )),
+        Some((command, rest)) if command == "use-version" => Ok(DfsCliCommand::UseConflictVersion(
+            parse_dfs_conflict_use_version_options(rest)?,
+        )),
+        Some((command, rest)) if command == "save-version" => Ok(
+            DfsCliCommand::SaveConflictVersion(parse_dfs_conflict_save_version_options(rest)?),
+        ),
+        _ => Ok(DfsCliCommand::Conflicts(parse_dfs_filter_options(args)?)),
+    }
+}
+
 pub(crate) fn parse_dfs_filter_options(args: &[String]) -> Result<DfsFilterOptions, CliError> {
     let mut options = DfsFilterOptions::default();
     let mut index = 0;
@@ -330,6 +433,269 @@ pub(crate) fn parse_dfs_filter_options(args: &[String]) -> Result<DfsFilterOptio
         index += 1;
     }
     Ok(options)
+}
+
+pub(crate) fn parse_dfs_conflict_resolve_options(
+    args: &[String],
+) -> Result<DfsConflictResolveOptions, CliError> {
+    let mut common = DfsCommonOptions::default();
+    let mut file_system_id = default_dfs_file_system_id();
+    let mut path = None;
+    let mut object_id = None;
+    let mut conflict_ids = Vec::new();
+    let mut delete_file = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--metadata-root" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                common.metadata_root = Some(PathBuf::from(value));
+            }
+            "--filesystem" | "--fs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                file_system_id = parse_dfs_file_system_id(value)?;
+            }
+            "--path" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                path = Some(non_empty_string(value, "path")?);
+            }
+            "--object" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                object_id = Some(parse_dfs_object_id(value)?);
+            }
+            "--id" | "--conflict" | "--conflict-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                conflict_ids.push(non_empty_string(value, "conflict id")?);
+            }
+            "--delete-file" => delete_file = true,
+            "--json" => common.json = true,
+            _ => return Err(CliError::Usage),
+        }
+        index += 1;
+    }
+    if path.is_none() && object_id.is_none() {
+        return Err(CliError::Usage);
+    }
+    Ok(DfsConflictResolveOptions {
+        common,
+        file_system_id,
+        path,
+        object_id,
+        conflict_ids,
+        delete_file,
+    })
+}
+
+pub(crate) fn parse_dfs_conflict_versions_options(
+    args: &[String],
+) -> Result<DfsConflictVersionsOptions, CliError> {
+    let mut common = DfsCommonOptions::default();
+    let mut file_system_id = default_dfs_file_system_id();
+    let mut path = None;
+    let mut object_id = None;
+    let mut conflict_ids = Vec::new();
+    parse_dfs_conflict_target_options(
+        args,
+        &mut common,
+        &mut file_system_id,
+        &mut path,
+        &mut object_id,
+        &mut conflict_ids,
+        None,
+    )?;
+    if path.is_none() && object_id.is_none() {
+        return Err(CliError::Usage);
+    }
+    Ok(DfsConflictVersionsOptions {
+        common,
+        file_system_id,
+        path,
+        object_id,
+        conflict_ids,
+    })
+}
+
+pub(crate) fn parse_dfs_conflict_use_version_options(
+    args: &[String],
+) -> Result<DfsConflictUseVersionOptions, CliError> {
+    let mut common = DfsCommonOptions::default();
+    let mut file_system_id = default_dfs_file_system_id();
+    let mut path = None;
+    let mut object_id = None;
+    let mut conflict_ids = Vec::new();
+    let mut version = None;
+    parse_dfs_conflict_target_options(
+        args,
+        &mut common,
+        &mut file_system_id,
+        &mut path,
+        &mut object_id,
+        &mut conflict_ids,
+        Some(&mut version),
+    )?;
+    if path.is_none() && object_id.is_none() {
+        return Err(CliError::Usage);
+    }
+    Ok(DfsConflictUseVersionOptions {
+        common,
+        file_system_id,
+        path,
+        object_id,
+        version: version.ok_or(CliError::Usage)?,
+        conflict_ids,
+    })
+}
+
+pub(crate) fn parse_dfs_conflict_save_version_options(
+    args: &[String],
+) -> Result<DfsConflictSaveVersionOptions, CliError> {
+    let mut common = DfsCommonOptions::default();
+    let mut file_system_id = default_dfs_file_system_id();
+    let mut path = None;
+    let mut object_id = None;
+    let mut conflict_ids = Vec::new();
+    let mut version = None;
+    let mut destination_path = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--to" | "--destination" | "--dest" => {
+                index += 1;
+                destination_path = Some(non_empty_string(
+                    args.get(index).ok_or(CliError::Usage)?,
+                    "destination path",
+                )?);
+            }
+            _ => {
+                parse_one_dfs_conflict_target_option(
+                    args,
+                    &mut index,
+                    &mut common,
+                    &mut file_system_id,
+                    &mut path,
+                    &mut object_id,
+                    &mut conflict_ids,
+                    Some(&mut version),
+                )?;
+            }
+        }
+        index += 1;
+    }
+    if path.is_none() && object_id.is_none() {
+        return Err(CliError::Usage);
+    }
+    Ok(DfsConflictSaveVersionOptions {
+        common,
+        file_system_id,
+        path,
+        object_id,
+        version: version.ok_or(CliError::Usage)?,
+        conflict_ids,
+        destination_path: destination_path.ok_or(CliError::Usage)?,
+    })
+}
+
+fn parse_dfs_conflict_target_options(
+    args: &[String],
+    common: &mut DfsCommonOptions,
+    file_system_id: &mut DfsFileSystemId,
+    path: &mut Option<String>,
+    object_id: &mut Option<DfsObjectId>,
+    conflict_ids: &mut Vec<String>,
+    mut version: Option<&mut Option<DfsVersion>>,
+) -> Result<(), CliError> {
+    let mut index = 0;
+    while index < args.len() {
+        parse_one_dfs_conflict_target_option(
+            args,
+            &mut index,
+            common,
+            file_system_id,
+            path,
+            object_id,
+            conflict_ids,
+            version.as_deref_mut(),
+        )?;
+        index += 1;
+    }
+    Ok(())
+}
+
+fn parse_one_dfs_conflict_target_option(
+    args: &[String],
+    index: &mut usize,
+    common: &mut DfsCommonOptions,
+    file_system_id: &mut DfsFileSystemId,
+    path: &mut Option<String>,
+    object_id: &mut Option<DfsObjectId>,
+    conflict_ids: &mut Vec<String>,
+    version: Option<&mut Option<DfsVersion>>,
+) -> Result<(), CliError> {
+    match args[*index].as_str() {
+        "--metadata-root" => {
+            *index += 1;
+            let Some(value) = args.get(*index) else {
+                return Err(CliError::Usage);
+            };
+            common.metadata_root = Some(PathBuf::from(value));
+        }
+        "--filesystem" | "--fs" => {
+            *index += 1;
+            let Some(value) = args.get(*index) else {
+                return Err(CliError::Usage);
+            };
+            *file_system_id = parse_dfs_file_system_id(value)?;
+        }
+        "--path" => {
+            *index += 1;
+            let Some(value) = args.get(*index) else {
+                return Err(CliError::Usage);
+            };
+            *path = Some(non_empty_string(value, "path")?);
+        }
+        "--object" => {
+            *index += 1;
+            let Some(value) = args.get(*index) else {
+                return Err(CliError::Usage);
+            };
+            *object_id = Some(parse_dfs_object_id(value)?);
+        }
+        "--id" | "--conflict" | "--conflict-id" => {
+            *index += 1;
+            let Some(value) = args.get(*index) else {
+                return Err(CliError::Usage);
+            };
+            conflict_ids.push(non_empty_string(value, "conflict id")?);
+        }
+        "--version" => {
+            let Some(version) = version else {
+                return Err(CliError::Usage);
+            };
+            *index += 1;
+            let Some(value) = args.get(*index) else {
+                return Err(CliError::Usage);
+            };
+            *version = Some(parse_dfs_version(value)?);
+        }
+        "--json" => common.json = true,
+        _ => return Err(CliError::Usage),
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_dfs_services_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
@@ -792,7 +1158,38 @@ fn run_dfs_inspection_against_metadata_root(
     metadata_root: PathBuf,
     request: DaemonDfsInspectionRequest,
 ) -> Result<DaemonDfsInspectionResponse, CliError> {
-    let metadata = open_dfs_metadata_for_inspection(Some(metadata_root))?;
+    let mut metadata = open_dfs_metadata_for_inspection(Some(metadata_root))?;
+    let request = match request {
+        DaemonDfsInspectionRequest::ResolveConflicts {
+            file_system_id,
+            object_id,
+            conflict_ids,
+        } => {
+            return Ok(DaemonDfsInspectionResponse::ResolveConflicts {
+                report: sinomo_runtime::dfs::resolve_dfs_conflicts(
+                    metadata.backend_mut(),
+                    file_system_id.as_ref(),
+                    object_id.as_ref(),
+                    &conflict_ids,
+                )?,
+            });
+        }
+        DaemonDfsInspectionRequest::UseConflictVersion {
+            object_id,
+            version,
+            conflict_ids,
+        } => {
+            return Ok(DaemonDfsInspectionResponse::UseConflictVersion {
+                report: sinomo_runtime::dfs::use_dfs_conflict_version(
+                    metadata.backend_mut(),
+                    &object_id,
+                    &version,
+                    &conflict_ids,
+                )?,
+            });
+        }
+        request => request,
+    };
     let inspector = metadata.inspector();
     Ok(match request {
         DaemonDfsInspectionRequest::Status => DaemonDfsInspectionResponse::Status {
@@ -829,6 +1226,14 @@ fn run_dfs_inspection_against_metadata_root(
                 next_cursor: page.next_cursor,
             }
         }
+        DaemonDfsInspectionRequest::ResolveConflicts { .. } => unreachable!(),
+        DaemonDfsInspectionRequest::ConflictVersions {
+            object_id,
+            conflict_ids,
+        } => DaemonDfsInspectionResponse::ConflictVersions {
+            report: inspector.conflict_versions(&object_id, &conflict_ids)?,
+        },
+        DaemonDfsInspectionRequest::UseConflictVersion { .. } => unreachable!(),
         DaemonDfsInspectionRequest::Repair {
             file_system_id,
             object_id,
@@ -1028,6 +1433,14 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
                 }
             }
             Ok(())
+        }
+        DfsCliCommand::ResolveConflicts(options) => run_dfs_conflicts_resolve_command(options),
+        DfsCliCommand::ConflictVersions(options) => run_dfs_conflicts_versions_command(options),
+        DfsCliCommand::UseConflictVersion(options) => {
+            run_dfs_conflicts_use_version_command(options)
+        }
+        DfsCliCommand::SaveConflictVersion(options) => {
+            run_dfs_conflicts_save_version_command(options)
         }
         DfsCliCommand::Repair(options) => {
             let DaemonDfsInspectionResponse::Repair {
@@ -1280,6 +1693,470 @@ fn run_dfs_metadata_shard_transfer_primary(
     };
     print_dfs_metadata_shard_transfer_primary_report(&report, options.json)?;
     Ok(())
+}
+
+fn resolve_dfs_conflict_target(
+    common: &DfsCommonOptions,
+    file_system_id: &DfsFileSystemId,
+    path: Option<&String>,
+    explicit_object_id: Option<&DfsObjectId>,
+) -> Result<(DfsObjectId, Option<String>), CliError> {
+    if let Some(requested_path) = path {
+        let DaemonDfsInspectionResponse::Path { object } = run_dfs_inspection(
+            common,
+            DaemonDfsInspectionRequest::Path {
+                file_system_id: file_system_id.clone(),
+                path: requested_path.clone(),
+            },
+        )?
+        else {
+            return Err(CliError::Usage);
+        };
+        let Some(object) = object else {
+            return Err(CliError::MissingArtifact {
+                artifact: format!("DFS path {requested_path} in filesystem {file_system_id}"),
+            });
+        };
+        if let Some(explicit_object_id) = explicit_object_id
+            && explicit_object_id != &object.object.object_id
+        {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "DFS path {} resolved to object {}, not requested object {}",
+                    requested_path, object.object.object_id, explicit_object_id
+                ),
+            });
+        }
+        return Ok((object.object.object_id.clone(), Some(object.object.path)));
+    }
+
+    let object_id = explicit_object_id.cloned().ok_or(CliError::Usage)?;
+    Ok((object_id, None))
+}
+
+fn run_dfs_conflicts_resolve_command(options: DfsConflictResolveOptions) -> Result<(), CliError> {
+    if options.common.metadata_root.is_some() && options.delete_file {
+        return Err(CliError::Parse {
+            detail: "--delete-file cannot be used with --metadata-root".to_string(),
+        });
+    }
+
+    let mut object_id = options.object_id.clone();
+    let mut path = options.path.clone();
+    if let Some(requested_path) = options.path.as_ref() {
+        let DaemonDfsInspectionResponse::Path { object } = run_dfs_inspection(
+            &options.common,
+            DaemonDfsInspectionRequest::Path {
+                file_system_id: options.file_system_id.clone(),
+                path: requested_path.clone(),
+            },
+        )?
+        else {
+            return Err(CliError::Usage);
+        };
+        let Some(object) = object else {
+            return Err(CliError::MissingArtifact {
+                artifact: format!(
+                    "DFS path {} in filesystem {}",
+                    requested_path, options.file_system_id
+                ),
+            });
+        };
+        if let Some(explicit_object_id) = object_id.as_ref()
+            && explicit_object_id != &object.object.object_id
+        {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "DFS path {} resolved to object {}, not requested object {}",
+                    requested_path, object.object.object_id, explicit_object_id
+                ),
+            });
+        }
+        object_id = Some(object.object.object_id.clone());
+        path = Some(object.object.path.clone());
+    }
+
+    let object_id = object_id.ok_or(CliError::Usage)?;
+    if options.delete_file && path.is_none() {
+        let DaemonDfsInspectionResponse::Object { object } = run_dfs_inspection(
+            &options.common,
+            DaemonDfsInspectionRequest::Object {
+                object_id: object_id.clone(),
+            },
+        )?
+        else {
+            return Err(CliError::Usage);
+        };
+        let Some(object) = object else {
+            return Err(CliError::MissingArtifact {
+                artifact: format!("DFS object {object_id}"),
+            });
+        };
+        path = Some(object.object.path.clone());
+    }
+
+    let DaemonDfsInspectionResponse::ResolveConflicts { report } = run_dfs_inspection(
+        &options.common,
+        DaemonDfsInspectionRequest::ResolveConflicts {
+            file_system_id: Some(options.file_system_id.clone()),
+            object_id: Some(object_id.clone()),
+            conflict_ids: options.conflict_ids.clone(),
+        },
+    )?
+    else {
+        return Err(CliError::Usage);
+    };
+
+    let mut deleted_file = false;
+    if options.delete_file {
+        let Some(path_to_delete) = path.as_ref() else {
+            return Err(CliError::Parse {
+                detail: "cannot delete DFS file without a resolved path".to_string(),
+            });
+        };
+        delete_dfs_file_for_conflict_resolution(path_to_delete)?;
+        deleted_file = true;
+    }
+
+    if options.common.json {
+        print_json(
+            "<dfs-conflicts-resolve>",
+            &DfsConflictResolveCliReport {
+                file_system_id: options.file_system_id,
+                object_id,
+                path,
+                deleted_file,
+                removed: report.removed,
+                not_found_conflict_ids: report.not_found_conflict_ids,
+            },
+        )?;
+    } else {
+        if report.removed.is_empty() {
+            println!("No matching DFS conflicts.");
+        } else {
+            println!("Resolved {} DFS conflict record(s).", report.removed.len());
+            for conflict in &report.removed {
+                println!(
+                    "  {} object={} path={}",
+                    conflict.conflict_id, conflict.object_id, conflict.path
+                );
+            }
+        }
+        if deleted_file && let Some(path) = path.as_ref() {
+            println!("Deleted DFS file: {path}");
+        }
+        if !report.not_found_conflict_ids.is_empty() {
+            println!(
+                "Conflict id(s) not found: {}",
+                report.not_found_conflict_ids.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_dfs_conflicts_versions_command(options: DfsConflictVersionsOptions) -> Result<(), CliError> {
+    let (object_id, _path) = resolve_dfs_conflict_target(
+        &options.common,
+        &options.file_system_id,
+        options.path.as_ref(),
+        options.object_id.as_ref(),
+    )?;
+    let DaemonDfsInspectionResponse::ConflictVersions { report } = run_dfs_inspection(
+        &options.common,
+        DaemonDfsInspectionRequest::ConflictVersions {
+            object_id: object_id.clone(),
+            conflict_ids: options.conflict_ids.clone(),
+        },
+    )?
+    else {
+        return Err(CliError::Usage);
+    };
+    let Some(report) = report else {
+        return Err(CliError::MissingArtifact {
+            artifact: format!("DFS object {object_id}"),
+        });
+    };
+    if options.common.json {
+        print_json("<dfs-conflict-versions>", &report)
+    } else {
+        print_dfs_conflict_versions_report(&report);
+        Ok(())
+    }
+}
+
+fn run_dfs_conflicts_use_version_command(
+    options: DfsConflictUseVersionOptions,
+) -> Result<(), CliError> {
+    let (object_id, path) = resolve_dfs_conflict_target(
+        &options.common,
+        &options.file_system_id,
+        options.path.as_ref(),
+        options.object_id.as_ref(),
+    )?;
+    let DaemonDfsInspectionResponse::UseConflictVersion { report } = run_dfs_inspection(
+        &options.common,
+        DaemonDfsInspectionRequest::UseConflictVersion {
+            object_id: object_id.clone(),
+            version: options.version.clone(),
+            conflict_ids: options.conflict_ids.clone(),
+        },
+    )?
+    else {
+        return Err(CliError::Usage);
+    };
+
+    if options.common.json {
+        print_json(
+            "<dfs-conflicts-use-version>",
+            &DfsConflictUseVersionCliReport {
+                file_system_id: options.file_system_id,
+                object_id,
+                path,
+                version: options.version,
+                changed: report.changed,
+                removed: report.removed,
+                not_found_conflict_ids: report.not_found_conflict_ids,
+            },
+        )?;
+    } else {
+        if report.changed {
+            println!(
+                "DFS object {} now uses version {}.",
+                report.committed_object.object_id, report.committed_object.version
+            );
+        } else {
+            println!(
+                "DFS object {} already used version {}.",
+                report.committed_object.object_id, report.committed_object.version
+            );
+        }
+        if report.removed.is_empty() {
+            println!("No matching DFS conflict records were removed.");
+        } else {
+            println!("Removed {} DFS conflict record(s).", report.removed.len());
+            for conflict in &report.removed {
+                println!("  {}", conflict.conflict_id);
+            }
+        }
+        if !report.not_found_conflict_ids.is_empty() {
+            println!(
+                "Conflict id(s) not found: {}",
+                report.not_found_conflict_ids.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_dfs_conflicts_save_version_command(
+    options: DfsConflictSaveVersionOptions,
+) -> Result<(), CliError> {
+    if options.common.metadata_root.is_some() {
+        return Err(CliError::Parse {
+            detail: "conflicts save-version needs DFS content and cannot use --metadata-root"
+                .to_string(),
+        });
+    }
+    let (object_id, source_path) = resolve_dfs_conflict_target(
+        &options.common,
+        &options.file_system_id,
+        options.path.as_ref(),
+        options.object_id.as_ref(),
+    )?;
+    let version = find_dfs_conflict_version(
+        &options.common,
+        &object_id,
+        &options.version,
+        options.conflict_ids.clone(),
+    )?;
+    let content_hash = version
+        .content_hash
+        .clone()
+        .ok_or_else(|| CliError::Parse {
+            detail: format!(
+                "DFS object {object_id} version {} does not have file content",
+                options.version
+            ),
+        })?;
+    let bytes = read_dfs_object_version_content(
+        &object_id,
+        &options.version,
+        &content_hash,
+        version.size_bytes,
+    )?;
+    write_dfs_file_for_conflict_version(&options.destination_path, &bytes)?;
+    if options.common.json {
+        print_json(
+            "<dfs-conflicts-save-version>",
+            &DfsConflictSaveVersionCliReport {
+                file_system_id: options.file_system_id,
+                object_id,
+                source_path,
+                version: options.version,
+                destination_path: options.destination_path,
+                bytes_written: bytes.len(),
+            },
+        )?;
+    } else {
+        println!(
+            "Saved DFS object {} version {} to {} ({} bytes).",
+            object_id,
+            options.version,
+            options.destination_path,
+            bytes.len()
+        );
+    }
+    Ok(())
+}
+
+fn find_dfs_conflict_version(
+    common: &DfsCommonOptions,
+    object_id: &DfsObjectId,
+    version: &DfsVersion,
+    conflict_ids: Vec<String>,
+) -> Result<DfsOperatorConflictVersionView, CliError> {
+    let DaemonDfsInspectionResponse::ConflictVersions { report } = run_dfs_inspection(
+        common,
+        DaemonDfsInspectionRequest::ConflictVersions {
+            object_id: object_id.clone(),
+            conflict_ids,
+        },
+    )?
+    else {
+        return Err(CliError::Usage);
+    };
+    let Some(report) = report else {
+        return Err(CliError::MissingArtifact {
+            artifact: format!("DFS object {object_id}"),
+        });
+    };
+    report
+        .versions
+        .into_iter()
+        .find(|candidate| &candidate.version == version)
+        .ok_or_else(|| CliError::MissingArtifact {
+            artifact: format!("DFS object {object_id} version {version}"),
+        })
+}
+
+fn read_dfs_object_version_content(
+    object_id: &DfsObjectId,
+    version: &DfsVersion,
+    content_hash: &str,
+    size_bytes: Option<u64>,
+) -> Result<Vec<u8>, CliError> {
+    if let Some(status) = default_main_daemon_status()? {
+        let request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
+            sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
+            &sinomo_runtime::daemon::DaemonDfsBrowserReadObjectVersionRequest {
+                object_id: object_id.to_string(),
+                version: version.to_string(),
+                content_hash: content_hash.to_string(),
+                size_bytes,
+            },
+        )?;
+        let response = daemon_send_daemon_rpc(
+            &status.address,
+            &request,
+            std::time::Duration::from_secs(30),
+        )?;
+        let response: sinomo_runtime::daemon::DaemonDfsBrowserReadObjectVersionResponse =
+            response.decode_body()?;
+        return Ok(response.bytes);
+    }
+
+    let opened = sinomo_runtime::dfs::open_mounted_sifs_service(None)?;
+    opened
+        .service
+        .read_object_version_content(object_id, version, content_hash, size_bytes)
+        .map_err(|source| CliError::Parse {
+            detail: format!("cannot read DFS object {object_id} version {version}: {source}"),
+        })
+}
+
+fn write_dfs_file_for_conflict_version(path: &str, bytes: &[u8]) -> Result<(), CliError> {
+    if let Some(status) = default_main_daemon_status()? {
+        let request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+            sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
+            &sinomo_runtime::daemon::DaemonDfsBrowserWriteFileRequest {
+                path: path.to_string(),
+                bytes: bytes.to_vec(),
+            },
+        )?;
+        let response = daemon_send_daemon_rpc(
+            &status.address,
+            &request,
+            std::time::Duration::from_secs(30),
+        )?;
+        let _: sinomo_runtime::daemon::DaemonDfsBrowserWriteFileResponse =
+            response.decode_body()?;
+        return Ok(());
+    }
+
+    let mut opened = sinomo_runtime::dfs::open_mounted_sifs_service(None)?;
+    if let Some(parent) = dfs_parent_path(path) {
+        opened
+            .service
+            .posix_mkdir_all(&parent)
+            .map_err(|source| CliError::Parse {
+                detail: format!("cannot create DFS directory {parent}: {source}"),
+            })?;
+    }
+    let mut candidates = opened.replica_candidates.clone();
+    if !candidates.contains(opened.service.node_id()) {
+        candidates.insert(0, opened.service.node_id().clone());
+    }
+    let mut write_options = sinomo_runtime::dfs::DfsWriteOptions::replicated_eventual(candidates);
+    write_options.foreground_replica_repair = false;
+    opened
+        .service
+        .posix_write_file(path, bytes, write_options)
+        .map(drop)
+        .map_err(|source| CliError::Parse {
+            detail: format!("cannot write DFS file {path}: {source}"),
+        })
+}
+
+fn dfs_parent_path(path: &str) -> Option<String> {
+    let normalized = path.trim();
+    let index = normalized.rfind('/')?;
+    if index == 0 {
+        Some("/".to_string())
+    } else {
+        Some(normalized[..index].to_string())
+    }
+}
+
+fn delete_dfs_file_for_conflict_resolution(path: &str) -> Result<(), CliError> {
+    if let Some(status) = default_main_daemon_status()? {
+        let request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_DELETE_ROUTE,
+            sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
+            &sinomo_runtime::daemon::DaemonDfsBrowserDeleteRequest {
+                path: path.to_string(),
+                directory: false,
+            },
+        )?;
+        let response = daemon_send_daemon_rpc(
+            &status.address,
+            &request,
+            std::time::Duration::from_secs(10),
+        )?;
+        let _: sinomo_runtime::daemon::DaemonDfsBrowserDeleteResponse = response.decode_body()?;
+        return Ok(());
+    }
+
+    let mut opened = sinomo_runtime::dfs::open_mounted_sifs_service(None)?;
+    opened
+        .service
+        .posix_unlink(path)
+        .map(drop)
+        .map_err(|source| CliError::Parse {
+            detail: format!("cannot delete DFS file {path}: {source}"),
+        })
 }
 
 fn print_dfs_metadata_shard_transfer_primary_report(
@@ -2019,6 +2896,50 @@ fn print_dfs_object_view(object: &sinomo_runtime::dfs::DfsOperatorObjectView) {
     );
 }
 
+fn print_dfs_conflict_versions_report(report: &DfsOperatorConflictVersionsReport) {
+    println!("DFS conflict versions: {}", report.object.object_id);
+    println!("  path: {}", report.object.path);
+    println!("  current: {}", report.object.version);
+    if report.conflicts.is_empty() {
+        println!("  conflicts: none");
+    } else {
+        println!("  conflicts: {}", report.conflicts.len());
+    }
+    if report.versions.is_empty() {
+        println!("No conflict versions.");
+        return;
+    }
+    for version in &report.versions {
+        let roles = version
+            .roles
+            .iter()
+            .map(|role| {
+                role.conflict_id
+                    .as_ref()
+                    .map(|id| format!("{}:{id}", role.role))
+                    .unwrap_or_else(|| role.role.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "  {} roles=[{}] hash={} size={} stored={} visible={} current={}",
+            version.version,
+            roles,
+            option_label(&version.content_hash),
+            version
+                .size_bytes
+                .map(|size| size.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            version.stored,
+            version.visible,
+            version.current
+        );
+        if !version.locations.is_empty() {
+            println!("    locations: {}", join_labels(&version.locations));
+        }
+    }
+}
+
 pub(crate) fn run_dfs_expose_command(command: DfsExposeCliCommand) -> Result<(), CliError> {
     match command {
         DfsExposeCliCommand::Init(options) => {
@@ -2263,6 +3184,12 @@ pub(crate) fn default_dfs_file_system_id() -> DfsFileSystemId {
 pub(crate) fn parse_dfs_object_id(value: &str) -> Result<DfsObjectId, CliError> {
     DfsObjectId::new(value).map_err(|source| CliError::Parse {
         detail: format!("invalid DFS object id `{value}`: {source}"),
+    })
+}
+
+pub(crate) fn parse_dfs_version(value: &str) -> Result<DfsVersion, CliError> {
+    DfsVersion::new(value).map_err(|source| CliError::Parse {
+        detail: format!("invalid DFS version `{value}`: {source}"),
     })
 }
 
