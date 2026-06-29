@@ -3714,14 +3714,27 @@ fn chats_heading_text(chat: &ChatState) -> String {
     }
 }
 
-fn empty_sessions_label(filter: &str, kind_filter: SessionKindFilter) -> &'static str {
+fn empty_sessions_copy(
+    chat: &ChatState,
+    filter: &str,
+    kind_filter: SessionKindFilter,
+) -> (&'static str, Option<&'static str>) {
     if !filter.is_empty() {
-        return "No matching conversations";
+        return ("No matching conversations", None);
+    }
+    if chat.visible_session_has_started()
+        && !chat.current_is_channel()
+        && matches!(
+            kind_filter,
+            SessionKindFilter::All | SessionKindFilter::Chats
+        )
+    {
+        return ("Current chat is open", Some("Saved after SIFS confirms"));
     }
     match kind_filter {
-        SessionKindFilter::All => "No conversations yet",
-        SessionKindFilter::Chats => "No chats yet",
-        SessionKindFilter::Channels => "No channels yet",
+        SessionKindFilter::All => ("No conversations yet", None),
+        SessionKindFilter::Chats => ("No chats yet", None),
+        SessionKindFilter::Channels => ("No channels yet", None),
     }
 }
 
@@ -3817,13 +3830,17 @@ fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 /// Build the CHATS ListView: stored chats/channels only. Creation actions live
 /// above the scroll area so the list itself behaves like persistent history.
 fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (sessions, filter, kind_filter, loading) = {
+    let (sessions, filter, kind_filter, loading, empty_copy) = {
         let chat = shared.chat();
+        let filter = normalized_session_filter(&chat.session_filter);
+        let kind_filter = chat.session_kind_filter;
+        let empty_copy = empty_sessions_copy(&chat, &filter, kind_filter);
         (
             chat.sessions.clone(),
-            normalized_session_filter(&chat.session_filter),
-            chat.session_kind_filter,
+            filter,
+            kind_filter,
             chat.session_list_loading,
+            empty_copy,
         )
     };
     let visible_indices = filtered_session_indices(&sessions, &filter, kind_filter);
@@ -3842,11 +3859,12 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 .disabled(),
         );
     } else if visible_indices.is_empty() {
-        items.push(
-            ListItem::new(empty_sessions_label(&filter, kind_filter))
-                .leading_text(" ")
-                .disabled(),
-        );
+        let (label, detail) = empty_copy;
+        let mut item = ListItem::new(label).leading_text(" ").disabled();
+        if let Some(detail) = detail {
+            item = item.detail(detail);
+        }
+        items.push(item);
     }
     let s = shared.clone();
     ListView::new("chat-sessions")
@@ -7970,6 +7988,7 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.activity_panel_visible().hash(&mut h);
     chat.session_list_loading.hash(&mut h);
     chat.session_kind_filter.hash(&mut h);
+    chat.visible_session_has_started().hash(&mut h);
     chat.runtime_recovery_target()
         .map(RuntimeRecoveryTarget::key)
         .unwrap_or("none")
@@ -8640,6 +8659,35 @@ mod tests {
         assert_eq!(
             session_kind_filter_count_label(&state.sessions, SessionKindFilter::All, true),
             "1"
+        );
+    }
+
+    #[test]
+    fn empty_sessions_copy_reflects_active_unlisted_chat() {
+        let (_backend, mut state) = isolated_chat_state("active-unlisted-chat-copy");
+        assert_eq!(
+            empty_sessions_copy(&state, "", SessionKindFilter::All),
+            ("No conversations yet", None)
+        );
+
+        state
+            .messages
+            .push(ChatMessage::user("Draft a rollout plan."));
+        assert_eq!(
+            empty_sessions_copy(&state, "", SessionKindFilter::All),
+            ("Current chat is open", Some("Saved after SIFS confirms"))
+        );
+        assert_eq!(
+            empty_sessions_copy(&state, "", SessionKindFilter::Chats),
+            ("Current chat is open", Some("Saved after SIFS confirms"))
+        );
+        assert_eq!(
+            empty_sessions_copy(&state, "", SessionKindFilter::Channels),
+            ("No channels yet", None)
+        );
+        assert_eq!(
+            empty_sessions_copy(&state, "release", SessionKindFilter::All),
+            ("No matching conversations", None)
         );
     }
 
