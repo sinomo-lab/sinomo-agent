@@ -1191,13 +1191,15 @@ impl Widget for EvolutionView {
     fn paint(&self, ctx: &mut PaintCtx) {
         let (theme, pal) = self.palette();
         let bounds = ctx.bounds();
-        let (dashboard, selected, advanced_open, readiness_details_open) = {
+        let (dashboard, selected, advanced_open, readiness_details_open, start_ready, starting) = {
             let state = self.shared.evolution();
             (
                 state.dashboard.clone(),
                 state.selected,
                 state.start_advanced_open,
                 state.readiness_details_open,
+                state.can_start(),
+                state.is_starting(),
             )
         };
         let layout = layout_for(bounds, advanced_open);
@@ -1217,7 +1219,15 @@ impl Widget for EvolutionView {
         );
         self.start.paint(ctx);
         paint_queue(ctx, &theme, &pal, layout.queue, &dashboard, selected);
-        paint_detail(ctx, &theme, &pal, layout.detail, selected_job);
+        paint_detail(
+            ctx,
+            &theme,
+            &pal,
+            layout.detail,
+            selected_job,
+            start_ready,
+            starting,
+        );
         if let Some(rail) = layout.rail {
             let action = {
                 let state = self.shared.evolution();
@@ -1798,10 +1808,12 @@ fn paint_detail(
     pal: &Palette,
     rect: Rect,
     job: Option<&EvolutionJobSummary>,
+    start_ready: bool,
+    starting: bool,
 ) {
     let inner = rect.inflate(-PAD, -PAD);
     let Some(job) = job else {
-        paint_detail_empty(ctx, theme, pal, inner);
+        paint_detail_empty(ctx, theme, pal, inner, start_ready, starting);
         return;
     };
 
@@ -1892,7 +1904,14 @@ fn paint_detail(
     );
 }
 
-fn paint_detail_empty(ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette, rect: Rect) {
+fn paint_detail_empty(
+    ctx: &mut PaintCtx,
+    theme: &sui::DefaultTheme,
+    pal: &Palette,
+    rect: Rect,
+    start_ready: bool,
+    starting: bool,
+) {
     let panel_w = rect.width().min(420.0);
     let panel_h = 154.0;
     let panel = Rect::new(
@@ -1911,7 +1930,7 @@ fn paint_detail_empty(ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palet
     );
     widgets::draw_centered(
         ctx,
-        EVOLUTION_EMPTY_SUBTITLE,
+        empty_detail_subtitle(start_ready, starting),
         pal.text_style(theme, 13.0, FontWeight::NORMAL, pal.text_faint),
         panel.x() + panel.width() / 2.0,
         panel.y() + 58.0,
@@ -1926,20 +1945,37 @@ fn paint_detail_empty(ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palet
             panel.width() - 28.0,
             60.0,
         ),
-        &empty_detail_rows(),
+        &empty_detail_rows(start_ready, starting),
     );
 }
 
-fn empty_detail_rows() -> Vec<(String, String)> {
+fn empty_detail_subtitle(start_ready: bool, starting: bool) -> &'static str {
+    if starting {
+        "Starting the evolution agent."
+    } else if start_ready {
+        "Objective ready. Press Start to create a candidate."
+    } else {
+        EVOLUTION_EMPTY_SUBTITLE
+    }
+}
+
+fn empty_detail_rows(start_ready: bool, starting: bool) -> Vec<(String, String)> {
+    let (next, options) = if starting {
+        (
+            "wait for the candidate queue",
+            "scope and target ring are locked",
+        )
+    } else if start_ready {
+        ("press Start above", "review scope and target ring")
+    } else {
+        (
+            "describe the improvement above",
+            "scope and target ring are optional",
+        )
+    };
     vec![
-        (
-            "Next".to_string(),
-            "describe the improvement above".to_string(),
-        ),
-        (
-            "Options".to_string(),
-            "scope and target ring are optional".to_string(),
-        ),
+        ("Next".to_string(), next.to_string()),
+        ("Options".to_string(), options.to_string()),
     ]
 }
 
@@ -2635,7 +2671,11 @@ mod tests {
             EVOLUTION_EMPTY_SUBTITLE,
             "Describe an objective above, then Start."
         );
-        let rows = empty_detail_rows();
+        assert_eq!(
+            empty_detail_subtitle(false, false),
+            "Describe an objective above, then Start."
+        );
+        let rows = empty_detail_rows(false, false);
         assert!(
             rows.iter()
                 .any(|(label, value)| label == "Next" && value == "describe the improvement above")
@@ -2652,6 +2692,38 @@ mod tests {
             rows.iter()
                 .all(|(_, value)| !value.contains("no candidate selected"))
         );
+    }
+
+    #[test]
+    fn ready_evolution_empty_state_points_to_start_action() {
+        assert_eq!(
+            empty_detail_subtitle(true, false),
+            "Objective ready. Press Start to create a candidate."
+        );
+        let rows = empty_detail_rows(true, false);
+        assert!(
+            rows.iter()
+                .any(|(label, value)| label == "Next" && value == "press Start above")
+        );
+        assert!(rows
+            .iter()
+            .any(|(label, value)| label == "Options" && value == "review scope and target ring"));
+    }
+
+    #[test]
+    fn starting_evolution_empty_state_points_to_candidate_queue() {
+        assert_eq!(
+            empty_detail_subtitle(false, true),
+            "Starting the evolution agent."
+        );
+        let rows = empty_detail_rows(false, true);
+        assert!(
+            rows.iter()
+                .any(|(label, value)| label == "Next" && value == "wait for the candidate queue")
+        );
+        assert!(rows.iter().any(
+            |(label, value)| label == "Options" && value == "scope and target ring are locked"
+        ));
     }
 
     #[test]
