@@ -8244,10 +8244,11 @@ impl InspectorView {
 
     fn measured_content_height(&self, _ctx: &mut MeasureCtx, width: f32) -> f32 {
         let w = (width - INSPECTOR_PAD * 2.0).max(0.0);
-        let mut y = INSPECTOR_STATE_PANEL_Y;
         let files = self.shared.files();
+        let mut y = inspector_state_panel_y(&files.tasks);
 
-        let finish = |end_y: f32| (end_y + INSPECTOR_BOTTOM_PAD).max(INSPECTOR_MIN_CONTENT_H);
+        let finish =
+            |end_y: f32| (end_y + INSPECTOR_BOTTOM_PAD).max(inspector_min_content_h(&files.tasks));
 
         if files.loading {
             let rows = sifs_loading_rows(&files.path, files.inspector_details_open);
@@ -8272,7 +8273,7 @@ impl InspectorView {
 
         let actions = inspector_actions(&files, entry);
         if !actions.is_empty() {
-            let action_start = INSPECTOR_PAD + 4.0 + 30.0 + 26.0 + 30.0;
+            let action_start = inspector_state_panel_y(&files.tasks) + 26.0 + 30.0;
             y = (action_start + inspector_actions_height(actions.len())).max(y) + 12.0;
         }
 
@@ -8487,13 +8488,27 @@ const INSPECTOR_DETAIL_BUTTON_W: f32 = 104.0;
 const INSPECTOR_DETAIL_BUTTON_H: f32 = 24.0;
 const INSPECTOR_ACTION_BUTTON_H: f32 = 28.0;
 const INSPECTOR_ACTION_GAP: f32 = 8.0;
-const INSPECTOR_TASK_PANEL_H: f32 = 160.0;
+const INSPECTOR_TASK_PANEL_MIN_H: f32 = 160.0;
 const INSPECTOR_TASK_ROW_H: f32 = 29.0;
 const INSPECTOR_TASK_CANCEL_W: f32 = 58.0;
 const INSPECTOR_TASK_PANEL_Y: f32 = INSPECTOR_PAD + 34.0;
-const INSPECTOR_STATE_PANEL_Y: f32 = INSPECTOR_TASK_PANEL_Y + INSPECTOR_TASK_PANEL_H + 12.0;
-const INSPECTOR_MIN_CONTENT_H: f32 = INSPECTOR_STATE_PANEL_Y + 170.0;
 const INSPECTOR_BOTTOM_PAD: f32 = 18.0;
+const INSPECTOR_STATE_PANEL_MIN_EXTRA_H: f32 = 170.0;
+
+fn inspector_task_panel_height(tasks: &[FilesTask]) -> f32 {
+    if tasks.is_empty() {
+        return INSPECTOR_TASK_PANEL_MIN_H;
+    }
+    (46.0 + tasks.len() as f32 * INSPECTOR_TASK_ROW_H + 12.0).max(INSPECTOR_TASK_PANEL_MIN_H)
+}
+
+fn inspector_state_panel_y(tasks: &[FilesTask]) -> f32 {
+    INSPECTOR_TASK_PANEL_Y + inspector_task_panel_height(tasks) + 12.0
+}
+
+fn inspector_min_content_h(tasks: &[FilesTask]) -> f32 {
+    inspector_state_panel_y(tasks) + INSPECTOR_STATE_PANEL_MIN_EXTRA_H
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InspectorAction {
@@ -8677,13 +8692,13 @@ fn inspector_detail_button_label(details_open: bool) -> &'static str {
     }
 }
 
-fn inspector_detail_button_rect(bounds: Rect) -> Rect {
+fn inspector_detail_button_rect(bounds: Rect, tasks: &[FilesTask]) -> Rect {
     let content_x = bounds.x() + INSPECTOR_PAD;
     let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
     let button_w = INSPECTOR_DETAIL_BUTTON_W.min((content_w - 24.0).max(0.0));
     Rect::new(
         content_x + content_w - 12.0 - button_w,
-        bounds.y() + INSPECTOR_STATE_PANEL_Y + 8.0,
+        bounds.y() + inspector_state_panel_y(tasks) + 8.0,
         button_w,
         INSPECTOR_DETAIL_BUTTON_H,
     )
@@ -8693,11 +8708,11 @@ fn inspector_detail_button_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
     sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(7_401))
 }
 
-fn inspector_actions_origin_y(bounds: Rect) -> f32 {
-    bounds.y() + INSPECTOR_STATE_PANEL_Y + 26.0 + 30.0
+fn inspector_actions_origin_y(bounds: Rect, tasks: &[FilesTask]) -> f32 {
+    bounds.y() + inspector_state_panel_y(tasks) + 26.0 + 30.0
 }
 
-fn inspector_action_button_rect(bounds: Rect, index: usize) -> Rect {
+fn inspector_action_button_rect(bounds: Rect, tasks: &[FilesTask], index: usize) -> Rect {
     let content_x = bounds.x() + INSPECTOR_PAD;
     let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
     let col_w = ((content_w - INSPECTOR_ACTION_GAP) * 0.5).max(0.0);
@@ -8705,7 +8720,7 @@ fn inspector_action_button_rect(bounds: Rect, index: usize) -> Rect {
     let row = index / 2;
     Rect::new(
         content_x + col as f32 * (col_w + INSPECTOR_ACTION_GAP),
-        inspector_actions_origin_y(bounds)
+        inspector_actions_origin_y(bounds, tasks)
             + row as f32 * (INSPECTOR_ACTION_BUTTON_H + INSPECTOR_ACTION_GAP),
         col_w,
         INSPECTOR_ACTION_BUTTON_H,
@@ -8744,24 +8759,24 @@ fn inspector_action_button_widget_id(
     sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(salt))
 }
 
-fn inspector_task_panel_rect(bounds: Rect) -> Rect {
+fn inspector_task_panel_rect(bounds: Rect, tasks: &[FilesTask]) -> Rect {
     let content_x = bounds.x() + INSPECTOR_PAD;
     let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
     Rect::new(
         content_x,
         bounds.y() + INSPECTOR_TASK_PANEL_Y,
         content_w,
-        INSPECTOR_TASK_PANEL_H,
+        inspector_task_panel_height(tasks),
     )
 }
 
-fn inspector_task_clear_rect(bounds: Rect) -> Rect {
-    let panel = inspector_task_panel_rect(bounds);
+fn inspector_task_clear_rect(bounds: Rect, tasks: &[FilesTask]) -> Rect {
+    let panel = inspector_task_panel_rect(bounds, tasks);
     Rect::new(panel.max_x() - 102.0, panel.y() + 8.0, 90.0, 22.0)
 }
 
-fn inspector_task_cancel_rect(bounds: Rect, row_index: usize) -> Rect {
-    let panel = inspector_task_panel_rect(bounds);
+fn inspector_task_cancel_rect(bounds: Rect, tasks: &[FilesTask], row_index: usize) -> Rect {
+    let panel = inspector_task_panel_rect(bounds, tasks);
     Rect::new(
         panel.max_x() - INSPECTOR_TASK_CANCEL_W - 10.0,
         panel.y() + 46.0 + row_index as f32 * INSPECTOR_TASK_ROW_H + 2.0,
@@ -8797,7 +8812,8 @@ impl Widget for InspectorView {
             let clear_finished = {
                 let files = self.shared.files();
                 files_tasks_have_finished(&files.tasks)
-                    && inspector_task_clear_rect(ctx.bounds()).contains(pointer.position)
+                    && inspector_task_clear_rect(ctx.bounds(), &files.tasks)
+                        .contains(pointer.position)
             };
             if clear_finished {
                 self.shared.files_mut().clear_finished_tasks();
@@ -8813,11 +8829,10 @@ impl Widget for InspectorView {
                 files
                     .tasks
                     .iter()
-                    .take(3)
                     .enumerate()
                     .find(|(index, task)| {
                         task.state.can_cancel()
-                            && inspector_task_cancel_rect(ctx.bounds(), *index)
+                            && inspector_task_cancel_rect(ctx.bounds(), &files.tasks, *index)
                                 .contains(pointer.position)
                     })
                     .map(|(_, task)| task.id)
@@ -8837,7 +8852,7 @@ impl Widget for InspectorView {
                         .into_iter()
                         .enumerate()
                         .find(|(index, _)| {
-                            inspector_action_button_rect(ctx.bounds(), *index)
+                            inspector_action_button_rect(ctx.bounds(), &files.tasks, *index)
                                 .contains(pointer.position)
                         })
                         .map(|(_, action)| (action, entry.path))
@@ -8906,13 +8921,13 @@ impl Widget for InspectorView {
                 return;
             }
 
-            let can_toggle_details = {
+            let details_hit = {
                 let files = self.shared.files();
-                files.loading || files.error.is_some() || files.selected_entry().is_some()
+                (files.loading || files.error.is_some() || files.selected_entry().is_some())
+                    && inspector_detail_button_rect(ctx.bounds(), &files.tasks)
+                        .contains(pointer.position)
             };
-            if can_toggle_details
-                && inspector_detail_button_rect(ctx.bounds()).contains(pointer.position)
-            {
+            if details_hit {
                 let details_open = self.shared.files().inspector_details_open;
                 self.shared.files_mut().inspector_details_open = !details_open;
                 ctx.request_measure();
@@ -8962,7 +8977,7 @@ impl Widget for InspectorView {
         widgets::draw_text_in(ctx, Rect::new(x, y, w, 18.0), "INSPECTOR", header);
         y += 30.0;
         self.task_panel(ctx, &theme, &pal, bounds, &files.tasks);
-        y += INSPECTOR_TASK_PANEL_H + 12.0;
+        y += inspector_task_panel_height(&files.tasks) + 12.0;
 
         if files.loading {
             let details_open = files.inspector_details_open;
@@ -8976,6 +8991,7 @@ impl Widget for InspectorView {
                 w,
                 "Loading SIFS",
                 &rows,
+                &files.tasks,
                 Some(details_open),
             );
             return;
@@ -8993,6 +9009,7 @@ impl Widget for InspectorView {
                 w,
                 "SIFS unavailable",
                 &rows,
+                &files.tasks,
                 Some(details_open),
             );
             return;
@@ -9009,6 +9026,7 @@ impl Widget for InspectorView {
                 w,
                 unselected_inspector_title(files.source),
                 &rows,
+                &files.tasks,
                 None,
             );
             return;
@@ -9018,7 +9036,7 @@ impl Widget for InspectorView {
 
         // Name + kind.
         let details_open = files.inspector_details_open;
-        let detail_rect = inspector_detail_button_rect(bounds);
+        let detail_rect = inspector_detail_button_rect(bounds, &files.tasks);
         self.detail_button(ctx, &theme, &pal, detail_rect, details_open);
         let title_right_gap = INSPECTOR_DETAIL_BUTTON_W + 10.0;
         let name_style = pal.text_style(&theme, 16.0, FontWeight::SEMIBOLD, pal.text);
@@ -9064,10 +9082,10 @@ impl Widget for InspectorView {
 
         let actions = inspector_actions(&files, entry);
         if !actions.is_empty() {
-            self.action_buttons(ctx, &theme, &pal, bounds, &actions);
-            y = (inspector_actions_origin_y(bounds) + inspector_actions_height(actions.len()))
-                .max(y)
-                + 12.0;
+            self.action_buttons(ctx, &theme, &pal, bounds, &files.tasks, &actions);
+            let actions_bottom = inspector_actions_origin_y(bounds, &files.tasks)
+                + inspector_actions_height(actions.len());
+            y = actions_bottom.max(y) + 12.0;
         }
 
         y = self.info_row(ctx, &theme, &pal, x, y, w, "Path", &entry.path);
@@ -9564,7 +9582,7 @@ impl Widget for InspectorView {
         let mut task_panel = SemanticsNode::new(
             inspector_task_panel_widget_id(ctx.widget_id()),
             SemanticsRole::Text,
-            inspector_task_panel_rect(ctx.bounds()),
+            inspector_task_panel_rect(ctx.bounds(), &tasks),
         );
         task_panel.parent = Some(ctx.widget_id());
         task_panel.name = Some("File task queue".to_string());
@@ -9575,7 +9593,7 @@ impl Widget for InspectorView {
             let mut node = SemanticsNode::new(
                 inspector_task_clear_widget_id(ctx.widget_id()),
                 SemanticsRole::Button,
-                inspector_task_clear_rect(ctx.bounds()),
+                inspector_task_clear_rect(ctx.bounds(), &tasks),
             );
             node.parent = Some(ctx.widget_id());
             node.name = Some("Clear finished file tasks".to_string());
@@ -9587,14 +9605,13 @@ impl Widget for InspectorView {
 
         for (index, task) in tasks
             .iter()
-            .take(3)
             .enumerate()
             .filter(|(_, task)| task.state.can_cancel())
         {
             let mut node = SemanticsNode::new(
                 inspector_task_cancel_widget_id(ctx.widget_id(), task.id),
                 SemanticsRole::Button,
-                inspector_task_cancel_rect(ctx.bounds(), index),
+                inspector_task_cancel_rect(ctx.bounds(), &tasks, index),
             );
             node.parent = Some(ctx.widget_id());
             node.name = Some(format!("Cancel {}", task.title));
@@ -9608,7 +9625,7 @@ impl Widget for InspectorView {
                 let mut node = SemanticsNode::new(
                     inspector_action_button_widget_id(ctx.widget_id(), action),
                     SemanticsRole::Button,
-                    inspector_action_button_rect(ctx.bounds(), index),
+                    inspector_action_button_rect(ctx.bounds(), &tasks, index),
                 );
                 node.parent = Some(ctx.widget_id());
                 node.name = Some(action.semantic_name(entry));
@@ -9665,7 +9682,7 @@ impl Widget for InspectorView {
         let mut node = SemanticsNode::new(
             inspector_detail_button_widget_id(ctx.widget_id()),
             SemanticsRole::Button,
-            inspector_detail_button_rect(ctx.bounds()),
+            inspector_detail_button_rect(ctx.bounds(), &tasks),
         );
         node.parent = Some(ctx.widget_id());
         node.name = Some(inspector_detail_button_label(details_open).to_string());
@@ -9688,6 +9705,7 @@ impl InspectorView {
         w: f32,
         title: &str,
         rows: &[(&str, String)],
+        tasks: &[FilesTask],
         details_open: Option<bool>,
     ) {
         let label_style = pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text_faint);
@@ -9712,7 +9730,7 @@ impl InspectorView {
         let panel = Rect::new(x, y, w, panel_h);
         widgets::round_panel(ctx, panel, pal.panel, pal.border, 8.0);
         let detail_button =
-            details_open.map(|open| (inspector_detail_button_rect(ctx.bounds()), open));
+            details_open.map(|open| (inspector_detail_button_rect(ctx.bounds(), tasks), open));
         let title_right_gap = if detail_button.is_some() {
             INSPECTOR_DETAIL_BUTTON_W + 10.0
         } else {
@@ -9811,6 +9829,7 @@ impl InspectorView {
         theme: &sui::DefaultTheme,
         pal: &Palette,
         bounds: Rect,
+        tasks: &[FilesTask],
         actions: &[InspectorAction],
     ) {
         for (index, action) in actions.iter().copied().enumerate() {
@@ -9818,7 +9837,7 @@ impl InspectorView {
                 ctx,
                 theme,
                 pal,
-                inspector_action_button_rect(bounds, index),
+                inspector_action_button_rect(bounds, tasks, index),
                 action,
             );
         }
@@ -9871,11 +9890,11 @@ impl InspectorView {
         bounds: Rect,
         tasks: &[FilesTask],
     ) {
-        let panel = inspector_task_panel_rect(bounds);
+        let panel = inspector_task_panel_rect(bounds, tasks);
         widgets::round_panel(ctx, panel, pal.panel, pal.border, 8.0);
         let has_finished = files_tasks_have_finished(tasks);
         let title_right = if has_finished {
-            inspector_task_clear_rect(bounds).x() - 8.0
+            inspector_task_clear_rect(bounds, tasks).x() - 8.0
         } else {
             panel.max_x() - 12.0
         };
@@ -9891,7 +9910,7 @@ impl InspectorView {
             pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint),
         );
         if has_finished {
-            let clear = inspector_task_clear_rect(bounds);
+            let clear = inspector_task_clear_rect(bounds, tasks);
             widgets::round_panel(ctx, clear, pal.field, pal.border, 7.0);
             widgets::draw_text_in(
                 ctx,
@@ -9955,9 +9974,9 @@ impl InspectorView {
 
         let title_style = pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.text);
         let detail_style = pal.text_style(theme, 10.5, FontWeight::NORMAL, pal.text_faint);
-        for (index, task) in tasks.iter().take(3).enumerate() {
+        for (index, task) in tasks.iter().enumerate() {
             let y = panel.y() + 46.0 + index as f32 * INSPECTOR_TASK_ROW_H;
-            let cancel = inspector_task_cancel_rect(bounds, index);
+            let cancel = inspector_task_cancel_rect(bounds, tasks, index);
             let text_w = if task.state.can_cancel() {
                 cancel.x() - panel.x() - 20.0
             } else {
@@ -15357,6 +15376,61 @@ mod tests {
         assert_eq!(files.tasks.len(), 1);
         assert_eq!(files.tasks[0].id, 78);
         assert_eq!(files.tasks[0].state, FilesTaskState::Running);
+
+        Ok(())
+    }
+
+    #[test]
+    fn inspector_task_queue_exposes_all_retained_tasks() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.tasks = (0..6)
+                .map(|index| FilesTask {
+                    id: 100 + index,
+                    source: FilesSourceKind::Sifs,
+                    title: format!("Copy batch {}", index + 1),
+                    detail: format!("/artifact-{index}.bin -> /archive/artifact-{index}.bin"),
+                    state: FilesTaskState::Running,
+                    progress: Some((index as f32 + 1.0) / 10.0),
+                })
+                .collect();
+        }
+        let scroll_state = ScrollState::new();
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files full task queue")
+                    .root(
+                        SizedBox::new()
+                            .width(INSPECTOR_W)
+                            .height(320.0)
+                            .with_child(inspector(&shared, &scroll_state)),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        let _snapshot = window.snapshot()?;
+        assert!(
+            scroll_state.max_offset().y > 0.0,
+            "expanded task queue should remain scrollable through the inspector ScrollView"
+        );
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel Copy batch 6")
+            .click()?;
+
+        let files = shared.files();
+        assert_eq!(files.tasks[5].state, FilesTaskState::CancelRequested);
+        assert!(operation_cancelled(&files.worker_cancellations, 105));
 
         Ok(())
     }
