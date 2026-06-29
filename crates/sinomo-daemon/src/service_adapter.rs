@@ -1811,15 +1811,19 @@ impl Service for DaemonDfsBrowserService {
             let data_dir = Arc::clone(&ctx.data_dir);
             let response = match route.as_str() {
                 DAEMON_DFS_BROWSER_STATUS_ROUTE => {
-                    let _: crate::DaemonDfsBrowserStatusRequest = request.decode_body()?;
+                    let payload: crate::DaemonDfsBrowserStatusRequest = request.decode_body()?;
                     let backend =
                         run_blocking_service_task(route.clone(), "DFS browser status", move || {
                             DaemonDfsBrowserBackend::for_data_dir(data_dir)
                         })
                         .await?;
-                    let (health, health_error) = match backend.health_summary() {
-                        Ok(health) => (Some(health), None),
-                        Err(error) => (None, Some(error.to_string())),
+                    let (health, health_error) = if payload.include_health {
+                        match backend.health_summary() {
+                            Ok(health) => (Some(health), None),
+                            Err(error) => (None, Some(error.to_string())),
+                        }
+                    } else {
+                        (None, None)
                     };
                     ObjectRpcResponse::encode_body(
                         DAEMON_DFS_BROWSER_STATUS_ROUTE,

@@ -60,8 +60,25 @@ pub(crate) fn cluster_join_trace(args: std::fmt::Arguments<'_>) {
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
-pub struct DaemonDfsBrowserStatusRequest;
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserStatusRequest {
+    #[serde(default)]
+    pub include_health: bool,
+}
+
+impl DaemonDfsBrowserStatusRequest {
+    pub fn node_only() -> Self {
+        Self {
+            include_health: false,
+        }
+    }
+
+    pub fn with_health() -> Self {
+        Self {
+            include_health: true,
+        }
+    }
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserStatusResponse {

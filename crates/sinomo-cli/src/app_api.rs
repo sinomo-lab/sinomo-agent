@@ -48,8 +48,6 @@ const APP_CHAT_RUNTIME_START_TIMEOUT: Duration = Duration::from_secs(5);
 const APP_CHAT_RUNTIME_SILENCE_TIMEOUT: Duration = Duration::from_secs(45);
 const STRUCTURED_AGENT_JSON_STREAM: &str = "__sinomo_structured_agent_json_stream__";
 pub const SIFS_AGENT_CHANNELS_ROOT: &str = "/services/sinomo-agent/channels";
-const SIFS_AGENT_CHANNEL_INDEX_PATH: &str = "/services/sinomo-agent/channel-index.json";
-const SIFS_AGENT_CHANNEL_INDEX_SCHEMA_VERSION: u32 = 1;
 
 /// Lightweight channel metadata for list views.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -98,13 +96,6 @@ impl AgentChannelSummary {
     fn is_deleted(&self) -> bool {
         self.deleted_at.is_some()
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct SifsAgentChannelIndex {
-    schema_version: u32,
-    #[serde(default)]
-    channels: Vec<AgentChannelSummary>,
 }
 
 /// The active agent / model selection, as plain strings.
@@ -446,38 +437,7 @@ impl SifsAgentChannelStore {
             .collect())
     }
 
-    fn read_channel_index(&self) -> Result<Option<SifsAgentChannelIndex>, AgentChannelStoreError> {
-        let bytes = match self.browser.read_file(SIFS_AGENT_CHANNEL_INDEX_PATH) {
-            Ok(bytes) => bytes,
-            Err(detail) if sifs_error_is_not_found(&detail) => return Ok(None),
-            Err(detail) => return Err(channel_store_io(SIFS_AGENT_CHANNEL_INDEX_PATH, detail)),
-        };
-        let Ok(index) = serde_json::from_slice::<SifsAgentChannelIndex>(&bytes) else {
-            return Ok(None);
-        };
-        if index.schema_version != SIFS_AGENT_CHANNEL_INDEX_SCHEMA_VERSION {
-            return Ok(None);
-        }
-        Ok(Some(index))
-    }
-
-    fn write_channel_index(
-        &self,
-        summaries: &[AgentChannelSummary],
-    ) -> Result<(), AgentChannelStoreError> {
-        let index = SifsAgentChannelIndex {
-            schema_version: SIFS_AGENT_CHANNEL_INDEX_SCHEMA_VERSION,
-            channels: summaries.to_vec(),
-        };
-        let bytes = serde_json::to_vec_pretty(&index).map_err(|source| {
-            AgentChannelStoreError::Serialization {
-                detail: source.to_string(),
-            }
-        })?;
-        self.write_file(SIFS_AGENT_CHANNEL_INDEX_PATH, &bytes)
-    }
-
-    fn rebuild_channel_index(
+    fn channel_summaries_from_ids(
         &self,
         ids: &BTreeSet<SessionId>,
     ) -> Result<Vec<AgentChannelSummary>, AgentChannelStoreError> {
@@ -508,42 +468,18 @@ impl SifsAgentChannelStore {
             summaries.push(AgentChannelSummary::from_channel(&snapshot.channel));
         }
         summaries.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-        self.write_channel_index(&summaries)?;
         Ok(summaries)
-    }
-
-    fn update_channel_index(&self, channel: &AgentChannel) -> Result<(), AgentChannelStoreError> {
-        let mut summaries = match self.read_channel_index()? {
-            Some(index) => index.channels,
-            None => {
-                let ids = self.channel_ids_from_sifs()?;
-                self.rebuild_channel_index(&ids)?
-            }
-        };
-        let summary = AgentChannelSummary::from_channel(channel);
-        match summaries
-            .iter_mut()
-            .find(|existing| existing.channel_id == summary.channel_id)
-        {
-            Some(existing) => *existing = summary,
-            None => summaries.push(summary),
-        }
-        summaries.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-        self.write_channel_index(&summaries)
     }
 
     pub fn list_channel_summaries(
         &self,
     ) -> Result<Vec<AgentChannelSummary>, AgentChannelStoreError> {
-        if let Some(index) = self.read_channel_index()? {
-            return Ok(Self::sorted_visible_summaries(index.channels));
-        }
         let ids = self.channel_ids_from_sifs()?;
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         Ok(Self::sorted_visible_summaries(
-            self.rebuild_channel_index(&ids)?,
+            self.channel_summaries_from_ids(&ids)?,
         ))
     }
 }
@@ -559,8 +495,7 @@ impl AgentChannelStore for SifsAgentChannelStore {
                 detail: source.to_string(),
             }
         })?;
-        self.write_file(&Self::snapshot_path(&channel.channel_id), &bytes)?;
-        self.update_channel_index(channel)
+        self.write_file(&Self::snapshot_path(&channel.channel_id), &bytes)
     }
 
     fn load_channel(
@@ -2141,7 +2076,7 @@ impl SifsBrowser {
     fn open_remote_backend(backend: RemoteSifsBrowser) -> Result<Self, String> {
         let status: sinomo_runtime::daemon::DaemonDfsBrowserStatusResponse = backend.rpc(
             sinomo_runtime::daemon::DAEMON_DFS_BROWSER_STATUS_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserStatusRequest,
+            &sinomo_runtime::daemon::DaemonDfsBrowserStatusRequest::node_only(),
         )?;
         Ok(Self {
             backend: SifsBrowserBackend::Remote(backend),
@@ -2388,7 +2323,7 @@ impl RemoteSifsBrowser {
     fn status(&self) -> Result<sinomo_runtime::daemon::DaemonDfsBrowserStatusResponse, String> {
         self.rpc(
             sinomo_runtime::daemon::DAEMON_DFS_BROWSER_STATUS_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserStatusRequest,
+            &sinomo_runtime::daemon::DaemonDfsBrowserStatusRequest::with_health(),
         )
     }
 
@@ -3196,7 +3131,7 @@ mod tests {
     }
 
     #[test]
-    fn sifs_channel_summaries_track_indexed_channel_metadata() {
+    fn sifs_channel_summaries_track_snapshot_metadata_without_index_cache() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-summaries");
         let data_dir = SinomoDataDir::new(&root);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
@@ -3231,6 +3166,13 @@ mod tests {
                 .expect("list tombstoned summaries")
                 .is_empty(),
             "deleted channels should remain in SIFS but stay hidden from summaries"
+        );
+        assert!(
+            SifsBrowser::open(&data_dir)
+                .expect("open SIFS")
+                .read_file("/services/sinomo-agent/channel-index.json")
+                .is_err(),
+            "channel summaries should not create a shared mutable index cache"
         );
     }
 
