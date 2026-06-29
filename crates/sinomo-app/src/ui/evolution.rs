@@ -890,54 +890,65 @@ fn start_controls_layout(bounds: Rect, advanced_open: bool) -> StartControlsLayo
     let starter_actions = starter_action_rects(starter_bounds);
     let controls_y = starter_bounds.max_y() + CONTROL_GAP;
     if bounds.width() >= START_BREAKPOINT {
-        let fixed_w = if advanced_open {
-            START_OPTIONS_W + START_BUTTON_W + START_TARGET_W + CONTROL_GAP * 4.0
-        } else {
-            START_OPTIONS_W + START_BUTTON_W + CONTROL_GAP * 2.0
-        };
+        if advanced_open {
+            let label_y = controls_y;
+            let row1_y = label_y + CONTROL_LABEL_H + CONTROL_LABEL_GAP;
+            let row2_label_y = row1_y + CONTROL_H + CONTROL_GAP;
+            let row2_y = row2_label_y + CONTROL_LABEL_H + CONTROL_LABEL_GAP;
+            let fixed_w = START_TARGET_W + START_OPTIONS_W + START_BUTTON_W + CONTROL_GAP * 3.0;
+            let scope_w = (bounds.width() - fixed_w).max(0.0);
+            let objective = Rect::new(bounds.x(), row1_y, bounds.width(), CONTROL_H);
+            let scope = Rect::new(bounds.x(), row2_y, scope_w, CONTROL_H);
+            let target = Rect::new(
+                scope.max_x() + CONTROL_GAP,
+                row2_y,
+                START_TARGET_W,
+                CONTROL_H,
+            );
+            let options = Rect::new(
+                target.max_x() + CONTROL_GAP,
+                row2_y,
+                START_OPTIONS_W,
+                CONTROL_H,
+            );
+            let start = Rect::new(
+                options.max_x() + CONTROL_GAP,
+                row2_y,
+                START_BUTTON_W,
+                CONTROL_H,
+            );
+            return StartControlsLayout {
+                objective_label: label_rect(objective, label_y),
+                options_label: label_rect(options, row2_label_y),
+                scope_label: label_rect(scope, row2_label_y),
+                target_label: label_rect(target, row2_label_y),
+                starter_actions,
+                objective,
+                options,
+                scope,
+                target,
+                start,
+            };
+        }
+
+        let fixed_w = START_OPTIONS_W + START_BUTTON_W + CONTROL_GAP * 2.0;
         let flexible_w = (bounds.width() - fixed_w).max(0.0);
         let controls_h = (bounds.max_y() - controls_y).max(0.0);
         let label_y = controls_y + (controls_h - block_h).max(0.0) / 2.0;
         let y = label_y + CONTROL_LABEL_H + CONTROL_LABEL_GAP;
         let mut x = bounds.x();
-        let (objective_w, scope_w) = if advanced_open {
-            let objective_w = flexible_w * 0.56;
-            (objective_w, flexible_w - objective_w)
-        } else {
-            (flexible_w, 0.0)
-        };
-        let objective = Rect::new(x, y, objective_w, CONTROL_H);
+        let objective = Rect::new(x, y, flexible_w, CONTROL_H);
         x = objective.max_x() + CONTROL_GAP;
-        let scope = if advanced_open {
-            let rect = Rect::new(x, y, scope_w, CONTROL_H);
-            x = rect.max_x() + CONTROL_GAP;
-            rect
-        } else {
-            Rect::ZERO
-        };
-        let target = if advanced_open {
-            let rect = Rect::new(x, y, START_TARGET_W, CONTROL_H);
-            x = rect.max_x() + CONTROL_GAP;
-            rect
-        } else {
-            Rect::ZERO
-        };
+        let scope = Rect::ZERO;
+        let target = Rect::ZERO;
         let options = Rect::new(x, y, START_OPTIONS_W, CONTROL_H);
         x = options.max_x() + CONTROL_GAP;
         let start = Rect::new(x, y, START_BUTTON_W, CONTROL_H);
         StartControlsLayout {
             objective_label: label_rect(objective, label_y),
             options_label: label_rect(options, label_y),
-            scope_label: if advanced_open {
-                label_rect(scope, label_y)
-            } else {
-                Rect::ZERO
-            },
-            target_label: if advanced_open {
-                label_rect(target, label_y)
-            } else {
-                Rect::ZERO
-            },
+            scope_label: Rect::ZERO,
+            target_label: Rect::ZERO,
             starter_actions,
             objective,
             options,
@@ -1395,7 +1406,9 @@ fn readiness_detail_toggle_visible(
 fn start_height_for(width: f32, advanced_open: bool) -> f32 {
     let controls_w = (width - PAD * 2.0).max(0.0);
     let starter_extra = starter_actions_height_for(controls_w) + CONTROL_GAP;
-    if controls_w >= START_BREAKPOINT {
+    if controls_w >= START_BREAKPOINT && advanced_open {
+        START_WIDE_H + starter_extra + control_block_height() + CONTROL_GAP
+    } else if controls_w >= START_BREAKPOINT {
         START_WIDE_H + starter_extra
     } else if advanced_open {
         START_NARROW_EXPANDED_H + starter_extra
@@ -1406,7 +1419,9 @@ fn start_height_for(width: f32, advanced_open: bool) -> f32 {
 
 fn start_controls_height_for(width: f32, advanced_open: bool) -> f32 {
     let starter_extra = starter_actions_height_for(width) + CONTROL_GAP;
-    if width >= START_BREAKPOINT {
+    if width >= START_BREAKPOINT && advanced_open {
+        starter_extra + control_block_height() * 2.0 + CONTROL_GAP
+    } else if width >= START_BREAKPOINT {
         starter_extra + control_block_height()
     } else if advanced_open {
         starter_extra + control_block_height() * 3.0 + CONTROL_GAP * 2.0
@@ -2553,10 +2568,15 @@ mod tests {
         assert!(layout.scope_label.max_y() <= layout.scope.y());
         assert!(layout.target_label.max_y() <= layout.target.y());
         assert!(layout.options_label.max_y() <= layout.options.y());
-        assert_eq!(layout.objective.y(), layout.scope.y());
+        assert_eq!(layout.objective.x(), 0.0);
+        assert_eq!(layout.objective.width(), 900.0);
+        assert!(layout.objective.max_y() + CONTROL_GAP <= layout.scope_label.y());
         assert_eq!(layout.scope.y(), layout.target.y());
         assert_eq!(layout.target.y(), layout.options.y());
         assert_eq!(layout.options.y(), layout.start.y());
+        assert!(layout.scope.max_x() <= layout.target.x());
+        assert!(layout.target.max_x() <= layout.options.x());
+        assert!(layout.options.max_x() <= layout.start.x());
     }
 
     #[test]
