@@ -4617,6 +4617,37 @@ fn entry_meta(entry: &SifsEntry) -> String {
     }
 }
 
+fn entry_row_meta(entry: &SifsEntry, files: &FilesState, active: bool) -> String {
+    if active && files.source == FilesSourceKind::Sifs {
+        return sifs_compact_header_line(
+            entry,
+            files.selected_details.as_ref(),
+            files.clustered,
+            files.details_loading,
+            files.details_error.as_deref(),
+        );
+    }
+    entry_meta(entry)
+}
+
+fn entry_row_description(entry: &SifsEntry, files: &FilesState, active: bool) -> String {
+    let source = files.source;
+    let mut description = format!(
+        "{}, {} {}",
+        entry_kind_label(entry),
+        source.path_label(),
+        entry.path
+    );
+    if source == FilesSourceKind::Sifs && active {
+        description.push_str(". Placement ");
+        description.push_str(&entry_row_meta(entry, files, true));
+    }
+    if entry.is_dir {
+        description.push_str(". Activate opens the folder; Inspect selects it for management");
+    }
+    description
+}
+
 fn entry_kind_label(entry: &SifsEntry) -> &'static str {
     if entry.is_dir {
         "Folder"
@@ -5154,8 +5185,21 @@ fn unselected_inspector_management(files: &FilesState) -> String {
     }
 }
 
+fn unselected_inspector_health(files: &FilesState) -> Option<String> {
+    if files.source != FilesSourceKind::Sifs {
+        return None;
+    }
+    if let Some(health) = files.sifs_health.as_ref() {
+        return Some(sifs_health_status_detail(health));
+    }
+    if let Some(error) = files.sifs_health_error.as_deref() {
+        return Some(sifs_health_error_status_detail(error));
+    }
+    Some("DFS health not loaded".to_string())
+}
+
 fn unselected_inspector_rows(files: &FilesState) -> Vec<(&'static str, String)> {
-    vec![
+    let mut rows = vec![
         ("Path", files.path.clone()),
         ("Entries", files_entry_count_status(files)),
         ("Scope", unselected_inspector_scope(files)),
@@ -5163,8 +5207,12 @@ fn unselected_inspector_rows(files: &FilesState) -> Vec<(&'static str, String)> 
             "Status",
             unselected_inspector_status(files.source, files.entries.is_empty()).to_string(),
         ),
-        ("Next step", unselected_inspector_management(files)),
-    ]
+    ];
+    if let Some(health) = unselected_inspector_health(files) {
+        rows.push(("DFS health", health));
+    }
+    rows.push(("Next step", unselected_inspector_management(files)));
+    rows
 }
 
 fn local_details_signature(details: Option<&LocalObjectDetails>) -> String {
@@ -5654,7 +5702,10 @@ impl Widget for SifsEntryRow {
         let label_color = if active { pal.text } else { pal.text_muted };
         let title_style = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, label_color);
         let meta_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
-        let source = self.shared.files().source;
+        let (source, meta_text) = {
+            let files = self.shared.files();
+            (files.source, entry_row_meta(&self.entry, &files, active))
+        };
 
         let leading = Rect::new(bounds.x() + 2.0, bounds.y(), 20.0, bounds.height());
         let icon_side = 15.0;
@@ -5726,14 +5777,19 @@ impl Widget for SifsEntryRow {
         }
 
         let actions_w = row_actions_width();
-        let meta_w = 74.0_f32.min(bounds.width() * 0.36).max(0.0);
+        let meta_w = if source == FilesSourceKind::Sifs && active {
+            166.0_f32.min(bounds.width() * 0.34).max(86.0)
+        } else {
+            74.0_f32.min(bounds.width() * 0.36).max(0.0)
+        };
         let meta_rect = Rect::new(
             (bounds.max_x() - actions_w - meta_w).max(bounds.x()),
             bounds.y(),
             meta_w,
             bounds.height(),
         );
-        widgets::draw_text_in(ctx, meta_rect, &entry_meta(&self.entry), meta_style);
+        let meta_display = display_name_for_width(&meta_text, meta_rect.width(), 6.2);
+        widgets::draw_text_in(ctx, meta_rect, &meta_display, meta_style);
 
         let title_x = leading.max_x() + 5.0;
         let title_right = meta_rect.x() - 6.0;
@@ -5752,21 +5808,20 @@ impl Widget for SifsEntryRow {
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         let row_id = ctx.widget_id();
         let mut node = SemanticsNode::new(row_id, SemanticsRole::ListItem, ctx.bounds());
-        let source = self.shared.files().source;
+        let (source, description, active, marked) = {
+            let files = self.shared.files();
+            (
+                files.source,
+                entry_row_description(&self.entry, &files, files.selected == Some(self.index)),
+                files.selected == Some(self.index),
+                files.entry_marked(self.index),
+            )
+        };
         node.name = Some(self.entry.name.clone());
-        let mut description = format!(
-            "{}, {} {}",
-            entry_kind_label(&self.entry),
-            source.path_label(),
-            self.entry.path
-        );
-        if self.entry.is_dir {
-            description.push_str(". Activate opens the folder; Inspect selects it for management");
-        }
         node.description = Some(description);
         node.state.focused = ctx.is_focused();
         node.state.hovered = self.hovered;
-        node.state.selected = self.active() || self.marked();
+        node.state.selected = active || marked;
         node.actions = vec![SemanticsAction::Focus, SemanticsAction::Activate];
         ctx.push(node);
 
@@ -6063,6 +6118,27 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             })
     };
 
+    let repair_replicas = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Redo, "Repair replicas")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || {
+                    let files = s.files();
+                    files.source == FilesSourceKind::Sifs
+                        && files.can_modify_current_location()
+                        && files.selected_entry().is_some()
+                }
+            })
+            .on_press_with_ctx(move |ctx| {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut().start_replica_repair(waker);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+
     let rename = {
         let s = shared.clone();
         IconButton::new(IconGlyph::MoreHorizontal, "Rename")
@@ -6123,6 +6199,7 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .with_item(copy, FlexItem::new().no_shrink())
         .with_item(move_to, FlexItem::new().no_shrink())
         .with_item(refresh_placement, FlexItem::new().no_shrink())
+        .with_item(repair_replicas, FlexItem::new().no_shrink())
         .with_item(rename, FlexItem::new().no_shrink())
         .with_item(delete, FlexItem::new().no_shrink());
 
@@ -6590,12 +6667,14 @@ fn files_list_body(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollS
         .iter()
         .filter_map(|index| {
             let entry = entries.get(*index)?.clone();
+            let detail = {
+                let files = shared.files();
+                entry_row_description(&entry, &files, files.selected == Some(*index))
+            };
             Some(
-                ListItem::new(entry.name.clone()).with_child(SifsEntryRow::new(
-                    shared.clone(),
-                    *index,
-                    entry,
-                )),
+                ListItem::new(entry.name.clone())
+                    .detail(detail)
+                    .with_child(SifsEntryRow::new(shared.clone(), *index, entry)),
             )
         })
         .collect();
@@ -8109,11 +8188,12 @@ impl InspectorView {
                 task_signature
             ),
             None => format!(
-                "unselected|{:?}|{}|{}|{}|{}",
+                "unselected|{:?}|{}|{}|{}|{}|{}",
                 files.source,
                 files.path,
                 files.clustered,
                 files.entries.len(),
+                unselected_inspector_health(&files).unwrap_or_default(),
                 task_signature
             ),
         }
@@ -11970,7 +12050,10 @@ mod tests {
             files.loading = false;
             files.entries.clear();
         }
-        assert_eq!(inspector.summary(), "unselected|Sifs|/services|false|0|");
+        assert_eq!(
+            inspector.summary(),
+            "unselected|Sifs|/services|false|0|DFS health not loaded|"
+        );
     }
 
     #[test]
@@ -12043,6 +12126,11 @@ mod tests {
         assert!(rows.iter().any(|(label, value)| {
             *label == "Scope" && value == "cluster-backed SIFS namespace"
         }));
+        assert!(
+            rows.iter().any(|(label, value)| {
+                *label == "DFS health" && value == "DFS health not loaded"
+            })
+        );
         assert!(rows.iter().any(|(label, value)| {
             *label == "Next step"
                 && value.contains("created SIFS objects expose placement and replica actions")
@@ -12070,6 +12158,42 @@ mod tests {
         );
         assert!(rows.iter().any(|(label, value)| {
             *label == "Next step" && value.contains("switch places to browse another filesystem")
+        }));
+        assert!(!rows.iter().any(|(label, _)| *label == "DFS health"));
+    }
+
+    #[test]
+    fn unselected_sifs_inspector_rows_surface_namespace_health() {
+        let backend = Backend::local_fallback();
+        let mut files = FilesState::new(&backend);
+        files.loaded = true;
+        files.loading = false;
+        files.source = FilesSourceKind::Sifs;
+        files.clustered = true;
+        files.path = "/".to_string();
+        files.sifs_health = Some(SifsHealthSummary {
+            file_system_count: 1,
+            object_count: 776,
+            version_count: 2482,
+            pending_write_count: 43,
+            open_conflict_count: 21,
+            pending_repair_count: 18,
+            pending_namespace_job_count: 0,
+            failed_namespace_job_count: 0,
+            metadata_shard_count: 3,
+            repair_attempt_count: 18,
+        });
+
+        let rows = unselected_inspector_rows(&files);
+        assert!(rows.iter().any(|(label, value)| {
+            *label == "DFS health" && value == "DFS 21 conflicts, 18 repairs, 43 pending writes"
+        }));
+
+        files.sifs_health = None;
+        files.sifs_health_error = Some("metadata root missing".to_string());
+        let rows = unselected_inspector_rows(&files);
+        assert!(rows.iter().any(|(label, value)| {
+            *label == "DFS health" && value == "DFS health unavailable: metadata root missing"
         }));
     }
 
@@ -12240,6 +12364,42 @@ mod tests {
             sifs_replication_summary(Some(&details), true),
             "local placement policy"
         );
+    }
+
+    #[test]
+    fn active_sifs_row_meta_surfaces_replica_repair_state() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.source = FilesSourceKind::Sifs;
+        state.clustered = true;
+        state.details_loading = false;
+        state.details_error = None;
+        state.selected = Some(0);
+        state.entries = vec![SifsEntry {
+            name: "artifact.txt".to_string(),
+            path: "/artifact.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(5),
+        }];
+        let mut details = test_sifs_details(Vec::new());
+        details.health = Some(SifsObjectHealth {
+            agent_state: "pending-repair".to_string(),
+            version_count: 1,
+            receipt_count: 1,
+            intent_count: 1,
+            open_conflict_count: 0,
+            pending_repair_count: 1,
+            missing_replica_nodes: vec!["node-b".to_string()],
+        });
+        state.selected_details = Some(details);
+
+        let entry = state.entries[0].clone();
+        assert_eq!(
+            entry_row_meta(&entry, &state, true),
+            "5 B · 1/2 nodes · 1 repair"
+        );
+        assert_eq!(entry_row_meta(&entry, &state, false), "5 B");
     }
 
     #[test]
@@ -14409,6 +14569,90 @@ mod tests {
                 node.bounds
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn files_toolbar_repairs_replicas_and_row_semantics_show_placement() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.source = FilesSourceKind::Sifs;
+            files.loaded = true;
+            files.loading = false;
+            files.error = None;
+            files.clustered = true;
+            files.path = "/".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.selected = Some(0);
+            let mut details = test_sifs_details(Vec::new());
+            details.health = Some(SifsObjectHealth {
+                agent_state: "pending-repair".to_string(),
+                version_count: 1,
+                receipt_count: 1,
+                intent_count: 1,
+                open_conflict_count: 0,
+                pending_repair_count: 1,
+                missing_replica_nodes: vec!["node-b".to_string()],
+            });
+            files.selected_details = Some(details);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files replica repair")
+                    .root(
+                        SizedBox::new()
+                            .width(1280.0)
+                            .height(720.0)
+                            .with_child(view(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+
+        let snapshot = window.snapshot()?;
+        let row = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::ListItem
+                    && node.name.as_deref() == Some("artifact.txt")
+            })
+            .expect("artifact row semantics");
+        assert!(
+            row.description.as_deref().is_some_and(
+                |description| description.contains("Placement 5 B · 1/2 nodes · 1 repair")
+            ),
+            "selected SIFS row should expose compact placement metadata, got {:?}",
+            row.description
+        );
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Repair replicas")
+            .click()?;
+
+        let files = shared.files();
+        assert!(
+            files
+                .tasks
+                .iter()
+                .any(|task| task.title == "Repair replicas"),
+            "toolbar repair action should queue a background file task"
+        );
 
         Ok(())
     }
