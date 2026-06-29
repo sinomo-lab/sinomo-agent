@@ -1301,7 +1301,7 @@ impl FilesState {
                 if let Some(current) = &mut self.action_prompt {
                     current.error = Some(format!(
                         "type DELETE to remove {}",
-                        selected_entries_label(prompt.targets.len())
+                        marked_entries_label(prompt.targets.len())
                     ));
                 }
                 return;
@@ -5789,7 +5789,7 @@ fn files_sort_select(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
 
 fn files_mark_visible_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
-    IconButton::new(IconGlyph::Check, "Select visible entries")
+    IconButton::new(IconGlyph::Check, "Mark visible entries")
         .size(30.0)
         .theme_when(clone_reader(reader))
         .enabled_when({
@@ -5819,15 +5819,15 @@ fn files_clear_marks_button(shared: &Shared, reader: &ThemeReader) -> impl Widge
 
 fn files_marked_summary_label(shared: &Shared) -> impl Widget + use<> {
     let s = shared.clone();
-    sui::Label::dynamic("No selection", move || {
+    sui::Label::dynamic("No marked entries", move || {
         let count = s.files().marked_count();
         if count == 0 {
-            "No selection".to_string()
+            "No marked entries".to_string()
         } else {
-            selected_entries_label(count)
+            marked_entries_label(count)
         }
     })
-    .semantic_name("Files marked selection")
+    .semantic_name("Files marked entries")
     .font_size(11.0)
     .line_height(16.0)
 }
@@ -6552,11 +6552,11 @@ fn plural(count: usize, singular: &str) -> String {
     }
 }
 
-fn selected_entries_label(count: usize) -> String {
+fn marked_entries_label(count: usize) -> String {
     if count == 1 {
-        "1 selected entry".to_string()
+        "1 marked entry".to_string()
     } else {
-        format!("{count} selected entries")
+        format!("{count} marked entries")
     }
 }
 
@@ -9718,7 +9718,7 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .map(|path| format!("Copy {path} to another {} path", source.operation_scope()))
             .unwrap_or_else(|| "Select a file to copy".to_string()),
         FileActionPromptKind::CopySelected => {
-            let label = selected_entries_label(prompt.targets.len());
+            let label = marked_entries_label(prompt.targets.len());
             format!(
                 "Copy {label} into a destination folder in {}",
                 source.operation_scope()
@@ -9735,7 +9735,7 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .map(|path| format!("Download SIFS {path} to a local path"))
             .unwrap_or_else(|| "Select a SIFS file or folder to download".to_string()),
         FileActionPromptKind::TransferSelected => {
-            let label = selected_entries_label(prompt.targets.len());
+            let label = marked_entries_label(prompt.targets.len());
             match source {
                 FilesSourceKind::Sifs => format!("Download {label} into a local folder"),
                 FilesSourceKind::Local => format!("Copy {label} into a SIFS folder"),
@@ -9747,7 +9747,7 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .map(|path| format!("Move {path} to another {} path", source.operation_scope()))
             .unwrap_or_else(|| "Select an item to move".to_string()),
         FileActionPromptKind::MoveSelected => {
-            let label = selected_entries_label(prompt.targets.len());
+            let label = marked_entries_label(prompt.targets.len());
             format!(
                 "Move {label} into a destination folder in {}",
                 source.operation_scope()
@@ -9764,7 +9764,7 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .map(|path| format!("Delete {path}"))
             .unwrap_or_else(|| "Select an item to delete".to_string()),
         FileActionPromptKind::DeleteSelected => {
-            let label = selected_entries_label(prompt.targets.len());
+            let label = marked_entries_label(prompt.targets.len());
             format!("Delete {label} from {}", shared.files().path)
         }
     };
@@ -12366,7 +12366,7 @@ mod tests {
                 .action_prompt
                 .as_ref()
                 .and_then(|prompt| prompt.error.as_deref()),
-            Some("type DELETE to remove 2 selected entries")
+            Some("type DELETE to remove 2 marked entries")
         );
 
         let (tx, rx) = mpsc::channel();
@@ -13474,8 +13474,8 @@ mod tests {
         let snapshot = window.snapshot()?;
         assert!(snapshot.accessibility.nodes.iter().any(|node| {
             node.role == sui::SemanticsRole::Text
-                && node.name.as_deref() == Some("Files marked selection")
-                && node.value == Some(sui::SemanticsValue::Text("1 selected entry".to_string()))
+                && node.name.as_deref() == Some("Files marked entries")
+                && node.value == Some(sui::SemanticsValue::Text("1 marked entry".to_string()))
         }));
 
         window
@@ -13553,7 +13553,7 @@ mod tests {
             .click()?;
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Select visible entries")
+            .with_name("Mark visible entries")
             .click()?;
         assert_eq!(shared.files().marked_count(), 2);
 
