@@ -1817,11 +1817,16 @@ impl Service for DaemonDfsBrowserService {
                             DaemonDfsBrowserBackend::for_data_dir(data_dir)
                         })
                         .await?;
+                    let (health, health_error) = match backend.health_summary() {
+                        Ok(health) => (Some(health), None),
+                        Err(error) => (None, Some(error.to_string())),
+                    };
                     ObjectRpcResponse::encode_body(
                         DAEMON_DFS_BROWSER_STATUS_ROUTE,
                         &crate::DaemonDfsBrowserStatusResponse {
                             node_id: backend.node_id()?,
-                            health: backend.health_summary().ok(),
+                            health,
+                            health_error,
                         },
                     )?
                 }

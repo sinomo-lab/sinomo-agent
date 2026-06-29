@@ -2149,9 +2149,16 @@ impl SifsBrowser {
             SifsBrowserBackend::Local(backend) => backend
                 .operator_status()
                 .map(|status| status.map(sifs_health_from_status)),
-            SifsBrowserBackend::Remote(remote) => remote
-                .status()
-                .map(|status| status.health.map(sifs_health_summary_from_rpc)),
+            SifsBrowserBackend::Remote(remote) => {
+                let status = remote.status()?;
+                if let Some(health) = status.health {
+                    Ok(Some(sifs_health_summary_from_rpc(health)))
+                } else if let Some(error) = status.health_error {
+                    Err(error)
+                } else {
+                    Ok(None)
+                }
+            }
         }
     }
 

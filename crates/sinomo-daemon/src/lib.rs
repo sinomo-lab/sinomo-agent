@@ -68,6 +68,8 @@ pub struct DaemonDfsBrowserStatusResponse {
     pub node_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<DaemonDfsBrowserHealthSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_error: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
