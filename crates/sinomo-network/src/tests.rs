@@ -3173,6 +3173,21 @@ fn iroh_daemon_proxy_command_accept_returns_stream_before_idle_timeout() {
 }
 
 #[test]
+fn iroh_daemon_proxy_peer_closed_accept_is_not_error_noise() {
+    let closed = NetworkError::Io {
+        operation: "accept iroh daemon command stream".to_string(),
+        detail: "closed by peer: done (code 0)".to_string(),
+    };
+    assert!(crate::roaming::iroh_proxy_command_stream_accept_error_is_peer_close(&closed));
+
+    let unrelated = NetworkError::Io {
+        operation: "accept iroh daemon command stream".to_string(),
+        detail: "permission denied".to_string(),
+    };
+    assert!(!crate::roaming::iroh_proxy_command_stream_accept_error_is_peer_close(&unrelated));
+}
+
+#[test]
 fn iroh_daemon_proxy_frame_reader_charges_budget_before_body_read() {
     assert_eq!(
         crate::roaming::IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT,

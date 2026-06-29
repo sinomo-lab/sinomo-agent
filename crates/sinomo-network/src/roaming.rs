@@ -1313,7 +1313,15 @@ async fn run_iroh_daemon_proxy(
                         break;
                     }
                     Err(error) => {
-                        eprintln!("sinomo iroh daemon proxy command stream accept failed: {error}");
+                        if iroh_proxy_command_stream_accept_error_is_peer_close(&error) {
+                            tracing::debug!(
+                                "sinomo iroh daemon proxy command stream closed by peer: {error}"
+                            );
+                        } else {
+                            eprintln!(
+                                "sinomo iroh daemon proxy command stream accept failed: {error}"
+                            );
+                        }
                         break;
                     }
                 };
@@ -1437,6 +1445,15 @@ where
         }),
         Err(_) => Ok(None),
     }
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) fn iroh_proxy_command_stream_accept_error_is_peer_close(error: &NetworkError) -> bool {
+    let NetworkError::Io { operation, detail } = error else {
+        return false;
+    };
+    operation == "accept iroh daemon command stream"
+        && (detail.contains("closed by peer") || detail.contains("stopped"))
 }
 
 #[cfg(feature = "iroh-transport")]

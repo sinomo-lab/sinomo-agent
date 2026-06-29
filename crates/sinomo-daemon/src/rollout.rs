@@ -53,6 +53,7 @@ const CLUSTER_ROLLOUT_UPLOAD_MAX_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 const SHADOW_MAIN_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const SHADOW_MAIN_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHADOW_MAIN_RESTART_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
+const SHADOW_RUNTIME_TASK_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[allow(clippy::too_many_arguments)]
 fn write_cluster_rollout_progress(
@@ -543,6 +544,34 @@ fn reexec_shadow_supervisor(
     }
 }
 
+fn join_shadow_runtime_task(
+    runtime: &tokio::runtime::Runtime,
+    label: &str,
+    task: tokio::task::JoinHandle<()>,
+    abort_first: bool,
+) {
+    let abort_handle = task.abort_handle();
+    if abort_first {
+        abort_handle.abort();
+    }
+    let result = runtime
+        .block_on(async { tokio::time::timeout(SHADOW_RUNTIME_TASK_JOIN_TIMEOUT, task).await });
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if error.is_cancelled() => {}
+        Ok(Err(error)) => {
+            tracing::warn!("sinomo shadow daemon {label} task stopped with error: {error}");
+        }
+        Err(_) => {
+            abort_handle.abort();
+            tracing::warn!(
+                "sinomo shadow daemon {label} task did not stop within {}ms",
+                SHADOW_RUNTIME_TASK_JOIN_TIMEOUT.as_millis()
+            );
+        }
+    }
+}
+
 pub fn run_shadow_daemon_supervision_loop(
     options: crate::DaemonRunOptions,
     shadow_paths: DaemonPaths,
@@ -561,6 +590,7 @@ pub fn run_shadow_daemon_supervision_loop(
     let listener = daemon_runtime.block_on(sinomo_network::AsyncDaemonControlListener::bind(
         &bind_address,
     ))?;
+    let mut shadow_runtime_tasks = Vec::new();
     tracing::info!("sinomo shadow daemon listening on {bind_address}");
     crate::append_operational_event_best_effort(
         &shadow_paths,
@@ -577,39 +607,44 @@ pub fn run_shadow_daemon_supervision_loop(
             "main_binary": main_binary.display().to_string(),
         }),
     );
-    if let Err(error) = start_daemon_iroh_proxy_if_clustered(
+    match start_daemon_iroh_proxy_if_clustered(
         &shadow_paths,
         &options,
         cluster.as_ref(),
         daemon_runtime_handle.clone(),
         "shadow daemon",
     ) {
-        tracing::warn!("sinomo shadow daemon iroh proxy disabled: {error}");
-        crate::append_operational_log_best_effort(
-            &shadow_paths,
-            crate::OperationalSeverity::Warn,
-            "shadow-daemon",
-            "sinomo shadow daemon iroh proxy disabled",
-            None,
-            serde_json::json!({
-                "error": error.to_string(),
-            }),
-        );
+        Ok(Some(task)) => shadow_runtime_tasks.push(("iroh proxy", task)),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!("sinomo shadow daemon iroh proxy disabled: {error}");
+            crate::append_operational_log_best_effort(
+                &shadow_paths,
+                crate::OperationalSeverity::Warn,
+                "shadow-daemon",
+                "sinomo shadow daemon iroh proxy disabled",
+                None,
+                serde_json::json!({
+                    "error": error.to_string(),
+                }),
+            );
+        }
     }
-    if let Err(error) =
-        start_shadow_daemon_status_publisher(&shadow_paths, daemon_runtime_handle.clone())
-    {
-        tracing::warn!("sinomo shadow daemon status publisher disabled: {error}");
-        crate::append_operational_log_best_effort(
-            &shadow_paths,
-            crate::OperationalSeverity::Warn,
-            "shadow-daemon",
-            "sinomo shadow daemon status publisher disabled",
-            None,
-            serde_json::json!({
-                "error": error.to_string(),
-            }),
-        );
+    match start_shadow_daemon_status_publisher(&shadow_paths, daemon_runtime_handle.clone()) {
+        Ok(task) => shadow_runtime_tasks.push(("status publisher", task)),
+        Err(error) => {
+            tracing::warn!("sinomo shadow daemon status publisher disabled: {error}");
+            crate::append_operational_log_best_effort(
+                &shadow_paths,
+                crate::OperationalSeverity::Warn,
+                "shadow-daemon",
+                "sinomo shadow daemon status publisher disabled",
+                None,
+                serde_json::json!({
+                    "error": error.to_string(),
+                }),
+            );
+        }
     }
     if let Err(error) = complete_pending_shadow_rollout_after_start(&shadow_paths, &rollout_paths) {
         tracing::warn!("sinomo shadow daemon rollout finalization publish failed: {error}");
@@ -635,6 +670,7 @@ pub fn run_shadow_daemon_supervision_loop(
     let mut next_pending_activation_shutdown_nudge = Instant::now();
     let mut main_probe_status = DaemonProbeStatus::NotRunning;
     let (control_shutdown_tx, control_shutdown_rx) = tokio::sync::watch::channel(false);
+    let control_shutdown_signal = control_shutdown_tx.clone();
     let (control_loop_tx, control_loop_rx) = std::sync::mpsc::channel::<Result<(), DaemonError>>();
     let control_paths = shadow_paths.clone();
     let control_bind_address = bind_address.clone();
@@ -668,12 +704,28 @@ pub fn run_shadow_daemon_supervision_loop(
         match control_loop_rx.try_recv() {
             Ok(Ok(())) => break,
             Ok(Err(error)) => {
-                shadow_control_accept_task.abort();
+                join_shadow_runtime_task(
+                    &daemon_runtime,
+                    "control accept",
+                    shadow_control_accept_task,
+                    true,
+                );
+                for (label, task) in shadow_runtime_tasks {
+                    join_shadow_runtime_task(&daemon_runtime, label, task, true);
+                }
                 return Err(error);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                shadow_control_accept_task.abort();
+                join_shadow_runtime_task(
+                    &daemon_runtime,
+                    "control accept",
+                    shadow_control_accept_task,
+                    true,
+                );
+                for (label, task) in shadow_runtime_tasks {
+                    join_shadow_runtime_task(&daemon_runtime, label, task, true);
+                }
                 return Err(DaemonError::Network {
                     address: bind_address.clone(),
                     detail: "shadow daemon control accept loop stopped before reporting shutdown"
@@ -1015,7 +1067,16 @@ pub fn run_shadow_daemon_supervision_loop(
 
         thread::sleep(shadow_idle_interval);
     }
-    shadow_control_accept_task.abort();
+    let _ = control_shutdown_signal.send(true);
+    join_shadow_runtime_task(
+        &daemon_runtime,
+        "control accept",
+        shadow_control_accept_task,
+        false,
+    );
+    for (label, task) in shadow_runtime_tasks {
+        join_shadow_runtime_task(&daemon_runtime, label, task, true);
+    }
 
     // Compatibility for old pending re-exec requests. New rollouts are finalized
     // by the main daemon from the stable installed shadow path.

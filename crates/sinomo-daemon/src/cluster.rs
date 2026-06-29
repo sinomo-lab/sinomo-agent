@@ -883,28 +883,28 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
     cluster: Option<&DaemonClusterStatus>,
     runtime: tokio::runtime::Handle,
     label: &str,
-) -> Result<(), DaemonError> {
+) -> Result<Option<tokio::task::JoinHandle<()>>, DaemonError> {
     if sinomo_network::iroh_disabled_by_env() {
         tracing::info!("sinomo {label} iroh disabled (SINOMO_DISABLE_IROH)");
-        return Ok(());
+        return Ok(None);
     }
     if paths.root.parent().is_none() {
         tracing::warn!(
             "sinomo {label} iroh proxy disabled: daemon paths have no data directory parent"
         );
-        return Ok(());
+        return Ok(None);
     }
     let proxy_key = daemon_iroh_proxy_start_key(paths, label);
     if !claim_daemon_iroh_proxy_start(&proxy_key)? {
         tracing::debug!("sinomo {label} iroh proxy already initialized");
-        return Ok(());
+        return Ok(None);
     }
     let paths = paths.clone();
     let options = options.clone();
     let mut cluster = cluster.cloned();
     let label = label.to_string();
     let runtime = runtime.clone();
-    runtime.clone().spawn(async move {
+    let task = runtime.clone().spawn(async move {
         let Some(data_dir) = paths.root.parent().map(|path| path.to_path_buf()) else {
             tracing::warn!(
                 "sinomo {label} iroh proxy disabled: daemon paths have no data directory parent"
@@ -1069,7 +1069,7 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
             .await;
         }
     });
-    Ok(())
+    Ok(Some(task))
 }
 
 fn daemon_iroh_proxy_start_key(paths: &DaemonPaths, label: &str) -> String {
@@ -1132,9 +1132,9 @@ fn refresh_daemon_iroh_repair_route_with_runtime(
 pub(crate) fn start_shadow_daemon_status_publisher(
     paths: &DaemonPaths,
     runtime: tokio::runtime::Handle,
-) -> Result<(), DaemonError> {
+) -> Result<tokio::task::JoinHandle<()>, DaemonError> {
     let status_paths = paths.clone();
-    runtime.clone().spawn(async move {
+    let task = runtime.clone().spawn(async move {
         let iroh_disabled = sinomo_network::iroh_disabled_by_env();
         let mut startup_retries_remaining = DAEMON_SHADOW_STATUS_STARTUP_RETRY_ATTEMPTS;
         let mut publish_interval = DAEMON_SHADOW_STATUS_STARTUP_RETRY_INTERVAL;
@@ -1196,7 +1196,7 @@ pub(crate) fn start_shadow_daemon_status_publisher(
             };
         }
     });
-    Ok(())
+    Ok(task)
 }
 
 fn daemon_paths_have_settled_solo_cluster(paths: &DaemonPaths) -> Result<bool, DaemonError> {
