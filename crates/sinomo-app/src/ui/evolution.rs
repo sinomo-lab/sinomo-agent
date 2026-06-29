@@ -2170,22 +2170,13 @@ fn paint_rail(
         action,
     );
     y += SECTION_GAP;
-    y = paint_rail_section(
-        ctx,
-        theme,
-        pal,
-        Rect::new(inner.x(), y, inner.width(), 112.0),
-        "Rollback",
-        &rollback_rows(job),
-    );
-    y += SECTION_GAP;
     paint_rail_section(
         ctx,
         theme,
         pal,
-        Rect::new(inner.x(), y, inner.width(), 172.0),
-        "Artifacts",
-        &artifact_rows(job),
+        Rect::new(inner.x(), y, inner.width(), 150.0),
+        "Review summary",
+        &selected_review_rows(job),
     );
 }
 
@@ -2391,48 +2382,52 @@ fn decision_action_rows(
     ]
 }
 
-fn rollback_rows(job: &EvolutionJobSummary) -> Vec<(String, String)> {
-    vec![
-        ("Strategy".to_string(), job.recovery_strategy.clone()),
-        ("Policy".to_string(), job.rollback_policy.clone()),
-        (
-            "Revision".to_string(),
-            job.source_revision
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string()),
+fn selected_review_rows(job: &EvolutionJobSummary) -> Vec<(String, String)> {
+    let rollback = match (
+        job.recovery_strategy.trim().is_empty(),
+        job.rollback_policy.trim().is_empty(),
+    ) {
+        (true, true) => "not recorded".to_string(),
+        (false, true) => compact(&job.recovery_strategy, 52),
+        (true, false) => compact(&job.rollback_policy, 52),
+        (false, false) => compact(
+            &format!("{} / {}", job.recovery_strategy, job.rollback_policy),
+            52,
         ),
-        ("Note".to_string(), job.recovery_note.clone()),
-    ]
-}
+    };
+    let scorecard = if job.scorecard_path.is_some() {
+        "scorecard"
+    } else {
+        "no scorecard"
+    };
+    let next = if job.status_key == "awaiting-approval" && job.decision.is_none() {
+        "approve or reject".to_string()
+    } else if job.decision.is_some() {
+        "decision recorded".to_string()
+    } else {
+        "watch lifecycle status".to_string()
+    };
 
-fn artifact_rows(job: &EvolutionJobSummary) -> Vec<(String, String)> {
     vec![
-        ("Bundle".to_string(), tail_path(&job.bundle_path, 54)),
         (
-            "Packet".to_string(),
-            tail_path(&job.mutation_packet_path, 54),
+            "Verification".to_string(),
+            job.verification_outcome
+                .clone()
+                .unwrap_or_else(|| "not recorded".to_string()),
         ),
         (
-            "Diff".to_string(),
-            job.diff_path
-                .as_deref()
-                .map(|path| tail_path(path, 54))
-                .unwrap_or_else(|| "missing".to_string()),
+            "Gates".to_string(),
+            format!(
+                "{} required, {} commands",
+                job.required_gate_count, job.verification_command_count
+            ),
         ),
+        ("Rollback".to_string(), rollback),
         (
-            "Scorecard".to_string(),
-            job.scorecard_path
-                .as_deref()
-                .map(|path| tail_path(path, 54))
-                .unwrap_or_else(|| "missing".to_string()),
+            "Artifacts".to_string(),
+            format!("{} refs, {scorecard}", job.artifact_ref_count),
         ),
-        (
-            "Summary".to_string(),
-            job.candidate_summary_path
-                .as_deref()
-                .map(|path| tail_path(path, 54))
-                .unwrap_or_else(|| "missing".to_string()),
-        ),
+        ("Next".to_string(), next),
     ]
 }
 
@@ -2667,6 +2662,44 @@ mod tests {
             .join("\n");
         assert!(expanded_text.contains("Source path:"));
         assert!(expanded_text.contains(r"C:\Users\IX\.sinomo\evolution"));
+    }
+
+    #[test]
+    fn selected_review_rows_keep_raw_paths_out_of_rail() {
+        let job = EvolutionJobSummary {
+            status_key: "awaiting-approval".to_string(),
+            recovery_strategy: "git branch reset".to_string(),
+            rollback_policy: "Manual".to_string(),
+            verification_outcome: Some("passed".to_string()),
+            required_gate_count: 4,
+            verification_command_count: 3,
+            artifact_ref_count: 7,
+            scorecard_path: Some(
+                r"C:\Users\IX\.sinomo\evolution\candidates\candidate\scorecard.json".to_string(),
+            ),
+            bundle_path: r"C:\Users\IX\.sinomo\evolution\candidates\candidate".to_string(),
+            mutation_packet_path:
+                r"C:\Users\IX\.sinomo\evolution\candidates\candidate\mutation-packet.json"
+                    .to_string(),
+            ..EvolutionJobSummary::default()
+        };
+
+        let rows = selected_review_rows(&job);
+        let text = rows
+            .iter()
+            .map(|(label, value)| format!("{label}: {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Verification: passed"));
+        assert!(text.contains("Gates: 4 required, 3 commands"));
+        assert!(text.contains("Rollback: git branch reset / Manual"));
+        assert!(text.contains("Artifacts: 7 refs, scorecard"));
+        assert!(text.contains("Next: approve or reject"));
+        assert!(
+            !text.contains(r"C:\Users"),
+            "compact rail summary should not expose raw local artifact paths"
+        );
     }
 
     #[test]
