@@ -579,6 +579,8 @@ fn terminate_daemon_from_status_file(
     let Ok(status) = crate::read_daemon_status(paths) else {
         return Ok(None);
     };
+    #[cfg(not(unix))]
+    let _ = (wait_timeout, probe_timeout, &status);
     #[cfg(unix)]
     {
         unsafe extern "C" {

@@ -15691,15 +15691,12 @@ fn member_daemon_status_targets_prefer_healthy_iroh_over_unknown_stale_lan() {
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
     let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_status_healthy_iroh_before_stale_lan")
-            .expect("cluster");
-    let local =
-        NodeId::from_legacy_named("node_status_healthy_iroh_before_stale_lan_local")
-            .expect("local");
-    let remote =
-        NodeId::from_legacy_named("node_status_healthy_iroh_before_stale_lan_remote")
-            .expect("remote");
+    let cluster_id = ClusterId::from_legacy_named("cluster_status_healthy_iroh_before_stale_lan")
+        .expect("cluster");
+    let local = NodeId::from_legacy_named("node_status_healthy_iroh_before_stale_lan_local")
+        .expect("local");
+    let remote = NodeId::from_legacy_named("node_status_healthy_iroh_before_stale_lan_remote")
+        .expect("remote");
     let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id.clone(),
         "status healthy iroh before stale lan",

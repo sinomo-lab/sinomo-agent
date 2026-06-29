@@ -1,8 +1,5 @@
 use crate::{SANDBOX_WASIX_MAX_TASKS, SandboxWasiError};
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 use wasmer::{Global, Value};
 use wasmer_wasix::{
     WasiRuntimeError,
@@ -186,7 +183,7 @@ fn host_cgroup_task_capacity() -> Option<usize> {
             _ => None,
         }
     })?;
-    let mut path = PathBuf::from("/sys/fs/cgroup");
+    let mut path = std::path::PathBuf::from("/sys/fs/cgroup");
     if !relative.is_empty() {
         path.push(relative);
     }
@@ -205,7 +202,7 @@ fn host_cgroup_task_capacity() -> Option<usize> {
                 None => available,
             });
         }
-        if path == PathBuf::from("/sys/fs/cgroup") {
+        if path == std::path::PathBuf::from("/sys/fs/cgroup") {
             break;
         }
         if !path.pop() {

@@ -220,7 +220,6 @@ fn spawn_detached_no_inherit(binary: &Path, args: &[&str]) -> Result<(), DaemonE
 fn spawn_detached_no_inherit(binary: &Path, args: &[&str]) -> Result<(), DaemonError> {
     use std::ffi::c_void;
     use std::mem::{size_of, zeroed};
-    use std::os::windows::ffi::OsStrExt;
     use std::ptr::{null, null_mut};
 
     type Bool = i32;

@@ -4993,7 +4993,7 @@ fn channel_agents_editor(
             ChannelAgentsStoreStatus::Failed(detail) => {
                 let settings = {
                     let s = shared.clone();
-                    sui::Button::new("Connection settings")
+                    sui::Button::new("Open connection settings")
                         .icon(IconGlyph::Alert)
                         .theme_when(secondary_button_theme(reader))
                         .on_press(move || open_settings_section(&s, SettingsSection::Connection))
@@ -9578,7 +9578,7 @@ mod tests {
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Connection settings")
+            .with_name("Open connection settings")
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);

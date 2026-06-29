@@ -864,6 +864,7 @@ fn metadata_inode(metadata: &fs::Metadata, path: &SandboxPath) -> u64 {
     }
     #[cfg(not(unix))]
     {
+        let _ = metadata;
         sandbox_inode_for_path(path)
     }
 }

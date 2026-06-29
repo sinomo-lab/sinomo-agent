@@ -306,10 +306,6 @@ fn copy_dir_tree_no_symlinks(source: &Path, destination: &Path) -> Result<(), Sa
         detail: error.to_string(),
     })?;
     if metadata.file_type().is_symlink() {
-        let target = fs::read_link(source).map_err(|error| SandboxStoreError::Io {
-            path: source.display().to_string(),
-            detail: error.to_string(),
-        })?;
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|error| SandboxStoreError::Io {
                 path: parent.display().to_string(),
@@ -317,12 +313,18 @@ fn copy_dir_tree_no_symlinks(source: &Path, destination: &Path) -> Result<(), Sa
             })?;
         }
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, destination).map_err(|error| {
-            SandboxStoreError::Io {
-                path: destination.display().to_string(),
+        {
+            let target = fs::read_link(source).map_err(|error| SandboxStoreError::Io {
+                path: source.display().to_string(),
                 detail: error.to_string(),
-            }
-        })?;
+            })?;
+            std::os::unix::fs::symlink(&target, destination).map_err(|error| {
+                SandboxStoreError::Io {
+                    path: destination.display().to_string(),
+                    detail: error.to_string(),
+                }
+            })?;
+        }
         #[cfg(not(unix))]
         return Err(SandboxStoreError::Io {
             path: destination.display().to_string(),

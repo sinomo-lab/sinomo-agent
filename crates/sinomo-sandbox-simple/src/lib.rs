@@ -10,26 +10,31 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+#[cfg(not(windows))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
+#[cfg(not(windows))]
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use sinomo_node::NodeId;
+#[cfg(not(windows))]
+use sinomo_sandbox::SandboxCancellationToken;
 use sinomo_sandbox::{
     LocalSandboxFileSystem, LocalSandboxInstanceLayout, LocalSandboxInstanceStore,
-    SANDBOX_UNLIMITED_WALL_TIME_MS, SandboxCancellationToken, SandboxCommandExecutionError,
-    SandboxCommandId, SandboxCommandRecord, SandboxCommandRecordStatus, SandboxCommandRequest,
-    SandboxFsError, SandboxLocalCommandOutcome, SandboxOutputSink, SandboxOutputStream,
-    SandboxPath, SandboxPolicy, SandboxProcessPlan, SandboxProcessPlanOutcome,
-    SandboxResourceLimits, SandboxResourceUsage, SandboxStoreError, SandboxWasiError,
-    effective_sandbox_timeout_ms, persist_command_outputs, record_local_command_history,
-    sandbox_command_record_status_for_wasi_error, sandbox_command_stderr_path,
-    sandbox_command_stdout_path, sandbox_output_chunks, validate_sandbox_process_plan,
-    validate_sandbox_process_plan_working_directories, validate_sandbox_toolchain_argv,
-    validate_toolchain_command_name, validate_workspace_usage, validate_written_bytes,
+    SANDBOX_UNLIMITED_WALL_TIME_MS, SandboxCommandExecutionError, SandboxCommandId,
+    SandboxCommandRecord, SandboxCommandRecordStatus, SandboxCommandRequest, SandboxFsError,
+    SandboxLocalCommandOutcome, SandboxOutputSink, SandboxOutputStream, SandboxPath, SandboxPolicy,
+    SandboxProcessPlan, SandboxProcessPlanOutcome, SandboxResourceLimits, SandboxResourceUsage,
+    SandboxStoreError, SandboxWasiError, effective_sandbox_timeout_ms, persist_command_outputs,
+    record_local_command_history, sandbox_command_record_status_for_wasi_error,
+    sandbox_command_stderr_path, sandbox_command_stdout_path, sandbox_output_chunks,
+    validate_sandbox_process_plan, validate_sandbox_process_plan_working_directories,
+    validate_sandbox_toolchain_argv, validate_toolchain_command_name, validate_workspace_usage,
+    validate_written_bytes,
 };
 use time::OffsetDateTime;
 
@@ -75,8 +80,14 @@ impl SandboxSimpleNativeCommandRunner {
         Ok(Self::new(SandboxSimpleNativeConfig::from_env()?))
     }
 
+    #[cfg(target_os = "linux")]
     pub fn landlock_supported() -> bool {
         linux::landlock_abi_version().is_ok()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn landlock_supported() -> bool {
+        false
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -369,6 +380,7 @@ impl SandboxSimpleNativeCommandRunner {
 struct SandboxSimpleNativePolicy {
     read_paths: Vec<PathBuf>,
     write_paths: Vec<PathBuf>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     execute_paths: Vec<PathBuf>,
 }
 
@@ -820,7 +832,7 @@ fn invalid_request(detail: impl Into<String>) -> SandboxCommandExecutionError {
     .into()
 }
 
-#[cfg(unix)]
+#[cfg(all(not(windows), unix))]
 fn exit_status_code(output: &Output) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     output
@@ -830,7 +842,7 @@ fn exit_status_code(output: &Output) -> i32 {
         .unwrap_or(128)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(windows), not(unix)))]
 fn exit_status_code(output: &Output) -> i32 {
     output.status.code().unwrap_or(128)
 }
@@ -1787,7 +1799,7 @@ mod linux {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(windows)))]
 mod linux {
     use std::io;
 
