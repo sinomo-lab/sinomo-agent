@@ -4310,6 +4310,13 @@ fn sifs_metadata_error_next_step(error: &str) -> String {
     }
 }
 
+fn sifs_metadata_error_needs_connection(error: &str) -> bool {
+    matches!(
+        sifs_unavailable_summary(error),
+        "SIFS access needs authorization." | "SIFS needs a daemon connection."
+    )
+}
+
 fn file_preview_error_display(source: FilesSourceKind, error: &str) -> String {
     if source != FilesSourceKind::Sifs {
         return error.to_string();
@@ -7660,7 +7667,7 @@ impl InspectorView {
         y += 26.0;
         y += 34.0;
 
-        let actions = inspector_actions(files.source, entry);
+        let actions = inspector_actions(&files, entry);
         if !actions.is_empty() {
             let action_start = INSPECTOR_PAD + 4.0 + 30.0 + 26.0 + 30.0;
             y = (action_start + inspector_actions_height(actions.len())).max(y) + 12.0;
@@ -7898,6 +7905,7 @@ enum InspectorAction {
     RepairReplicas,
     PinContent,
     UnpinContent,
+    ConnectionSettings,
 }
 
 impl InspectorAction {
@@ -7914,6 +7922,7 @@ impl InspectorAction {
             Self::RepairReplicas => "Repair replicas",
             Self::PinContent => "Pin content",
             Self::UnpinContent => "Unpin content",
+            Self::ConnectionSettings => "Connection settings",
         }
     }
 
@@ -7930,6 +7939,7 @@ impl InspectorAction {
             Self::RepairReplicas => IconGlyph::Redo,
             Self::PinContent => IconGlyph::Lock,
             Self::UnpinContent => IconGlyph::Unlock,
+            Self::ConnectionSettings => IconGlyph::Alert,
         }
     }
 
@@ -7945,7 +7955,8 @@ impl InspectorAction {
             | Self::RefreshPlacement
             | Self::RepairReplicas
             | Self::PinContent
-            | Self::UnpinContent => None,
+            | Self::UnpinContent
+            | Self::ConnectionSettings => None,
         }
     }
 
@@ -7956,6 +7967,7 @@ impl InspectorAction {
             Self::RepairReplicas => format!("Repair replicas {}", entry.name),
             Self::PinContent => format!("Pin content {}", entry.name),
             Self::UnpinContent => format!("Unpin content {}", entry.name),
+            Self::ConnectionSettings => "Connection settings".to_string(),
             Self::CopyToSifs => format!("Copy to SIFS {}", entry.name),
             Self::CopyToLocal => format!("Download {}", entry.name),
             Self::Copy | Self::Move | Self::Rename | Self::Delete => {
@@ -7965,20 +7977,27 @@ impl InspectorAction {
     }
 }
 
-fn inspector_actions(source: FilesSourceKind, entry: &SifsEntry) -> Vec<InspectorAction> {
+fn inspector_actions(files: &FilesState, entry: &SifsEntry) -> Vec<InspectorAction> {
     let mut actions = Vec::with_capacity(8);
     if entry.is_dir {
         actions.push(InspectorAction::OpenFolder);
     }
     actions.push(InspectorAction::Copy);
-    match source {
+    match files.source {
         FilesSourceKind::Local => actions.push(InspectorAction::CopyToSifs),
         FilesSourceKind::Sifs => actions.push(InspectorAction::CopyToLocal),
     }
     actions.push(InspectorAction::Move);
     actions.push(InspectorAction::Rename);
     actions.push(InspectorAction::Delete);
-    if source == FilesSourceKind::Sifs {
+    if files.source == FilesSourceKind::Sifs {
+        if files
+            .details_error
+            .as_deref()
+            .is_some_and(sifs_metadata_error_needs_connection)
+        {
+            actions.push(InspectorAction::ConnectionSettings);
+        }
         actions.push(InspectorAction::RefreshPlacement);
         actions.push(InspectorAction::RepairReplicas);
         if !entry.is_dir && !entry.is_link {
@@ -8084,6 +8103,7 @@ fn inspector_action_button_widget_id(
         InspectorAction::RepairReplicas => 7_579,
         InspectorAction::PinContent => 7_587,
         InspectorAction::UnpinContent => 7_599,
+        InspectorAction::ConnectionSettings => 7_603,
     };
     sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(salt))
 }
@@ -8177,7 +8197,7 @@ impl Widget for InspectorView {
             let selected_action = {
                 let files = self.shared.files();
                 files.selected_entry().cloned().and_then(|entry| {
-                    inspector_actions(files.source, &entry)
+                    inspector_actions(&files, &entry)
                         .into_iter()
                         .enumerate()
                         .find(|(index, _)| {
@@ -8212,6 +8232,10 @@ impl Widget for InspectorView {
                         let waker = { self.shared.borrow().waker.clone() };
                         self.shared.files_mut().start_unpin_content(waker);
                         request_files_overlay_rebuild(ctx);
+                    }
+                    InspectorAction::ConnectionSettings => {
+                        open_settings_section(&self.shared, SettingsSection::Connection);
+                        ctx.request_measure();
                     }
                     InspectorAction::Copy
                     | InspectorAction::CopyToSifs
@@ -8387,7 +8411,7 @@ impl Widget for InspectorView {
         );
         y += 34.0;
 
-        let actions = inspector_actions(files.source, entry);
+        let actions = inspector_actions(&files, entry);
         if !actions.is_empty() {
             self.action_buttons(ctx, &theme, &pal, bounds, &actions);
             y = (inspector_actions_origin_y(bounds) + inspector_actions_height(actions.len()))
@@ -8847,11 +8871,16 @@ impl Widget for InspectorView {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let (selected_entry, source, details_open, tasks) = {
+        let (selected_entry, selected_actions, details_open, tasks) = {
             let files = self.shared.files();
+            let selected_entry = files.selected_entry().cloned();
+            let selected_actions = selected_entry
+                .as_ref()
+                .map(|entry| inspector_actions(&files, entry))
+                .unwrap_or_default();
             (
-                files.selected_entry().cloned(),
-                files.source,
+                selected_entry,
+                selected_actions,
                 (files.loading || files.error.is_some() || files.selected_entry().is_some())
                     .then_some(files.inspector_details_open),
                 files.tasks.clone(),
@@ -8901,7 +8930,7 @@ impl Widget for InspectorView {
         }
 
         if let Some(entry) = &selected_entry {
-            for (index, action) in inspector_actions(source, entry).into_iter().enumerate() {
+            for (index, action) in selected_actions.into_iter().enumerate() {
                 let mut node = SemanticsNode::new(
                     inspector_action_button_widget_id(ctx.widget_id(), action),
                     SemanticsRole::Button,
@@ -8922,6 +8951,10 @@ impl Widget for InspectorView {
                     }
                     InspectorAction::UnpinContent => {
                         format!("Remove this node's SIFS content pin for {}", entry.path)
+                    }
+                    InspectorAction::ConnectionSettings => {
+                        "Open Connection settings for SIFS authorization and daemon recovery"
+                            .to_string()
                     }
                     InspectorAction::CopyToSifs => {
                         format!("Copy local {} into SIFS", entry.path)
@@ -9119,7 +9152,10 @@ impl InspectorView {
             InspectorAction::RefreshPlacement
             | InspectorAction::RepairReplicas
             | InspectorAction::PinContent
-            | InspectorAction::UnpinContent => (pal.field, pal.border, pal.accent, pal.accent),
+            | InspectorAction::UnpinContent
+            | InspectorAction::ConnectionSettings => {
+                (pal.field, pal.border, pal.accent, pal.accent)
+            }
             InspectorAction::CopyToSifs | InspectorAction::CopyToLocal => {
                 (pal.field, pal.border, pal.accent, pal.accent)
             }
@@ -14625,6 +14661,54 @@ mod tests {
             FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn selected_sifs_metadata_error_offers_connection_recovery() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/services".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/services/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.selected = Some(0);
+            files.details_error = Some("device authorization was denied".to_string());
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files inspector SIFS metadata recovery")
+                    .root(
+                        SizedBox::new()
+                            .width(INSPECTOR_W)
+                            .height(720.0)
+                            .with_child(InspectorView::new(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Connection settings")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
         Ok(())
     }
 
