@@ -43,8 +43,8 @@ use sui::{
 };
 
 use sinomo_cli::app_api::{
-    SifsBrowser, SifsEntry, SifsFileRead, SifsMetadataShardDetails, SifsObjectDetails,
-    SifsObjectHealth,
+    SifsBrowser, SifsEntry, SifsFileRead, SifsHealthSummary, SifsMetadataShardDetails,
+    SifsObjectDetails, SifsObjectHealth,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use time::format_description::well_known::Rfc3339;
@@ -389,6 +389,7 @@ pub struct FilesState {
     selected_local_details: Option<LocalObjectDetails>,
     pub details_loading: bool,
     pub details_error: Option<String>,
+    sifs_health: Option<SifsHealthSummary>,
     selected_preview: Option<FilesPreview>,
     preview_loading: bool,
     preview_error: Option<String>,
@@ -437,6 +438,7 @@ impl FilesState {
             selected_local_details: None,
             details_loading: false,
             details_error: None,
+            sifs_health: None,
             selected_preview: None,
             preview_loading: false,
             preview_error: None,
@@ -549,6 +551,9 @@ impl FilesState {
                 self.error = None;
                 if self.source == FilesSourceKind::Local {
                     self.node_id = local_node_label();
+                    self.sifs_health = None;
+                } else if let Some(browser) = self.browser.as_ref() {
+                    self.sifs_health = browser.health_summary().ok().flatten();
                 }
                 if let Some(select_path) = self.pending_select_path.take()
                     && let Some(index) = self
@@ -647,6 +652,7 @@ impl FilesState {
         self.marked_entries.clear();
         self.clear_selected_details();
         self.node_id.clear();
+        self.sifs_health = None;
         self.inspector_details_open = false;
         self.loaded = self.source == FilesSourceKind::Local;
         self.loading = false;
@@ -764,6 +770,7 @@ impl FilesState {
                 match result {
                     Ok(listing) => {
                         self.node_id = listing.node_id;
+                        self.sifs_health = listing.health;
                         self.entries = listing.entries;
                         self.error = None;
                         if let Some(select_path) = self.pending_select_path.take()
@@ -778,6 +785,7 @@ impl FilesState {
                     }
                     Err(error) => {
                         self.entries.clear();
+                        self.sifs_health = None;
                         self.error = Some(error);
                     }
                 }
@@ -2015,6 +2023,7 @@ impl FilesState {
 
 struct FilesListing {
     node_id: String,
+    health: Option<SifsHealthSummary>,
     entries: Vec<SifsEntry>,
 }
 
@@ -2130,6 +2139,7 @@ fn files_worker_loop(
                     }
                     let result = list_local_dir(&path).map(|entries| FilesListing {
                         node_id: local_node_label(),
+                        health: None,
                         entries,
                     });
                     (path, result)
@@ -2158,6 +2168,7 @@ fn files_worker_loop(
                             let path = browser.normalize(&requested_path);
                             let result = browser.list_shallow(&path).map(|entries| FilesListing {
                                 node_id: browser.node_id().to_string(),
+                                health: browser.health_summary().ok().flatten(),
                                 entries,
                             });
                             (path, result)
@@ -6630,10 +6641,103 @@ fn open_settings_section(shared: &Shared, section: SettingsSection) {
     }
 }
 
+fn sifs_health_has_attention(health: &SifsHealthSummary) -> bool {
+    health.open_conflict_count > 0
+        || health.pending_repair_count > 0
+        || health.failed_namespace_job_count > 0
+}
+
+fn sifs_health_has_activity(health: &SifsHealthSummary) -> bool {
+    health.pending_write_count > 0 || health.pending_namespace_job_count > 0
+}
+
+fn sifs_health_status_detail(health: &SifsHealthSummary) -> String {
+    let mut parts = Vec::new();
+    if health.open_conflict_count > 0 {
+        parts.push(format!(
+            "{} {}",
+            health.open_conflict_count,
+            if health.open_conflict_count == 1 {
+                "conflict"
+            } else {
+                "conflicts"
+            }
+        ));
+    }
+    if health.pending_repair_count > 0 {
+        parts.push(format!(
+            "{} {}",
+            health.pending_repair_count,
+            if health.pending_repair_count == 1 {
+                "repair"
+            } else {
+                "repairs"
+            }
+        ));
+    }
+    if health.failed_namespace_job_count > 0 {
+        parts.push(format!(
+            "{} failed namespace {}",
+            health.failed_namespace_job_count,
+            if health.failed_namespace_job_count == 1 {
+                "job"
+            } else {
+                "jobs"
+            }
+        ));
+    }
+    if health.pending_write_count > 0 {
+        parts.push(format!(
+            "{} pending {}",
+            health.pending_write_count,
+            if health.pending_write_count == 1 {
+                "write"
+            } else {
+                "writes"
+            }
+        ));
+    }
+    if health.pending_namespace_job_count > 0 {
+        parts.push(format!(
+            "{} namespace {}",
+            health.pending_namespace_job_count,
+            if health.pending_namespace_job_count == 1 {
+                "job"
+            } else {
+                "jobs"
+            }
+        ));
+    }
+    if parts.is_empty() {
+        format!(
+            "DFS healthy; {} objects, {} shards",
+            health.object_count, health.metadata_shard_count
+        )
+    } else {
+        format!("DFS {}", parts.join(", "))
+    }
+}
+
 fn files_source_status(files: &FilesState) -> &'static str {
     match files.source {
         FilesSourceKind::Sifs if files.error.is_some() => "SIFS unavailable",
         FilesSourceKind::Sifs if files.loading => "Loading SIFS",
+        FilesSourceKind::Sifs
+            if files
+                .sifs_health
+                .as_ref()
+                .is_some_and(sifs_health_has_attention) =>
+        {
+            "SIFS degraded"
+        }
+        FilesSourceKind::Sifs
+            if files
+                .sifs_health
+                .as_ref()
+                .is_some_and(sifs_health_has_activity) =>
+        {
+            "SIFS syncing"
+        }
         FilesSourceKind::Sifs if files.clustered => "SIFS online",
         FilesSourceKind::Sifs => "Local SIFS",
         FilesSourceKind::Local if files.error.is_some() => "Local unavailable",
@@ -6811,14 +6915,21 @@ fn files_task_queue_summary(tasks: &[FilesTask]) -> String {
 }
 
 fn files_status_summary(files: &FilesState) -> String {
-    format!(
+    let mut summary = format!(
         "{} | Path {} | {} | {} | {}",
         files_source_status(files),
         files.path,
         files_entry_count_status(files),
         files_selection_status(files),
         files_task_status(files),
-    )
+    );
+    if files.source == FilesSourceKind::Sifs
+        && let Some(health) = files.sifs_health.as_ref()
+    {
+        summary.push_str(" | ");
+        summary.push_str(&sifs_health_status_detail(health));
+    }
+    summary
 }
 
 fn push_unique_place(
@@ -7201,6 +7312,18 @@ impl FilesStatusBar {
             pal.accent
         } else if files.source == FilesSourceKind::Local {
             pal.good
+        } else if files
+            .sifs_health
+            .as_ref()
+            .is_some_and(sifs_health_has_attention)
+        {
+            pal.warn
+        } else if files
+            .sifs_health
+            .as_ref()
+            .is_some_and(sifs_health_has_activity)
+        {
+            pal.accent
         } else if files.clustered {
             pal.good
         } else {
@@ -7258,12 +7381,18 @@ impl Widget for FilesStatusBar {
         let info_x = chip.max_x() + 12.0;
         let info_w = (right.x() - info_x - 12.0).max(0.0);
         let selected = files_status_bar_selection(&files);
-        let info = format!(
+        let mut info = format!(
             "{} | {} | {}",
             middle_short(&files.path, 64),
             files_entry_count_status(&files),
             selected,
         );
+        if files.source == FilesSourceKind::Sifs
+            && let Some(health) = files.sifs_health.as_ref()
+        {
+            info.push_str(" | ");
+            info.push_str(&middle_short(&sifs_health_status_detail(health), 48));
+        }
         widgets::draw_text_in(
             ctx,
             Rect::new(info_x, y, info_w, 24.0),
@@ -12411,6 +12540,25 @@ mod tests {
             files_status_summary(&state),
             "Local SIFS | Path /cluster-tests | 1 entry | 1 entry marked | 1 task done"
         );
+
+        state.clustered = true;
+        state.sifs_health = Some(SifsHealthSummary {
+            file_system_count: 1,
+            object_count: 776,
+            version_count: 2482,
+            pending_write_count: 43,
+            open_conflict_count: 21,
+            pending_repair_count: 18,
+            pending_namespace_job_count: 0,
+            failed_namespace_job_count: 0,
+            metadata_shard_count: 3,
+            repair_attempt_count: 18,
+        });
+        assert_eq!(files_source_status(&state), "SIFS degraded");
+        assert_eq!(
+            files_status_summary(&state),
+            "SIFS degraded | Path /cluster-tests | 1 entry | 1 entry marked | 1 task done | DFS 21 conflicts, 18 repairs, 43 pending writes"
+        );
     }
 
     #[test]
@@ -12605,6 +12753,7 @@ mod tests {
             path: "/services".to_string(),
             result: Ok(FilesListing {
                 node_id: "node-a".to_string(),
+                health: None,
                 entries: vec![SifsEntry {
                     name: "sinomo".to_string(),
                     path: "/services/sinomo".to_string(),

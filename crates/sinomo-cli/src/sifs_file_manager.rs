@@ -353,6 +353,18 @@ impl SifsFileManagerBackend {
             .map_err(|error| format!("cannot read SIFS operational metrics: {error}"))
     }
 
+    pub(crate) fn operator_status(
+        &self,
+    ) -> Result<Option<sinomo_runtime::dfs::DfsOperatorStatus>, String> {
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        if !cluster_paths.state.exists() {
+            return Ok(None);
+        }
+        sinomo_runtime::dfs::inspect_cluster_aware_dfs_status(&self.data_dir, &cluster_paths)
+            .map(Some)
+            .map_err(|error| format!("cannot read SIFS operator status: {error}"))
+    }
+
     pub(crate) fn local_pins_for_path(
         &self,
         file_system_id: &sinomo_runtime::dfs::DfsFileSystemId,

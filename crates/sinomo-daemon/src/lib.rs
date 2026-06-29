@@ -66,6 +66,22 @@ pub struct DaemonDfsBrowserStatusRequest;
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserStatusResponse {
     pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<DaemonDfsBrowserHealthSummary>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserHealthSummary {
+    pub file_system_count: usize,
+    pub object_count: usize,
+    pub version_count: usize,
+    pub pending_write_count: usize,
+    pub open_conflict_count: usize,
+    pub pending_repair_count: usize,
+    pub pending_namespace_job_count: usize,
+    pub failed_namespace_job_count: usize,
+    pub metadata_shard_count: usize,
+    pub repair_attempt_count: usize,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]

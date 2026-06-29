@@ -2048,6 +2048,21 @@ pub struct SifsObjectHealth {
     pub missing_replica_nodes: Vec<String>,
 }
 
+/// Bounded operator health for the mounted SIFS namespace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SifsHealthSummary {
+    pub file_system_count: usize,
+    pub object_count: usize,
+    pub version_count: usize,
+    pub pending_write_count: usize,
+    pub open_conflict_count: usize,
+    pub pending_repair_count: usize,
+    pub pending_namespace_job_count: usize,
+    pub failed_namespace_job_count: usize,
+    pub metadata_shard_count: usize,
+    pub repair_attempt_count: usize,
+}
+
 /// Bounded bytes read for a file preview or lightweight inspection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SifsFileRead {
@@ -2126,6 +2141,18 @@ impl SifsBrowser {
     /// The node SIFS objects are placed on locally.
     pub fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// Read a bounded namespace health summary for the current SIFS mount.
+    pub fn health_summary(&self) -> Result<Option<SifsHealthSummary>, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend
+                .operator_status()
+                .map(|status| status.map(sifs_health_from_status)),
+            SifsBrowserBackend::Remote(remote) => remote
+                .status()
+                .map(|status| status.health.map(sifs_health_summary_from_rpc)),
+        }
     }
 
     /// List a directory (directories first, then files, name-sorted).
@@ -2340,6 +2367,13 @@ impl SifsBrowser {
 }
 
 impl RemoteSifsBrowser {
+    fn status(&self) -> Result<sinomo_runtime::daemon::DaemonDfsBrowserStatusResponse, String> {
+        self.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_STATUS_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserStatusRequest,
+        )
+    }
+
     fn rpc<Req, Resp>(&self, route: &str, body: &Req) -> Result<Resp, String>
     where
         Req: serde::Serialize + ?Sized,
@@ -2629,7 +2663,7 @@ fn sifs_details_from_rpc(
             .into_iter()
             .map(sifs_pin_from_rpc)
             .collect(),
-        health: response.health.map(sifs_health_from_rpc),
+        health: response.health.map(sifs_object_health_from_rpc),
         metadata_shard: response.metadata_shard.map(sifs_metadata_shard_from_rpc),
     }
 }
@@ -2720,7 +2754,7 @@ fn sifs_pin_from_rpc(pin: sinomo_runtime::daemon::DaemonDfsBrowserPinRecord) -> 
     }
 }
 
-fn sifs_health_from_rpc(
+fn sifs_object_health_from_rpc(
     health: sinomo_runtime::daemon::DaemonDfsBrowserObjectHealth,
 ) -> SifsObjectHealth {
     SifsObjectHealth {
@@ -2731,6 +2765,38 @@ fn sifs_health_from_rpc(
         open_conflict_count: health.open_conflict_count,
         pending_repair_count: health.pending_repair_count,
         missing_replica_nodes: health.missing_replica_nodes,
+    }
+}
+
+fn sifs_health_from_status(status: sinomo_runtime::dfs::DfsOperatorStatus) -> SifsHealthSummary {
+    SifsHealthSummary {
+        file_system_count: status.file_system_count,
+        object_count: status.object_count,
+        version_count: status.version_count,
+        pending_write_count: status.pending_write_count,
+        open_conflict_count: status.open_conflict_count,
+        pending_repair_count: status.pending_repair_count,
+        pending_namespace_job_count: status.pending_namespace_job_count,
+        failed_namespace_job_count: status.failed_namespace_job_count,
+        metadata_shard_count: status.metadata_shards.len(),
+        repair_attempt_count: status.repair_attempts.len(),
+    }
+}
+
+fn sifs_health_summary_from_rpc(
+    health: sinomo_runtime::daemon::DaemonDfsBrowserHealthSummary,
+) -> SifsHealthSummary {
+    SifsHealthSummary {
+        file_system_count: health.file_system_count,
+        object_count: health.object_count,
+        version_count: health.version_count,
+        pending_write_count: health.pending_write_count,
+        open_conflict_count: health.open_conflict_count,
+        pending_repair_count: health.pending_repair_count,
+        pending_namespace_job_count: health.pending_namespace_job_count,
+        failed_namespace_job_count: health.failed_namespace_job_count,
+        metadata_shard_count: health.metadata_shard_count,
+        repair_attempt_count: health.repair_attempt_count,
     }
 }
 

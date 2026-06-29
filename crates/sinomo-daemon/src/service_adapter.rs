@@ -1379,6 +1379,13 @@ impl DaemonDfsBrowserBackend {
         Ok(self.lock_service()?.node_id().to_string())
     }
 
+    fn health_summary(&self) -> Result<crate::DaemonDfsBrowserHealthSummary, ServiceError> {
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        let status = sinomo_dfs::inspect_cluster_aware_dfs_status(&self.data_dir, &cluster_paths)
+            .map_err(dfs_browser_service_error)?;
+        Ok(daemon_dfs_browser_health_summary(status))
+    }
+
     fn list(
         &self,
         request: crate::DaemonDfsBrowserListRequest,
@@ -1814,6 +1821,7 @@ impl Service for DaemonDfsBrowserService {
                         DAEMON_DFS_BROWSER_STATUS_ROUTE,
                         &crate::DaemonDfsBrowserStatusResponse {
                             node_id: backend.node_id()?,
+                            health: backend.health_summary().ok(),
                         },
                     )?
                 }
@@ -2073,6 +2081,23 @@ fn daemon_dfs_browser_metadata_shard(
         local_node_id,
         local_is_primary,
         local_is_replica,
+    }
+}
+
+fn daemon_dfs_browser_health_summary(
+    status: sinomo_dfs::DfsOperatorStatus,
+) -> crate::DaemonDfsBrowserHealthSummary {
+    crate::DaemonDfsBrowserHealthSummary {
+        file_system_count: status.file_system_count,
+        object_count: status.object_count,
+        version_count: status.version_count,
+        pending_write_count: status.pending_write_count,
+        open_conflict_count: status.open_conflict_count,
+        pending_repair_count: status.pending_repair_count,
+        pending_namespace_job_count: status.pending_namespace_job_count,
+        failed_namespace_job_count: status.failed_namespace_job_count,
+        metadata_shard_count: status.metadata_shards.len(),
+        repair_attempt_count: status.repair_attempts.len(),
     }
 }
 
