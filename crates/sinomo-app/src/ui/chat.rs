@@ -290,7 +290,7 @@ impl RecoveryCardAction {
         match self {
             RecoveryCardAction::RetryChatList => "Retry now",
             RecoveryCardAction::CheckSifs => "Check SIFS",
-            RecoveryCardAction::OpenConnectionSettings => "Open settings",
+            RecoveryCardAction::OpenConnectionSettings => "Connection settings",
             RecoveryCardAction::OpenProviderSetup => "Provider setup",
         }
     }
@@ -6574,7 +6574,7 @@ impl TranscriptView {
         match action {
             RecoveryCardAction::RetryChatList => 112.0,
             RecoveryCardAction::CheckSifs => 116.0,
-            RecoveryCardAction::OpenConnectionSettings => 128.0,
+            RecoveryCardAction::OpenConnectionSettings => 164.0,
             RecoveryCardAction::OpenProviderSetup => 142.0,
         }
     }
@@ -7466,7 +7466,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 fn provider_setup_button(shared: &Shared, reader: &ThemeReader) -> SizedBox {
     let s = shared.clone();
     SizedBox::new().height(SELECTOR_H).with_child(
-        sui::Button::new("Setup provider")
+        sui::Button::new("Set up provider")
             .icon(IconGlyph::Add)
             .theme_when(composer_control_reader(reader))
             .on_press(move || open_provider_setup(&s)),
@@ -10368,7 +10368,7 @@ mod tests {
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Open settings")
+            .with_name("Connection settings")
             .with_description("Connection settings")
             .click()?;
 
@@ -11291,7 +11291,7 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Open settings")
+                .with_name("Connection settings")
                 .with_description("Connection settings")
                 .count()?,
             1,
@@ -11378,7 +11378,7 @@ mod tests {
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Open settings")
+            .with_name("Connection settings")
             .with_description("Connection settings")
             .click()?;
 
@@ -11521,7 +11521,7 @@ mod tests {
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Open settings")
+            .with_name("Connection settings")
             .with_description("Connection settings")
             .click()?;
 
@@ -11654,7 +11654,7 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Setup provider")
+                .with_name("Set up provider")
                 .count()?,
             0,
             "the composer setup button should not duplicate the recovery card action"

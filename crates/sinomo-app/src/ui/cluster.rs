@@ -1398,7 +1398,7 @@ fn paint_cluster_warning_action(
         ctx,
         Rect::new(rect.x() + 30.0, rect.y() + 5.0, rect.width() - 40.0, 18.0),
         if rect.width() < 150.0 {
-            "Settings"
+            "Connection"
         } else {
             "Connection settings"
         },

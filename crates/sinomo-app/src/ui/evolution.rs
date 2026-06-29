@@ -347,7 +347,7 @@ impl EvolutionStarterObjective {
     fn label(self) -> &'static str {
         match self {
             Self::PolishApp => "Polish app",
-            Self::FixCheck => "Fix check",
+            Self::FixCheck => "Fix cargo check",
             Self::CheckCluster => "Check cluster",
         }
     }
@@ -394,7 +394,7 @@ impl EvolutionStarterObjective {
     fn width(self) -> f32 {
         match self {
             Self::PolishApp => 122.0,
-            Self::FixCheck => 108.0,
+            Self::FixCheck => 136.0,
             Self::CheckCluster => 130.0,
         }
     }

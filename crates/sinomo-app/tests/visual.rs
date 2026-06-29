@@ -2033,9 +2033,9 @@ fn composer_without_provider_is_read_only_and_opens_setup() {
 
     window
         .get_by_role(SemanticsRole::Button)
-        .with_name("Setup provider")
+        .with_name("Set up provider")
         .click()
-        .expect("click Setup provider");
+        .expect("click Set up provider");
 
     assert_eq!(shared.borrow().active_tab, Tab::Settings);
     let settings = shared.settings();
