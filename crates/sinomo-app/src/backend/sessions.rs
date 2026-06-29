@@ -7,6 +7,8 @@
 //! may exist from older builds, but reads and writes in this module use SIFS as
 //! the source of truth.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use sinomo_cli::app_api::{SifsBrowser, SifsEntry};
 use sinomo_runtime::local::SinomoDataDir;
@@ -382,7 +384,7 @@ fn list_flat_sifs_records(browser: &SifsBrowser) -> Vec<SessionMeta> {
     let Ok(entries) = browser.list_if_exists("/services") else {
         return Vec::new();
     };
-    entries
+    let records_by_path = entries
         .into_iter()
         .filter(|entry| !entry.is_dir)
         .filter_map(|entry| {
@@ -393,9 +395,24 @@ fn list_flat_sifs_records(browser: &SifsBrowser) -> Vec<SessionMeta> {
             if !valid_session_id(id) {
                 return None;
             }
-            let bytes = browser.read_file(&entry.path).ok()?;
+            Some((entry.path, id.to_string()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if records_by_path.is_empty() {
+        return Vec::new();
+    }
+
+    let paths = records_by_path.keys().cloned().collect::<Vec<_>>();
+    let Ok(results) = browser.read_files(&paths) else {
+        return Vec::new();
+    };
+    results
+        .into_iter()
+        .filter_map(|(path, result)| {
+            let id = records_by_path.get(&path)?;
+            let bytes = result.ok()?;
             let record = serde_json::from_slice::<StoredSessionRecord>(&bytes).ok()?;
-            (record.meta.id == id).then_some(record.meta)
+            (record.meta.id.as_str() == id.as_str()).then_some(record.meta)
         })
         .collect()
 }
@@ -471,10 +488,7 @@ fn load_sifs_record_from_browser(browser: &SifsBrowser, id: &str) -> Option<Stor
 
 fn load_flat_sifs_record(browser: &SifsBrowser, id: &str) -> Option<StoredSessionRecord> {
     let file_path = sifs_session_file(id).ok()?;
-    let file_name = sifs_path_file_name(&file_path)?;
-    let service_entries = browser.list_if_exists("/services").ok()?;
-    let listed_path = listed_sifs_file_path(&service_entries, file_name)?;
-    let bytes = browser.read_file(&listed_path).ok()?;
+    let bytes = browser.read_file(&file_path).ok()?;
     serde_json::from_slice::<StoredSessionRecord>(&bytes).ok()
 }
 
@@ -496,10 +510,6 @@ fn load_legacy_sifs_record(browser: &SifsBrowser, id: &str) -> Option<StoredSess
             deleted_unix: None,
         });
     Some(StoredSessionRecord { meta, transcript })
-}
-
-fn sifs_path_file_name(path: &str) -> Option<&str> {
-    path.rsplit('/').next().filter(|name| !name.is_empty())
 }
 
 fn listed_sifs_file_path(entries: &[SifsEntry], name: &str) -> Option<String> {
