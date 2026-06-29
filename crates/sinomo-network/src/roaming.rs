@@ -1768,6 +1768,7 @@ async fn send_iroh_daemon_control_request_attempt_async(
             Ok(Ok(streams)) => streams,
             Ok(Err(source)) => {
                 connection.close(0_u8.into(), b"open stream failed");
+                drop(connection);
                 close_iroh_endpoint(&endpoint).await;
                 return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
                     NetworkError::Io {
@@ -1778,6 +1779,7 @@ async fn send_iroh_daemon_control_request_attempt_async(
             }
             Err(_) => {
                 connection.close(0_u8.into(), b"open stream timed out");
+                drop(connection);
                 close_iroh_endpoint(&endpoint).await;
                 return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
                     iroh_daemon_command_timeout_error(connect_timeout),
@@ -1789,6 +1791,7 @@ async fn send_iroh_daemon_control_request_attempt_async(
             Ok(streams) => streams,
             Err(source) => {
                 connection.close(0_u8.into(), b"open stream failed");
+                drop(connection);
                 close_iroh_endpoint(&endpoint).await;
                 return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
                     NetworkError::Io {
@@ -1814,12 +1817,18 @@ async fn send_iroh_daemon_control_request_attempt_async(
         Ok(()) => {}
         Err(source) => {
             connection.close(0_u8.into(), b"write failed");
+            drop(send);
+            drop(recv);
+            drop(connection);
             close_iroh_endpoint(&endpoint).await;
             return Err(IrohDaemonControlAttemptError::AfterRequestAccepted(source));
         }
     }
     if let Err(source) = send.finish() {
         connection.close(0_u8.into(), b"finish failed");
+        drop(send);
+        drop(recv);
+        drop(connection);
         close_iroh_endpoint(&endpoint).await;
         return Err(IrohDaemonControlAttemptError::AfterRequestAccepted(
             NetworkError::Io {
@@ -1832,11 +1841,15 @@ async fn send_iroh_daemon_control_request_attempt_async(
         Ok(response) => response,
         Err(error) => {
             connection.close(0_u8.into(), b"read failed");
+            drop(recv);
+            drop(connection);
             close_iroh_endpoint(&endpoint).await;
             return Err(IrohDaemonControlAttemptError::AfterRequestAccepted(error));
         }
     };
     connection.close(0_u8.into(), b"done");
+    drop(recv);
+    drop(connection);
     close_iroh_endpoint(&endpoint).await;
     Ok(response)
 }
