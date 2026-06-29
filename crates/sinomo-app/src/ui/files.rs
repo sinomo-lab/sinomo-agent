@@ -3243,6 +3243,30 @@ fn report_indexed_progress(
     progress.report(format!("{action} {processed} of {total}: {path}"), fraction);
 }
 
+const PLAN_SCAN_REPORT_STEP: usize = 32;
+const PLAN_SCAN_PROGRESS_START: f32 = 0.08;
+const PLAN_SCAN_PROGRESS_END: f32 = 0.12;
+
+fn report_plan_scan_progress(
+    progress: Option<&FilesOperationProgress<'_>>,
+    scope: &str,
+    scanned: usize,
+    path: &str,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if scanned == 0 || scanned % PLAN_SCAN_REPORT_STEP != 0 {
+        return;
+    }
+    let steps = (scanned / PLAN_SCAN_REPORT_STEP).min(8) as f32;
+    let fraction = Some((PLAN_SCAN_PROGRESS_START + steps * 0.005).min(PLAN_SCAN_PROGRESS_END));
+    progress.report(
+        format!("Scanning {scope}: {scanned} items; latest {path}"),
+        fraction,
+    );
+}
+
 fn copy_sifs_file_with_progress(
     browser: &SifsBrowser,
     source_path: &str,
@@ -3291,7 +3315,7 @@ fn copy_sifs_directory_with_progress(
         progress.report(format!("Scanning SIFS folder {source_path}"), Some(0.08));
     }
     let mut plan = Vec::new();
-    collect_sifs_copy_plan(browser, source_path, target_path, &mut plan)?;
+    collect_sifs_copy_plan(browser, source_path, target_path, &mut plan, progress)?;
     let total = plan.len().max(1);
     for (index, item) in plan.iter().enumerate() {
         check_progress_cancelled(
@@ -3338,26 +3362,31 @@ fn collect_sifs_copy_plan(
     source_path: &str,
     target_path: &str,
     plan: &mut Vec<FilesCopyPlanItem>,
+    progress: Option<&FilesOperationProgress<'_>>,
 ) -> Result<(), FilesOperationFailure> {
+    check_progress_cancelled(progress, format!("cancelled while scanning {source_path}"))?;
     plan.push(FilesCopyPlanItem {
         source: source_path.to_string(),
         target: target_path.to_string(),
         is_dir: true,
     });
+    report_plan_scan_progress(progress, "Scanned SIFS copy plan", plan.len(), source_path);
     let entries = browser
         .list_shallow(source_path)
         .map_err(FilesOperationFailure::Error)?;
     for entry in entries {
+        check_progress_cancelled(progress, format!("cancelled while scanning {}", entry.path))?;
         let child_target =
             join_sifs_child(target_path, &entry.name).map_err(FilesOperationFailure::Error)?;
         if entry.is_dir {
-            collect_sifs_copy_plan(browser, &entry.path, &child_target, plan)?;
+            collect_sifs_copy_plan(browser, &entry.path, &child_target, plan, progress)?;
         } else {
             plan.push(FilesCopyPlanItem {
-                source: entry.path,
+                source: entry.path.clone(),
                 target: child_target,
                 is_dir: false,
             });
+            report_plan_scan_progress(progress, "Scanned SIFS copy plan", plan.len(), &entry.path);
         }
     }
     Ok(())
@@ -3417,7 +3446,7 @@ fn copy_local_directory_to_sifs_with_progress(
         );
     }
     let mut plan = Vec::new();
-    collect_local_to_sifs_copy_plan(Path::new(source_path), target_path, &mut plan)?;
+    collect_local_to_sifs_copy_plan(Path::new(source_path), target_path, &mut plan, progress)?;
     let total = plan.len().max(1);
     for (index, item) in plan.iter().enumerate() {
         check_progress_cancelled(
@@ -3451,16 +3480,23 @@ fn collect_local_to_sifs_copy_plan(
     source: &Path,
     target_sifs_path: &str,
     plan: &mut Vec<FilesCopyPlanItem>,
+    progress: Option<&FilesOperationProgress<'_>>,
 ) -> Result<(), FilesOperationFailure> {
+    check_progress_cancelled(
+        progress,
+        format!("cancelled while scanning {}", source.display()),
+    )?;
     let metadata = fs::symlink_metadata(source).map_err(|error| {
         FilesOperationFailure::Error(format!("cannot inspect {}: {error}", source.display()))
     })?;
     if metadata.file_type().is_dir() {
+        let source_display = source.to_string_lossy().into_owned();
         plan.push(FilesCopyPlanItem {
-            source: source.to_string_lossy().into_owned(),
+            source: source_display.clone(),
             target: target_sifs_path.to_string(),
             is_dir: true,
         });
+        report_plan_scan_progress(progress, "Scanned import plan", plan.len(), &source_display);
         let read_dir = fs::read_dir(source).map_err(|error| {
             FilesOperationFailure::Error(format!("cannot list {}: {error}", source.display()))
         })?;
@@ -3474,14 +3510,16 @@ fn collect_local_to_sifs_copy_plan(
             let name = entry.file_name().to_string_lossy().into_owned();
             let child_target =
                 join_sifs_child(target_sifs_path, &name).map_err(FilesOperationFailure::Error)?;
-            collect_local_to_sifs_copy_plan(&entry.path(), &child_target, plan)?;
+            collect_local_to_sifs_copy_plan(&entry.path(), &child_target, plan, progress)?;
         }
     } else {
+        let source_display = source.to_string_lossy().into_owned();
         plan.push(FilesCopyPlanItem {
-            source: source.to_string_lossy().into_owned(),
+            source: source_display.clone(),
             target: target_sifs_path.to_string(),
             is_dir: false,
         });
+        report_plan_scan_progress(progress, "Scanned import plan", plan.len(), &source_display);
     }
     Ok(())
 }
@@ -3535,7 +3573,13 @@ fn copy_sifs_directory_to_local_with_progress(
         );
     }
     let mut plan = Vec::new();
-    collect_sifs_to_local_copy_plan(browser, source_path, Path::new(target_path), &mut plan)?;
+    collect_sifs_to_local_copy_plan(
+        browser,
+        source_path,
+        Path::new(target_path),
+        &mut plan,
+        progress,
+    )?;
     let total = plan.len().max(1);
     for (index, item) in plan.iter().enumerate() {
         check_progress_cancelled(
@@ -3573,25 +3617,30 @@ fn collect_sifs_to_local_copy_plan(
     source_path: &str,
     target: &Path,
     plan: &mut Vec<FilesCopyPlanItem>,
+    progress: Option<&FilesOperationProgress<'_>>,
 ) -> Result<(), FilesOperationFailure> {
+    check_progress_cancelled(progress, format!("cancelled while scanning {source_path}"))?;
     plan.push(FilesCopyPlanItem {
         source: source_path.to_string(),
         target: target.to_string_lossy().into_owned(),
         is_dir: true,
     });
+    report_plan_scan_progress(progress, "Scanned download plan", plan.len(), source_path);
     let entries = browser
         .list_shallow(source_path)
         .map_err(FilesOperationFailure::Error)?;
     for entry in entries {
+        check_progress_cancelled(progress, format!("cancelled while scanning {}", entry.path))?;
         let child_target = target.join(&entry.name);
         if entry.is_dir {
-            collect_sifs_to_local_copy_plan(browser, &entry.path, &child_target, plan)?;
+            collect_sifs_to_local_copy_plan(browser, &entry.path, &child_target, plan, progress)?;
         } else {
             plan.push(FilesCopyPlanItem {
-                source: entry.path,
+                source: entry.path.clone(),
                 target: child_target.to_string_lossy().into_owned(),
                 is_dir: false,
             });
+            report_plan_scan_progress(progress, "Scanned download plan", plan.len(), &entry.path);
         }
     }
     Ok(())
@@ -3635,7 +3684,7 @@ fn delete_sifs_directory_recursive_with_progress(
         );
     }
     let mut plan = Vec::new();
-    collect_sifs_delete_plan(browser, path, &mut plan)?;
+    collect_sifs_delete_plan(browser, path, &mut plan, progress)?;
     let total = plan.len().max(1);
     for (index, item) in plan.iter().enumerate() {
         check_progress_cancelled(
@@ -3665,24 +3714,34 @@ fn collect_sifs_delete_plan(
     browser: &SifsBrowser,
     path: &str,
     plan: &mut Vec<FilesDeletePlanItem>,
+    progress: Option<&FilesOperationProgress<'_>>,
 ) -> Result<(), FilesOperationFailure> {
+    check_progress_cancelled(progress, format!("cancelled while scanning {path}"))?;
     let entries = browser
         .list_shallow(path)
         .map_err(FilesOperationFailure::Error)?;
     for entry in entries {
+        check_progress_cancelled(progress, format!("cancelled while scanning {}", entry.path))?;
         if entry.is_dir {
-            collect_sifs_delete_plan(browser, &entry.path, plan)?;
+            collect_sifs_delete_plan(browser, &entry.path, plan, progress)?;
         } else {
             plan.push(FilesDeletePlanItem {
-                path: entry.path,
+                path: entry.path.clone(),
                 is_dir: false,
             });
+            report_plan_scan_progress(
+                progress,
+                "Scanned SIFS delete plan",
+                plan.len(),
+                &entry.path,
+            );
         }
     }
     plan.push(FilesDeletePlanItem {
         path: path.to_string(),
         is_dir: true,
     });
+    report_plan_scan_progress(progress, "Scanned SIFS delete plan", plan.len(), path);
     Ok(())
 }
 
@@ -3699,7 +3758,12 @@ fn copy_local_directory_with_progress(
         progress.report(format!("Scanning folder {source_path}"), Some(0.08));
     }
     let mut plan = Vec::new();
-    collect_local_copy_plan(Path::new(source_path), Path::new(target_path), &mut plan)?;
+    collect_local_copy_plan(
+        Path::new(source_path),
+        Path::new(target_path),
+        &mut plan,
+        progress,
+    )?;
     let total = plan.len().max(1);
     for (index, item) in plan.iter().enumerate() {
         check_progress_cancelled(
@@ -3736,16 +3800,28 @@ fn collect_local_copy_plan(
     source: &Path,
     target: &Path,
     plan: &mut Vec<FilesCopyPlanItem>,
+    progress: Option<&FilesOperationProgress<'_>>,
 ) -> Result<(), FilesOperationFailure> {
+    check_progress_cancelled(
+        progress,
+        format!("cancelled while scanning {}", source.display()),
+    )?;
     let metadata = fs::symlink_metadata(source).map_err(|error| {
         FilesOperationFailure::Error(format!("cannot inspect {}: {error}", source.display()))
     })?;
     if metadata.file_type().is_dir() {
+        let source_display = source.to_string_lossy().into_owned();
         plan.push(FilesCopyPlanItem {
-            source: source.to_string_lossy().into_owned(),
+            source: source_display.clone(),
             target: target.to_string_lossy().into_owned(),
             is_dir: true,
         });
+        report_plan_scan_progress(
+            progress,
+            "Scanned local copy plan",
+            plan.len(),
+            &source_display,
+        );
         let read_dir = fs::read_dir(source).map_err(|error| {
             FilesOperationFailure::Error(format!("cannot list {}: {error}", source.display()))
         })?;
@@ -3756,14 +3832,26 @@ fn collect_local_copy_plan(
                     source.display()
                 ))
             })?;
-            collect_local_copy_plan(&entry.path(), &target.join(entry.file_name()), plan)?;
+            collect_local_copy_plan(
+                &entry.path(),
+                &target.join(entry.file_name()),
+                plan,
+                progress,
+            )?;
         }
     } else {
+        let source_display = source.to_string_lossy().into_owned();
         plan.push(FilesCopyPlanItem {
-            source: source.to_string_lossy().into_owned(),
+            source: source_display.clone(),
             target: target.to_string_lossy().into_owned(),
             is_dir: false,
         });
+        report_plan_scan_progress(
+            progress,
+            "Scanned local copy plan",
+            plan.len(),
+            &source_display,
+        );
     }
     Ok(())
 }
@@ -3776,7 +3864,7 @@ fn delete_local_directory_recursive_with_progress(
         progress.report(format!("Scanning folder {path} for delete"), Some(0.08));
     }
     let mut plan = Vec::new();
-    collect_local_delete_plan(Path::new(path), &mut plan)?;
+    collect_local_delete_plan(Path::new(path), &mut plan, progress)?;
     let total = plan.len().max(1);
     for (index, item) in plan.iter().enumerate() {
         check_progress_cancelled(
@@ -3811,7 +3899,12 @@ fn delete_local_directory_recursive_with_progress(
 fn collect_local_delete_plan(
     path: &Path,
     plan: &mut Vec<FilesDeletePlanItem>,
+    progress: Option<&FilesOperationProgress<'_>>,
 ) -> Result<(), FilesOperationFailure> {
+    check_progress_cancelled(
+        progress,
+        format!("cancelled while scanning {}", path.display()),
+    )?;
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         FilesOperationFailure::Error(format!("cannot inspect {}: {error}", path.display()))
     })?;
@@ -3826,17 +3919,31 @@ fn collect_local_delete_plan(
                     path.display()
                 ))
             })?;
-            collect_local_delete_plan(&entry.path(), plan)?;
+            collect_local_delete_plan(&entry.path(), plan, progress)?;
         }
+        let path_display = path.to_string_lossy().into_owned();
         plan.push(FilesDeletePlanItem {
-            path: path.to_string_lossy().into_owned(),
+            path: path_display.clone(),
             is_dir: true,
         });
+        report_plan_scan_progress(
+            progress,
+            "Scanned local delete plan",
+            plan.len(),
+            &path_display,
+        );
     } else {
+        let path_display = path.to_string_lossy().into_owned();
         plan.push(FilesDeletePlanItem {
-            path: path.to_string_lossy().into_owned(),
+            path: path_display.clone(),
             is_dir: false,
         });
+        report_plan_scan_progress(
+            progress,
+            "Scanned local delete plan",
+            plan.len(),
+            &path_display,
+        );
     }
     Ok(())
 }
