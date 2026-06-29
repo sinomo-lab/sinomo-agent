@@ -6860,12 +6860,52 @@ fn files_source_status(files: &FilesState) -> &'static str {
         {
             "SIFS syncing"
         }
+        FilesSourceKind::Sifs if files_sifs_daemon_is_remote(files) => "Remote SIFS",
         FilesSourceKind::Sifs if files.clustered => "SIFS online",
         FilesSourceKind::Sifs => "Local SIFS",
         FilesSourceKind::Local if files.error.is_some() => "Local unavailable",
         FilesSourceKind::Local if files.loading => "Loading local",
         FilesSourceKind::Local => "Local files",
     }
+}
+
+fn files_sifs_connection_detail(files: &FilesState) -> Option<String> {
+    if files.source != FilesSourceKind::Sifs {
+        return None;
+    }
+    files.daemon_address.as_deref().map(|address| {
+        let label = if daemon_address_is_remote(address) {
+            "remote daemon"
+        } else {
+            "daemon"
+        };
+        format!("{label} {}", middle_short(address, 44))
+    })
+}
+
+fn files_sifs_daemon_is_remote(files: &FilesState) -> bool {
+    files
+        .daemon_address
+        .as_deref()
+        .is_some_and(daemon_address_is_remote)
+}
+
+fn daemon_address_is_remote(address: &str) -> bool {
+    let host = daemon_address_host(address);
+    !matches!(host, "" | "localhost" | "::1") && !host.starts_with("127.") && host != "0.0.0.0"
+}
+
+fn daemon_address_host(address: &str) -> &str {
+    let trimmed = address.trim();
+    if let Some(rest) = trimmed.strip_prefix('[')
+        && let Some((host, _)) = rest.split_once(']')
+    {
+        return host;
+    }
+    trimmed
+        .rsplit_once(':')
+        .map(|(host, _)| host.trim_matches(['[', ']']))
+        .unwrap_or(trimmed)
 }
 
 fn files_entry_count_status(files: &FilesState) -> String {
@@ -7037,14 +7077,18 @@ fn files_task_queue_summary(tasks: &[FilesTask]) -> String {
 }
 
 fn files_status_summary(files: &FilesState) -> String {
-    let mut summary = format!(
-        "{} | Path {} | {} | {} | {}",
-        files_source_status(files),
+    let mut summary = files_source_status(files).to_string();
+    if let Some(detail) = files_sifs_connection_detail(files) {
+        summary.push_str(" | ");
+        summary.push_str(&detail);
+    }
+    summary.push_str(&format!(
+        " | Path {} | {} | {} | {}",
         files.path,
         files_entry_count_status(files),
         files_selection_status(files),
         files_task_status(files),
-    );
+    ));
     if files.source == FilesSourceKind::Sifs
         && let Some(health) = files.sifs_health.as_ref()
     {
@@ -7510,12 +7554,15 @@ impl Widget for FilesStatusBar {
         let info_x = chip.max_x() + 12.0;
         let info_w = (right.x() - info_x - 12.0).max(0.0);
         let selected = files_status_bar_selection(&files);
-        let mut info = format!(
-            "{} | {} | {}",
+        let mut info_parts = vec![
             middle_short(&files.path, 64),
             files_entry_count_status(&files),
             selected,
-        );
+        ];
+        if let Some(detail) = files_sifs_connection_detail(&files) {
+            info_parts.insert(1, middle_short(&detail, 48));
+        }
+        let mut info = info_parts.join(" | ");
         if files.source == FilesSourceKind::Sifs
             && let Some(health) = files.sifs_health.as_ref()
         {
@@ -13316,6 +13363,33 @@ mod tests {
         assert_eq!(
             files_status_summary(&state),
             "SIFS unknown | Path /cluster-tests | 1 entry | 1 entry marked | 1 task done | DFS health unavailable: metadata root missing"
+        );
+    }
+
+    #[test]
+    fn files_status_summary_distinguishes_remote_sifs_daemon() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.loaded = true;
+        state.loading = false;
+        state.path = "/sinomo/nodes".to_string();
+        state.daemon_address = Some("sodium.sinomo.net:21353".to_string());
+        state.clustered = true;
+
+        assert_eq!(daemon_address_host("127.0.0.1:21353"), "127.0.0.1");
+        assert!(!daemon_address_is_remote("127.0.0.1:21353"));
+        assert!(daemon_address_is_remote("sodium.sinomo.net:21353"));
+        assert_eq!(files_source_status(&state), "Remote SIFS");
+        assert_eq!(
+            files_status_summary(&state),
+            "Remote SIFS | remote daemon sodium.sinomo.net:21353 | Path /sinomo/nodes | 0 entries | no selection | idle"
+        );
+
+        state.daemon_address = Some("127.0.0.1:21353".to_string());
+        assert_eq!(files_source_status(&state), "SIFS online");
+        assert_eq!(
+            files_sifs_connection_detail(&state).as_deref(),
+            Some("daemon 127.0.0.1:21353")
         );
     }
 
