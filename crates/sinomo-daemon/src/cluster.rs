@@ -882,6 +882,7 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
     options: &DaemonRunOptions,
     cluster: Option<&DaemonClusterStatus>,
     runtime: tokio::runtime::Handle,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     label: &str,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, DaemonError> {
     if sinomo_network::iroh_disabled_by_env() {
@@ -917,6 +918,12 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
         let mut next_republish = Instant::now();
         let mut proxy_start_failures = 0_u32;
         loop {
+            if daemon_cluster_shutdown_requested(&shutdown_rx) {
+                if let Some(handle) = proxy_handle.take() {
+                    let _ = handle.join().await;
+                }
+                return;
+            }
             if proxy_handle
                 .as_ref()
                 .is_some_and(sinomo_network::IrohDaemonProxyHandle::is_finished)
@@ -942,7 +949,17 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
                 .await;
                 let Ok((status, state_exists)) = status else {
                     tracing::warn!("sinomo {label} iroh cluster status task failed");
-                    tokio::time::sleep(DAEMON_CLUSTER_PUBLISH_INTERVAL).await;
+                    if daemon_cluster_sleep_or_shutdown(
+                        &mut shutdown_rx,
+                        DAEMON_CLUSTER_PUBLISH_INTERVAL,
+                    )
+                    .await
+                    {
+                        if let Some(handle) = proxy_handle.take() {
+                            let _ = handle.join().await;
+                        }
+                        return;
+                    }
                     continue;
                 };
                 cluster = status;
@@ -952,12 +969,27 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
                     } else {
                         DAEMON_CLUSTER_PUBLISH_INTERVAL
                     };
-                    tokio::time::sleep(retry_delay).await;
+                    if daemon_cluster_sleep_or_shutdown(&mut shutdown_rx, retry_delay).await {
+                        if let Some(handle) = proxy_handle.take() {
+                            let _ = handle.join().await;
+                        }
+                        return;
+                    }
                     continue;
                 }
             }
             let Some(current_cluster) = cluster.clone() else {
-                tokio::time::sleep(DAEMON_CLUSTER_PUBLISH_INTERVAL).await;
+                if daemon_cluster_sleep_or_shutdown(
+                    &mut shutdown_rx,
+                    DAEMON_CLUSTER_PUBLISH_INTERVAL,
+                )
+                .await
+                {
+                    if let Some(handle) = proxy_handle.take() {
+                        let _ = handle.join().await;
+                    }
+                    return;
+                }
                 continue;
             };
             if proxy_handle.is_none() {
@@ -1020,9 +1052,14 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
                                     &cluster_paths,
                                     &current_cluster.node_id,
                                 ),
-                            );
+                        );
                         proxy_start_failures = proxy_start_failures.saturating_add(1);
-                        tokio::time::sleep(retry_delay).await;
+                        if daemon_cluster_sleep_or_shutdown(&mut shutdown_rx, retry_delay).await {
+                            if let Some(handle) = proxy_handle.take() {
+                                let _ = handle.join().await;
+                            }
+                            return;
+                        }
                     }
                 }
                 continue;
@@ -1062,14 +1099,42 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
                         publish_node,
                     );
             }
-            tokio::time::sleep(sinomo_network::cluster_iroh_proxy_republish_sleep_duration(
-                Instant::now(),
-                next_republish,
-            ))
-            .await;
+            if daemon_cluster_sleep_or_shutdown(
+                &mut shutdown_rx,
+                sinomo_network::cluster_iroh_proxy_republish_sleep_duration(
+                    Instant::now(),
+                    next_republish,
+                ),
+            )
+            .await
+            {
+                if let Some(handle) = proxy_handle.take() {
+                    let _ = handle.join().await;
+                }
+                return;
+            }
         }
     });
     Ok(Some(task))
+}
+
+fn daemon_cluster_shutdown_requested(shutdown: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *shutdown.borrow()
+}
+
+async fn daemon_cluster_sleep_or_shutdown(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    delay: Duration,
+) -> bool {
+    if daemon_cluster_shutdown_requested(shutdown) {
+        return true;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => false,
+        changed = shutdown.changed() => {
+            changed.is_err() || daemon_cluster_shutdown_requested(shutdown)
+        }
+    }
 }
 
 fn daemon_iroh_proxy_start_key(paths: &DaemonPaths, label: &str) -> String {
@@ -1132,6 +1197,7 @@ fn refresh_daemon_iroh_repair_route_with_runtime(
 pub(crate) fn start_shadow_daemon_status_publisher(
     paths: &DaemonPaths,
     runtime: tokio::runtime::Handle,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<tokio::task::JoinHandle<()>, DaemonError> {
     let status_paths = paths.clone();
     let task = runtime.clone().spawn(async move {
@@ -1139,7 +1205,9 @@ pub(crate) fn start_shadow_daemon_status_publisher(
         let mut startup_retries_remaining = DAEMON_SHADOW_STATUS_STARTUP_RETRY_ATTEMPTS;
         let mut publish_interval = DAEMON_SHADOW_STATUS_STARTUP_RETRY_INTERVAL;
         loop {
-            tokio::time::sleep(publish_interval).await;
+            if daemon_cluster_sleep_or_shutdown(&mut shutdown_rx, publish_interval).await {
+                return;
+            }
             let tick_paths = status_paths.clone();
             let tick_runtime = runtime.clone();
             let tick = tokio::task::spawn_blocking(move || {

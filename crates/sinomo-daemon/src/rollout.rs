@@ -600,6 +600,8 @@ pub fn run_shadow_daemon_supervision_loop(
         &bind_address,
     ))?;
     let mut shadow_runtime_tasks = Vec::new();
+    let (control_shutdown_tx, control_shutdown_rx) = tokio::sync::watch::channel(false);
+    let control_shutdown_signal = control_shutdown_tx.clone();
     tracing::info!("sinomo shadow daemon listening on {bind_address}");
     crate::append_operational_event_best_effort(
         &shadow_paths,
@@ -621,6 +623,7 @@ pub fn run_shadow_daemon_supervision_loop(
         &options,
         cluster.as_ref(),
         daemon_runtime_handle.clone(),
+        control_shutdown_rx.clone(),
         "shadow daemon",
     ) {
         Ok(Some(task)) => shadow_runtime_tasks.push(("iroh proxy", task)),
@@ -639,7 +642,11 @@ pub fn run_shadow_daemon_supervision_loop(
             );
         }
     }
-    match start_shadow_daemon_status_publisher(&shadow_paths, daemon_runtime_handle.clone()) {
+    match start_shadow_daemon_status_publisher(
+        &shadow_paths,
+        daemon_runtime_handle.clone(),
+        control_shutdown_rx.clone(),
+    ) {
         Ok(task) => shadow_runtime_tasks.push(("status publisher", task)),
         Err(error) => {
             tracing::warn!("sinomo shadow daemon status publisher disabled: {error}");
@@ -678,8 +685,6 @@ pub fn run_shadow_daemon_supervision_loop(
     let mut last_main_probe = Instant::now() - shadow_main_probe_interval(false);
     let mut next_pending_activation_shutdown_nudge = Instant::now();
     let mut main_probe_status = DaemonProbeStatus::NotRunning;
-    let (control_shutdown_tx, control_shutdown_rx) = tokio::sync::watch::channel(false);
-    let control_shutdown_signal = control_shutdown_tx.clone();
     let (control_loop_tx, control_loop_rx) = std::sync::mpsc::channel::<Result<(), DaemonError>>();
     let control_paths = shadow_paths.clone();
     let control_bind_address = bind_address.clone();
@@ -713,28 +718,30 @@ pub fn run_shadow_daemon_supervision_loop(
         match control_loop_rx.try_recv() {
             Ok(Ok(())) => break,
             Ok(Err(error)) => {
+                let _ = control_shutdown_signal.send(true);
                 join_shadow_runtime_task(
                     &daemon_runtime,
                     "control accept",
                     shadow_control_accept_task,
-                    true,
+                    false,
                 );
                 for (label, task) in shadow_runtime_tasks {
-                    join_shadow_runtime_task(&daemon_runtime, label, task, true);
+                    join_shadow_runtime_task(&daemon_runtime, label, task, false);
                 }
                 drain_shadow_runtime_after_task_shutdown(&daemon_runtime);
                 return Err(error);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let _ = control_shutdown_signal.send(true);
                 join_shadow_runtime_task(
                     &daemon_runtime,
                     "control accept",
                     shadow_control_accept_task,
-                    true,
+                    false,
                 );
                 for (label, task) in shadow_runtime_tasks {
-                    join_shadow_runtime_task(&daemon_runtime, label, task, true);
+                    join_shadow_runtime_task(&daemon_runtime, label, task, false);
                 }
                 drain_shadow_runtime_after_task_shutdown(&daemon_runtime);
                 return Err(DaemonError::Network {
@@ -1086,7 +1093,7 @@ pub fn run_shadow_daemon_supervision_loop(
         false,
     );
     for (label, task) in shadow_runtime_tasks {
-        join_shadow_runtime_task(&daemon_runtime, label, task, true);
+        join_shadow_runtime_task(&daemon_runtime, label, task, false);
     }
     drain_shadow_runtime_after_task_shutdown(&daemon_runtime);
 

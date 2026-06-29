@@ -520,10 +520,19 @@ fn try_cluster_member_daemon_status_targets_impl(
     state: &ClusterBootstrapState,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
+    let kv_endpoints = match read_cluster_endpoints_from_kv(paths) {
+        Ok(endpoints) => endpoints,
+        Err(error @ NetworkError::ResourceExhausted { .. }) => return Err(error),
+        Err(_) => Vec::new(),
+    };
     let mut targets = Vec::new();
     for member in &state.members {
-        let mut member_targets =
-            try_cluster_member_daemon_status_targets_with_graph(state, member, &graph)?;
+        let mut member_targets = try_cluster_member_daemon_status_targets_with_graph(
+            state,
+            member,
+            &graph,
+            &kv_endpoints,
+        )?;
         crate::object::try_reserve_vec(
             &mut targets,
             member_targets.len(),
@@ -1226,6 +1235,7 @@ fn try_cluster_member_daemon_status_targets_with_graph(
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
     graph: &ClusterConnectivityGraph,
+    kv_endpoints: &[ClusterEndpointRecord],
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let is_local_process = cluster_member_is_local_process(state, member);
     let member_runs_main_daemon = cluster_member_has_main_daemon_capability(member);
@@ -1245,6 +1255,34 @@ fn try_cluster_member_daemon_status_targets_with_graph(
         member_endpoints.push(try_clone_selector_endpoint(
             endpoint,
             "collect member daemon status endpoints",
+        )?);
+    }
+    for endpoint in kv_endpoints
+        .iter()
+        .filter(|endpoint| endpoint.node_id == member.node_id)
+    {
+        if !is_local_process && matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly) {
+            continue;
+        }
+        if member_runs_main_daemon && cluster_endpoint_identifies_shadow_daemon_for_node(endpoint) {
+            continue;
+        }
+        if !matches!(
+            endpoint.transport,
+            ClusterTransportKind::LanTcp
+                | ClusterTransportKind::Loopback
+                | ClusterTransportKind::Iroh
+        ) {
+            continue;
+        }
+        crate::object::try_reserve_vec(
+            &mut member_endpoints,
+            1,
+            "collect member daemon status kv endpoints",
+        )?;
+        member_endpoints.push(try_clone_selector_endpoint(
+            endpoint,
+            "collect member daemon status kv endpoints",
         )?);
     }
     let mut endpoints = try_prefer_bounded_daemon_command_targets(member_endpoints)?;

@@ -48,6 +48,8 @@ pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
     DAEMON_CLUSTER_PUBLISH_INTERVAL;
 pub const DAEMON_NETWORK_ENVIRONMENT_WATCH_ENV: &str = "SINOMO_DAEMON_NETWORK_ENVIRONMENT_WATCH";
 pub(crate) const ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE: Duration = Duration::from_millis(200);
+const DAEMON_RUNTIME_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+const DAEMON_RUNTIME_TASK_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const DAEMON_SANDBOX_STREAM_CHANNEL_CAPACITY: usize = 64;
 const DAEMON_DFS_MESSAGE_REPLAY_RETENTION: Duration = Duration::from_secs(120);
 const DAEMON_DFS_MESSAGE_REPLAY_WAIT: Duration = Duration::from_secs(30);
@@ -134,7 +136,15 @@ fn daemon_network_environment_watch_enabled_for(value: Option<&str>, is_linux: b
     }
 }
 
-async fn start_daemon_network_environment_watch(label: &str) -> Option<Arc<tokio::sync::Notify>> {
+struct DaemonNetworkEnvironmentWatch {
+    notify: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn start_daemon_network_environment_watch(
+    label: &str,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Option<DaemonNetworkEnvironmentWatch> {
     if !daemon_network_environment_watch_enabled() {
         tracing::debug!(
             "sinomo {label} network environment watcher disabled; scheduled cluster maintenance remains active"
@@ -156,9 +166,17 @@ async fn start_daemon_network_environment_watch(label: &str) -> Option<Arc<tokio
     let notify = Arc::new(tokio::sync::Notify::new());
     let task_notify = Arc::clone(&notify);
     let task_label = label.to_string();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         loop {
-            let update = watch.changed().await;
+            let update = tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+                update = watch.changed() => update,
+            };
             tracing::debug!(
                 "sinomo {task_label} network environment changed: +{} -{} ~{}",
                 update.diff.added.len(),
@@ -168,7 +186,7 @@ async fn start_daemon_network_environment_watch(label: &str) -> Option<Arc<tokio
             task_notify.notify_one();
         }
     });
-    Some(notify)
+    Some(DaemonNetworkEnvironmentWatch { notify, task })
 }
 
 #[cfg(feature = "sandbox")]
@@ -281,6 +299,9 @@ pub fn run_daemon_control_loop_with_services(
     let listener = daemon_runtime.block_on(sinomo_network::AsyncDaemonControlListener::bind(
         &bind_address,
     ))?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_signal = shutdown_tx.clone();
+    let mut runtime_tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
     tracing::info!("sinomo {label} listening on {bind_address}");
     crate::append_operational_event_best_effort(
         &paths,
@@ -296,25 +317,30 @@ pub fn run_daemon_control_loop_with_services(
             "cluster_node_id": cluster.as_ref().map(|status| status.node_id.to_string()),
         }),
     );
-    if let Err(error) = start_daemon_iroh_proxy_if_clustered(
+    match start_daemon_iroh_proxy_if_clustered(
         &paths,
         &options,
         cluster.as_ref(),
         daemon_runtime_handle.clone(),
+        shutdown_rx.clone(),
         label,
     ) {
-        tracing::warn!("sinomo {label} iroh proxy disabled: {error}");
-        crate::append_operational_log_best_effort(
-            &paths,
-            crate::OperationalSeverity::Warn,
-            "daemon-control",
-            format!("sinomo {label} iroh proxy disabled"),
-            None,
-            serde_json::json!({
-                "label": label,
-                "error": error.to_string(),
-            }),
-        );
+        Ok(Some(task)) => runtime_tasks.push(("iroh proxy", task)),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!("sinomo {label} iroh proxy disabled: {error}");
+            crate::append_operational_log_best_effort(
+                &paths,
+                crate::OperationalSeverity::Warn,
+                "daemon-control",
+                format!("sinomo {label} iroh proxy disabled"),
+                None,
+                serde_json::json!({
+                    "label": label,
+                    "error": error.to_string(),
+                }),
+            );
+        }
     }
 
     if label == "daemon" && crate::dfs::default_distributed_dfs_enabled() {
@@ -347,12 +373,16 @@ pub fn run_daemon_control_loop_with_services(
     let maintenance_label = label.to_string();
     let maintenance_idle_stats = idle_stats.clone();
     let maintenance_runtime = daemon_runtime_handle.clone();
-    daemon_runtime_handle.spawn(run_daemon_background_maintenance_loop(
-        maintenance_paths,
-        maintenance_options,
-        maintenance_label,
-        maintenance_idle_stats,
-        maintenance_runtime,
+    runtime_tasks.push((
+        "background maintenance",
+        daemon_runtime_handle.spawn(run_daemon_background_maintenance_loop(
+            maintenance_paths,
+            maintenance_options,
+            maintenance_label,
+            maintenance_idle_stats,
+            maintenance_runtime,
+            shutdown_rx.clone(),
+        )),
     ));
 
     let service_host = daemon_runtime.block_on(
@@ -363,7 +393,6 @@ pub fn run_daemon_control_loop_with_services(
         ),
     )?;
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     daemon_runtime.block_on(run_daemon_control_accept_loop(
         listener,
         paths.clone(),
@@ -372,8 +401,13 @@ pub fn run_daemon_control_loop_with_services(
         service_host,
         daemon_runtime_handle.clone(),
         shutdown_tx,
-        shutdown_rx,
+        shutdown_rx.clone(),
     ))?;
+    let _ = shutdown_signal.send(true);
+    for (task_label, task) in runtime_tasks {
+        join_daemon_runtime_task(&daemon_runtime, task_label, task, false);
+    }
+    drain_daemon_runtime_after_task_shutdown(&daemon_runtime);
     crate::append_operational_event_best_effort(
         &paths,
         crate::OperationalSeverity::Info,
@@ -390,12 +424,49 @@ pub fn run_daemon_control_loop_with_services(
     Ok(())
 }
 
+fn join_daemon_runtime_task(
+    runtime: &tokio::runtime::Runtime,
+    label: &str,
+    task: tokio::task::JoinHandle<()>,
+    abort_first: bool,
+) {
+    let abort_handle = task.abort_handle();
+    if abort_first {
+        abort_handle.abort();
+    }
+    let result = runtime
+        .block_on(async { tokio::time::timeout(DAEMON_RUNTIME_TASK_JOIN_TIMEOUT, task).await });
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if error.is_cancelled() => {}
+        Ok(Err(error)) => {
+            tracing::warn!("sinomo daemon {label} task stopped with error: {error}");
+        }
+        Err(_) => {
+            abort_handle.abort();
+            tracing::warn!(
+                "sinomo daemon {label} task did not stop within {}ms",
+                DAEMON_RUNTIME_TASK_JOIN_TIMEOUT.as_millis()
+            );
+        }
+    }
+}
+
+fn drain_daemon_runtime_after_task_shutdown(runtime: &tokio::runtime::Runtime) {
+    runtime.block_on(async {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(DAEMON_RUNTIME_TASK_DRAIN_GRACE).await;
+        tokio::task::yield_now().await;
+    });
+}
+
 async fn run_daemon_background_maintenance_loop(
     paths: DaemonPaths,
     options: crate::DaemonRunOptions,
     label: String,
     idle_stats: Arc<crate::IdleStatsAtomics>,
     runtime: tokio::runtime::Handle,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut cluster_network = ClusterNetworkMaintenance::with_idle_stats(idle_stats.clone()).await;
     let dfs_maintenance_enabled = background_dfs_maintenance_enabled();
@@ -415,8 +486,8 @@ async fn run_daemon_background_maintenance_loop(
         .unwrap_or(maintenance_started);
     let dfs_maintenance_notify = daemon_dfs_maintenance_notify();
     let cluster_maintenance_notify = daemon_cluster_maintenance_notify();
-    let network_environment_notify = if label == "daemon" {
-        start_daemon_network_environment_watch(&label).await
+    let network_environment_watch = if label == "daemon" {
+        start_daemon_network_environment_watch(&label, shutdown_rx.clone()).await
     } else {
         None
     };
@@ -609,10 +680,17 @@ async fn run_daemon_background_maintenance_loop(
         );
         let dfs_notify = (dfs_maintenance_enabled && label == "daemon")
             .then(|| Arc::clone(&dfs_maintenance_notify));
-        let network_notify = network_environment_notify.as_ref().map(Arc::clone);
+        let network_notify = network_environment_watch
+            .as_ref()
+            .map(|watch| Arc::clone(&watch.notify));
         let cluster_notify = Some(Arc::clone(&cluster_maintenance_notify));
         tokio::select! {
             _ = tokio::time::sleep(sleep_duration) => {}
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
             _ = daemon_optional_notify(dfs_notify) => {
                 dfs_triggered_maintenance_requested = true;
                 last_dfs_maintenance = Instant::now()
@@ -628,6 +706,9 @@ async fn run_daemon_background_maintenance_loop(
                 cluster_network.request_network_environment_refresh(Instant::now());
             }
         }
+    }
+    if let Some(watch) = network_environment_watch {
+        let _ = watch.task.await;
     }
 }
 

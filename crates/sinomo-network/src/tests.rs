@@ -15577,6 +15577,114 @@ fn member_daemon_status_targets_filter_shadow_endpoints_before_ordering() {
 }
 
 #[test]
+fn member_daemon_status_targets_include_fresh_kv_iroh_endpoint() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-status-kv-iroh");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_status_kv_iroh").expect("cluster");
+    let local = NodeId::from_legacy_named("node_status_kv_iroh_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_status_kv_iroh_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "status kv iroh",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let stale_lan = daemon_lan_endpoint(&remote, "10.14.1.11:21353".to_string(), 10);
+    let stale_bridge = daemon_lan_endpoint(&remote, "172.17.0.1:21353".to_string(), 20);
+    let fresh_iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&remote, "iroh_public_key_status_kv_iroh"),
+        node_id: remote.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_status_kv_iroh?relay=https://relay.example./".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote.clone(), "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![stale_lan.clone(), stale_bridge.clone()];
+    state.members.push(member.clone());
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    append_cluster_raft_command(
+        &paths,
+        &local,
+        KvCommand::Op(
+            KvOp::put_serde(
+                cluster_endpoint_key(&remote, &fresh_iroh),
+                &fresh_iroh,
+                None,
+            )
+            .expect("fresh iroh endpoint op"),
+        ),
+    )
+    .expect("publish fresh iroh endpoint");
+
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local,
+        vec![
+            cluster_connectivity_record(
+                &state,
+                &stale_lan,
+                ClusterConnectivityState::Unreachable,
+                None,
+                3,
+                None,
+                Some("timed out".to_string()),
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &stale_bridge,
+                ClusterConnectivityState::Unreachable,
+                None,
+                3,
+                None,
+                Some("timed out".to_string()),
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &fresh_iroh,
+                ClusterConnectivityState::Healthy,
+                Some(25),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            ),
+        ],
+    )
+    .expect("connectivity records");
+
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::MemberDaemonStatus)
+        .into_iter()
+        .filter(|endpoint| endpoint.node_id == member.node_id)
+        .collect::<Vec<_>>();
+
+    assert_eq!(targets[0].endpoint_id, fresh_iroh.endpoint_id);
+    assert!(
+        targets
+            .iter()
+            .any(|endpoint| endpoint.endpoint_id == stale_lan.endpoint_id),
+        "stale LAN endpoints should remain as fallbacks after the healthy KV Iroh endpoint"
+    );
+}
+
+#[test]
 fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-rollout-lan-public-iroh");
     let data_dir = SinomoDataDir::new(&root);
