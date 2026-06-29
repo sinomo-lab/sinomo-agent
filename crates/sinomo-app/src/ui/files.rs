@@ -864,6 +864,10 @@ impl FilesState {
         !self.history_forward.is_empty()
     }
 
+    fn can_modify_current_location(&self) -> bool {
+        self.loaded && !self.loading && self.error.is_none()
+    }
+
     fn push_history(stack: &mut Vec<FilesLocation>, location: FilesLocation) {
         if stack.last() == Some(&location) {
             return;
@@ -5452,7 +5456,7 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
-                move || !s.files().loading
+                move || s.files().can_modify_current_location()
             })
             .on_press_with_ctx(move |ctx| {
                 s.files_mut()
@@ -5469,7 +5473,7 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
-                move || !s.files().loading
+                move || s.files().can_modify_current_location()
             })
             .on_press_with_ctx(move |ctx| {
                 s.files_mut()
@@ -5485,7 +5489,10 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
-                move || !s.files().loading && s.files().selected_entry().is_some()
+                move || {
+                    let files = s.files();
+                    files.can_modify_current_location() && files.selected_entry().is_some()
+                }
             })
             .on_press_with_ctx(move |ctx| {
                 s.files_mut().open_action_prompt(FileActionPromptKind::Copy);
@@ -5500,7 +5507,10 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
-                move || !s.files().loading && s.files().selected_entry().is_some()
+                move || {
+                    let files = s.files();
+                    files.can_modify_current_location() && files.selected_entry().is_some()
+                }
             })
             .on_press_with_ctx(move |ctx| {
                 s.files_mut().open_action_prompt(FileActionPromptKind::Move);
@@ -5518,7 +5528,7 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 move || {
                     let files = s.files();
                     files.source == FilesSourceKind::Sifs
-                        && !files.loading
+                        && files.can_modify_current_location()
                         && files.selected_entry().is_some()
                 }
             })
@@ -5536,7 +5546,10 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
-                move || !s.files().loading && s.files().selected_entry().is_some()
+                move || {
+                    let files = s.files();
+                    files.can_modify_current_location() && files.selected_entry().is_some()
+                }
             })
             .on_press_with_ctx(move |ctx| {
                 s.files_mut()
@@ -5552,7 +5565,10 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
-                move || !s.files().loading && s.files().selected_entry().is_some()
+                move || {
+                    let files = s.files();
+                    files.can_modify_current_location() && files.selected_entry().is_some()
+                }
             })
             .on_press_with_ctx(move |ctx| {
                 s.files_mut()
@@ -5841,7 +5857,10 @@ fn files_copy_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widge
         .theme_when(clone_reader(reader))
         .enabled_when({
             let s = s.clone();
-            move || !s.files().loading && s.files().marked_count() > 0
+            move || {
+                let files = s.files();
+                files.can_modify_current_location() && files.marked_count() > 0
+            }
         })
         .on_press_with_ctx(move |ctx| {
             s.files_mut()
@@ -5863,7 +5882,10 @@ fn files_transfer_marked_button(shared: &Shared, reader: &ThemeReader) -> impl W
         .theme_when(clone_reader(reader))
         .enabled_when({
             let s = s.clone();
-            move || !s.files().loading && s.files().marked_count() > 0
+            move || {
+                let files = s.files();
+                files.can_modify_current_location() && files.marked_count() > 0
+            }
         })
         .on_press_with_ctx(move |ctx| {
             s.files_mut()
@@ -5881,7 +5903,10 @@ fn files_move_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widge
         .theme_when(clone_reader(reader))
         .enabled_when({
             let s = s.clone();
-            move || !s.files().loading && s.files().marked_count() > 0
+            move || {
+                let files = s.files();
+                files.can_modify_current_location() && files.marked_count() > 0
+            }
         })
         .on_press_with_ctx(move |ctx| {
             s.files_mut()
@@ -5899,7 +5924,10 @@ fn files_delete_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Wid
         .theme_when(clone_reader(reader))
         .enabled_when({
             let s = s.clone();
-            move || !s.files().loading && s.files().marked_count() > 0
+            move || {
+                let files = s.files();
+                files.can_modify_current_location() && files.marked_count() > 0
+            }
         })
         .on_press_with_ctx(move |ctx| {
             s.files_mut()
@@ -12582,6 +12610,28 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
+        let snapshot = window.snapshot()?;
+
+        for name in ["New file", "New folder"] {
+            assert!(
+                snapshot.accessibility.nodes.iter().any(|node| {
+                    node.role == sui::SemanticsRole::Button
+                        && node.name.as_deref() == Some(name)
+                        && node.state.disabled
+                }),
+                "{name} should be disabled while the current SIFS location is unavailable"
+            );
+        }
+        for name in ["Retry SIFS", "Connection settings"] {
+            assert!(
+                snapshot.accessibility.nodes.iter().any(|node| {
+                    node.role == sui::SemanticsRole::Button
+                        && node.name.as_deref() == Some(name)
+                        && !node.state.disabled
+                }),
+                "{name} should stay available for SIFS recovery"
+            );
+        }
 
         window
             .get_by_role(sui::SemanticsRole::Button)
