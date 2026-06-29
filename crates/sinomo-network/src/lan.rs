@@ -9,7 +9,7 @@ use std::future::Future;
 use std::sync::LazyLock;
 use std::time::Instant;
 
-const DEFAULT_LAN_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2);
+const DEFAULT_LAN_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(60);
 const PUBLIC_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(300);
 pub(crate) const PUBLIC_IP_DISCOVERY_EMPTY_CACHE_TTL: Duration = Duration::from_secs(30);
 pub(crate) const PUBLIC_IP_DISCOVERY_DEFERRED_CACHE_TTL: Duration = Duration::from_secs(30);
