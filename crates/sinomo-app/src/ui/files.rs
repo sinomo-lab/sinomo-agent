@@ -4466,6 +4466,76 @@ fn sifs_health_summary(details: Option<&SifsObjectDetails>) -> String {
     format!("{}; no repair backlog", health.agent_state)
 }
 
+fn sifs_compact_placement_summary(
+    details: Option<&SifsObjectDetails>,
+    clustered: bool,
+    loading: bool,
+    error: Option<&str>,
+) -> String {
+    if loading {
+        return "loading placement".to_string();
+    }
+    if error.is_some() {
+        return "placement unavailable".to_string();
+    }
+    let Some(details) = details else {
+        return if clustered {
+            "placement pending".to_string()
+        } else {
+            "local node only".to_string()
+        };
+    };
+
+    let placement = match details.policy.as_str() {
+        "local-owned" => "local".to_string(),
+        "ephemeral-local" => "ephemeral".to_string(),
+        _ => match details.current_locations.len() {
+            0 => "no durable nodes".to_string(),
+            1 => "1 node".to_string(),
+            count => format!("{count} nodes"),
+        },
+    };
+    let health = details
+        .health
+        .as_ref()
+        .map(|health| {
+            if health.open_conflict_count > 0 {
+                plural(health.open_conflict_count, "conflict")
+            } else if health.pending_repair_count > 0 {
+                plural(health.pending_repair_count, "missing replica")
+            } else if health.agent_state == "healthy" {
+                "healthy".to_string()
+            } else {
+                health.agent_state.clone()
+            }
+        })
+        .unwrap_or_else(|| "health pending".to_string());
+    if health == "healthy" {
+        return match details.current_locations.len() {
+            0 => placement,
+            _ => format!("{placement} healthy"),
+        };
+    }
+    format!("{placement} · {health}")
+}
+
+fn sifs_compact_header_line(
+    entry: &SifsEntry,
+    details: Option<&SifsObjectDetails>,
+    clustered: bool,
+    loading: bool,
+    error: Option<&str>,
+) -> String {
+    let placement = sifs_compact_placement_summary(details, clustered, loading, error);
+    if entry.is_dir {
+        return format!("directory · {placement}");
+    }
+    if entry.is_link {
+        return format!("link · {placement}");
+    }
+    format!("{} · {placement}", details_size(entry, details))
+}
+
 fn sifs_missing_replica_summary(health: &SifsObjectHealth) -> String {
     if health.missing_replica_nodes.is_empty() {
         return "none".to_string();
@@ -8154,10 +8224,26 @@ impl Widget for InspectorView {
                 }
             });
         let kind_style = pal.text_style(&theme, 12.5, FontWeight::NORMAL, pal.text_muted);
+        let kind_line = if files.source == FilesSourceKind::Sifs {
+            sifs_compact_header_line(
+                entry,
+                details,
+                files.clustered,
+                files.details_loading,
+                files.details_error.as_deref(),
+            )
+        } else {
+            format!("{kind} · {}", details_size(entry, details))
+        };
+        let kind_width = if files.source == FilesSourceKind::Sifs {
+            title_rect.width()
+        } else {
+            w
+        };
         widgets::draw_text_in(
             ctx,
-            Rect::new(x, y, w, 20.0),
-            &format!("{kind} · {}", details_size(entry, details)),
+            Rect::new(x, y, kind_width, 20.0),
+            &display_name_for_width(&kind_line, kind_width, 6.8),
             kind_style,
         );
         y += 34.0;
@@ -11379,6 +11465,66 @@ mod tests {
         let first = sifs_details_signature(Some(&details));
         details.health.as_mut().unwrap().pending_repair_count = 0;
         assert_ne!(sifs_details_signature(Some(&details)), first);
+    }
+
+    #[test]
+    fn sifs_compact_placement_summary_fits_selected_header() {
+        assert_eq!(
+            sifs_compact_placement_summary(None, true, true, None),
+            "loading placement"
+        );
+        assert_eq!(
+            sifs_compact_placement_summary(None, true, false, Some("metadata failed")),
+            "placement unavailable"
+        );
+        assert_eq!(
+            sifs_compact_placement_summary(None, true, false, None),
+            "placement pending"
+        );
+        assert_eq!(
+            sifs_compact_placement_summary(None, false, false, None),
+            "local node only"
+        );
+
+        let mut details = SifsObjectDetails {
+            file_system_id: "sifs".to_string(),
+            object_id: "obj".to_string(),
+            path: "/artifact.txt".to_string(),
+            kind: "file".to_string(),
+            version: "v1".to_string(),
+            content_hash: None,
+            size_bytes: Some(5),
+            link_count: 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            policy: "replicated-eventual".to_string(),
+            current_locations: vec!["node-a".to_string(), "node-b".to_string()],
+            local_pins: Vec::new(),
+            health: Some(SifsObjectHealth {
+                agent_state: "healthy".to_string(),
+                version_count: 1,
+                receipt_count: 2,
+                intent_count: 0,
+                open_conflict_count: 0,
+                pending_repair_count: 0,
+                missing_replica_nodes: Vec::new(),
+            }),
+        };
+        assert_eq!(
+            sifs_compact_placement_summary(Some(&details), true, false, None),
+            "2 nodes healthy"
+        );
+
+        details.health.as_mut().unwrap().pending_repair_count = 1;
+        assert_eq!(
+            sifs_compact_placement_summary(Some(&details), true, false, None),
+            "2 nodes · 1 missing replica"
+        );
     }
 
     #[test]
