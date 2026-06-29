@@ -20,11 +20,8 @@ fn apply_local_iroh_endpoint_record_to_state(
     state: &mut ClusterBootstrapState,
     record: crate::IrohEndpointRecord,
 ) -> bool {
-    let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
     let mut endpoint = record.endpoint();
-    if endpoint.node_id == shadow_node_id {
-        endpoint.node_id = state.local_node_id.clone();
-    }
+    fold_local_shadow_iroh_endpoint_node_id(state, &mut endpoint);
     let Some(member) = state
         .members
         .iter_mut()
@@ -81,7 +78,8 @@ pub fn apply_cluster_iroh_endpoint_advertisement(
     persisted_endpoints: Option<&[ClusterEndpointRecord]>,
     timestamp: OffsetDateTime,
 ) -> Option<ClusterMemberRecord> {
-    let endpoint = record.endpoint();
+    let mut endpoint = record.endpoint();
+    fold_local_shadow_iroh_endpoint_node_id(state, &mut endpoint);
     let member = state
         .members
         .iter_mut()
@@ -93,6 +91,15 @@ pub fn apply_cluster_iroh_endpoint_advertisement(
     }
     state.updated_at = timestamp;
     Some(member.clone())
+}
+
+fn fold_local_shadow_iroh_endpoint_node_id(
+    state: &ClusterBootstrapState,
+    endpoint: &mut ClusterEndpointRecord,
+) {
+    if endpoint.node_id == shadow_daemon_node_id(&state.local_node_id) {
+        endpoint.node_id = state.local_node_id.clone();
+    }
 }
 
 pub(crate) fn cleanup_member_iroh_endpoints(member: &mut ClusterMemberRecord) -> bool {
