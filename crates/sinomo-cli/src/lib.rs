@@ -1234,7 +1234,9 @@ fn cli_local_cluster_quorum_if_relevant(
 fn dfs_command_requires_cluster_state(command: &DfsCliCommand) -> bool {
     match command {
         DfsCliCommand::Status(options) => options.cluster,
-        DfsCliCommand::Services { .. } | DfsCliCommand::MetadataPublish { .. } => true,
+        DfsCliCommand::Services { .. }
+        | DfsCliCommand::MetadataPublish { .. }
+        | DfsCliCommand::MetadataShardTransferPrimary(_) => true,
         _ => false,
     }
 }

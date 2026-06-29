@@ -6,7 +6,7 @@ use crate::file_manager::{
     FileManagerRead, validated_relative_child_path,
 };
 use sinomo_runtime::dfs::{
-    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsEndpointTransport,
+    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsControlPlaneStore, DfsEndpointTransport,
     DfsMetadataJournalReplicationOptions, DfsMetadataShardConfig, DfsNodeAdvertisement,
     DfsObjectKind, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
     DfsPeerTransportFuture, DfsPinAddRequest, DfsPinMode, DfsStat, DfsWriteOptions,
@@ -38,6 +38,19 @@ pub(crate) struct SifsFileManagerBackend {
 #[derive(Debug)]
 pub(crate) struct SifsParallelReadPool {
     workers: Vec<SifsFileManagerBackend>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SifsMetadataPrimaryTransferReport {
+    pub(crate) file_system_id: String,
+    pub(crate) shard_id: String,
+    pub(crate) previous_primary_node_id: String,
+    pub(crate) new_primary_node_id: String,
+    pub(crate) previous_epoch: u64,
+    pub(crate) new_epoch: u64,
+    pub(crate) changed: bool,
+    pub(crate) shard: DfsMetadataShardConfig,
+    pub(crate) local_node_id: String,
 }
 
 impl SifsFileManagerBackend {
@@ -358,6 +371,110 @@ impl SifsFileManagerBackend {
                 .collect()
         })
         .map_err(|error| format!("cannot read SIFS content pins: {error}"))
+    }
+
+    pub(crate) fn metadata_shard_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<DfsMetadataShardConfig>, String> {
+        let path = normalize_sifs_path(path)?;
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        if !cluster_paths.state.exists() {
+            return Ok(None);
+        }
+        refresh_sifs_cluster_kv_snapshot(&cluster_paths);
+        let mut kv = SifsControlPlaneKvClient::new(&cluster_paths);
+        let store = DfsControlPlaneStore::new(&mut kv);
+        store
+            .select_metadata_shard_for_path_strict_default_sifs_split(&sifs_file_system_id(), &path)
+            .map_err(|error| format!("cannot read SIFS metadata shard for {path}: {error}"))
+    }
+
+    pub(crate) fn transfer_metadata_primary_to_local(
+        &self,
+        path: &str,
+        expected_epoch: Option<u64>,
+    ) -> Result<SifsMetadataPrimaryTransferReport, String> {
+        let path = normalize_sifs_path(path)?;
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        if !cluster_paths.state.exists() {
+            return Err("SIFS metadata primary transfer requires a cluster".to_string());
+        }
+        refresh_sifs_cluster_kv_snapshot(&cluster_paths);
+        let state = network::read_cluster_state(&cluster_paths)
+            .map_err(|error| format!("cannot read local cluster state: {error}"))?;
+        let local_node_id = state.local_node_id;
+        let mut kv = SifsControlPlaneKvClient::new(&cluster_paths);
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        let previous = store
+            .select_metadata_shard_for_path_strict_default_sifs_split(&sifs_file_system_id(), &path)
+            .map_err(|error| format!("cannot read SIFS metadata shard for {path}: {error}"))?
+            .ok_or_else(|| format!("no SIFS metadata shard controls {path}"))?;
+        if let Some(expected_epoch) = expected_epoch {
+            if previous.epoch != expected_epoch {
+                return Err(format!(
+                    "SIFS metadata shard {} epoch is {}, expected {}",
+                    previous.shard_id, previous.epoch, expected_epoch
+                ));
+            }
+        }
+        if previous.primary_node_id == local_node_id {
+            return Ok(SifsMetadataPrimaryTransferReport {
+                file_system_id: previous.file_system_id.to_string(),
+                shard_id: previous.shard_id.clone(),
+                previous_primary_node_id: previous.primary_node_id.to_string(),
+                new_primary_node_id: previous.primary_node_id.to_string(),
+                previous_epoch: previous.epoch,
+                new_epoch: previous.epoch,
+                changed: false,
+                shard: previous,
+                local_node_id: local_node_id.to_string(),
+            });
+        }
+        if !previous
+            .replica_node_ids
+            .iter()
+            .any(|node_id| node_id == &local_node_id)
+        {
+            return Err(format!(
+                "local node {} is not a metadata replica for SIFS shard {}",
+                local_node_id, previous.shard_id
+            ));
+        }
+        let expected_epoch = previous.epoch;
+        let updated = store
+            .transfer_metadata_shard_primary(
+                &previous.file_system_id,
+                &previous.shard_id,
+                expected_epoch,
+                local_node_id.clone(),
+            )
+            .map_err(|error| {
+                format!(
+                    "cannot transfer SIFS metadata shard {} primary: {error}",
+                    previous.shard_id
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "SIFS metadata shard {} changed while transferring primary; refresh placement and retry",
+                    previous.shard_id
+                )
+            })?;
+        if let Ok(mut service) = self.lock_service() {
+            service.invalidate_sifs_metadata_shard_cache();
+        }
+        Ok(SifsMetadataPrimaryTransferReport {
+            file_system_id: previous.file_system_id.to_string(),
+            shard_id: previous.shard_id,
+            previous_primary_node_id: previous.primary_node_id.to_string(),
+            new_primary_node_id: updated.primary_node_id.to_string(),
+            previous_epoch: expected_epoch,
+            new_epoch: updated.epoch,
+            changed: true,
+            shard: updated,
+            local_node_id: local_node_id.to_string(),
+        })
     }
 
     pub(crate) fn create_dir_all(&self, path: &str) -> Result<(), String> {

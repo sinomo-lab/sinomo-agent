@@ -1966,7 +1966,7 @@ fn app_cluster_name(name: &str) -> String {
 // ----------------------------------------------------------------------------
 
 use crate::file_manager::{FileManagerBackend, FileManagerEntryKind};
-use crate::sifs_file_manager::SifsFileManagerBackend;
+use crate::sifs_file_manager::{SifsFileManagerBackend, SifsMetadataPrimaryTransferReport};
 
 /// One SIFS directory entry.
 #[derive(Clone, Debug)]
@@ -2000,6 +2000,32 @@ pub struct SifsObjectDetails {
     pub current_locations: Vec<String>,
     pub local_pins: Vec<SifsPinDetails>,
     pub health: Option<SifsObjectHealth>,
+    pub metadata_shard: Option<SifsMetadataShardDetails>,
+}
+
+/// Metadata shard placement for the selected SIFS path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SifsMetadataShardDetails {
+    pub shard_id: String,
+    pub primary_node_id: String,
+    pub replica_node_ids: Vec<String>,
+    pub epoch: u64,
+    pub local_node_id: String,
+    pub local_is_primary: bool,
+    pub local_is_replica: bool,
+}
+
+/// Result of transferring a selected path's metadata shard primary to this node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SifsMetadataPrimaryTransferOutcome {
+    pub file_system_id: String,
+    pub shard_id: String,
+    pub previous_primary_node_id: String,
+    pub new_primary_node_id: String,
+    pub previous_epoch: u64,
+    pub new_epoch: u64,
+    pub changed: bool,
+    pub metadata_shard: SifsMetadataShardDetails,
 }
 
 /// Local DFS pin state for a selected SIFS object.
@@ -2148,7 +2174,13 @@ impl SifsBrowser {
                 let local_pins = backend
                     .local_pins_for_path(&stat.file_system_id, &stat.path)
                     .unwrap_or_default();
-                sifs_details_from_stat(stat, local_pins)
+                let local_node_id = backend.node_label();
+                let metadata_shard = backend
+                    .metadata_shard_for_path(&stat.path)
+                    .ok()
+                    .flatten()
+                    .map(|shard| sifs_metadata_shard_from_config(shard, local_node_id.clone()));
+                sifs_details_from_stat(stat, local_pins, metadata_shard)
             }),
             SifsBrowserBackend::Remote(remote) => remote.stat(path),
         }
@@ -2273,6 +2305,18 @@ impl SifsBrowser {
         match &self.backend {
             SifsBrowserBackend::Local(backend) => backend.unpin_metadata(path),
             SifsBrowserBackend::Remote(remote) => remote.unpin_metadata(path),
+        }
+    }
+
+    pub fn make_metadata_primary(
+        &self,
+        path: &str,
+    ) -> Result<SifsMetadataPrimaryTransferOutcome, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend
+                .transfer_metadata_primary_to_local(path, None)
+                .map(sifs_metadata_primary_transfer_from_backend),
+            SifsBrowserBackend::Remote(remote) => remote.make_metadata_primary(path),
         }
     }
 
@@ -2489,6 +2533,21 @@ impl RemoteSifsBrowser {
         )?;
         Ok(response.removed)
     }
+
+    fn make_metadata_primary(
+        &self,
+        path: &str,
+    ) -> Result<SifsMetadataPrimaryTransferOutcome, String> {
+        let response: sinomo_runtime::daemon::DaemonDfsBrowserTransferMetadataPrimaryResponse =
+            self.rpc(
+                sinomo_runtime::daemon::DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
+                &sinomo_runtime::daemon::DaemonDfsBrowserTransferMetadataPrimaryRequest {
+                    path: path.to_string(),
+                    expected_epoch: None,
+                },
+            )?;
+        Ok(sifs_metadata_primary_transfer_from_rpc(response))
+    }
 }
 
 fn sifs_entry_from_file_manager(entry: crate::file_manager::FileManagerEntry) -> SifsEntry {
@@ -2514,6 +2573,7 @@ fn sifs_entry_from_rpc(entry: sinomo_runtime::daemon::DaemonDfsBrowserEntry) -> 
 fn sifs_details_from_stat(
     stat: sinomo_runtime::dfs::DfsStat,
     local_pins: Vec<sinomo_runtime::dfs::DfsPinRecord>,
+    metadata_shard: Option<SifsMetadataShardDetails>,
 ) -> SifsObjectDetails {
     SifsObjectDetails {
         file_system_id: stat.file_system_id.to_string(),
@@ -2539,6 +2599,7 @@ fn sifs_details_from_stat(
             .collect(),
         local_pins: local_pins.into_iter().map(sifs_pin_from_record).collect(),
         health: None,
+        metadata_shard,
     }
 }
 
@@ -2569,6 +2630,77 @@ fn sifs_details_from_rpc(
             .map(sifs_pin_from_rpc)
             .collect(),
         health: response.health.map(sifs_health_from_rpc),
+        metadata_shard: response.metadata_shard.map(sifs_metadata_shard_from_rpc),
+    }
+}
+
+fn sifs_metadata_shard_from_config(
+    shard: sinomo_runtime::dfs::DfsMetadataShardConfig,
+    local_node_id: String,
+) -> SifsMetadataShardDetails {
+    let primary_node_id = shard.primary_node_id.to_string();
+    let replica_node_ids = shard
+        .replica_node_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let local_is_primary = primary_node_id == local_node_id;
+    let local_is_replica = replica_node_ids
+        .iter()
+        .any(|node_id| node_id == &local_node_id);
+    SifsMetadataShardDetails {
+        shard_id: shard.shard_id,
+        primary_node_id,
+        replica_node_ids,
+        epoch: shard.epoch,
+        local_node_id,
+        local_is_primary,
+        local_is_replica,
+    }
+}
+
+fn sifs_metadata_shard_from_rpc(
+    shard: sinomo_runtime::daemon::DaemonDfsBrowserMetadataShard,
+) -> SifsMetadataShardDetails {
+    SifsMetadataShardDetails {
+        shard_id: shard.shard_id,
+        primary_node_id: shard.primary_node_id,
+        replica_node_ids: shard.replica_node_ids,
+        epoch: shard.epoch,
+        local_node_id: shard.local_node_id,
+        local_is_primary: shard.local_is_primary,
+        local_is_replica: shard.local_is_replica,
+    }
+}
+
+fn sifs_metadata_primary_transfer_from_backend(
+    report: SifsMetadataPrimaryTransferReport,
+) -> SifsMetadataPrimaryTransferOutcome {
+    let metadata_shard = sifs_metadata_shard_from_config(report.shard, report.local_node_id);
+    SifsMetadataPrimaryTransferOutcome {
+        file_system_id: report.file_system_id,
+        shard_id: report.shard_id,
+        previous_primary_node_id: report.previous_primary_node_id,
+        new_primary_node_id: report.new_primary_node_id,
+        previous_epoch: report.previous_epoch,
+        new_epoch: report.new_epoch,
+        changed: report.changed,
+        metadata_shard,
+    }
+}
+
+fn sifs_metadata_primary_transfer_from_rpc(
+    response: sinomo_runtime::daemon::DaemonDfsBrowserTransferMetadataPrimaryResponse,
+) -> SifsMetadataPrimaryTransferOutcome {
+    SifsMetadataPrimaryTransferOutcome {
+        file_system_id: response.file_system_id,
+        shard_id: response.shard_id,
+        previous_primary_node_id: response.previous_primary_node_id,
+        new_primary_node_id: response.new_primary_node_id,
+        previous_epoch: response.previous_epoch,
+        new_epoch: response.new_epoch,
+        changed: response.changed,
+        metadata_shard: sifs_metadata_shard_from_rpc(response.metadata_shard),
     }
 }
 

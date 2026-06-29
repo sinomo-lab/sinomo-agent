@@ -27,6 +27,7 @@ pub(crate) enum DfsCliCommand {
     MetadataPublish {
         json: bool,
     },
+    MetadataShardTransferPrimary(DfsMetadataShardTransferPrimaryOptions),
     Mount(DfsMountOptions),
     Services {
         json: bool,
@@ -62,6 +63,15 @@ pub(crate) struct DfsMountOptions {
     pub(crate) sync_local_changes: bool,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct DfsMetadataShardTransferPrimaryOptions {
+    pub(crate) file_system_id: DfsFileSystemId,
+    pub(crate) shard_id: String,
+    pub(crate) new_primary_node_id: NodeId,
+    pub(crate) expected_epoch: Option<u64>,
+    pub(crate) json: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct DfsConflictCliPage {
     conflicts: Vec<DfsConflictRecord>,
@@ -74,6 +84,18 @@ struct DfsRepairCliPage {
     repairs: Vec<DfsOperatorRepairView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DfsMetadataShardTransferPrimaryReport {
+    file_system_id: DfsFileSystemId,
+    shard_id: String,
+    previous_primary_node_id: NodeId,
+    new_primary_node_id: NodeId,
+    previous_epoch: u64,
+    new_epoch: u64,
+    changed: bool,
+    shard: DfsMetadataShardConfig,
 }
 
 pub(crate) enum DfsInspectionMetadata {
@@ -341,6 +363,68 @@ pub(crate) fn parse_dfs_metadata_command(args: &[String]) -> Result<DfsCliComman
                 }
             }
             Ok(DfsCliCommand::MetadataPublish { json })
+        }
+        Some((command, rest)) if command == "shard" => parse_dfs_metadata_shard_command(rest),
+        _ => Err(CliError::Usage),
+    }
+}
+
+pub(crate) fn parse_dfs_metadata_shard_command(args: &[String]) -> Result<DfsCliCommand, CliError> {
+    let (command, rest) = args.split_first().ok_or(CliError::Usage)?;
+    match command.as_str() {
+        "transfer-primary" => {
+            let mut file_system_id = default_dfs_file_system_id();
+            let mut shard_id = None;
+            let mut new_primary_node_id = None;
+            let mut expected_epoch = None;
+            let mut json = false;
+            let mut index = 0;
+            while index < rest.len() {
+                match rest[index].as_str() {
+                    "--filesystem" | "--fs" => {
+                        index += 1;
+                        file_system_id =
+                            parse_dfs_file_system_id(rest.get(index).ok_or(CliError::Usage)?)?;
+                    }
+                    "--shard" => {
+                        index += 1;
+                        shard_id = Some(non_empty_string(
+                            rest.get(index).ok_or(CliError::Usage)?,
+                            "metadata shard id",
+                        )?);
+                    }
+                    "--to" | "--node" | "--primary" => {
+                        index += 1;
+                        new_primary_node_id =
+                            Some(parse_node_id(rest.get(index).ok_or(CliError::Usage)?)?);
+                    }
+                    "--expected-epoch" | "--epoch" => {
+                        index += 1;
+                        let value = rest.get(index).ok_or(CliError::Usage)?;
+                        expected_epoch =
+                            Some(value.parse::<u64>().map_err(|source| CliError::Parse {
+                                detail: format!(
+                                    "invalid DFS metadata shard epoch `{value}`: {source}"
+                                ),
+                            })?);
+                    }
+                    "--json" => json = true,
+                    value if !value.starts_with('-') && shard_id.is_none() => {
+                        shard_id = Some(non_empty_string(value, "metadata shard id")?);
+                    }
+                    _ => return Err(CliError::Usage),
+                }
+                index += 1;
+            }
+            Ok(DfsCliCommand::MetadataShardTransferPrimary(
+                DfsMetadataShardTransferPrimaryOptions {
+                    file_system_id,
+                    shard_id: shard_id.ok_or(CliError::Usage)?,
+                    new_primary_node_id: new_primary_node_id.ok_or(CliError::Usage)?,
+                    expected_epoch,
+                    json,
+                },
+            ))
         }
         _ => Err(CliError::Usage),
     }
@@ -1096,10 +1180,130 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             }
             Ok(())
         }
+        DfsCliCommand::MetadataShardTransferPrimary(options) => {
+            run_dfs_metadata_shard_transfer_primary(options)
+        }
         DfsCliCommand::Mount(options) => run_dfs_mount_command(options),
         DfsCliCommand::Pin(command) => run_dfs_pin_command(command),
         DfsCliCommand::Expose(command) => run_dfs_expose_command(command),
     }
+}
+
+fn run_dfs_metadata_shard_transfer_primary(
+    options: DfsMetadataShardTransferPrimaryOptions,
+) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let mut kv = CliDfsControlPlaneKvClient::new(&cluster_paths);
+    let mut store = sinomo_runtime::dfs::DfsControlPlaneStore::new(&mut kv);
+    let previous = store
+        .get_metadata_shard(&options.file_system_id, &options.shard_id)?
+        .ok_or_else(|| CliError::Parse {
+            detail: format!(
+                "DFS metadata shard {} for filesystem {} was not found",
+                options.shard_id, options.file_system_id
+            ),
+        })?;
+
+    if let Some(expected_epoch) = options.expected_epoch {
+        if previous.epoch != expected_epoch {
+            return Err(CliError::ClusterReadOnly {
+                detail: format!(
+                    "DFS metadata shard {} epoch is {}, expected {}",
+                    options.shard_id, previous.epoch, expected_epoch
+                ),
+            });
+        }
+    }
+
+    if previous.primary_node_id == options.new_primary_node_id {
+        let report = DfsMetadataShardTransferPrimaryReport {
+            file_system_id: options.file_system_id,
+            shard_id: options.shard_id,
+            previous_primary_node_id: previous.primary_node_id.clone(),
+            new_primary_node_id: previous.primary_node_id.clone(),
+            previous_epoch: previous.epoch,
+            new_epoch: previous.epoch,
+            changed: false,
+            shard: previous,
+        };
+        print_dfs_metadata_shard_transfer_primary_report(&report, options.json)?;
+        return Ok(());
+    }
+
+    if !previous
+        .replica_node_ids
+        .iter()
+        .any(|node_id| node_id == &options.new_primary_node_id)
+    {
+        return Err(CliError::ClusterReadOnly {
+            detail: format!(
+                "node {} is not a replica of DFS metadata shard {}; add metadata replication before promoting it",
+                options.new_primary_node_id, options.shard_id
+            ),
+        });
+    }
+
+    let expected_epoch = previous.epoch;
+    let updated = store.transfer_metadata_shard_primary(
+        &options.file_system_id,
+        &options.shard_id,
+        expected_epoch,
+        options.new_primary_node_id.clone(),
+    )?;
+    let Some(updated) = updated else {
+        let current = store.get_metadata_shard(&options.file_system_id, &options.shard_id)?;
+        let current_epoch = current
+            .as_ref()
+            .map(|shard| shard.epoch.to_string())
+            .unwrap_or_else(|| "missing".to_string());
+        return Err(CliError::ClusterReadOnly {
+            detail: format!(
+                "DFS metadata shard {} changed while transferring primary; expected epoch {}, current epoch {}",
+                options.shard_id, expected_epoch, current_epoch
+            ),
+        });
+    };
+
+    let report = DfsMetadataShardTransferPrimaryReport {
+        file_system_id: options.file_system_id,
+        shard_id: options.shard_id,
+        previous_primary_node_id: previous.primary_node_id,
+        new_primary_node_id: updated.primary_node_id.clone(),
+        previous_epoch: expected_epoch,
+        new_epoch: updated.epoch,
+        changed: true,
+        shard: updated,
+    };
+    print_dfs_metadata_shard_transfer_primary_report(&report, options.json)?;
+    Ok(())
+}
+
+fn print_dfs_metadata_shard_transfer_primary_report(
+    report: &DfsMetadataShardTransferPrimaryReport,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        return print_json("<dfs-metadata-shard-transfer-primary>", report);
+    }
+    if report.changed {
+        println!(
+            "DFS metadata shard primary transferred: {} shard={} {} -> {} epoch {} -> {}",
+            report.file_system_id,
+            report.shard_id,
+            report.previous_primary_node_id,
+            report.new_primary_node_id,
+            report.previous_epoch,
+            report.new_epoch
+        );
+    } else {
+        println!(
+            "DFS metadata shard primary unchanged: {} shard={} primary={} epoch={}",
+            report.file_system_id, report.shard_id, report.new_primary_node_id, report.new_epoch
+        );
+    }
+    Ok(())
 }
 
 fn run_dfs_smoke_via_daemon_address(

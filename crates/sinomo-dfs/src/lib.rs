@@ -10474,6 +10474,10 @@ where
 }
 
 impl<T> NetworkedDfsService<T> {
+    pub fn invalidate_sifs_metadata_shard_cache(&mut self) {
+        self.cached_sifs_metadata_shards = None;
+    }
+
     fn next_dfs_routed_message(
         &mut self,
         target_node_id: &NodeId,

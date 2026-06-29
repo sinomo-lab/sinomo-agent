@@ -31,6 +31,8 @@ pub const DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE: &str = "/daemon/dfs/browser/pin
 pub const DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE: &str = "/daemon/dfs/browser/unpin-metadata";
 pub const DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE: &str = "/daemon/dfs/browser/pin-content";
 pub const DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE: &str = "/daemon/dfs/browser/unpin-content";
+pub const DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE: &str =
+    "/daemon/dfs/browser/transfer-metadata-primary";
 pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_STATUS_ROUTE,
     DAEMON_DFS_BROWSER_STAT_ROUTE,
@@ -46,6 +48,7 @@ pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
     DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE,
     DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
+    DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
 ];
 
 pub(crate) fn cluster_join_trace(args: std::fmt::Arguments<'_>) {
@@ -116,6 +119,19 @@ pub struct DaemonDfsBrowserStatResponse {
     pub local_pins: Vec<DaemonDfsBrowserPinRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<DaemonDfsBrowserObjectHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_shard: Option<DaemonDfsBrowserMetadataShard>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserMetadataShard {
+    pub shard_id: String,
+    pub primary_node_id: String,
+    pub replica_node_ids: Vec<String>,
+    pub epoch: u64,
+    pub local_node_id: String,
+    pub local_is_primary: bool,
+    pub local_is_replica: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
@@ -248,6 +264,25 @@ pub struct DaemonDfsBrowserUnpinContentRequest {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserUnpinContentResponse {
     pub removed: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserTransferMetadataPrimaryRequest {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_epoch: Option<u64>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserTransferMetadataPrimaryResponse {
+    pub file_system_id: String,
+    pub shard_id: String,
+    pub previous_primary_node_id: String,
+    pub new_primary_node_id: String,
+    pub previous_epoch: u64,
+    pub new_epoch: u64,
+    pub changed: bool,
+    pub metadata_shard: DaemonDfsBrowserMetadataShard,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]

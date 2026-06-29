@@ -312,6 +312,12 @@ pub(super) fn print_dfs_help() {
     println!("  sinomo dfs metadata publish [--json]");
     println!("      Publish the local primary metadata shard journal to configured replicas.");
     println!(
+        "  sinomo dfs metadata shard transfer-primary <shard> --to <node_id> [--filesystem <file_system_id>] [--expected-epoch <n>] [--json]"
+    );
+    println!(
+        "      Transfer a metadata shard primary to an existing replica through fenced cluster KV."
+    );
+    println!(
         "  sinomo dfs mount <mount-point> [--root <sifs-path>] [--read-only] [--allow-other] [--data-dir <path>]"
     );
     println!("      Expose SIFS locally through FUSE on Unix or Windows Cloud Files on Windows.");

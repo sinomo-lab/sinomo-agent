@@ -9,12 +9,12 @@ use super::{
     ClusterRoleOptions, ClusterRolloutBuildRequest, ClusterStateAuthorityOptions, DaemonCliCommand,
     DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
     DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
-    DfsMountOptions, DfsPinCliCommand, InstallLayout, InstallOptions, InteractionModel,
-    InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
-    ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget,
-    ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
-    ProviderCommandOptions, ProviderName, RolloutAdvanceOptions, RolloutCliCommand,
-    RolloutMainActivation, RolloutModuleNativeDylibOptions, RolloutOptions,
+    DfsMetadataShardTransferPrimaryOptions, DfsMountOptions, DfsPinCliCommand, InstallLayout,
+    InstallOptions, InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
+    InteractionSurfaceKind, ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions,
+    ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand,
+    ProviderCliCommand, ProviderCommandOptions, ProviderName, RolloutAdvanceOptions,
+    RolloutCliCommand, RolloutMainActivation, RolloutModuleNativeDylibOptions, RolloutOptions,
     RolloutProgressExpectation, RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler,
     SelfRolloutPaths, TestCliCommand, UninstallOptions, apply_cluster_node_role,
     apply_cluster_raft_role, authenticate_daemon_control_request,
@@ -6917,6 +6917,15 @@ fn cluster_state_guard_applies_to_distributed_runtime_commands() {
     assert!(cli_command_requires_cluster_state(&CliCommand::Dfs(
         DfsCliCommand::MetadataPublish { json: false }
     )));
+    assert!(cli_command_requires_cluster_state(&CliCommand::Dfs(
+        DfsCliCommand::MetadataShardTransferPrimary(DfsMetadataShardTransferPrimaryOptions {
+            file_system_id: sinomo_runtime::dfs::sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            new_primary_node_id: NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d5").expect("node"),
+            expected_epoch: Some(1),
+            json: false,
+        })
+    )));
     assert!(!cli_command_requires_cluster_state(&CliCommand::Models(
         ModelsCliCommand::Help
     )));
@@ -7129,6 +7138,27 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
     assert_eq!(
         parse_dfs_command(&["smoke".to_string(), "--json".to_string()]).expect("dfs smoke"),
         DfsCliCommand::Smoke { json: true }
+    );
+    assert_eq!(
+        parse_dfs_command(&[
+            "metadata".to_string(),
+            "shard".to_string(),
+            "transfer-primary".to_string(),
+            "root".to_string(),
+            "--to".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d5".to_string(),
+            "--expected-epoch".to_string(),
+            "7".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("dfs metadata shard transfer-primary"),
+        DfsCliCommand::MetadataShardTransferPrimary(DfsMetadataShardTransferPrimaryOptions {
+            file_system_id: sinomo_runtime::dfs::sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            new_primary_node_id: NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d5").expect("node"),
+            expected_epoch: Some(7),
+            json: true,
+        })
     );
     assert_eq!(
         parse_dfs_command(&[

@@ -31,8 +31,8 @@ use sinomo_kv::{
     CLUSTER_KV_WATCH_EVENTS_ROUTE, CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_RPC_ROUTE_POLICIES,
     CLUSTER_RAFT_RPC_ROUTES, ClusterKvRpcRoutePolicy, ClusterKvWatchCancelRequest,
     ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest, ClusterKvWatchDrainResponse,
-    ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration, KvEntry, KvSnapshot, KvTxn,
-    KvTxnResponse,
+    ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration, KvEntry, KvError, KvOp, KvSnapshot,
+    KvTxn, KvTxnResponse,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_module::{MODULE_NATIVE_DYLIB_CANCEL_ROUTE, MODULE_RPC_CATEGORY};
@@ -121,9 +121,9 @@ use crate::{
     DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILES_ROUTE, DAEMON_DFS_BROWSER_RENAME_ROUTE,
     DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE, DAEMON_DFS_BROWSER_STATUS_ROUTE,
-    DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
-    DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
-    DAEMON_STATUS_ROUTE,
+    DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE, DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
+    DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE, DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+    DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
 };
 
 static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
@@ -1235,6 +1235,72 @@ struct DaemonDfsBrowserBackend {
     endpoint_targets_refreshed_at: Mutex<Option<Instant>>,
 }
 
+#[derive(Clone, Debug)]
+struct DaemonDfsBrowserControlPlaneKvClient {
+    cluster_paths: ClusterPaths,
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl DaemonDfsBrowserControlPlaneKvClient {
+    fn new(cluster_paths: &ClusterPaths, runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            cluster_paths: cluster_paths.clone(),
+            runtime: Some(runtime),
+        }
+    }
+
+    fn read_only(cluster_paths: &ClusterPaths) -> Self {
+        Self {
+            cluster_paths: cluster_paths.clone(),
+            runtime: None,
+        }
+    }
+
+    fn kv_error(&self, source: impl std::fmt::Display) -> KvError {
+        KvError::Io {
+            path: self.cluster_paths.kv_snapshot.display().to_string(),
+            detail: source.to_string(),
+        }
+    }
+}
+
+impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsBrowserControlPlaneKvClient {
+    fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+        sinomo_kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
+    }
+
+    fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+        sinomo_kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
+    }
+
+    fn put(&mut self, key: String, value: Vec<u8>) -> Result<sinomo_kv::KvRevision, KvError> {
+        let response = self.txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key,
+                value,
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        })?;
+        Ok(response.revision)
+    }
+
+    fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            self.kv_error("read-only DFS browser KV client cannot submit transactions")
+        })?;
+        let response = crate::cluster::handle_cluster_kv_txn_request_with_cluster_paths_on_runtime(
+            &self.cluster_paths,
+            txn,
+            true,
+            runtime,
+        )
+        .map_err(|source| self.kv_error(source))?;
+        Ok(response)
+    }
+}
+
 static DAEMON_DFS_BROWSER_BACKENDS: OnceLock<
     Mutex<HashMap<PathBuf, Arc<DaemonDfsBrowserBackend>>>,
 > = OnceLock::new();
@@ -1354,7 +1420,43 @@ impl DaemonDfsBrowserBackend {
         let health = daemon_dfs_browser_object_health(&service, &stat.object_id);
         let local_pins =
             daemon_dfs_browser_local_pins(&self.data_dir, &stat.file_system_id, &stat.path);
-        Ok(daemon_dfs_browser_stat_response(stat, local_pins, health))
+        let local_node_id = service.node_id().clone();
+        drop(service);
+        let metadata_shard = self
+            .metadata_shard_for_path(&stat.path, None)
+            .ok()
+            .flatten()
+            .map(|shard| daemon_dfs_browser_metadata_shard(shard, &local_node_id));
+        Ok(daemon_dfs_browser_stat_response(
+            stat,
+            local_pins,
+            health,
+            metadata_shard,
+        ))
+    }
+
+    fn metadata_shard_for_path(
+        &self,
+        path: &str,
+        runtime: Option<&tokio::runtime::Handle>,
+    ) -> Result<Option<sinomo_dfs::DfsMetadataShardConfig>, ServiceError> {
+        let path = normalize_sifs_browser_path(path)?;
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        if !cluster_paths.state.exists() {
+            return Ok(None);
+        }
+        let mut kv = if let Some(runtime) = runtime {
+            DaemonDfsBrowserControlPlaneKvClient::new(&cluster_paths, runtime.clone())
+        } else {
+            DaemonDfsBrowserControlPlaneKvClient::read_only(&cluster_paths)
+        };
+        let store = sinomo_dfs::DfsControlPlaneStore::new(&mut kv);
+        store
+            .select_metadata_shard_for_path_strict_default_sifs_split(
+                &sinomo_dfs::sifs_file_system_id(),
+                &path,
+            )
+            .map_err(dfs_browser_service_error)
     }
 
     fn read_file(
@@ -1567,6 +1669,92 @@ impl DaemonDfsBrowserBackend {
     ) -> Result<crate::DaemonDfsBrowserUnpinContentResponse, ServiceError> {
         let removed = self.unpin_path_mode(&request.path, sinomo_dfs::DfsPinMode::Content)?;
         Ok(crate::DaemonDfsBrowserUnpinContentResponse { removed })
+    }
+
+    fn transfer_metadata_primary(
+        &self,
+        request: crate::DaemonDfsBrowserTransferMetadataPrimaryRequest,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<crate::DaemonDfsBrowserTransferMetadataPrimaryResponse, ServiceError> {
+        let path = normalize_sifs_browser_path(&request.path)?;
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        if !cluster_paths.state.exists() {
+            return Err(ServiceError::Service(
+                "SIFS metadata primary transfer requires a cluster".to_string(),
+            ));
+        }
+        let state = sinomo_network::read_cluster_state(&cluster_paths)
+            .map_err(|error| ServiceError::Service(error.to_string()))?;
+        let local_node_id = state.local_node_id;
+        let mut kv = DaemonDfsBrowserControlPlaneKvClient::new(&cluster_paths, runtime.clone());
+        let mut store = sinomo_dfs::DfsControlPlaneStore::new(&mut kv);
+        let previous = store
+            .select_metadata_shard_for_path_strict_default_sifs_split(
+                &sinomo_dfs::sifs_file_system_id(),
+                &path,
+            )
+            .map_err(dfs_browser_service_error)?
+            .ok_or_else(|| {
+                ServiceError::Service(format!("no SIFS metadata shard controls {path}"))
+            })?;
+        if let Some(expected_epoch) = request.expected_epoch {
+            if previous.epoch != expected_epoch {
+                return Err(ServiceError::Service(format!(
+                    "SIFS metadata shard {} epoch is {}, expected {}",
+                    previous.shard_id, previous.epoch, expected_epoch
+                )));
+            }
+        }
+        if previous.primary_node_id == local_node_id {
+            return Ok(crate::DaemonDfsBrowserTransferMetadataPrimaryResponse {
+                file_system_id: previous.file_system_id.to_string(),
+                shard_id: previous.shard_id.clone(),
+                previous_primary_node_id: previous.primary_node_id.to_string(),
+                new_primary_node_id: previous.primary_node_id.to_string(),
+                previous_epoch: previous.epoch,
+                new_epoch: previous.epoch,
+                changed: false,
+                metadata_shard: daemon_dfs_browser_metadata_shard(previous, &local_node_id),
+            });
+        }
+        if !previous
+            .replica_node_ids
+            .iter()
+            .any(|node_id| node_id == &local_node_id)
+        {
+            return Err(ServiceError::Service(format!(
+                "local node {} is not a metadata replica for SIFS shard {}",
+                local_node_id, previous.shard_id
+            )));
+        }
+        let expected_epoch = previous.epoch;
+        let updated = store
+            .transfer_metadata_shard_primary(
+                &previous.file_system_id,
+                &previous.shard_id,
+                expected_epoch,
+                local_node_id.clone(),
+            )
+            .map_err(dfs_browser_service_error)?
+            .ok_or_else(|| {
+                ServiceError::Service(format!(
+                    "SIFS metadata shard {} changed while transferring primary; refresh placement and retry",
+                    previous.shard_id
+                ))
+            })?;
+        if let Ok(mut service) = self.lock_service() {
+            service.invalidate_sifs_metadata_shard_cache();
+        }
+        Ok(crate::DaemonDfsBrowserTransferMetadataPrimaryResponse {
+            file_system_id: previous.file_system_id.to_string(),
+            shard_id: previous.shard_id,
+            previous_primary_node_id: previous.primary_node_id.to_string(),
+            new_primary_node_id: updated.primary_node_id.to_string(),
+            previous_epoch: expected_epoch,
+            new_epoch: updated.epoch,
+            changed: true,
+            metadata_shard: daemon_dfs_browser_metadata_shard(updated, &local_node_id),
+        })
     }
 
     fn flush_after_mutation(
@@ -1799,6 +1987,27 @@ impl Service for DaemonDfsBrowserService {
                     .await?;
                     ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE, &result)?
                 }
+                DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let runtime = require_service_runtime(
+                        runtime.as_ref(),
+                        "DFS browser metadata primary transfer",
+                    )?
+                    .clone();
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS browser metadata primary transfer",
+                        move || {
+                            DaemonDfsBrowserBackend::for_data_dir(data_dir)?
+                                .transfer_metadata_primary(payload, &runtime)
+                        },
+                    )
+                    .await?;
+                    ObjectRpcResponse::encode_body(
+                        DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
+                        &result,
+                    )?
+                }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
             ctx.respond(response)?;
@@ -1811,6 +2020,7 @@ fn daemon_dfs_browser_stat_response(
     stat: sinomo_dfs::DfsStat,
     local_pins: Vec<crate::DaemonDfsBrowserPinRecord>,
     health: Option<crate::DaemonDfsBrowserObjectHealth>,
+    metadata_shard: Option<crate::DaemonDfsBrowserMetadataShard>,
 ) -> crate::DaemonDfsBrowserStatResponse {
     crate::DaemonDfsBrowserStatResponse {
         file_system_id: stat.file_system_id.to_string(),
@@ -1836,6 +2046,33 @@ fn daemon_dfs_browser_stat_response(
             .collect(),
         local_pins,
         health,
+        metadata_shard,
+    }
+}
+
+fn daemon_dfs_browser_metadata_shard(
+    shard: sinomo_dfs::DfsMetadataShardConfig,
+    local_node_id: &sinomo_node::NodeId,
+) -> crate::DaemonDfsBrowserMetadataShard {
+    let primary_node_id = shard.primary_node_id.to_string();
+    let local_node_id = local_node_id.to_string();
+    let replica_node_ids = shard
+        .replica_node_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let local_is_primary = primary_node_id == local_node_id;
+    let local_is_replica = replica_node_ids
+        .iter()
+        .any(|node_id| node_id == &local_node_id);
+    crate::DaemonDfsBrowserMetadataShard {
+        shard_id: shard.shard_id,
+        primary_node_id,
+        replica_node_ids,
+        epoch: shard.epoch,
+        local_node_id,
+        local_is_primary,
+        local_is_replica,
     }
 }
 

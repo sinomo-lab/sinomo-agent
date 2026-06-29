@@ -43,7 +43,8 @@ use sui::{
 };
 
 use sinomo_cli::app_api::{
-    SifsBrowser, SifsEntry, SifsFileRead, SifsObjectDetails, SifsObjectHealth,
+    SifsBrowser, SifsEntry, SifsFileRead, SifsMetadataShardDetails, SifsObjectDetails,
+    SifsObjectHealth,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use time::format_description::well_known::Rfc3339;
@@ -275,6 +276,7 @@ enum FilesOperationKind {
     Delete,
     RefreshPlacement,
     RepairReplicas,
+    MakeMetadataPrimary,
     PinMetadata,
     UnpinMetadata,
     PinContent,
@@ -1732,6 +1734,26 @@ impl FilesState {
         );
     }
 
+    fn start_make_metadata_primary(&mut self, waker: Option<sui::UiHandle>) {
+        if self.source != FilesSourceKind::Sifs {
+            return;
+        }
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+        self.start_operation(
+            FilesOperation {
+                kind: FilesOperationKind::MakeMetadataPrimary,
+                path: entry.path.clone(),
+                target: None,
+                directory: entry.is_dir,
+            },
+            "Make metadata primary".to_string(),
+            entry.path,
+            waker,
+        );
+    }
+
     fn start_pin_metadata(&mut self, waker: Option<sui::UiHandle>) {
         if self.source != FilesSourceKind::Sifs {
             return;
@@ -3015,6 +3037,26 @@ fn execute_sifs_operation(
                 message: format!("requested replica repair for {}", operation.path),
             })
         }
+        FilesOperationKind::MakeMetadataPrimary => {
+            let outcome = browser
+                .make_metadata_primary(&operation.path)
+                .map_err(FilesOperationFailure::Error)?;
+            Ok(FilesOperationOutcome {
+                refresh_path: current_path.to_string(),
+                select_path: Some(operation.path.clone()),
+                message: if outcome.changed {
+                    format!(
+                        "made local node primary for SIFS metadata shard {} (epoch {} -> {})",
+                        outcome.shard_id, outcome.previous_epoch, outcome.new_epoch
+                    )
+                } else {
+                    format!(
+                        "local node already primary for SIFS metadata shard {}",
+                        outcome.shard_id
+                    )
+                },
+            })
+        }
         FilesOperationKind::PinMetadata => {
             let node_id = browser
                 .pin_metadata(&operation.path)
@@ -3260,6 +3302,9 @@ fn execute_local_operation_with_progress(
         )),
         FilesOperationKind::RepairReplicas => Err(FilesOperationFailure::Error(
             "replica repair is only available for SIFS".to_string(),
+        )),
+        FilesOperationKind::MakeMetadataPrimary => Err(FilesOperationFailure::Error(
+            "metadata primary transfer is only available for SIFS".to_string(),
         )),
         FilesOperationKind::PinMetadata
         | FilesOperationKind::UnpinMetadata
@@ -4165,6 +4210,12 @@ fn files_operation_cancelled_detail(operation: &FilesOperation) -> String {
         FilesOperationKind::RepairReplicas => {
             format!("cancelled before repairing replicas for {}", operation.path)
         }
+        FilesOperationKind::MakeMetadataPrimary => {
+            format!(
+                "cancelled before making metadata primary for {}",
+                operation.path
+            )
+        }
         FilesOperationKind::PinMetadata => {
             format!("cancelled before pinning metadata for {}", operation.path)
         }
@@ -4216,6 +4267,12 @@ fn operation_progress_label(
         }
         FilesOperationKind::RepairReplicas => {
             format!("{phase} replica repair in {scope}: {}", operation.path)
+        }
+        FilesOperationKind::MakeMetadataPrimary => {
+            format!(
+                "{phase} metadata primary transfer in {scope}: {}",
+                operation.path
+            )
         }
         FilesOperationKind::PinMetadata => {
             format!("{phase} metadata pin in {scope}: {}", operation.path)
@@ -4571,6 +4628,54 @@ fn details_locations(details: &SifsObjectDetails) -> String {
     }
 }
 
+fn sifs_can_make_metadata_primary(details: &SifsObjectDetails) -> bool {
+    details.metadata_shard.as_ref().is_some_and(|shard| {
+        shard.local_is_replica && !shard.local_is_primary && !shard.local_node_id.is_empty()
+    })
+}
+
+fn sifs_metadata_shard_summary(details: Option<&SifsObjectDetails>) -> String {
+    let Some(shard) = details.and_then(|details| details.metadata_shard.as_ref()) else {
+        return "metadata shard not loaded".to_string();
+    };
+    if shard.local_is_primary {
+        format!("{} primary here; epoch {}", shard.shard_id, shard.epoch)
+    } else if shard.local_is_replica {
+        format!(
+            "{} primary {}; local replica; epoch {}",
+            shard.shard_id,
+            short(&shard.primary_node_id, 18),
+            shard.epoch
+        )
+    } else {
+        format!(
+            "{} primary {}; local not replica; epoch {}",
+            shard.shard_id,
+            short(&shard.primary_node_id, 18),
+            shard.epoch
+        )
+    }
+}
+
+fn sifs_metadata_shard_detail_summary(shard: &SifsMetadataShardDetails) -> String {
+    let replicas = if shard.replica_node_ids.is_empty() {
+        "none".to_string()
+    } else {
+        shard
+            .replica_node_ids
+            .iter()
+            .map(|node_id| short(node_id, 18))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "primary {}; replicas {}; epoch {}",
+        short(&shard.primary_node_id, 18),
+        replicas,
+        shard.epoch
+    )
+}
+
 fn sifs_pin_summary(details: Option<&SifsObjectDetails>) -> String {
     let Some(details) = details else {
         return "pin state unknown; refresh metadata to manage pins".to_string();
@@ -4840,6 +4945,9 @@ fn sifs_placement_next_step(details: Option<&SifsObjectDetails>, clustered: bool
     let Some(details) = details else {
         return "load SIFS metadata before changing placement".to_string();
     };
+    if sifs_can_make_metadata_primary(details) {
+        return "make this node primary if the current metadata primary is unavailable".to_string();
+    }
     if details.policy == "local-owned" {
         return "copy or move into a replicated SIFS namespace to spread across nodes".to_string();
     }
@@ -4919,13 +5027,29 @@ fn sifs_details_signature(details: Option<&SifsObjectDetails>) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
+            let shard = details
+                .metadata_shard
+                .as_ref()
+                .map(|shard| {
+                    format!(
+                        "{}:{}:{}:{}:{}:{}",
+                        shard.shard_id,
+                        shard.primary_node_id,
+                        shard.replica_node_ids.join(","),
+                        shard.epoch,
+                        shard.local_node_id,
+                        shard.local_is_primary
+                    )
+                })
+                .unwrap_or_default();
             format!(
-                "{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}",
                 details.version,
                 details.policy,
                 details.current_locations.join(","),
                 pins,
-                health
+                health,
+                shard
             )
         })
         .unwrap_or_default()
@@ -8080,6 +8204,7 @@ enum InspectorAction {
     Delete,
     RefreshPlacement,
     RepairReplicas,
+    MakeMetadataPrimary,
     PinMetadata,
     UnpinMetadata,
     PinContent,
@@ -8099,6 +8224,7 @@ impl InspectorAction {
             Self::Delete => "Delete",
             Self::RefreshPlacement => "Refresh placement",
             Self::RepairReplicas => "Repair replicas",
+            Self::MakeMetadataPrimary => "Make metadata primary",
             Self::PinMetadata => "Pin metadata",
             Self::UnpinMetadata => "Unpin metadata",
             Self::PinContent => "Pin content",
@@ -8118,6 +8244,7 @@ impl InspectorAction {
             Self::Delete => IconGlyph::Trash,
             Self::RefreshPlacement => IconGlyph::Storage,
             Self::RepairReplicas => IconGlyph::Redo,
+            Self::MakeMetadataPrimary => IconGlyph::ChevronUp,
             Self::PinMetadata => IconGlyph::Lock,
             Self::UnpinMetadata => IconGlyph::Unlock,
             Self::PinContent => IconGlyph::Lock,
@@ -8137,6 +8264,7 @@ impl InspectorAction {
             Self::OpenFolder
             | Self::RefreshPlacement
             | Self::RepairReplicas
+            | Self::MakeMetadataPrimary
             | Self::PinMetadata
             | Self::UnpinMetadata
             | Self::PinContent
@@ -8150,6 +8278,7 @@ impl InspectorAction {
             Self::OpenFolder => "Open folder".to_string(),
             Self::RefreshPlacement => format!("Refresh placement {}", entry.name),
             Self::RepairReplicas => format!("Repair replicas {}", entry.name),
+            Self::MakeMetadataPrimary => format!("Make metadata primary {}", entry.name),
             Self::PinMetadata => format!("Pin metadata {}", entry.name),
             Self::UnpinMetadata => format!("Unpin metadata {}", entry.name),
             Self::PinContent => format!("Pin content {}", entry.name),
@@ -8189,6 +8318,9 @@ fn inspector_actions(files: &FilesState, entry: &SifsEntry) -> Vec<InspectorActi
         if !metadata_needs_connection && !files.details_loading {
             if let Some(details) = files.selected_details.as_ref() {
                 actions.push(InspectorAction::RepairReplicas);
+                if sifs_can_make_metadata_primary(details) {
+                    actions.push(InspectorAction::MakeMetadataPrimary);
+                }
                 if sifs_has_local_pin(details, "metadata") {
                     actions.push(InspectorAction::UnpinMetadata);
                 } else {
@@ -8300,6 +8432,7 @@ fn inspector_action_button_widget_id(
         InspectorAction::Delete => 7_553,
         InspectorAction::RefreshPlacement => 7_571,
         InspectorAction::RepairReplicas => 7_579,
+        InspectorAction::MakeMetadataPrimary => 7_581,
         InspectorAction::PinMetadata => 7_583,
         InspectorAction::UnpinMetadata => 7_585,
         InspectorAction::PinContent => 7_587,
@@ -8422,6 +8555,11 @@ impl Widget for InspectorView {
                     InspectorAction::RepairReplicas => {
                         let waker = { self.shared.borrow().waker.clone() };
                         self.shared.files_mut().start_replica_repair(waker);
+                        request_files_overlay_rebuild(ctx);
+                    }
+                    InspectorAction::MakeMetadataPrimary => {
+                        let waker = { self.shared.borrow().waker.clone() };
+                        self.shared.files_mut().start_make_metadata_primary(waker);
                         request_files_overlay_rebuild(ctx);
                     }
                     InspectorAction::PinMetadata => {
@@ -8824,6 +8962,17 @@ impl Widget for InspectorView {
             .unwrap_or("not loaded");
         let placement = sifs_replication_summary(details, files.clustered);
         y = self.info_row(ctx, &theme, &pal, x, y + 10.0, w, "Placement", &placement);
+        let metadata_shard = sifs_metadata_shard_summary(details);
+        y = self.info_row(
+            ctx,
+            &theme,
+            &pal,
+            x,
+            y + 4.0,
+            w,
+            "Metadata",
+            &metadata_shard,
+        );
         let health = sifs_health_summary(details);
         y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Health", &health);
         let pins = sifs_pin_summary(details);
@@ -8894,6 +9043,18 @@ impl Widget for InspectorView {
             }
 
             y = self.info_row(ctx, &theme, &pal, x, y + 4.0, w, "Policy", policy);
+            if let Some(shard) = details.and_then(|details| details.metadata_shard.as_ref()) {
+                y = self.info_row(
+                    ctx,
+                    &theme,
+                    &pal,
+                    x,
+                    y + 4.0,
+                    w,
+                    "Shard",
+                    &sifs_metadata_shard_detail_summary(shard),
+                );
+            }
             if let Some(health) = details.and_then(|details| details.health.as_ref()) {
                 y = self.info_row(
                     ctx,
@@ -9157,6 +9318,12 @@ impl Widget for InspectorView {
                     InspectorAction::RepairReplicas => {
                         format!("Request SIFS replica repair for {}", entry.path)
                     }
+                    InspectorAction::MakeMetadataPrimary => {
+                        format!(
+                            "Transfer the SIFS metadata shard primary for {} to this node",
+                            entry.path
+                        )
+                    }
                     InspectorAction::PinMetadata => {
                         format!("Pin SIFS metadata on this node for {}", entry.path)
                     }
@@ -9368,6 +9535,7 @@ impl InspectorView {
             InspectorAction::Delete => (pal.field, pal.border, pal.warn, pal.warn),
             InspectorAction::RefreshPlacement
             | InspectorAction::RepairReplicas
+            | InspectorAction::MakeMetadataPrimary
             | InspectorAction::PinMetadata
             | InspectorAction::UnpinMetadata
             | InspectorAction::PinContent
@@ -10650,6 +10818,7 @@ mod tests {
             policy: "replicated-eventual".to_string(),
             current_locations: vec!["node-a".to_string()],
             local_pins,
+            metadata_shard: None,
             health: None,
         }
     }
@@ -11810,6 +11979,7 @@ mod tests {
             policy: "replicated-eventual".to_string(),
             current_locations: vec!["node-a".to_string()],
             local_pins: Vec::new(),
+            metadata_shard: None,
             health: None,
         };
         assert_eq!(
@@ -11845,6 +12015,7 @@ mod tests {
             policy: "replicated-eventual".to_string(),
             current_locations: vec!["node-a".to_string()],
             local_pins: Vec::new(),
+            metadata_shard: None,
             health: None,
         };
         assert_eq!(
@@ -11915,6 +12086,7 @@ mod tests {
             policy: "replicated-eventual".to_string(),
             current_locations: vec!["node-a".to_string()],
             local_pins: Vec::new(),
+            metadata_shard: None,
             health: Some(SifsObjectHealth {
                 agent_state: "pending-repair".to_string(),
                 version_count: 2,
@@ -11986,6 +12158,7 @@ mod tests {
             policy: "replicated-eventual".to_string(),
             current_locations: vec!["node-a".to_string(), "node-b".to_string()],
             local_pins: Vec::new(),
+            metadata_shard: None,
             health: Some(SifsObjectHealth {
                 agent_state: "current".to_string(),
                 version_count: 1,
@@ -12038,6 +12211,7 @@ mod tests {
             policy: "replicated-eventual".to_string(),
             current_locations: Vec::new(),
             local_pins: Vec::new(),
+            metadata_shard: None,
             health: None,
         };
 
@@ -12153,6 +12327,7 @@ mod tests {
             policy: "replicated-eventual".to_string(),
             current_locations: vec!["node-a".to_string()],
             local_pins: Vec::new(),
+            metadata_shard: None,
             health: None,
         };
         let first = sifs_details_signature(Some(&details));
@@ -12515,6 +12690,7 @@ mod tests {
                 policy: "replicated-eventual".to_string(),
                 current_locations: vec!["node-a".to_string(), "node-b".to_string()],
                 local_pins: Vec::new(),
+                metadata_shard: None,
                 health: None,
             })),
         });
@@ -13217,6 +13393,7 @@ mod tests {
             policy: "replicated-eventual".to_string(),
             current_locations: Vec::new(),
             local_pins: Vec::new(),
+            metadata_shard: None,
             health: None,
         });
 
@@ -14813,7 +14990,17 @@ mod tests {
                 size: Some(5),
             }];
             files.selected = Some(0);
-            files.selected_details = Some(test_sifs_details(Vec::new()));
+            let mut details = test_sifs_details(Vec::new());
+            details.metadata_shard = Some(SifsMetadataShardDetails {
+                shard_id: "root".to_string(),
+                primary_node_id: "node-b".to_string(),
+                replica_node_ids: vec!["node-a".to_string(), "node-b".to_string()],
+                epoch: 7,
+                local_node_id: "node-a".to_string(),
+                local_is_primary: false,
+                local_is_replica: true,
+            });
+            files.selected_details = Some(details);
             files.worker_tx = Some(tx);
             files.worker_rx = Some(result_rx);
         }
@@ -14901,6 +15088,28 @@ mod tests {
                 assert_eq!(request_id, shared.files().tasks[0].id);
                 assert_eq!(source, FilesSourceKind::Sifs);
                 assert_eq!(operation.kind, FilesOperationKind::RepairReplicas);
+                assert_eq!(operation.path, "/services/artifact.txt");
+            }
+            FilesWorkerCommand::List { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+        }
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Make metadata primary artifact.txt")
+            .click()?;
+
+        assert_eq!(shared.files().tasks[0].title, "Make metadata primary");
+        match rx.try_recv().expect("metadata primary command") {
+            FilesWorkerCommand::Operation {
+                request_id,
+                source,
+                operation,
+            } => {
+                assert_eq!(request_id, shared.files().tasks[0].id);
+                assert_eq!(source, FilesSourceKind::Sifs);
+                assert_eq!(operation.kind, FilesOperationKind::MakeMetadataPrimary);
                 assert_eq!(operation.path, "/services/artifact.txt");
             }
             FilesWorkerCommand::List { .. } => panic!("expected operation command"),
@@ -15337,6 +15546,7 @@ mod tests {
                 policy: "replicated-eventual".to_string(),
                 current_locations: vec!["node-a".to_string(), "node-b".to_string()],
                 local_pins: Vec::new(),
+                metadata_shard: None,
                 health: None,
             });
         }
