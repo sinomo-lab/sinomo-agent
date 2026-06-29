@@ -2838,6 +2838,15 @@ fn iroh_daemon_proxy_admission_limit_releases_permits() {
         crate::roaming::IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES
             >= crate::IROH_DAEMON_COMMAND_MAX_BYTES.saturating_add(12)
     );
+    assert!(
+        crate::roaming::IROH_DAEMON_CLIENT_ENDPOINT_CLOSE_TIMEOUT >= Duration::from_secs(2),
+        "transient client endpoints need enough time to close without noisy ungraceful drops"
+    );
+    assert!(
+        crate::roaming::IROH_DAEMON_CLIENT_ENDPOINT_CLOSE_TIMEOUT
+            <= crate::roaming::IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT,
+        "endpoint close cleanup should stay bounded by normal proxy stream IO timeouts"
+    );
     let limiter = Arc::new(tokio::sync::Semaphore::new(2));
     let first =
         crate::roaming::try_acquire_iroh_proxy_permit(&limiter, 2, "test").expect("first permit");

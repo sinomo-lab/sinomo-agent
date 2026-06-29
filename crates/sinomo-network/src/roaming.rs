@@ -39,6 +39,8 @@ const IROH_DAEMON_RPC_MAX_ATTEMPTS: usize = 3;
 const IROH_DAEMON_RPC_RETRY_INITIAL: Duration = Duration::from_millis(40);
 #[cfg(any(feature = "iroh-transport", test))]
 const IROH_DAEMON_RPC_RETRY_MAX: Duration = Duration::from_millis(250);
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) const IROH_DAEMON_CLIENT_ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(feature = "iroh-transport")]
 const IROH_SECRET_KEY_LOCK_WAIT: Duration = Duration::from_secs(2);
 #[cfg(feature = "iroh-transport")]
@@ -326,6 +328,7 @@ impl IrohEndpointRecord {
 
 pub struct IrohDaemonProxyHandle {
     record: IrohEndpointRecord,
+    shutdown: Option<tokio::sync::watch::Sender<bool>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -345,12 +348,14 @@ impl IrohDaemonProxyHandle {
     }
 
     pub fn abort(&self) {
+        self.request_shutdown();
         if let Some(task) = &self.task {
             task.abort();
         }
     }
 
     pub async fn join(mut self) -> Result<(), NetworkError> {
+        self.request_shutdown();
         let Some(task) = self.task.take() else {
             return Ok(());
         };
@@ -359,13 +364,17 @@ impl IrohDaemonProxyHandle {
             detail: source.to_string(),
         })
     }
+
+    fn request_shutdown(&self) {
+        if let Some(shutdown) = &self.shutdown {
+            let _ = shutdown.send(true);
+        }
+    }
 }
 
 impl Drop for IrohDaemonProxyHandle {
     fn drop(&mut self) {
-        if let Some(task) = &self.task {
-            task.abort();
-        }
+        self.request_shutdown();
     }
 }
 
@@ -1133,6 +1142,7 @@ pub async fn start_iroh_daemon_proxy(
     daemon_address: String,
 ) -> Result<IrohDaemonProxyHandle, NetworkError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let supervisor_runtime = runtime.clone();
     let task = runtime.spawn(run_iroh_daemon_proxy_supervisor(
         supervisor_runtime,
@@ -1141,14 +1151,17 @@ pub async fn start_iroh_daemon_proxy(
         node_id,
         daemon_address,
         Some(IrohDaemonProxyReady::Async(tx)),
+        shutdown_rx,
     ));
     let record = match rx.await {
         Ok(Ok(record)) => record,
         Ok(Err(error)) => {
+            let _ = shutdown_tx.send(true);
             task.abort();
             return Err(error);
         }
         Err(source) => {
+            let _ = shutdown_tx.send(true);
             task.abort();
             return Err(NetworkError::Io {
                 operation: "start iroh daemon proxy".to_string(),
@@ -1158,6 +1171,7 @@ pub async fn start_iroh_daemon_proxy(
     };
     Ok(IrohDaemonProxyHandle {
         record,
+        shutdown: Some(shutdown_tx),
         task: Some(task),
     })
 }
@@ -1184,9 +1198,13 @@ async fn run_iroh_daemon_proxy_supervisor(
     node_id: NodeId,
     daemon_address: String,
     mut first_ready: Option<IrohDaemonProxyReady>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut restart_failures = 0_u32;
     loop {
+        if iroh_daemon_proxy_shutdown_requested(&shutdown) {
+            return;
+        }
         let secret_key =
             match load_or_create_iroh_secret_key_async(&runtime, &paths, &node_id).await {
                 Ok(secret_key) => secret_key,
@@ -1197,8 +1215,14 @@ async fn run_iroh_daemon_proxy_supervisor(
                     }
                     eprintln!("sinomo iroh daemon proxy restart failed: {error}");
                     restart_failures = restart_failures.saturating_add(1);
-                    tokio::time::sleep(iroh_daemon_proxy_restart_delay(restart_failures, &node_id))
-                        .await;
+                    if iroh_daemon_proxy_sleep_or_shutdown(
+                        &mut shutdown,
+                        iroh_daemon_proxy_restart_delay(restart_failures, &node_id),
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     continue;
                 }
             };
@@ -1211,8 +1235,12 @@ async fn run_iroh_daemon_proxy_supervisor(
             daemon_address.clone(),
             secret_key,
             first_ready.take(),
+            shutdown.clone(),
         )
         .await;
+        if iroh_daemon_proxy_shutdown_requested(&shutdown) {
+            return;
+        }
         if let Err(error) = result {
             eprintln!("sinomo iroh daemon proxy stopped: {error}");
         } else {
@@ -1223,7 +1251,33 @@ async fn run_iroh_daemon_proxy_supervisor(
         } else {
             restart_failures = restart_failures.saturating_add(1);
         }
-        tokio::time::sleep(iroh_daemon_proxy_restart_delay(restart_failures, &node_id)).await;
+        if iroh_daemon_proxy_sleep_or_shutdown(
+            &mut shutdown,
+            iroh_daemon_proxy_restart_delay(restart_failures, &node_id),
+        )
+        .await
+        {
+            return;
+        }
+    }
+}
+
+#[cfg(feature = "iroh-transport")]
+fn iroh_daemon_proxy_shutdown_requested(shutdown: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *shutdown.borrow()
+}
+
+#[cfg(feature = "iroh-transport")]
+async fn iroh_daemon_proxy_sleep_or_shutdown(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    delay: Duration,
+) -> bool {
+    if iroh_daemon_proxy_shutdown_requested(shutdown) {
+        return true;
+    }
+    tokio::select! {
+        () = tokio::time::sleep(delay) => false,
+        changed = shutdown.changed() => changed.is_err() || iroh_daemon_proxy_shutdown_requested(shutdown),
     }
 }
 
@@ -1236,6 +1290,7 @@ async fn run_iroh_daemon_proxy(
     daemon_address: String,
     secret_key: iroh::SecretKey,
     mut ready: Option<IrohDaemonProxyReady>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), NetworkError> {
     let builder = match sinomo_iroh_endpoint_builder() {
         Ok(builder) => builder,
@@ -1283,7 +1338,20 @@ async fn run_iroh_daemon_proxy(
         IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS,
     ));
     let command_byte_budget = IrohProxyByteBudget::new(IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES);
-    while let Some(connecting) = endpoint.accept().await {
+    loop {
+        let connecting = tokio::select! {
+            connecting = endpoint.accept() => connecting,
+            changed = shutdown.changed() => {
+                if changed.is_err() || iroh_daemon_proxy_shutdown_requested(&shutdown) {
+                    close_iroh_endpoint(&endpoint).await;
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        let Some(connecting) = connecting else {
+            break;
+        };
         let Some(connection_permit) = try_acquire_iroh_proxy_permit(
             &connection_limiter,
             IROH_DAEMON_PROXY_MAX_CONNECTIONS,
@@ -1425,6 +1493,7 @@ async fn run_iroh_daemon_proxy(
             }
         });
     }
+    close_iroh_endpoint(&endpoint).await;
     Ok(())
 }
 
@@ -1987,7 +2056,7 @@ fn iroh_daemon_response_frame_error(error: NetworkError) -> NetworkError {
 
 #[cfg(feature = "iroh-transport")]
 async fn close_iroh_endpoint(endpoint: &iroh::Endpoint) {
-    let _ = tokio::time::timeout(Duration::from_millis(250), endpoint.close()).await;
+    let _ = tokio::time::timeout(IROH_DAEMON_CLIENT_ENDPOINT_CLOSE_TIMEOUT, endpoint.close()).await;
 }
 
 #[cfg(feature = "iroh-transport")]
