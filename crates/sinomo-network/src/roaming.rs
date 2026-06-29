@@ -39,8 +39,6 @@ const IROH_DAEMON_RPC_MAX_ATTEMPTS: usize = 3;
 const IROH_DAEMON_RPC_RETRY_INITIAL: Duration = Duration::from_millis(40);
 #[cfg(any(feature = "iroh-transport", test))]
 const IROH_DAEMON_RPC_RETRY_MAX: Duration = Duration::from_millis(250);
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const IROH_DAEMON_CLIENT_ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(feature = "iroh-transport")]
 const IROH_SECRET_KEY_LOCK_WAIT: Duration = Duration::from_secs(2);
 #[cfg(feature = "iroh-transport")]
@@ -2069,7 +2067,7 @@ fn iroh_daemon_response_frame_error(error: NetworkError) -> NetworkError {
 
 #[cfg(feature = "iroh-transport")]
 async fn close_iroh_endpoint(endpoint: &iroh::Endpoint) {
-    let _ = tokio::time::timeout(IROH_DAEMON_CLIENT_ENDPOINT_CLOSE_TIMEOUT, endpoint.close()).await;
+    endpoint.close().await;
 }
 
 #[cfg(feature = "iroh-transport")]
