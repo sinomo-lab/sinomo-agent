@@ -5738,8 +5738,9 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         let browse_local = if source == FilesSourceKind::Sifs {
             let s = shared.clone();
             Some(
-                IconButton::new(IconGlyph::Folder, "Browse local files")
-                    .size(30.0)
+                sui::Button::new("Browse local files")
+                    .icon(IconGlyph::Folder)
+                    .min_width(156.0)
                     .theme_when(secondary_button_theme(reader))
                     .on_press(move || {
                         let waker = { s.borrow().waker.clone() };
@@ -5749,15 +5750,26 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         } else {
             None
         };
-        let mut actions = Stack::horizontal()
+        let mut primary_actions = Stack::horizontal()
             .spacing(8.0)
             .alignment(Alignment::Center)
             .with_child(retry);
         if let Some(settings) = settings {
-            actions = actions.with_child(settings);
+            primary_actions = primary_actions.with_child(settings);
         }
+        let mut action_height = 32.0;
+        let mut actions = Stack::vertical()
+            .spacing(8.0)
+            .alignment(Alignment::Center)
+            .with_child(primary_actions);
         if let Some(browse_local) = browse_local {
-            actions = actions.with_child(browse_local);
+            actions = actions.with_child(
+                SizedBox::new()
+                    .width(180.0)
+                    .height(30.0)
+                    .with_child(browse_local),
+            );
+            action_height = 70.0;
         }
         let body = centered_note(
             shared,
@@ -5766,7 +5778,8 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             source_unavailable_summary(source, &error),
         )
         .glyph(IconGlyph::Storage)
-        .action(actions);
+        .action(actions)
+        .action_height(action_height);
         return placeholder_with_task_strip(shared, body, has_tasks);
     }
     if is_empty {
@@ -7883,6 +7896,10 @@ fn sifs_loading_rows(path: &str, details_open: bool) -> Vec<(&'static str, Strin
 fn sifs_unavailable_rows(error: &str, details_open: bool) -> Vec<(&'static str, String)> {
     let mut rows = vec![
         ("Status", sifs_unavailable_summary(error).to_string()),
+        (
+            "Available",
+            "Local files, drives, UNC paths, and mounted paths still work.".to_string(),
+        ),
         (
             "Next",
             "Retry SIFS, open Connection, or browse local files".to_string(),
@@ -11319,6 +11336,11 @@ mod tests {
             *label == "Status" && value == "SIFS access needs authorization."
         }));
         assert!(collapsed.iter().any(|(label, _)| *label == "Next"));
+        assert!(
+            collapsed
+                .iter()
+                .any(|(label, value)| { *label == "Available" && value.contains("UNC paths") })
+        );
         assert!(
             collapsed
                 .iter()

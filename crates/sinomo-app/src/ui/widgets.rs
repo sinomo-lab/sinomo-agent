@@ -154,6 +154,7 @@ pub struct Placeholder {
     title: String,
     subtitle: String,
     action: Option<WidgetPod>,
+    action_height: f32,
 }
 
 impl Placeholder {
@@ -170,6 +171,7 @@ impl Placeholder {
             title: title.into(),
             subtitle: subtitle.into(),
             action: None,
+            action_height: 32.0,
         }
     }
 
@@ -187,13 +189,22 @@ impl Placeholder {
         self.action = Some(WidgetPod::new(action));
         self
     }
+
+    /// Override the compact action slot height for multi-row recovery actions.
+    pub fn action_height(mut self, height: f32) -> Self {
+        self.action_height = height.max(32.0);
+        self
+    }
 }
 
 impl Widget for Placeholder {
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         if let Some(action) = &mut self.action {
             let action_width = 360.0_f32.min((constraints.max.width - 32.0).max(0.0));
-            action.measure(ctx, Constraints::tight(Size::new(action_width, 32.0)));
+            action.measure(
+                ctx,
+                Constraints::tight(Size::new(action_width, self.action_height)),
+            );
         }
         constraints.max
     }
@@ -203,7 +214,10 @@ impl Widget for Placeholder {
             let w = 360.0_f32.min((bounds.width() - 32.0).max(0.0));
             let cx = bounds.x() + bounds.width() / 2.0;
             let cy = bounds.y() + bounds.height() / 2.0 - 18.0;
-            action.arrange(ctx, Rect::new(cx - w / 2.0, cy + 54.0, w, 32.0));
+            action.arrange(
+                ctx,
+                Rect::new(cx - w / 2.0, cy + 54.0, w, self.action_height),
+            );
         }
     }
 
