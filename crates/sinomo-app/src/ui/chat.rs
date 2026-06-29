@@ -3745,6 +3745,10 @@ fn empty_sessions_copy(
     }
 }
 
+fn loading_sessions_copy() -> (&'static str, &'static str) {
+    ("Loading SIFS chats...", "SIFS chat/channel history")
+}
+
 fn plural_agents(count: usize) -> String {
     if count == 1 {
         "1 agent".to_string()
@@ -3860,8 +3864,10 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         })
         .collect::<Vec<_>>();
     if loading && sessions.is_empty() {
+        let (label, detail) = loading_sessions_copy();
         items.push(
-            ListItem::new("Loading chats...")
+            ListItem::new(label)
+                .detail(detail)
                 .leading_text("...")
                 .disabled(),
         );
@@ -8724,6 +8730,10 @@ mod tests {
     fn chat_session_counts_distinguish_empty_loading_from_empty_loaded() {
         let (_backend, mut state) = isolated_chat_state("chat-list-loading-label");
 
+        assert_eq!(
+            loading_sessions_copy(),
+            ("Loading SIFS chats...", "SIFS chat/channel history")
+        );
         state.session_list_loading = true;
         assert_eq!(chats_heading_text(&state), "CONVERSATIONS · loading");
         assert_eq!(
@@ -8758,6 +8768,37 @@ mod tests {
             session_kind_filter_count_label(&state.sessions, SessionKindFilter::All, true),
             "1"
         );
+    }
+
+    #[test]
+    fn rendered_empty_loading_sidebar_explains_sifs_storage() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            chat.sessions.clear();
+            chat.session_list_loading = true;
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat sessions loading")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::ListItem)
+            .with_name("Loading SIFS chats...")
+            .with_description("SIFS chat/channel history")
+            .expect()
+            .to_be_visible()?;
+
+        Ok(())
     }
 
     #[test]
