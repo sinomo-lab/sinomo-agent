@@ -231,7 +231,8 @@ impl Widget for ClusterView {
                     let cluster = self.shared.cluster();
                     (
                         cluster.selected.is_none(),
-                        cluster.selected.is_none() && !cluster.snapshot.warnings.is_empty(),
+                        cluster.selected.is_none()
+                            && cluster_actionable_warning(&cluster.snapshot).is_some(),
                     )
                 };
                 if overview_refresh_action
@@ -385,7 +386,8 @@ impl Widget for ClusterView {
             let cluster = self.shared.cluster();
             let selected = cluster.selected.clone();
             (
-                cluster.selected.is_none() && !cluster.snapshot.warnings.is_empty(),
+                cluster.selected.is_none()
+                    && cluster_actionable_warning(&cluster.snapshot).is_some(),
                 overview_detail_toggle_visible(&cluster.snapshot, cluster.selected.as_ref()),
                 cluster.diagnostics_open,
                 selected.clone(),
@@ -826,7 +828,7 @@ fn paint_detail_panel(
     let lines = selection
         .map(|selection| detail_lines(snapshot, topology, selection, diagnostics_open))
         .unwrap_or_else(|| overview_lines(snapshot, topology, diagnostics_open));
-    let show_warning_action = selection.is_none() && !snapshot.warnings.is_empty();
+    let show_warning_action = selection.is_none() && cluster_actionable_warning(snapshot).is_some();
     let show_overview_details = overview_detail_toggle_visible(snapshot, selection);
     let selected_warning_action = selected_node_needs_connection_settings(snapshot, selection);
     let title_style = pal.text_style(theme, 15.0, FontWeight::SEMIBOLD, pal.text);
@@ -974,7 +976,7 @@ fn overview_lines(
         format!("topology: {direct_edges} edges"),
         format!("LAN: {} segments", topology.lan_segments.len()),
     ];
-    let warning = snapshot.warnings.first();
+    let warning = cluster_actionable_warning(snapshot);
     if let Some(warning) = warning {
         lines.push(format!(
             "attention: {}",
@@ -982,7 +984,7 @@ fn overview_lines(
         ));
     }
     if diagnostics_open {
-        if let Some(warning) = warning {
+        if let Some(warning) = snapshot.warnings.first() {
             lines.push(format!("warning detail: {}", short(warning, 42)));
         }
         lines.push(format!("diagnostics: {}", snapshot.source));
@@ -1101,6 +1103,27 @@ fn cluster_attention_summary(snapshot: &ClusterSnapshot, warning: &str) -> Strin
         );
     }
     cluster_warning_summary(warning).to_string()
+}
+
+fn cluster_actionable_warning(snapshot: &ClusterSnapshot) -> Option<&str> {
+    let warning = snapshot.warnings.first()?.as_str();
+    let counts = availability_counts(snapshot);
+    if counts.offline > 0 || counts.unknown > 0 {
+        return Some(warning);
+    }
+    if counts.total > 0
+        && counts.online == counts.total
+        && cluster_warning_is_direct_probe_fallback(warning)
+    {
+        return None;
+    }
+    Some(warning)
+}
+
+fn cluster_warning_is_direct_probe_fallback(warning: &str) -> bool {
+    let lower = warning.to_ascii_lowercase();
+    lower.contains("daemon health aggregation unavailable")
+        && lower.contains("showing direct cluster probes")
 }
 
 fn node_plural(count: usize, state: &str) -> String {
@@ -2073,6 +2096,39 @@ mod tests {
             open.iter()
                 .any(|line| line
                     .starts_with("warning detail: daemon health aggregation unavailable"))
+        );
+    }
+
+    #[test]
+    fn overview_direct_probe_fallback_is_diagnostic_only_when_all_nodes_online() {
+        let snapshot = ClusterSnapshot {
+            source: "daemon 127.0.0.1:21353".to_string(),
+            nodes: vec![node("node-a"), node("node-b"), node("node-c")],
+            warnings: vec![
+                "daemon health aggregation unavailable: rpc failed; showing direct cluster probes"
+                    .to_string(),
+            ],
+            ..ClusterSnapshot::default()
+        };
+        let topology = build_topology(&snapshot);
+
+        let closed = overview_lines(&snapshot, &topology, false);
+        assert!(closed.iter().any(|line| line == "health: 3 / 3 online"));
+        assert!(
+            !closed.iter().any(|line| line.starts_with("attention:")),
+            "direct probe fallback should not surface as attention when every node is online"
+        );
+        assert!(
+            cluster_actionable_warning(&snapshot).is_none(),
+            "all-online direct-probe fallback should stay diagnostics-only"
+        );
+
+        let open = overview_lines(&snapshot, &topology, true);
+        assert!(
+            open.iter()
+                .any(|line| line
+                    .starts_with("warning detail: daemon health aggregation unavailable")),
+            "technical fallback detail should remain available behind diagnostics"
         );
     }
 
