@@ -1738,6 +1738,12 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
     if clustered {
         body = body.with_child(value_row(shared, reader, "Cluster", cluster_summary));
 
+        body = body.with_child(
+            FormRow::new("Health", cluster_dashboard_button(shared, reader))
+                .inline()
+                .theme_when(clone_reader(reader)),
+        );
+
         let generate = {
             let s = shared.clone();
             sui::Button::new("Generate invitation")
@@ -1851,6 +1857,12 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             .with_child(value_row(shared, reader, "State", "running locally"))
             .with_child(value_row(shared, reader, "Nodes", "this device only"));
 
+        body = body.with_child(
+            FormRow::new("Health", cluster_dashboard_button(shared, reader))
+                .inline()
+                .theme_when(clone_reader(reader)),
+        );
+
         let join_on_change = {
             let s = shared.clone();
             move |value: String| {
@@ -1906,6 +1918,14 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
     }
 
     FormSection::new("Cluster", body).theme_when(clone_reader(reader))
+}
+
+fn cluster_dashboard_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    sui::Button::new("Open Cluster dashboard")
+        .icon(sui::IconGlyph::Storage)
+        .theme_when(secondary_button_theme(reader))
+        .on_press(move || open_tab(&s, Tab::Cluster))
 }
 
 fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -4737,6 +4757,39 @@ mod tests {
             .with_name("Cancel")
             .click()?;
         assert!(!shared.settings().leave_confirming);
+
+        Ok(())
+    }
+
+    #[test]
+    fn cluster_settings_open_dashboard_action_switches_to_cluster_tab() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            settings.open(SettingsSection::Cluster);
+            settings.clustered = true;
+            settings.cluster_summary = Some("cluster test · voter".to_string());
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Cluster settings dashboard action")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open Cluster dashboard")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Cluster);
 
         Ok(())
     }
