@@ -4342,6 +4342,18 @@ mod tests {
             "SIFS file access needs recovery."
         );
 
+        {
+            let mut files = shared.files_mut();
+            files.error = None;
+            files.details_error = Some("selected object metadata failed".to_string());
+        }
+        let issues = connection_issues(&shared);
+        assert_eq!(issues.len(), 2);
+        assert_eq!(
+            issues[1].detail,
+            "SIFS metadata unavailable: selected object metadata failed"
+        );
+
         shared.chat_mut().notice = None;
         shared.chat_mut().activity.push(ChatActivityEntry {
             title: "agent error".to_string(),

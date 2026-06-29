@@ -460,6 +460,15 @@ impl FilesState {
         if let Some(error) = self.error.as_deref().filter(|text| !text.is_empty()) {
             return Some(format!("SIFS unavailable: {error}"));
         }
+        if self.source == FilesSourceKind::Sifs {
+            if let Some(error) = self
+                .details_error
+                .as_deref()
+                .filter(|text| !text.is_empty())
+            {
+                return Some(format!("SIFS metadata unavailable: {error}"));
+            }
+        }
         self.tasks
             .iter()
             .find(|task| {
@@ -4540,16 +4549,65 @@ fn sifs_replication_summary(details: Option<&SifsObjectDetails>, clustered: bool
         return "local placement policy".to_string();
     }
     if details.policy.starts_with("replicated") {
+        if let Some(health) = details.health.as_ref() {
+            let repair_count = sifs_repair_backlog_count(health);
+            if health.open_conflict_count > 0 {
+                return format!(
+                    "replicated; {}, {} open",
+                    sifs_replica_coverage_label(details),
+                    plural(health.open_conflict_count, "conflict")
+                );
+            }
+            if repair_count > 0 {
+                return format!(
+                    "replicated; {}, {} pending",
+                    sifs_replica_coverage_label(details),
+                    plural(repair_count, "repair")
+                );
+            }
+            return match count {
+                0 => "replication pending; no durable replica receipt yet".to_string(),
+                _ => format!(
+                    "replicated; {} current",
+                    sifs_replica_coverage_label(details)
+                ),
+            };
+        }
         return match count {
             0 => "replication pending; no durable location recorded".to_string(),
-            1 => "one durable location recorded; replica repair may still be pending".to_string(),
-            count => format!("{count} durable locations recorded"),
+            1 => "one durable location recorded; repair status not loaded".to_string(),
+            count => format!("{count} durable locations recorded; repair status not loaded"),
         };
     }
     if count == 0 {
         format!("{}; no durable location recorded", details.policy)
     } else {
         format!("{}; {} location(s) recorded", details.policy, count)
+    }
+}
+
+fn sifs_repair_backlog_count(health: &SifsObjectHealth) -> usize {
+    health
+        .pending_repair_count
+        .max(health.missing_replica_nodes.len())
+}
+
+fn sifs_replica_desired_count(details: &SifsObjectDetails) -> usize {
+    let current = details.current_locations.len();
+    details
+        .health
+        .as_ref()
+        .map(|health| current + sifs_repair_backlog_count(health))
+        .unwrap_or(current)
+}
+
+fn sifs_replica_coverage_label(details: &SifsObjectDetails) -> String {
+    let current = details.current_locations.len();
+    let desired = sifs_replica_desired_count(details);
+    if desired > current {
+        format!("{current}/{desired} durable nodes")
+    } else {
+        plural(current, "durable node")
     }
 }
 
@@ -4564,11 +4622,21 @@ fn sifs_health_summary(details: Option<&SifsObjectDetails>) -> String {
             plural(health.open_conflict_count, "conflict")
         );
     }
-    if health.pending_repair_count > 0 {
+    let repair_count = sifs_repair_backlog_count(health);
+    if repair_count > 0 {
+        let missing = sifs_missing_replica_summary(health);
+        if missing != "none" {
+            return format!(
+                "{}; {} pending for {}",
+                health.agent_state,
+                plural(repair_count, "repair"),
+                missing
+            );
+        }
         return format!(
-            "{}; {}",
+            "{}; {} pending",
             health.agent_state,
-            plural(health.pending_repair_count, "missing replica")
+            plural(repair_count, "repair")
         );
     }
     if health.intent_count > 0 && health.agent_state == "pending-write" {
@@ -4578,6 +4646,10 @@ fn sifs_health_summary(details: Option<&SifsObjectDetails>) -> String {
         );
     }
     format!("{}; no repair backlog", health.agent_state)
+}
+
+fn sifs_agent_state_is_current(state: &str) -> bool {
+    state == "current" || state == "healthy"
 }
 
 fn sifs_compact_placement_summary(
@@ -4603,11 +4675,19 @@ fn sifs_compact_placement_summary(
     let placement = match details.policy.as_str() {
         "local-owned" => "local".to_string(),
         "ephemeral-local" => "ephemeral".to_string(),
-        _ => match details.current_locations.len() {
-            0 => "no durable nodes".to_string(),
-            1 => "1 node".to_string(),
-            count => format!("{count} nodes"),
-        },
+        _ => {
+            let current = details.current_locations.len();
+            let desired = sifs_replica_desired_count(details);
+            if desired > current {
+                format!("{current}/{desired} nodes")
+            } else {
+                match current {
+                    0 => "no durable nodes".to_string(),
+                    1 => "1 node".to_string(),
+                    count => format!("{count} nodes"),
+                }
+            }
+        }
     };
     let health = details
         .health
@@ -4615,9 +4695,9 @@ fn sifs_compact_placement_summary(
         .map(|health| {
             if health.open_conflict_count > 0 {
                 plural(health.open_conflict_count, "conflict")
-            } else if health.pending_repair_count > 0 {
-                plural(health.pending_repair_count, "missing replica")
-            } else if health.agent_state == "healthy" {
+            } else if sifs_repair_backlog_count(health) > 0 {
+                plural(sifs_repair_backlog_count(health), "repair")
+            } else if sifs_agent_state_is_current(&health.agent_state) {
                 "healthy".to_string()
             } else {
                 health.agent_state.clone()
@@ -4676,12 +4756,18 @@ fn sifs_placement_next_step(details: Option<&SifsObjectDetails>, clustered: bool
         return "copy into durable SIFS storage before relying on this object".to_string();
     }
     if details.policy.starts_with("replicated") {
-        if details
-            .health
-            .as_ref()
-            .is_some_and(|health| health.pending_repair_count > 0)
-        {
-            return "repair replicas, then refresh placement".to_string();
+        if let Some(health) = details.health.as_ref() {
+            if health.open_conflict_count > 0 {
+                return "resolve SIFS conflicts before changing placement".to_string();
+            }
+            if sifs_repair_backlog_count(health) > 0 {
+                return "repair replicas, then refresh placement".to_string();
+            }
+            if sifs_agent_state_is_current(&health.agent_state)
+                && details.current_locations.len() > 1
+            {
+                return "placement is healthy; use details for object and version ids".to_string();
+            }
         }
         return match details.current_locations.len() {
             0 => "refresh metadata; no durable replica receipt is recorded yet".to_string(),
@@ -11599,12 +11685,41 @@ mod tests {
         };
         assert_eq!(
             sifs_replication_summary(Some(&details), true),
-            "one durable location recorded; replica repair may still be pending"
+            "one durable location recorded; repair status not loaded"
         );
         details.current_locations.push("node-b".to_string());
         assert_eq!(
             sifs_replication_summary(Some(&details), true),
-            "2 durable locations recorded"
+            "2 durable locations recorded; repair status not loaded"
+        );
+        details.health = Some(SifsObjectHealth {
+            agent_state: "pending-repair".to_string(),
+            version_count: 2,
+            receipt_count: 1,
+            intent_count: 1,
+            open_conflict_count: 0,
+            pending_repair_count: 1,
+            missing_replica_nodes: vec!["node-c".to_string()],
+        });
+        assert_eq!(
+            sifs_replication_summary(Some(&details), true),
+            "replicated; 2/3 durable nodes, 1 repair pending"
+        );
+        details.health.as_mut().unwrap().pending_repair_count = 0;
+        details
+            .health
+            .as_mut()
+            .unwrap()
+            .missing_replica_nodes
+            .clear();
+        assert_eq!(
+            sifs_replication_summary(Some(&details), true),
+            "replicated; 2 durable nodes current"
+        );
+        details.health.as_mut().unwrap().open_conflict_count = 1;
+        assert_eq!(
+            sifs_replication_summary(Some(&details), true),
+            "replicated; 2 durable nodes, 1 conflict open"
         );
         details.policy = "local-owned".to_string();
         assert_eq!(
@@ -11649,7 +11764,7 @@ mod tests {
 
         assert_eq!(
             sifs_health_summary(Some(&details)),
-            "pending-repair; 1 missing replica"
+            "pending-repair; 1 repair pending for …e-b-long-identifier"
         );
         assert_eq!(
             sifs_placement_next_step(Some(&details), true),
@@ -11708,7 +11823,7 @@ mod tests {
             current_locations: vec!["node-a".to_string(), "node-b".to_string()],
             local_pins: Vec::new(),
             health: Some(SifsObjectHealth {
-                agent_state: "healthy".to_string(),
+                agent_state: "current".to_string(),
                 version_count: 1,
                 receipt_count: 2,
                 intent_count: 0,
@@ -11725,7 +11840,7 @@ mod tests {
         details.health.as_mut().unwrap().pending_repair_count = 1;
         assert_eq!(
             sifs_compact_placement_summary(Some(&details), true, false, None),
-            "2 nodes · 1 missing replica"
+            "2/3 nodes · 1 repair"
         );
     }
 
@@ -11775,6 +11890,24 @@ mod tests {
         assert_eq!(
             sifs_placement_next_step(Some(&details), true),
             "replica locations are visible; use details for object and version ids"
+        );
+        details.health = Some(SifsObjectHealth {
+            agent_state: "current".to_string(),
+            version_count: 1,
+            receipt_count: 2,
+            intent_count: 0,
+            open_conflict_count: 0,
+            pending_repair_count: 0,
+            missing_replica_nodes: Vec::new(),
+        });
+        assert_eq!(
+            sifs_placement_next_step(Some(&details), true),
+            "placement is healthy; use details for object and version ids"
+        );
+        details.health.as_mut().unwrap().open_conflict_count = 1;
+        assert_eq!(
+            sifs_placement_next_step(Some(&details), true),
+            "resolve SIFS conflicts before changing placement"
         );
         details.policy = "local-owned".to_string();
         assert_eq!(
@@ -12091,6 +12224,12 @@ mod tests {
         assert_eq!(
             state.connection_attention_detail(),
             Some("Refresh placement failed: device authorization was denied".to_string())
+        );
+
+        state.details_error = Some("selected object metadata failed".to_string());
+        assert_eq!(
+            state.connection_attention_detail(),
+            Some("SIFS metadata unavailable: selected object metadata failed".to_string())
         );
 
         state.error = Some("daemon connection refused".to_string());
