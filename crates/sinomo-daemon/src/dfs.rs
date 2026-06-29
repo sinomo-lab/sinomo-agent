@@ -99,8 +99,15 @@ pub(crate) struct DaemonDfsPendingMaintenanceWork {
 }
 
 impl DaemonDfsPendingMaintenanceWork {
+    #[cfg(test)]
     pub(crate) fn has_work(self) -> bool {
         self.pending_repair_count > 0 || self.pending_namespace_job_count > 0
+    }
+
+    pub(crate) fn should_trigger_background_maintenance(self) -> bool {
+        // Pending repairs can represent unreachable replicas and are expensive to
+        // rescan. Namespace jobs are local durable work and should keep waking.
+        self.pending_namespace_job_count > 0
     }
 }
 
@@ -1481,6 +1488,7 @@ mod tests {
         assert_eq!(pending.pending_namespace_job_count, 1);
         assert_eq!(pending.pending_repair_count, 0);
         assert!(pending.has_work());
+        assert!(pending.should_trigger_background_maintenance());
 
         let runtime = daemon_test_runtime("daemon-dfs-maintenance-namespace-jobs");
         runtime
@@ -1519,6 +1527,17 @@ mod tests {
             b"daemon namespace job"
         );
         assert!(service.posix_read_file(&old_file).is_err());
+    }
+
+    #[test]
+    fn daemon_dfs_pending_repair_backlog_does_not_force_triggered_loop() {
+        let pending = DaemonDfsPendingMaintenanceWork {
+            pending_repair_count: 8,
+            pending_namespace_job_count: 0,
+        };
+
+        assert!(pending.has_work());
+        assert!(!pending.should_trigger_background_maintenance());
     }
 
     #[test]

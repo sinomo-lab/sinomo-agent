@@ -41,8 +41,8 @@ use time::OffsetDateTime;
 
 pub const DAEMON_COMMAND_MAX_BYTES: usize = sinomo_network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES;
 pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
-pub const DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
-pub const DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(5);
+pub const DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+pub const DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 pub const DAEMON_ROLLOUT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(60);
 pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
     DAEMON_CLUSTER_PUBLISH_INTERVAL;
@@ -451,7 +451,7 @@ async fn run_daemon_background_maintenance_loop(
             })
             .await
             {
-                Ok(Ok(work)) if work.has_work() => {
+                Ok(Ok(work)) if work.should_trigger_background_maintenance() => {
                     dfs_triggered_maintenance_requested = true;
                 }
                 Ok(Ok(_)) => {}
@@ -482,7 +482,8 @@ async fn run_daemon_background_maintenance_loop(
                     .await
                     {
                         Ok(Ok(work)) => {
-                            dfs_triggered_maintenance_requested = work.has_work();
+                            dfs_triggered_maintenance_requested =
+                                work.should_trigger_background_maintenance();
                         }
                         Ok(Err(error)) => {
                             dfs_triggered_maintenance_requested = false;
@@ -5021,7 +5022,7 @@ mod tests {
                 None,
             ),
             Duration::from_secs(3),
-            "pending DFS repair or namespace work should wake before the fixed five-minute tick"
+            "triggered DFS namespace work should wake before the fixed five-minute tick"
         );
         let almost_due_dfs = now
             .checked_sub(DAEMON_DFS_MAINTENANCE_INTERVAL - Duration::from_secs(1))
