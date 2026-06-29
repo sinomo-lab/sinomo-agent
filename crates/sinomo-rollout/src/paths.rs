@@ -45,12 +45,7 @@ impl SelfRolloutPaths {
 
     pub fn plan(&self) -> SelfRolloutPlan {
         let native_dylib_modules = default_native_dylib_module_builds(&self.source_repo);
-        let mut build_args = vec![
-            "build".to_string(),
-            "--locked".to_string(),
-            "-p".to_string(),
-            "sinomo".to_string(),
-        ];
+        let mut build_args = vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
         append_native_dylib_module_build_args(&mut build_args, &native_dylib_modules);
         SelfRolloutPlan {
             build_program: "cargo".to_string(),
@@ -533,12 +528,8 @@ mod tests {
         let paths = SelfRolloutPaths::new(Path::new("/tmp/sinomo-data"));
         let plan = paths.plan();
         let expected_modules = default_native_dylib_module_builds(&paths.source_repo);
-        let mut expected_build_args = vec![
-            "build".to_string(),
-            "--locked".to_string(),
-            "-p".to_string(),
-            "sinomo".to_string(),
-        ];
+        let mut expected_build_args =
+            vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
         append_native_dylib_module_build_args(&mut expected_build_args, &expected_modules);
 
         assert_eq!(plan.build_program, "cargo");

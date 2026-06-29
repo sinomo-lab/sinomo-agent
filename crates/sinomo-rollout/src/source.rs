@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const ROLLOUT_BUILD_EXCLUDED_WORKSPACE_MEMBER: &str = "crates/sinomo-app";
 const MANAGED_SIBLING_SOURCE_REPOS: &[&str] = &["sui"];
+const ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV: &str = "SINOMO_ROLLOUT_BUILD_COMMIT_OVERRIDE";
 
 #[cfg(windows)]
 fn rollout_child_command(program: &str) -> Command {
@@ -130,10 +131,8 @@ pub fn rollout_build_dev_artifacts(
 ) -> Result<RolloutBuiltArtifacts, RolloutError> {
     let modules = discover_default_native_dylib_module_builds(repo)?;
     let build_args = rollout_build_args(&modules);
-    let _workspace_manifest = prepare_rollout_build_workspace_manifest(repo)?;
-    let build = rollout_child_command("cargo")
-        .args(&build_args)
-        .current_dir(repo)
+    let _source_guards = prepare_rollout_build_source(repo)?;
+    let build = rollout_cargo_build_command(repo, &build_args)?
         .output()
         .map_err(|source| RolloutError::Io {
             path: format!("cargo {}", build_args.join(" ")),
@@ -186,10 +185,8 @@ fn rollout_build_dev_native_dylib_modules(
 ) -> Result<Vec<LocalRolloutNativeDylibModuleArtifact>, RolloutError> {
     let modules = discover_default_native_dylib_module_builds(repo)?;
     let build_args = rollout_module_build_args(&modules);
-    let _workspace_manifest = prepare_rollout_build_workspace_manifest(repo)?;
-    let build = rollout_child_command("cargo")
-        .args(&build_args)
-        .current_dir(repo)
+    let _source_guards = prepare_rollout_build_source(repo)?;
+    let build = rollout_cargo_build_command(repo, &build_args)?
         .output()
         .map_err(|source| RolloutError::Io {
             path: format!("cargo {}", build_args.join(" ")),
@@ -254,10 +251,8 @@ pub fn rollout_build_dev_native_dylib_module(
         }
     };
     let build_args = rollout_single_module_build_args(&module);
-    let _workspace_manifest = prepare_rollout_build_workspace_manifest(repo)?;
-    let build = rollout_child_command("cargo")
-        .args(&build_args)
-        .current_dir(repo)
+    let _source_guards = prepare_rollout_build_source(repo)?;
+    let build = rollout_cargo_build_command(repo, &build_args)?
         .output()
         .map_err(|source| RolloutError::Io {
             path: format!("cargo {}", build_args.join(" ")),
@@ -287,18 +282,13 @@ pub fn rollout_build_dev_native_dylib_module(
 }
 
 fn rollout_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> Vec<String> {
-    let mut args = vec![
-        "build".to_string(),
-        "--locked".to_string(),
-        "-p".to_string(),
-        "sinomo".to_string(),
-    ];
+    let mut args = vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
     append_native_dylib_module_build_args(&mut args, modules);
     args
 }
 
 fn rollout_module_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> Vec<String> {
-    let mut args = vec!["build".to_string(), "--locked".to_string()];
+    let mut args = vec!["build".to_string()];
     append_native_dylib_module_build_args(&mut args, modules);
     args
 }
@@ -306,7 +296,6 @@ fn rollout_module_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> V
 fn rollout_single_module_build_args(module: &SelfRolloutNativeDylibModuleBuild) -> Vec<String> {
     let mut args = vec![
         "build".to_string(),
-        "--locked".to_string(),
         "-p".to_string(),
         module.package.clone(),
     ];
@@ -335,6 +324,37 @@ fn ensure_artifact_exists(path: &Path) -> Result<(), RolloutError> {
             artifact: path.display().to_string(),
         })
     }
+}
+
+fn rollout_build_commit_override(repo: &Path) -> Result<String, RolloutError> {
+    git_one_line(repo, &["rev-parse", "--short=12", "HEAD"])
+}
+
+fn rollout_cargo_build_command(
+    repo: &Path,
+    build_args: &[String],
+) -> Result<Command, RolloutError> {
+    let commit = rollout_build_commit_override(repo)?;
+    let mut command = rollout_child_command("cargo");
+    command
+        .args(build_args)
+        .current_dir(repo)
+        .env(ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV, commit);
+    Ok(command)
+}
+
+struct RolloutBuildSourceGuards {
+    _workspace_manifest: RolloutBuildWorkspaceManifest,
+    _lockfile: RolloutBuildLockfileGuard,
+}
+
+fn prepare_rollout_build_source(repo: &Path) -> Result<RolloutBuildSourceGuards, RolloutError> {
+    let lockfile = RolloutBuildLockfileGuard::capture(repo)?;
+    let workspace_manifest = prepare_rollout_build_workspace_manifest(repo)?;
+    Ok(RolloutBuildSourceGuards {
+        _workspace_manifest: workspace_manifest,
+        _lockfile: lockfile,
+    })
 }
 
 struct RolloutBuildWorkspaceManifest {
@@ -379,6 +399,43 @@ fn prepare_rollout_build_workspace_manifest(
         path,
         original: Some(original),
     })
+}
+
+struct RolloutBuildLockfileGuard {
+    path: PathBuf,
+    original: Option<Vec<u8>>,
+}
+
+impl RolloutBuildLockfileGuard {
+    fn capture(repo: &Path) -> Result<Self, RolloutError> {
+        let path = repo.join("Cargo.lock");
+        let original = match fs::read(&path) {
+            Ok(original) => Some(original),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(RolloutError::Io {
+                    path: path.display().to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        };
+        Ok(Self { path, original })
+    }
+}
+
+impl Drop for RolloutBuildLockfileGuard {
+    fn drop(&mut self) {
+        match self.original.take() {
+            Some(original) => {
+                let _ = fs::write(&self.path, original);
+            }
+            None => match fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            },
+        }
+    }
 }
 
 fn rollout_build_sibling_gui_dependencies_available(repo: &Path) -> bool {
@@ -1235,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn rollout_build_args_use_locked_source() {
+    fn rollout_build_args_use_source_packages() {
         let module = SelfRolloutNativeDylibModuleBuild {
             package: "sinomo-test-module".to_string(),
             features: vec!["sinomo-test-module/test-feature".to_string()],
@@ -1251,7 +1308,6 @@ mod tests {
             rollout_build_args(std::slice::from_ref(&module)),
             vec![
                 "build",
-                "--locked",
                 "-p",
                 "sinomo",
                 "-p",
@@ -1264,7 +1320,6 @@ mod tests {
             rollout_module_build_args(std::slice::from_ref(&module)),
             vec![
                 "build",
-                "--locked",
                 "-p",
                 "sinomo-test-module",
                 "--features",
@@ -1275,7 +1330,6 @@ mod tests {
             rollout_single_module_build_args(&module),
             vec![
                 "build",
-                "--locked",
                 "-p",
                 "sinomo-test-module",
                 "--features",
@@ -1392,6 +1446,21 @@ default-members = [
         }
 
         assert_eq!(fs::read_to_string(&manifest).expect("restored"), original);
+    }
+
+    #[test]
+    fn rollout_build_lockfile_guard_restores_original_lockfile() {
+        let root = unique_temp("sinomo-rollout-build-lockfile");
+        let lockfile = root.join("Cargo.lock");
+        let original = b"# original lockfile\n";
+        fs::write(&lockfile, original).expect("lockfile");
+
+        {
+            let _guard = RolloutBuildLockfileGuard::capture(&root).expect("guard");
+            fs::write(&lockfile, b"# changed lockfile\n").expect("changed lockfile");
+        }
+
+        assert_eq!(fs::read(&lockfile).expect("restored"), original);
     }
 
     #[test]

@@ -4,10 +4,19 @@
 //! hash is what distinguishes one build from another in `sinomo cluster health`.
 //! Falls back to "unknown" when git is unavailable or the source is not a repo.
 
+use std::env;
 use std::process::Command;
 
+const ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV: &str = "SINOMO_ROLLOUT_BUILD_COMMIT_OVERRIDE";
+
 fn main() {
-    let commit = git_commit().unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rerun-if-env-changed={ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV}");
+    let commit = env::var(ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(git_commit)
+        .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=SINOMO_GIT_COMMIT={commit}");
 
     // Rebuild when HEAD moves so the embedded commit stays current.
