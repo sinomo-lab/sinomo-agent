@@ -55,6 +55,7 @@ const SHADOW_MAIN_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHADOW_MAIN_RESTART_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
 const SHADOW_RUNTIME_TASK_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 const SHADOW_RUNTIME_TASK_DRAIN_GRACE: Duration = Duration::from_millis(100);
+const SHADOW_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[allow(clippy::too_many_arguments)]
 fn write_cluster_rollout_progress(
@@ -581,6 +582,11 @@ fn drain_shadow_runtime_after_task_shutdown(runtime: &tokio::runtime::Runtime) {
     });
 }
 
+fn shutdown_shadow_runtime_after_task_shutdown(runtime: tokio::runtime::Runtime) {
+    drain_shadow_runtime_after_task_shutdown(&runtime);
+    runtime.shutdown_timeout(SHADOW_RUNTIME_SHUTDOWN_TIMEOUT);
+}
+
 pub fn run_shadow_daemon_supervision_loop(
     options: crate::DaemonRunOptions,
     shadow_paths: DaemonPaths,
@@ -728,7 +734,7 @@ pub fn run_shadow_daemon_supervision_loop(
                 for (label, task) in shadow_runtime_tasks {
                     join_shadow_runtime_task(&daemon_runtime, label, task, false);
                 }
-                drain_shadow_runtime_after_task_shutdown(&daemon_runtime);
+                shutdown_shadow_runtime_after_task_shutdown(daemon_runtime);
                 return Err(error);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -743,7 +749,7 @@ pub fn run_shadow_daemon_supervision_loop(
                 for (label, task) in shadow_runtime_tasks {
                     join_shadow_runtime_task(&daemon_runtime, label, task, false);
                 }
-                drain_shadow_runtime_after_task_shutdown(&daemon_runtime);
+                shutdown_shadow_runtime_after_task_shutdown(daemon_runtime);
                 return Err(DaemonError::Network {
                     address: bind_address.clone(),
                     detail: "shadow daemon control accept loop stopped before reporting shutdown"
@@ -1095,7 +1101,7 @@ pub fn run_shadow_daemon_supervision_loop(
     for (label, task) in shadow_runtime_tasks {
         join_shadow_runtime_task(&daemon_runtime, label, task, false);
     }
-    drain_shadow_runtime_after_task_shutdown(&daemon_runtime);
+    shutdown_shadow_runtime_after_task_shutdown(daemon_runtime);
 
     // Compatibility for old pending re-exec requests. New rollouts are finalized
     // by the main daemon from the stable installed shadow path.
