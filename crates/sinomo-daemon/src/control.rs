@@ -46,6 +46,7 @@ pub const DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL: Duration = Duration::fr
 pub const DAEMON_ROLLOUT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(60);
 pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
     DAEMON_CLUSTER_PUBLISH_INTERVAL;
+pub const DAEMON_NETWORK_ENVIRONMENT_WATCH_ENV: &str = "SINOMO_DAEMON_NETWORK_ENVIRONMENT_WATCH";
 pub(crate) const ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE: Duration = Duration::from_millis(200);
 const DAEMON_SANDBOX_STREAM_CHANNEL_CAPACITY: usize = 64;
 const DAEMON_DFS_MESSAGE_REPLAY_RETENTION: Duration = Duration::from_secs(120);
@@ -116,7 +117,30 @@ pub(crate) fn request_daemon_cluster_maintenance_refresh() {
     daemon_cluster_maintenance_notify().notify_one();
 }
 
+fn daemon_network_environment_watch_enabled() -> bool {
+    daemon_network_environment_watch_enabled_for(
+        std::env::var(DAEMON_NETWORK_ENVIRONMENT_WATCH_ENV)
+            .ok()
+            .as_deref(),
+        cfg!(target_os = "linux"),
+    )
+}
+
+fn daemon_network_environment_watch_enabled_for(value: Option<&str>, is_linux: bool) -> bool {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        Some(_) | None => !is_linux,
+    }
+}
+
 async fn start_daemon_network_environment_watch(label: &str) -> Option<Arc<tokio::sync::Notify>> {
+    if !daemon_network_environment_watch_enabled() {
+        tracing::debug!(
+            "sinomo {label} network environment watcher disabled; scheduled cluster maintenance remains active"
+        );
+        return None;
+    }
     let mut watch = match netwatcher::watch_interfaces_async::<netwatcher::async_adapter::Tokio>() {
         Ok(watch) => watch,
         Err(error) => {
@@ -5067,6 +5091,34 @@ mod tests {
         assert!(!background_dfs_maintenance_enabled_for(Some("false")));
         assert!(!background_dfs_maintenance_enabled_for(Some(" no ")));
         assert!(!background_dfs_maintenance_enabled_for(Some("OFF")));
+    }
+
+    #[test]
+    fn network_environment_watch_defaults_off_on_linux_with_override() {
+        assert!(
+            !daemon_network_environment_watch_enabled_for(None, true),
+            "Linux defaults to scheduled maintenance because netwatcher can poll sysfs aggressively"
+        );
+        assert!(
+            daemon_network_environment_watch_enabled_for(None, false),
+            "non-Linux keeps the event watcher by default"
+        );
+        assert!(daemon_network_environment_watch_enabled_for(
+            Some("1"),
+            true
+        ));
+        assert!(daemon_network_environment_watch_enabled_for(
+            Some(" true "),
+            true
+        ));
+        assert!(!daemon_network_environment_watch_enabled_for(
+            Some("off"),
+            false
+        ));
+        assert!(
+            !daemon_network_environment_watch_enabled_for(Some("unexpected"), true),
+            "unknown override values preserve the Linux default"
+        );
     }
 
     #[test]
