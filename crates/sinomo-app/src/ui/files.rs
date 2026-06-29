@@ -4573,17 +4573,27 @@ fn details_locations(details: &SifsObjectDetails) -> String {
 
 fn sifs_pin_summary(details: Option<&SifsObjectDetails>) -> String {
     let Some(details) = details else {
-        return "pin state not loaded".to_string();
+        return "pin state unknown; refresh metadata to manage pins".to_string();
     };
     if details.local_pins.is_empty() {
-        return "not pinned on this node".to_string();
+        return "no local pins on this node".to_string();
     }
     details
         .local_pins
         .iter()
-        .map(|pin| format!("{} pin on {}", pin.mode, short(&pin.pinned_by_node_id, 20)))
+        .map(|pin| {
+            format!(
+                "{} pinned on {}",
+                pin.mode,
+                short(&pin.pinned_by_node_id, 20)
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn sifs_has_local_pin(details: &SifsObjectDetails, mode: &str) -> bool {
+    details.local_pins.iter().any(|pin| pin.mode == mode)
 }
 
 fn sifs_pin_detail_summary(details: &SifsObjectDetails) -> String {
@@ -8168,20 +8178,30 @@ fn inspector_actions(files: &FilesState, entry: &SifsEntry) -> Vec<InspectorActi
     actions.push(InspectorAction::Rename);
     actions.push(InspectorAction::Delete);
     if files.source == FilesSourceKind::Sifs {
-        if files
+        let metadata_needs_connection = files
             .details_error
             .as_deref()
-            .is_some_and(sifs_metadata_error_needs_connection)
-        {
+            .is_some_and(sifs_metadata_error_needs_connection);
+        if metadata_needs_connection {
             actions.push(InspectorAction::ConnectionSettings);
         }
         actions.push(InspectorAction::RefreshPlacement);
-        actions.push(InspectorAction::RepairReplicas);
-        actions.push(InspectorAction::PinMetadata);
-        actions.push(InspectorAction::UnpinMetadata);
-        if !entry.is_dir && !entry.is_link {
-            actions.push(InspectorAction::PinContent);
-            actions.push(InspectorAction::UnpinContent);
+        if !metadata_needs_connection && !files.details_loading {
+            if let Some(details) = files.selected_details.as_ref() {
+                actions.push(InspectorAction::RepairReplicas);
+                if sifs_has_local_pin(details, "metadata") {
+                    actions.push(InspectorAction::UnpinMetadata);
+                } else {
+                    actions.push(InspectorAction::PinMetadata);
+                }
+                if !entry.is_dir && !entry.is_link {
+                    if sifs_has_local_pin(details, "content") {
+                        actions.push(InspectorAction::UnpinContent);
+                    } else {
+                        actions.push(InspectorAction::PinContent);
+                    }
+                }
+            }
         }
     }
     actions
@@ -10595,6 +10615,7 @@ mod tests {
     use super::*;
     use crate::backend::Backend;
     use crate::state::AppState;
+    use sinomo_cli::app_api::SifsPinDetails;
 
     fn files_test_temp_dir(name: &str) -> PathBuf {
         let stamp = std::time::SystemTime::now()
@@ -10607,6 +10628,30 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create temp dir");
         root
+    }
+
+    fn test_sifs_details(local_pins: Vec<SifsPinDetails>) -> SifsObjectDetails {
+        SifsObjectDetails {
+            file_system_id: "sifs".to_string(),
+            object_id: "obj".to_string(),
+            path: "/artifact.txt".to_string(),
+            kind: "file".to_string(),
+            version: "v1".to_string(),
+            content_hash: None,
+            size_bytes: Some(5),
+            link_count: 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            policy: "replicated-eventual".to_string(),
+            current_locations: vec!["node-a".to_string()],
+            local_pins,
+            health: None,
+        }
     }
 
     #[test]
@@ -10989,7 +11034,13 @@ mod tests {
             .nodes
             .iter()
             .find(|node| {
-                node.role == sui::SemanticsRole::ListItem && node.name.as_deref() == Some("dir")
+                node.role == sui::SemanticsRole::ListItem
+                    && node.name.as_deref() == Some("services")
+                    && node.description.as_deref().is_some_and(|description| {
+                        description.contains(
+                            "Activate opens the folder; Inspect selects it for management",
+                        )
+                    })
             })
             .expect("directory row semantics should be present");
         assert!(
@@ -12116,38 +12167,25 @@ mod tests {
 
     #[test]
     fn sifs_pin_summary_surfaces_local_content_pins() {
-        let mut details = SifsObjectDetails {
-            file_system_id: "sifs".to_string(),
-            object_id: "obj".to_string(),
-            path: "/artifact.txt".to_string(),
-            kind: "file".to_string(),
-            version: "v1".to_string(),
-            content_hash: None,
-            size_bytes: Some(5),
-            link_count: 1,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: 0,
-            modified_at_unix_nanos: 0,
-            created_at_unix_nanos: 0,
-            changed_at_unix_nanos: 0,
-            policy: "replicated-eventual".to_string(),
-            current_locations: vec!["node-a".to_string()],
-            local_pins: vec![sinomo_cli::app_api::SifsPinDetails {
-                pinned_by_node_id: "node-a".to_string(),
-                mode: "content".to_string(),
-                created_at_unix_nanos: Some(0),
-            }],
-            health: None,
-        };
+        let mut details = test_sifs_details(vec![SifsPinDetails {
+            pinned_by_node_id: "node-a".to_string(),
+            mode: "content".to_string(),
+            created_at_unix_nanos: Some(0),
+        }]);
 
-        assert_eq!(sifs_pin_summary(Some(&details)), "content pin on node-a");
+        assert_eq!(
+            sifs_pin_summary(None),
+            "pin state unknown; refresh metadata to manage pins"
+        );
+        assert_eq!(sifs_pin_summary(Some(&details)), "content pinned on node-a");
         assert!(sifs_pin_detail_summary(&details).contains("content on node-a since"));
 
         let pinned = sifs_details_signature(Some(&details));
         details.local_pins.clear();
-        assert_eq!(sifs_pin_summary(Some(&details)), "not pinned on this node");
+        assert_eq!(
+            sifs_pin_summary(Some(&details)),
+            "no local pins on this node"
+        );
         assert_ne!(sifs_details_signature(Some(&details)), pinned);
     }
 
@@ -13966,13 +14004,13 @@ mod tests {
         let window = app.main_window()?;
         let snapshot = window.snapshot()?;
 
-        for label in ["Rename", "Delete"] {
+        for (label, name) in [("Rename", "Rename"), ("Delete", "Delete selected item")] {
             let node = snapshot
                 .accessibility
                 .nodes
                 .iter()
                 .find(|node| {
-                    node.role == sui::SemanticsRole::Button && node.name.as_deref() == Some(label)
+                    node.role == sui::SemanticsRole::Button && node.name.as_deref() == Some(name)
                 })
                 .unwrap_or_else(|| panic!("{label} command should be present"));
             assert!(
@@ -14775,6 +14813,7 @@ mod tests {
                 size: Some(5),
             }];
             files.selected = Some(0);
+            files.selected_details = Some(test_sifs_details(Vec::new()));
             files.worker_tx = Some(tx);
             files.worker_rx = Some(result_rx);
         }
@@ -14869,6 +14908,14 @@ mod tests {
             FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
         }
 
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Unpin metadata artifact.txt")
+                .count()?,
+            0,
+            "unpinned metadata should expose pin, not unpin"
+        );
         window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Pin metadata artifact.txt")
@@ -14891,28 +14938,14 @@ mod tests {
             FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
         }
 
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Unpin metadata artifact.txt")
-            .click()?;
-
-        assert_eq!(shared.files().tasks[0].title, "Unpin metadata");
-        match rx.try_recv().expect("metadata unpin command") {
-            FilesWorkerCommand::Operation {
-                request_id,
-                source,
-                operation,
-            } => {
-                assert_eq!(request_id, shared.files().tasks[0].id);
-                assert_eq!(source, FilesSourceKind::Sifs);
-                assert_eq!(operation.kind, FilesOperationKind::UnpinMetadata);
-                assert_eq!(operation.path, "/services/artifact.txt");
-            }
-            FilesWorkerCommand::List { .. } => panic!("expected operation command"),
-            FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
-            FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
-        }
-
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Unpin content artifact.txt")
+                .count()?,
+            0,
+            "unpinned content should expose pin, not unpin"
+        );
         window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Pin content artifact.txt")
@@ -14935,6 +14968,98 @@ mod tests {
             FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn selected_pinned_sifs_file_inspector_exposes_unpin_actions() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let (tx, rx) = mpsc::channel();
+        let (_result_tx, result_rx) = mpsc::channel();
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/services".to_string();
+            files.node_id = "node-a".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/services/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.selected = Some(0);
+            files.selected_details = Some(test_sifs_details(vec![
+                SifsPinDetails {
+                    pinned_by_node_id: "node-a".to_string(),
+                    mode: "metadata".to_string(),
+                    created_at_unix_nanos: Some(0),
+                },
+                SifsPinDetails {
+                    pinned_by_node_id: "node-a".to_string(),
+                    mode: "content".to_string(),
+                    created_at_unix_nanos: Some(0),
+                },
+            ]));
+            files.worker_tx = Some(tx);
+            files.worker_rx = Some(result_rx);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files inspector pinned file actions")
+                    .root(
+                        SizedBox::new()
+                            .width(INSPECTOR_W)
+                            .height(720.0)
+                            .with_child(InspectorView::new(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Pin metadata artifact.txt")
+                .count()?,
+            0,
+            "pinned metadata should expose unpin, not pin"
+        );
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Unpin metadata artifact.txt")
+            .click()?;
+
+        assert_eq!(shared.files().tasks[0].title, "Unpin metadata");
+        match rx.try_recv().expect("metadata unpin command") {
+            FilesWorkerCommand::Operation {
+                request_id,
+                source,
+                operation,
+            } => {
+                assert_eq!(request_id, shared.files().tasks[0].id);
+                assert_eq!(source, FilesSourceKind::Sifs);
+                assert_eq!(operation.kind, FilesOperationKind::UnpinMetadata);
+                assert_eq!(operation.path, "/services/artifact.txt");
+            }
+            FilesWorkerCommand::List { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+        }
+
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Pin content artifact.txt")
+                .count()?,
+            0,
+            "pinned content should expose unpin, not pin"
+        );
         window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Unpin content artifact.txt")
@@ -14994,6 +15119,23 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Repair replicas artifact.txt")
+                .count()?,
+            0,
+            "metadata connection errors should hide replica repair"
+        );
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Pin metadata artifact.txt")
+                .count()?,
+            0,
+            "metadata connection errors should hide pin actions"
+        );
 
         window
             .get_by_role(sui::SemanticsRole::Button)
