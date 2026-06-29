@@ -137,6 +137,7 @@ pub(crate) fn shadow_daemon_paths_from_defaults() -> Result<DaemonPaths, CliErro
 }
 
 pub(crate) fn complete_shadow_rollout_from_helper() -> Result<(), CliError> {
+    std::thread::sleep(std::time::Duration::from_secs(2));
     let response =
         daemon_handle_deferred_shadow_rollout_completion(&daemon_paths_from_defaults()?)?;
     print!("{response}");
