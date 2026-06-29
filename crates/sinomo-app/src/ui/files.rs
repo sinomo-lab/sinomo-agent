@@ -5560,7 +5560,7 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 
     let delete = {
         let s = shared.clone();
-        IconButton::new(IconGlyph::Trash, "Delete")
+        IconButton::new(IconGlyph::Trash, "Delete selected item")
             .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when({
@@ -5850,9 +5850,9 @@ fn files_marked_summary_label(shared: &Shared) -> impl Widget + use<> {
 
 fn files_copy_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
-    sui::Button::new("Copy marked")
+    sui::Button::new("Copy")
         .icon(IconGlyph::Restore)
-        .min_width(106.0)
+        .min_width(76.0)
         .min_height(28.0)
         .theme_when(clone_reader(reader))
         .enabled_when({
@@ -5872,7 +5872,7 @@ fn files_copy_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widge
 fn files_transfer_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
     let (glyph, label, width) = match shared.files().source {
-        FilesSourceKind::Sifs => (IconGlyph::Download, "Download marked", 132.0),
+        FilesSourceKind::Sifs => (IconGlyph::Download, "Download", 100.0),
         FilesSourceKind::Local => (IconGlyph::Storage, "Copy to SIFS", 112.0),
     };
     sui::Button::new(label)
@@ -5896,9 +5896,9 @@ fn files_transfer_marked_button(shared: &Shared, reader: &ThemeReader) -> impl W
 
 fn files_move_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
-    sui::Button::new("Move marked")
+    sui::Button::new("Move")
         .icon(IconGlyph::ChevronRight)
-        .min_width(106.0)
+        .min_width(78.0)
         .min_height(28.0)
         .theme_when(clone_reader(reader))
         .enabled_when({
@@ -5917,9 +5917,9 @@ fn files_move_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widge
 
 fn files_delete_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
-    sui::Button::new("Delete marked")
+    sui::Button::new("Delete")
         .icon(IconGlyph::Trash)
-        .min_width(112.0)
+        .min_width(82.0)
         .min_height(28.0)
         .theme_when(clone_reader(reader))
         .enabled_when({
@@ -13530,7 +13530,7 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Copy marked")
+            .with_name("Copy")
             .click()?;
         {
             let files = shared.files();
@@ -13547,7 +13547,7 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Download marked")
+            .with_name("Download")
             .click()?;
         {
             let files = shared.files();
@@ -13567,7 +13567,7 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Move marked")
+            .with_name("Move")
             .click()?;
         {
             let files = shared.files();
@@ -13584,7 +13584,7 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Delete marked")
+            .with_name("Delete")
             .click()?;
         {
             let files = shared.files();
