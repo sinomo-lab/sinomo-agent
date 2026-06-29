@@ -1060,7 +1060,10 @@ fn public_reachability_summary(snapshot: &ClusterSnapshot) -> String {
         .iter()
         .filter(|node| node.public_reachable)
         .count();
-    format!("{} public reachable", public)
+    format!(
+        "{public} / {} nodes publicly reachable",
+        snapshot.nodes.len()
+    )
 }
 
 fn cluster_attention_summary(snapshot: &ClusterSnapshot, warning: &str) -> String {
@@ -1159,6 +1162,7 @@ fn node_detail_lines(node: &ClusterNodeInfo, diagnostics_open: bool) -> Vec<Stri
         format!("process: {}", node.process),
         format!("role: {} {}", node.member_role, node.member_state),
         format!("address: {}", node.address.as_deref().unwrap_or("-")),
+        format!("route: {}", node_route_summary(node, reachable_endpoints)),
         format!(
             "endpoints: {} / {} reachable",
             reachable_endpoints,
@@ -1194,6 +1198,24 @@ fn node_detail_lines(node: &ClusterNodeInfo, diagnostics_open: bool) -> Vec<Stri
         lines.push(format!("version: {}", node.daemon_version));
     }
     lines
+}
+
+fn node_route_summary(node: &ClusterNodeInfo, reachable_endpoints: usize) -> &'static str {
+    let availability = node.availability.to_ascii_lowercase();
+    if matches!(availability.as_str(), "offline" | "unavailable") {
+        return "node offline";
+    }
+    if node.endpoints.is_empty() {
+        return "no endpoints published";
+    }
+    if reachable_endpoints == 0 {
+        return "endpoints unreachable";
+    }
+    if node.public_reachable {
+        "public route reachable"
+    } else {
+        "LAN/local route only"
+    }
 }
 
 fn node_next_step_summary(node: &ClusterNodeInfo, reachable_endpoints: usize) -> &'static str {
@@ -1909,7 +1931,11 @@ mod tests {
 
         assert_eq!(lines[0], "Cluster overview");
         assert!(lines.iter().any(|line| line == "health: 2 / 2 online"));
-        assert!(lines.iter().any(|line| line == "reach: 1 public reachable"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "reach: 1 / 2 nodes publicly reachable")
+        );
         assert!(lines.iter().any(|line| line == "topology: 1 edges"));
         assert!(lines.iter().any(|line| line == "source: daemon connected"));
         assert!(
@@ -2332,6 +2358,11 @@ mod tests {
         assert!(
             closed
                 .iter()
+                .any(|line| line == "route: LAN/local route only")
+        );
+        assert!(
+            closed
+                .iter()
                 .any(|line| line == "next: LAN or local routing only")
         );
         assert!(
@@ -2359,12 +2390,22 @@ mod tests {
         assert!(
             offline_lines
                 .iter()
+                .any(|line| line == "route: node offline")
+        );
+        assert!(
+            offline_lines
+                .iter()
                 .any(|line| { line == "next: start daemon on that node or check its route" })
         );
 
         let mut unreachable = node("node-unreachable");
         unreachable.endpoints = vec![endpoint("127.0.0.1:21353", false)];
         let unreachable_lines = node_detail_lines(&unreachable, false);
+        assert!(
+            unreachable_lines
+                .iter()
+                .any(|line| line == "route: endpoints unreachable")
+        );
         assert!(
             unreachable_lines
                 .iter()
@@ -2375,6 +2416,11 @@ mod tests {
         public.public_reachable = true;
         public.endpoints = vec![endpoint("203.0.113.10:21353", true)];
         let public_lines = node_detail_lines(&public, false);
+        assert!(
+            public_lines
+                .iter()
+                .any(|line| line == "route: public route reachable")
+        );
         assert!(
             public_lines
                 .iter()
