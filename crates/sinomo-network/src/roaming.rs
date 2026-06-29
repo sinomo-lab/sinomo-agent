@@ -1453,7 +1453,9 @@ pub(crate) fn iroh_proxy_command_stream_accept_error_is_peer_close(error: &Netwo
         return false;
     };
     operation == "accept iroh daemon command stream"
-        && (detail.contains("closed by peer") || detail.contains("stopped"))
+        && (detail.contains("closed by peer")
+            || detail == "timed out"
+            || detail.contains("stopped"))
 }
 
 #[cfg(feature = "iroh-transport")]

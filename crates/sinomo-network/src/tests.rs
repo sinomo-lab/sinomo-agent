@@ -3180,6 +3180,12 @@ fn iroh_daemon_proxy_peer_closed_accept_is_not_error_noise() {
     };
     assert!(crate::roaming::iroh_proxy_command_stream_accept_error_is_peer_close(&closed));
 
+    let timed_out = NetworkError::Io {
+        operation: "accept iroh daemon command stream".to_string(),
+        detail: "timed out".to_string(),
+    };
+    assert!(crate::roaming::iroh_proxy_command_stream_accept_error_is_peer_close(&timed_out));
+
     let unrelated = NetworkError::Io {
         operation: "accept iroh daemon command stream".to_string(),
         detail: "permission denied".to_string(),
