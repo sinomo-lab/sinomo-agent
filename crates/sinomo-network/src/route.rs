@@ -34,6 +34,7 @@ pub const CLUSTER_ROUTING_RPC_ROUTE_METADATA: &[(&str, &str)] =
 const CLUSTER_RELAY_DEFAULT_TTL: u8 = 8;
 const CLUSTER_RELAY_MAX_FAILURE_DETAILS: usize = 8;
 const CLUSTER_RELAY_FAILURE_DETAIL_MAX_CHARS: usize = 512;
+const CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX: Duration = Duration::from_secs(5);
 const CLUSTER_DELIVERY_DEGRADED_LINK_COST: u64 = 50_000;
 const CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST: u64 = CLUSTER_DELIVERY_DEGRADED_LINK_COST / 2;
 const CLUSTER_DELIVERY_UNOBSERVED_NEIGHBOR_COST: u64 = 75_000;
@@ -1922,6 +1923,7 @@ where
                 endpoints = %cluster_object_rpc_endpoint_trace_list(&route_plan.endpoints),
                 "cluster object rpc route plan selected"
             );
+            let route_endpoint_count = route_plan.endpoints.len();
             for endpoint in route_plan.endpoints {
                 let attempt_started_at = Instant::now();
                 let Some(remaining) = deadline.checked_remaining() else {
@@ -1931,8 +1933,10 @@ where
                     ));
                 };
                 let final_hop = &route_plan.next_hop == target_node_id;
+                let endpoint_attempt_budget =
+                    cluster_target_endpoint_attempt_budget(remaining, route_endpoint_count);
                 let hop_timeouts =
-                    cluster_relay_hop_transport_timeouts(options.timeouts, remaining);
+                    cluster_relay_hop_transport_timeouts(options.timeouts, endpoint_attempt_budget);
                 let (outer_build_us, outer_sign_us, send_us, response) = if final_hop {
                     let send_started_at = Instant::now();
                     let response = self
@@ -2260,6 +2264,16 @@ fn cluster_relay_hop_transport_timeouts(
         return shaped;
     };
     shaped.with_idle_timeout(Some(idle_timeout.min(CLUSTER_RELAY_MIN_RESPONSE_BUDGET)))
+}
+
+fn cluster_target_endpoint_attempt_budget(
+    remaining_route_budget: Option<Duration>,
+    endpoint_count: usize,
+) -> Option<Duration> {
+    if endpoint_count <= 1 {
+        return remaining_route_budget;
+    }
+    remaining_route_budget.map(|remaining| remaining.min(CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX))
 }
 
 pub(crate) fn relay_envelope_hop_transport_timeouts(
@@ -3978,6 +3992,58 @@ mod tests {
         assert_eq!(host.sent[1].0.node_id, bridge);
         let retried_envelope = RelayEnvelope::from_request(&host.sent[1].1).expect("envelope");
         assert_eq!(retried_envelope.target_node_id, target);
+    }
+
+    #[tokio::test]
+    async fn object_rpc_call_target_caps_each_endpoint_attempt() {
+        let (_root, paths) = test_paths("sinomo-network-call-target-endpoint-budget");
+        let cluster_id = cid("cluster_call_target_endpoint_budget");
+        let local = nid("node_call_target_endpoint_budget_local");
+        let target = nid("node_call_target_endpoint_budget_target");
+        let stale_endpoint = endpoint(&target, "10.90.7.10:21353", 0);
+        let good_endpoint = endpoint(&target, "10.90.7.11:21353", 1);
+        let mut state = test_state(cluster_id, local);
+        add_member(
+            &mut state,
+            target.clone(),
+            "target",
+            vec![stale_endpoint.clone(), good_endpoint.clone()],
+        );
+        mark_local_endpoints_healthy(&paths, &state, &[stale_endpoint, good_endpoint]);
+        let runtime = tokio::runtime::Handle::current();
+        let mut host = RecordingTargetHost::new([
+            SendOutcome::Error("stale endpoint hung"),
+            SendOutcome::Response("target-ok"),
+        ]);
+        let mut client = ClusterObjectRpcClient::routed(&mut host, &runtime, &paths);
+
+        let rpc_response = client
+            .call_target(
+                &state,
+                &target,
+                &request(),
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(
+                    15,
+                ))),
+            )
+            .await
+            .expect("target rpc");
+
+        assert_eq!(
+            rpc_response.decode_body::<String>().expect("body"),
+            "target-ok"
+        );
+        assert_eq!(host.sent.len(), 2);
+        assert_eq!(host.sent[0].0.address, "10.90.7.10:21353");
+        assert_eq!(host.sent[1].0.address, "10.90.7.11:21353");
+        assert_eq!(
+            host.sent[0].3.connect_timeout,
+            Some(CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX)
+        );
+        assert_eq!(
+            host.sent[1].3.connect_timeout,
+            Some(CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX)
+        );
     }
 
     #[tokio::test]
