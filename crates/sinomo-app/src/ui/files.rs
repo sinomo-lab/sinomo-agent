@@ -6479,6 +6479,13 @@ fn files_marked_summary_label(shared: &Shared) -> impl Widget + use<> {
     .line_height(16.0)
 }
 
+fn files_marked_hint_label() -> impl Widget {
+    sui::Label::new("Mark rows to batch copy, transfer, move, or delete")
+        .semantic_name("Files marked entries")
+        .font_size(11.0)
+        .line_height(16.0)
+}
+
 fn files_copy_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
     sui::Button::new("Copy")
@@ -6586,25 +6593,61 @@ fn files_filter_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
         .with_child(files_mark_visible_button(shared, reader))
         .with_child(files_clear_marks_button(shared, reader));
 
-    let marked_actions = Stack::horizontal()
-        .spacing(8.0)
-        .alignment(Alignment::Center)
-        .with_child(
-            SizedBox::new()
-                .width(116.0)
-                .height(28.0)
-                .with_child(files_marked_summary_label(shared)),
-        )
-        .with_child(files_copy_marked_button(shared, reader))
-        .with_child(files_transfer_marked_button(shared, reader))
-        .with_child(files_move_marked_button(shared, reader))
-        .with_child(files_delete_marked_button(shared, reader));
-
     Stack::vertical()
         .spacing(6.0)
         .alignment(Alignment::Stretch)
         .with_child(SizedBox::new().height(30.0).with_child(filters))
-        .with_child(SizedBox::new().height(28.0).with_child(marked_actions))
+        .with_child(
+            SizedBox::new()
+                .height(28.0)
+                .with_child(files_marked_actions_rebuild(shared, reader)),
+        )
+}
+
+fn files_marked_actions_rebuild(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || {
+                let files = s.files();
+                (
+                    files.marked_count(),
+                    files.source,
+                    files.can_modify_current_location(),
+                )
+            }
+        },
+        move |_key| files_marked_actions(&s, &r),
+    )
+}
+
+fn files_marked_actions(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    if shared.files().marked_count() == 0 {
+        return WidgetPod::new(
+            Stack::horizontal()
+                .spacing(8.0)
+                .alignment(Alignment::Center)
+                .with_child(files_marked_hint_label()),
+        );
+    }
+
+    WidgetPod::new(
+        Stack::horizontal()
+            .spacing(8.0)
+            .alignment(Alignment::Center)
+            .with_child(
+                SizedBox::new()
+                    .width(116.0)
+                    .height(28.0)
+                    .with_child(files_marked_summary_label(shared)),
+            )
+            .with_child(files_copy_marked_button(shared, reader))
+            .with_child(files_transfer_marked_button(shared, reader))
+            .with_child(files_move_marked_button(shared, reader))
+            .with_child(files_delete_marked_button(shared, reader)),
+    )
 }
 
 fn files_list_body_signature(shared: &Shared) -> (u64, String, FileSortMode) {
@@ -14820,6 +14863,27 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
+
+        let initial_snapshot = window.snapshot()?;
+        assert!(
+            initial_snapshot.accessibility.nodes.iter().any(|node| {
+                node.role == sui::SemanticsRole::Text
+                    && node.name.as_deref() == Some("Files marked entries")
+                    && node.value
+                        == Some(sui::SemanticsValue::Text(
+                            "Mark rows to batch copy, transfer, move, or delete".to_string(),
+                        ))
+            }),
+            "the unmarked state should show a quiet batch-action hint"
+        );
+        for name in ["Copy", "Download", "Move", "Delete"] {
+            assert!(
+                !initial_snapshot.accessibility.nodes.iter().any(|node| {
+                    node.role == sui::SemanticsRole::Button && node.name.as_deref() == Some(name)
+                }),
+                "batch action {name} should stay hidden until entries are marked"
+            );
+        }
 
         window
             .get_by_role(sui::SemanticsRole::Button)
