@@ -7244,8 +7244,8 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     );
     push_unique_place(
         &mut places,
-        "Current local",
-        "host filesystem",
+        "Working folder",
+        "app working dir",
         FilesSourceKind::Local,
         files.local_path.clone(),
         IconGlyph::Folder,
@@ -11731,7 +11731,8 @@ mod tests {
                 && place.action == FilePlaceAction::OpenPathPrompt
         }));
         assert!(places.iter().any(|place| {
-            place.label == "Current local"
+            place.label == "Working folder"
+                && place.detail == "app working dir"
                 && place.source == FilesSourceKind::Local
                 && place.path == root.to_string_lossy()
         }));
