@@ -2834,6 +2834,13 @@ fn iroh_daemon_proxy_admission_limit_releases_permits() {
         crate::roaming::IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS
             >= crate::roaming::IROH_DAEMON_PROXY_MAX_CONNECTIONS
     );
+    let estimated_proxy_fd_budget = crate::roaming::IROH_DAEMON_PROXY_MAX_CONNECTIONS
+        + crate::roaming::IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS.saturating_mul(2)
+        + 64;
+    assert!(
+        estimated_proxy_fd_budget <= 512,
+        "proxy admission should leave room under a 1024 open-file soft limit"
+    );
     assert!(
         crate::roaming::IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES
             >= crate::IROH_DAEMON_COMMAND_MAX_BYTES.saturating_add(12)

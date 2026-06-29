@@ -48,9 +48,9 @@ const IROH_SECRET_KEY_LOCK_RETRY_MAX: Duration = Duration::from_millis(40);
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) const IROH_DAEMON_PROXY_ERROR_ROUTE: &str = "/iroh-daemon-proxy/error";
 #[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const IROH_DAEMON_PROXY_MAX_CONNECTIONS: usize = 128;
+pub(crate) const IROH_DAEMON_PROXY_MAX_CONNECTIONS: usize = 64;
 #[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS: usize = 512;
+pub(crate) const IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS: usize = 128;
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) const IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES: usize =
     IROH_DAEMON_COMMAND_MAX_BYTES.saturating_add(12);
@@ -1336,16 +1336,26 @@ async fn run_iroh_daemon_proxy(
         IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS,
     ));
     let command_byte_budget = IrohProxyByteBudget::new(IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES);
+    let mut connection_tasks = tokio::task::JoinSet::new();
     loop {
         let connecting = tokio::select! {
-            connecting = endpoint.accept() => connecting,
+            biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || iroh_daemon_proxy_shutdown_requested(&shutdown) {
                     close_iroh_endpoint(&endpoint).await;
+                    abort_and_drain_iroh_daemon_proxy_tasks(&mut connection_tasks, "connection")
+                        .await;
                     return Ok(());
                 }
                 continue;
             }
+            joined = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Some(result) = joined {
+                    log_iroh_daemon_proxy_task_join("connection", result);
+                }
+                continue;
+            }
+            connecting = endpoint.accept() => connecting,
         };
         let Some(connecting) = connecting else {
             break;
@@ -1360,19 +1370,37 @@ async fn run_iroh_daemon_proxy(
         let daemon_address = daemon_address.clone();
         let command_limiter = command_limiter.clone();
         let command_byte_budget = command_byte_budget.clone();
-        let connection_runtime = runtime.clone();
-        runtime.spawn(async move {
+        let mut connection_shutdown = shutdown.clone();
+        connection_tasks.spawn(async move {
             let _connection_permit = connection_permit;
             let Ok(connection) = connecting.await else {
                 return;
             };
+            let mut command_tasks = tokio::task::JoinSet::new();
             loop {
-                let (mut send, mut recv) = match accept_iroh_proxy_command_stream_with_idle_timeout(
-                    connection.accept_bi(),
-                    IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT,
-                )
-                .await
-                {
+                let accepted = tokio::select! {
+                    biased;
+                    changed = connection_shutdown.changed() => {
+                        if changed.is_err()
+                            || iroh_daemon_proxy_shutdown_requested(&connection_shutdown)
+                        {
+                            connection.close(0_u8.into(), b"daemon shutdown");
+                            break;
+                        }
+                        continue;
+                    }
+                    joined = command_tasks.join_next(), if !command_tasks.is_empty() => {
+                        if let Some(result) = joined {
+                            log_iroh_daemon_proxy_task_join("command", result);
+                        }
+                        continue;
+                    }
+                    accepted = accept_iroh_proxy_command_stream_with_idle_timeout(
+                        connection.accept_bi(),
+                        IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT,
+                    ) => accepted,
+                };
+                let (mut send, mut recv) = match accepted {
                     Ok(Some(streams)) => streams,
                     Ok(None) => {
                         connection.close(0_u8.into(), b"idle timeout");
@@ -1415,7 +1443,7 @@ async fn run_iroh_daemon_proxy(
                 };
                 let daemon_address = daemon_address.clone();
                 let command_byte_budget = command_byte_budget.clone();
-                connection_runtime.spawn(async move {
+                command_tasks.spawn(async move {
                     let _command_permit = command_permit;
                     let (request, request_budget_permit) =
                         match read_iroh_proxy_frame_async_with_idle_timeout(
@@ -1489,10 +1517,34 @@ async fn run_iroh_daemon_proxy(
                     drop(response_budget_permit);
                 });
             }
+            abort_and_drain_iroh_daemon_proxy_tasks(&mut command_tasks, "command").await;
         });
     }
     close_iroh_endpoint(&endpoint).await;
+    abort_and_drain_iroh_daemon_proxy_tasks(&mut connection_tasks, "connection").await;
     Ok(())
+}
+
+#[cfg(feature = "iroh-transport")]
+fn log_iroh_daemon_proxy_task_join(label: &str, result: Result<(), tokio::task::JoinError>) {
+    match result {
+        Ok(()) => {}
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => {
+            eprintln!("sinomo iroh daemon proxy {label} task stopped: {error}");
+        }
+    }
+}
+
+#[cfg(feature = "iroh-transport")]
+async fn abort_and_drain_iroh_daemon_proxy_tasks(
+    tasks: &mut tokio::task::JoinSet<()>,
+    label: &str,
+) {
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        log_iroh_daemon_proxy_task_join(label, result);
+    }
 }
 
 #[cfg(any(feature = "iroh-transport", test))]
