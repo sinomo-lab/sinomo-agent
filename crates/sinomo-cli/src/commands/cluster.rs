@@ -26,7 +26,9 @@ pub(crate) use network::{
 pub(crate) use network::{compact_default_invite_introducers, push_unique_introducer};
 #[cfg(test)]
 pub(crate) use sinomo_runtime::node::apply_cluster_raft_role;
-use sinomo_runtime::node::cluster_member_is_local_process;
+use sinomo_runtime::node::{
+    cluster_member_is_legacy_shadow_daemon, cluster_member_is_local_process,
+};
 
 #[cfg(test)]
 pub(crate) fn build_cluster_raft_append_request_from_next_index(
@@ -47,6 +49,8 @@ pub(crate) enum ClusterCliCommand {
     Invite(ClusterInviteOptions),
     Join(ClusterJoinOptions),
     Migrate(ClusterMigrateCommand),
+    Rename(ClusterRenameOptions),
+    RenameHostnames,
     Role(ClusterRoleOptions),
     StateAuthority(ClusterStateAuthorityOptions),
     RepairMembers(ClusterRepairMembersOptions),
@@ -72,7 +76,7 @@ impl Default for ClusterInitOptions {
         Self {
             cluster_id: None,
             node_id: None,
-            name: "sinomo-local".to_string(),
+            name: default_cluster_node_name("sinomo-local"),
         }
     }
 }
@@ -82,6 +86,12 @@ pub(crate) struct ClusterJoinOptions {
     pub(crate) invite: String,
     pub(crate) cluster_id: Option<ClusterId>,
     pub(crate) node_id: Option<NodeId>,
+    pub(crate) name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClusterRenameOptions {
+    pub(crate) node_id: NodeId,
     pub(crate) name: String,
 }
 
@@ -154,6 +164,17 @@ pub(crate) fn parse_cluster_command(args: &[String]) -> Result<ClusterCliCommand
         Some((command, rest)) if matches!(command.as_str(), "migrate" | "migration") => Ok(
             ClusterCliCommand::Migrate(parse_cluster_migrate_command(rest)?),
         ),
+        Some((command, rest)) if matches!(command.as_str(), "rename" | "set-name") => Ok(
+            ClusterCliCommand::Rename(parse_cluster_rename_options(rest)?),
+        ),
+        Some((command, []))
+            if matches!(
+                command.as_str(),
+                "rename-hostnames" | "rename-to-hostnames" | "rename-nodes-to-hostnames"
+            ) =>
+        {
+            Ok(ClusterCliCommand::RenameHostnames)
+        }
         Some((command, rest)) if matches!(command.as_str(), "role" | "set-role") => {
             Ok(ClusterCliCommand::Role(parse_cluster_role_options(rest)?))
         }
@@ -297,7 +318,7 @@ pub(crate) fn parse_cluster_join_options(args: &[String]) -> Result<ClusterJoinO
         invite: invite.clone(),
         cluster_id: None,
         node_id: None,
-        name: "sinomo-node".to_string(),
+        name: default_cluster_node_name("sinomo-node"),
     };
     let mut index = 0;
     while index < rest.len() {
@@ -333,6 +354,20 @@ pub(crate) fn parse_cluster_join_options(args: &[String]) -> Result<ClusterJoinO
         index += 1;
     }
     Ok(options)
+}
+
+pub(crate) fn parse_cluster_rename_options(
+    args: &[String],
+) -> Result<ClusterRenameOptions, CliError> {
+    let [node_id, name] = args else {
+        return Err(CliError::Usage);
+    };
+    Ok(ClusterRenameOptions {
+        node_id: NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
+            detail: format!("invalid node id `{node_id}`: {source}"),
+        })?,
+        name: non_empty_cluster_name(name)?,
+    })
 }
 
 pub(crate) fn parse_cluster_migrate_command(
@@ -548,6 +583,138 @@ pub(crate) fn non_empty_address(address: &str) -> Result<String, CliError> {
     Ok(address.to_string())
 }
 
+pub(crate) fn default_cluster_node_name(fallback: &str) -> String {
+    default_cluster_node_name_with(fallback, local_hostname())
+}
+
+pub(crate) fn default_cluster_node_name_with(fallback: &str, hostname: Option<String>) -> String {
+    hostname
+        .and_then(|hostname| clean_cluster_hostname(&hostname))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn local_hostname() -> Option<String> {
+    for key in ["HOSTNAME", "COMPUTERNAME"] {
+        if let Ok(value) = std::env::var(key)
+            && let Some(hostname) = clean_cluster_hostname(&value)
+        {
+            return Some(hostname);
+        }
+    }
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|hostname| clean_cluster_hostname(&hostname))
+}
+
+fn clean_cluster_hostname(hostname: &str) -> Option<String> {
+    let hostname = hostname.trim().trim_end_matches('.');
+    if hostname.is_empty()
+        || hostname.eq_ignore_ascii_case("localhost")
+        || hostname.eq_ignore_ascii_case("localhost.localdomain")
+        || hostname.eq_ignore_ascii_case("(none)")
+        || hostname.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(hostname.to_string())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClusterHostnameRenameTarget {
+    pub(crate) node_id: NodeId,
+    pub(crate) name: String,
+}
+
+pub(crate) fn cluster_hostname_rename_targets(
+    state: &ClusterBootstrapState,
+    local_hostname: Option<&str>,
+) -> Vec<ClusterHostnameRenameTarget> {
+    let local_hostname = local_hostname.and_then(clean_cluster_hostname);
+    state
+        .members
+        .iter()
+        .filter(|member| {
+            !matches!(member.state, ClusterMemberState::Removed)
+                && !cluster_member_is_legacy_shadow_daemon(member)
+        })
+        .filter_map(|member| {
+            let name = if member.node_id == state.local_node_id {
+                local_hostname
+                    .clone()
+                    .or_else(|| cluster_member_hostname_from_endpoints(member))
+            } else {
+                cluster_member_hostname_from_endpoints(member)
+            }?;
+            Some(ClusterHostnameRenameTarget {
+                node_id: member.node_id.clone(),
+                name,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn cluster_member_hostname_from_endpoints(
+    member: &ClusterMemberRecord,
+) -> Option<String> {
+    let mut candidates = member
+        .endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            let hostname = cluster_endpoint_hostname(&endpoint.address)?;
+            Some((
+                endpoint_address_port(&endpoint.address) != Some(SINOMO_DAEMON_DEFAULT_PORT),
+                endpoint.priority,
+                hostname,
+            ))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    candidates
+        .into_iter()
+        .map(|(_, _, hostname)| hostname)
+        .next()
+}
+
+pub(crate) fn cluster_endpoint_hostname(address: &str) -> Option<String> {
+    let address = address.trim();
+    if address.is_empty()
+        || address.starts_with("iroh://")
+        || address.parse::<std::net::SocketAddr>().is_ok()
+        || address.parse::<std::net::IpAddr>().is_ok()
+    {
+        return None;
+    }
+    let host = if let Some(rest) = address.strip_prefix('[') {
+        let end = rest.find(']')?;
+        &rest[..end]
+    } else {
+        address
+            .rsplit_once(':')
+            .map(|(host, _)| host)
+            .unwrap_or(address)
+    };
+    if host.parse::<std::net::IpAddr>().is_ok()
+        || host.contains('/')
+        || host.contains('?')
+        || host.contains('#')
+        || host.contains('@')
+    {
+        return None;
+    }
+    clean_cluster_hostname(host)
+}
+
+fn endpoint_address_port(address: &str) -> Option<u16> {
+    let address = address.trim();
+    if let Ok(socket) = address.parse::<std::net::SocketAddr>() {
+        return Some(socket.port());
+    }
+    address.rsplit_once(':')?.1.parse().ok()
+}
+
 pub(crate) fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), CliError> {
     match command {
         ClusterCliCommand::Help => {
@@ -558,6 +725,8 @@ pub(crate) fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), 
         ClusterCliCommand::Invite(options) => cluster_invite(options),
         ClusterCliCommand::Join(options) => cluster_join(options),
         ClusterCliCommand::Migrate(command) => cluster_migrate(command),
+        ClusterCliCommand::Rename(options) => cluster_rename(options),
+        ClusterCliCommand::RenameHostnames => cluster_rename_hostnames(),
         ClusterCliCommand::Role(options) => cluster_role(options),
         ClusterCliCommand::StateAuthority(options) => cluster_state_authority_role(options),
         ClusterCliCommand::RepairMembers(options) => cluster_repair_members(options),
@@ -2250,6 +2419,78 @@ pub(crate) fn cluster_peers() -> Result<(), CliError> {
     Ok(())
 }
 
+pub(crate) fn cluster_rename(options: ClusterRenameOptions) -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    refresh_cluster_kv_from_local_daemon(&paths)?;
+    let state = network::read_cluster_state(&paths)?;
+    let update = network::update_cluster_node_name_with_host(
+        &paths,
+        state,
+        options.node_id.clone(),
+        options.name.clone(),
+        OffsetDateTime::now_utc(),
+        &mut CliClusterMemberMutationHost,
+    )?;
+    if !update.changed {
+        println!(
+            "cluster member {} already has name {}",
+            update.node_id, update.name
+        );
+        return Ok(());
+    }
+
+    println!(
+        "cluster member {} renamed: {} -> {}",
+        update.node_id, update.previous_name, update.name
+    );
+    nudge_local_daemon_cluster_activation();
+    Ok(())
+}
+
+pub(crate) fn cluster_rename_hostnames() -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    refresh_cluster_kv_from_local_daemon(&paths)?;
+    let mut state = read_cluster_state(&paths)?;
+    let local_hostname = local_hostname();
+    let targets = cluster_hostname_rename_targets(&state, local_hostname.as_deref());
+    if targets.is_empty() {
+        println!("no cluster member hostnames could be inferred");
+        return Ok(());
+    }
+
+    let mut changed_count = 0usize;
+    let mut unchanged_count = 0usize;
+    for target in targets {
+        let update = network::update_cluster_node_name_with_host(
+            &paths,
+            state,
+            target.node_id,
+            target.name,
+            OffsetDateTime::now_utc(),
+            &mut CliClusterMemberMutationHost,
+        )?;
+        if update.changed {
+            changed_count = changed_count.saturating_add(1);
+            println!(
+                "cluster member {} renamed: {} -> {}",
+                update.node_id, update.previous_name, update.name
+            );
+        } else {
+            unchanged_count = unchanged_count.saturating_add(1);
+            println!(
+                "cluster member {} already has name {}",
+                update.node_id, update.name
+            );
+        }
+        state = network::read_cluster_state(&paths)?;
+    }
+    println!("hostname rename summary: {changed_count} changed, {unchanged_count} unchanged");
+    if changed_count > 0 {
+        nudge_local_daemon_cluster_activation();
+    }
+    Ok(())
+}
+
 pub(crate) struct CliClusterMemberMutationHost;
 
 impl network::ClusterMemberMutationHost for CliClusterMemberMutationHost {
@@ -2635,8 +2876,8 @@ pub(crate) fn cluster_leave_with_paths(
                 .map(|state| state.cluster_name.trim())
                 .filter(|name| !name.is_empty())
         })
-        .unwrap_or("sinomo-local")
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| default_cluster_node_name("sinomo-local"));
 
     let quarantine = if existing.is_some() || cluster_storage_has_live_artifacts(paths) {
         Some(quarantine_cluster_storage_for_leave(

@@ -6,9 +6,10 @@ use super::{
     CliClusterMemberMutationHost, CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand,
     ClusterInitOptions, ClusterInviteOptions, ClusterJoinOptions, ClusterJoinRegistrationRequest,
     ClusterMigrateCommand, ClusterMigrationPlanOptions, ClusterPaths, ClusterRemoveOptions,
-    ClusterRoleOptions, ClusterRolloutBuildRequest, ClusterStateAuthorityOptions, DaemonCliCommand,
-    DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
-    DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
+    ClusterRenameOptions, ClusterRoleOptions, ClusterRolloutBuildRequest,
+    ClusterStateAuthorityOptions, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
+    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DebugCliCommand, DfsCliCommand,
+    DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
     DfsMetadataShardTransferPrimaryOptions, DfsMountOptions, DfsPinCliCommand, InstallLayout,
     InstallOptions, InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
     InteractionSurfaceKind, ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions,
@@ -7408,6 +7409,22 @@ fn cluster_parser_accepts_init_and_join_options() {
     );
     assert_eq!(
         parse_cluster_command(&[
+            "rename".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string(),
+            "workstation-a".to_string(),
+        ])
+        .expect("cluster rename"),
+        ClusterCliCommand::Rename(ClusterRenameOptions {
+            node_id: NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d6").expect("node"),
+            name: "workstation-a".to_string(),
+        })
+    );
+    assert_eq!(
+        parse_cluster_command(&["rename-hostnames".to_string()]).expect("cluster rename-hostnames"),
+        ClusterCliCommand::RenameHostnames
+    );
+    assert_eq!(
+        parse_cluster_command(&[
             "role".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string(),
             "server".to_string(),
@@ -7542,6 +7559,138 @@ fn cluster_init_persists_local_cluster_state() {
         cluster_kv_state_authority_id(&paths, &state).expect("reelected state authority"),
         Some(NodeId::from_legacy_named("node_local").expect("node"))
     );
+}
+
+#[test]
+fn cluster_default_node_name_uses_hostname_when_available() {
+    assert_eq!(
+        super::default_cluster_node_name_with("sinomo-local", Some("workstation-a\n".to_string())),
+        "workstation-a"
+    );
+    assert_eq!(
+        super::default_cluster_node_name_with("sinomo-local", Some("localhost".to_string())),
+        "sinomo-local"
+    );
+    assert_eq!(
+        super::default_cluster_node_name_with("sinomo-node", None),
+        "sinomo-node"
+    );
+}
+
+#[test]
+fn cluster_hostname_targets_prefer_local_hostname_and_remote_hostname_endpoint() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_hostname_targets").expect("cluster");
+    let local_node = NodeId::from_legacy_named("node_hostname_targets_local").expect("node");
+    let remote_node = NodeId::from_legacy_named("node_hostname_targets_remote").expect("node");
+    let removed_node = NodeId::from_legacy_named("node_hostname_targets_removed").expect("node");
+    let shadow_node = NodeId::from_legacy_named("node_hostname_targets_shadow").expect("node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "hostname targets",
+        local_node.clone(),
+        "old-local",
+        "pk-local",
+        now,
+    );
+    state.members[0].endpoints = vec![daemon_lan_endpoint(
+        &local_node,
+        "10.0.0.10:21353".to_string(),
+        20,
+    )];
+    let mut remote = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        remote_node.clone(),
+        "old-remote",
+        "pk-remote",
+        now,
+    );
+    remote.endpoints = vec![
+        daemon_lan_endpoint(&remote_node, "10.0.0.20:21353".to_string(), 20),
+        daemon_lan_endpoint(&remote_node, "remote-host:21353".to_string(), 5),
+        daemon_lan_endpoint(&remote_node, "remote-shadow:21354".to_string(), 1),
+    ];
+    state.members.push(remote);
+    let mut removed = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        removed_node,
+        "removed",
+        "pk-removed",
+        now,
+    );
+    removed.state = ClusterMemberState::Removed;
+    removed.endpoints = vec![daemon_lan_endpoint(
+        &removed.node_id,
+        "removed-host:21353".to_string(),
+        0,
+    )];
+    state.members.push(removed);
+    let mut shadow =
+        ClusterMemberRecord::local_non_voting(cluster_id, shadow_node, "shadow", "pk-shadow", now);
+    shadow
+        .capabilities
+        .push(CapabilityName::new("daemon.shadow.supervise").expect("capability"));
+    shadow.endpoints = vec![daemon_lan_endpoint(
+        &shadow.node_id,
+        "shadow-host:21354".to_string(),
+        0,
+    )];
+    state.members.push(shadow);
+
+    let targets = super::cluster_hostname_rename_targets(&state, Some("local-host"));
+
+    assert_eq!(
+        targets
+            .iter()
+            .map(|target| (target.node_id.clone(), target.name.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (local_node, "local-host".to_string()),
+            (remote_node, "remote-host".to_string()),
+        ]
+    );
+    assert_eq!(
+        super::cluster_endpoint_hostname("node.example.test:21353"),
+        Some("node.example.test".to_string())
+    );
+    assert_eq!(super::cluster_endpoint_hostname("10.0.0.1:21353"), None);
+}
+
+#[test]
+fn cluster_node_rename_updates_local_state_and_kv() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-rename");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    let node_id = NodeId::from_legacy_named("node_rename_local").expect("node");
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::from_legacy_named("cluster_rename").expect("cluster")),
+            node_id: Some(node_id.clone()),
+            name: "old-name".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+    let state = read_cluster_state(&paths).expect("cluster state");
+
+    let update = network::update_cluster_node_name_with_host(
+        &paths,
+        state,
+        node_id.clone(),
+        "new-host".to_string(),
+        OffsetDateTime::now_utc(),
+        &mut CliClusterMemberMutationHost,
+    )
+    .expect("rename node");
+
+    assert!(update.changed);
+    assert_eq!(update.previous_name, "old-name");
+    assert_eq!(update.name, "new-host");
+    let state = read_cluster_state(&paths).expect("renamed state");
+    assert_eq!(state.local_node_display_name, "new-host");
+    assert_eq!(state.members[0].display_name, "new-host");
+    let kv_members = read_cluster_members_from_kv(&paths).expect("kv members");
+    assert_eq!(kv_members.len(), 1);
+    assert_eq!(kv_members[0].display_name, "new-host");
 }
 
 #[test]
