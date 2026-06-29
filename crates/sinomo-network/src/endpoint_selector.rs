@@ -1406,9 +1406,12 @@ fn cluster_rollout_route_process_rank(
     shadow_node_id: &NodeId,
 ) -> u8 {
     let unavailable = graph.unavailability_rank(endpoint) != 0;
-    if endpoint.node_id == *main_node_id {
+    let identifies_shadow = cluster_endpoint_identifies_shadow_daemon_for_node(endpoint);
+    if endpoint.node_id == *main_node_id && !identifies_shadow {
         if unavailable { 2 } else { 0 }
-    } else if endpoint.node_id == *shadow_node_id {
+    } else if endpoint.node_id == *shadow_node_id
+        || (endpoint.node_id == *main_node_id && identifies_shadow)
+    {
         if unavailable { 3 } else { 1 }
     } else {
         4

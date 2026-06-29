@@ -6374,12 +6374,19 @@ fn rollout_target_selection_prefers_main_route_before_shadow_backup() {
     );
     let main_endpoint = daemon_lan_endpoint(&main, "10.0.0.41:21353".to_string(), 10);
     let shadow_endpoint = daemon_lan_endpoint(&shadow, "10.0.0.42:21354".to_string(), 10);
+    let mut folded_shadow_endpoint =
+        daemon_lan_endpoint(&shadow, "10.0.0.40:21354".to_string(), 10);
+    folded_shadow_endpoint.node_id = main.clone();
 
     let selected = first_cluster_rollout_target_endpoint_for_main(
         &paths,
         &state,
         &main,
-        &[main_endpoint.clone(), shadow_endpoint.clone()],
+        &[
+            folded_shadow_endpoint.clone(),
+            main_endpoint.clone(),
+            shadow_endpoint.clone(),
+        ],
     )
     .expect("rollout endpoint");
 
