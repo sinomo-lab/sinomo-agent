@@ -28,6 +28,7 @@ const PACKED_BLOB_INDEX_LOG_FILE: &str = "index.slog";
 const PACKED_BLOB_LOCK_FILE: &str = "pack.lock";
 const PACKED_BLOB_SMALL_LIMIT_BYTES: u64 = 16 * 1024;
 const PACKED_BLOB_SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const PACKED_BLOB_INDEX_CACHE_TTL: Duration = Duration::from_secs(1);
 const STREAMED_OBJECT_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 
 fn content_store_perf_trace(args: std::fmt::Arguments<'_>) {
@@ -438,6 +439,18 @@ pub struct LocalContentStore {
     quota: Option<ContentStoreQuota>,
     stats_snapshot_active: Arc<AtomicBool>,
     deferred_durable_blobs: Arc<Mutex<BTreeMap<PathBuf, PathBuf>>>,
+    packed_index_cache: Arc<Mutex<PackedBlobIndexCache>>,
+}
+
+#[derive(Debug, Default)]
+struct PackedBlobIndexCache {
+    entry: Option<PackedBlobIndexCacheEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct PackedBlobIndexCacheEntry {
+    loaded_at: Instant,
+    index: PackedBlobIndex,
 }
 
 #[derive(Debug, Clone)]
@@ -910,6 +923,7 @@ impl LocalContentStore {
             quota: None,
             stats_snapshot_active,
             deferred_durable_blobs: Arc::new(Mutex::new(BTreeMap::new())),
+            packed_index_cache: Arc::new(Mutex::new(PackedBlobIndexCache::default())),
         })
     }
 
@@ -3287,10 +3301,44 @@ impl LocalContentStore {
         Ok(index)
     }
 
-    fn packed_blob_location(&self, hash: &str) -> Result<Option<PackedBlobLocation>> {
-        hash_hex(hash)?;
+    fn read_cached_packed_blob_index_for_read(&self) -> Result<PackedBlobIndex> {
+        let now = Instant::now();
+        {
+            let cache = self
+                .packed_index_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = &cache.entry
+                && now.saturating_duration_since(entry.loaded_at) <= PACKED_BLOB_INDEX_CACHE_TTL
+            {
+                return Ok(entry.index.clone());
+            }
+        }
+
         let _lock = self.lock_packed_blobs_for_read()?;
         let index = self.read_packed_blob_index_unlocked()?;
+        let mut cache = self
+            .packed_index_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.entry = Some(PackedBlobIndexCacheEntry {
+            loaded_at: now,
+            index: index.clone(),
+        });
+        Ok(index)
+    }
+
+    fn invalidate_packed_blob_index_cache(&self) {
+        let mut cache = self
+            .packed_index_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.entry = None;
+    }
+
+    fn packed_blob_location(&self, hash: &str) -> Result<Option<PackedBlobLocation>> {
+        hash_hex(hash)?;
+        let index = self.read_cached_packed_blob_index_for_read()?;
         Ok(index.entries.get(hash).cloned())
     }
 
@@ -3353,6 +3401,7 @@ impl LocalContentStore {
             location: Some(location),
             next_segment_id: index.next_segment_id,
         })?;
+        self.invalidate_packed_blob_index_cache();
         Ok(true)
     }
 
@@ -3494,6 +3543,9 @@ impl LocalContentStore {
         } else {
             self.append_packed_blob_index_log_entries_unlocked_relaxed(&records)?;
         }
+        if !records.is_empty() {
+            self.invalidate_packed_blob_index_cache();
+        }
         Ok(stats_delta)
     }
 
@@ -3509,6 +3561,7 @@ impl LocalContentStore {
                 location: None,
                 next_segment_id: index.next_segment_id,
             })?;
+            self.invalidate_packed_blob_index_cache();
         }
         Ok(removed)
     }
@@ -5854,6 +5907,35 @@ mod tests {
             .read_packed_blob_index_unlocked()
             .expect("replayed packed index");
         assert_eq!(index.entries.len(), 2);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn packed_blob_index_cache_is_invalidated_after_local_write() {
+        let root = temp_root("packed_blob_index_cache_is_invalidated_after_local_write");
+        let store = LocalContentStore::new(&root).expect("create store");
+
+        let first = store
+            .put_object_version("object-packed-cache-a", "v1", b"packed cache alpha")
+            .expect("put first packed object");
+        assert!(
+            store
+                .packed_blob_location(&first.content_hash)
+                .expect("populate packed cache")
+                .is_some()
+        );
+
+        let second = store
+            .put_object_version("object-packed-cache-b", "v1", b"packed cache bravo")
+            .expect("put second packed object");
+        assert!(
+            store
+                .packed_blob_location(&second.content_hash)
+                .expect("read invalidated packed cache")
+                .is_some(),
+            "same-process packed writes must invalidate the cached index"
+        );
 
         cleanup(&root);
     }
