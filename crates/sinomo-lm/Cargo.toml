@@ -16,6 +16,7 @@ base64.workspace = true
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 http = "1"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "json", "query", "rustls"] }
+ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

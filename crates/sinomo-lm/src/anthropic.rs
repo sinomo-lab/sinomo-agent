@@ -259,7 +259,7 @@ fn anthropic_headers(
     Ok(headers)
 }
 
-fn anthropic_messages_payload(
+pub(crate) fn anthropic_messages_payload(
     request: &LanguageModelRequest,
     model: &str,
     options: &LanguageModelProviderOptions,
@@ -332,7 +332,7 @@ fn anthropic_messages_payload(
     payload
 }
 
-fn extract_anthropic_text(value: &serde_json::Value) -> String {
+pub(crate) fn extract_anthropic_text(value: &serde_json::Value) -> String {
     value
         .get("content")
         .and_then(serde_json::Value::as_array)
@@ -351,6 +351,20 @@ fn stream_anthropic_messages_response(
     model: &str,
     on_event: &mut dyn FnMut(LanguageModelStreamEvent),
 ) -> Result<LanguageModelResponse, LanguageModelError> {
+    stream_anthropic_messages_response_with_provider(
+        response,
+        AnthropicProvider::PROVIDER_ID,
+        model,
+        on_event,
+    )
+}
+
+pub(crate) fn stream_anthropic_messages_response_with_provider(
+    response: reqwest::blocking::Response,
+    provider: &str,
+    model: &str,
+    on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+) -> Result<LanguageModelResponse, LanguageModelError> {
     let mut content = String::new();
     let mut usage = LanguageModelUsage {
         input_tokens: None,
@@ -360,11 +374,11 @@ fn stream_anthropic_messages_response(
     let mut saw_usage = false;
     let mut emitted_finished = false;
 
-    read_server_sent_events(response, AnthropicProvider::PROVIDER_ID, model, |event| {
+    read_server_sent_events(response, provider, model, |event| {
         let mut value =
             serde_json::from_str::<serde_json::Value>(&event.data).map_err(|source| {
                 LanguageModelError::ProviderInvocationFailed {
-                    provider: AnthropicProvider::PROVIDER_ID.to_string(),
+                    provider: provider.to_string(),
                     model: model.to_string(),
                     detail: format!(
                         "failed to parse Anthropic stream event: {source}: {}",
@@ -443,7 +457,7 @@ fn stream_anthropic_messages_response(
                     detail: detail.clone(),
                 });
                 return Err(LanguageModelError::ProviderInvocationFailed {
-                    provider: AnthropicProvider::PROVIDER_ID.to_string(),
+                    provider: provider.to_string(),
                     model: model.to_string(),
                     detail,
                 });
@@ -466,7 +480,7 @@ fn stream_anthropic_messages_response(
     }
 
     Ok(LanguageModelResponse {
-        provider: AnthropicProvider::PROVIDER_ID.to_string(),
+        provider: provider.to_string(),
         model: model.to_string(),
         content,
         items: Vec::new(),

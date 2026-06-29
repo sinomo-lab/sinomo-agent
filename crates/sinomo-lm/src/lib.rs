@@ -2,6 +2,7 @@
 
 mod anthropic;
 mod api_key;
+mod claude;
 mod claude_code;
 mod codex;
 mod codex_cli;
@@ -14,6 +15,11 @@ mod realtime_audio;
 mod test_cases;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
+pub use claude::{
+    CLAUDE_DEFAULT_MODEL, CLAUDE_OAUTH_AUTHORIZE_URL, CLAUDE_OAUTH_CLIENT_ID,
+    CLAUDE_OAUTH_REDIRECT_URI, CLAUDE_PROVIDER_ID, ClaudeConfig, ClaudeOAuthTokens,
+    ClaudePkceLogin, ClaudeProvider, SINOMO_CLAUDE_CREDENTIALS_FILE_ENV_VAR,
+};
 pub use claude_code::{
     CLAUDE_CODE_DEFAULT_MODEL, ClaudeCodeConfig, ClaudeCodeProvider, ClaudePermissionMode,
 };
@@ -1041,6 +1047,7 @@ pub fn inferred_model_context_window_tokens(provider: &str, model: &str) -> Opti
         }
         CodexCliProvider::PROVIDER_ID => codex_cli::inferred_context_window_tokens(&model),
         CODEX_PROVIDER_ID => codex::inferred_context_window_tokens(&model),
+        ClaudeProvider::PROVIDER_ID => claude::inferred_context_window_tokens(&model),
         ClaudeCodeProvider::PROVIDER_ID => claude_code::inferred_context_window_tokens(&model),
         AnthropicProvider::PROVIDER_ID => anthropic::inferred_context_window_tokens(&model),
         OpenAiProvider::PROVIDER_ID => openai::inferred_context_window_tokens(&model),
@@ -1699,6 +1706,7 @@ pub fn effective_model_name(provider: &str, configured_model: &str) -> String {
         GitHubCopilotCliProvider::PROVIDER_ID => GitHubCopilotCliConfig::default().model,
         CodexCliProvider::PROVIDER_ID => CODEX_CLI_DEFAULT_MODEL.to_string(),
         CODEX_PROVIDER_ID => CODEX_DEFAULT_MODEL.to_string(),
+        ClaudeProvider::PROVIDER_ID => CLAUDE_DEFAULT_MODEL.to_string(),
         ClaudeCodeProvider::PROVIDER_ID => CLAUDE_CODE_DEFAULT_MODEL.to_string(),
         AnthropicProvider::PROVIDER_ID => AnthropicConfig::default().default_model,
         OpenAiProvider::PROVIDER_ID => OpenAiConfig::default().default_model,
@@ -1722,6 +1730,7 @@ pub fn default_model_provider_ids() -> &'static [&'static str] {
         GitHubCopilotCliProvider::PROVIDER_ID,
         CodexCliProvider::PROVIDER_ID,
         CODEX_PROVIDER_ID,
+        ClaudeProvider::PROVIDER_ID,
         ClaudeCodeProvider::PROVIDER_ID,
         AnthropicProvider::PROVIDER_ID,
         OpenAiProvider::PROVIDER_ID,
@@ -1739,12 +1748,13 @@ pub fn normalize_model_provider(provider: &str) -> Option<String> {
         }
         CodexCliProvider::PROVIDER_ID => Some(CodexCliProvider::PROVIDER_ID.to_string()),
         CODEX_PROVIDER_ID => Some(CODEX_PROVIDER_ID.to_string()),
+        ClaudeProvider::PROVIDER_ID | "claude-subscription" | "anthropic-oauth" => {
+            Some(ClaudeProvider::PROVIDER_ID.to_string())
+        }
         ClaudeCodeProvider::PROVIDER_ID | "anthropic-claude-code" => {
             Some(ClaudeCodeProvider::PROVIDER_ID.to_string())
         }
-        AnthropicProvider::PROVIDER_ID | "claude" => {
-            Some(AnthropicProvider::PROVIDER_ID.to_string())
-        }
+        AnthropicProvider::PROVIDER_ID => Some(AnthropicProvider::PROVIDER_ID.to_string()),
         OpenAiProvider::PROVIDER_ID | "openai-api" => Some(OpenAiProvider::PROVIDER_ID.to_string()),
         DeepSeekProvider::PROVIDER_ID | "deepseek-api" => {
             Some(DeepSeekProvider::PROVIDER_ID.to_string())
@@ -1758,7 +1768,11 @@ pub fn normalize_model_provider(provider: &str) -> Option<String> {
 }
 
 pub fn subscription_usage_provider_ids() -> &'static [&'static str] {
-    &[CODEX_PROVIDER_ID, GitHubCopilotProvider::PROVIDER_ID]
+    &[
+        CODEX_PROVIDER_ID,
+        ClaudeProvider::PROVIDER_ID,
+        GitHubCopilotProvider::PROVIDER_ID,
+    ]
 }
 
 pub fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, LanguageModelError> {
@@ -1775,6 +1789,10 @@ pub fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, Langu
             detail: format!("provider `{provider}` does not use Sinomo-managed authentication"),
         }),
         CODEX_PROVIDER_ID => codex_provider_for_model(PROVIDER_DEFAULT_MODEL).list_models(),
+        ClaudeProvider::PROVIDER_ID => {
+            let (provider, _) = claude_provider()?;
+            provider.list_models()
+        }
         AnthropicProvider::PROVIDER_ID => {
             let (provider, _) = anthropic_provider()?;
             provider.api_key()?;
@@ -1866,6 +1884,10 @@ pub fn collect_provider_model_catalogs(
 pub fn provider_usage(provider: &str) -> Result<LanguageModelProviderUsage, LanguageModelError> {
     match provider {
         CODEX_PROVIDER_ID => codex_provider_for_model(PROVIDER_DEFAULT_MODEL).usage(),
+        ClaudeProvider::PROVIDER_ID => {
+            let (provider, _) = claude_provider()?;
+            provider.usage()
+        }
         GitHubCopilotProvider::PROVIDER_ID => {
             let (provider, _) = github_copilot_provider()?;
             provider.usage()
@@ -1997,6 +2019,20 @@ fn configured_model_provider(
                     Some(credentials_path),
                 ),
             ))
+        }
+        ClaudeProvider::PROVIDER_ID => {
+            let credentials_path = data_dir.provider_credentials_file(ClaudeProvider::PROVIDER_ID);
+            let default_config = ClaudeConfig::default();
+            let provider = ClaudeProvider::new(ClaudeConfig {
+                api_base_url: account
+                    .and_then(|account| account.api_base_url.clone())
+                    .unwrap_or(default_config.api_base_url),
+                default_model: model_or_default(model, default_config.default_model),
+                credentials_path: Some(credentials_path),
+                options: provider_options.clone(),
+                claude_code_version: default_config.claude_code_version,
+            });
+            Ok(Box::new(provider))
         }
         ClaudeCodeProvider::PROVIDER_ID => {
             let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
@@ -2463,6 +2499,19 @@ pub fn anthropic_provider() -> Result<(AnthropicProvider, PathBuf), LanguageMode
     Ok((provider, credentials_path))
 }
 
+pub fn claude_provider() -> Result<(ClaudeProvider, PathBuf), LanguageModelError> {
+    let data_dir = provider_data_dir(ClaudeProvider::PROVIDER_ID)?;
+    let credentials_path = data_dir.provider_credentials_file(ClaudeProvider::PROVIDER_ID);
+    let provider = ClaudeProvider::new(ClaudeConfig {
+        api_base_url: ClaudeConfig::default().api_base_url,
+        default_model: ClaudeConfig::default().default_model,
+        credentials_path: Some(credentials_path.clone()),
+        options: LanguageModelProviderOptions::default(),
+        claude_code_version: ClaudeConfig::default().claude_code_version,
+    });
+    Ok((provider, credentials_path))
+}
+
 pub fn openai_provider() -> Result<(OpenAiProvider, PathBuf), LanguageModelError> {
     let data_dir = provider_data_dir(OpenAiProvider::PROVIDER_ID)?;
     let credentials_path = data_dir.provider_credentials_file(OpenAiProvider::PROVIDER_ID);
@@ -2759,6 +2808,15 @@ pub fn test_provider_credentials(
             provider.test_connection()?;
             Ok(ProviderCredentialTest {
                 provider: CODEX_PROVIDER_ID.to_string(),
+                credentials_path,
+            })
+        }
+        ClaudeProvider::PROVIDER_ID => {
+            let (provider, credentials_path) = claude_provider()?;
+            provider.oauth_tokens()?;
+            provider.test_connection()?;
+            Ok(ProviderCredentialTest {
+                provider: ClaudeProvider::PROVIDER_ID.to_string(),
                 credentials_path,
             })
         }

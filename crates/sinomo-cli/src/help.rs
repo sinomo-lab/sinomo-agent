@@ -42,6 +42,7 @@ pub fn print_usage() {
     println!("Environment:");
     println!("  SINOMO_DATA_DIR             Defaults to ~/.sinomo");
     println!("  SINOMO_CODEX_CREDENTIALS_FILE  Overrides Sinomo's Codex credentials file");
+    println!("  SINOMO_CLAUDE_CREDENTIALS_FILE Overrides Sinomo's Claude credentials file");
     println!("  ANTHROPIC_API_KEY           Used by `providers auth/test anthropic`");
     println!("  OPENAI_API_KEY              Used by `providers auth/test openai`");
     println!("  DEEPSEEK_API_KEY            Used by `providers auth/test deepseek`");
@@ -395,6 +396,7 @@ pub(super) fn print_providers_help() {
     println!("Provider IDs:");
     println!("  github-copilot");
     println!("  codex");
+    println!("  claude");
     println!("  anthropic");
     println!("  openai");
     println!("  deepseek");

@@ -47,15 +47,15 @@ use sinomo_agent::{
     run_local_agent_readiness_gate, user_interaction_input_event,
 };
 use sinomo_lm::{
-    AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, CurrentDefaultModel,
+    AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, ClaudeProvider, CurrentDefaultModel,
     DEFAULT_PROVIDER_ACCOUNT, DeepSeekProvider, GeminiProvider, GitHubCopilotProvider,
     LM_PROVIDER_CONFIG_KEY, LM_PROVIDER_CONFIG_KV_KEY, LM_RUNTIME_CONFIG_KEY,
     LM_RUNTIME_CONFIG_KV_KEY, LanguageModelError, LanguageModelModelOptions,
     LanguageModelProviderOptions, LanguageModelProviderUsage, LanguageModelRequest,
     LanguageModelResponse, LanguageModelStreamEvent, ModelConfig, ModelPaths, ModelRuntimeConfig,
     NvidiaProvider, OpenAiProvider, ProviderAccountConfig, ProviderReasoningEffort,
-    ProviderTextVerbosity, codex_provider, collect_provider_model_catalogs, collect_provider_usage,
-    complete_configured_model_request_streaming_events_with_account,
+    ProviderTextVerbosity, claude_provider, codex_provider, collect_provider_model_catalogs,
+    collect_provider_usage, complete_configured_model_request_streaming_events_with_account,
     complete_configured_model_request_with_account,
     current_default_model as resolve_current_default_model, default_model_provider_ids,
     github_copilot_provider, load_model_config, model_config_cluster_kv_txn,

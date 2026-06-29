@@ -7768,6 +7768,7 @@ dependencies = [
  "futures-util",
  "http",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sinomo-runtime",

@@ -22,8 +22,8 @@ use sinomo_agent::{
     InteractionSession, InteractionSurface, InteractionSurfaceKind, TaskId,
 };
 use sinomo_lm::{
-    AnthropicConfig, ClaudeCodeConfig, CodexCliConfig, GeminiConfig, GitHubCopilotConfig,
-    OpenAiConfig, PROVIDER_DEFAULT_MODEL, ProviderReasoningEffort,
+    AnthropicConfig, CLAUDE_DEFAULT_MODEL, ClaudeCodeConfig, CodexCliConfig, GeminiConfig,
+    GitHubCopilotConfig, OpenAiConfig, PROVIDER_DEFAULT_MODEL, ProviderReasoningEffort,
 };
 use sinomo_runtime::events::{InMemoryEventStore, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
@@ -1744,6 +1744,17 @@ pub fn provider_summaries() -> Vec<ProviderSummary> {
             name: "Anthropic".to_string(),
             models: dedup(vec![
                 AnthropicConfig::default().default_model,
+                "claude-opus-4-8".to_string(),
+                "claude-sonnet-4-6".to_string(),
+                "claude-haiku-4-5".to_string(),
+            ]),
+        },
+        ProviderSummary {
+            id: "claude".to_string(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            name: "Claude".to_string(),
+            models: dedup(vec![
+                CLAUDE_DEFAULT_MODEL.to_string(),
                 "claude-opus-4-8".to_string(),
                 "claude-sonnet-4-6".to_string(),
                 "claude-haiku-4-5".to_string(),

@@ -346,6 +346,7 @@ pub fn load_provider_config(client: &dyn ConfigClient) -> Option<ModelConfig> {
 /// A human-friendly label for a provider id (falls back to the id itself).
 pub fn provider_display_name(id: &str) -> String {
     match id {
+        "claude" => "Claude",
         "anthropic" => "Anthropic",
         "openai" => "OpenAI",
         "gemini" => "Google Gemini",

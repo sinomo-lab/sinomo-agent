@@ -4,6 +4,7 @@ use super::*;
 pub(super) enum ProviderName {
     GitHubCopilot,
     Codex,
+    Claude,
     Anthropic,
     OpenAi,
     DeepSeek,
@@ -44,6 +45,7 @@ pub(super) fn parse_provider_command(args: &[String]) -> Result<ProviderCliComma
     let provider = match provider.as_str() {
         "github-copilot" => ProviderName::GitHubCopilot,
         "codex" => ProviderName::Codex,
+        "claude" => ProviderName::Claude,
         "anthropic" => ProviderName::Anthropic,
         "openai" => ProviderName::OpenAi,
         "deepseek" => ProviderName::DeepSeek,
@@ -79,6 +81,7 @@ pub(super) fn run_provider_command(command: ProviderCliCommand) -> Result<(), Cl
         ProviderCliCommand::Auth(options) => match options.provider {
             ProviderName::GitHubCopilot => auth_github_copilot(),
             ProviderName::Codex => auth_codex(),
+            ProviderName::Claude => auth_claude(),
             ProviderName::Anthropic => auth_api_key_provider(
                 "Anthropic",
                 AnthropicProvider::PROVIDER_ID,
@@ -100,6 +103,7 @@ pub(super) fn run_provider_command(command: ProviderCliCommand) -> Result<(), Cl
         ProviderCliCommand::Test(options) => match options.provider {
             ProviderName::GitHubCopilot => test_github_copilot(),
             ProviderName::Codex => test_codex(),
+            ProviderName::Claude => test_claude(),
             ProviderName::Anthropic => test_api_key_provider(
                 "Anthropic",
                 AnthropicProvider::PROVIDER_ID,
@@ -136,14 +140,21 @@ pub fn provider_uses_device_login(provider: &str) -> bool {
 pub fn provider_signed_in(provider: &str) -> bool {
     let path = match provider {
         "codex" => codex_provider().ok().map(|(_, path)| path),
+        "claude" => claude_provider().ok().map(|(_, path)| path),
         "github-copilot" => github_copilot_provider().ok().map(|(_, path)| path),
         _ => None,
     };
-    path.is_some_and(|path| {
-        std::fs::metadata(&path)
-            .map(|meta| meta.len() > 0)
-            .unwrap_or(false)
-    })
+    match provider {
+        "claude" => claude_provider()
+            .ok()
+            .map(|(provider, _)| provider.has_oauth_tokens())
+            .unwrap_or(false),
+        _ => path.is_some_and(|path| {
+            std::fs::metadata(&path)
+                .map(|meta| meta.len() > 0)
+                .unwrap_or(false)
+        }),
+    }
 }
 
 /// Run a provider's OAuth device-login flow: start it (calling `on_prompt` with the URL + user
@@ -295,6 +306,29 @@ pub fn auth_codex() -> Result<(), CliError> {
     Ok(())
 }
 
+pub fn auth_claude() -> Result<(), CliError> {
+    let (provider, _credentials_path) = claude_provider()?;
+    let login = provider.begin_pkce_login()?;
+    println!("Open this URL in your browser:");
+    println!("{}", login.authorization_url);
+    println!();
+    println!("After authorizing, paste the returned code here.");
+    println!("The code should include the state suffix after `#`.");
+    print!("Authorization code: ");
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+
+    let mut authorization_code = String::new();
+    std::io::stdin()
+        .read_line(&mut authorization_code)
+        .map_err(|source| CliError::AuthProvider {
+            detail: source.to_string(),
+        })?;
+    provider.complete_pkce_login(&login, &authorization_code)?;
+    test_provider_credentials(ClaudeProvider::PROVIDER_ID)?;
+    println!("Claude credentials saved.");
+    Ok(())
+}
+
 pub fn test_codex() -> Result<(), CliError> {
     let result = test_provider_credentials(CODEX_PROVIDER_ID)?;
     println!(
@@ -303,6 +337,17 @@ pub fn test_codex() -> Result<(), CliError> {
     );
     println!("Codex ChatGPT auth: ok");
     println!("Codex provider connection: ok");
+    Ok(())
+}
+
+pub fn test_claude() -> Result<(), CliError> {
+    let result = test_provider_credentials(ClaudeProvider::PROVIDER_ID)?;
+    println!(
+        "Testing Claude credentials at {}",
+        result.credentials_path.display()
+    );
+    println!("Claude subscription auth: ok");
+    println!("Claude provider connection: ok");
     Ok(())
 }
 

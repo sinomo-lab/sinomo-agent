@@ -21,23 +21,23 @@ use super::{
     build_cluster_raft_append_request_from_next_index, cli_command_is_help,
     cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
     cli_invocation_force_local_mode, cluster_doctor_findings, cluster_has_local_quorum,
-    cluster_init_with_paths, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_kv_state_authority_id, cluster_leave_with_paths,
-    cluster_migration_plan_with_paths, cluster_node_status_from_daemon_status,
-    cluster_peer_members, cluster_state_sync_txn, compact_default_invite_introducers,
-    daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_http_fetch,
-    daemon_package_version, data_dir_storage_contract_findings, decode_cluster_join_invite,
-    encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
-    format_rollout_progress_line, handle_daemon_cluster_join_request,
-    handle_daemon_cluster_kv_txn_request, handle_daemon_rollout_build_request,
-    install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
-    invite_communication_channels, invite_introducer_endpoint,
-    invite_introducer_endpoint_from_state, load_tui_model_runtime_config,
-    main_agent_config_tool_registry, main_agent_handler_for_tui_with_data_dir,
-    managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
-    normalize_model_provider, open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command,
-    parse_cli_invocation, parse_cluster_command, parse_cluster_join_invite_argument,
-    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
+    cluster_init_with_paths, cluster_invite_with_paths, cluster_join_with_paths,
+    cluster_kv_state_authority_id, cluster_leave_with_paths, cluster_migration_plan_with_paths,
+    cluster_node_status_from_daemon_status, cluster_peer_members, cluster_state_sync_txn,
+    compact_default_invite_introducers, daemon_advertised_endpoints_for_state,
+    daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
+    data_dir_storage_contract_findings, decode_cluster_join_invite, encode_cluster_join_invite,
+    ensure_rollout_layout, expire_cluster_network_records_in_kv, format_rollout_progress_line,
+    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_txn_request,
+    handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
+    invite_channels_for_join_registration, invite_communication_channels,
+    invite_introducer_endpoint, invite_introducer_endpoint_from_state,
+    load_tui_model_runtime_config, main_agent_config_tool_registry,
+    main_agent_handler_for_tui_with_data_dir, managed_source_status, model_config_uses_cluster,
+    models_default_with_data_dir, normalize_model_provider,
+    open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
+    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
+    parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
     parse_provider_command, parse_rollout_command, parse_slash_command, parse_test_command,
     parse_uninstall_options, parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
@@ -511,6 +511,19 @@ fn provider_commands_parse_action_before_provider() {
         ProviderCliCommand::Test(ProviderCommandOptions {
             provider: ProviderName::GitHubCopilot,
             account: "default".to_string(),
+        })
+    );
+    assert_eq!(
+        parse_provider_command(&[
+            "auth".to_string(),
+            "claude".to_string(),
+            "--account".to_string(),
+            "personal".to_string(),
+        ])
+        .expect("provider command"),
+        ProviderCliCommand::Auth(ProviderCommandOptions {
+            provider: ProviderName::Claude,
+            account: "personal".to_string(),
         })
     );
     assert_eq!(
@@ -13716,6 +13729,14 @@ fn model_provider_aliases_normalize_to_supported_provider_ids() {
     assert_eq!(
         normalize_model_provider("google-gemini").as_deref(),
         Some("gemini")
+    );
+    assert_eq!(
+        normalize_model_provider("claude").as_deref(),
+        Some("claude")
+    );
+    assert_eq!(
+        normalize_model_provider("claude-subscription").as_deref(),
+        Some("claude")
     );
     assert_eq!(
         normalize_model_provider("anthropic-claude-code").as_deref(),
