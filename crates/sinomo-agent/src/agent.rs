@@ -14,7 +14,7 @@ use crate::{
     AgentCancellationToken, AgentCompactionEngine, AgentCompactionRequest, AgentDefinition,
     AgentError, AgentLoopDecision, AgentLoopInput, AgentOutputFormat, AgentToolCall,
     AsyncTaskNextAction, AsyncTaskUpdate, CodexStyleAgentCompactionEngine, InteractionModel,
-    InteractionSession, TaskId, agent_output_contract, parse_agent_loop_response,
+    InteractionSession, SkillCatalog, TaskId, agent_output_contract, parse_agent_loop_response,
     render_agent_package_system_prompt, render_agent_system_prompt_with_descriptors,
 };
 use serde::{Deserialize, Serialize};
@@ -3991,6 +3991,8 @@ pub struct AgentConfig {
     pub visible_toolsets: Vec<String>,
     #[serde(default, skip_serializing_if = "AgentModuleToolProjection::is_empty")]
     pub module_tool_projection: AgentModuleToolProjection,
+    #[serde(default, skip_serializing_if = "SkillCatalog::is_empty")]
+    pub skill_catalog: SkillCatalog,
     #[serde(default = "default_workspace_instruction_files")]
     pub workspace_instruction_files: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4036,6 +4038,7 @@ impl AgentConfig {
             run_context: AgentRunContext::default(),
             visible_toolsets,
             module_tool_projection: AgentModuleToolProjection::default(),
+            skill_catalog: SkillCatalog::default(),
             workspace_instruction_files: default_workspace_instruction_files(),
             instruction_file_max_bytes: Some(DEFAULT_WORKSPACE_INSTRUCTION_FILE_BYTES),
             expand_prompt_references: default_expand_prompt_references(),
@@ -4165,6 +4168,11 @@ impl AgentConfig {
 
     pub fn with_module_tool_projection(mut self, projection: AgentModuleToolProjection) -> Self {
         self.module_tool_projection = projection;
+        self
+    }
+
+    pub fn with_skill_catalog(mut self, catalog: SkillCatalog) -> Self {
+        self.skill_catalog = catalog;
         self
     }
 
@@ -6854,6 +6862,11 @@ impl<'a> AgentToolOrchestrator<'a> {
                     "model_families": &skill.model_families,
                     "activation_tags": &skill.activation_tags,
                     "required_capabilities": &skill.required_capabilities,
+                    "catalog_version": &skill.catalog_version,
+                    "catalog_content_hash": &skill.catalog_content_hash,
+                    "catalog_base_hash": &skill.catalog_base_hash,
+                    "catalog_status": &skill.catalog_status,
+                    "catalog_manifest_path": &skill.catalog_manifest_path,
                     "activation": skill_activation_metadata(skill),
                     "has_embedded_text": skill.embedded_text.is_some(),
                 })
@@ -9023,13 +9036,19 @@ impl<M: InteractionModel> Agent<M> {
     }
 
     fn skill_plan(&self) -> AgentSkillPlan {
-        AgentSkillPlan::from_package_and_modules(
+        let agent_keys = [
+            self.config.definition.key().to_string(),
+            self.config.definition.name.clone(),
+        ];
+        let catalog_entries = self
+            .config
+            .skill_catalog
+            .active_entries_for_scopes(agent_keys.iter().map(String::as_str));
+        AgentSkillPlan::from_package_modules_and_catalog_entries(
             self.config.definition.skills.clone(),
             &self.config.module_tool_projection,
-            [
-                self.config.definition.key().to_string(),
-                self.config.definition.name.clone(),
-            ],
+            agent_keys,
+            catalog_entries,
         )
     }
 }
@@ -13216,6 +13235,88 @@ mod tests {
             "skill activation requires a host runtime activation executor"
         );
         assert!(activate.evidence.record_value("skill_disclosure").is_some());
+    }
+
+    #[test]
+    fn skill_disclosure_includes_active_catalog_skills() {
+        let text = "# Catalog skill\nUse the SIFS catalog version.";
+        let entry = crate::SkillCatalogEntry::new(
+            "skill.catalog.debug",
+            "1.0.0",
+            crate::SkillCatalogSource::user("user.test"),
+            text,
+        )
+        .with_description("Catalog-backed debug workflow.")
+        .with_activation_tags(vec!["debug".to_string()]);
+        let mut catalog = crate::SkillCatalog::default();
+        catalog.upsert_entry(entry.clone()).expect("catalog entry");
+        catalog
+            .set_activation(crate::SkillActivationRecord::new(
+                crate::SkillActivationScope::Cluster.as_str(),
+                &entry,
+                "test",
+                "catalog default",
+            ))
+            .expect("activation");
+        let catalog_entries =
+            catalog.active_entries_for_scopes([crate::SkillActivationScope::Cluster.as_str()]);
+        let skill_plan = AgentSkillPlan::from_package_modules_and_catalog_entries(
+            std::iter::empty::<String>(),
+            &AgentModuleToolProjection::default(),
+            ["coding-agent"],
+            catalog_entries,
+        );
+
+        let registry = AgentToolRegistry::new();
+        let plan = AgentToolPlanner::plan(
+            registry.descriptors(),
+            &AgentModuleToolProjection::default(),
+            std::iter::empty::<AgentToolSpec>(),
+            std::iter::empty::<AgentToolSpec>(),
+            false,
+            ["discovery"],
+            registry.generation(),
+        );
+        let input = agent_input("use catalog skill");
+        let policy = AgentToolSurface::default_for_role(AgentRole::Deliberation);
+        let run_context = AgentRunContext::default();
+        let orchestrator =
+            AgentToolOrchestrator::new(&policy, None, &run_context).with_skill_plan(skill_plan);
+        let search = orchestrator.execute(
+            &registry,
+            &input.session,
+            &plan,
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "skill_search".to_string(),
+                input: serde_json::json!({ "query": "catalog" }),
+                r#async: false,
+                summary: "find catalog skill".to_string(),
+            },
+        );
+        assert_eq!(search.status, AgentToolStatus::Succeeded);
+        let matches = search
+            .output
+            .get("matches")
+            .and_then(serde_json::Value::as_array)
+            .expect("matches");
+        assert!(
+            matches.iter().any(|value| {
+                value.get("id").and_then(serde_json::Value::as_str) == Some("skill.catalog.debug")
+                    && value.get("source").and_then(serde_json::Value::as_str) == Some("catalog")
+                    && value
+                        .get("catalog_version")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("1.0.0")
+                    && value
+                        .get("catalog_content_hash")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(entry.content_hash.as_str())
+            }),
+            "{matches:?}"
+        );
     }
 
     #[test]

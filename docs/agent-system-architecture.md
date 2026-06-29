@@ -52,6 +52,8 @@ Important exported surfaces:
 - `AgentCompactor` and `AgentCompactionSummary`;
 - `AgentToolRegistry`, `AgentToolOrchestrator`, `AgentToolSurface`,
   `ToolAvailability`, `AgentToolEvidence`, and `AgentToolPairIntegrity`;
+- `SkillCatalog`, `SkillCatalogEntry`, `SkillCatalogSifsStore`,
+  `SkillActivationRecord`, and `SkillConflictRecord`;
 - `AgentSessionStore`, `FileAgentSessionStore`, `AgentTraceStore`, and
   `FileAgentTraceStore`;
 - `AgentSessionControlPlane`, `AgentSessionRuntime`,
@@ -98,6 +100,31 @@ invalid tool names, invalid tool-surface entries, invalid skills, invalid
 context providers, blank model preferences, invalid temperatures, conflicting
 legacy/model-policy fields, zero runtime limits, and unknown context or
 compaction strategies before the package enters the catalog.
+
+## Skill Catalog
+
+The managed skill catalog is cluster state stored in SIFS under
+`/services/sinomo/skills`. Skill bodies are human-readable `SKILL.md` files.
+Catalog metadata, active pointers, and conflict records are SOBJ files. Sinomo
+built-ins and module-declared skills are provider-managed sources and can be
+reconciled automatically into SIFS. User, agent, and evolution skills are
+override sources and must not be overwritten silently by provider updates.
+
+Module skills use existing `ModuleDeclarativeResourceKind::Skill` declarations.
+Embedded module skill text can be materialized directly; path-backed module
+resources resolve their bytes through the module payload before publishing the
+same catalog write. `AgentSkillPlan` merges package-declared skills,
+module-projected skills, and active catalog entries. Catalog descriptors carry
+SIFS path, version, content hash, base hash, status, and manifest path so
+`skill_search` and `skill_describe` can disclose provenance without loading
+every skill body into prompt context.
+
+Upstream updates for Sinomo or module skills auto-replace only clean
+provider-managed versions from the same source. When a user, agent, or
+evolution override exists, the catalog records either a three-way merge
+candidate or an open conflict. Resolution modes preserve the Hermes-style
+operator choices: keep the existing override, overwrite with backup, rename the
+override, or accept a merged version.
 
 Runtime limits are unbounded by default. Explicit caps remain opt-in and can be
 set by callers that own a concrete session or model constraint. Package-derived

@@ -27,6 +27,7 @@ mod process;
 mod readiness;
 mod service;
 mod session_store;
+mod skill_catalog;
 pub mod tools;
 
 pub use agent::*;
@@ -36,6 +37,7 @@ pub use process::*;
 pub use readiness::*;
 pub use service::*;
 pub use session_store::*;
+pub use skill_catalog::*;
 pub use tools::*;
 
 pub type TaskId = Id;
@@ -74,6 +76,12 @@ pub fn register_storage_paths(
         sinomo_runtime::storage::StorageRing::R2,
         "agents",
         "local user-defined agent definitions",
+    )?;
+    layout.register_escape_path(
+        "sinomo-agent",
+        sinomo_runtime::storage::StorageRing::R2,
+        "skills",
+        "local mirror and import/export staging for SIFS-backed skill catalog artifacts",
     )
 }
 
