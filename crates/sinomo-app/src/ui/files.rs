@@ -1757,6 +1757,24 @@ impl FilesState {
         );
     }
 
+    fn start_current_location_replica_repair(&mut self, waker: Option<sui::UiHandle>) {
+        if self.source != FilesSourceKind::Sifs {
+            return;
+        }
+        let path = self.path.clone();
+        self.start_operation(
+            FilesOperation {
+                kind: FilesOperationKind::RepairReplicas,
+                path: path.clone(),
+                target: None,
+                directory: true,
+            },
+            "Repair replicas".to_string(),
+            path,
+            waker,
+        );
+    }
+
     fn start_make_metadata_primary(&mut self, waker: Option<sui::UiHandle>) {
         if self.source != FilesSourceKind::Sifs {
             return;
@@ -8513,6 +8531,7 @@ fn inspector_min_content_h(tasks: &[FilesTask]) -> f32 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RootInspectorAction {
     RefreshFolder,
+    RepairReplicas,
     OpenCluster,
     ConnectionSettings,
 }
@@ -8521,6 +8540,7 @@ impl RootInspectorAction {
     fn label(self) -> &'static str {
         match self {
             Self::RefreshFolder => "Refresh folder",
+            Self::RepairReplicas => "Repair replicas",
             Self::OpenCluster => "Open Cluster",
             Self::ConnectionSettings => "Connection settings",
         }
@@ -8529,6 +8549,7 @@ impl RootInspectorAction {
     fn glyph(self) -> IconGlyph {
         match self {
             Self::RefreshFolder => IconGlyph::Redo,
+            Self::RepairReplicas => IconGlyph::Redo,
             Self::OpenCluster => IconGlyph::Storage,
             Self::ConnectionSettings => IconGlyph::Alert,
         }
@@ -8537,6 +8558,7 @@ impl RootInspectorAction {
     fn description(self) -> &'static str {
         match self {
             Self::RefreshFolder => "Reload the current file listing and SIFS health summary",
+            Self::RepairReplicas => "Request SIFS replica repair for the current location",
             Self::OpenCluster => "Open Cluster health and routing diagnostics",
             Self::ConnectionSettings => "Open Connection settings for daemon and SIFS recovery",
         }
@@ -8550,6 +8572,13 @@ fn unselected_inspector_actions(files: &FilesState) -> Vec<RootInspectorAction> 
 
     let mut actions = vec![RootInspectorAction::RefreshFolder];
     if files.source == FilesSourceKind::Sifs {
+        if files
+            .sifs_health
+            .as_ref()
+            .is_some_and(|health| health.pending_repair_count > 0)
+        {
+            actions.push(RootInspectorAction::RepairReplicas);
+        }
         if files.sifs_health.as_ref().is_some_and(|health| {
             sifs_health_has_attention(health) || sifs_health_has_activity(health)
         }) {
@@ -8842,6 +8871,7 @@ fn root_inspector_action_button_widget_id(
 ) -> sui::WidgetId {
     let salt = match action {
         RootInspectorAction::RefreshFolder => 7_701,
+        RootInspectorAction::RepairReplicas => 7_702,
         RootInspectorAction::OpenCluster => 7_703,
         RootInspectorAction::ConnectionSettings => 7_707,
     };
@@ -8959,6 +8989,13 @@ impl Widget for InspectorView {
                 match action {
                     RootInspectorAction::RefreshFolder => {
                         self.shared.files_mut().reload();
+                        request_files_overlay_rebuild(ctx);
+                    }
+                    RootInspectorAction::RepairReplicas => {
+                        let waker = { self.shared.borrow().waker.clone() };
+                        self.shared
+                            .files_mut()
+                            .start_current_location_replica_repair(waker);
                         request_files_overlay_rebuild(ctx);
                     }
                     RootInspectorAction::OpenCluster => {
@@ -10037,6 +10074,7 @@ impl InspectorView {
     ) {
         let (fill, border, text, icon) = match action {
             RootInspectorAction::RefreshFolder => (pal.field, pal.border, pal.text, pal.accent),
+            RootInspectorAction::RepairReplicas => (pal.field, pal.border, pal.accent, pal.accent),
             RootInspectorAction::OpenCluster => (pal.field, pal.border, pal.text, pal.accent),
             RootInspectorAction::ConnectionSettings => (pal.field, pal.warn, pal.warn, pal.warn),
         };
@@ -12533,6 +12571,72 @@ mod tests {
             FilesWorkerCommand::Operation { .. } => panic!("expected list command"),
             FilesWorkerCommand::Details { .. } => panic!("expected list command"),
             FilesWorkerCommand::Preview { .. } => panic!("expected list command"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn unselected_sifs_inspector_action_repairs_current_location() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let (tx, rx) = mpsc::channel();
+        let (_result_tx, result_rx) = mpsc::channel();
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.source = FilesSourceKind::Sifs;
+            files.clustered = true;
+            files.path = "/cluster-tests".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/cluster-tests/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.sifs_health = Some(degraded_sifs_health());
+            files.worker_tx = Some(tx);
+            files.worker_rx = Some(result_rx);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files root repair action")
+                    .root(
+                        SizedBox::new()
+                            .width(INSPECTOR_W)
+                            .height(720.0)
+                            .with_child(InspectorView::new(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Repair replicas")
+            .click()?;
+
+        assert_eq!(shared.files().tasks[0].title, "Repair replicas");
+        match rx.try_recv().expect("replica repair command") {
+            FilesWorkerCommand::Operation {
+                request_id,
+                source,
+                operation,
+            } => {
+                assert_eq!(request_id, shared.files().tasks[0].id);
+                assert_eq!(source, FilesSourceKind::Sifs);
+                assert_eq!(operation.kind, FilesOperationKind::RepairReplicas);
+                assert_eq!(operation.path, "/cluster-tests");
+                assert!(operation.directory);
+            }
+            FilesWorkerCommand::List { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
         }
 
         Ok(())
