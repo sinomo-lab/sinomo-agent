@@ -41,10 +41,10 @@ use sinomo_agent::{
     AgentSessionProgressRequest, AgentSessionProgressResponse, AgentSessionResumeRequest,
     AgentSessionResumeResponse, AgentSessionRuntime, AgentSessionSteerRequest,
     AgentSessionTerminalResultsRequest, AgentSessionTerminalResultsResponse,
-    AgentTaskTerminalResult, AgentToolProgressEvent, ConfigAgentToolConfig, EventEnvelopeExt,
-    FileAgentDefinitionStore, InteractionModel, InteractionOutput, InteractionSession,
-    InteractionSurface, InteractionSurfaceKind, TaskId, interaction_event,
-    run_local_agent_readiness_gate, user_interaction_input_event,
+    AgentTaskTerminalResult, AgentToolProgressEvent, AgentToolRegistry, ConfigAgentToolConfig,
+    EventEnvelopeExt, FileAgentDefinitionStore, InteractionModel, InteractionOutput,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
+    TaskId, interaction_event, run_local_agent_readiness_gate, user_interaction_input_event,
 };
 use sinomo_lm::{
     AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, ClaudeProvider, CurrentDefaultModel,
@@ -3235,11 +3235,25 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
 
 pub(crate) fn main_agent_config_tool_registry(
     data_dir: &SinomoDataDir,
-) -> Result<sinomo_agent::AgentToolRegistry, CliError> {
+) -> Result<AgentToolRegistry, CliError> {
+    let workspace_root = std::env::current_dir().map_err(|source| CliError::Io {
+        path: "current directory".to_string(),
+        detail: source.to_string(),
+    })?;
+    main_agent_tool_registry_for_workspace(data_dir, &workspace_root)
+}
+
+pub(crate) fn main_agent_tool_registry_for_workspace(
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+) -> Result<AgentToolRegistry, CliError> {
     let store = main_agent_config_store()?;
-    Ok(sinomo_agent::AgentToolRegistry::config_management(
-        ConfigAgentToolConfig::new(data_dir.clone(), store),
-    ))
+    Ok(
+        AgentToolRegistry::local_workspace_with_config(LocalWorkspaceAgentConfig::new(
+            workspace_root,
+        ))
+        .with_config_management(ConfigAgentToolConfig::new(data_dir.clone(), store)),
+    )
 }
 
 pub(crate) fn main_agent_config_store() -> Result<sinomo_runtime::config::ConfigStore, CliError> {

@@ -51,7 +51,6 @@ type Handler = RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>;
 const APP_CHAT_RUNTIME_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 const APP_CHAT_RUNTIME_START_TIMEOUT: Duration = Duration::from_secs(5);
 const APP_CHAT_RUNTIME_SILENCE_TIMEOUT: Duration = Duration::from_secs(45);
-const STRUCTURED_AGENT_JSON_STREAM: &str = "__sinomo_structured_agent_json_stream__";
 pub const SIFS_AGENT_CHANNELS_ROOT: &str = "/services/sinomo-agent/channels";
 
 /// Lightweight channel metadata for list views.
@@ -1673,7 +1672,7 @@ fn drain_runtime_events_with_limits(
     let mut saw_worker = false;
     let mut terminal = false;
     let mut failure = None;
-    let mut streamed_text = String::new();
+    let mut stream_state = ChatStreamState::default();
     let started_at = Instant::now();
     let mut last_event_at = started_at;
 
@@ -1706,7 +1705,7 @@ fn drain_runtime_events_with_limits(
         last_event_at = Instant::now();
 
         for event in events {
-            match runtime_event_to_chat(event, &mut streamed_text, on_event) {
+            match runtime_event_to_chat(event, &mut stream_state, on_event) {
                 RuntimeDrainState::Running => {
                     saw_worker = true;
                 }
@@ -1747,9 +1746,63 @@ enum RuntimeDrainState {
     TerminalErr(String),
 }
 
+#[derive(Default)]
+struct ChatStreamState {
+    visible_text: String,
+    structured_json: String,
+}
+
+impl ChatStreamState {
+    fn append_plain_token(&mut self, token: &str) {
+        self.structured_json.clear();
+        self.visible_text.push_str(token);
+    }
+
+    fn emit_text_suffix(&mut self, text: &str, on_event: &mut dyn FnMut(ChatStreamEvent)) {
+        if text.is_empty() {
+            return;
+        }
+        if self.visible_text.trim().is_empty() {
+            self.visible_text.clear();
+            self.visible_text.push_str(text);
+            on_event(ChatStreamEvent::Token(text.to_string()));
+        } else if text.starts_with(self.visible_text.as_str()) {
+            let suffix = &text[self.visible_text.len()..];
+            if !suffix.is_empty() {
+                self.visible_text.push_str(suffix);
+                on_event(ChatStreamEvent::Token(suffix.to_string()));
+            }
+        } else if self.visible_text.as_str() != text {
+            self.visible_text.clear();
+            self.visible_text.push_str(text);
+            on_event(ChatStreamEvent::Token(text.to_string()));
+        }
+    }
+
+    fn emit_final_text(&mut self, text: &str, on_event: &mut dyn FnMut(ChatStreamEvent)) {
+        self.structured_json.clear();
+        self.emit_text_suffix(text, on_event);
+    }
+
+    fn append_structured_delta(&mut self, delta: &str, on_event: &mut dyn FnMut(ChatStreamEvent)) {
+        if self.structured_json.is_empty() {
+            self.structured_json.push_str(delta);
+        } else if delta.starts_with(self.structured_json.as_str()) {
+            self.structured_json.clear();
+            self.structured_json.push_str(delta);
+        } else {
+            self.structured_json.push_str(delta);
+        }
+
+        if let Some(text) = structured_json_text_prefix(&self.structured_json) {
+            self.emit_text_suffix(&text, on_event);
+        }
+    }
+}
+
 fn runtime_event_to_chat(
     event: AgentRuntimeEvent,
-    streamed_text: &mut String,
+    stream_state: &mut ChatStreamState,
     on_event: &mut dyn FnMut(ChatStreamEvent),
 ) -> RuntimeDrainState {
     match event.payload {
@@ -1766,27 +1819,12 @@ fn runtime_event_to_chat(
         AgentRuntimeEventPayload::TurnFinalDecision { decision, .. } => {
             let text = decision.text.trim();
             if !text.is_empty() {
-                if streamed_text == STRUCTURED_AGENT_JSON_STREAM || streamed_text.trim().is_empty()
-                {
-                    streamed_text.clear();
-                    streamed_text.push_str(text);
-                    on_event(ChatStreamEvent::Token(text.to_string()));
-                } else if text.starts_with(streamed_text.as_str()) {
-                    let suffix = &text[streamed_text.len()..];
-                    if !suffix.is_empty() {
-                        streamed_text.push_str(suffix);
-                        on_event(ChatStreamEvent::Token(suffix.to_string()));
-                    }
-                } else if streamed_text.as_str() != text {
-                    streamed_text.clear();
-                    streamed_text.push_str(text);
-                    on_event(ChatStreamEvent::Token(text.to_string()));
-                }
+                stream_state.emit_final_text(text, on_event);
             }
             RuntimeDrainState::Running
         }
         AgentRuntimeEventPayload::ModelProgress { event, .. } => {
-            forward_model_event(event, streamed_text, on_event);
+            forward_model_event(event, stream_state, on_event);
             RuntimeDrainState::Running
         }
         AgentRuntimeEventPayload::ToolProgress { event, .. } => {
@@ -1799,7 +1837,7 @@ fn runtime_event_to_chat(
 
 fn forward_model_event(
     event: AgentModelEvent,
-    streamed_text: &mut String,
+    stream_state: &mut ChatStreamState,
     on_event: &mut dyn FnMut(ChatStreamEvent),
 ) {
     match event {
@@ -1812,16 +1850,15 @@ fn forward_model_event(
             on_event(ChatStreamEvent::Context(chat_context_snapshot(report)));
         }
         AgentModelEvent::AssistantTextDelta { delta, .. } => {
-            if streamed_text == STRUCTURED_AGENT_JSON_STREAM
+            if !stream_state.structured_json.is_empty()
                 || tui::starts_structured_agent_json_delta(&delta)
             {
-                streamed_text.clear();
-                streamed_text.push_str(STRUCTURED_AGENT_JSON_STREAM);
+                stream_state.append_structured_delta(&delta, on_event);
                 return;
             }
             for event in split_chunk(&delta) {
                 if let ChatStreamEvent::Token(token) = &event {
-                    streamed_text.push_str(token);
+                    stream_state.append_plain_token(token);
                 }
                 on_event(event);
             }
@@ -1887,6 +1924,102 @@ fn forward_model_event(
             on_event(ChatStreamEvent::Notice(format!("model aborted: {reason}")));
         }
     }
+}
+
+fn structured_json_text_prefix(raw: &str) -> Option<String> {
+    let mut json = raw.trim_start();
+    if let Some(after_fence) = json.strip_prefix("```json") {
+        json = after_fence.trim_start_matches(['\r', '\n']);
+    } else if let Some(after_fence) = json.strip_prefix("```") {
+        json = after_fence.trim_start_matches(['\r', '\n']);
+    }
+    let value_start = json_text_value_start(json)?;
+    decode_json_string_prefix(&json[value_start..])
+}
+
+fn json_text_value_start(json: &str) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(relative) = json[search_from..].find("\"text\"") {
+        let key_start = search_from + relative;
+        if is_escaped_quote(json, key_start) {
+            search_from = key_start + 1;
+            continue;
+        }
+        let mut cursor = key_start + "\"text\"".len();
+        cursor += json[cursor..]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if !json[cursor..].starts_with(':') {
+            search_from = key_start + 1;
+            continue;
+        }
+        cursor += ':'.len_utf8();
+        cursor += json[cursor..]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if json[cursor..].starts_with('"') {
+            return Some(cursor + '"'.len_utf8());
+        }
+        return None;
+    }
+    None
+}
+
+fn is_escaped_quote(text: &str, quote_index: usize) -> bool {
+    let mut slash_count = 0;
+    for byte in text[..quote_index].as_bytes().iter().rev() {
+        if *byte == b'\\' {
+            slash_count += 1;
+        } else {
+            break;
+        }
+    }
+    slash_count % 2 == 1
+}
+
+fn decode_json_string_prefix(text: &str) -> Option<String> {
+    let mut output = String::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Some(output),
+            '\\' => {
+                let escaped = chars.next()?;
+                match escaped {
+                    '"' => output.push('"'),
+                    '\\' => output.push('\\'),
+                    '/' => output.push('/'),
+                    'b' => output.push('\u{0008}'),
+                    'f' => output.push('\u{000c}'),
+                    'n' => output.push('\n'),
+                    'r' => output.push('\r'),
+                    't' => output.push('\t'),
+                    'u' => {
+                        let mut digits = String::new();
+                        for _ in 0..4 {
+                            let digit = chars.next()?;
+                            if !digit.is_ascii_hexdigit() {
+                                return Some(output);
+                            }
+                            digits.push(digit);
+                        }
+                        if let Ok(value) = u32::from_str_radix(&digits, 16)
+                            && let Some(decoded) = char::from_u32(value)
+                        {
+                            output.push(decoded);
+                        }
+                    }
+                    _ => return Some(output),
+                }
+            }
+            _ => output.push(ch),
+        }
+    }
+    Some(output)
 }
 
 fn forward_tool_event(event: AgentToolProgressEvent, on_event: &mut dyn FnMut(ChatStreamEvent)) {
@@ -3320,7 +3453,7 @@ mod tests {
 
     #[test]
     fn chat_mapper_emits_final_decision_without_streaming_delta() {
-        let mut streamed_text = String::new();
+        let mut stream_state = ChatStreamState::default();
         let mut events = Vec::new();
         let mut on_event = |event| events.push(chat_event_label(event));
 
@@ -3331,18 +3464,18 @@ mod tests {
                 decision: final_decision("ready"),
                 stop_reason: AgentStopReason::FinalDecision,
             }),
-            &mut streamed_text,
+            &mut stream_state,
             &mut on_event,
         );
 
         assert!(matches!(state, RuntimeDrainState::Running));
         assert_eq!(events, vec!["token:ready"]);
-        assert_eq!(streamed_text, "ready");
+        assert_eq!(stream_state.visible_text, "ready");
     }
 
     #[test]
     fn chat_mapper_appends_only_final_suffix_after_streaming_delta() {
-        let mut streamed_text = String::new();
+        let mut stream_state = ChatStreamState::default();
         let mut events = Vec::new();
         let mut on_event = |event| events.push(chat_event_label(event));
         let op_id = TaskId::generate();
@@ -3356,7 +3489,7 @@ mod tests {
                     delta: "hello".to_string(),
                 },
             }),
-            &mut streamed_text,
+            &mut stream_state,
             &mut on_event,
         );
         let final_state = runtime_event_to_chat(
@@ -3366,19 +3499,19 @@ mod tests {
                 decision: final_decision("hello world"),
                 stop_reason: AgentStopReason::FinalDecision,
             }),
-            &mut streamed_text,
+            &mut stream_state,
             &mut on_event,
         );
 
         assert!(matches!(first, RuntimeDrainState::Running));
         assert!(matches!(final_state, RuntimeDrainState::Running));
         assert_eq!(events, vec!["token:hello", "token: world"]);
-        assert_eq!(streamed_text, "hello world");
+        assert_eq!(stream_state.visible_text, "hello world");
     }
 
     #[test]
-    fn chat_mapper_suppresses_structured_agent_json_delta() {
-        let mut streamed_text = String::new();
+    fn chat_mapper_streams_structured_agent_json_text_delta() {
+        let mut stream_state = ChatStreamState::default();
         let mut events = Vec::new();
         let mut on_event = |event| events.push(chat_event_label(event));
         let op_id = TaskId::generate();
@@ -3399,7 +3532,7 @@ mod tests {
                     .to_string(),
                 },
             }),
-            &mut streamed_text,
+            &mut stream_state,
             &mut on_event,
         );
         let final_state = runtime_event_to_chat(
@@ -3409,19 +3542,19 @@ mod tests {
                 decision: final_decision("ready"),
                 stop_reason: AgentStopReason::FinalDecision,
             }),
-            &mut streamed_text,
+            &mut stream_state,
             &mut on_event,
         );
 
         assert!(matches!(first, RuntimeDrainState::Running));
         assert!(matches!(final_state, RuntimeDrainState::Running));
         assert_eq!(events, vec!["token:ready"]);
-        assert_eq!(streamed_text, "ready");
+        assert_eq!(stream_state.visible_text, "ready");
     }
 
     #[test]
-    fn chat_mapper_suppresses_partial_structured_agent_json_delta() {
-        let mut streamed_text = String::new();
+    fn chat_mapper_streams_partial_structured_agent_json_text_delta() {
+        let mut stream_state = ChatStreamState::default();
         let mut events = Vec::new();
         let mut on_event = |event| events.push(chat_event_label(event));
         let op_id = TaskId::generate();
@@ -3435,7 +3568,7 @@ mod tests {
                     delta: "{\n".to_string(),
                 },
             }),
-            &mut streamed_text,
+            &mut stream_state,
             &mut on_event,
         );
         let second = runtime_event_to_chat(
@@ -3447,7 +3580,7 @@ mod tests {
                     delta: r#""response_mode":"answer","text":"ready","tool_calls":[],"background_handoff":null,"next_state":"listening"}"#.to_string(),
                 },
             }),
-            &mut streamed_text,
+            &mut stream_state,
             &mut on_event,
         );
         let final_state = runtime_event_to_chat(
@@ -3457,7 +3590,7 @@ mod tests {
                 decision: final_decision("ready"),
                 stop_reason: AgentStopReason::FinalDecision,
             }),
-            &mut streamed_text,
+            &mut stream_state,
             &mut on_event,
         );
 
@@ -3465,7 +3598,58 @@ mod tests {
         assert!(matches!(second, RuntimeDrainState::Running));
         assert!(matches!(final_state, RuntimeDrainState::Running));
         assert_eq!(events, vec!["token:ready"]);
-        assert_eq!(streamed_text, "ready");
+        assert_eq!(stream_state.visible_text, "ready");
+    }
+
+    #[test]
+    fn chat_mapper_streams_long_structured_agent_json_text_increments() {
+        let mut stream_state = ChatStreamState::default();
+        let mut events = Vec::new();
+        let mut on_event = |event| events.push(chat_event_label(event));
+        let op_id = TaskId::generate();
+
+        for (sequence, delta) in [
+            (
+                1,
+                r##"{"response_mode":"answer","text":"# Draft\n"##.to_string(),
+            ),
+            (2, "Body paragraph".to_string()),
+            (
+                3,
+                r#"\nDone","tool_calls":[],"background_handoff":null,"next_state":"listening"}"#
+                    .to_string(),
+            ),
+        ] {
+            runtime_event_to_chat(
+                runtime_event(AgentRuntimeEventPayload::ModelProgress {
+                    sequence,
+                    op_id: op_id.clone(),
+                    event: AgentModelEvent::AssistantTextDelta {
+                        step_index: 0,
+                        delta,
+                    },
+                }),
+                &mut stream_state,
+                &mut on_event,
+            );
+        }
+        let final_state = runtime_event_to_chat(
+            runtime_event(AgentRuntimeEventPayload::TurnFinalDecision {
+                sequence: 4,
+                op_id,
+                decision: final_decision("# Draft\nBody paragraph\nDone"),
+                stop_reason: AgentStopReason::FinalDecision,
+            }),
+            &mut stream_state,
+            &mut on_event,
+        );
+
+        assert!(matches!(final_state, RuntimeDrainState::Running));
+        assert_eq!(
+            events,
+            vec!["token:# Draft\n", "token:Body paragraph", "token:\nDone"]
+        );
+        assert_eq!(stream_state.visible_text, "# Draft\nBody paragraph\nDone");
     }
 
     #[test]
@@ -3486,7 +3670,7 @@ mod tests {
 
     #[test]
     fn progress_model_deltas_are_forwarded_as_notices() {
-        let mut streamed_text = String::new();
+        let mut stream_state = ChatStreamState::default();
         let mut events = Vec::new();
         let mut on_event = |event| events.push(chat_event_label(event));
 
@@ -3496,12 +3680,12 @@ mod tests {
                 delta: "<sinomo_progress>waiting for configured model runtime</sinomo_progress>"
                     .to_string(),
             },
-            &mut streamed_text,
+            &mut stream_state,
             &mut on_event,
         );
 
         assert_eq!(events, vec!["notice:waiting for configured model runtime"]);
-        assert!(streamed_text.is_empty());
+        assert!(stream_state.visible_text.is_empty());
     }
 
     #[test]

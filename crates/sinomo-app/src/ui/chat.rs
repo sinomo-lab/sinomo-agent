@@ -354,7 +354,7 @@ impl ChatQuickAction {
     fn prompt(self) -> Option<&'static str> {
         match self {
             Self::PlanChange => Some(
-                "Plan the next code change in this repository and identify the safest first step.",
+                "Use the coding tools to inspect this repository, then plan the next code change. Return the safest first step, the files or commands you would check first, likely risks, and a focused verification command.",
             ),
             Self::CheckCluster => {
                 Some("Check the local cluster status and explain anything that needs attention.")
@@ -385,10 +385,10 @@ impl ChatQuickAction {
 
     fn description(self) -> &'static str {
         match self {
-            Self::PlanChange => "Prepare a planning prompt",
-            Self::CheckCluster => "Prepare a cluster status prompt",
-            Self::DraftDocument => "Prepare a document drafting prompt",
-            Self::ReasonImage => "Prepare an image or file reasoning prompt",
+            Self::PlanChange => "Use coding agent to plan repository work",
+            Self::CheckCluster => "Use background agent to inspect cluster status",
+            Self::DraftDocument => "Prepare a polished Markdown note",
+            Self::ReasonImage => "Open attachment controls for image or file analysis",
             Self::RolePlay => "Prepare a role-playing prompt",
             Self::ManageChannel => "Open channel agents and settings",
         }
@@ -396,12 +396,20 @@ impl ChatQuickAction {
 
     fn subtitle(self) -> &'static str {
         match self {
-            Self::PlanChange => "Safest first step",
-            Self::CheckCluster => "Daemon health",
+            Self::PlanChange => "coding-agent",
+            Self::CheckCluster => "background-agent",
             Self::DraftDocument => "Structured note",
             Self::ReasonImage => "Attachment analysis",
             Self::RolePlay => "Persona test",
             Self::ManageChannel => "Agents and title",
+        }
+    }
+
+    fn preferred_agent_key(self) -> Option<&'static str> {
+        match self {
+            Self::PlanChange => Some("coding-agent"),
+            Self::CheckCluster => Some("background-agent"),
+            Self::DraftDocument | Self::ReasonImage | Self::RolePlay | Self::ManageChannel => None,
         }
     }
 
@@ -3015,6 +3023,7 @@ impl ChatState {
             self.begin_edit_current_session();
             return;
         }
+        self.select_quick_action_agent(action);
         let Some(prompt) = action.prompt() else {
             return;
         };
@@ -3024,6 +3033,30 @@ impl ChatState {
             self.attachment_controls_open = true;
         }
         self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    fn select_quick_action_agent(&mut self, action: ChatQuickAction) {
+        if self.current_is_channel() || self.visible_session_has_started() {
+            return;
+        }
+        let Some(agent_key) = action.preferred_agent_key() else {
+            return;
+        };
+        if self.info.agent == agent_key
+            || self
+                .agents
+                .iter()
+                .any(|agent| agent.name == self.info.agent && agent.key == agent_key)
+        {
+            return;
+        }
+        if let Some(index) = self
+            .agents
+            .iter()
+            .position(|agent| agent.key == agent_key || agent.name == agent_key)
+        {
+            self.select_agent(index);
+        }
     }
 
     /// Select an agent by sidebar index and tell the worker to switch.
@@ -10910,6 +10943,45 @@ mod tests {
     }
 
     #[test]
+    fn plan_change_quick_action_selects_coding_agent_for_fresh_chat() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_test_agents(&mut state);
+        state.session_id = SessionId::generate().to_string();
+
+        state.apply_quick_action(ChatQuickAction::PlanChange);
+
+        let prompt = ChatQuickAction::PlanChange.prompt().expect("plan prompt");
+        assert_eq!(state.info.agent, "coding-agent");
+        assert_eq!(state.input, prompt);
+        assert_eq!(state.cursor, prompt.len());
+        assert!(
+            prompt.contains("Use the coding tools to inspect this repository"),
+            "the coding preset should ask for repository inspection, not generic planning"
+        );
+    }
+
+    #[test]
+    fn quick_action_agent_routing_keeps_started_chat_agent() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_test_agents(&mut state);
+        state.session_id = SessionId::generate().to_string();
+        state.messages.push(ChatMessage::user("already started"));
+
+        state.apply_quick_action(ChatQuickAction::PlanChange);
+
+        assert_eq!(
+            state.info.agent, "main-agent",
+            "quick actions must not silently switch the agent of an existing transcript"
+        );
+        assert_eq!(
+            state.input,
+            ChatQuickAction::PlanChange.prompt().expect("plan prompt")
+        );
+    }
+
+    #[test]
     fn empty_conversation_title_follows_selected_saved_chat() {
         let (_backend, mut state) = isolated_chat_state("empty-chat-title");
         let session_id = SessionId::generate().to_string();
@@ -11847,7 +11919,7 @@ mod tests {
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Check cluster")
-            .with_description("Prepare a cluster status prompt")
+            .with_description("Use background agent to inspect cluster status")
             .click()?;
 
         let chat = shared.chat();

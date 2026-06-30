@@ -37,10 +37,11 @@ use super::{
     invite_communication_channels, invite_introducer_endpoint,
     invite_introducer_endpoint_from_state, load_tui_model_runtime_config,
     main_agent_config_tool_registry, main_agent_handler_for_tui_with_data_dir,
-    managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
-    normalize_model_provider, open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command,
-    parse_cli_invocation, parse_cluster_command, parse_cluster_join_invite_argument,
-    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
+    main_agent_tool_registry_for_workspace, managed_source_status, model_config_uses_cluster,
+    models_default_with_data_dir, normalize_model_provider,
+    open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
+    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
+    parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
     parse_provider_command, parse_rollout_command, parse_slash_command, parse_test_command,
     parse_uninstall_options, parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
@@ -13565,16 +13566,26 @@ fn models_default_writes_global_model_config() {
 }
 
 #[test]
-fn main_agent_config_tool_registry_exposes_host_config_catalog() {
+fn main_agent_tool_registry_exposes_config_catalog_and_workspace_tools() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-config-tools");
     let data_dir = SinomoDataDir::new(&root);
-    let registry = main_agent_config_tool_registry(&data_dir).expect("config tool registry");
+    std::fs::write(root.join("workspace.txt"), "workspace tool content\n").expect("workspace file");
+    let registry =
+        main_agent_tool_registry_for_workspace(&data_dir, root.path()).expect("tool registry");
     let names: Vec<_> = registry
         .descriptors()
         .into_iter()
         .map(|descriptor| descriptor.spec.name)
         .collect();
-    for expected in ["config_search", "config_get", "config_set"] {
+    for expected in [
+        "config_search",
+        "config_get",
+        "config_set",
+        "read_file",
+        "search",
+        "changed_files",
+        "git_diff",
+    ] {
         assert!(names.iter().any(|name| name == expected), "{expected}");
     }
 
@@ -13616,6 +13627,26 @@ fn main_agent_config_tool_registry_exposes_host_config_catalog() {
     assert!(
         !keys.iter().any(|key| key.starts_with("lm.credentials.")),
         "provider credentials are account data in lm.providers, not config catalog entries"
+    );
+
+    let read = registry.execute(
+        &session,
+        0,
+        0,
+        &sinomo_agent::AgentToolCall {
+            call_id: None,
+            tool: "read_file".to_string(),
+            input: serde_json::json!({ "path": "workspace.txt" }),
+            r#async: false,
+            summary: "read workspace file".to_string(),
+        },
+    );
+    assert_eq!(read.status, sinomo_agent::AgentToolStatus::Succeeded);
+    assert_eq!(
+        read.output
+            .get("content")
+            .and_then(serde_json::Value::as_str),
+        Some("workspace tool content\n")
     );
 }
 
