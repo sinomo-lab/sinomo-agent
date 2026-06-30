@@ -372,6 +372,19 @@ fn save_sifs_with_browser(
         &sifs_session_file(id)?,
         &serde_json::to_vec(&record).map_err(|error| error.to_string())?,
     )?;
+    update_sifs_index(browser, meta)?;
+    Ok(())
+}
+
+fn update_sifs_index(browser: &SifsBrowser, meta: &SessionMeta) -> Result<(), String> {
+    let mut metas = read_sifs_index(browser).unwrap_or_default().sessions;
+    merge_session_meta(&mut metas, meta.clone());
+    metas.sort_by_key(|existing| std::cmp::Reverse(existing.updated_unix));
+    let index = StoredSessionIndex { sessions: metas };
+    browser.write_file(
+        SIFS_SESSIONS_INDEX,
+        &serde_json::to_vec(&index).map_err(|error| error.to_string())?,
+    )?;
     Ok(())
 }
 
@@ -722,6 +735,68 @@ mod tests {
                 .iter()
                 .any(|session| session.id == meta.id && session.title == meta.title),
             "flat session records should be listed even when the index is absent"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_updates_sifs_index_for_fast_sidebar_listing() {
+        let root = temp_data_dir("sifs-index-save");
+        let data_dir = SinomoDataDir::new(&root);
+        let id = "01hxy6qa9k0t9vr4g9n8d3q5f0";
+        let messages = vec![StoredMessage::new("user", "hello", "user", "message")];
+
+        save(&data_dir, id, "indexed after save", &messages).expect("save");
+
+        let browser = SifsBrowser::open(&data_dir).expect("open sifs");
+        let index = read_sifs_index(&browser).expect("session index");
+        let meta = index
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .expect("saved session indexed");
+        assert_eq!(meta.title, "indexed after save");
+        assert_eq!(meta.message_count, 1);
+        assert!(meta.deleted_unix.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rename_and_delete_update_sifs_index() {
+        let root = temp_data_dir("sifs-index-edit");
+        let data_dir = SinomoDataDir::new(&root);
+        let id = "01hxy6qa9k0t9vr4g9n8d3q5f1";
+        let messages = vec![StoredMessage::new("user", "hello", "user", "message")];
+
+        save(&data_dir, id, "original", &messages).expect("save");
+        rename(&data_dir, id, "Renamed in index").expect("rename");
+
+        let browser = SifsBrowser::open(&data_dir).expect("open sifs");
+        let index = read_sifs_index(&browser).expect("session index");
+        let meta = index
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .expect("renamed session indexed");
+        assert_eq!(meta.title, "Renamed in index");
+        assert_eq!(meta.title_source.as_deref(), Some("user"));
+        assert!(meta.deleted_unix.is_none());
+
+        delete(&data_dir, id).expect("delete");
+
+        let browser = SifsBrowser::open(&data_dir).expect("reopen sifs");
+        let index = read_sifs_index(&browser).expect("session index");
+        let meta = index
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .expect("deleted session tombstone indexed");
+        assert!(meta.deleted_unix.is_some());
+        assert!(
+            list(&data_dir).iter().all(|session| session.id != id),
+            "indexed tombstone should hide deleted sessions from the sidebar list"
         );
 
         let _ = fs::remove_dir_all(root);

@@ -114,6 +114,8 @@ impl Shell {
         // interactive app builds content when the connection resolves (see `event`).
         if shell.shared.is_ready() {
             shell.build_content();
+            let waker = { shell.shared.borrow().waker.clone() };
+            shell.shared.chat_mut().start_session_list_load(waker);
         }
         shell
     }
@@ -532,7 +534,13 @@ impl Widget for Shell {
         // and how the inner tab hosts catch nested switches).
         if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
             let cluster_changed = self.pump_cluster_refresh();
-            if cluster_changed {
+            let chat_changed = if self.shared.is_ready() {
+                self.shared.chat_mut().pump_session_list()
+            } else {
+                false
+            };
+            self.schedule_chat_session_timer(ctx);
+            if cluster_changed || chat_changed {
                 ctx.request_measure();
                 ctx.request_arrange();
                 ctx.request_semantics();
@@ -851,15 +859,54 @@ fn shell_status(shared: &Shared) -> ShellStatus {
 mod tests {
     use super::*;
     use crate::backend::Backend;
+    use crate::backend::sessions::{self, StoredMessage};
     use crate::state::AppState;
     use crate::ui::chat::{ActivityTone, ChatActivityEntry};
     use crate::ui::settings::SettingsSection;
+    use sinomo_runtime::local::SinomoDataDir;
+    use std::fs;
 
     #[test]
     fn product_wordmark_and_chat_tab_use_distinct_labels() {
         assert_eq!(Tab::Sinomo.title(), "Chat");
         assert_eq!(tab_label(Tab::Sinomo, false), "Chat");
         assert_eq!(tab_label(Tab::Sinomo, true), "Chat");
+    }
+
+    #[test]
+    fn already_ready_shell_starts_chat_history_load() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-app-ready-shell-history-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let data_dir = SinomoDataDir::new(&root);
+        let session_id = "01hxy6qa9k0t9vr4g9n8d3q6a0";
+        sessions::save(
+            &data_dir,
+            session_id,
+            "Ready shell history",
+            &[StoredMessage::new("user", "hello", "user", "message")],
+        )
+        .expect("save SIFS session");
+
+        let backend = Backend::local_fallback_for_data_dir(data_dir);
+        let state = AppState::ready(backend);
+        let shared = Shared::new(state);
+        shared.chat_mut().sessions.clear();
+
+        let _shell = Shell::new(shared.clone());
+
+        assert!(
+            shared
+                .chat()
+                .sessions
+                .iter()
+                .any(|session| session.id == session_id && session.title == "Ready shell history"),
+            "already-ready shells should kick the chat history loader"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
