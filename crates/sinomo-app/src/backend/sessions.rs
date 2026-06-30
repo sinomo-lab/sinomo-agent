@@ -372,7 +372,15 @@ fn save_sifs_with_browser(
         &sifs_session_file(id)?,
         &serde_json::to_vec(&record).map_err(|error| error.to_string())?,
     )?;
-    update_sifs_index(browser, meta)?;
+    // The flat per-session record is the authoritative SIFS object; the index only accelerates
+    // sidebar listing and can be rebuilt from records when it is stale or conflicted.
+    if let Err(error) = update_sifs_index(browser, meta) {
+        tracing::warn!(
+            session_id = %meta.id,
+            %error,
+            "chat session index update failed after the SIFS record was saved"
+        );
+    }
     Ok(())
 }
 
@@ -759,6 +767,32 @@ mod tests {
         assert_eq!(meta.title, "indexed after save");
         assert_eq!(meta.message_count, 1);
         assert!(meta.deleted_unix.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_succeeds_when_sidebar_index_update_fails() {
+        let root = temp_data_dir("sifs-index-unavailable");
+        let data_dir = SinomoDataDir::new(&root);
+        let id = "01hxy6qa9k0t9vr4g9n8d3q5f2";
+        let messages = vec![StoredMessage::new("user", "hello", "user", "message")];
+        let browser = SifsBrowser::open(&data_dir).expect("open sifs");
+        browser
+            .create_dir_all(SIFS_SESSIONS_INDEX)
+            .expect("occupy index path");
+
+        save(&data_dir, id, "saved without index", &messages)
+            .expect("flat session record should remain authoritative");
+
+        let loaded = load_transcript(&data_dir, id).expect("transcript saved");
+        assert_eq!(loaded.messages.len(), 1);
+        assert!(
+            list(&data_dir)
+                .iter()
+                .any(|session| session.id == id && session.title == "saved without index"),
+            "sidebar listing should fall back to flat SIFS records when the index is unavailable"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

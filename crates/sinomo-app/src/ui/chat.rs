@@ -1292,7 +1292,16 @@ impl ChatState {
         self.refresh_sessions();
     }
 
+    fn reset_session_list_load(&mut self) {
+        self.session_list_rx = None;
+        self.session_list_loading = false;
+        self.session_list_started_at = None;
+        self.session_list_slow_notice_shown = false;
+        self.session_list_details_open = false;
+    }
+
     fn retry_chat_list_with_waker(&mut self, waker: Option<sui::UiHandle>) {
+        self.reset_session_list_load();
         self.start_session_list_load(waker);
     }
 
@@ -14889,6 +14898,52 @@ mod tests {
                 .all(|entry| entry.title != "chat list"),
             "successful late result should clear stale chat-list warnings"
         );
+    }
+
+    #[test]
+    fn retry_chat_list_restarts_stuck_load_and_refreshes_history() {
+        let root =
+            std::env::temp_dir().join(format!("sinomo-app-chat-list-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data_dir = SinomoDataDir::new(&root);
+        let session_id = "01hxy6qa9k0t9vr4g9n8d3q6b1";
+        sessions::save(
+            &data_dir,
+            session_id,
+            "Recovered by retry",
+            &[StoredMessage::new("user", "hello", "user", "message")],
+        )
+        .expect("save persisted chat");
+        let backend = Backend::local_fallback_for_data_dir(data_dir);
+        let mut state = ChatState::new(&backend);
+        state.sessions.clear();
+        let (_tx, rx) = mpsc::channel();
+        state.session_list_rx = Some(rx);
+        state.session_list_loading = true;
+        state.session_list_started_at = Some(
+            Instant::now()
+                .checked_sub(SESSION_LIST_UI_TIMEOUT + Duration::from_secs(1))
+                .expect("past timestamp"),
+        );
+        state.session_list_slow_notice_shown = true;
+        state.session_list_details_open = true;
+
+        state.retry_chat_list_with_waker(None);
+
+        assert!(!state.session_list_loading);
+        assert!(state.session_list_rx.is_none());
+        assert!(state.session_list_started_at.is_none());
+        assert!(!state.session_list_slow_notice_shown);
+        assert!(!state.session_list_details_open);
+        assert!(
+            state
+                .sessions
+                .iter()
+                .any(|session| session.id == session_id && session.title == "Recovered by retry"),
+            "retry should discard the stale worker and reload persisted sidebar history"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
