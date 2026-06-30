@@ -50,7 +50,7 @@ pub const DAEMON_NETWORK_ENVIRONMENT_WATCH_ENV: &str = "SINOMO_DAEMON_NETWORK_EN
 pub(crate) const ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE: Duration = Duration::from_millis(200);
 const DAEMON_RUNTIME_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_IROH_PROXY_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
-const DAEMON_BACKGROUND_MAINTENANCE_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+const DAEMON_BACKGROUND_MAINTENANCE_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(90);
 const DAEMON_RUNTIME_TASK_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const DAEMON_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const DAEMON_SANDBOX_STREAM_CHANNEL_CAPACITY: usize = 64;
@@ -4263,6 +4263,11 @@ mod tests {
         assert!(
             daemon_runtime_task_join_timeout("iroh proxy") > DAEMON_RUNTIME_TASK_JOIN_TIMEOUT,
             "Iroh endpoint close needs more time than generic helper task shutdown"
+        );
+        assert!(
+            daemon_runtime_task_join_timeout("background maintenance")
+                > DAEMON_IROH_PROXY_TASK_JOIN_TIMEOUT,
+            "background maintenance may already be inside a full cluster replication budget"
         );
         assert_eq!(
             daemon_runtime_task_join_timeout("control accept"),
