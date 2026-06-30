@@ -11272,6 +11272,16 @@ fn daemon_rollout_timeout_covers_windows_shadow_handoff() {
 }
 
 #[test]
+fn remote_build_rollout_timeout_does_not_idle_timeout_slow_builds() {
+    let timeouts = super::remote_build_rollout_timeouts();
+    assert_eq!(timeouts.idle_timeout, None);
+    assert!(
+        timeouts.connect_timeout >= Some(super::remote_build_rollout_connect_timeout()),
+        "remote build connect timeout should preserve the configured connection budget"
+    );
+}
+
+#[test]
 fn rollout_progress_bar_formats_known_and_unknown_progress() {
     assert_eq!(rollout_progress_bar(None), "[........................]   -");
     let status = sinomo_runtime::core::ClusterNodeRolloutStatus {
