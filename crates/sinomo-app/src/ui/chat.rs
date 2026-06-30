@@ -79,6 +79,9 @@ const OVERVIEW_H: f32 = 86.0;
 const COMPOSER_H: f32 = 132.0;
 const PAD: f32 = 16.0;
 const SIDEBAR_ROW_H: f32 = 36.0;
+const SIDEBAR_ROW_EDIT_W: f32 = 46.0;
+const SIDEBAR_ROW_EDIT_H: f32 = 22.0;
+const SIDEBAR_ROW_EDIT_GAP: f32 = 8.0;
 const SELECTOR_H: f32 = 30.0;
 const COMPOSER_PAD_Y: f32 = 12.0;
 const COMPOSER_SECTION_GAP: f32 = 10.0;
@@ -4309,12 +4312,13 @@ impl ChatSessionRow {
     }
 
     fn edit_rect(&self, bounds: Rect) -> Rect {
-        let side = 22.0_f32.min(bounds.height()).max(0.0);
+        let width = SIDEBAR_ROW_EDIT_W.min((bounds.width() - 30.0).max(0.0));
+        let height = SIDEBAR_ROW_EDIT_H.min(bounds.height()).max(0.0);
         Rect::new(
-            bounds.max_x() - side - 2.0,
-            bounds.y() + (bounds.height() - side) * 0.5,
-            side,
-            side,
+            bounds.max_x() - width - 2.0,
+            bounds.y() + (bounds.height() - height) * 0.5,
+            width,
+            height,
         )
     }
 
@@ -4322,7 +4326,7 @@ impl ChatSessionRow {
         if !bounds.contains(position) {
             return None;
         }
-        if self.edit_rect(bounds).contains(position) {
+        if self.show_edit_button() && self.edit_rect(bounds).contains(position) {
             Some(ChatSessionRowHit::Edit)
         } else {
             Some(ChatSessionRowHit::Row)
@@ -4493,15 +4497,19 @@ impl Widget for ChatSessionRow {
                 (pal.hover, pal.border.with_alpha(0.72), pal.text_muted)
             };
             widgets::round_panel(ctx, edit, fill, border, 6.0);
-            draw_glyph(
+            widgets::draw_text_in(
                 ctx,
-                IconGlyph::MoreHorizontal,
-                edit.inflate(-4.0, -4.0),
-                glyph_color,
+                Rect::new(edit.x() + 7.0, edit.y() + 3.0, edit.width() - 14.0, 16.0),
+                "Edit",
+                pal.text_style(&theme, 10.5, FontWeight::SEMIBOLD, glyph_color),
             );
         }
 
-        let edit_gap = if show_edit { 28.0 } else { 0.0 };
+        let edit_gap = if show_edit {
+            edit.width() + SIDEBAR_ROW_EDIT_GAP
+        } else {
+            0.0
+        };
         let title_x = icon_panel.max_x() + 7.0;
         let title_right = bounds.max_x() - edit_gap - 5.0;
         let title_rect = Rect::new(
@@ -9444,6 +9452,23 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
+
+        let snapshot = window.snapshot()?;
+        let edit_button = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("Edit Dialog chat")
+            })
+            .expect("chat row edit button");
+        assert!(
+            edit_button.bounds.width() >= SIDEBAR_ROW_EDIT_W - 0.5
+                && edit_button.bounds.height() >= SIDEBAR_ROW_EDIT_H - 0.5,
+            "row edit button should be a visible text pill, got {:?}",
+            edit_button.bounds
+        );
 
         window
             .get_by_role(SemanticsRole::Button)
