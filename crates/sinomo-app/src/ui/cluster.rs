@@ -2023,7 +2023,11 @@ mod tests {
                 .any(|line| line == "mode: public and private routing")
         );
         assert!(lines.iter().any(|line| line == "LAN: 0 segments"));
-        assert!(lines.iter().any(|line| line == "connection: daemon connected"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "connection: daemon connected")
+        );
         assert!(
             !lines.iter().any(|line| line.starts_with("topology:")),
             "direct topology edge counts belong behind diagnostics"
