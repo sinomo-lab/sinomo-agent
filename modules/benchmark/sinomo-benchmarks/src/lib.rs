@@ -59,6 +59,7 @@ pub enum BenchmarkFamily {
     Coding,
     Terminal,
     VisionAction,
+    AgentDiscussion,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -150,14 +151,35 @@ pub fn benchmark_module_path(relative_path: &str) -> String {
     )
 }
 
+fn required_tool_kinds(
+    tools: Vec<AgentToolSpec>,
+    required: &[AgentToolKind],
+) -> Vec<AgentToolKind> {
+    let mut kinds = tools
+        .into_iter()
+        .filter(|tool| required.contains(&tool.kind))
+        .map(|tool| tool.kind)
+        .collect::<Vec<_>>();
+    for required_kind in required {
+        if !kinds.contains(required_kind) {
+            kinds.push(required_kind.clone());
+        }
+    }
+    kinds
+}
+
 pub fn benchmark_module_catalog() -> BenchmarkModuleCatalog {
     BenchmarkModuleCatalog {
         module_root: SINOMO_BENCHMARKS_MODULE_ROOT.to_string(),
-        suites: vec![swebench_verified_10_descriptor()],
+        suites: vec![
+            swebench_verified_10_descriptor(),
+            agent_channel_discussion_descriptor(),
+        ],
         plans: vec![
             swebench_verified_10_plan(),
             agent_compaction_quality_plan(),
             agent_memory_quality_plan(),
+            agent_channel_discussion_plan(),
             terminalbench_harbor_plan(),
             mcu_minestudio_plan(),
             minestudio_plan(),
@@ -185,6 +207,7 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
             "benchmark.agent.cancel-probe".to_string(),
             "benchmark.agent.compaction.plan".to_string(),
             "benchmark.agent.memory.plan".to_string(),
+            "benchmark.agent.channel-discussion.plan".to_string(),
             "benchmark.swebench.plan".to_string(),
             "benchmark.minestudio.plan".to_string(),
             "benchmark.terminalbench.plan".to_string(),
@@ -223,6 +246,50 @@ pub fn swebench_verified_10_descriptor() -> BenchmarkSuiteDescriptor {
     }
 }
 
+pub fn agent_channel_discussion_descriptor() -> BenchmarkSuiteDescriptor {
+    BenchmarkSuiteDescriptor {
+        name: "agent-channel-discussion".to_string(),
+        family: BenchmarkFamily::AgentDiscussion,
+        task_count: 8,
+        dataset: Some("native-fixtures-plus-clembench-derived-miniatures".to_string()),
+        split: Some("fixture-and-live-subset".to_string()),
+        runner: benchmark_module_path("agent/run_channel_discussion_eval.py"),
+        baseline: Some("single-role or official clembench backend baseline".to_string()),
+    }
+}
+
+pub fn agent_channel_discussion_plan() -> BenchmarkHarnessPlan {
+    BenchmarkHarnessPlan {
+        name: "agent-channel-discussion".to_string(),
+        setup_commands: vec![
+            "cargo build -p sinomo".to_string(),
+            format!(
+                "python3 {} --mode plan --suite all",
+                benchmark_module_path("agent/run_channel_discussion_eval.py")
+            ),
+            format!(
+                "python3 {} --mode fixture --suite all --summary-out benchmark-results/agent-channel-discussion/fixture-summary.json",
+                benchmark_module_path("agent/run_channel_discussion_eval.py")
+            ),
+        ],
+        run_command: format!(
+            "python3 {} --mode run --suite clembench-lite --provider codex --model gpt-5.4-mini --summary-out benchmark-results/agent-channel-discussion/summary.json --progress-out benchmark-results/agent-channel-discussion/progress.jsonl",
+            benchmark_module_path("agent/run_channel_discussion_eval.py")
+        ),
+        required_tools: default_main_agent_tools()
+            .into_iter()
+            .filter(|tool| matches!(tool.kind, AgentToolKind::RunShellCommand))
+            .map(|tool| tool.kind)
+            .collect(),
+        notes: vec![
+            "This is a live/model eval harness for channel and multi-agent discussion behavior, not a Rust unit test.".to_string(),
+            "Fixture mode covers native consensus, hidden-info merge, useful silence, response-limit containment, and final handoff cases.".to_string(),
+            "The clembench-lite suite contains small Taboo, private/shared, and reference-game miniatures inspired by clembench communication games.".to_string(),
+            "The optional --mode clembench adapter prepares a trimmed upstream clembench workspace with a generated Sinomo clemcore backend.".to_string(),
+        ],
+    }
+}
+
 pub fn agent_compaction_quality_plan() -> BenchmarkHarnessPlan {
     BenchmarkHarnessPlan {
         name: "agent-compaction-quality".to_string(),
@@ -241,19 +308,15 @@ pub fn agent_compaction_quality_plan() -> BenchmarkHarnessPlan {
             "python3 {} --mode run --provider codex --model gpt-5.2-codex --summary-out benchmark-results/agent-compaction/summary.json --progress-out benchmark-results/agent-compaction/progress.jsonl",
             benchmark_module_path("agent/run_compaction_eval.py")
         ),
-        required_tools: default_coding_agent_tools()
-            .into_iter()
-            .filter(|tool| {
-                matches!(
-                    tool.kind,
-                    AgentToolKind::ReadFile
-                        | AgentToolKind::SearchFiles
-                        | AgentToolKind::ApplyPatch
-                        | AgentToolKind::RunShellCommand
-                )
-            })
-            .map(|tool| tool.kind)
-            .collect(),
+        required_tools: required_tool_kinds(
+            default_coding_agent_tools(),
+            &[
+                AgentToolKind::ReadFile,
+                AgentToolKind::SearchFiles,
+                AgentToolKind::ApplyPatch,
+                AgentToolKind::RunShellCommand,
+            ],
+        ),
         notes: vec![
             "This is a live/model eval harness for compaction quality, not a normal Rust unit test.".to_string(),
             "The checked-in plan covers long-session resume, constraint retention, coding after compaction, and cluster-ops after compaction.".to_string(),
@@ -336,20 +399,16 @@ pub fn swebench_verified_10_plan() -> BenchmarkHarnessPlan {
             "python3 {} --mode both --provider deepseek --model deepseek-v4-flash --baseline-model deepseek/deepseek-v4-flash --evaluate --summary-out benchmark-results/swebench/summary.json --progress-out benchmark-results/swebench/progress.jsonl",
             benchmark_module_path("swebench/run_swebench_verified.py")
         ),
-        required_tools: default_coding_agent_tools()
-            .into_iter()
-            .filter(|tool| {
-                matches!(
-                    tool.kind,
-                    AgentToolKind::ReadFile
-                        | AgentToolKind::SearchFiles
-                        | AgentToolKind::ApplyPatch
-                        | AgentToolKind::RunShellCommand
-                        | AgentToolKind::RequestUserInput
-                )
-            })
-            .map(|tool| tool.kind)
-            .collect(),
+        required_tools: required_tool_kinds(
+            default_coding_agent_tools(),
+            &[
+                AgentToolKind::ReadFile,
+                AgentToolKind::SearchFiles,
+                AgentToolKind::ApplyPatch,
+                AgentToolKind::RunShellCommand,
+                AgentToolKind::RequestUserInput,
+            ],
+        ),
         notes: vec![
             "The Sinomo path runs the Rust coding Agent with local workspace tools and writes SWE-bench prediction JSONL.".to_string(),
             "The baseline path delegates to mini-SWE-agent with a regex filter over the same 10 Verified instance ids.".to_string(),
@@ -1025,6 +1084,51 @@ mod tests {
     }
 
     #[test]
+    fn agent_channel_discussion_plan_lists_native_and_clembench_paths() {
+        let descriptor = agent_channel_discussion_descriptor();
+        assert_eq!(descriptor.name, "agent-channel-discussion");
+        assert_eq!(descriptor.family, BenchmarkFamily::AgentDiscussion);
+        assert_eq!(descriptor.task_count, 8);
+        assert!(
+            descriptor
+                .runner
+                .contains("agent/run_channel_discussion_eval.py")
+        );
+        let plan = agent_channel_discussion_plan();
+        assert_eq!(plan.name, "agent-channel-discussion");
+        assert!(
+            plan.setup_commands
+                .iter()
+                .any(|command| command.contains("--mode fixture --suite all"))
+        );
+        assert!(
+            plan.run_command
+                .contains("agent/run_channel_discussion_eval.py --mode run")
+        );
+        assert!(plan.run_command.contains("gpt-5.4-mini"));
+        assert!(
+            plan.required_tools
+                .contains(&AgentToolKind::RunShellCommand)
+        );
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("clembench-lite"))
+        );
+        let runner = include_str!("../agent/run_channel_discussion_eval.py");
+        assert!(runner.contains("native-consensus-arithmetic"));
+        assert!(runner.contains("native-hidden-info-merge"));
+        assert!(runner.contains("native-silence-routing"));
+        assert!(runner.contains("native-loop-bound"));
+        assert!(runner.contains("native-final-handoff"));
+        assert!(runner.contains("clem-taboo-mini"));
+        assert!(runner.contains("clem-privateshared-mini"));
+        assert!(runner.contains("clem-reference-mini"));
+        assert!(runner.contains("sinomo_api.py"));
+        assert!(runner.contains("clemcore"));
+    }
+
+    #[test]
     fn swebench_runner_rebuilds_default_agent_and_records_binary_provenance() {
         let runner = include_str!("../swebench/run_swebench_verified.py");
         assert!(runner.contains("DEFAULT_AGENT_BIN"));
@@ -1299,6 +1403,11 @@ mod tests {
                 .capabilities
                 .contains(&"benchmark.agent.memory.plan".to_string())
         );
+        assert!(
+            descriptor
+                .capabilities
+                .contains(&"benchmark.agent.channel-discussion.plan".to_string())
+        );
         assert!(descriptor.surfaces.object_rpc_routes.iter().any(|route| {
             route.route == SINOMO_BENCHMARKS_CANCEL_PROBE_ROUTE
                 && route.category == SINOMO_BENCHMARKS_RPC_CATEGORY
@@ -1317,8 +1426,9 @@ mod tests {
         let catalog = benchmark_module_catalog();
 
         assert_eq!(catalog.module_root, SINOMO_BENCHMARKS_MODULE_ROOT);
-        assert_eq!(catalog.suites.len(), 1);
+        assert_eq!(catalog.suites.len(), 2);
         assert_eq!(catalog.suites[0].name, "swebench-verified-10");
+        assert_eq!(catalog.suites[1].name, "agent-channel-discussion");
         assert!(
             catalog
                 .plans
@@ -1336,6 +1446,12 @@ mod tests {
                 .plans
                 .iter()
                 .any(|plan| plan.name == "agent-memory-quality")
+        );
+        assert!(
+            catalog
+                .plans
+                .iter()
+                .any(|plan| plan.name == "agent-channel-discussion")
         );
         assert!(
             catalog
