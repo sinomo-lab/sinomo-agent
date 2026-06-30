@@ -298,6 +298,7 @@ enum ChatQuickAction {
     ReasonImage,
     RolePlay,
     ManageChannel,
+    NewChannel,
 }
 
 impl RecoveryCardAction {
@@ -343,6 +344,7 @@ impl ChatQuickAction {
         Self::DraftDocument,
         Self::RolePlay,
     ];
+    const CHANNEL_ONBOARDING: [Self; 1] = [Self::NewChannel];
 
     fn label(self) -> &'static str {
         match self {
@@ -352,6 +354,7 @@ impl ChatQuickAction {
             Self::ReasonImage => "Inspect attachment",
             Self::RolePlay => "Role play",
             Self::ManageChannel => "Manage channel",
+            Self::NewChannel => "New channel",
         }
     }
 
@@ -363,6 +366,7 @@ impl ChatQuickAction {
             Self::ReasonImage => "Attach",
             Self::RolePlay => "Role",
             Self::ManageChannel => "Manage",
+            Self::NewChannel => "New",
         }
     }
 
@@ -374,6 +378,7 @@ impl ChatQuickAction {
             Self::ReasonImage => 76.0,
             Self::RolePlay => 64.0,
             Self::ManageChannel => 86.0,
+            Self::NewChannel => 66.0,
         }
     }
 
@@ -394,7 +399,7 @@ impl ChatQuickAction {
             Self::RolePlay => Some(
                 "Role play as a skeptical product reviewer evaluating this chat and channel interface. Stay in character, critique the workflow, and propose specific improvements.",
             ),
-            Self::ManageChannel => None,
+            Self::ManageChannel | Self::NewChannel => None,
         }
     }
 
@@ -406,6 +411,7 @@ impl ChatQuickAction {
             Self::ReasonImage => IconGlyph::Search,
             Self::RolePlay => IconGlyph::Chat,
             Self::ManageChannel => IconGlyph::Chat,
+            Self::NewChannel => IconGlyph::Add,
         }
     }
 
@@ -417,6 +423,7 @@ impl ChatQuickAction {
             Self::ReasonImage => "Open attachment controls for file context",
             Self::RolePlay => "Prepare a role-playing prompt",
             Self::ManageChannel => "Open channel agents and settings",
+            Self::NewChannel => "Create a shared channel",
         }
     }
 
@@ -428,6 +435,7 @@ impl ChatQuickAction {
             Self::ReasonImage => "SIFS metadata",
             Self::RolePlay => "Persona test",
             Self::ManageChannel => "Agents and title",
+            Self::NewChannel => "Shared timeline",
         }
     }
 
@@ -435,7 +443,11 @@ impl ChatQuickAction {
         match self {
             Self::PlanChange => Some("coding-agent"),
             Self::CheckCluster => Some("background-agent"),
-            Self::DraftDocument | Self::ReasonImage | Self::RolePlay | Self::ManageChannel => None,
+            Self::DraftDocument
+            | Self::ReasonImage
+            | Self::RolePlay
+            | Self::ManageChannel
+            | Self::NewChannel => None,
         }
     }
 
@@ -446,7 +458,7 @@ impl ChatQuickAction {
 
 fn quick_actions_for_chat(chat: &ChatState) -> &'static [ChatQuickAction] {
     if chat.show_channel_onboarding() {
-        return &[];
+        return &ChatQuickAction::CHANNEL_ONBOARDING;
     }
     if chat.current_is_channel() {
         &ChatQuickAction::CHANNEL
@@ -2119,8 +2131,7 @@ impl ChatState {
                     "You can keep chatting or use New channel to start one now.".to_string()
                 }
                 ChannelFilterEmptyState::Empty => {
-                    "Use New channel in the sidebar, then choose agents and edit the title."
-                        .to_string()
+                    "Use New channel to choose agents and edit the title.".to_string()
                 }
             });
         }
@@ -3374,6 +3385,10 @@ impl ChatState {
     }
 
     fn apply_quick_action(&mut self, action: ChatQuickAction) {
+        if action == ChatQuickAction::NewChannel {
+            self.new_channel(None);
+            return;
+        }
         if action == ChatQuickAction::ManageChannel {
             self.begin_edit_current_session();
             return;
@@ -8933,6 +8948,7 @@ impl TranscriptView {
             ChatQuickAction::ReasonImage => 190.0,
             ChatQuickAction::RolePlay => 148.0,
             ChatQuickAction::ManageChannel => 176.0,
+            ChatQuickAction::NewChannel => 176.0,
         }
     }
 
@@ -9200,7 +9216,12 @@ impl TranscriptView {
     }
 
     fn activate_quick_action(&self, action: ChatQuickAction) {
-        self.shared.chat_mut().apply_quick_action(action);
+        if action == ChatQuickAction::NewChannel {
+            let waker = { self.shared.borrow().waker.clone() };
+            self.shared.chat_mut().new_channel(waker);
+        } else {
+            self.shared.chat_mut().apply_quick_action(action);
+        }
     }
 
     fn recovery_action_widget_id(parent: sui::WidgetId, slot: usize) -> sui::WidgetId {
@@ -9784,7 +9805,9 @@ impl TranscriptView {
         let pressed = self.pressed_quick_action.get() == Some(action);
         let primary = matches!(
             action,
-            ChatQuickAction::PlanChange | ChatQuickAction::ManageChannel
+            ChatQuickAction::PlanChange
+                | ChatQuickAction::ManageChannel
+                | ChatQuickAction::NewChannel
         );
         let fill = if pressed {
             pal.selected
@@ -12053,11 +12076,12 @@ mod tests {
         );
         assert_eq!(
             state.empty_conversation_context().as_deref(),
-            Some("Use New channel in the sidebar, then choose agents and edit the title.")
+            Some("Use New channel to choose agents and edit the title.")
         );
-        assert!(
-            quick_actions_for_chat(&state).is_empty(),
-            "channel onboarding should not present direct-chat starter actions"
+        assert_eq!(
+            quick_actions_for_chat(&state),
+            &[ChatQuickAction::NewChannel],
+            "channel onboarding should present only the channel creation action"
         );
 
         state.sessions.clear();
@@ -12072,8 +12096,9 @@ mod tests {
             state.empty_conversation_context().as_deref(),
             Some("You can keep chatting or use New channel to start one now.")
         );
-        assert!(
-            quick_actions_for_chat(&state).is_empty(),
+        assert_eq!(
+            quick_actions_for_chat(&state),
+            &[ChatQuickAction::NewChannel],
             "channel loading should also avoid direct-chat starter actions"
         );
     }
@@ -13361,9 +13386,7 @@ mod tests {
         );
         assert!(
             window
-                .get_by_text(
-                    "Use New channel in the sidebar, then choose agents and edit the title."
-                )
+                .get_by_text("Use New channel to choose agents and edit the title.")
                 .count()?
                 >= 1,
             "empty channel filter should point to the visible create action"
@@ -13376,13 +13399,21 @@ mod tests {
             0,
             "channel onboarding should not show direct-chat starter actions"
         );
+        let direct_channel_button = window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("New channel")
+            .with_description("Create a shared channel");
         assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("New channel")
-                .count()?,
+            direct_channel_button.count()?,
             1,
-            "the channel creation action should remain visible in the sidebar"
+            "the main pane should expose a direct channel creation action"
+        );
+        direct_channel_button.click()?;
+        let chat = shared.chat();
+        assert_eq!(
+            chat.session_edit_id.as_deref(),
+            Some(chat.session_id.as_str()),
+            "main-pane New channel should open the channel editor"
         );
 
         Ok(())
