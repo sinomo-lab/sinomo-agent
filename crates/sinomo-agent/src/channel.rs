@@ -1,6 +1,6 @@
 use crate::{
-    AgentDefinition, AgentItem, AgentRole, AgentSession, AgentStoragePaths, InteractionModel,
-    TaskId,
+    AgentDefinition, AgentItem, AgentRole, AgentSession, AgentStoragePaths,
+    AgentToolRuntimeDefinition, InteractionModel, TaskId,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{
@@ -127,6 +127,7 @@ impl AgentChannel {
             agent_session_id: SessionId::generate(),
             enabled: true,
             order,
+            tool_runtime: AgentToolRuntimeDefinition::default(),
             observed_through_sequence: 0,
         };
         let participant_id = participant.participant_id.clone();
@@ -334,6 +335,11 @@ pub struct AgentChannelParticipant {
     pub agent_session_id: SessionId,
     pub enabled: bool,
     pub order: u32,
+    #[serde(
+        default,
+        skip_serializing_if = "AgentToolRuntimeDefinition::is_default"
+    )]
+    pub tool_runtime: AgentToolRuntimeDefinition,
     #[serde(default)]
     pub observed_through_sequence: u64,
 }

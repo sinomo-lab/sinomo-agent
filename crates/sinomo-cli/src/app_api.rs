@@ -131,6 +131,14 @@ pub struct ChatToolRuntimeSelection {
     pub sandbox_node_id: Option<String>,
 }
 
+impl ChatToolRuntimeSelection {
+    fn from_agent_definition(definition: &AgentDefinition) -> Self {
+        Self {
+            sandbox_node_id: definition.tool_runtime.sandbox_node_id.clone(),
+        }
+    }
+}
+
 /// A streamed event produced while the agent answers.
 #[derive(Clone, Debug)]
 pub enum ChatStreamEvent {
@@ -239,6 +247,7 @@ pub struct ChatParticipant {
     pub agent_session_id: String,
     pub enabled: bool,
     pub order: u32,
+    pub tool_runtime: ChatToolRuntimeSelection,
 }
 
 /// Compact background task state for the app UI.
@@ -306,6 +315,7 @@ pub struct AgentSummary {
     pub key: String,
     pub name: String,
     pub description: String,
+    pub tool_runtime: ChatToolRuntimeSelection,
 }
 
 /// A selectable language-model provider with a small starter model list.
@@ -621,6 +631,7 @@ pub struct AgentChat {
     channel: AgentChannel,
     runtime: InteractionRuntime<InMemoryEventStore, Handler>,
     tool_runtime: ChatToolRuntimeSelection,
+    tool_runtime_explicit_override: bool,
 }
 
 impl AgentChat {
@@ -686,15 +697,18 @@ impl AgentChat {
             .replace_agent_session(&session, agent_transcript_from_history(&[]))?;
         let mut channel = AgentChannel::with_default_title(session.session_id.clone());
         let info: ChatRuntimeInfo = tui::app_runtime_info(runtime.handler()).into();
+        let tool_runtime = default_tool_runtime_for_agent(&data_dir, &info.agent);
         let align_primary_session = should_align_primary_participant(&channel);
-        ensure_primary_participant(&mut channel, &info, align_primary_session);
+        let participant_id = ensure_primary_participant(&mut channel, &info, align_primary_session);
+        set_participant_tool_runtime(&mut channel, &participant_id, &tool_runtime);
         Ok(Self {
             data_dir,
             daemon_connected,
             channel_store,
             channel,
             runtime,
-            tool_runtime: ChatToolRuntimeSelection::default(),
+            tool_runtime,
+            tool_runtime_explicit_override: false,
         })
     }
 
@@ -709,7 +723,12 @@ impl AgentChat {
             .replace_agent_session(&session, agent_transcript_from_history(&[]));
         self.channel = AgentChannel::with_default_title(session.session_id.clone());
         let info = self.runtime_info();
-        ensure_primary_participant(&mut self.channel, &info, true);
+        if !self.tool_runtime_explicit_override {
+            self.tool_runtime = default_tool_runtime_for_agent(&self.data_dir, &info.agent);
+        }
+        let participant_id = ensure_primary_participant(&mut self.channel, &info, true);
+        let tool_runtime = self.tool_runtime.clone();
+        set_participant_tool_runtime(&mut self.channel, &participant_id, &tool_runtime);
     }
 
     /// Adopt an existing channel id for continued turns (fresh in-memory context;
@@ -721,12 +740,13 @@ impl AgentChat {
     ) -> Result<(), CliError> {
         let session = app_session(Some(session_id));
         let info = self.runtime_info();
-        let (mut channel, should_save_after_resume) =
+        let (mut channel, should_save_after_resume, loaded_existing_channel) =
             match self.channel_store.load_channel(&session.session_id) {
-                Ok(Some(channel)) => (channel, true),
+                Ok(Some(channel)) => (channel, true, true),
                 Ok(None) => (
                     legacy_channel_from_history(session.session_id.clone(), history, &info),
                     !history.is_empty(),
+                    false,
                 ),
                 Err(error) => {
                     return Err(CliError::Parse {
@@ -735,7 +755,20 @@ impl AgentChat {
                 }
             };
         let align_primary_session = should_align_primary_participant(&channel);
-        ensure_primary_participant(&mut channel, &info, align_primary_session);
+        let participant_id = ensure_primary_participant(&mut channel, &info, align_primary_session);
+        if !self.tool_runtime_explicit_override {
+            self.tool_runtime = channel
+                .participant(&participant_id)
+                .map(|participant| {
+                    chat_tool_runtime_from_agent_runtime_definition(&participant.tool_runtime)
+                })
+                .filter(|tool_runtime| !tool_runtime.is_default())
+                .unwrap_or_else(|| default_tool_runtime_for_agent(&self.data_dir, &info.agent));
+        }
+        if !loaded_existing_channel {
+            let tool_runtime = self.tool_runtime.clone();
+            set_participant_tool_runtime(&mut channel, &participant_id, &tool_runtime);
+        }
         self.runtime
             .replace_store_and_session(InMemoryEventStore::new(), session.clone());
         self.runtime
@@ -771,6 +804,7 @@ impl AgentChat {
             parse_chat_tool_runtime_node_id(node_id)?;
         }
         self.tool_runtime.sandbox_node_id = normalized;
+        self.tool_runtime_explicit_override = true;
         Ok(self.tool_runtime())
     }
 
@@ -1016,6 +1050,7 @@ impl AgentChat {
             runtime: &mut self.runtime,
             context_attachments,
             tool_runtime: self.tool_runtime.clone(),
+            tool_runtime_explicit_override: self.tool_runtime_explicit_override,
         };
         let store = self.channel_store.as_ref();
         let mut channel_runtime = AgentChannelRuntime::new(channel, store, executor)
@@ -1124,18 +1159,26 @@ impl AgentChat {
         let info = tui::app_switch_agent(
             self.runtime.handler_mut(),
             &self.data_dir,
-            definition,
+            definition.clone(),
             self.daemon_connected,
         )?;
         let info: ChatRuntimeInfo = info.into();
         if self.channel.channel_kind == AgentChannelKind::Channel {
-            ensure_primary_participant(&mut self.channel, &info, false);
+            let participant_id = ensure_primary_participant(&mut self.channel, &info, false);
+            let tool_runtime = ChatToolRuntimeSelection::from_agent_definition(&definition);
+            set_participant_tool_runtime(&mut self.channel, &participant_id, &tool_runtime);
         } else {
             for participant in &mut self.channel.participants {
                 participant.enabled = false;
             }
+            if !self.tool_runtime_explicit_override {
+                self.tool_runtime = ChatToolRuntimeSelection::from_agent_definition(&definition);
+            }
             let align_primary_session = should_align_primary_participant(&self.channel);
-            ensure_primary_participant(&mut self.channel, &info, align_primary_session);
+            let participant_id =
+                ensure_primary_participant(&mut self.channel, &info, align_primary_session);
+            let tool_runtime = self.tool_runtime.clone();
+            set_participant_tool_runtime(&mut self.channel, &participant_id, &tool_runtime);
         }
         self.save_channel_best_effort();
         Ok(info)
@@ -1152,7 +1195,10 @@ impl AgentChat {
     fn primary_speaker(&mut self) -> ChatSpeaker {
         let info = self.runtime_info();
         let align_primary_session = should_align_primary_participant(&self.channel);
-        ensure_primary_participant(&mut self.channel, &info, align_primary_session);
+        let participant_id =
+            ensure_primary_participant(&mut self.channel, &info, align_primary_session);
+        let tool_runtime = self.tool_runtime.clone();
+        set_participant_tool_runtime(&mut self.channel, &participant_id, &tool_runtime);
         self.primary_participant()
             .map(|participant| chat_speaker(&self.channel.channel_id, participant))
             .unwrap_or_else(|| ChatSpeaker {
@@ -1200,6 +1246,7 @@ struct AppAgentChannelExecutor<'a> {
     runtime: &'a mut InteractionRuntime<InMemoryEventStore, Handler>,
     context_attachments: Vec<AgentContextAttachment>,
     tool_runtime: ChatToolRuntimeSelection,
+    tool_runtime_explicit_override: bool,
 }
 
 impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
@@ -1239,8 +1286,13 @@ impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
         .map_err(channel_executor_cli_error)?;
 
         let interaction_session = app_session(Some(&participant.agent_session_id.to_string()));
-        let sandbox_node_id = parse_chat_tool_runtime_selection(&self.tool_runtime)
-            .map_err(channel_executor_cli_error)?;
+        let tool_runtime = if self.tool_runtime_explicit_override {
+            self.tool_runtime.clone()
+        } else {
+            chat_tool_runtime_from_agent_runtime_definition(&participant.tool_runtime)
+        };
+        let sandbox_node_id =
+            parse_chat_tool_runtime_selection(&tool_runtime).map_err(channel_executor_cli_error)?;
         self.runtime
             .handler_mut()
             .configure_tool_runtime_for_session(
@@ -1853,7 +1905,7 @@ fn ensure_primary_participant(
     channel: &mut AgentChannel,
     info: &ChatRuntimeInfo,
     align_session_to_channel: bool,
-) {
+) -> TaskId {
     let agent_key = if info.agent.trim().is_empty() {
         "main-agent"
     } else {
@@ -1868,6 +1920,41 @@ fn ensure_primary_participant(
             participant.order = 1;
             participant.enabled = true;
         }
+    }
+    participant_id
+}
+
+fn set_participant_tool_runtime(
+    channel: &mut AgentChannel,
+    participant_id: &TaskId,
+    tool_runtime: &ChatToolRuntimeSelection,
+) {
+    if let Some(participant) = channel.participant_mut(participant_id) {
+        participant.tool_runtime.sandbox_node_id = tool_runtime.sandbox_node_id.clone();
+    }
+}
+
+fn default_tool_runtime_for_agent(
+    data_dir: &SinomoDataDir,
+    agent_key: &str,
+) -> ChatToolRuntimeSelection {
+    resolve_agent(data_dir, agent_key)
+        .as_ref()
+        .map(ChatToolRuntimeSelection::from_agent_definition)
+        .unwrap_or_default()
+}
+
+fn chat_tool_runtime_from_agent_runtime_definition(
+    tool_runtime: &sinomo_agent::AgentToolRuntimeDefinition,
+) -> ChatToolRuntimeSelection {
+    ChatToolRuntimeSelection {
+        sandbox_node_id: tool_runtime.sandbox_node_id.clone(),
+    }
+}
+
+impl ChatToolRuntimeSelection {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
     }
 }
 
@@ -1893,6 +1980,7 @@ fn chat_participant(participant: &AgentChannelParticipant) -> ChatParticipant {
         agent_session_id: participant.agent_session_id.to_string(),
         enabled: participant.enabled,
         order: participant.order,
+        tool_runtime: chat_tool_runtime_from_agent_runtime_definition(&participant.tool_runtime),
     }
 }
 
@@ -1912,6 +2000,7 @@ fn participant_from_speaker(speaker: &ChatSpeaker) -> AgentChannelParticipant {
         agent_session_id,
         enabled: true,
         order: 1,
+        tool_runtime: sinomo_agent::AgentToolRuntimeDefinition::default(),
         observed_through_sequence: 0,
     }
 }
@@ -2486,6 +2575,7 @@ pub fn agent_summaries(data_dir: &SinomoDataDir) -> Vec<AgentSummary> {
                 definition.name.clone()
             },
             description: definition.description.clone(),
+            tool_runtime: ChatToolRuntimeSelection::from_agent_definition(definition),
         })
         .collect()
 }
@@ -3677,7 +3767,7 @@ fn parent_sifs_browser_path(path: &str) -> Option<String> {
 mod tests {
     use super::*;
     use sinomo_agent::{
-        AgentInteractionState, AgentLoopDecision, AgentLoopResponseMode, AgentStopReason,
+        AgentInteractionState, AgentLoopDecision, AgentLoopResponseMode, AgentRole, AgentStopReason,
     };
     use std::collections::VecDeque;
 
@@ -4129,6 +4219,11 @@ mod tests {
             .expect("participant")
             .agent_session_id
             .clone();
+        channel
+            .participant_mut(&participant_id)
+            .expect("participant")
+            .tool_runtime
+            .sandbox_node_id = Some("channel-node".to_string());
         assert_ne!(participant_session_id, channel_id);
         store.save_channel(&channel).expect("save channel");
 
@@ -4144,6 +4239,77 @@ mod tests {
         assert_eq!(
             participant.agent_session_id,
             participant_session_id.to_string()
+        );
+        assert_eq!(
+            participant.tool_runtime.sandbox_node_id.as_deref(),
+            Some("channel-node")
+        );
+    }
+
+    #[test]
+    fn app_chat_new_chat_uses_agent_tool_runtime_default() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-agent-tool-runtime");
+        let data_dir = SinomoDataDir::new(&root);
+        let definition =
+            AgentDefinition::custom("worker-agent", AgentRole::Main, "Use the worker sandbox.")
+                .with_sandbox_runtime_node_id("worker-node");
+        let definition_store = sinomo_agent::FileAgentDefinitionStore::for_data_dir(&data_dir);
+        sinomo_agent::AgentDefinitionStore::save_definition(&definition_store, &definition)
+            .expect("save agent definition");
+
+        let mut chat = AgentChat::new(data_dir, false).expect("chat runtime");
+        chat.set_agent("worker-agent").expect("set agent");
+
+        assert_eq!(
+            chat.tool_runtime().sandbox_node_id.as_deref(),
+            Some("worker-node")
+        );
+        let participant = chat
+            .participants()
+            .into_iter()
+            .find(|participant| participant.agent_key == "worker-agent")
+            .expect("worker participant");
+        assert_eq!(
+            participant.tool_runtime.sandbox_node_id.as_deref(),
+            Some("worker-node")
+        );
+    }
+
+    #[test]
+    fn app_chat_channel_set_agent_stamps_agent_tool_runtime_default() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-agent-tool-runtime");
+        let data_dir = SinomoDataDir::new(&root);
+        let definition =
+            AgentDefinition::custom("worker-agent", AgentRole::Main, "Use the worker sandbox.")
+                .with_sandbox_runtime_node_id("worker-node");
+        let definition_store = sinomo_agent::FileAgentDefinitionStore::for_data_dir(&data_dir);
+        sinomo_agent::AgentDefinitionStore::save_definition(&definition_store, &definition)
+            .expect("save agent definition");
+
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Team channel");
+        channel.ensure_user(AgentChannelUser::app_local());
+        store.save_channel(&channel).expect("save channel");
+
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        chat.resume_session(&channel_id.to_string(), &[])
+            .expect("resume channel");
+        chat.set_agent("worker-agent").expect("set channel agent");
+
+        let saved = SifsAgentChannelStore::open(&data_dir)
+            .expect("reopen channel store")
+            .load_channel(&channel_id)
+            .expect("load channel")
+            .expect("channel saved");
+        let participant = saved
+            .enabled_participants_in_order()
+            .into_iter()
+            .find(|participant| participant.agent_key == "worker-agent")
+            .expect("worker participant");
+        assert_eq!(
+            participant.tool_runtime.sandbox_node_id.as_deref(),
+            Some("worker-node")
         );
     }
 

@@ -1011,6 +1011,11 @@ pub(crate) struct TuiAgentRuntimeInfo {
     reasoning_effort: Option<ProviderReasoningEffort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reasoning_budget_tokens: Option<u32>,
+    #[serde(
+        default,
+        skip_serializing_if = "sinomo_agent::AgentToolRuntimeDefinition::is_default"
+    )]
+    tool_runtime: sinomo_agent::AgentToolRuntimeDefinition,
 }
 
 impl TuiAgentRuntimeInfo {
@@ -1046,6 +1051,7 @@ impl Default for TuiAgentRuntimeInfo {
             account: None,
             reasoning_effort: None,
             reasoning_budget_tokens: None,
+            tool_runtime: sinomo_agent::AgentToolRuntimeDefinition::default(),
         }
     }
 }
@@ -1114,6 +1120,7 @@ struct TuiState {
     cluster_label: Option<String>,
     runtime_info: TuiAgentRuntimeInfo,
     tool_runtime_node_id: Option<String>,
+    tool_runtime_explicit_override: bool,
     runtime_activity: TuiRuntimeActivity,
     last_model_usage: Option<TuiTokenUsage>,
     session_token_usage: TuiTokenUsage,
@@ -1147,8 +1154,9 @@ impl TuiState {
             session_id: session.session_id.to_string(),
             daemon_connected: daemon.is_some(),
             cluster_label,
+            tool_runtime_node_id: runtime_info.tool_runtime.sandbox_node_id.clone(),
             runtime_info,
-            tool_runtime_node_id: None,
+            tool_runtime_explicit_override: false,
             runtime_activity: TuiRuntimeActivity::default(),
             last_model_usage: None,
             session_token_usage: TuiTokenUsage::default(),
@@ -1939,6 +1947,9 @@ impl TuiState {
     }
 
     fn update_runtime_info(&mut self, runtime_info: TuiAgentRuntimeInfo) {
+        if !self.tool_runtime_explicit_override {
+            self.tool_runtime_node_id = runtime_info.tool_runtime.sandbox_node_id.clone();
+        }
         self.runtime_info = runtime_info;
     }
 
@@ -3101,6 +3112,7 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
         }
         TuiSlashCommand::ToolRuntime(TuiToolRuntimeCommand::Local) => {
             state.tool_runtime_node_id = None;
+            state.tool_runtime_explicit_override = true;
             let session = runtime.session().clone();
             runtime
                 .handler
@@ -3116,6 +3128,7 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
                 .handler
                 .configure_tui_tool_runtime(data_dir, &session, Some(parsed_node_id))?;
             state.tool_runtime_node_id = Some(node_id.clone());
+            state.tool_runtime_explicit_override = true;
             Ok(vec![InteractionOutput::Line(format!(
                 "sandbox runtime node: {node_id}"
             ))])
@@ -6211,6 +6224,7 @@ impl DefaultMainAgentChatModel {
                 account: None,
                 reasoning_effort: None,
                 reasoning_budget_tokens: None,
+                tool_runtime: sinomo_agent::AgentToolRuntimeDefinition::default(),
             };
         }
         TuiAgentRuntimeInfo {
@@ -6220,6 +6234,7 @@ impl DefaultMainAgentChatModel {
             account: None,
             reasoning_effort: None,
             reasoning_budget_tokens: None,
+            tool_runtime: sinomo_agent::AgentToolRuntimeDefinition::default(),
         }
     }
 
@@ -6449,6 +6464,7 @@ where
             account: self.account.clone(),
             reasoning_effort: self.reasoning_effort,
             reasoning_budget_tokens: self.reasoning_budget_tokens,
+            tool_runtime: self.agent_definition.tool_runtime.clone(),
         }
     }
 

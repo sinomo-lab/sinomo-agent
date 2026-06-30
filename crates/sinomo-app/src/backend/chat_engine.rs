@@ -803,6 +803,7 @@ fn worker(
                             set_active_session_id(&active_session_id, &evt_tx, &session_id);
                         }
                         let _ = evt_tx.send(ChatEvent::RuntimeInfo(info.into()));
+                        let _ = evt_tx.send(ChatEvent::ToolRuntime(chat.tool_runtime()));
                     }
                     Err(error) => {
                         let _ = evt_tx.send(ChatEvent::Error {

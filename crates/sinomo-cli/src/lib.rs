@@ -2978,6 +2978,7 @@ pub(crate) fn agent_package_inspection_json(definition: &AgentDefinition) -> ser
             "vendor_options": definition.model_policy.vendor_options.clone(),
         },
         "runtime_limits": definition.runtime_limits,
+        "tool_runtime": definition.tool_runtime,
         "output_format": definition.output_format,
     })
 }
@@ -3049,6 +3050,11 @@ pub(crate) fn agent_package_inspection_text(definition: &AgentDefinition) -> Str
     output.push_str(&format!(
         "    max model repair attempts: {}\n",
         format_unbounded_runtime_limit(definition.runtime_limits.max_model_repair_attempts)
+    ));
+    output.push_str("  tool runtime:\n");
+    output.push_str(&format!(
+        "    sandbox node: {}\n",
+        format_optional_value(definition.tool_runtime.sandbox_node_id.as_deref())
     ));
     output.push_str("  tool surface:\n");
     output.push_str(&format!(

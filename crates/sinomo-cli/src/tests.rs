@@ -5810,7 +5810,8 @@ fn agent_session_text_renderers_summarize_persisted_state() {
 fn agent_inspection_renders_package_surface_and_prompt() {
     let mut definition = sinomo_agent::AgentDefinition::coding()
         .with_skill("rust.coding")
-        .with_package_version("2.0.0");
+        .with_package_version("2.0.0")
+        .with_sandbox_runtime_node_id("worker-node");
     definition.temperature = Some(0.3);
     definition.max_output_tokens = Some(321);
 
@@ -5829,6 +5830,8 @@ fn agent_inspection_renders_package_surface_and_prompt() {
     assert!(text.contains("max steps: unbounded"));
     assert!(text.contains("max tool calls per step: unbounded"));
     assert!(text.contains("max model repair attempts: unbounded"));
+    assert!(text.contains("tool runtime:"));
+    assert!(text.contains("sandbox node: worker-node"));
     assert!(text.contains("system prompt:"));
     assert_eq!(json["id"], "coding-agent");
     assert_eq!(json["package"]["version"], "2.0.0");
@@ -5838,6 +5841,7 @@ fn agent_inspection_renders_package_surface_and_prompt() {
         .expect("temperature");
     assert!((temperature - 0.3).abs() < 0.000001);
     assert_eq!(json["effective_model_policy"]["max_output_tokens"], 321);
+    assert_eq!(json["tool_runtime"]["sandbox_node_id"], "worker-node");
 
     definition.runtime_limits.max_steps = Some(12);
     definition.runtime_limits.max_tool_calls_per_step = Some(3);

@@ -3363,7 +3363,9 @@ impl ChatState {
         );
         channel.ensure_user(sinomo_agent::AgentChannelUser::app_local());
         let (agent_key, agent_name) = self.default_channel_agent();
-        channel.ensure_participant(agent_key, agent_name);
+        let participant_id = channel.ensure_participant(agent_key.clone(), agent_name);
+        let tool_runtime = self.agent_tool_runtime(&agent_key);
+        set_channel_participant_tool_runtime(&mut channel, &participant_id, &tool_runtime);
         let session_ref = session_ref_for_channel(&channel);
 
         self.reset_visible_session(session_id.clone());
@@ -3441,6 +3443,14 @@ impl ChatState {
         (key.clone(), key)
     }
 
+    fn agent_tool_runtime(&self, agent_key: &str) -> ChatToolRuntimeSelection {
+        self.agents
+            .iter()
+            .find(|agent| agent.key == agent_key || agent.name == agent_key)
+            .map(|agent| agent.tool_runtime.clone())
+            .unwrap_or_default()
+    }
+
     fn set_channel_agent_idx(&mut self, index: usize) {
         self.channel_agent_idx = index.min(self.agents.len().saturating_sub(1));
     }
@@ -3461,6 +3471,7 @@ impl ChatState {
         };
         let agent_key = agent.key.clone();
         let agent_name = agent.name.clone();
+        let tool_runtime = agent.tool_runtime.clone();
         let store = match self.agent_channel_store() {
             Ok(store) => store,
             Err(error) => {
@@ -3485,7 +3496,8 @@ impl ChatState {
             }
         };
         channel.channel_kind = AgentChannelKind::Channel;
-        channel.ensure_participant(agent_key, agent_name.clone());
+        let participant_id = channel.ensure_participant(agent_key, agent_name.clone());
+        set_channel_participant_tool_runtime(&mut channel, &participant_id, &tool_runtime);
         match store.save_channel(&channel) {
             Ok(()) => {
                 self.refresh_sessions();
@@ -4011,6 +4023,16 @@ fn parse_channel_id(id: &str) -> std::io::Result<SessionId> {
 
 fn channel_store_io_error(error: sinomo_agent::AgentChannelStoreError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
+}
+
+fn set_channel_participant_tool_runtime(
+    channel: &mut AgentChannel,
+    participant_id: &sinomo_agent::TaskId,
+    tool_runtime: &ChatToolRuntimeSelection,
+) {
+    if let Some(participant) = channel.participant_mut(participant_id) {
+        participant.tool_runtime.sandbox_node_id = tool_runtime.sandbox_node_id.clone();
+    }
 }
 
 fn merge_model_lists(existing: &[String], fetched: &[String]) -> Vec<String> {
@@ -11113,11 +11135,13 @@ mod tests {
                 key: "main-agent".to_string(),
                 name: "main-agent".to_string(),
                 description: String::new(),
+                tool_runtime: ChatToolRuntimeSelection::default(),
             },
             AgentSummary {
                 key: "coding-agent".to_string(),
                 name: "coding-agent".to_string(),
                 description: String::new(),
+                tool_runtime: ChatToolRuntimeSelection::default(),
             },
         ];
         state.info.agent = "main-agent".to_string();
@@ -11530,11 +11554,13 @@ mod tests {
             key: "custom-agent".to_string(),
             name: "Custom".to_string(),
             description: "Investigates product workflows and summarizes risky edges.".to_string(),
+            tool_runtime: ChatToolRuntimeSelection::default(),
         };
         let coding = AgentSummary {
             key: "coding-agent".to_string(),
             name: "coding-agent".to_string(),
             description: String::new(),
+            tool_runtime: ChatToolRuntimeSelection::default(),
         };
 
         assert_eq!(
@@ -11863,6 +11889,7 @@ mod tests {
     fn new_channel_creates_channel_entry_and_opens_config() {
         let (_backend, mut state) = isolated_chat_state("new-channel");
         seed_test_agents(&mut state);
+        state.agents[0].tool_runtime.sandbox_node_id = Some("main-node".to_string());
 
         state.new_channel(None);
         wait_for(&mut state, Duration::from_secs(5), |state| {
@@ -11898,6 +11925,10 @@ mod tests {
         let participants = channel.enabled_participants_in_order();
         assert_eq!(participants.len(), 1);
         assert_eq!(participants[0].agent_key, "main-agent");
+        assert_eq!(
+            participants[0].tool_runtime.sandbox_node_id.as_deref(),
+            Some("main-node")
+        );
         assert_ne!(
             participants[0].agent_session_id, channel.channel_id,
             "explicit channel participants keep their own agent sessions"
@@ -11908,6 +11939,7 @@ mod tests {
     fn channel_config_adds_selected_agent_and_updates_sidebar_count() {
         let (_backend, mut state) = isolated_chat_state("channel-add-agent");
         seed_test_agents(&mut state);
+        state.agents[1].tool_runtime.sandbox_node_id = Some("coding-node".to_string());
         state.new_channel(None);
         wait_for(&mut state, Duration::from_secs(5), |state| {
             state.pending_session_reset.is_none() && state.channel_create_rx.is_none()
@@ -11930,6 +11962,14 @@ mod tests {
             participants
                 .iter()
                 .any(|participant| participant.agent_key == "coding-agent")
+        );
+        let coding = participants
+            .iter()
+            .find(|participant| participant.agent_key == "coding-agent")
+            .expect("coding participant");
+        assert_eq!(
+            coding.tool_runtime.sandbox_node_id.as_deref(),
+            Some("coding-node")
         );
         assert_eq!(
             state

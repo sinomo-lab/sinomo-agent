@@ -11204,6 +11204,31 @@ mod tests {
     }
 
     #[test]
+    fn agent_config_preserves_definition_tool_runtime() {
+        let definition = AgentDefinition::custom("worker-agent", AgentRole::Main, "Be helpful.")
+            .with_sandbox_runtime_node_id("worker-node");
+        let config = AgentConfig::new("fake", "fake").with_agent_definition(definition);
+
+        let value = serde_json::to_value(&config).expect("serialize config");
+        assert_eq!(
+            value
+                .pointer("/definition/tool_runtime/sandbox_node_id")
+                .and_then(serde_json::Value::as_str),
+            Some("worker-node")
+        );
+
+        let round_trip: AgentConfig = serde_json::from_value(value).expect("deserialize config");
+        assert_eq!(
+            round_trip
+                .definition
+                .tool_runtime
+                .sandbox_node_id
+                .as_deref(),
+            Some("worker-node")
+        );
+    }
+
+    #[test]
     fn agent_config_workspace_root_populates_local_workspace_ref() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-workspace");
 

@@ -383,6 +383,11 @@ pub struct AgentDefinition {
         skip_serializing_if = "AgentRuntimeLimitsDefinition::is_default"
     )]
     pub runtime_limits: AgentRuntimeLimitsDefinition,
+    #[serde(
+        default,
+        skip_serializing_if = "AgentToolRuntimeDefinition::is_default"
+    )]
+    pub tool_runtime: AgentToolRuntimeDefinition,
     #[serde(default)]
     pub output_format: AgentOutputFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -588,6 +593,23 @@ impl AgentRuntimeLimitsDefinition {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentToolRuntimeDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_node_id: Option<String>,
+}
+
+impl AgentToolRuntimeDefinition {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn with_sandbox_node_id(mut self, sandbox_node_id: impl Into<String>) -> Self {
+        self.sandbox_node_id = Some(sandbox_node_id.into());
+        self
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AgentContextStrategyDescriptor {
     pub id: String,
@@ -705,6 +727,7 @@ impl AgentDefinition {
             compaction: AgentCompactionDefinition::default(),
             model_policy: AgentModelPolicy::default(),
             runtime_limits: AgentRuntimeLimitsDefinition::default(),
+            tool_runtime: AgentToolRuntimeDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
             temperature: None,
             max_output_tokens: None,
@@ -733,6 +756,7 @@ impl AgentDefinition {
                 ..AgentModelPolicy::default()
             },
             runtime_limits: AgentRuntimeLimitsDefinition::default(),
+            tool_runtime: AgentToolRuntimeDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
             temperature,
             max_output_tokens,
@@ -761,6 +785,7 @@ impl AgentDefinition {
                 ..AgentModelPolicy::default()
             },
             runtime_limits: AgentRuntimeLimitsDefinition::default(),
+            tool_runtime: AgentToolRuntimeDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
             temperature,
             max_output_tokens,
@@ -788,6 +813,7 @@ impl AgentDefinition {
                 ..AgentModelPolicy::default()
             },
             runtime_limits: AgentRuntimeLimitsDefinition::default(),
+            tool_runtime: AgentToolRuntimeDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
             temperature,
             max_output_tokens: None,
@@ -815,6 +841,7 @@ impl AgentDefinition {
                 ..AgentModelPolicy::default()
             },
             runtime_limits: AgentRuntimeLimitsDefinition::default(),
+            tool_runtime: AgentToolRuntimeDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
             temperature,
             max_output_tokens: None,
@@ -855,6 +882,16 @@ impl AgentDefinition {
 
     pub fn with_package_provenance(mut self, provenance: AgentPackageProvenance) -> Self {
         self.package.provenance = provenance;
+        self
+    }
+
+    pub fn with_tool_runtime(mut self, tool_runtime: AgentToolRuntimeDefinition) -> Self {
+        self.tool_runtime = tool_runtime;
+        self
+    }
+
+    pub fn with_sandbox_runtime_node_id(mut self, sandbox_node_id: impl Into<String>) -> Self {
+        self.tool_runtime.sandbox_node_id = Some(sandbox_node_id.into());
         self
     }
 
@@ -933,6 +970,8 @@ pub enum AgentDefinitionValidationError {
     ConflictingModelPolicyField { id: String, field: String },
     #[error("agent definition `{id}` has invalid runtime limit `{field}`")]
     InvalidRuntimeLimit { id: String, field: String },
+    #[error("agent definition `{id}` has invalid sandbox runtime node id `{node_id}`")]
+    InvalidSandboxRuntimeNodeId { id: String, node_id: String },
     #[error("agent definition `{id}` module provenance is missing module id")]
     MissingProvenanceModuleId { id: String },
     #[error(
@@ -1115,6 +1154,16 @@ impl AgentDefinitionValidator {
                 field: "runtime_limits.max_tool_calls_per_step".to_string(),
             });
         }
+        if let Some(node_id) = definition.tool_runtime.sandbox_node_id.as_deref()
+            && !is_valid_agent_sandbox_runtime_node_id(node_id)
+        {
+            return Err(
+                AgentDefinitionValidationError::InvalidSandboxRuntimeNodeId {
+                    id: id.to_string(),
+                    node_id: node_id.to_string(),
+                },
+            );
+        }
         if !self
             .context_strategies
             .contains(&definition.context.pipeline_id)
@@ -1165,6 +1214,10 @@ fn validate_model_preference(
         field: field.to_string(),
         value: value.to_string(),
     })
+}
+
+fn is_valid_agent_sandbox_runtime_node_id(value: &str) -> bool {
+    NodeId::new(value.to_string()).is_ok() || NodeId::from_legacy_named(value.to_string()).is_ok()
 }
 
 fn validate_temperature(
@@ -2706,6 +2759,39 @@ mod tests {
             error,
             AgentDefinitionValidationError::InvalidRuntimeLimit { .. }
         ));
+
+        let definition = AgentDefinition::custom("bad-agent", AgentRole::Main, "Be helpful.")
+            .with_sandbox_runtime_node_id("bad node");
+
+        let error = definition
+            .validate()
+            .expect_err("invalid sandbox runtime node");
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::InvalidSandboxRuntimeNodeId { .. }
+        ));
+    }
+
+    #[test]
+    fn agent_definition_serializes_tool_runtime_default() {
+        let definition = AgentDefinition::custom("worker-agent", AgentRole::Main, "Be helpful.")
+            .with_sandbox_runtime_node_id("worker-node");
+
+        definition.validate().expect("definition validates");
+        let value = serde_json::to_value(&definition).expect("serialize definition");
+        assert_eq!(
+            value
+                .pointer("/tool_runtime/sandbox_node_id")
+                .and_then(serde_json::Value::as_str),
+            Some("worker-node")
+        );
+
+        let round_trip: AgentDefinition =
+            serde_json::from_value(value).expect("deserialize definition");
+        assert_eq!(
+            round_trip.tool_runtime.sandbox_node_id.as_deref(),
+            Some("worker-node")
+        );
     }
 
     #[test]

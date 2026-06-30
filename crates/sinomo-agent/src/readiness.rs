@@ -1183,6 +1183,9 @@ fn agent_definition_validation_error_kind(error: &AgentDefinitionValidationError
             "ConflictingModelPolicyField"
         }
         AgentDefinitionValidationError::InvalidRuntimeLimit { .. } => "InvalidRuntimeLimit",
+        AgentDefinitionValidationError::InvalidSandboxRuntimeNodeId { .. } => {
+            "InvalidSandboxRuntimeNodeId"
+        }
         AgentDefinitionValidationError::MissingProvenanceModuleId { .. } => {
             "MissingProvenanceModuleId"
         }
