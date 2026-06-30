@@ -6860,37 +6860,12 @@ fn sifs_health_error_status_detail(error: &str) -> String {
 
 fn sifs_health_status_summary(health: &SifsHealthSummary) -> String {
     if sifs_health_has_attention(health) {
-        if health.open_conflict_count > 0 {
-            return format!(
-                "Needs attention; {} open {}",
-                health.open_conflict_count,
-                if health.open_conflict_count == 1 {
-                    "conflict"
-                } else {
-                    "conflicts"
-                }
-            );
-        }
-        if health.pending_repair_count > 0 {
-            return format!(
-                "Needs attention; {} pending {}",
-                health.pending_repair_count,
-                if health.pending_repair_count == 1 {
-                    "repair"
-                } else {
-                    "repairs"
-                }
-            );
-        }
-        return "Needs attention; namespace jobs failed".to_string();
+        return "Needs attention".to_string();
     }
     if sifs_health_has_activity(health) {
-        return "Syncing; writes or namespace jobs are still settling".to_string();
+        return "Syncing".to_string();
     }
-    format!(
-        "Healthy; {} objects, {} metadata shards",
-        health.object_count, health.metadata_shard_count
-    )
+    "Healthy".to_string()
 }
 
 fn sifs_health_error_status_summary(_error: &str) -> String {
@@ -12586,9 +12561,10 @@ mod tests {
         files.sifs_health = Some(degraded_sifs_health());
 
         let rows = unselected_inspector_rows(&files);
-        assert!(rows.iter().any(|(label, value)| {
-            *label == "SIFS health" && value == "Needs attention; 21 open conflicts"
-        }));
+        assert!(
+            rows.iter()
+                .any(|(label, value)| { *label == "SIFS health" && value == "Needs attention" })
+        );
         assert!(!rows.iter().any(|(label, _)| *label == "DFS detail"));
 
         files.inspector_details_open = true;
