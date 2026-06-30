@@ -5102,6 +5102,7 @@ fn sessions_scroll_signature(
     String,
     usize,
     bool,
+    bool,
 ) {
     let chat = shared.chat();
     let sessions = chat
@@ -5120,6 +5121,7 @@ fn sessions_scroll_signature(
         chat.pending_delete_id.clone().unwrap_or_default(),
         chat.channel_agent_idx,
         chat.session_list_loading,
+        chat.session_list_slow_notice_shown,
     )
 }
 
@@ -5682,7 +5684,7 @@ fn sidebar(
             move || sidebar_signature(&s)
         },
         move |_sig| {
-            let column = Flex::vertical()
+            let mut column = Flex::vertical()
                 .main_gap(4.0)
                 .align_items(Alignment::Stretch)
                 .with_child(SizedBox::new().height(18.0))
@@ -5712,6 +5714,12 @@ fn sidebar(
                     InsetX::new(sessions_scroll_rebuild(&s, &r, &sessions_scroll_state), 8.0),
                     FlexItem::flex(1.0).min_height(0.0),
                 );
+            if let Some(actions) = slow_session_load_actions(&s, &r) {
+                column = column
+                    .with_child(SizedBox::new().height(8.0))
+                    .with_child(InsetX::new(actions, 8.0))
+                    .with_child(SizedBox::new().height(8.0));
+            }
             WidgetPod::new(Surface::sidebar(column).fill().theme_when(clone_reader(&r)))
         },
     )
@@ -5729,6 +5737,7 @@ fn sidebar_signature(
     String,
     String,
     usize,
+    bool,
     bool,
 ) {
     let chat = shared.chat();
@@ -5754,6 +5763,84 @@ fn sidebar_signature(
         chat.session_delete_confirm_id.clone().unwrap_or_default(),
         chat.channel_agent_idx,
         chat.session_list_loading,
+        chat.session_list_slow_notice_shown,
+    )
+}
+
+fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<impl Widget + use<>> {
+    {
+        let chat = shared.chat();
+        if !(chat.session_list_loading && chat.session_list_slow_notice_shown) {
+            return None;
+        }
+    }
+
+    let retry = {
+        let s = shared.clone();
+        sui::Button::new("Retry")
+            .icon(IconGlyph::Redo)
+            .min_height(28.0)
+            .min_width(78.0)
+            .theme_when(composer_control_reader(reader))
+            .on_press(move || {
+                let waker = { s.borrow().waker.clone() };
+                s.chat_mut().retry_chat_list_with_waker(waker);
+            })
+    };
+    let check_sifs = {
+        let s = shared.clone();
+        sui::Button::new("Check SIFS")
+            .icon(IconGlyph::Storage)
+            .min_height(28.0)
+            .min_width(112.0)
+            .theme_when(secondary_button_theme(reader))
+            .on_press(move || open_files_tab(&s))
+    };
+    let connection = {
+        let s = shared.clone();
+        sui::Button::new("Connection")
+            .icon(IconGlyph::Alert)
+            .min_height(28.0)
+            .min_width(128.0)
+            .theme_when(secondary_button_theme(reader))
+            .on_press(move || open_settings_section(&s, SettingsSection::Connection))
+    };
+
+    let actions = Flex::horizontal()
+        .main_gap(6.0)
+        .align_items(Alignment::Stretch)
+        .with_item(
+            SizedBox::new().height(28.0).with_child(retry),
+            FlexItem::flex(1.0).min_width(78.0),
+        )
+        .with_item(
+            SizedBox::new().height(28.0).with_child(check_sifs),
+            FlexItem::flex(1.35).min_width(112.0),
+        );
+    let body = Flex::vertical()
+        .main_gap(6.0)
+        .align_items(Alignment::Stretch)
+        .with_child(dialog_section_label(shared, "SIFS history is slow").font_size(11.0))
+        .with_child(
+            muted_label(
+                shared,
+                "Chat and channel history stays in SIFS. You can keep chatting while it syncs.",
+            )
+            .font_size(10.5),
+        )
+        .with_child(SizedBox::new().height(28.0).with_child(actions))
+        .with_child(SizedBox::new().height(28.0).with_child(connection));
+
+    Some(
+        Surface::panel(body)
+            .padding(Insets {
+                left: 10.0,
+                top: 10.0,
+                right: 10.0,
+                bottom: 10.0,
+            })
+            .fill_width()
+            .theme_when(clone_reader(reader)),
     )
 }
 
@@ -10003,6 +10090,7 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.models_loading.hash(&mut h);
     chat.activity_panel_visible().hash(&mut h);
     chat.session_list_loading.hash(&mut h);
+    chat.session_list_slow_notice_shown.hash(&mut h);
     chat.session_kind_filter.hash(&mut h);
     chat.visible_session_has_started().hash(&mut h);
     chat.runtime_recovery_target()
@@ -10747,6 +10835,101 @@ mod tests {
             .with_description("Reading chats and channels from cluster storage")
             .expect()
             .to_be_visible()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_slow_loading_sidebar_exposes_sifs_recovery_actions() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            chat.sessions.clear();
+            chat.session_list_loading = true;
+            chat.session_list_slow_notice_shown = true;
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat sessions slow loading")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::ListItem)
+            .with_name("Still syncing SIFS history...")
+            .with_description("Reading chat and channel metadata from cluster storage")
+            .expect()
+            .to_be_visible()?;
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Retry")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Check SIFS")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Connection")
+                .count()?,
+            1
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Check SIFS")
+            .click()?;
+        assert_eq!(shared.borrow().active_tab, Tab::Files);
+
+        Ok(())
+    }
+
+    #[test]
+    fn slow_loading_sidebar_connection_action_opens_settings() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            chat.sessions.clear();
+            chat.session_list_loading = true;
+            chat.session_list_slow_notice_shown = true;
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat sessions slow loading settings")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Connection")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
 
         Ok(())
     }
