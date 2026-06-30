@@ -93,6 +93,8 @@ const COMPOSER_PAD_Y: f32 = 12.0;
 const COMPOSER_SECTION_GAP: f32 = 10.0;
 const INPUT_ACTION_GAP: f32 = 10.0;
 const SEND_BUTTON_SIZE: f32 = 40.0;
+const COMPOSER_DEFAULT_ACTION_W: f32 = SEND_BUTTON_SIZE * 2.0 + 6.0;
+const COMPOSER_REUSE_ACTION_W: f32 = 166.0;
 const COMPOSER_TEXT_SIZE: f32 = 13.5;
 const COMPOSER_LINE_HEIGHT: f32 = 19.0;
 const SESSION_LIST_UI_TIMEOUT: Duration = Duration::from_secs(8);
@@ -2884,6 +2886,36 @@ impl ChatState {
     fn can_send(&self) -> bool {
         (!self.input.trim().is_empty() || !self.attachments.is_empty())
             && !self.providers.is_empty()
+    }
+
+    fn latest_reusable_answer(&self) -> Option<&str> {
+        self.messages.iter().rev().find_map(|message| {
+            (message.source == ChatMessageSource::Model
+                && message.kind == ChatMessageKind::Message
+                && !message.text.trim().is_empty())
+            .then_some(message.text.as_str())
+        })
+    }
+
+    fn can_reuse_latest_answer(&self) -> bool {
+        !self.streaming
+            && !self.providers.is_empty()
+            && self.input.trim().is_empty()
+            && self.attachments.is_empty()
+            && self.attachment_path_input.trim().is_empty()
+            && self.latest_reusable_answer().is_some()
+    }
+
+    fn use_latest_answer_as_draft(&mut self) {
+        let Some(answer) = self.latest_reusable_answer().map(str::to_string) else {
+            return;
+        };
+        self.input = answer;
+        self.cursor = self.input.len();
+        self.attachment_path_input.clear();
+        self.attachment_controls_open = false;
+        self.attachments.clear();
+        self.draft_revision = self.draft_revision.wrapping_add(1);
     }
 
     /// Replace the configured provider-account list after Settings changes it.
@@ -9621,18 +9653,19 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 /// The composer's bottom row: a flexible message `TextArea` and a fixed-size action slot. The input
 /// is bound to the draft via `on_change`; Enter submits normally, or queues a follow-up during an
 /// active stream. The action control swaps from Send to Interrupt while streaming.
-fn composer_action_signature(shared: &Shared) -> (bool, bool) {
+fn composer_action_signature(shared: &Shared) -> (bool, bool, bool) {
     let chat = shared.chat();
     (
         chat.streaming,
         !chat.input.is_empty()
             || !chat.attachments.is_empty()
             || !chat.attachment_path_input.is_empty(),
+        chat.can_reuse_latest_answer(),
     )
 }
 
 fn composer_actions(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let (streaming, has_draft) = composer_action_signature(shared);
+    let (streaming, has_draft, can_reuse_answer) = composer_action_signature(shared);
     if streaming {
         let s = shared.clone();
         WidgetPod::new(
@@ -9680,6 +9713,38 @@ fn composer_actions(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 .align_items(Alignment::Center)
                 .spacer()
                 .with_child(clear)
+                .with_child(send),
+        )
+    } else if can_reuse_answer {
+        let reuse = {
+            let s = shared.clone();
+            sui::Button::new("Use answer")
+                .icon(IconGlyph::Redo)
+                .min_height(SEND_BUTTON_SIZE)
+                .min_width(112.0)
+                .theme_when(secondary_button_theme(reader))
+                .on_press(move || {
+                    s.chat_mut().use_latest_answer_as_draft();
+                })
+        };
+        let s = shared.clone();
+        let send = IconButton::new(IconGlyph::Send, "Send")
+            .size(SEND_BUTTON_SIZE)
+            .icon_size(17.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || s.chat().can_send()
+            })
+            .on_press(move || {
+                s.chat_mut().submit();
+            });
+        WidgetPod::new(
+            Flex::horizontal()
+                .gap(6.0)
+                .align_items(Alignment::Center)
+                .spacer()
+                .with_child(reuse)
                 .with_child(send),
         )
     } else {
@@ -9759,7 +9824,11 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let row = ComposerInputRow::new(
         WidgetPod::new(input),
         action,
-        SEND_BUTTON_SIZE * 2.0 + 6.0,
+        if shared.chat().can_reuse_latest_answer() {
+            COMPOSER_REUSE_ACTION_W
+        } else {
+            COMPOSER_DEFAULT_ACTION_W
+        },
         SEND_BUTTON_SIZE,
         INPUT_ACTION_GAP,
     );
@@ -12137,6 +12206,65 @@ mod tests {
         assert!(
             chat.draft_revision > revision_after_quick_action,
             "clear draft should trigger the programmatic composer refresh path"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_latest_answer_can_be_loaded_into_composer() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let answer = "# Design note\n\nThis response should become an editable draft.";
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.sessions.clear();
+            chat.messages = vec![
+                ChatMessage::user("draft a note"),
+                ChatMessage::model(answer),
+            ];
+            chat.input.clear();
+            chat.cursor = 0;
+            chat.session_id = SessionId::generate().to_string();
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat answer reuse")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Use answer")
+                .count()?,
+            1
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Use answer")
+            .click()?;
+        app.run_until_idle()?;
+
+        let chat = shared.chat();
+        assert_eq!(chat.input, answer);
+        assert_eq!(chat.cursor, answer.len());
+        drop(chat);
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Clear draft")
+                .count()?,
+            1,
+            "loading an answer should switch the composer back to draft actions"
         );
 
         Ok(())
@@ -14549,6 +14677,44 @@ mod tests {
         assert!(
             state.can_send(),
             "a pending new-session ack must not disable the Send button"
+        );
+    }
+
+    #[test]
+    fn latest_model_answer_can_be_reused_as_draft() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        let answer = "# Draft\n\nFinished text ready to revise.";
+        state.messages = vec![
+            ChatMessage::user("write a short draft"),
+            ChatMessage::model("old answer"),
+            ChatMessage::system_info("cluster connected"),
+            ChatMessage::model(String::new()),
+            ChatMessage::model(answer),
+        ];
+
+        assert_eq!(state.latest_reusable_answer(), Some(answer));
+        assert!(state.can_reuse_latest_answer());
+
+        state.use_latest_answer_as_draft();
+
+        assert_eq!(state.input, answer);
+        assert_eq!(state.cursor, answer.len());
+        assert!(
+            !state.can_reuse_latest_answer(),
+            "a populated draft should hide the reuse action"
+        );
+        assert!(
+            state.draft_revision > 0,
+            "loading the answer should refresh the composer host"
+        );
+
+        state.clear_draft();
+        state.streaming = true;
+        assert!(
+            !state.can_reuse_latest_answer(),
+            "active streams use the interrupt action instead"
         );
     }
 
