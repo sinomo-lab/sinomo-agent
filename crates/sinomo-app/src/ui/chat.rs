@@ -758,6 +758,7 @@ struct ChannelCreateWorkerResult {
 struct SessionListWorkerResult {
     sessions: Vec<SessionRef>,
     error: Option<String>,
+    complete: bool,
 }
 
 impl ChatState {
@@ -1047,7 +1048,11 @@ impl ChatState {
     fn refresh_sessions(&mut self) {
         let (sessions, error) =
             list_conversations_with_error(&self.data_dir, self.sifs_daemon.as_ref());
-        self.apply_session_list_result(SessionListWorkerResult { sessions, error });
+        self.apply_session_list_result(SessionListWorkerResult {
+            sessions,
+            error,
+            complete: true,
+        });
     }
 
     pub fn start_session_list_load(&mut self, waker: Option<sui::UiHandle>) {
@@ -1067,9 +1072,56 @@ impl ChatState {
         let spawn_result = thread::Builder::new()
             .name("sinomo-app-chat-list".to_string())
             .spawn(move || {
-                let (sessions, error) =
-                    list_conversations_with_error(&data_dir, sifs_daemon.as_ref());
-                let _ = tx.send(SessionListWorkerResult { sessions, error });
+                let (indexed_chat_sessions, _) =
+                    list_index_chat_conversations_with_error(&data_dir, sifs_daemon.as_ref());
+                let mut last_partial_sessions = Vec::new();
+                if !indexed_chat_sessions.is_empty()
+                    && tx
+                        .send(SessionListWorkerResult {
+                            sessions: indexed_chat_sessions.clone(),
+                            error: None,
+                            complete: false,
+                        })
+                        .is_ok()
+                {
+                    last_partial_sessions = indexed_chat_sessions.clone();
+                    if let Some(waker) = worker_waker.as_ref() {
+                        waker.wake();
+                    }
+                }
+
+                let (mut chat_sessions, chat_error) =
+                    list_chat_conversations_with_error(&data_dir, sifs_daemon.as_ref());
+                if chat_sessions.is_empty() && !indexed_chat_sessions.is_empty() {
+                    chat_sessions = indexed_chat_sessions;
+                }
+                if chat_sessions != last_partial_sessions
+                    && tx
+                        .send(SessionListWorkerResult {
+                            sessions: chat_sessions.clone(),
+                            error: None,
+                            complete: false,
+                        })
+                        .is_ok()
+                {
+                    if let Some(waker) = worker_waker.as_ref() {
+                        waker.wake();
+                    }
+                }
+
+                let (channel_sessions, channel_error) =
+                    list_channel_conversations_with_error(&data_dir, sifs_daemon.as_ref());
+                let mut sessions = chat_sessions;
+                merge_channel_conversations(&mut sessions, channel_sessions);
+                sort_conversations(&mut sessions);
+                let error = chat_error
+                    .filter(|_| sessions.is_empty())
+                    .or_else(|| channel_error.filter(|_| sessions.is_empty()));
+                let _ = tx.send(SessionListWorkerResult {
+                    sessions,
+                    error,
+                    complete: true,
+                });
                 if let Some(waker) = worker_waker {
                     waker.wake();
                 }
@@ -1103,48 +1155,58 @@ impl ChatState {
     }
 
     pub fn pump_session_list(&mut self) -> bool {
-        let result = match self.session_list_rx.as_ref().map(|rx| rx.try_recv()) {
-            Some(Ok(result)) => result,
-            Some(Err(TryRecvError::Empty)) => {
-                if self.session_list_loading
-                    && !self.session_list_slow_notice_shown
-                    && self
-                        .session_list_started_at
-                        .is_some_and(|started| started.elapsed() >= SESSION_LIST_UI_TIMEOUT)
-                {
-                    let detail = format!(
-                        "SIFS chat list is still loading after {} seconds",
-                        SESSION_LIST_UI_TIMEOUT.as_secs()
+        let mut changed = false;
+        loop {
+            let result = match self.session_list_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(result)) => result,
+                Some(Err(TryRecvError::Empty)) => {
+                    if changed {
+                        return true;
+                    }
+                    if self.session_list_loading
+                        && !self.session_list_slow_notice_shown
+                        && self
+                            .session_list_started_at
+                            .is_some_and(|started| started.elapsed() >= SESSION_LIST_UI_TIMEOUT)
+                    {
+                        let detail = format!(
+                            "SIFS conversation history is still loading after {} seconds",
+                            SESSION_LIST_UI_TIMEOUT.as_secs()
+                        );
+                        self.session_list_slow_notice_shown = true;
+                        self.replace_activity("chat list", detail, ActivityTone::Running);
+                        return true;
+                    }
+                    return false;
+                }
+                None => return changed,
+                Some(Err(TryRecvError::Disconnected)) => {
+                    self.session_list_rx = None;
+                    self.session_list_loading = false;
+                    self.session_list_started_at = None;
+                    self.session_list_slow_notice_shown = false;
+                    self.session_list_details_open = false;
+                    self.notice = Some("chat list failed: worker stopped".to_string());
+                    self.replace_activity(
+                        "chat list",
+                        "worker stopped before loading chats from SIFS".to_string(),
+                        ActivityTone::Warn,
                     );
-                    self.session_list_slow_notice_shown = true;
-                    self.replace_activity("chat list", detail, ActivityTone::Running);
                     return true;
                 }
-                return false;
-            }
-            None => return false,
-            Some(Err(TryRecvError::Disconnected)) => {
+            };
+            let complete = result.complete;
+            self.apply_session_list_result(result);
+            changed = true;
+            if complete {
                 self.session_list_rx = None;
                 self.session_list_loading = false;
                 self.session_list_started_at = None;
                 self.session_list_slow_notice_shown = false;
                 self.session_list_details_open = false;
-                self.notice = Some("chat list failed: worker stopped".to_string());
-                self.replace_activity(
-                    "chat list",
-                    "worker stopped before loading chats from SIFS".to_string(),
-                    ActivityTone::Warn,
-                );
                 return true;
             }
-        };
-        self.session_list_rx = None;
-        self.session_list_loading = false;
-        self.session_list_started_at = None;
-        self.session_list_slow_notice_shown = false;
-        self.session_list_details_open = false;
-        self.apply_session_list_result(result);
-        true
+        }
     }
 
     pub fn pump_worker_events(&mut self) -> bool {
@@ -1157,7 +1219,11 @@ impl ChatState {
     }
 
     fn apply_session_list_result(&mut self, result: SessionListWorkerResult) {
-        let SessionListWorkerResult { sessions, error } = result;
+        let SessionListWorkerResult {
+            sessions,
+            error,
+            complete,
+        } = result;
         self.sessions = sessions;
         match error {
             Some(detail) => {
@@ -1172,7 +1238,9 @@ impl ChatState {
                 {
                     self.notice = None;
                 }
-                self.activity.retain(|entry| entry.title != "chat list");
+                if complete {
+                    self.activity.retain(|entry| entry.title != "chat list");
+                }
             }
         }
     }
@@ -3401,7 +3469,11 @@ impl ChatState {
                             .map_err(channel_store_io_error)?;
                         let (sessions, error) =
                             list_conversations_with_error(&data_dir, sifs_daemon.as_ref());
-                        Ok(SessionListWorkerResult { sessions, error })
+                        Ok(SessionListWorkerResult {
+                            sessions,
+                            error,
+                            complete: true,
+                        })
                     })
                     .map_err(|error| error.to_string());
                 let _ = tx.send(ChannelCreateWorkerResult {
@@ -3619,7 +3691,40 @@ fn list_conversations_with_error(
     data_dir: &SinomoDataDir,
     sifs_daemon: Option<&sessions::SifsDaemonAccess>,
 ) -> (Vec<SessionRef>, Option<String>) {
+    let (mut conversations, chat_error) = list_chat_conversations_with_error(data_dir, sifs_daemon);
+    let (channel_sessions, channel_error) =
+        list_channel_conversations_with_error(data_dir, sifs_daemon);
+    merge_channel_conversations(&mut conversations, channel_sessions);
+    sort_conversations(&mut conversations);
+    let error = chat_error
+        .filter(|_| conversations.is_empty())
+        .or_else(|| channel_error.filter(|_| conversations.is_empty()));
+    (conversations, error)
+}
+
+fn list_index_chat_conversations_with_error(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+) -> (Vec<SessionRef>, Option<String>) {
+    let Some(_) = sifs_daemon else {
+        return (Vec::new(), None);
+    };
+    match sessions::list_index_with_report_via_daemon(data_dir, sifs_daemon) {
+        Ok(metas) => (chat_metas_to_session_refs(metas), None),
+        Err(_) => (Vec::new(), None),
+    }
+}
+
+fn list_chat_conversations_with_error(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+) -> (Vec<SessionRef>, Option<String>) {
     let (chat_metas, chat_error) = list_chat_metas_with_error(data_dir, sifs_daemon);
+    let conversations = chat_metas_to_session_refs(chat_metas);
+    (conversations, chat_error)
+}
+
+fn chat_metas_to_session_refs(chat_metas: Vec<sessions::SessionMeta>) -> Vec<SessionRef> {
     let mut conversations = chat_metas
         .into_iter()
         .map(|meta| SessionRef {
@@ -3631,13 +3736,21 @@ fn list_conversations_with_error(
             participant_names: Vec::new(),
         })
         .collect::<Vec<_>>();
+    sort_conversations(&mut conversations);
+    conversations
+}
 
+fn list_channel_conversations_with_error(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+) -> (Vec<SessionRef>, Option<String>) {
     let channel_result = open_agent_channel_store(data_dir, sifs_daemon).and_then(|store| {
         store
             .list_channel_summaries()
             .map_err(channel_store_io_error)
     });
-    let channel_error = match channel_result {
+    let mut conversations = Vec::new();
+    let error = match channel_result {
         Ok(channels) => {
             let mut seen_channel_ids = BTreeSet::new();
             for channel in channels {
@@ -3648,9 +3761,6 @@ fn list_conversations_with_error(
                 if !seen_channel_ids.insert(id.clone()) {
                     continue;
                 }
-                conversations.retain(|conversation| {
-                    !(conversation.id == id && conversation.kind == ConversationKind::Chat)
-                });
                 conversations.push(SessionRef {
                     id,
                     title: if channel.title.trim().is_empty() {
@@ -3668,12 +3778,21 @@ fn list_conversations_with_error(
         }
         Err(error) => Some(error.to_string()),
     };
-
     sort_conversations(&mut conversations);
-    let error = chat_error
-        .filter(|_| conversations.is_empty())
-        .or_else(|| channel_error.filter(|_| conversations.is_empty()));
     (conversations, error)
+}
+
+fn merge_channel_conversations(conversations: &mut Vec<SessionRef>, channels: Vec<SessionRef>) {
+    let mut seen_channel_ids = BTreeSet::new();
+    for channel in channels {
+        if !seen_channel_ids.insert(channel.id.clone()) {
+            continue;
+        }
+        conversations.retain(|conversation| {
+            !(conversation.id == channel.id && conversation.kind == ConversationKind::Chat)
+        });
+        conversations.push(channel);
+    }
 }
 
 fn session_ref_for_channel(channel: &AgentChannel) -> SessionRef {
@@ -5271,17 +5390,23 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 .with_child(ChatSessionRow::new(shared.clone(), session))
         })
         .collect::<Vec<_>>();
+    let slow_loading = loading && sessions.is_empty() && {
+        let chat = shared.chat();
+        chat.session_list_slow_notice_shown
+    };
     if loading && sessions.is_empty() {
-        let (label, detail) = {
+        let (label, detail, details_open) = {
             let chat = shared.chat();
-            loading_sessions_copy(&chat)
+            let (label, detail) = loading_sessions_copy(&chat);
+            (label, detail, chat.session_list_details_open)
         };
-        items.push(
-            ListItem::new(label)
-                .detail(detail)
-                .leading_text("...")
-                .disabled(),
-        );
+        let mut item = ListItem::new(label).detail(detail).leading_text("...");
+        if slow_loading {
+            item = item.trailing(if details_open { "Hide" } else { "Details" });
+        } else {
+            item = item.disabled();
+        }
+        items.push(item);
     } else if visible_indices.is_empty() {
         let (label, detail) = empty_copy;
         let mut item = ListItem::new(label).leading_text(" ").disabled();
@@ -5308,6 +5433,12 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .theme_when(clone_reader(reader))
         .on_change(move |index, _label| {
             let mut chat = s.chat_mut();
+            if chat.session_list_loading && chat.sessions.is_empty() {
+                if index == 0 && chat.session_list_slow_notice_shown {
+                    chat.toggle_session_list_details();
+                }
+                return;
+            }
             let filter = normalized_session_filter(&chat.session_filter);
             let visible_indices =
                 filtered_session_indices(&chat.sessions, &filter, chat.session_kind_filter);
@@ -6045,6 +6176,9 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
         if !(chat.session_list_loading && chat.session_list_slow_notice_shown) {
             return None;
         }
+        if !chat.session_list_details_open {
+            return None;
+        }
         chat.session_list_details_open
     };
 
@@ -6107,7 +6241,7 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
             FlexItem::flex(1.35).min_width(112.0),
         );
     let summary = ComposerInputRow::new(
-        WidgetPod::new(dialog_section_label(shared, "History sync slow").font_size(11.0)),
+        WidgetPod::new(dialog_section_label(shared, "History diagnostics").font_size(11.0)),
         WidgetPod::new(
             Flex::horizontal()
                 .align_items(Alignment::Center)
@@ -11416,7 +11550,15 @@ mod tests {
                 .get_by_role(SemanticsRole::Button)
                 .with_name("Details")
                 .count()?,
-            1
+            0,
+            "the collapsed sidebar should not show a second footer status"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Hide")
+                .count()?,
+            0
         );
         assert_eq!(
             window
@@ -11444,9 +11586,17 @@ mod tests {
         );
 
         window
-            .get_by_role(SemanticsRole::Button)
-            .with_name("Details")
+            .get_by_role(SemanticsRole::ListItem)
+            .with_name("History still loading...")
             .click()?;
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Hide")
+                .count()?,
+            1,
+            "expanding from the loading row should expose the diagnostics footer"
+        );
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
@@ -11501,8 +11651,8 @@ mod tests {
         let window = app.main_window()?;
 
         window
-            .get_by_role(SemanticsRole::Button)
-            .with_name("Details")
+            .get_by_role(SemanticsRole::ListItem)
+            .with_name("History still loading...")
             .click()?;
 
         window
@@ -13791,6 +13941,82 @@ mod tests {
     }
 
     #[test]
+    fn partial_session_list_result_shows_chat_history_while_channels_load() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let (tx, rx) = mpsc::channel();
+        state.session_list_rx = Some(rx);
+        state.session_list_loading = true;
+        state.session_list_started_at = Some(Instant::now());
+
+        let chat_id = SessionId::generate().to_string();
+        tx.send(SessionListWorkerResult {
+            sessions: vec![SessionRef {
+                id: chat_id.clone(),
+                title: "Visible chat".to_string(),
+                kind: ConversationKind::Chat,
+                updated_unix: 10,
+                participant_count: 1,
+                participant_names: Vec::new(),
+            }],
+            error: None,
+            complete: false,
+        })
+        .expect("send partial chat result");
+
+        assert!(
+            state.pump_session_list(),
+            "partial chat result should update visible history"
+        );
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].id, chat_id);
+        assert!(state.session_list_loading);
+        assert!(state.session_list_rx.is_some());
+        assert!(state.session_list_started_at.is_some());
+
+        let channel_id = SessionId::generate().to_string();
+        tx.send(SessionListWorkerResult {
+            sessions: vec![
+                SessionRef {
+                    id: chat_id.clone(),
+                    title: "Visible chat".to_string(),
+                    kind: ConversationKind::Chat,
+                    updated_unix: 10,
+                    participant_count: 1,
+                    participant_names: Vec::new(),
+                },
+                SessionRef {
+                    id: channel_id.clone(),
+                    title: "Planning channel".to_string(),
+                    kind: ConversationKind::Channel,
+                    updated_unix: 20,
+                    participant_count: 2,
+                    participant_names: vec!["main-agent".to_string(), "reviewer".to_string()],
+                },
+            ],
+            error: None,
+            complete: true,
+        })
+        .expect("send final merged result");
+
+        assert!(
+            state.pump_session_list(),
+            "final result should finish history loading"
+        );
+        assert_eq!(state.sessions.len(), 2);
+        assert!(state.sessions.iter().any(|session| session.id == chat_id));
+        assert!(
+            state
+                .sessions
+                .iter()
+                .any(|session| session.id == channel_id)
+        );
+        assert!(!state.session_list_loading);
+        assert!(state.session_list_rx.is_none());
+        assert!(state.session_list_started_at.is_none());
+    }
+
+    #[test]
     fn timed_out_session_list_load_can_recover_from_late_result() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
@@ -13847,6 +14073,7 @@ mod tests {
                 participant_names: Vec::new(),
             }],
             error: None,
+            complete: true,
         })
         .expect("send late result");
 

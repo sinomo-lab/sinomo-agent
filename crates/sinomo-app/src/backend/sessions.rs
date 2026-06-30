@@ -14,6 +14,7 @@ use sinomo_cli::app_api::{SifsBrowser, SifsEntry};
 use sinomo_runtime::local::SinomoDataDir;
 
 pub const SIFS_SESSIONS_ROOT: &str = "/services/sinomo-app/chat/sessions";
+const SIFS_SESSIONS_INDEX: &str = "/services/sinomo-app-chat-sessions-index.json";
 const SIFS_SESSION_FILE_PREFIX: &str = "/services/sinomo-app-chat-session-";
 const SIFS_SESSION_FILE_NAME_PREFIX: &str = "sinomo-app-chat-session-";
 const SIFS_SESSION_FILE_SUFFIX: &str = ".json";
@@ -102,6 +103,12 @@ pub struct StoredTranscript {
 struct StoredSessionRecord {
     meta: SessionMeta,
     transcript: StoredTranscript,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StoredSessionIndex {
+    #[serde(default)]
+    sessions: Vec<SessionMeta>,
 }
 
 /// Persist a chat's metadata + transcript.
@@ -297,6 +304,18 @@ pub fn list_with_report_via_daemon(
     Ok(metas)
 }
 
+pub fn list_index_with_report_via_daemon(
+    data_dir: &SinomoDataDir,
+    daemon: Option<&SifsDaemonAccess>,
+) -> Result<Vec<SessionMeta>, String> {
+    let daemon =
+        daemon.ok_or_else(|| "chat persistence requires a daemon connection".to_string())?;
+    let browser = open_sifs_browser(data_dir, Some(daemon))?;
+    let mut metas = list_sifs_index(&browser)?;
+    metas.retain(|meta| meta.deleted_unix.is_none());
+    Ok(metas)
+}
+
 /// Load a chat's transcript on demand.
 pub fn load_transcript(data_dir: &SinomoDataDir, id: &str) -> Option<StoredTranscript> {
     load_transcript_using(data_dir, None, id)
@@ -361,7 +380,7 @@ fn list_sifs(
     daemon: Option<&SifsDaemonAccess>,
 ) -> Result<Vec<SessionMeta>, String> {
     let browser = open_sifs_browser(data_dir, daemon)?;
-    let mut metas = Vec::new();
+    let mut metas = list_sifs_index(&browser).unwrap_or_default();
     for meta in list_flat_sifs_records(&browser)
         .into_iter()
         .chain(list_legacy_sifs(&browser))
@@ -369,6 +388,12 @@ fn list_sifs(
         merge_session_meta(&mut metas, meta);
     }
     metas.retain(|meta| meta.deleted_unix.is_none());
+    Ok(metas)
+}
+
+fn list_sifs_index(browser: &SifsBrowser) -> Result<Vec<SessionMeta>, String> {
+    let mut metas = read_sifs_index(browser)?.sessions;
+    metas.sort_by_key(|meta| std::cmp::Reverse(meta.updated_unix));
     Ok(metas)
 }
 
@@ -486,6 +511,11 @@ fn load_sifs_record_from_browser(browser: &SifsBrowser, id: &str) -> Option<Stor
     load_legacy_sifs_record(browser, id)
 }
 
+fn read_sifs_index(browser: &SifsBrowser) -> Result<StoredSessionIndex, String> {
+    let bytes = browser.read_file(SIFS_SESSIONS_INDEX)?;
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+}
+
 fn load_flat_sifs_record(browser: &SifsBrowser, id: &str) -> Option<StoredSessionRecord> {
     let file_path = sifs_session_file(id).ok()?;
     let bytes = browser.read_file(&file_path).ok()?;
@@ -569,6 +599,92 @@ mod tests {
         assert_eq!(transcript.messages[1].text, "hi");
         assert_eq!(transcript.messages[2].source.as_deref(), Some("system"));
         assert_eq!(transcript.messages[2].kind.as_deref(), Some("error"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sifs_listing_recovers_index_only_session_records() {
+        let root = temp_data_dir("sifs-index-listing");
+        let data_dir = SinomoDataDir::new(&root);
+        let id = "01hxy6qa9k0t9vr4g9n8d3q5e0";
+        let meta = SessionMeta {
+            id: id.to_string(),
+            title: "indexed record".to_string(),
+            updated_unix: 84,
+            message_count: 2,
+            title_source: Some("user".to_string()),
+            deleted_unix: None,
+        };
+        let browser = SifsBrowser::open(&data_dir).expect("open sifs");
+        browser
+            .write_file(
+                SIFS_SESSIONS_INDEX,
+                &serde_json::to_vec(&StoredSessionIndex {
+                    sessions: vec![meta.clone()],
+                })
+                .expect("index json"),
+            )
+            .expect("write session index");
+
+        let listed = list(&data_dir);
+        assert!(
+            listed
+                .iter()
+                .any(|session| session.id == meta.id && session.title == meta.title),
+            "index-only session records from older builds should remain visible"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sifs_listing_index_tombstone_hides_older_flat_record() {
+        let root = temp_data_dir("sifs-index-tombstone");
+        let data_dir = SinomoDataDir::new(&root);
+        let id = "01hxy6qa9k0t9vr4g9n8d3q5e1";
+        let flat_meta = SessionMeta {
+            id: id.to_string(),
+            title: "older flat record".to_string(),
+            updated_unix: 10,
+            message_count: 1,
+            title_source: Some("auto".to_string()),
+            deleted_unix: None,
+        };
+        let tombstone = SessionMeta {
+            id: id.to_string(),
+            title: "Deleted chat".to_string(),
+            updated_unix: 20,
+            message_count: 0,
+            title_source: None,
+            deleted_unix: Some(20),
+        };
+        let browser = SifsBrowser::open(&data_dir).expect("open sifs");
+        browser
+            .write_file(
+                &sifs_session_file(id).expect("session path"),
+                &serde_json::to_vec(&StoredSessionRecord {
+                    meta: flat_meta,
+                    transcript: StoredTranscript::default(),
+                })
+                .expect("record json"),
+            )
+            .expect("write flat record");
+        browser
+            .write_file(
+                SIFS_SESSIONS_INDEX,
+                &serde_json::to_vec(&StoredSessionIndex {
+                    sessions: vec![tombstone],
+                })
+                .expect("index json"),
+            )
+            .expect("write session index");
+
+        let listed = list(&data_dir);
+        assert!(
+            listed.iter().all(|session| session.id != id),
+            "newer index tombstones should prevent older flat records from reappearing"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
