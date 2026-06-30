@@ -800,7 +800,10 @@ pub fn run_shadow_daemon_supervision_loop(
                 &main_probe_status,
                 supervised_main.as_ref().map(|child| child.id()),
             ) {
-                let _ = promote_shadow_main_rollout(
+                let promoted_main_binary = pending.activation.main_binary.clone();
+                let promoted_source = pending.activation.source.clone();
+                let promoted_requested_at = pending.activation.requested_at.clone();
+                let promoted_main_options = promote_shadow_main_rollout(
                     &rollout_paths,
                     pending,
                     &options.host,
@@ -812,14 +815,23 @@ pub fn run_shadow_daemon_supervision_loop(
                     "shadow-daemon",
                     "rollout.stage.accepted",
                     "candidate main became healthy; promoting shadow main rollout",
-                    Some(&pending.activation.requested_at),
+                    Some(&promoted_requested_at),
                     serde_json::json!({
-                        "source": pending.activation.source,
-                        "requested_at": pending.activation.requested_at,
-                        "main_binary": main_binary.display().to_string(),
+                        "source": promoted_source,
+                        "requested_at": promoted_requested_at,
+                        "main_binary": promoted_main_binary.display().to_string(),
                     }),
                 );
-                break;
+                main_binary = promoted_main_binary;
+                main_options = promoted_main_options;
+                main_probe_status = probe_daemon_status(&main_paths, probe_timeout);
+                last_main_probe = Instant::now();
+                pending_rollout = None;
+                if shadow_reexec_request_path(&rollout_paths).exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(200));
+                continue;
             } else if Instant::now() >= pending.deadline {
                 let detail = "candidate main did not become healthy before rollout timeout";
                 if let Some(child) = supervised_main.as_mut() {
