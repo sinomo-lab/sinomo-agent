@@ -100,6 +100,7 @@ const COMPOSER_REUSE_ACTION_W: f32 = 166.0;
 const COMPOSER_TEXT_SIZE: f32 = 13.5;
 const COMPOSER_LINE_HEIGHT: f32 = 19.0;
 const SESSION_LIST_UI_TIMEOUT: Duration = Duration::from_secs(8);
+const TRANSCRIPT_LOAD_UI_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as the other tabs.)
@@ -749,6 +750,9 @@ pub struct ChatState {
     save_rxs: Vec<Receiver<SaveWorkerResult>>,
     delete_rx: Option<Receiver<DeleteWorkerResult>>,
     channel_create_rx: Option<Receiver<ChannelCreateWorkerResult>>,
+    transcript_load_rx: Option<Receiver<TranscriptLoadWorkerResult>>,
+    transcript_load_started_at: Option<Instant>,
+    transcript_load_slow_notice_shown: bool,
     session_list_rx: Option<Receiver<SessionListWorkerResult>>,
     session_list_loading: bool,
     session_list_started_at: Option<Instant>,
@@ -774,6 +778,11 @@ struct SaveWorkerResult {
 struct ChannelCreateWorkerResult {
     session: SessionRef,
     result: Result<SessionListWorkerResult, String>,
+}
+
+struct TranscriptLoadWorkerResult {
+    session: SessionRef,
+    result: Result<Vec<ChatMessage>, String>,
 }
 
 struct SessionListWorkerResult {
@@ -864,6 +873,9 @@ impl ChatState {
             save_rxs: Vec::new(),
             delete_rx: None,
             channel_create_rx: None,
+            transcript_load_rx: None,
+            transcript_load_started_at: None,
+            transcript_load_slow_notice_shown: false,
             session_list_rx: None,
             session_list_loading: false,
             session_list_started_at: None,
@@ -900,6 +912,9 @@ impl ChatState {
 
     /// Persist the current chat and update the sidebar row after SIFS confirms the write.
     fn persist(&mut self) {
+        if self.transcript_load_pending() {
+            return;
+        }
         let session_id = self.session_id.clone();
         let messages = self.messages.clone();
         self.persist_messages(&session_id, &messages, true);
@@ -1351,17 +1366,6 @@ impl ChatState {
         channel.channel_kind = AgentChannelKind::Channel;
         channel.rename(title);
         store.save_channel(&channel).map_err(channel_store_io_error)
-    }
-
-    fn load_channel_messages(&self, id: &str) -> Option<Vec<ChatMessage>> {
-        let channel_id = id.parse::<SessionId>().ok()?;
-        let channel = self
-            .agent_channel_store()
-            .ok()?
-            .load_channel(&channel_id)
-            .ok()
-            .flatten()?;
-        Some(channel_messages(&channel))
     }
 
     fn channel_agent_refs(&self, id: &str) -> Vec<ChannelAgentRef> {
@@ -2020,6 +2024,13 @@ impl ChatState {
         self.session_edit_details_open = false;
         self.session_title_draft.clear();
         self.session_delete_confirm_id = None;
+        self.transcript_load_rx = None;
+        self.transcript_load_started_at = None;
+        self.transcript_load_slow_notice_shown = false;
+    }
+
+    fn transcript_load_pending(&self) -> bool {
+        self.transcript_load_rx.is_some()
     }
 
     fn visible_session_has_started(&self) -> bool {
@@ -2490,39 +2501,14 @@ impl ChatState {
         true
     }
 
-    /// Open a stored chat: load its transcript for display and tell the worker
-    /// to continue under that id.
+    /// Open a stored chat/channel without blocking the UI thread. The transcript/timeline is read
+    /// from SIFS on a worker thread, then applied by `pump_transcript_load`.
     fn open_session(&mut self, index: usize) {
         let Some(session) = self.sessions.get(index).cloned() else {
             return;
         };
-        let id = session.id.clone();
-        let messages: Vec<ChatMessage> = match session.kind {
-            ConversationKind::Chat => self
-                .load_chat_transcript(&id)
-                .unwrap_or_default()
-                .messages
-                .into_iter()
-                .map(ChatMessage::from_stored)
-                .collect(),
-            ConversationKind::Channel => self.load_channel_messages(&id).unwrap_or_else(|| {
-                self.load_chat_transcript(&id)
-                    .unwrap_or_default()
-                    .messages
-                    .into_iter()
-                    .map(ChatMessage::from_stored)
-                    .collect()
-            }),
-        };
-        let history: Vec<ChatHistoryMessage> = messages
-            .iter()
-            .map(|m| ChatHistoryMessage {
-                role: m.history_role().to_string(),
-                text: m.text.clone(),
-            })
-            .collect();
-        self.messages = messages;
-        self.session_id = id.clone();
+        self.session_id = session.id.clone();
+        self.messages = vec![transcript_loading_message(&session)];
         self.streaming = false;
         self.notice = None;
         self.context = None;
@@ -2539,10 +2525,149 @@ impl ChatState {
         self.session_edit_details_open = false;
         self.session_title_draft.clear();
         self.session_delete_confirm_id = None;
-        self.handle.send_command(ChatCommand::Resume {
-            session_id: id,
-            history,
-        });
+        self.transcript_load_rx = None;
+        self.replace_activity(
+            "chat load",
+            transcript_loading_detail(session.kind),
+            ActivityTone::Running,
+        );
+        self.start_transcript_load(session);
+    }
+
+    fn start_transcript_load(&mut self, session: SessionRef) {
+        let (tx, rx) = mpsc::channel();
+        let data_dir = self.data_dir.clone();
+        let sifs_daemon = self.sifs_daemon.clone();
+        let worker_session = session.clone();
+        let worker_waker = self.ui_waker.clone();
+        let spawn_result = thread::Builder::new()
+            .name("sinomo-app-chat-load".to_string())
+            .spawn(move || {
+                let result = load_conversation_messages(
+                    &data_dir,
+                    sifs_daemon.as_ref(),
+                    &worker_session.id,
+                    worker_session.kind,
+                );
+                let _ = tx.send(TranscriptLoadWorkerResult {
+                    session: worker_session,
+                    result,
+                });
+                if let Some(waker) = worker_waker {
+                    waker.wake();
+                }
+            });
+
+        match spawn_result {
+            Ok(_) => {
+                self.transcript_load_rx = Some(rx);
+                self.transcript_load_started_at = Some(Instant::now());
+                self.transcript_load_slow_notice_shown = false;
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                self.transcript_load_rx = None;
+                self.transcript_load_started_at = None;
+                self.transcript_load_slow_notice_shown = false;
+                self.messages = vec![transcript_load_error_message(session.kind)];
+                self.notice = Some(format!("chat load failed: {detail}"));
+                self.replace_activity("chat load", detail, ActivityTone::Warn);
+            }
+        }
+    }
+
+    pub fn pump_transcript_load(&mut self) -> bool {
+        let Some(result) = self.transcript_load_rx.as_ref().map(|rx| rx.try_recv()) else {
+            return false;
+        };
+        match result {
+            Ok(result) => {
+                self.transcript_load_rx = None;
+                self.transcript_load_started_at = None;
+                self.transcript_load_slow_notice_shown = false;
+                self.apply_transcript_load_result(result);
+                true
+            }
+            Err(TryRecvError::Empty) => self.maybe_show_slow_transcript_load(),
+            Err(TryRecvError::Disconnected) => {
+                self.transcript_load_rx = None;
+                self.transcript_load_started_at = None;
+                self.transcript_load_slow_notice_shown = false;
+                self.messages = vec![ChatMessage::system_error(
+                    "Chat history stopped loading before SIFS returned a transcript.",
+                )];
+                self.notice = Some("chat load failed: worker stopped".to_string());
+                self.replace_activity(
+                    "chat load",
+                    "worker stopped before loading chat history from SIFS".to_string(),
+                    ActivityTone::Warn,
+                );
+                true
+            }
+        }
+    }
+
+    fn maybe_show_slow_transcript_load(&mut self) -> bool {
+        if self.transcript_load_slow_notice_shown
+            || !self
+                .transcript_load_started_at
+                .is_some_and(|started| started.elapsed() >= TRANSCRIPT_LOAD_UI_TIMEOUT)
+        {
+            return false;
+        }
+        self.transcript_load_slow_notice_shown = true;
+        let kind = self
+            .sessions
+            .iter()
+            .find(|session| session.id == self.session_id)
+            .map(|session| session.kind)
+            .unwrap_or(ConversationKind::Chat);
+        self.messages = vec![transcript_slow_loading_message(kind)];
+        self.replace_activity(
+            "chat load",
+            format!(
+                "SIFS transcript is still loading after {} seconds",
+                TRANSCRIPT_LOAD_UI_TIMEOUT.as_secs()
+            ),
+            ActivityTone::Running,
+        );
+        true
+    }
+
+    fn apply_transcript_load_result(&mut self, result: TranscriptLoadWorkerResult) {
+        if result.session.id != self.session_id {
+            return;
+        }
+        match result.result {
+            Ok(messages) => {
+                let history: Vec<ChatHistoryMessage> = messages
+                    .iter()
+                    .map(|m| ChatHistoryMessage {
+                        role: m.history_role().to_string(),
+                        text: m.text.clone(),
+                    })
+                    .collect();
+                self.messages = messages;
+                self.activity.retain(|entry| entry.title != "chat load");
+                if self.notice.as_deref().is_some_and(|notice| {
+                    notice.starts_with("chat load failed:")
+                        || notice == "wait for this chat history to finish loading"
+                }) {
+                    self.notice = None;
+                }
+                self.scroll = f32::MAX;
+                self.stick_bottom = true;
+                self.handle.send_command(ChatCommand::Resume {
+                    session_id: result.session.id,
+                    history,
+                });
+            }
+            Err(detail) => {
+                self.messages = vec![transcript_load_error_message(result.session.kind)];
+                self.notice = Some(format!("chat load failed: {detail}"));
+                self.replace_activity("chat load", detail, ActivityTone::Warn);
+            }
+        }
     }
 
     fn current_provider(&self) -> Option<&ProviderSummary> {
@@ -3145,6 +3270,10 @@ impl ChatState {
             self.notice = Some("set up a provider before sending".to_string());
             return;
         }
+        if self.transcript_load_pending() {
+            self.notice = Some("wait for this chat history to finish loading".to_string());
+            return;
+        }
         let Some((provider, model, account)) = self.current_model_selection() else {
             self.notice = Some("choose a model before sending".to_string());
             return;
@@ -3219,6 +3348,7 @@ impl ChatState {
     fn can_send(&self) -> bool {
         (!self.input.trim().is_empty() || !self.attachments.is_empty())
             && !self.providers.is_empty()
+            && !self.transcript_load_pending()
     }
 
     fn latest_reusable_answer(&self) -> Option<&str> {
@@ -3233,6 +3363,7 @@ impl ChatState {
     fn can_reuse_latest_answer(&self) -> bool {
         !self.streaming
             && !self.providers.is_empty()
+            && !self.transcript_load_pending()
             && self.input.trim().is_empty()
             && self.attachments.is_empty()
             && self.attachment_path_input.trim().is_empty()
@@ -3438,6 +3569,10 @@ impl ChatState {
             self.channel_agent_idx = index;
             self.begin_edit_current_session();
             self.notice = Some("use channel config to add agents".to_string());
+            return;
+        }
+        if self.transcript_load_pending() {
+            self.notice = Some("wait for this chat history to finish loading".to_string());
             return;
         }
         if self.visible_session_has_started() {
@@ -4038,6 +4173,99 @@ fn channel_messages(channel: &AgentChannel) -> Vec<ChatMessage> {
             }
         })
         .collect()
+}
+
+fn load_conversation_messages(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+    id: &str,
+    kind: ConversationKind,
+) -> Result<Vec<ChatMessage>, String> {
+    match kind {
+        ConversationKind::Chat => Ok(load_chat_messages_from_sifs(data_dir, sifs_daemon, id)),
+        ConversationKind::Channel => {
+            match load_channel_messages_from_sifs(data_dir, sifs_daemon, id) {
+                Ok(Some(messages)) => Ok(messages),
+                Ok(None) => Ok(load_chat_messages_from_sifs(data_dir, sifs_daemon, id)),
+                Err(error) => {
+                    let fallback = load_chat_messages_from_sifs(data_dir, sifs_daemon, id);
+                    if fallback.is_empty() {
+                        Err(error)
+                    } else {
+                        Ok(fallback)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn load_chat_messages_from_sifs(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+    id: &str,
+) -> Vec<ChatMessage> {
+    let transcript = match sifs_daemon {
+        Some(_) => sessions::load_transcript_via_daemon(data_dir, sifs_daemon, id),
+        None => sessions::load_transcript(data_dir, id),
+    };
+    transcript
+        .unwrap_or_default()
+        .messages
+        .into_iter()
+        .map(ChatMessage::from_stored)
+        .collect()
+}
+
+fn load_channel_messages_from_sifs(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+    id: &str,
+) -> Result<Option<Vec<ChatMessage>>, String> {
+    let channel_id = parse_channel_id(id).map_err(|error| error.to_string())?;
+    let store =
+        open_agent_channel_store(data_dir, sifs_daemon).map_err(|error| error.to_string())?;
+    let channel = store
+        .load_channel(&channel_id)
+        .map_err(channel_store_io_error)
+        .map_err(|error| error.to_string())?;
+    Ok(channel.map(|channel| channel_messages(&channel)))
+}
+
+fn transcript_loading_message(session: &SessionRef) -> ChatMessage {
+    ChatMessage::system_info(match session.kind {
+        ConversationKind::Chat => "Loading chat history from SIFS...",
+        ConversationKind::Channel => "Loading channel timeline from SIFS...",
+    })
+}
+
+fn transcript_loading_detail(kind: ConversationKind) -> String {
+    match kind {
+        ConversationKind::Chat => "Loading chat history from SIFS".to_string(),
+        ConversationKind::Channel => "Loading channel timeline from SIFS".to_string(),
+    }
+}
+
+fn transcript_slow_loading_message(kind: ConversationKind) -> ChatMessage {
+    ChatMessage::system_info(match kind {
+        ConversationKind::Chat => {
+            "Chat history is still loading from SIFS. You can keep using Sinomo or select another chat."
+        }
+        ConversationKind::Channel => {
+            "Channel timeline is still loading from SIFS. You can keep using Sinomo or select another chat."
+        }
+    })
+}
+
+fn transcript_load_error_message(kind: ConversationKind) -> ChatMessage {
+    ChatMessage::system_error(match kind {
+        ConversationKind::Chat => {
+            "Sinomo could not load this chat history. Open Activity for SIFS recovery details."
+        }
+        ConversationKind::Channel => {
+            "Sinomo could not load this channel timeline. Open Activity for SIFS recovery details."
+        }
+    })
 }
 
 fn visible_channel_message_text(message: &sinomo_agent::AgentChannelMessage) -> String {
@@ -10832,12 +11060,14 @@ impl ChatView {
             let worker_changed = chat.pump_worker_events();
             let save_changed = chat.pump_chat_saves();
             let list_changed = chat.pump_session_list();
+            let transcript_changed = chat.pump_transcript_load();
             let delete_changed = chat.pump_delete();
             let channel_create_changed = chat.pump_channel_create();
             let media_changed = chat.pump_media_call_runtime();
             worker_changed
                 || save_changed
                 || list_changed
+                || transcript_changed
                 || delete_changed
                 || channel_create_changed
                 || media_changed
@@ -10845,6 +11075,7 @@ impl ChatView {
         let streaming = self.shared.chat().streaming;
         let media_call_active = self.shared.chat().media_call.active;
         let save_pending = self.shared.chat().chat_save_pending();
+        let transcript_pending = self.shared.chat().transcript_load_pending();
 
         // Recompute the coarse signature each tick: a worker event (RuntimeInfo / Models / TurnDone,
         // or a token that resolved the selection) may have changed the selector option lists, the
@@ -10869,6 +11100,7 @@ impl ChatView {
         if streaming
             || media_call_active
             || save_pending
+            || transcript_pending
             || self.idle_frames.get() < PUMP_IDLE_BUDGET
         {
             ctx.request_animation_frame();
@@ -10898,6 +11130,9 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.attachment_path_input.is_empty().hash(&mut h);
     chat.models_loading.hash(&mut h);
     chat.activity_panel_visible().hash(&mut h);
+    chat.session_id.hash(&mut h);
+    chat.transcript_load_pending().hash(&mut h);
+    chat.transcript_load_slow_notice_shown.hash(&mut h);
     chat.session_list_loading.hash(&mut h);
     chat.session_list_slow_notice_shown.hash(&mut h);
     chat.session_kind_filter.hash(&mut h);
@@ -11877,6 +12112,103 @@ mod tests {
         assert_eq!(
             state.draft_revision, revision,
             "typing must not change the programmatic composer rebuild key"
+        );
+    }
+
+    #[test]
+    fn open_session_loads_transcript_asynchronously() {
+        let (_backend, mut state) = isolated_chat_state("open-session-async");
+        seed_default_provider(&mut state);
+        let session_id = SessionId::generate().to_string();
+        sessions::save_with_report(
+            &state.data_dir,
+            &session_id,
+            "Saved plan",
+            &[
+                StoredMessage::legacy("user", "original prompt"),
+                StoredMessage::legacy("agent", "original answer"),
+            ],
+        )
+        .expect("save transcript");
+        state.sessions = vec![SessionRef {
+            id: session_id.clone(),
+            title: "Saved plan".to_string(),
+            kind: ConversationKind::Chat,
+            updated_unix: 1,
+            participant_count: 1,
+            participant_names: Vec::new(),
+        }];
+        state.set_draft("follow up".to_string());
+
+        state.open_session(0);
+
+        assert_eq!(state.session_id, session_id);
+        assert!(state.transcript_load_pending());
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].source, ChatMessageSource::System);
+        assert_eq!(state.messages[0].kind, ChatMessageKind::Info);
+        assert!(
+            state.messages[0].text.contains("Loading chat history"),
+            "selection should show a non-blocking loading row"
+        );
+        assert!(
+            !state.can_send(),
+            "composer should wait until saved history is hydrated"
+        );
+
+        state.submit();
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("wait for this chat history to finish loading")
+        );
+
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            !state.transcript_load_pending() && state.messages.len() == 2
+        });
+
+        assert_eq!(state.messages[0].text, "original prompt");
+        assert_eq!(state.messages[1].text, "original answer");
+        assert_eq!(state.notice, None);
+        assert!(
+            state.can_send(),
+            "composer should become available after the transcript loads"
+        );
+    }
+
+    #[test]
+    fn transcript_load_timeout_surfaces_background_sifs_work() {
+        let (_backend, mut state) = isolated_chat_state("open-session-slow");
+        let (_tx, rx) = mpsc::channel();
+        state.session_id = "slow-chat".to_string();
+        state.sessions = vec![SessionRef {
+            id: "slow-chat".to_string(),
+            title: "Slow chat".to_string(),
+            kind: ConversationKind::Chat,
+            updated_unix: 1,
+            participant_count: 1,
+            participant_names: Vec::new(),
+        }];
+        state.messages = vec![ChatMessage::system_info(
+            "Loading chat history from SIFS...",
+        )];
+        state.transcript_load_rx = Some(rx);
+        state.transcript_load_started_at =
+            Some(Instant::now() - TRANSCRIPT_LOAD_UI_TIMEOUT - Duration::from_millis(10));
+
+        assert!(state.pump_transcript_load());
+        assert!(state.transcript_load_pending());
+        assert!(state.transcript_load_slow_notice_shown);
+        assert_eq!(state.messages.len(), 1);
+        assert!(
+            state.messages[0]
+                .text
+                .contains("Chat history is still loading from SIFS")
+        );
+        assert!(
+            state
+                .activity
+                .iter()
+                .any(|entry| entry.title == "chat load" && entry.tone == ActivityTone::Running)
         );
     }
 
@@ -16575,6 +16907,7 @@ mod tests {
                 state.apply_event(event);
             }
             state.pump_session_list();
+            state.pump_transcript_load();
             state.pump_channel_create();
             state.pump_delete();
             if predicate(state) {
