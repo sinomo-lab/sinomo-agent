@@ -682,6 +682,7 @@ struct PendingChatAttachment {
 pub struct ChatState {
     pub data_dir: Arc<SinomoDataDir>,
     sifs_daemon: Option<sessions::SifsDaemonAccess>,
+    ui_waker: Option<sui::UiHandle>,
     pub handle: ChatHandle,
     pub session_id: String,
     pub info: RuntimeInfo,
@@ -722,6 +723,7 @@ pub struct ChatState {
     session_title_draft: String,
     session_delete_confirm_id: Option<String>,
     pending_delete_id: Option<String>,
+    save_rxs: Vec<Receiver<SaveWorkerResult>>,
     delete_rx: Option<Receiver<DeleteWorkerResult>>,
     channel_create_rx: Option<Receiver<ChannelCreateWorkerResult>>,
     session_list_rx: Option<Receiver<SessionListWorkerResult>>,
@@ -735,6 +737,14 @@ pub struct ChatState {
 struct DeleteWorkerResult {
     session: SessionRef,
     kind: ConversationKind,
+    result: Result<(), String>,
+}
+
+struct SaveWorkerResult {
+    session_id: String,
+    title: String,
+    messages: Vec<ChatMessage>,
+    report_visible_failures: bool,
     result: Result<(), String>,
 }
 
@@ -759,8 +769,10 @@ impl ChatState {
         let sifs_storage = daemon_address
             .as_deref()
             .map(|address| AgentChatSifsStorage::new(address, backend.app_runtime.handle()));
-        let event_wake: Option<ChatEventWake> =
-            waker.map(|waker| Arc::new(move || waker.wake()) as ChatEventWake);
+        let event_wake: Option<ChatEventWake> = waker.as_ref().map(|waker| {
+            let waker = waker.clone();
+            Arc::new(move || waker.wake()) as ChatEventWake
+        });
         let handle = ChatHandle::spawn(
             (*backend.data_dir).clone(),
             daemon_connected,
@@ -784,6 +796,7 @@ impl ChatState {
         let mut state = Self {
             data_dir: backend.data_dir.clone(),
             sifs_daemon,
+            ui_waker: waker,
             handle,
             session_id: String::new(),
             info: RuntimeInfo::default(),
@@ -823,6 +836,7 @@ impl ChatState {
             session_title_draft: String::new(),
             session_delete_confirm_id: None,
             pending_delete_id: None,
+            save_rxs: Vec::new(),
             delete_rx: None,
             channel_create_rx: None,
             session_list_rx: None,
@@ -877,6 +891,48 @@ impl ChatState {
         }
         let title = Self::title_from_messages(messages);
         let stored: Vec<StoredMessage> = messages.iter().map(ChatMessage::to_stored).collect();
+        if let Some(sifs_daemon) = self.sifs_daemon.clone() {
+            let (tx, rx) = mpsc::channel();
+            let data_dir = self.data_dir.clone();
+            let session_id = session_id.to_string();
+            let title = title.clone();
+            let messages = messages.to_vec();
+            let ui_waker = self.ui_waker.clone();
+            let spawn_result = thread::Builder::new()
+                .name("sinomo-app-chat-save".to_string())
+                .spawn(move || {
+                    let result = sessions::save_with_report_via_daemon(
+                        &data_dir,
+                        Some(&sifs_daemon),
+                        &session_id,
+                        &title,
+                        &stored,
+                    )
+                    .map_err(|error| error.to_string());
+                    let _ = tx.send(SaveWorkerResult {
+                        session_id,
+                        title,
+                        messages,
+                        report_visible_failures,
+                        result,
+                    });
+                    if let Some(waker) = ui_waker {
+                        waker.wake();
+                    }
+                });
+            match spawn_result {
+                Ok(_) => {
+                    self.save_rxs.push(rx);
+                }
+                Err(error) if report_visible_failures => {
+                    let detail = error.to_string();
+                    self.notice = Some(format!("chat save failed: {detail}"));
+                    self.push_activity("chat save", detail, ActivityTone::Warn);
+                }
+                Err(_) => {}
+            }
+            return;
+        }
         match self.save_chat_record(session_id, &title, &stored) {
             Ok(_) => {
                 if let Some(session) =
@@ -887,6 +943,64 @@ impl ChatState {
             }
             Err(error) if report_visible_failures => {
                 let detail = error.to_string();
+                self.notice = Some(format!("chat save failed: {detail}"));
+                self.push_activity("chat save", detail, ActivityTone::Warn);
+            }
+            Err(_) => {}
+        }
+    }
+
+    pub fn chat_save_pending(&self) -> bool {
+        !self.save_rxs.is_empty()
+    }
+
+    pub fn pump_chat_saves(&mut self) -> bool {
+        let mut changed = false;
+        let mut index = 0;
+        while index < self.save_rxs.len() {
+            match self.save_rxs[index].try_recv() {
+                Ok(result) => {
+                    self.save_rxs.swap_remove(index);
+                    self.apply_save_result(result);
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => {
+                    index += 1;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.save_rxs.swap_remove(index);
+                    self.notice = Some("chat save failed: worker stopped".to_string());
+                    self.push_activity(
+                        "chat save",
+                        "worker stopped before saving the chat to SIFS".to_string(),
+                        ActivityTone::Warn,
+                    );
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    fn apply_save_result(&mut self, result: SaveWorkerResult) {
+        match result.result {
+            Ok(()) => {
+                if let Some(session) = self.session_ref_after_chat_save(
+                    &result.session_id,
+                    &result.title,
+                    &result.messages,
+                ) {
+                    self.upsert_session_ref(session);
+                }
+                if self
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.starts_with("chat save failed:"))
+                {
+                    self.notice = None;
+                }
+            }
+            Err(detail) if result.report_visible_failures => {
                 self.notice = Some(format!("chat save failed: {detail}"));
                 self.push_activity("chat save", detail, ActivityTone::Warn);
             }
@@ -2316,6 +2430,31 @@ impl ChatState {
         }
     }
 
+    fn current_model_selection(&self) -> Option<(String, String, String)> {
+        let provider = self.current_provider()?;
+        let provider_id = provider.id.trim();
+        let model = self.current_model();
+        if provider_id.is_empty() || model.trim().is_empty() {
+            return None;
+        }
+        Some((provider_id.to_string(), model, provider.account.clone()))
+    }
+
+    fn runtime_matches_selection(&self, provider: &str, model: &str, account: &str) -> bool {
+        self.info.provider == provider
+            && self.info.model == model
+            && sinomo_lm::normalize_provider_account_name(self.info.account.as_deref()) == account
+    }
+
+    fn current_model_selection_command(&self) -> Option<ChatCommand> {
+        self.current_model_selection()
+            .map(|(provider, model, account)| ChatCommand::SetModel {
+                provider,
+                model,
+                account,
+            })
+    }
+
     fn current_media_provider_model(&self) -> (String, String) {
         let provider = self
             .current_provider()
@@ -2692,19 +2831,8 @@ impl ChatState {
             }
             ChatEvent::Usage { usage, .. } => {
                 self.usage = Some(usage.clone());
-                let input = usage
-                    .input_tokens
-                    .map(|tokens| tokens.to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                let output = usage
-                    .output_tokens
-                    .map(|tokens| tokens.to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                self.push_activity(
-                    "model usage",
-                    format!("{} input · {} output", input, output),
-                    ActivityTone::Neutral,
-                );
+                let (detail, tone) = usage_activity_detail(&usage, self.streaming);
+                self.replace_activity("model usage", detail, tone);
             }
             ChatEvent::TurnDone { .. } => {
                 self.streaming = false;
@@ -2870,6 +2998,10 @@ impl ChatState {
             self.notice = Some("set up a provider before sending".to_string());
             return;
         }
+        let Some((provider, model, account)) = self.current_model_selection() else {
+            self.notice = Some("choose a model before sending".to_string());
+            return;
+        };
         let session_id = self.ensure_visible_session_id();
         if self.streaming {
             if !attachments.is_empty() {
@@ -2890,6 +3022,13 @@ impl ChatState {
             self.scroll = f32::MAX;
             self.persist();
             return;
+        }
+        if !self.runtime_matches_selection(&provider, &model, &account) {
+            self.handle.send_command(ChatCommand::SetModel {
+                provider,
+                model,
+                account,
+            });
         }
         let visible_text = visible_user_message_text(&text, &self.attachments);
         self.messages.push(ChatMessage::user(visible_text));
@@ -3399,21 +3538,8 @@ impl ChatState {
 
     /// Push the current provider/model selection to the worker.
     fn push_model_selection(&mut self) {
-        let provider = self
-            .current_provider()
-            .map(|p| p.id.clone())
-            .unwrap_or_default();
-        let account = self
-            .current_provider()
-            .map(|p| p.account.clone())
-            .unwrap_or_else(|| sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string());
-        let model = self.current_model();
-        if !provider.is_empty() {
-            self.handle.send_command(ChatCommand::SetModel {
-                provider,
-                model,
-                account,
-            });
+        if let Some(command) = self.current_model_selection_command() {
+            self.handle.send_command(command);
         }
     }
 
@@ -4675,6 +4801,28 @@ fn usage_summary(chat: &ChatState) -> Option<String> {
     })
 }
 
+fn usage_activity_detail(usage: &ChatUsageSnapshot, streaming: bool) -> (String, ActivityTone) {
+    let input = usage
+        .input_tokens
+        .map(|tokens| tokens.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    match usage.output_tokens {
+        Some(0) if streaming => (
+            format!("{input} input · waiting for output"),
+            ActivityTone::Running,
+        ),
+        Some(output) => (
+            format!("{input} input · {output} output"),
+            ActivityTone::Neutral,
+        ),
+        None if streaming => (
+            format!("{input} input · waiting for output"),
+            ActivityTone::Running,
+        ),
+        None => (format!("{input} input · ? output"), ActivityTone::Neutral),
+    }
+}
+
 fn transcript_message_display_text(message: &ChatMessage) -> String {
     if message.kind != ChatMessageKind::Error {
         let text = if message.source == ChatMessageSource::Model {
@@ -4955,7 +5103,7 @@ fn empty_sessions_copy(
             SessionKindFilter::All | SessionKindFilter::Chats
         )
     {
-        return ("Current chat is open", Some("Saved after SIFS confirms"));
+        return ("Current chat is open", Some("Saved after history syncs"));
     }
     match kind_filter {
         SessionKindFilter::All => ("No conversations yet", None),
@@ -4966,15 +5114,9 @@ fn empty_sessions_copy(
 
 fn loading_sessions_copy(chat: &ChatState) -> (&'static str, &'static str) {
     if chat.session_list_slow_notice_shown {
-        (
-            "Still syncing SIFS history...",
-            "Reading chat and channel metadata from cluster storage",
-        )
+        ("History still loading...", "You can keep chatting")
     } else {
-        (
-            "Syncing SIFS history...",
-            "Reading chats and channels from cluster storage",
-        )
+        ("Loading history...", "Saved chats and channels")
     }
 }
 
@@ -5932,7 +6074,7 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
             FlexItem::flex(1.35).min_width(112.0),
         );
     let summary = ComposerInputRow::new(
-        WidgetPod::new(dialog_section_label(shared, "SIFS history slow").font_size(11.0)),
+        WidgetPod::new(dialog_section_label(shared, "History sync slow").font_size(11.0)),
         WidgetPod::new(
             Flex::horizontal()
                 .align_items(Alignment::Center)
@@ -10393,11 +10535,13 @@ impl ChatView {
         let changed = {
             let mut chat = self.shared.chat_mut();
             let worker_changed = chat.pump_worker_events();
+            let save_changed = chat.pump_chat_saves();
             let list_changed = chat.pump_session_list();
             let delete_changed = chat.pump_delete();
             let channel_create_changed = chat.pump_channel_create();
             let media_changed = chat.pump_media_call_runtime();
             worker_changed
+                || save_changed
                 || list_changed
                 || delete_changed
                 || channel_create_changed
@@ -10405,6 +10549,7 @@ impl ChatView {
         };
         let streaming = self.shared.chat().streaming;
         let media_call_active = self.shared.chat().media_call.active;
+        let save_pending = self.shared.chat().chat_save_pending();
 
         // Recompute the coarse signature each tick: a worker event (RuntimeInfo / Models / TurnDone,
         // or a token that resolved the selection) may have changed the selector option lists, the
@@ -10426,7 +10571,11 @@ impl ChatView {
             self.idle_frames
                 .set(self.idle_frames.get().saturating_add(1));
         }
-        if streaming || media_call_active || self.idle_frames.get() < PUMP_IDLE_BUDGET {
+        if streaming
+            || media_call_active
+            || save_pending
+            || self.idle_frames.get() < PUMP_IDLE_BUDGET
+        {
             ctx.request_animation_frame();
             self.pump_alive.set(true);
         }
@@ -11123,18 +11272,12 @@ mod tests {
 
         assert_eq!(
             loading_sessions_copy(&state),
-            (
-                "Syncing SIFS history...",
-                "Reading chats and channels from cluster storage"
-            )
+            ("Loading history...", "Saved chats and channels")
         );
         state.session_list_slow_notice_shown = true;
         assert_eq!(
             loading_sessions_copy(&state),
-            (
-                "Still syncing SIFS history...",
-                "Reading chat and channel metadata from cluster storage"
-            )
+            ("History still loading...", "You can keep chatting")
         );
         state.session_list_slow_notice_shown = false;
         state.session_list_loading = true;
@@ -11174,7 +11317,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_empty_loading_sidebar_explains_sifs_storage() -> sui::Result<()> {
+    fn rendered_empty_loading_sidebar_uses_product_copy() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -11196,8 +11339,8 @@ mod tests {
 
         window
             .get_by_role(SemanticsRole::ListItem)
-            .with_name("Syncing SIFS history...")
-            .with_description("Reading chats and channels from cluster storage")
+            .with_name("Loading history...")
+            .with_description("Saved chats and channels")
             .expect()
             .to_be_visible()?;
 
@@ -11229,8 +11372,8 @@ mod tests {
 
         window
             .get_by_role(SemanticsRole::ListItem)
-            .with_name("Still syncing SIFS history...")
-            .with_description("Reading chat and channel metadata from cluster storage")
+            .with_name("History still loading...")
+            .with_description("You can keep chatting")
             .expect()
             .to_be_visible()?;
         assert_eq!(
@@ -11255,6 +11398,14 @@ mod tests {
                 .count()?,
             0,
             "SIFS diagnostics should not occupy the primary sidebar until expanded"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Connection")
+                .count()?,
+            0,
+            "connection diagnostics should stay behind Details"
         );
 
         window
@@ -11346,11 +11497,11 @@ mod tests {
             .push(ChatMessage::user("Draft a rollout plan."));
         assert_eq!(
             empty_sessions_copy(&state, "", SessionKindFilter::All),
-            ("Current chat is open", Some("Saved after SIFS confirms"))
+            ("Current chat is open", Some("Saved after history syncs"))
         );
         assert_eq!(
             empty_sessions_copy(&state, "", SessionKindFilter::Chats),
-            ("Current chat is open", Some("Saved after SIFS confirms"))
+            ("Current chat is open", Some("Saved after history syncs"))
         );
         assert_eq!(
             empty_sessions_copy(&state, "", SessionKindFilter::Channels),
@@ -14230,6 +14381,43 @@ mod tests {
     }
 
     #[test]
+    fn streaming_zero_output_usage_reads_as_waiting_and_collapses_activity() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.streaming = true;
+        let session_id = state.session_id.clone();
+        let usage = ChatUsageSnapshot {
+            provider: "DeepSeek".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            input_tokens: Some(7067),
+            output_tokens: Some(0),
+        };
+
+        assert_eq!(
+            usage_activity_detail(&usage, true),
+            (
+                "7067 input · waiting for output".to_string(),
+                ActivityTone::Running
+            )
+        );
+
+        state.apply_event(ChatEvent::Usage {
+            session_id: session_id.clone(),
+            usage: usage.clone(),
+        });
+        state.apply_event(ChatEvent::Usage { session_id, usage });
+
+        let usage_entries = state
+            .activity
+            .iter()
+            .filter(|entry| entry.title == "model usage")
+            .collect::<Vec<_>>();
+        assert_eq!(usage_entries.len(), 1);
+        assert_eq!(usage_entries[0].detail, "7067 input · waiting for output");
+        assert_eq!(usage_entries[0].tone, ActivityTone::Running);
+    }
+
+    #[test]
     fn empty_turn_done_marks_placeholder_as_system_info() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
@@ -15580,6 +15768,83 @@ mod tests {
             state.current_model(),
             "deepseek-v4-flash",
             "the visible provider keeps its own configured model"
+        );
+    }
+
+    #[test]
+    fn visible_model_selection_command_ignores_hidden_runtime_provider() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.providers = vec![ProviderSummary {
+            id: "deepseek".to_string(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            name: "DeepSeek".to_string(),
+            models: vec!["deepseek-v4-flash".to_string()],
+        }];
+        state.provider_idx = 0;
+        state.model_idx = 0;
+        state.models_loading = false;
+        state.info = RuntimeInfo {
+            agent: "main".to_string(),
+            provider: "github-copilot".to_string(),
+            model: "gpt-5.4".to_string(),
+            account: Some(sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
+            effort: None,
+        };
+
+        let Some(ChatCommand::SetModel {
+            provider,
+            model,
+            account,
+        }) = state.current_model_selection_command()
+        else {
+            panic!("visible provider/model should produce a model switch command");
+        };
+
+        assert_eq!(provider, "deepseek");
+        assert_eq!(model, "deepseek-v4-flash");
+        assert_eq!(account, sinomo_lm::DEFAULT_PROVIDER_ACCOUNT);
+        assert!(
+            !state.runtime_matches_selection(&provider, &model, &account),
+            "submit must switch the worker before sending when the runtime is stale"
+        );
+    }
+
+    #[test]
+    fn submit_blocks_empty_visible_model_instead_of_using_hidden_runtime() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.providers = vec![ProviderSummary {
+            id: "deepseek".to_string(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            name: "DeepSeek".to_string(),
+            models: Vec::new(),
+        }];
+        state.provider_idx = 0;
+        state.model_idx = 0;
+        state.models_loading = false;
+        state.info = RuntimeInfo {
+            agent: "main".to_string(),
+            provider: "github-copilot".to_string(),
+            model: "gpt-5.4".to_string(),
+            account: Some(sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
+            effort: None,
+        };
+
+        state.set_draft("do not send through hidden runtime".to_string());
+        state.submit();
+
+        assert!(
+            !state.streaming,
+            "send should be blocked without a visible model"
+        );
+        assert!(
+            state.messages.is_empty(),
+            "blocked sends should not add bubbles"
+        );
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("choose a model before sending")
         );
     }
 
