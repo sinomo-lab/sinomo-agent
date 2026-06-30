@@ -79,7 +79,7 @@ const ACTIVITY_RAIL_W: f32 = 286.0;
 const OVERVIEW_H: f32 = 86.0;
 const MEDIA_CALL_H: f32 = 156.0;
 const MEDIA_CALL_COMPACT_H: f32 = 46.0;
-const COMPOSER_H: f32 = 196.0;
+const COMPOSER_H: f32 = 232.0;
 const PAD: f32 = 16.0;
 const SIDEBAR_ROW_H: f32 = 36.0;
 const SIDEBAR_ROW_EDIT_W: f32 = 26.0;
@@ -89,6 +89,7 @@ const SELECTOR_H: f32 = 30.0;
 const ATTACHMENT_AREA_H: f32 = 56.0;
 const ATTACHMENT_ENTRY_H: f32 = 30.0;
 const ATTACHMENT_CHIPS_H: f32 = 22.0;
+const SCENARIO_ACTION_H: f32 = 28.0;
 const COMPOSER_PAD_Y: f32 = 12.0;
 const COMPOSER_SECTION_GAP: f32 = 10.0;
 const INPUT_ACTION_GAP: f32 = 10.0;
@@ -353,6 +354,28 @@ impl ChatQuickAction {
         }
     }
 
+    fn compact_label(self) -> &'static str {
+        match self {
+            Self::PlanChange => "Code",
+            Self::CheckCluster => "Cluster",
+            Self::DraftDocument => "Doc",
+            Self::ReasonImage => "Attach",
+            Self::RolePlay => "Role",
+            Self::ManageChannel => "Manage",
+        }
+    }
+
+    fn compact_min_width(self) -> f32 {
+        match self {
+            Self::PlanChange => 66.0,
+            Self::CheckCluster => 82.0,
+            Self::DraftDocument => 62.0,
+            Self::ReasonImage => 76.0,
+            Self::RolePlay => 64.0,
+            Self::ManageChannel => 86.0,
+        }
+    }
+
     fn prompt(self) -> Option<&'static str> {
         match self {
             Self::PlanChange => Some(
@@ -417,6 +440,14 @@ impl ChatQuickAction {
 
     fn opens_attachment_controls(self) -> bool {
         matches!(self, Self::ReasonImage)
+    }
+}
+
+fn quick_actions_for_chat(chat: &ChatState) -> &'static [ChatQuickAction] {
+    if chat.current_is_channel() {
+        &ChatQuickAction::CHANNEL
+    } else {
+        &ChatQuickAction::CHAT
     }
 }
 
@@ -8368,11 +8399,7 @@ impl TranscriptView {
     }
 
     fn quick_actions(chat: &ChatState) -> &'static [ChatQuickAction] {
-        if chat.current_is_channel() {
-            &ChatQuickAction::CHANNEL
-        } else {
-            &ChatQuickAction::CHAT
-        }
+        quick_actions_for_chat(chat)
     }
 
     fn quick_action_rects(area: Rect, actions: &[ChatQuickAction]) -> Vec<(ChatQuickAction, Rect)> {
@@ -9650,6 +9677,48 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     )
 }
 
+fn scenario_action_signature(shared: &Shared) -> bool {
+    shared.chat().current_is_channel()
+}
+
+fn scenario_action_row_visible(chat: &ChatState) -> bool {
+    !chat.messages.is_empty()
+}
+
+fn scenario_actions(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let actions = {
+        let chat = shared.chat();
+        quick_actions_for_chat(&chat).to_vec()
+    };
+    let mut row = Flex::horizontal()
+        .main_gap(6.0)
+        .align_items(Alignment::Stretch);
+    for action in actions {
+        let s = shared.clone();
+        let button = sui::Button::new(action.compact_label())
+            .icon(action.icon())
+            .icon_size(13.0)
+            .icon_gap(5.0)
+            .min_height(SCENARIO_ACTION_H)
+            .min_width(action.compact_min_width())
+            .padding(Insets {
+                left: 8.0,
+                top: 4.0,
+                right: 8.0,
+                bottom: 4.0,
+            })
+            .theme_when(secondary_button_theme(reader))
+            .on_press(move || {
+                s.chat_mut().apply_quick_action(action);
+            });
+        row = row.with_item(
+            SizedBox::new().height(SCENARIO_ACTION_H).with_child(button),
+            FlexItem::flex(1.0).min_width(action.compact_min_width()),
+        );
+    }
+    WidgetPod::new(row)
+}
+
 /// The composer's bottom row: a flexible message `TextArea` and a fixed-size action slot. The input
 /// is bound to the draft via `on_change`; Enter submits normally, or queues a follow-up during an
 /// active stream. The action control swaps from Send to Interrupt while streaming.
@@ -9835,9 +9904,11 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     WidgetPod::new(row)
 }
 
-/// The full composer: a titlebar-surfaced panel with the selector row above the input row. Wrapped
-/// so the selector row rebuilds when the option lists change. A fixed `COMPOSER_H` tall.
-fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+fn composer_layout_signature(shared: &Shared) -> bool {
+    scenario_action_row_visible(&shared.chat())
+}
+
+fn composer_body(shared: &Shared, reader: &ThemeReader, show_scenario_actions: bool) -> WidgetPod {
     let selector_host = {
         let s = shared.clone();
         let r = Rc::clone(reader);
@@ -9885,18 +9956,42 @@ fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         )
     };
 
-    let input_h = (COMPOSER_H
-        - (COMPOSER_PAD_Y * 2.0)
-        - SELECTOR_H
-        - ATTACHMENT_AREA_H
-        - (COMPOSER_SECTION_GAP * 2.0))
-        .max(48.0);
-    let body = Stack::vertical()
+    let scenario_host = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::new(
+            {
+                let s = s.clone();
+                move || scenario_action_signature(&s)
+            },
+            move |_sig| scenario_actions(&s, &r),
+        )
+    };
+
+    let stacked_chrome_h = if show_scenario_actions {
+        SCENARIO_ACTION_H + COMPOSER_SECTION_GAP * 3.0
+    } else {
+        COMPOSER_SECTION_GAP * 2.0
+    };
+    let input_h =
+        (COMPOSER_H - (COMPOSER_PAD_Y * 2.0) - SELECTOR_H - ATTACHMENT_AREA_H - stacked_chrome_h)
+            .max(48.0);
+    let mut body = Stack::vertical()
         .spacing(0.0)
         .alignment(Alignment::Stretch)
         .with_child(SizedBox::new().height(COMPOSER_PAD_Y))
         .with_child(InsetX::new(selector_host, PAD))
-        .with_child(SizedBox::new().height(COMPOSER_SECTION_GAP))
+        .with_child(SizedBox::new().height(COMPOSER_SECTION_GAP));
+    if show_scenario_actions {
+        body = body
+            .with_child(
+                SizedBox::new()
+                    .height(SCENARIO_ACTION_H)
+                    .with_child(InsetX::new(scenario_host, PAD)),
+            )
+            .with_child(SizedBox::new().height(COMPOSER_SECTION_GAP));
+    }
+    body = body
         .with_child(
             SizedBox::new()
                 .height(ATTACHMENT_AREA_H)
@@ -9910,10 +10005,26 @@ fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         )
         .with_child(SizedBox::new().height(COMPOSER_PAD_Y));
 
-    Surface::new(SurfaceRole::Titlebar, body)
-        .border(SurfaceBorder::Top)
-        .fill()
-        .theme_when(clone_reader(reader))
+    WidgetPod::new(
+        Surface::new(SurfaceRole::Titlebar, body)
+            .border(SurfaceBorder::Top)
+            .fill()
+            .theme_when(clone_reader(reader)),
+    )
+}
+
+/// The full composer: a titlebar-surfaced panel with the selector row above the input row. Wrapped
+/// so the selector row rebuilds when the option lists change. A fixed `COMPOSER_H` tall.
+fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || composer_layout_signature(&s)
+        },
+        move |show_scenario_actions| composer_body(&s, &r, *show_scenario_actions),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -12169,6 +12280,15 @@ mod tests {
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Doc")
+                .count()?,
+            0,
+            "empty chats use the larger empty-state actions instead of duplicating compact composer presets"
+        );
+
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Check cluster")
@@ -12206,6 +12326,122 @@ mod tests {
         assert!(
             chat.draft_revision > revision_after_quick_action,
             "clear draft should trigger the programmatic composer refresh path"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_started_chat_keeps_scenario_actions_available() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            seed_test_agents(&mut chat);
+            chat.sessions.clear();
+            chat.session_id = SessionId::generate().to_string();
+            chat.messages = vec![
+                ChatMessage::user("We already have history."),
+                ChatMessage::model("Ready for the next task."),
+            ];
+            chat.input.clear();
+            chat.cursor = 0;
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Started chat scenario actions")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        for label in ["Code", "Doc", "Attach", "Role", "Cluster"] {
+            assert_eq!(
+                window
+                    .get_by_role(SemanticsRole::Button)
+                    .with_name(label)
+                    .count()?,
+                1,
+                "{label} scenario action should stay available after a chat has history"
+            );
+        }
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Doc")
+            .click()?;
+
+        let chat = shared.chat();
+        let prompt = ChatQuickAction::DraftDocument
+            .prompt()
+            .expect("document prompt");
+        assert_eq!(chat.input, prompt);
+        assert_eq!(chat.cursor, prompt.len());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_started_channel_scenario_manage_opens_edit_dialog() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let channel_id = SessionId::generate().to_string();
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            seed_test_agents(&mut chat);
+            chat.sessions = vec![SessionRef {
+                id: channel_id.clone(),
+                title: "Release triage".to_string(),
+                kind: ConversationKind::Channel,
+                updated_unix: 1,
+                participant_count: 2,
+                participant_names: vec!["main-agent".to_string(), "coding-agent".to_string()],
+            }];
+            chat.session_id = channel_id.clone();
+            chat.messages = vec![
+                ChatMessage::user("Continue this channel."),
+                ChatMessage::model("main-agent: I am ready."),
+            ];
+            chat.input.clear();
+            chat.cursor = 0;
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Started channel scenario actions")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        for label in ["Manage", "Code", "Doc", "Role"] {
+            assert_eq!(
+                window
+                    .get_by_role(SemanticsRole::Button)
+                    .with_name(label)
+                    .count()?,
+                1,
+                "{label} channel scenario action should stay available after channel history"
+            );
+        }
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Manage")
+            .click()?;
+        assert_eq!(
+            shared.chat().session_edit_id.as_deref(),
+            Some(channel_id.as_str()),
+            "Manage should open the same channel edit dialog as the sidebar row action"
         );
 
         Ok(())
