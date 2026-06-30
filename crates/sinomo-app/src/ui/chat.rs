@@ -6810,15 +6810,6 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 .with_child(details_toggle),
         );
 
-    if details_open {
-        body = body.with_child(session_edit_details(
-            shared,
-            &session,
-            participant_count,
-            &participant_names,
-        ));
-    }
-
     if is_channel {
         body = body
             .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
@@ -6833,13 +6824,22 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             ));
     }
 
-    body = body.with_child(Separator::horizontal().theme_when(clone_reader(reader)));
+    if details_open {
+        body = body.with_child(session_edit_details(
+            shared,
+            &session,
+            participant_count,
+            &participant_names,
+        ));
+    }
+
     let delete_label = if is_channel {
         "Delete channel"
     } else {
         "Delete chat"
     };
     if confirming_delete {
+        body = body.with_child(Separator::horizontal().theme_when(clone_reader(reader)));
         let confirm_title = compact_line(&session.title, 34);
         let confirm = {
             let s = shared.clone();
@@ -6878,7 +6878,8 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                     .spacer()
                     .with_child(confirm),
             );
-    } else {
+    } else if details_open {
+        body = body.with_child(Separator::horizontal().theme_when(clone_reader(reader)));
         let delete_session_id = session.id.clone();
         let delete = {
             let s = shared.clone();
@@ -7215,6 +7216,8 @@ struct SessionEditPopup {
     body: WidgetPod,
     panel_rect: Rect,
     body_rect: Rect,
+    body_content_height: f32,
+    body_scroll_y: f32,
     close_hovered: bool,
     on_dismiss: Option<Box<dyn FnMut()>>,
 }
@@ -7239,6 +7242,8 @@ impl SessionEditPopup {
             body: WidgetPod::new(body),
             panel_rect: Rect::ZERO,
             body_rect: Rect::ZERO,
+            body_content_height: 0.0,
+            body_scroll_y: 0.0,
             close_hovered: false,
             on_dismiss: None,
         }
@@ -7278,6 +7283,11 @@ impl SessionEditPopup {
             Self::CLOSE_SIZE,
             Self::CLOSE_SIZE,
         )
+    }
+
+    fn clamp_scroll_y(&self, offset: f32) -> f32 {
+        let max = (self.body_content_height - self.body_rect.height()).max(0.0);
+        offset.clamp(0.0, max)
     }
 }
 
@@ -7321,6 +7331,25 @@ impl Widget for SessionEditPopup {
             Event::Keyboard(key) if key.state == KeyState::Pressed && key.key == "Escape" => {
                 self.dismiss(ctx);
             }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Scroll
+                    && self.body_rect.contains(pointer.position) =>
+            {
+                if let Some(delta) = pointer.scroll_delta {
+                    let dy = match delta {
+                        ScrollDelta::Lines(v) => v.y * 42.0,
+                        ScrollDelta::Pixels(v) => v.y,
+                    };
+                    let next = self.clamp_scroll_y(self.body_scroll_y - dy);
+                    if (next - self.body_scroll_y).abs() > f32::EPSILON {
+                        self.body_scroll_y = next;
+                        ctx.request_arrange();
+                        ctx.request_paint();
+                        ctx.request_semantics();
+                        ctx.set_handled();
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -7353,10 +7382,12 @@ impl Widget for SessionEditPopup {
             .max(0.0);
         let body_size = self.body.measure(
             ctx,
-            Constraints::new(Size::ZERO, Size::new(body_width, body_max_height)),
+            Constraints::new(Size::ZERO, Size::new(body_width, f32::INFINITY)),
         );
+        self.body_content_height = body_size.height;
+        let body_height = body_size.height.min(body_max_height);
         let panel_height =
-            Self::PANEL_PADDING * 2.0 + Self::TITLE_HEIGHT + Self::BODY_GAP + body_size.height;
+            Self::PANEL_PADDING * 2.0 + Self::TITLE_HEIGHT + Self::BODY_GAP + body_height;
         let panel_x = ((viewport.width - panel_width) * 0.5).max(0.0);
         let panel_y = ((viewport.height - panel_height) * 0.5).max(Self::OUTER_MARGIN);
         self.panel_rect = Rect::new(panel_x, panel_y, panel_width, panel_height);
@@ -7364,8 +7395,9 @@ impl Widget for SessionEditPopup {
             panel_x + Self::PANEL_PADDING,
             panel_y + Self::PANEL_PADDING + Self::TITLE_HEIGHT + Self::BODY_GAP,
             body_width,
-            body_size.height,
+            body_height,
         );
+        self.body_scroll_y = self.clamp_scroll_y(self.body_scroll_y);
         viewport
     }
 
@@ -7377,14 +7409,25 @@ impl Widget for SessionEditPopup {
             + ((bounds.height() - panel_height) * 0.5)
                 .max(Self::OUTER_MARGIN.min(bounds.height().max(0.0)));
         self.panel_rect = Rect::new(panel_x, panel_y, panel_width, panel_height);
-        let body_size = self.body.measured_size();
+        let measured = self.body.measured_size();
+        self.body_content_height = measured.height;
+        self.body_scroll_y = self.clamp_scroll_y(self.body_scroll_y);
         self.body_rect = Rect::new(
             panel_x + Self::PANEL_PADDING,
             panel_y + Self::PANEL_PADDING + Self::TITLE_HEIGHT + Self::BODY_GAP,
-            body_size.width,
-            body_size.height,
+            measured.width,
+            (panel_height - Self::PANEL_PADDING * 2.0 - Self::TITLE_HEIGHT - Self::BODY_GAP)
+                .max(0.0),
         );
-        self.body.arrange(ctx, self.body_rect);
+        self.body.arrange(
+            ctx,
+            Rect::new(
+                self.body_rect.x(),
+                self.body_rect.y() - self.body_scroll_y,
+                measured.width,
+                measured.height,
+            ),
+        );
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
@@ -7426,7 +7469,9 @@ impl Widget for SessionEditPopup {
             close.inflate(-6.0, -6.0),
             self.theme.palette.text_muted,
         );
+        ctx.push_clip_rect(self.body_rect);
         self.body.paint(ctx);
+        ctx.pop_clip();
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
@@ -13031,6 +13076,20 @@ mod tests {
             .with_name("Edit Team channel")
             .click()?;
         app.run_until_idle()?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Remove main-agent")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Delete channel")
+            .expect()
+            .to_be_hidden()?;
+        window
+            .get_by_text("Storage: SIFS channel record and timeline")
+            .expect()
+            .to_be_hidden()?;
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Show details")
