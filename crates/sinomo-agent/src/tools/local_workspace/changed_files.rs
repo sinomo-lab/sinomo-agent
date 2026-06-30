@@ -26,6 +26,7 @@ impl AgentTool for ChangedFilesTool {
         ];
         let execution = match execute_local_command(
             &self.config,
+            request.session,
             &self.config.git_program,
             &args,
             None,

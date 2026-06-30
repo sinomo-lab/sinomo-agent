@@ -17,16 +17,19 @@ use super::{
 };
 use crate::{
     AgentCancellationToken, AgentProcessLifecycleStatus, AgentProcessManager, AgentProcessSnapshot,
-    AgentProcessStart, AgentStoragePaths, AgentToolCall, AgentToolKind, AgentToolSpec, TaskId,
-    default_coding_agent_tools,
+    AgentProcessStart, AgentStoragePaths, AgentToolCall, AgentToolKind, AgentToolSpec,
+    InteractionSession, TaskId, default_coding_agent_tools,
 };
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::node::NodeId;
 use sinomo_runtime::sandbox::{
     LocalSandboxInstanceLayout, LocalSandboxInstanceStore, LocalSandboxToolchainStore,
-    SandboxCommandExecutionError, SandboxId, SandboxMount, SandboxMountMode, SandboxPath,
-    SandboxPolicy, SandboxStoreError, SandboxToolchainId, SandboxWasiError,
+    SandboxCommandExecutionError, SandboxId, SandboxInstanceLifecycleStatus,
+    SandboxInstanceManifest, SandboxInstancePortability, SandboxMount, SandboxMountMode,
+    SandboxPath, SandboxPolicy, SandboxRuntimeBinding, SandboxStoreError, SandboxToolchainId,
+    SandboxTrackedProcess, SandboxTrackedProcessStatus, SandboxWasiError,
+    sandbox_execution_placement_for_node,
 };
 use sinomo_runtime::sandbox_simple::{SandboxSimpleNativeCommandRunner, SandboxSimpleNativeConfig};
 use std::collections::BTreeMap;
@@ -43,6 +46,7 @@ const DEFAULT_LOCAL_MAX_SEARCH_MATCHES: usize = 100;
 const DEFAULT_LOCAL_MAX_LIST_ENTRIES: usize = 200;
 const AGENT_SANDBOX_TOOLCHAIN_ID: &str = "agent_tools";
 const AGENT_HOME_SIFS_ROOT: &str = "/sinomo/agents";
+const SIMPLE_SANDBOX_RUNTIME: &str = "simple_sandbox";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalWorkspaceAgentConfig {
@@ -51,6 +55,9 @@ pub struct LocalWorkspaceAgentConfig {
     pub sifs_evidence: Option<LocalWorkspaceSifsEvidenceConfig>,
     pub command_runtime: LocalWorkspaceCommandRuntime,
     pub sandbox_runtime_root: PathBuf,
+    pub sandbox_instance_id: Option<SandboxId>,
+    pub sandbox_runtime_node_id: Option<NodeId>,
+    pub sandbox_portability: SandboxInstancePortability,
     pub agent_home_sifs_path: Option<String>,
     pub agent_home_local_root: Option<PathBuf>,
     pub sandbox_allow_unenforced: bool,
@@ -108,6 +115,9 @@ impl LocalWorkspaceAgentConfig {
             sifs_evidence: None,
             command_runtime: LocalWorkspaceCommandRuntime::SimpleSandbox,
             sandbox_runtime_root: default_agent_sandbox_runtime_root(),
+            sandbox_instance_id: None,
+            sandbox_runtime_node_id: None,
+            sandbox_portability: SandboxInstancePortability::NonPortable,
             agent_home_sifs_path,
             agent_home_local_root: None,
             sandbox_allow_unenforced: false,
@@ -138,6 +148,29 @@ impl LocalWorkspaceAgentConfig {
 
     pub fn with_sandbox_runtime_root(mut self, sandbox_runtime_root: impl Into<PathBuf>) -> Self {
         self.sandbox_runtime_root = sandbox_runtime_root.into();
+        self
+    }
+
+    pub fn with_sandbox_instance_id(mut self, sandbox_instance_id: SandboxId) -> Self {
+        self.sandbox_instance_id = Some(sandbox_instance_id);
+        self
+    }
+
+    pub fn with_sandbox_runtime_node_id(mut self, sandbox_runtime_node_id: NodeId) -> Self {
+        self.sandbox_runtime_node_id = Some(sandbox_runtime_node_id);
+        self
+    }
+
+    pub fn without_sandbox_runtime_node_id(mut self) -> Self {
+        self.sandbox_runtime_node_id = None;
+        self
+    }
+
+    pub fn with_sandbox_portability(
+        mut self,
+        sandbox_portability: SandboxInstancePortability,
+    ) -> Self {
+        self.sandbox_portability = sandbox_portability;
         self
     }
 
@@ -199,6 +232,7 @@ impl LocalWorkspaceAgentConfig {
     pub fn with_agent_storage(mut self, paths: &AgentStoragePaths, session_id: &SessionId) -> Self {
         self.evidence_dir = Some(paths.evidence_dir_for_session(session_id));
         self.agent_home_sifs_path = Some(default_agent_home_sifs_path_for_session(session_id));
+        self.sandbox_instance_id = Some(agent_sandbox_id_for_session(&self.root, session_id));
         self
     }
 
@@ -214,18 +248,23 @@ impl LocalWorkspaceAgentConfig {
     }
 }
 
+pub fn register_tools(registry: &AgentToolRegistry, config: LocalWorkspaceAgentConfig) {
+    registry.register(read_file::ReadFileTool::new(config.clone()));
+    registry.register(list_files::ListFilesTool::new(config.clone()));
+    registry.register(search::SearchFilesTool::new(config.clone()));
+    registry.register(edit_file::EditFileTool::new(config.clone()));
+    registry.register(write_file::WriteFileTool::new(config.clone()));
+    registry.register(apply_patch::ApplyPatchTool::new(config.clone()));
+    registry.register(changed_files::ChangedFilesTool::new(config.clone()));
+    registry.register(git_diff::GitDiffTool::new(config.clone()));
+    registry.register(run_command::RunCommandTool::new(config.clone()));
+    registry.register(request_user_input::RequestUserInputTool);
+}
+
 pub fn registry(config: LocalWorkspaceAgentConfig) -> AgentToolRegistry {
-    AgentToolRegistry::new()
-        .with_tool(read_file::ReadFileTool::new(config.clone()))
-        .with_tool(list_files::ListFilesTool::new(config.clone()))
-        .with_tool(search::SearchFilesTool::new(config.clone()))
-        .with_tool(edit_file::EditFileTool::new(config.clone()))
-        .with_tool(write_file::WriteFileTool::new(config.clone()))
-        .with_tool(apply_patch::ApplyPatchTool::new(config.clone()))
-        .with_tool(changed_files::ChangedFilesTool::new(config.clone()))
-        .with_tool(git_diff::GitDiffTool::new(config.clone()))
-        .with_tool(run_command::RunCommandTool::new(config.clone()))
-        .with_tool(request_user_input::RequestUserInputTool)
+    let registry = AgentToolRegistry::new();
+    register_tools(&registry, config);
+    registry
 }
 
 pub fn default_local_workspace_tool_descriptors() -> Vec<AgentToolDescriptor> {
@@ -292,12 +331,14 @@ enum LocalWorkspaceFileAccess {
 
 fn local_run_command_from_call(
     config: &LocalWorkspaceAgentConfig,
+    session: &InteractionSession,
     call: &AgentToolCall,
     cancellation_token: AgentCancellationToken,
     progress_sink: AgentToolProgressSink,
 ) -> AgentToolResult {
     local_shell_command_from_call(
         config,
+        session,
         call,
         "run_command",
         None,
@@ -309,6 +350,7 @@ fn local_run_command_from_call(
 
 fn local_shell_command_from_call(
     config: &LocalWorkspaceAgentConfig,
+    session: &InteractionSession,
     call: &AgentToolCall,
     tool_name: &str,
     default_command: Option<&str>,
@@ -341,6 +383,7 @@ fn local_shell_command_from_call(
     let (program, args): (&str, Vec<String>) = local_shell_program_and_args(command.clone());
     run_local_command_with_options(
         config,
+        session,
         program,
         args,
         None,
@@ -391,6 +434,7 @@ fn coding_evidence(evidence: &AgentToolEvidence) -> AgentCodingToolEvidence {
 
 fn run_local_command_with_options(
     config: &LocalWorkspaceAgentConfig,
+    session: &InteractionSession,
     program: &str,
     args: Vec<String>,
     stdin: Option<&[u8]>,
@@ -400,6 +444,7 @@ fn run_local_command_with_options(
 ) -> AgentToolResult {
     let execution = match execute_local_command(
         config,
+        session,
         program,
         &args,
         stdin,
@@ -447,6 +492,7 @@ struct LocalCommandOutput {
 
 fn execute_local_command(
     config: &LocalWorkspaceAgentConfig,
+    session: &InteractionSession,
     program: &str,
     args: &[String],
     stdin: Option<&[u8]>,
@@ -458,6 +504,7 @@ fn execute_local_command(
     match config.command_runtime {
         LocalWorkspaceCommandRuntime::SimpleSandbox => execute_simple_sandbox_command(
             config,
+            session,
             program,
             args,
             stdin,
@@ -588,6 +635,7 @@ fn execute_local_process_command(
 
 fn execute_simple_sandbox_command(
     config: &LocalWorkspaceAgentConfig,
+    session: &InteractionSession,
     program: &str,
     args: &[String],
     stdin: Option<&[u8]>,
@@ -607,7 +655,24 @@ fn execute_simple_sandbox_command(
     };
     let prepared = prepare_sandbox_command(program, args, &cwd)?;
     let sandbox_cwd = sandbox_path_for_host_path(&cwd)?;
-    let sandbox_id = agent_sandbox_id(&root);
+    let sandbox_id = agent_sandbox_id(config, &root);
+    let node_id = requested_sandbox_runtime_node(config, session);
+    if node_id != session.node_id {
+        return Err(AgentToolResult::blocked(
+            format!(
+                "simple sandbox runtime `{sandbox_id}` is pinned to node `{node_id}`, but this turn is executing on `{}`",
+                session.node_id
+            ),
+            serde_json::json!({
+                "error": "sandbox_runtime_remote_unavailable",
+                "runtime": SIMPLE_SANDBOX_RUNTIME,
+                "sandbox_id": sandbox_id,
+                "requested_node_id": node_id,
+                "executing_node_id": session.node_id,
+                "portability": config.sandbox_portability,
+            }),
+        ));
+    }
     let toolchain_id =
         SandboxToolchainId::from_legacy_named(AGENT_SANDBOX_TOOLCHAIN_ID).map_err(|source| {
             AgentToolResult::failed(
@@ -626,6 +691,7 @@ fn execute_simple_sandbox_command(
         &root,
         &cwd,
         &prepared.path_prefixes,
+        &node_id,
     )?;
     let runner = SandboxSimpleNativeCommandRunner::new(SandboxSimpleNativeConfig {
         allow_unenforced: config.sandbox_allow_unenforced,
@@ -639,7 +705,6 @@ fn execute_simple_sandbox_command(
         extra_execute_paths: sandbox_extra_execute_paths(&prepared.path_prefixes),
     });
     let toolchain_store = LocalSandboxToolchainStore::new(layout.toolchain_runtime_cache_root());
-    let node_id = NodeId::derived("sinomo-agent-simple-sandbox-node", sandbox_id.as_str());
     let policy = agent_sandbox_policy();
     let command_text = std::iter::once(program.to_string())
         .chain(args.iter().cloned())
@@ -647,6 +712,20 @@ fn execute_simple_sandbox_command(
         .join(" ");
     let process_id = TaskId::generate().to_string();
     let started = Instant::now();
+    mark_agent_sandbox_process_started(
+        &store,
+        &sandbox_id,
+        SandboxTrackedProcess {
+            process_id: process_id.clone(),
+            command: command_text.clone(),
+            argv: std::iter::once(program.to_string())
+                .chain(args.iter().cloned())
+                .collect(),
+            cwd: sandbox_path_for_host_path(&cwd)?,
+            started_at: time::OffsetDateTime::now_utc(),
+            status: SandboxTrackedProcessStatus::Running,
+        },
+    )?;
     progress_sink.emit(AgentToolProgressEvent::ProcessStarted {
         process: sandbox_process_snapshot(
             &process_id,
@@ -667,6 +746,7 @@ fn execute_simple_sandbox_command(
         ),
     });
     if cancellation_token.is_cancelled() {
+        mark_agent_sandbox_process_finished(&store, &sandbox_id, &process_id, None)?;
         let output = LocalCommandOutput {
             stdout: Vec::new(),
             stderr: b"command cancelled before sandbox start".to_vec(),
@@ -714,6 +794,7 @@ fn execute_simple_sandbox_command(
         &policy,
         None,
     );
+    let _ = mark_agent_sandbox_process_finished(&store, &sandbox_id, &process_id, None);
     match outcome {
         Ok(outcome) => {
             let status_code = Some(outcome.response.exit_status);
@@ -926,13 +1007,8 @@ fn prepare_agent_sandbox_manifest(
     root: &Path,
     cwd: &Path,
     path_prefixes: &[PathBuf],
-) -> Result<
-    (
-        sinomo_runtime::sandbox::SandboxInstanceManifest,
-        LocalSandboxInstanceLayout,
-    ),
-    AgentToolResult,
-> {
+    node_id: &NodeId,
+) -> Result<(SandboxInstanceManifest, LocalSandboxInstanceLayout), AgentToolResult> {
     fs::create_dir_all(&config.sandbox_runtime_root).map_err(|source| {
         AgentToolResult::failed(
             format!(
@@ -958,8 +1034,14 @@ fn prepare_agent_sandbox_manifest(
             ));
         }
     };
+    validate_sandbox_runtime_binding(&manifest, node_id, config)?;
     manifest.toolchain_id = toolchain_id.clone();
     manifest.cwd = sandbox_cwd;
+    manifest.runtime_binding = Some(SandboxRuntimeBinding {
+        runtime: SIMPLE_SANDBOX_RUNTIME.to_string(),
+        node_id: node_id.clone(),
+        portability: config.sandbox_portability.clone(),
+    });
     let agent_home_local = agent_home_local_mirror(config);
     if let Some(home) = agent_home_local.as_deref() {
         fs::create_dir_all(home).map_err(|source| {
@@ -984,6 +1066,19 @@ fn prepare_agent_sandbox_manifest(
         agent_home_local.as_deref(),
     );
     manifest.mounts = agent_home_mounts(config)?;
+    manifest.last_placement = Some(
+        sandbox_execution_placement_for_node(&manifest, node_id).map_err(|source| {
+            AgentToolResult::blocked(
+                format!("simple sandbox placement rejected: {source}"),
+                serde_json::json!({
+                    "error": "simple_sandbox_placement_rejected",
+                    "detail": source.to_string(),
+                    "sandbox_id": sandbox_id,
+                    "requested_node_id": node_id,
+                }),
+            )
+        })?,
+    );
     manifest.updated_at = now;
     let layout = store
         .save_manifest(&manifest)
@@ -1027,6 +1122,115 @@ fn prepare_agent_sandbox_manifest(
         }
     }
     Ok((manifest, layout))
+}
+
+fn validate_sandbox_runtime_binding(
+    manifest: &SandboxInstanceManifest,
+    node_id: &NodeId,
+    config: &LocalWorkspaceAgentConfig,
+) -> Result<(), AgentToolResult> {
+    let Some(binding) = &manifest.runtime_binding else {
+        return Ok(());
+    };
+    if binding.runtime != SIMPLE_SANDBOX_RUNTIME {
+        return Err(AgentToolResult::blocked(
+            format!(
+                "sandbox `{}` is already bound to runtime `{}`",
+                manifest.sandbox_id, binding.runtime
+            ),
+            serde_json::json!({
+                "error": "sandbox_runtime_binding_mismatch",
+                "sandbox_id": manifest.sandbox_id,
+                "existing_runtime": binding.runtime,
+                "requested_runtime": SIMPLE_SANDBOX_RUNTIME,
+            }),
+        ));
+    }
+    if binding.portability == SandboxInstancePortability::NonPortable && binding.node_id != *node_id
+    {
+        return Err(AgentToolResult::blocked(
+            format!(
+                "sandbox `{}` is non-portable and is already bound to node `{}`",
+                manifest.sandbox_id, binding.node_id
+            ),
+            serde_json::json!({
+                "error": "sandbox_non_portable_node_mismatch",
+                "sandbox_id": manifest.sandbox_id,
+                "existing_node_id": binding.node_id,
+                "requested_node_id": node_id,
+                "runtime": binding.runtime,
+                "portability": binding.portability,
+            }),
+        ));
+    }
+    if config.sandbox_portability == SandboxInstancePortability::NonPortable
+        && binding.node_id != *node_id
+    {
+        return Err(AgentToolResult::blocked(
+            format!(
+                "simple sandbox `{}` cannot move from node `{}` to node `{node_id}`",
+                manifest.sandbox_id, binding.node_id
+            ),
+            serde_json::json!({
+                "error": "sandbox_non_portable_node_mismatch",
+                "sandbox_id": manifest.sandbox_id,
+                "existing_node_id": binding.node_id,
+                "requested_node_id": node_id,
+                "runtime": SIMPLE_SANDBOX_RUNTIME,
+                "portability": config.sandbox_portability,
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn mark_agent_sandbox_process_started(
+    store: &LocalSandboxInstanceStore,
+    sandbox_id: &SandboxId,
+    process: SandboxTrackedProcess,
+) -> Result<(), AgentToolResult> {
+    let (mut manifest, _layout) = store
+        .load(sandbox_id)
+        .map_err(sandbox_store_failure("load simple sandbox manifest"))?;
+    manifest
+        .active_processes
+        .retain(|existing| existing.process_id != process.process_id);
+    manifest.active_processes.push(process);
+    manifest.lifecycle.status = SandboxInstanceLifecycleStatus::Running;
+    if manifest.lifecycle.started_at.is_none() {
+        manifest.lifecycle.started_at = Some(time::OffsetDateTime::now_utc());
+    }
+    manifest.lifecycle.stopped_at = None;
+    manifest.lifecycle.last_error = None;
+    manifest.updated_at = time::OffsetDateTime::now_utc();
+    store
+        .save_manifest(&manifest)
+        .map_err(sandbox_store_failure("save simple sandbox manifest"))?;
+    Ok(())
+}
+
+fn mark_agent_sandbox_process_finished(
+    store: &LocalSandboxInstanceStore,
+    sandbox_id: &SandboxId,
+    process_id: &str,
+    last_error: Option<String>,
+) -> Result<(), AgentToolResult> {
+    let (mut manifest, _layout) = store
+        .load(sandbox_id)
+        .map_err(sandbox_store_failure("load simple sandbox manifest"))?;
+    manifest
+        .active_processes
+        .retain(|process| process.process_id != process_id);
+    if manifest.active_processes.is_empty() {
+        manifest.lifecycle.status = SandboxInstanceLifecycleStatus::Stopped;
+        manifest.lifecycle.stopped_at = Some(time::OffsetDateTime::now_utc());
+    }
+    manifest.lifecycle.last_error = last_error;
+    manifest.updated_at = time::OffsetDateTime::now_utc();
+    store
+        .save_manifest(&manifest)
+        .map_err(sandbox_store_failure("save simple sandbox manifest"))?;
+    Ok(())
 }
 
 fn sandbox_store_failure(
@@ -1224,11 +1428,35 @@ fn dedup_pathbufs(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     unique
 }
 
-fn agent_sandbox_id(root: &Path) -> SandboxId {
+fn agent_sandbox_id(config: &LocalWorkspaceAgentConfig, root: &Path) -> SandboxId {
+    config
+        .sandbox_instance_id
+        .clone()
+        .unwrap_or_else(|| agent_sandbox_id_for_workspace(root))
+}
+
+fn agent_sandbox_id_for_workspace(root: &Path) -> SandboxId {
     SandboxId::derived(
         "sinomo-agent-local-workspace-sandbox",
         root.to_string_lossy().as_bytes(),
     )
+}
+
+fn agent_sandbox_id_for_session(root: &Path, session_id: &SessionId) -> SandboxId {
+    let mut seed = root.to_string_lossy().into_owned().into_bytes();
+    seed.push(0);
+    seed.extend(session_id.to_string().as_bytes());
+    SandboxId::derived("sinomo-agent-session-sandbox", &seed)
+}
+
+fn requested_sandbox_runtime_node(
+    config: &LocalWorkspaceAgentConfig,
+    session: &InteractionSession,
+) -> NodeId {
+    config
+        .sandbox_runtime_node_id
+        .clone()
+        .unwrap_or_else(|| session.node_id.clone())
 }
 
 fn default_agent_sandbox_runtime_root() -> PathBuf {
@@ -1560,10 +1788,13 @@ fn local_command_result_from_output(
 fn local_workspace_sandbox_metadata(config: &LocalWorkspaceAgentConfig) -> serde_json::Value {
     match config.command_runtime {
         LocalWorkspaceCommandRuntime::SimpleSandbox => serde_json::json!({
-            "runtime": "simple_sandbox",
+            "runtime": SIMPLE_SANDBOX_RUNTIME,
             "checked": true,
             "allow_unenforced": config.sandbox_allow_unenforced,
             "runtime_root": config.sandbox_runtime_root,
+            "sandbox_instance_id": config.sandbox_instance_id,
+            "runtime_node_id": config.sandbox_runtime_node_id,
+            "portability": config.sandbox_portability,
             "agent_home_sifs_path": config.agent_home_sifs_path,
             "agent_home_local_root": config.agent_home_local_root,
         }),
@@ -1905,6 +2136,17 @@ fn truncate_utf8_lossy(bytes: &[u8], max_bytes: usize) -> TruncatedText {
 mod tests {
     use super::*;
 
+    fn test_session(name: &str) -> InteractionSession {
+        InteractionSession::new(
+            SessionId::from_legacy_named(format!("session-{name}")).expect("session id"),
+            NodeId::from_legacy_named(format!("node-{name}")).expect("node id"),
+            crate::InteractionSurface::new(
+                "surface.test",
+                crate::InteractionSurfaceKind::CommandLine,
+            ),
+        )
+    }
+
     #[test]
     fn local_workspace_commands_default_to_simple_sandbox_with_agent_home() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-default");
@@ -1932,7 +2174,8 @@ mod tests {
             .with_sandbox_runtime_root(&runtime_root)
             .with_agent_home_sifs_path("/sinomo/agents/test-agent/home");
         let canonical_workspace = fs::canonicalize(&workspace).expect("canonical workspace");
-        let sandbox_id = agent_sandbox_id(&canonical_workspace);
+        let sandbox_id = agent_sandbox_id(&config, &canonical_workspace);
+        let node_id = NodeId::from_legacy_named("node-home").expect("node");
         let toolchain_id =
             SandboxToolchainId::from_legacy_named(AGENT_SANDBOX_TOOLCHAIN_ID).expect("toolchain");
         let store = LocalSandboxInstanceStore::new(&runtime_root);
@@ -1948,6 +2191,7 @@ mod tests {
             &canonical_workspace,
             &canonical_workspace,
             &[],
+            &node_id,
         )
         .expect("manifest");
         let (manifest, _layout) = store.load(&sandbox_id).expect("load manifest");
@@ -2036,6 +2280,144 @@ mod tests {
         );
     }
 
+    #[test]
+    fn data_dir_evidence_uses_distinct_sandbox_instance_per_session() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-session-id");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let session_a = SessionId::from_legacy_named("session-a").expect("session a");
+        let session_b = SessionId::from_legacy_named("session-b").expect("session b");
+        let config_a = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_data_dir_evidence(&data_dir, &session_a);
+        let config_b = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_data_dir_evidence(&data_dir, &session_b);
+        let canonical_workspace = fs::canonicalize(&workspace).expect("canonical workspace");
+
+        assert_ne!(
+            agent_sandbox_id(&config_a, &canonical_workspace),
+            agent_sandbox_id(&config_b, &canonical_workspace)
+        );
+    }
+
+    #[test]
+    fn simple_sandbox_manifest_blocks_non_portable_node_move() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-node-binding");
+        let runtime_root = root.join("sandbox-runtime");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let sandbox_id = SandboxId::from_legacy_named("sandbox-node-binding").expect("sandbox id");
+        let node_a = NodeId::from_legacy_named("node-a").expect("node a");
+        let node_b = NodeId::from_legacy_named("node-b").expect("node b");
+        let config_a = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_sandbox_runtime_root(&runtime_root)
+            .with_sandbox_instance_id(sandbox_id.clone())
+            .with_sandbox_runtime_node_id(node_a.clone());
+        let config_b = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_sandbox_runtime_root(&runtime_root)
+            .with_sandbox_instance_id(sandbox_id.clone())
+            .with_sandbox_runtime_node_id(node_b.clone());
+        let canonical_workspace = fs::canonicalize(&workspace).expect("canonical workspace");
+        let toolchain_id =
+            SandboxToolchainId::from_legacy_named(AGENT_SANDBOX_TOOLCHAIN_ID).expect("toolchain");
+        let store = LocalSandboxInstanceStore::new(&runtime_root);
+        let sandbox_cwd =
+            sandbox_path_for_host_path(&canonical_workspace).expect("sandbox cwd path");
+
+        prepare_agent_sandbox_manifest(
+            &config_a,
+            &store,
+            &sandbox_id,
+            &toolchain_id,
+            sandbox_cwd.clone(),
+            &canonical_workspace,
+            &canonical_workspace,
+            &[],
+            &node_a,
+        )
+        .expect("first placement");
+        let result = prepare_agent_sandbox_manifest(
+            &config_b,
+            &store,
+            &sandbox_id,
+            &toolchain_id,
+            sandbox_cwd,
+            &canonical_workspace,
+            &canonical_workspace,
+            &[],
+            &node_b,
+        );
+
+        let error = result.expect_err("non-portable sandbox should reject node move");
+        assert_eq!(
+            error
+                .output
+                .get("error")
+                .and_then(serde_json::Value::as_str),
+            Some("sandbox_non_portable_node_mismatch")
+        );
+    }
+
+    #[test]
+    fn simple_sandbox_manifest_tracks_active_process_lifecycle() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-process-tracking");
+        let runtime_root = root.join("sandbox-runtime");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config =
+            LocalWorkspaceAgentConfig::new(&workspace).with_sandbox_runtime_root(&runtime_root);
+        let canonical_workspace = fs::canonicalize(&workspace).expect("canonical workspace");
+        let sandbox_id = agent_sandbox_id(&config, &canonical_workspace);
+        let node_id = NodeId::from_legacy_named("node-process").expect("node");
+        let toolchain_id =
+            SandboxToolchainId::from_legacy_named(AGENT_SANDBOX_TOOLCHAIN_ID).expect("toolchain");
+        let store = LocalSandboxInstanceStore::new(&runtime_root);
+        let sandbox_cwd =
+            sandbox_path_for_host_path(&canonical_workspace).expect("sandbox cwd path");
+        prepare_agent_sandbox_manifest(
+            &config,
+            &store,
+            &sandbox_id,
+            &toolchain_id,
+            sandbox_cwd.clone(),
+            &canonical_workspace,
+            &canonical_workspace,
+            &[],
+            &node_id,
+        )
+        .expect("manifest");
+
+        mark_agent_sandbox_process_started(
+            &store,
+            &sandbox_id,
+            SandboxTrackedProcess {
+                process_id: "proc-1".to_string(),
+                command: "sleep 1".to_string(),
+                argv: vec!["sleep".to_string(), "1".to_string()],
+                cwd: sandbox_cwd,
+                started_at: time::OffsetDateTime::now_utc(),
+                status: SandboxTrackedProcessStatus::Running,
+            },
+        )
+        .expect("process started");
+        let (manifest, _layout) = store.load(&sandbox_id).expect("load running manifest");
+        assert_eq!(
+            manifest.lifecycle.status,
+            SandboxInstanceLifecycleStatus::Running
+        );
+        assert_eq!(manifest.active_processes.len(), 1);
+
+        mark_agent_sandbox_process_finished(&store, &sandbox_id, "proc-1", None)
+            .expect("process finished");
+        let (manifest, _layout) = store.load(&sandbox_id).expect("load stopped manifest");
+        assert_eq!(
+            manifest.lifecycle.status,
+            SandboxInstanceLifecycleStatus::Stopped
+        );
+        assert!(manifest.active_processes.is_empty());
+        assert!(manifest.lifecycle.stopped_at.is_some());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn simple_sandbox_command_denies_writes_outside_workspace_when_enforced() {
@@ -2059,6 +2441,7 @@ mod tests {
 
         let execution = execute_local_command(
             &config,
+            &test_session("sandbox-deny-write"),
             program,
             &args,
             Some(b"blocked"),
@@ -2107,6 +2490,7 @@ mod tests {
 
         let execution = execute_local_command(
             &config,
+            &test_session("sandbox-command"),
             "cmd.exe",
             &args,
             None,

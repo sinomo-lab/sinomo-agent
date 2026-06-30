@@ -73,6 +73,12 @@ struct StoredSandboxInstanceManifest {
     command_history: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_placement: Option<SandboxExecutionPlacement>,
+    #[serde(default)]
+    lifecycle: SandboxInstanceLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_binding: Option<SandboxRuntimeBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    active_processes: Vec<SandboxTrackedProcess>,
     temp_policy: SandboxTempPolicy,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     temp_epoch: u64,
@@ -335,6 +341,9 @@ impl TryFrom<&SandboxInstanceManifest> for StoredSandboxInstanceManifest {
                 .map(ToString::to_string)
                 .collect(),
             last_placement: manifest.last_placement.clone(),
+            lifecycle: manifest.lifecycle.clone(),
+            runtime_binding: manifest.runtime_binding.clone(),
+            active_processes: manifest.active_processes.clone(),
             temp_policy: manifest.temp_policy.clone(),
             temp_epoch: manifest.temp_epoch,
             limits: manifest.limits.clone(),
@@ -390,6 +399,9 @@ impl TryFrom<StoredSandboxInstanceManifest> for SandboxInstanceManifest {
                 })
                 .collect::<Result<Vec<_>, SandboxStoreError>>()?,
             last_placement: stored.last_placement,
+            lifecycle: stored.lifecycle,
+            runtime_binding: stored.runtime_binding,
+            active_processes: stored.active_processes,
             temp_policy: stored.temp_policy,
             temp_epoch: stored.temp_epoch,
             limits: stored.limits,

@@ -125,6 +125,12 @@ impl From<tui::AppRuntimeInfo> for ChatRuntimeInfo {
     }
 }
 
+/// Tool runtime placement for chat and channel turns.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ChatToolRuntimeSelection {
+    pub sandbox_node_id: Option<String>,
+}
+
 /// A streamed event produced while the agent answers.
 #[derive(Clone, Debug)]
 pub enum ChatStreamEvent {
@@ -614,6 +620,7 @@ pub struct AgentChat {
     channel_store: Box<dyn AgentChannelStore>,
     channel: AgentChannel,
     runtime: InteractionRuntime<InMemoryEventStore, Handler>,
+    tool_runtime: ChatToolRuntimeSelection,
 }
 
 impl AgentChat {
@@ -687,6 +694,7 @@ impl AgentChat {
             channel_store,
             channel,
             runtime,
+            tool_runtime: ChatToolRuntimeSelection::default(),
         })
     }
 
@@ -746,6 +754,34 @@ impl AgentChat {
 
     pub fn runtime_info(&self) -> ChatRuntimeInfo {
         tui::app_runtime_info(self.runtime.handler()).into()
+    }
+
+    pub fn tool_runtime(&self) -> ChatToolRuntimeSelection {
+        self.tool_runtime.clone()
+    }
+
+    pub fn set_tool_runtime_node(
+        &mut self,
+        sandbox_node_id: Option<String>,
+    ) -> Result<ChatToolRuntimeSelection, CliError> {
+        let normalized = sandbox_node_id
+            .map(|node_id| node_id.trim().to_string())
+            .filter(|node_id| !node_id.is_empty());
+        if let Some(node_id) = &normalized {
+            parse_chat_tool_runtime_node_id(node_id)?;
+        }
+        self.tool_runtime.sandbox_node_id = normalized;
+        Ok(self.tool_runtime())
+    }
+
+    fn configure_tool_runtime_for_session(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<(), CliError> {
+        let sandbox_node_id = parse_chat_tool_runtime_selection(&self.tool_runtime)?;
+        self.runtime
+            .handler_mut()
+            .configure_tool_runtime_for_session(&self.data_dir, session_id, sandbox_node_id)
     }
 
     pub fn channel_id(&self) -> String {
@@ -834,6 +870,8 @@ impl AgentChat {
         if self.channel.channel_kind == AgentChannelKind::Channel {
             return self.send_channel_with_attachments(text, attachments, on_event);
         }
+        let session_id = self.runtime.session().session_id.clone();
+        self.configure_tool_runtime_for_session(&session_id)?;
         let speaker = self.primary_speaker();
         let attachments = self.store_chat_attachments(attachments)?;
         let mut source = AgentChannelSource::app();
@@ -977,6 +1015,7 @@ impl AgentChat {
             daemon_connected,
             runtime: &mut self.runtime,
             context_attachments,
+            tool_runtime: self.tool_runtime.clone(),
         };
         let store = self.channel_store.as_ref();
         let mut channel_runtime = AgentChannelRuntime::new(channel, store, executor)
@@ -1160,6 +1199,7 @@ struct AppAgentChannelExecutor<'a> {
     daemon_connected: bool,
     runtime: &'a mut InteractionRuntime<InMemoryEventStore, Handler>,
     context_attachments: Vec<AgentContextAttachment>,
+    tool_runtime: ChatToolRuntimeSelection,
 }
 
 impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
@@ -1199,6 +1239,16 @@ impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
         .map_err(channel_executor_cli_error)?;
 
         let interaction_session = app_session(Some(&participant.agent_session_id.to_string()));
+        let sandbox_node_id = parse_chat_tool_runtime_selection(&self.tool_runtime)
+            .map_err(channel_executor_cli_error)?;
+        self.runtime
+            .handler_mut()
+            .configure_tool_runtime_for_session(
+                self.data_dir,
+                &interaction_session.session_id,
+                sandbox_node_id,
+            )
+            .map_err(channel_executor_cli_error)?;
         self.runtime
             .replace_store_and_session(InMemoryEventStore::new(), interaction_session.clone());
         self.runtime
@@ -2402,6 +2452,24 @@ fn app_session(session_id: Option<&str>) -> InteractionSession {
         node_id,
         InteractionSurface::new("surface.app", InteractionSurfaceKind::App),
     )
+}
+
+fn parse_chat_tool_runtime_selection(
+    selection: &ChatToolRuntimeSelection,
+) -> Result<Option<NodeId>, CliError> {
+    selection
+        .sandbox_node_id
+        .as_deref()
+        .map(parse_chat_tool_runtime_node_id)
+        .transpose()
+}
+
+fn parse_chat_tool_runtime_node_id(value: &str) -> Result<NodeId, CliError> {
+    NodeId::new(value.to_string())
+        .or_else(|_| NodeId::from_legacy_named(value.to_string()))
+        .map_err(|source| CliError::Parse {
+            detail: format!("invalid sandbox runtime node id `{value}`: {source}"),
+        })
 }
 
 /// All agents available for selection (stored definitions first, else built-ins).

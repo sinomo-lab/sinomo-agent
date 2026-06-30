@@ -21,7 +21,8 @@ use sinomo_agent::{
 use sinomo_cli::app_api::{
     AgentChat, AgentChatSifsStorage, ChatAttachmentInput, ChatContextSnapshot, ChatControlState,
     ChatControlStatus, ChatHistoryMessage, ChatProcessSnapshot, ChatRuntimeInfo, ChatSpeaker,
-    ChatStreamEvent, ChatTaskSnapshot, ChatToolCallSnapshot, ChatUsageSnapshot,
+    ChatStreamEvent, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
+    ChatUsageSnapshot,
 };
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
@@ -117,6 +118,9 @@ pub enum ChatCommand {
         key: String,
         history: Vec<ChatHistoryMessage>,
     },
+    SetToolRuntime {
+        sandbox_node_id: Option<String>,
+    },
     /// Ask sinomo-lm for the provider's available models (fetched off the worker so the
     /// blocking API call never stalls chat turns); the result arrives as [`ChatEvent::Models`].
     FetchModels {
@@ -183,6 +187,7 @@ pub enum ChatEvent {
     ControlStatus(ChatControlStatus),
     ControlState(ChatControlState),
     RuntimeInfo(RuntimeInfo),
+    ToolRuntime(ChatToolRuntimeSelection),
     SessionReset {
         session_id: String,
     },
@@ -220,6 +225,7 @@ impl ChatEvent {
             } => Some(session_id),
             ChatEvent::Ready { .. }
             | ChatEvent::RuntimeInfo(_)
+            | ChatEvent::ToolRuntime(_)
             | ChatEvent::Models { .. }
             | ChatEvent::Error {
                 session_id: None, ..
@@ -589,6 +595,7 @@ fn worker(
         session_id: chat.session_id(),
         info: chat.runtime_info().into(),
     });
+    let _ = evt_tx.send(ChatEvent::ToolRuntime(chat.tool_runtime()));
 
     while let Ok(command) = cmd_rx.recv() {
         match command {
@@ -805,6 +812,19 @@ fn worker(
                                 session_id
                             }),
                             error: format!("agent switch failed: {error}"),
+                        });
+                    }
+                }
+            }
+            ChatCommand::SetToolRuntime { sandbox_node_id } => {
+                match chat.set_tool_runtime_node(sandbox_node_id) {
+                    Ok(selection) => {
+                        let _ = evt_tx.send(ChatEvent::ToolRuntime(selection));
+                    }
+                    Err(error) => {
+                        let _ = evt_tx.send(ChatEvent::Error {
+                            session_id: Some(chat.session_id()),
+                            error: format!("tool runtime update failed: {error}"),
                         });
                     }
                 }

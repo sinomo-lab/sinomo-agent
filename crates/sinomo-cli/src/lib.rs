@@ -3247,13 +3247,39 @@ pub(crate) fn main_agent_tool_registry_for_workspace(
     data_dir: &SinomoDataDir,
     workspace_root: &Path,
 ) -> Result<AgentToolRegistry, CliError> {
+    let registry = AgentToolRegistry::new();
+    main_agent_configure_tool_registry_for_workspace(
+        &registry,
+        data_dir,
+        workspace_root,
+        None,
+        None,
+    )?;
+    Ok(registry)
+}
+
+pub(crate) fn main_agent_configure_tool_registry_for_workspace(
+    registry: &AgentToolRegistry,
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+    session_id: Option<&SessionId>,
+    sandbox_node_id: Option<NodeId>,
+) -> Result<(), CliError> {
     let store = main_agent_config_store()?;
-    Ok(
-        AgentToolRegistry::local_workspace_with_config(LocalWorkspaceAgentConfig::new(
-            workspace_root,
-        ))
-        .with_config_management(ConfigAgentToolConfig::new(data_dir.clone(), store)),
-    )
+    let mut config = LocalWorkspaceAgentConfig::new(workspace_root);
+    if let Some(session_id) = session_id {
+        config = config.with_data_dir_evidence(data_dir, session_id);
+    }
+    if let Some(sandbox_node_id) = sandbox_node_id {
+        config = config.with_sandbox_runtime_node_id(sandbox_node_id);
+    }
+    registry.clear();
+    sinomo_agent::local_workspace::register_tools(registry, config);
+    sinomo_agent::config::register_tools(
+        registry,
+        ConfigAgentToolConfig::new(data_dir.clone(), store),
+    );
+    Ok(())
 }
 
 pub(crate) fn main_agent_config_store() -> Result<sinomo_runtime::config::ConfigStore, CliError> {

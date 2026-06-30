@@ -38,6 +38,7 @@ impl AgentTool for GitDiffTool {
 
         let diff_output = match run_git_diff_command(
             &self.config,
+            request.session,
             staged,
             path.as_deref(),
             &[],
@@ -50,6 +51,7 @@ impl AgentTool for GitDiffTool {
         };
         let stat_output = match run_git_diff_command(
             &self.config,
+            request.session,
             staged,
             path.as_deref(),
             &["--stat"],
@@ -62,6 +64,7 @@ impl AgentTool for GitDiffTool {
         };
         let names_output = match run_git_diff_command(
             &self.config,
+            request.session,
             staged,
             path.as_deref(),
             &["--name-only"],
@@ -159,6 +162,7 @@ pub(super) fn descriptor() -> AgentToolDescriptor {
 
 fn run_git_diff_command(
     config: &LocalWorkspaceAgentConfig,
+    session: &InteractionSession,
     staged: bool,
     path: Option<&str>,
     extra_args: &[&str],
@@ -177,6 +181,7 @@ fn run_git_diff_command(
     }
     let execution = execute_local_command(
         config,
+        session,
         &config.git_program,
         &args,
         None,

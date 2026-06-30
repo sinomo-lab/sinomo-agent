@@ -30,6 +30,81 @@ pub struct SandboxMount {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxInstancePortability {
+    Portable,
+    NonPortable,
+}
+
+impl Default for SandboxInstancePortability {
+    fn default() -> Self {
+        Self::NonPortable
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SandboxRuntimeBinding {
+    pub runtime: String,
+    pub node_id: NodeId,
+    #[serde(default)]
+    pub portability: SandboxInstancePortability,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxInstanceLifecycleStatus {
+    Created,
+    Running,
+    Stopped,
+}
+
+impl Default for SandboxInstanceLifecycleStatus {
+    fn default() -> Self {
+        Self::Created
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SandboxInstanceLifecycle {
+    #[serde(default)]
+    pub status: SandboxInstanceLifecycleStatus,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub started_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub stopped_at: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl Default for SandboxInstanceLifecycle {
+    fn default() -> Self {
+        Self {
+            status: SandboxInstanceLifecycleStatus::Created,
+            started_at: None,
+            stopped_at: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxTrackedProcessStatus {
+    Running,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SandboxTrackedProcess {
+    pub process_id: String,
+    pub command: String,
+    pub argv: Vec<String>,
+    pub cwd: SandboxPath,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    pub status: SandboxTrackedProcessStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SandboxResourceLimits {
     pub memory_mb: u64,
     pub wall_time_ms: u64,
@@ -100,6 +175,12 @@ pub struct SandboxInstanceManifest {
     pub command_history: Vec<SandboxCommandId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_placement: Option<SandboxExecutionPlacement>,
+    #[serde(default)]
+    pub lifecycle: SandboxInstanceLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_binding: Option<SandboxRuntimeBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_processes: Vec<SandboxTrackedProcess>,
     pub temp_policy: SandboxTempPolicy,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub temp_epoch: u64,
@@ -125,6 +206,9 @@ impl SandboxInstanceManifest {
             mounts: Vec::new(),
             command_history: Vec::new(),
             last_placement: None,
+            lifecycle: SandboxInstanceLifecycle::default(),
+            runtime_binding: None,
+            active_processes: Vec::new(),
             temp_policy: SandboxTempPolicy::default(),
             temp_epoch: 0,
             limits: SandboxResourceLimits::default(),

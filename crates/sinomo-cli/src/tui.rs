@@ -450,6 +450,12 @@ fn submit_tui_input<H: TuiAgentRuntimeControl>(
 
     state.begin_submission(&line);
     terminal.draw(state)?;
+    let sandbox_node_id =
+        parse_tui_tool_runtime_state_node_id(state.tool_runtime_node_id.as_deref())?;
+    let session = runtime.session().clone();
+    runtime
+        .handler
+        .configure_tui_tool_runtime(data_dir, &session, sandbox_node_id)?;
 
     let mut render_error = None;
     let result = {
@@ -962,6 +968,7 @@ enum TuiSlashCommand {
     Agent(TuiAgentCommand),
     Files { target: TuiFilesTarget },
     Model(TuiModelCommand),
+    ToolRuntime(TuiToolRuntimeCommand),
     Settings,
     Sessions,
     Resume { session_id: SessionId },
@@ -978,6 +985,13 @@ enum TuiAgentCommand {
 enum TuiModelCommand {
     Status,
     Use(TuiModelSelection),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TuiToolRuntimeCommand {
+    Status,
+    Local,
+    Node(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1060,6 +1074,15 @@ trait TuiAgentRuntimeControl: InteractionEventHandler {
         daemon_connected: bool,
         definition: AgentDefinition,
     ) -> Result<TuiAgentRuntimeInfo, CliError>;
+
+    fn configure_tui_tool_runtime(
+        &mut self,
+        _data_dir: &SinomoDataDir,
+        _session: &InteractionSession,
+        _sandbox_node_id: Option<NodeId>,
+    ) -> Result<(), CliError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1090,6 +1113,7 @@ struct TuiState {
     daemon_connected: bool,
     cluster_label: Option<String>,
     runtime_info: TuiAgentRuntimeInfo,
+    tool_runtime_node_id: Option<String>,
     runtime_activity: TuiRuntimeActivity,
     last_model_usage: Option<TuiTokenUsage>,
     session_token_usage: TuiTokenUsage,
@@ -1124,6 +1148,7 @@ impl TuiState {
             daemon_connected: daemon.is_some(),
             cluster_label,
             runtime_info,
+            tool_runtime_node_id: None,
             runtime_activity: TuiRuntimeActivity::default(),
             last_model_usage: None,
             session_token_usage: TuiTokenUsage::default(),
@@ -2903,6 +2928,7 @@ fn parse_tui_slash_command(line: &str) -> Result<Option<TuiSlashCommand>, CliErr
             detail: "usage: /files [path|sifs:/path|local:<path>|--sifs [path]]".to_string(),
         }),
         [command, rest @ ..] if command == "model" => parse_tui_model_command(rest),
+        [command, rest @ ..] if command == "tool-runtime" => parse_tui_tool_runtime_command(rest),
         [command] if command == "settings" => Ok(Some(TuiSlashCommand::Settings)),
         [command, ..] if command == "settings" => Err(CliError::Parse {
             detail: "usage: /settings".to_string(),
@@ -2922,6 +2948,41 @@ fn parse_tui_slash_command(line: &str) -> Result<Option<TuiSlashCommand>, CliErr
         }),
         _ => Ok(None),
     }
+}
+
+fn parse_tui_tool_runtime_command(args: &[String]) -> Result<Option<TuiSlashCommand>, CliError> {
+    match args {
+        [] => Ok(Some(TuiSlashCommand::ToolRuntime(
+            TuiToolRuntimeCommand::Status,
+        ))),
+        [command] if command == "status" => Ok(Some(TuiSlashCommand::ToolRuntime(
+            TuiToolRuntimeCommand::Status,
+        ))),
+        [command] if command == "local" => Ok(Some(TuiSlashCommand::ToolRuntime(
+            TuiToolRuntimeCommand::Local,
+        ))),
+        [command, node_id] if command == "node" => {
+            parse_tui_tool_runtime_node_id(node_id)?;
+            Ok(Some(TuiSlashCommand::ToolRuntime(
+                TuiToolRuntimeCommand::Node(node_id.clone()),
+            )))
+        }
+        _ => Err(CliError::Parse {
+            detail: "usage: /tool-runtime [status|local|node <node-id>]".to_string(),
+        }),
+    }
+}
+
+fn parse_tui_tool_runtime_node_id(value: &str) -> Result<NodeId, CliError> {
+    NodeId::new(value.to_string())
+        .or_else(|_| NodeId::from_legacy_named(value.to_string()))
+        .map_err(|source| CliError::Parse {
+            detail: format!("invalid sandbox runtime node id `{value}`: {source}"),
+        })
+}
+
+fn parse_tui_tool_runtime_state_node_id(value: Option<&str>) -> Result<Option<NodeId>, CliError> {
+    value.map(parse_tui_tool_runtime_node_id).transpose()
 }
 
 fn default_tui_files_target() -> TuiFilesTarget {
@@ -3027,6 +3088,36 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
                 "model switched: {} {}",
                 info.agent,
                 info.model_label()
+            ))])
+        }
+        TuiSlashCommand::ToolRuntime(TuiToolRuntimeCommand::Status) => {
+            Ok(vec![InteractionOutput::Line(format!(
+                "sandbox runtime node: {}",
+                state
+                    .tool_runtime_node_id
+                    .as_deref()
+                    .unwrap_or("local turn node")
+            ))])
+        }
+        TuiSlashCommand::ToolRuntime(TuiToolRuntimeCommand::Local) => {
+            state.tool_runtime_node_id = None;
+            let session = runtime.session().clone();
+            runtime
+                .handler
+                .configure_tui_tool_runtime(data_dir, &session, None)?;
+            Ok(vec![InteractionOutput::Line(
+                "sandbox runtime node: local turn node".to_string(),
+            )])
+        }
+        TuiSlashCommand::ToolRuntime(TuiToolRuntimeCommand::Node(node_id)) => {
+            let parsed_node_id = parse_tui_tool_runtime_node_id(&node_id)?;
+            let session = runtime.session().clone();
+            runtime
+                .handler
+                .configure_tui_tool_runtime(data_dir, &session, Some(parsed_node_id))?;
+            state.tool_runtime_node_id = Some(node_id.clone());
+            Ok(vec![InteractionOutput::Line(format!(
+                "sandbox runtime node: {node_id}"
             ))])
         }
         TuiSlashCommand::Sessions => {
@@ -5854,6 +5945,29 @@ mod tui_tests {
     }
 
     #[test]
+    fn tui_tool_runtime_command_accepts_status_local_and_node_forms() {
+        assert_eq!(
+            parse_tui_slash_command("/tool-runtime")
+                .expect("parse")
+                .expect("status"),
+            TuiSlashCommand::ToolRuntime(TuiToolRuntimeCommand::Status)
+        );
+        assert_eq!(
+            parse_tui_slash_command("/tool-runtime local")
+                .expect("parse")
+                .expect("local"),
+            TuiSlashCommand::ToolRuntime(TuiToolRuntimeCommand::Local)
+        );
+        assert_eq!(
+            parse_tui_slash_command("/tool-runtime node worker-a")
+                .expect("parse")
+                .expect("node"),
+            TuiSlashCommand::ToolRuntime(TuiToolRuntimeCommand::Node("worker-a".to_string()))
+        );
+        assert!(parse_tui_slash_command("/tool-runtime node").is_err());
+    }
+
+    #[test]
     fn tui_agent_command_accepts_status_list_and_switch_forms() {
         assert_eq!(
             parse_tui_slash_command("/agent")
@@ -6338,6 +6452,25 @@ where
         }
     }
 
+    pub(crate) fn configure_tool_runtime_for_session(
+        &self,
+        data_dir: &SinomoDataDir,
+        session_id: &SessionId,
+        sandbox_node_id: Option<NodeId>,
+    ) -> Result<(), CliError> {
+        let workspace_root = std::env::current_dir().map_err(|source| CliError::Io {
+            path: "current directory".to_string(),
+            detail: source.to_string(),
+        })?;
+        main_agent_configure_tool_registry_for_workspace(
+            &self.tool_registry,
+            data_dir,
+            &workspace_root,
+            Some(session_id),
+            sandbox_node_id,
+        )
+    }
+
     fn build_runtime(&self, model: M, session: AgentSession) -> AgentSessionRuntime<M> {
         let mut session = session;
         session.role = self.agent_definition.role.clone();
@@ -6799,6 +6932,15 @@ impl TuiAgentRuntimeControl for RuntimeMainAgentInteractionHandler<DefaultMainAg
                 .unwrap_or_else(|| sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
         };
         self.switch_to_selection(data_dir, selection, daemon_connected)
+    }
+
+    fn configure_tui_tool_runtime(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        session: &InteractionSession,
+        sandbox_node_id: Option<NodeId>,
+    ) -> Result<(), CliError> {
+        self.configure_tool_runtime_for_session(data_dir, &session.session_id, sandbox_node_id)
     }
 }
 

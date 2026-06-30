@@ -58,7 +58,8 @@ use sinomo_agent::{
 use sinomo_cli::app_api::{
     AgentChatSifsStorage, AgentSummary, ChatAttachmentInput, ChatContextSnapshot,
     ChatHistoryMessage, ChatProcessSnapshot, ChatTaskSnapshot, ChatToolCallSnapshot,
-    ChatUsageSnapshot, ProviderSummary, SifsAgentChannelStore, agent_summaries, reasoning_efforts,
+    ChatToolRuntimeSelection, ChatUsageSnapshot, ProviderSummary, SifsAgentChannelStore,
+    agent_summaries, reasoning_efforts,
 };
 use sinomo_runtime::{events::SessionId, local::SinomoDataDir};
 
@@ -686,6 +687,7 @@ pub struct ChatState {
     pub handle: ChatHandle,
     pub session_id: String,
     pub info: RuntimeInfo,
+    pub tool_runtime: ChatToolRuntimeSelection,
     pub messages: Vec<ChatMessage>,
     pub input: String,
     pub cursor: usize,
@@ -800,6 +802,7 @@ impl ChatState {
             handle,
             session_id: String::new(),
             info: RuntimeInfo::default(),
+            tool_runtime: ChatToolRuntimeSelection::default(),
             messages: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -2738,6 +2741,11 @@ impl ChatState {
             .unwrap_or_default()
     }
 
+    pub fn set_tool_runtime_node(&mut self, sandbox_node_id: Option<String>) {
+        self.handle
+            .send_command(ChatCommand::SetToolRuntime { sandbox_node_id });
+    }
+
     fn apply_event(&mut self, event: ChatEvent) -> bool {
         if let Some(session_id) = event.session_id().map(str::to_string) {
             if self.session_id.is_empty() {
@@ -2884,6 +2892,9 @@ impl ChatState {
             ChatEvent::RuntimeInfo(info) => {
                 self.info = info;
                 self.sync_selection_from_info();
+            }
+            ChatEvent::ToolRuntime(selection) => {
+                self.tool_runtime = selection;
             }
             ChatEvent::SessionReset { session_id } => {
                 let acknowledged_pending =
