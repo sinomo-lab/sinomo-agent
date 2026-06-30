@@ -1391,7 +1391,7 @@ impl ChatState {
     fn activity_panel_needs_attention(&self) -> bool {
         matches!(
             self.runtime_health().tone,
-            ActivityTone::Running | ActivityTone::Warn | ActivityTone::Bad
+            ActivityTone::Warn | ActivityTone::Bad
         )
     }
 
@@ -13092,9 +13092,16 @@ mod tests {
 
         state.streaming = true;
         assert!(
-            state.activity_panel_visible(),
-            "active streaming should keep runtime activity visible"
+            !state.activity_panel_visible(),
+            "active streaming should stay in the overview unless the user opens Monitor"
         );
+        assert_eq!(activity_button_label(&state), "Monitor");
+        state.toggle_activity_panel();
+        assert!(
+            state.activity_panel_visible(),
+            "Monitor should still open runtime details on demand"
+        );
+        state.toggle_activity_panel();
         state.streaming = false;
         assert!(!state.activity_panel_visible());
 
@@ -13225,6 +13232,61 @@ mod tests {
         assert!(
             !shared.chat().activity_panel_visible(),
             "Activity button should close the idle activity rail"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_monitor_button_opens_running_activity_panel_on_demand() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.info.provider = "openai".to_string();
+            chat.info.model = "gpt-5".to_string();
+            chat.models_loading = false;
+            chat.streaming = true;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat monitor button")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert!(
+            !shared.chat().activity_panel_visible(),
+            "running state should not force the activity rail open"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Close activity")
+                .count()?,
+            0,
+            "the right rail should not be mounted until Monitor is opened"
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Monitor")
+            .click()?;
+        assert!(shared.chat().activity_panel_visible());
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Close activity")
+            .with_description("Hide the runtime activity panel")
+            .click()?;
+        assert!(
+            !shared.chat().activity_panel_visible(),
+            "manually-opened running details should be closable"
         );
 
         Ok(())
