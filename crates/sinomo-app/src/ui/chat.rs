@@ -2547,6 +2547,10 @@ impl ChatState {
         self.media_call_details_open
     }
 
+    fn media_call_panel_visible(&self) -> bool {
+        self.media_call.active || self.media_call_details_open
+    }
+
     fn media_call_elapsed_label(&self) -> String {
         let Some(started_at) = self.media_call.started_at else {
             return "00:00".to_string();
@@ -4640,6 +4644,21 @@ fn activity_button_description(chat: &ChatState) -> String {
         compact_line(&status, 72),
         activity_work_summary(chat)
     )
+}
+
+fn media_call_button_description(chat: &ChatState) -> String {
+    let (provider, model) = chat.current_media_provider_model();
+    if chat.media_call.active {
+        format!(
+            "Show or hide live media call controls. {}.",
+            chat.media_call_status_summary()
+        )
+    } else {
+        format!(
+            "Open realtime audio and video controls for {} / {}.",
+            provider, model
+        )
+    }
 }
 
 fn usage_summary(chat: &ChatState) -> Option<String> {
@@ -6908,6 +6927,8 @@ struct RuntimeOverview {
     shared: Shared,
     activity_hovered: Cell<bool>,
     activity_pressed: Cell<bool>,
+    call_hovered: Cell<bool>,
+    call_pressed: Cell<bool>,
 }
 
 impl RuntimeOverview {
@@ -6916,6 +6937,8 @@ impl RuntimeOverview {
             shared,
             activity_hovered: Cell::new(false),
             activity_pressed: Cell::new(false),
+            call_hovered: Cell::new(false),
+            call_pressed: Cell::new(false),
         }
     }
 
@@ -6941,8 +6964,24 @@ impl RuntimeOverview {
         (rect.x() >= bounds.x() + PAD + 88.0).then_some(rect)
     }
 
+    fn call_button_rect(bounds: Rect) -> Option<Rect> {
+        let activity = Self::activity_button_rect(bounds)?;
+        let button_w = 72.0_f32.min((bounds.width() * 0.18).max(60.0));
+        let rect = Rect::new(
+            activity.x() - 8.0 - button_w,
+            activity.y(),
+            button_w,
+            activity.height(),
+        );
+        (rect.x() >= bounds.x() + PAD + 140.0).then_some(rect)
+    }
+
     fn activity_button_hit(&self, bounds: Rect, position: Point) -> bool {
         Self::activity_button_rect(bounds).is_some_and(|rect| rect.contains(position))
+    }
+
+    fn call_button_hit(&self, bounds: Rect, position: Point) -> bool {
+        Self::call_button_rect(bounds).is_some_and(|rect| rect.contains(position))
     }
 
     fn request_activity_refresh(ctx: &mut EventCtx) {
@@ -6958,8 +6997,11 @@ impl Widget for RuntimeOverview {
         match event {
             Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
                 let hovered = self.activity_button_hit(ctx.bounds(), pointer.position);
-                if self.activity_hovered.get() != hovered {
+                let call_hovered = !hovered && self.call_button_hit(ctx.bounds(), pointer.position);
+                if self.activity_hovered.get() != hovered || self.call_hovered.get() != call_hovered
+                {
                     self.activity_hovered.set(hovered);
+                    self.call_hovered.set(call_hovered);
                     Self::request_activity_refresh(ctx);
                 }
             }
@@ -6969,6 +7011,11 @@ impl Widget for RuntimeOverview {
             {
                 if self.activity_button_hit(ctx.bounds(), pointer.position) {
                     self.activity_pressed.set(true);
+                    ctx.request_pointer_capture(pointer.pointer_id);
+                    Self::request_activity_refresh(ctx);
+                    ctx.set_handled();
+                } else if self.call_button_hit(ctx.bounds(), pointer.position) {
+                    self.call_pressed.set(true);
                     ctx.request_pointer_capture(pointer.pointer_id);
                     Self::request_activity_refresh(ctx);
                     ctx.set_handled();
@@ -6985,6 +7032,13 @@ impl Widget for RuntimeOverview {
                     ctx.release_pointer_capture(pointer.pointer_id);
                     Self::request_activity_refresh(ctx);
                     ctx.set_handled();
+                } else if self.call_pressed.take() {
+                    if self.call_button_hit(ctx.bounds(), pointer.position) {
+                        self.shared.chat_mut().toggle_media_call_details();
+                    }
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    Self::request_activity_refresh(ctx);
+                    ctx.set_handled();
                 }
             }
             Event::Pointer(pointer)
@@ -6993,8 +7047,10 @@ impl Widget for RuntimeOverview {
                     PointerEventKind::Leave | PointerEventKind::Cancel
                 ) =>
             {
-                let had_state =
-                    self.activity_hovered.replace(false) || self.activity_pressed.take();
+                let had_state = self.activity_hovered.replace(false)
+                    || self.activity_pressed.take()
+                    || self.call_hovered.replace(false)
+                    || self.call_pressed.take();
                 if had_state {
                     ctx.release_pointer_capture(pointer.pointer_id);
                     Self::request_activity_refresh(ctx);
@@ -7025,6 +7081,29 @@ impl Widget for RuntimeOverview {
         let health = chat.runtime_health();
         let chip = Self::health_chip_rect(bounds);
         let activity_button = Self::activity_button_rect(bounds);
+        let call_button = Self::call_button_rect(bounds);
+        if let Some(button) = call_button {
+            draw_overview_button(
+                ctx,
+                &pal,
+                &theme,
+                button,
+                if chat.media_call.active {
+                    "Live"
+                } else {
+                    "Call"
+                },
+                IconGlyph::Chat,
+                if chat.media_call.active {
+                    ActivityTone::Running
+                } else {
+                    ActivityTone::Neutral
+                },
+                chat.media_call_panel_visible(),
+                self.call_hovered.get(),
+                self.call_pressed.get(),
+            );
+        }
         if let Some(button) = activity_button {
             let activity_label = activity_button_label(&chat);
             draw_activity_overview_button(
@@ -7040,7 +7119,9 @@ impl Widget for RuntimeOverview {
             );
         }
         draw_health_chip(ctx, &pal, &theme, chip, &health);
-        let title_right = activity_button.map_or(chip.x(), |button| button.x());
+        let title_right = call_button
+            .or(activity_button)
+            .map_or(chip.x(), |button| button.x());
         let title_w = (title_right - x - 10.0).max(80.0);
         let runtime = runtime_overview_title(&chat);
         widgets::draw_text_in(ctx, Rect::new(x, top, title_w, 18.0), &runtime, title_style);
@@ -7128,6 +7209,28 @@ impl Widget for RuntimeOverview {
         node.state.hovered = self.activity_hovered.get();
         node.state.selected = chat.activity_panel_visible();
         ctx.push(node);
+
+        if let Some(rect) = Self::call_button_rect(ctx.bounds()) {
+            let mut node = SemanticsNode::new(
+                sui::WidgetId::new(ctx.widget_id().get().wrapping_mul(47).wrapping_add(12_203)),
+                SemanticsRole::Button,
+                rect,
+            );
+            node.parent = Some(ctx.widget_id());
+            node.name = Some(
+                if chat.media_call.active {
+                    "Live call"
+                } else {
+                    "Call"
+                }
+                .to_string(),
+            );
+            node.description = Some(media_call_button_description(&chat));
+            node.actions = vec![SemanticsAction::Activate];
+            node.state.hovered = self.call_hovered.get();
+            node.state.selected = chat.media_call_panel_visible();
+            ctx.push(node);
+        }
     }
 }
 
@@ -7678,6 +7781,43 @@ fn draw_activity_overview_button(
     hovered: bool,
     pressed: bool,
 ) {
+    let tone = if attention {
+        ActivityTone::Warn
+    } else if active {
+        ActivityTone::Good
+    } else {
+        ActivityTone::Neutral
+    };
+    draw_overview_button(
+        ctx,
+        pal,
+        theme,
+        rect,
+        label,
+        if attention {
+            IconGlyph::Alert
+        } else {
+            IconGlyph::History
+        },
+        tone,
+        active,
+        hovered,
+        pressed,
+    );
+}
+
+fn draw_overview_button(
+    ctx: &mut PaintCtx,
+    pal: &Palette,
+    theme: &DefaultTheme,
+    rect: Rect,
+    label: &str,
+    icon: IconGlyph,
+    tone: ActivityTone,
+    active: bool,
+    hovered: bool,
+    pressed: bool,
+) {
     let fill = if pressed {
         pal.selected
     } else if active {
@@ -7688,21 +7828,10 @@ fn draw_activity_overview_button(
         pal.titlebar
     };
     widgets::fill_round_rect(ctx, rect, fill, 6.0);
-    let tone = if attention {
-        ActivityTone::Warn
-    } else if active {
-        ActivityTone::Good
-    } else {
-        ActivityTone::Neutral
-    };
     let color = tone_color(pal, tone);
     draw_glyph(
         ctx,
-        if attention {
-            IconGlyph::Alert
-        } else {
-            IconGlyph::History
-        },
+        icon,
         Rect::new(rect.x() + 6.0, rect.y() + 4.0, 12.0, 12.0),
         color,
     );
@@ -8465,7 +8594,9 @@ impl TranscriptView {
 
         if row_w <= max_w {
             let mut x = area.x() + (area.width() - row_w) * 0.5;
-            let y = cy + 62.0;
+            let lower = area.y() + PAD;
+            let upper = (area.max_y() - PAD - button_h).max(lower);
+            let y = (cy + 62.0).clamp(lower, upper);
             return actions
                 .into_iter()
                 .zip(widths)
@@ -8489,11 +8620,9 @@ impl TranscriptView {
             let grid_w = cols as f32 * width + gap * cols.saturating_sub(1) as f32;
             let grid_h = rows as f32 * button_h + gap * rows.saturating_sub(1) as f32;
             let x0 = area.x() + (area.width() - grid_w) * 0.5;
-            let preferred_y = cy + 62.0;
-            let y0 = preferred_y
-                .min(area.max_y() - PAD - grid_h)
-                .max(cy + 52.0)
-                .max(area.y() + PAD);
+            let lower = area.y() + PAD;
+            let upper = (area.max_y() - PAD - grid_h).max(lower);
+            let y0 = (cy + 62.0).clamp(lower, upper);
             return actions
                 .iter()
                 .enumerate()
@@ -8517,11 +8646,9 @@ impl TranscriptView {
         let stack_h =
             button_h * actions.len() as f32 + gap * actions.len().saturating_sub(1) as f32;
         let x = area.x() + (area.width() - width) * 0.5;
-        let preferred_y = cy + 58.0;
-        let y0 = preferred_y
-            .min(area.max_y() - PAD - stack_h)
-            .max(cy + 48.0)
-            .max(area.y() + PAD);
+        let lower = area.y() + PAD;
+        let upper = (area.max_y() - PAD - stack_h).max(lower);
+        let y0 = (cy + 58.0).clamp(lower, upper);
         actions
             .iter()
             .enumerate()
@@ -10086,9 +10213,19 @@ fn main_column(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         let key_shared = shared.clone();
         let build_shared = shared.clone();
         RebuildOnChange::new(
-            move || key_shared.chat().media_call_details_visible(),
-            move |details_open| {
-                let height = if *details_open {
+            move || {
+                let chat = key_shared.chat();
+                (
+                    chat.media_call_panel_visible(),
+                    chat.media_call_details_visible(),
+                )
+            },
+            move |media_sig| {
+                let (panel_visible, details_open) = *media_sig;
+                if !panel_visible {
+                    return WidgetPod::new(TranscriptView::new(build_shared.clone()));
+                }
+                let height = if details_open {
                     MEDIA_CALL_H
                 } else {
                     MEDIA_CALL_COMPACT_H
@@ -12413,6 +12550,24 @@ mod tests {
     }
 
     #[test]
+    fn empty_state_quick_actions_stay_inside_short_transcript_area() {
+        let area = Rect::new(0.0, 0.0, 700.0, 300.0);
+        let rects = TranscriptView::quick_action_rects(area, &ChatQuickAction::CHAT);
+
+        assert_eq!(rects.len(), ChatQuickAction::CHAT.len());
+        for (action, rect) in rects {
+            assert!(
+                rect.y() >= area.y() + PAD,
+                "{action:?} quick action should not render above the transcript area"
+            );
+            assert!(
+                rect.max_y() <= area.max_y() - PAD + 0.5,
+                "{action:?} quick action should not overlap the composer: rect={rect:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rendered_started_chat_keeps_scenario_actions_available() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -13727,7 +13882,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_media_call_controls_are_compact_until_opened() -> sui::Result<()> {
+    fn rendered_media_call_controls_are_hidden_until_opened_from_overview() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -13751,9 +13906,17 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Show media controls")
+                .with_name("Call")
                 .count()?,
             1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Show media controls")
+                .count()?,
+            0,
+            "idle media controls should not consume a transcript row"
         );
         assert_eq!(
             window
@@ -13761,12 +13924,12 @@ mod tests {
                 .with_name("Start media call")
                 .count()?,
             0,
-            "idle media controls should be hidden behind the compact drawer"
+            "idle media controls should be hidden until Call is opened"
         );
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Show media controls")
+            .with_name("Call")
             .click()?;
         assert!(shared.chat().media_call_details_visible());
         assert_eq!(
@@ -13803,12 +13966,83 @@ mod tests {
             .with_name("Hide media controls")
             .click()?;
         assert!(!shared.chat().media_call_details_visible());
+        assert!(
+            !shared.chat().media_call_panel_visible(),
+            "hiding inactive controls should remove the media row again"
+        );
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
                 .with_name("Start media call")
                 .count()?,
             0
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_active_media_call_keeps_compact_status_after_hiding_controls() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.info.provider = "openai".to_string();
+            chat.info.model = "gpt-5".to_string();
+            chat.models_loading = false;
+            chat.media_call.active = true;
+            chat.media_call.provider = "OpenAI".to_string();
+            chat.media_call.model = "gpt-5".to_string();
+            chat.media_call.started_at = Some(Instant::now());
+            chat.media_call_details_open = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Active chat media controls")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert!(shared.chat().media_call_panel_visible());
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Live call")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Show media controls")
+                .count()?,
+            1,
+            "active calls should keep a compact media status row available"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Start media call")
+                .count()?,
+            0
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Show media controls")
+            .click()?;
+        assert!(shared.chat().media_call_details_visible());
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("End media call")
+                .count()?,
+            1
         );
 
         Ok(())
