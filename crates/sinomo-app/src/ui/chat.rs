@@ -5438,6 +5438,12 @@ fn session_edit_details(
             shared,
             format!("Agents: {}", active_agents_label(participant_count)),
         ));
+        if is_untitled_channel(session) {
+            details = details.with_child(muted_label(
+                shared,
+                "Title: Untitled channel; rename it to make it easy to find.",
+            ));
+        }
         if !participant_names.is_empty() {
             details = details.with_child(muted_label(
                 shared,
@@ -5457,9 +5463,21 @@ fn session_meta_label(session: &SessionRef) -> String {
     match session.kind {
         ConversationKind::Chat => updated,
         ConversationKind::Channel => {
-            format!("{} · {updated}", plural_agents(session.participant_count))
+            if is_untitled_channel(session) {
+                format!(
+                    "untitled · {} · {updated}",
+                    plural_agents(session.participant_count)
+                )
+            } else {
+                format!("{} · {updated}", plural_agents(session.participant_count))
+            }
         }
     }
+}
+
+fn is_untitled_channel(session: &SessionRef) -> bool {
+    session.kind == ConversationKind::Channel
+        && session.title.trim().eq_ignore_ascii_case("new channel")
 }
 
 fn session_kind_icon_description(kind: ConversationKind) -> &'static str {
@@ -6358,11 +6376,12 @@ impl Widget for ChatSessionRow {
         node.description = Some(match self.session.kind {
             ConversationKind::Chat => session_kind_icon_description(self.session.kind).to_string(),
             ConversationKind::Channel => {
-                format!(
-                    "{}, {} agents",
-                    session_kind_icon_description(self.session.kind),
-                    self.session.participant_count
-                )
+                let prefix = if is_untitled_channel(&self.session) {
+                    "Untitled shared channel"
+                } else {
+                    session_kind_icon_description(self.session.kind)
+                };
+                format!("{prefix}, {} agents", self.session.participant_count)
             }
         });
         node.state.focused = ctx.is_focused();
@@ -6755,7 +6774,17 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         .spacing(10.0)
         .alignment(Alignment::Stretch)
         .with_child(dialog_section_label(shared, "Name"))
-        .with_child(SizedBox::new().height(32.0).with_child(input))
+        .with_child(SizedBox::new().height(32.0).with_child(input));
+    if is_untitled_channel(&session) {
+        body = body.with_child(
+            muted_label(
+                shared,
+                "Untitled channel. Rename it so it is easy to recognize in the sidebar.",
+            )
+            .font_size(11.0),
+        );
+    }
+    body = body
         .with_child(
             Flex::horizontal()
                 .gap(6.0)
@@ -11697,8 +11726,20 @@ mod tests {
             participant_count: 1,
             participant_names: Vec::new(),
         };
+        let untitled_channel = SessionRef {
+            id: "channel-untitled".to_string(),
+            title: "New channel".to_string(),
+            kind: ConversationKind::Channel,
+            updated_unix: 0,
+            participant_count: 2,
+            participant_names: Vec::new(),
+        };
 
         assert_eq!(session_meta_label(&channel), "2 agents · not saved");
+        assert_eq!(
+            session_meta_label(&untitled_channel),
+            "untitled · 2 agents · not saved"
+        );
         assert_eq!(session_meta_label(&chat), "not saved");
         assert_eq!(
             session_kind_icon_description(channel.kind),
@@ -11737,6 +11778,17 @@ mod tests {
         assert!(session_matches_filter(
             &channel,
             &normalized_session_filter("2 agents")
+        ));
+        assert!(session_matches_filter(
+            &SessionRef {
+                id: "channel-untitled".to_string(),
+                title: "New channel".to_string(),
+                kind: ConversationKind::Channel,
+                updated_unix: 0,
+                participant_count: 2,
+                participant_names: Vec::new(),
+            },
+            &normalized_session_filter("untitled")
         ));
         assert!(session_matches_filter(
             &chat,
@@ -13012,6 +13064,67 @@ mod tests {
                 .iter()
                 .any(|node| node.name.as_deref() == Some("2 active")),
             "channel edit dialog should show the active-agent count"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_channel_edit_dialog_marks_default_title_as_untitled() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let channel_id = SessionId::generate().to_string();
+        {
+            let mut chat = shared.chat_mut();
+            seed_test_agents(&mut chat);
+            chat.sessions = vec![SessionRef {
+                id: channel_id.clone(),
+                title: "New channel".to_string(),
+                kind: ConversationKind::Channel,
+                updated_unix: 1,
+                participant_count: 1,
+                participant_names: vec!["main-agent".to_string()],
+            }];
+            chat.session_id = channel_id.clone();
+            chat.session_edit_id = Some(channel_id);
+            chat.session_title_draft = "New channel".to_string();
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Untitled channel editor")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+        let snapshot = window.snapshot()?;
+
+        assert!(
+            snapshot.accessibility.nodes.iter().any(|node| {
+                node.name.as_deref()
+                    == Some(
+                        "Untitled channel. Rename it so it is easy to recognize in the sidebar.",
+                    )
+            }),
+            "default channel title should be called out in the edit dialog"
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Show details")
+            .click()?;
+        app.run_until_idle()?;
+        let snapshot = window.snapshot()?;
+        assert!(
+            snapshot.accessibility.nodes.iter().any(|node| {
+                node.name.as_deref()
+                    == Some("Title: Untitled channel; rename it to make it easy to find.")
+            }),
+            "expanded details should explain the untitled channel state"
         );
 
         Ok(())
