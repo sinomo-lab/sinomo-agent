@@ -728,6 +728,7 @@ pub struct ChatState {
     session_list_loading: bool,
     session_list_started_at: Option<Instant>,
     session_list_slow_notice_shown: bool,
+    session_list_details_open: bool,
     channel_agent_idx: usize,
 }
 
@@ -828,6 +829,7 @@ impl ChatState {
             session_list_loading: false,
             session_list_started_at: None,
             session_list_slow_notice_shown: false,
+            session_list_details_open: false,
             channel_agent_idx: 0,
         };
         if let Some(detail) = session_list_error {
@@ -940,6 +942,7 @@ impl ChatState {
             return;
         }
         self.session_list_slow_notice_shown = false;
+        self.session_list_details_open = false;
         let (tx, rx) = mpsc::channel();
         let data_dir = self.data_dir.clone();
         let sifs_daemon = self.sifs_daemon.clone();
@@ -963,6 +966,7 @@ impl ChatState {
             self.session_list_loading = false;
             self.session_list_started_at = None;
             self.session_list_slow_notice_shown = false;
+            self.session_list_details_open = false;
             return;
         }
 
@@ -973,6 +977,12 @@ impl ChatState {
 
     pub fn session_list_is_loading(&self) -> bool {
         self.session_list_loading
+    }
+
+    fn toggle_session_list_details(&mut self) {
+        if self.session_list_loading && self.session_list_slow_notice_shown {
+            self.session_list_details_open = !self.session_list_details_open;
+        }
     }
 
     pub fn pump_session_list(&mut self) -> bool {
@@ -1001,6 +1011,7 @@ impl ChatState {
                 self.session_list_loading = false;
                 self.session_list_started_at = None;
                 self.session_list_slow_notice_shown = false;
+                self.session_list_details_open = false;
                 self.notice = Some("chat list failed: worker stopped".to_string());
                 self.replace_activity(
                     "chat list",
@@ -1014,6 +1025,7 @@ impl ChatState {
         self.session_list_loading = false;
         self.session_list_started_at = None;
         self.session_list_slow_notice_shown = false;
+        self.session_list_details_open = false;
         self.apply_session_list_result(result);
         true
     }
@@ -5803,6 +5815,7 @@ fn sidebar_signature(
     usize,
     bool,
     bool,
+    bool,
 ) {
     let chat = shared.chat();
     let active = chat
@@ -5828,16 +5841,34 @@ fn sidebar_signature(
         chat.channel_agent_idx,
         chat.session_list_loading,
         chat.session_list_slow_notice_shown,
+        chat.session_list_details_open,
     )
 }
 
 fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<impl Widget + use<>> {
-    {
+    let details_open = {
         let chat = shared.chat();
         if !(chat.session_list_loading && chat.session_list_slow_notice_shown) {
             return None;
         }
-    }
+        chat.session_list_details_open
+    };
+
+    let details = {
+        let s = shared.clone();
+        sui::Button::new(if details_open { "Hide" } else { "Details" })
+            .icon(if details_open {
+                IconGlyph::ChevronUp
+            } else {
+                IconGlyph::ChevronDown
+            })
+            .min_height(26.0)
+            .min_width(78.0)
+            .theme_when(secondary_button_theme(reader))
+            .on_press(move || {
+                s.chat_mut().toggle_session_list_details();
+            })
+    };
 
     let retry = {
         let s = shared.clone();
@@ -5881,19 +5912,35 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
             SizedBox::new().height(28.0).with_child(check_sifs),
             FlexItem::flex(1.35).min_width(112.0),
         );
-    let body = Flex::vertical()
+    let summary = ComposerInputRow::new(
+        WidgetPod::new(dialog_section_label(shared, "SIFS history slow").font_size(11.0)),
+        WidgetPod::new(
+            Flex::horizontal()
+                .align_items(Alignment::Center)
+                .spacer()
+                .with_child(details),
+        ),
+        86.0,
+        26.0,
+        8.0,
+    );
+    let mut body = Flex::vertical()
         .main_gap(6.0)
         .align_items(Alignment::Stretch)
-        .with_child(dialog_section_label(shared, "SIFS history is slow").font_size(11.0))
-        .with_child(
-            muted_label(
-                shared,
-                "Chat and channel history stays in SIFS. You can keep chatting while it syncs.",
+        .with_child(SizedBox::new().height(26.0).with_child(summary));
+
+    if details_open {
+        body = body
+            .with_child(
+                muted_label(
+                    shared,
+                    "Chat and channel history stays in SIFS. You can keep chatting while it syncs.",
+                )
+                .font_size(10.5),
             )
-            .font_size(10.5),
-        )
-        .with_child(SizedBox::new().height(28.0).with_child(actions))
-        .with_child(SizedBox::new().height(28.0).with_child(connection));
+            .with_child(SizedBox::new().height(28.0).with_child(actions))
+            .with_child(SizedBox::new().height(28.0).with_child(connection));
+    }
 
     Some(
         Surface::panel(body)
@@ -11021,7 +11068,8 @@ mod tests {
     }
 
     #[test]
-    fn rendered_slow_loading_sidebar_exposes_sifs_recovery_actions() -> sui::Result<()> {
+    fn rendered_slow_loading_sidebar_collapses_sifs_recovery_actions_until_details()
+    -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -11048,6 +11096,34 @@ mod tests {
             .with_description("Reading chat and channel metadata from cluster storage")
             .expect()
             .to_be_visible()?;
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Details")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Retry")
+                .count()?,
+            0,
+            "slow SIFS recovery controls should start behind Details"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Check SIFS")
+                .count()?,
+            0,
+            "SIFS diagnostics should not occupy the primary sidebar until expanded"
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Details")
+            .click()?;
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
@@ -11100,6 +11176,11 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Details")
+            .click()?;
 
         window
             .get_by_role(SemanticsRole::Button)
