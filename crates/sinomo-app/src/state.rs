@@ -60,7 +60,7 @@ impl Tab {
 
     pub fn title(self) -> &'static str {
         match self {
-            Tab::Sinomo => "Sinomo",
+            Tab::Sinomo => "Chat",
             Tab::Evolution => "Evolution",
             Tab::Cluster => "Cluster",
             Tab::Files => "Files",

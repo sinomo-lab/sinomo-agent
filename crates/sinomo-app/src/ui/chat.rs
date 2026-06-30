@@ -1,4 +1,4 @@
-//! "Sinomo" tab — the AI chat experience.
+//! "Chat" tab — the AI chat experience.
 //!
 //! Like the Settings and Files tabs, this is a fully *composed* `sui-widgets`
 //! tree: [`view`] returns a responsive host ([`ChatView`]) over pre-built pods

@@ -1089,15 +1089,29 @@ fn shell_tabbar_switches_tab_and_relayouts_content() {
     let app = TestApp::from_runtime(runtime).expect("headless test app");
     let window = app.main_window().expect("main window");
     app.run_until_idle().expect("settle initial layout");
-    assert_eq!(shared.active_tab(), Tab::Sinomo, "starts on the Sinomo tab");
+    assert_eq!(shared.active_tab(), Tab::Sinomo, "starts on the chat tab");
 
     let before = window.capture_screenshot().expect("capture before");
+    let root = window.root();
+    let snapshot = window.snapshot().expect("snapshot initial shell");
+    let tab_bar = snapshot
+        .accessibility
+        .nodes
+        .iter()
+        .find(|node| {
+            node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
+        })
+        .expect("shell tab bar semantics");
+    assert_eq!(
+        tab_bar.value,
+        Some(sui::SemanticsValue::Text("Chat".to_string()))
+    );
 
-    window
-        .get_by_role(SemanticsRole::TabBar)
-        .with_name("shell-tabs")
-        .press("End")
-        .expect("activate Settings tab");
+    click_at(
+        &root,
+        tab_bar.bounds.max_x() - 42.0,
+        tab_bar.bounds.y() + tab_bar.bounds.height() / 2.0,
+    );
     app.run_until_idle().expect("settle tab switch");
 
     assert_eq!(
