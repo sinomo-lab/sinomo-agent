@@ -497,12 +497,12 @@ pub(crate) use observe::{
     OperationalSeverity, append_operational_event_best_effort, append_operational_log_best_effort,
 };
 pub use paths::DaemonPaths;
-pub use process::start_daemon_command_process;
 pub(crate) use process::{
     CandidateMainDiagnostics, build_daemon_async_runtime, main_exit_observation_from_status,
     prepare_background_command, spawn_candidate_main_daemon_process, spawn_main_daemon_process,
     spawn_shadow_rollout_recovery_helper_process,
 };
+pub use process::{daemon_main_binary_for_shadow_start, start_daemon_command_process};
 pub use rollout::{
     LocalRolloutMainActivationPlan, handle_daemon_rollout_build_request,
     handle_daemon_rollout_native_dylib_module_request, handle_deferred_shadow_rollout_completion,

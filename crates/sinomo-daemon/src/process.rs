@@ -369,6 +369,14 @@ pub fn main_exit_observation_from_status(
     sinomo_rollout::MainExitObservation::exit_code(status.code().unwrap_or(1))
 }
 
+pub fn daemon_main_binary_for_shadow_start(invoked_exe: &Path) -> PathBuf {
+    if daemon_binary_stem(invoked_exe) == Some("sinomo-shadow") {
+        sibling_daemon_binary(invoked_exe, "sinomo").unwrap_or_else(|| invoked_exe.to_path_buf())
+    } else {
+        invoked_exe.to_path_buf()
+    }
+}
+
 pub fn start_daemon_command_process(
     options: &DaemonRunOptions,
     paths: &DaemonPaths,
@@ -392,6 +400,7 @@ pub fn start_daemon_command_process(
         path: "current executable".to_string(),
         detail: source.to_string(),
     })?;
+    let exe = daemon_start_executable_for_command(&exe, command_prefix);
     let mut command = Command::new(exe);
     command.args(command_prefix);
     for (key, value) in extra_env {
@@ -424,4 +433,69 @@ pub fn start_daemon_command_process(
         address: daemon_connect_address(&options.host, options.port),
         detail: format!("daemon process {} did not become ready", child.id()),
     })
+}
+
+fn daemon_start_executable_for_command(invoked_exe: &Path, command_prefix: &[&str]) -> PathBuf {
+    if matches!(command_prefix, ["daemon", "shadow", ..]) {
+        if daemon_binary_stem(invoked_exe) == Some("sinomo-shadow") {
+            return invoked_exe.to_path_buf();
+        }
+        if let Some(shadow_binary) = sibling_daemon_binary(invoked_exe, "sinomo-shadow") {
+            return shadow_binary;
+        }
+    }
+    invoked_exe.to_path_buf()
+}
+
+fn sibling_daemon_binary(invoked_exe: &Path, name: &str) -> Option<PathBuf> {
+    let file_name = format!("{name}{}", env::consts::EXE_SUFFIX);
+    let candidate = invoked_exe.with_file_name(file_name);
+    candidate.exists().then_some(candidate)
+}
+
+fn daemon_binary_stem(path: &Path) -> Option<&str> {
+    path.file_stem().and_then(|stem| stem.to_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_binary_path(root: &sinomo_testdir::TestDir, name: &str) -> PathBuf {
+        let path = root.join(format!("{name}{}", env::consts::EXE_SUFFIX));
+        File::create(&path).expect("test binary");
+        path
+    }
+
+    #[test]
+    fn shadow_start_uses_shadow_sibling_when_invoked_from_main_binary() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-shadow-start-exe");
+        let main = test_binary_path(&root, "sinomo");
+        let shadow = test_binary_path(&root, "sinomo-shadow");
+
+        assert_eq!(
+            daemon_start_executable_for_command(&main, &["daemon", "shadow", "run"]),
+            shadow
+        );
+    }
+
+    #[test]
+    fn shadow_start_keeps_invoked_binary_when_shadow_sibling_is_absent() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-shadow-start-dev-exe");
+        let main = test_binary_path(&root, "sinomo");
+
+        assert_eq!(
+            daemon_start_executable_for_command(&main, &["daemon", "shadow", "run"]),
+            main
+        );
+    }
+
+    #[test]
+    fn shadow_start_main_binary_env_uses_main_sibling_when_invoked_from_shadow() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-shadow-main-exe");
+        let main = test_binary_path(&root, "sinomo");
+        let shadow = test_binary_path(&root, "sinomo-shadow");
+
+        assert_eq!(daemon_main_binary_for_shadow_start(&shadow), main);
+    }
 }
