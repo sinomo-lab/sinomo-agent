@@ -55,6 +55,7 @@ const SHADOW_MAIN_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHADOW_MAIN_RESTART_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
 const SHADOW_RUNTIME_TASK_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 const SHADOW_IROH_PROXY_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+const SHADOW_STATUS_PUBLISHER_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 const SHADOW_RUNTIME_TASK_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const SHADOW_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -578,6 +579,7 @@ fn join_shadow_runtime_task(
 fn shadow_runtime_task_join_timeout(label: &str) -> Duration {
     match label {
         "iroh proxy" => SHADOW_IROH_PROXY_TASK_JOIN_TIMEOUT,
+        "status publisher" => SHADOW_STATUS_PUBLISHER_TASK_JOIN_TIMEOUT,
         _ => SHADOW_RUNTIME_TASK_JOIN_TIMEOUT,
     }
 }
@@ -3487,12 +3489,16 @@ mod tests {
             shadow_runtime_task_join_timeout("iroh proxy"),
             SHADOW_IROH_PROXY_TASK_JOIN_TIMEOUT
         );
+        assert_eq!(
+            shadow_runtime_task_join_timeout("status publisher"),
+            SHADOW_STATUS_PUBLISHER_TASK_JOIN_TIMEOUT
+        );
         assert!(
             shadow_runtime_task_join_timeout("iroh proxy") > SHADOW_RUNTIME_TASK_JOIN_TIMEOUT,
             "Iroh endpoint close needs more time than generic helper task shutdown"
         );
         assert_eq!(
-            shadow_runtime_task_join_timeout("status publisher"),
+            shadow_runtime_task_join_timeout("control accept"),
             SHADOW_RUNTIME_TASK_JOIN_TIMEOUT
         );
     }
