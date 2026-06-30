@@ -445,6 +445,9 @@ impl ChatQuickAction {
 }
 
 fn quick_actions_for_chat(chat: &ChatState) -> &'static [ChatQuickAction] {
+    if chat.show_channel_onboarding() {
+        return &[];
+    }
     if chat.current_is_channel() {
         &ChatQuickAction::CHANNEL
     } else {
@@ -620,6 +623,12 @@ enum SessionKindFilter {
     All,
     Chats,
     Channels,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelFilterEmptyState {
+    Loading,
+    Empty,
 }
 
 impl SessionKindFilter {
@@ -2028,6 +2037,28 @@ impl ChatState {
             .is_some_and(|session| session.kind == ConversationKind::Channel)
     }
 
+    fn channel_filter_empty_state(&self) -> Option<ChannelFilterEmptyState> {
+        if self.session_kind_filter == SessionKindFilter::Channels
+            && !self.current_is_channel()
+            && !self
+                .sessions
+                .iter()
+                .any(|session| session.kind == ConversationKind::Channel)
+        {
+            Some(if self.session_list_loading && self.sessions.is_empty() {
+                ChannelFilterEmptyState::Loading
+            } else {
+                ChannelFilterEmptyState::Empty
+            })
+        } else {
+            None
+        }
+    }
+
+    fn show_channel_onboarding(&self) -> bool {
+        self.channel_filter_empty_state().is_some()
+    }
+
     fn session_is_channel(&self, session_id: &str) -> bool {
         self.sessions
             .iter()
@@ -2036,6 +2067,12 @@ impl ChatState {
     }
 
     fn empty_conversation_title(&self) -> String {
+        if let Some(state) = self.channel_filter_empty_state() {
+            return match state {
+                ChannelFilterEmptyState::Loading => "Loading channels...".to_string(),
+                ChannelFilterEmptyState::Empty => "No channels yet".to_string(),
+            };
+        }
         if let Some(session) = self.current_session_ref() {
             if session.kind == ConversationKind::Channel {
                 format!("Channel: {}", session.title)
@@ -2053,6 +2090,15 @@ impl ChatState {
     }
 
     fn empty_conversation_hint(&self) -> String {
+        if let Some(state) = self.channel_filter_empty_state() {
+            return match state {
+                ChannelFilterEmptyState::Loading => "Saved channels are still loading.".to_string(),
+                ChannelFilterEmptyState::Empty => {
+                    "Create a channel to coordinate multiple agents around one shared timeline."
+                        .to_string()
+                }
+            };
+        }
         if let Some(session) = self
             .current_session_ref()
             .filter(|session| session.kind == ConversationKind::Channel)
@@ -2067,6 +2113,17 @@ impl ChatState {
     }
 
     fn empty_conversation_context(&self) -> Option<String> {
+        if let Some(state) = self.channel_filter_empty_state() {
+            return Some(match state {
+                ChannelFilterEmptyState::Loading => {
+                    "You can keep chatting or use New channel to start one now.".to_string()
+                }
+                ChannelFilterEmptyState::Empty => {
+                    "Use New channel in the sidebar, then choose agents and edit the title."
+                        .to_string()
+                }
+            });
+        }
         let session = self
             .current_session_ref()
             .filter(|session| session.kind == ConversationKind::Channel)?;
@@ -11973,6 +12030,55 @@ mod tests {
     }
 
     #[test]
+    fn empty_conversation_title_guides_empty_channel_filter() {
+        let (_backend, mut state) = isolated_chat_state("empty-channel-filter-title");
+        let chat_id = SessionId::generate().to_string();
+        state.sessions = vec![SessionRef {
+            id: chat_id.clone(),
+            title: "Current chat".to_string(),
+            kind: ConversationKind::Chat,
+            updated_unix: 1,
+            participant_count: 1,
+            participant_names: Vec::new(),
+        }];
+        state.session_id = chat_id;
+        state.session_kind_filter = SessionKindFilter::Channels;
+        state.messages.clear();
+
+        assert!(state.show_channel_onboarding());
+        assert_eq!(state.empty_conversation_title(), "No channels yet");
+        assert_eq!(
+            state.empty_conversation_hint(),
+            "Create a channel to coordinate multiple agents around one shared timeline."
+        );
+        assert_eq!(
+            state.empty_conversation_context().as_deref(),
+            Some("Use New channel in the sidebar, then choose agents and edit the title.")
+        );
+        assert!(
+            quick_actions_for_chat(&state).is_empty(),
+            "channel onboarding should not present direct-chat starter actions"
+        );
+
+        state.sessions.clear();
+        state.session_id.clear();
+        state.session_list_loading = true;
+        assert_eq!(state.empty_conversation_title(), "Loading channels...");
+        assert_eq!(
+            state.empty_conversation_hint(),
+            "Saved channels are still loading."
+        );
+        assert_eq!(
+            state.empty_conversation_context().as_deref(),
+            Some("You can keep chatting or use New channel to start one now.")
+        );
+        assert!(
+            quick_actions_for_chat(&state).is_empty(),
+            "channel loading should also avoid direct-chat starter actions"
+        );
+    }
+
+    #[test]
     fn session_rename_updates_sidebar_metadata_and_preserves_title() {
         let (_backend, mut state) = isolated_chat_state("rename");
         let session_id = SessionId::generate().to_string();
@@ -13213,6 +13319,70 @@ mod tests {
             shared.chat().session_edit_id.as_deref(),
             Some(channel_id.as_str()),
             "Manage channel should open the selected channel editor"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_empty_channel_filter_explains_next_step() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            seed_test_agents(&mut chat);
+            chat.sessions.clear();
+            chat.session_id.clear();
+            chat.session_kind_filter = SessionKindFilter::Channels;
+            chat.messages.clear();
+            chat.input.clear();
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Channel onboarding")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert!(
+            window
+                .get_by_text(
+                    "Create a channel to coordinate multiple agents around one shared timeline."
+                )
+                .count()?
+                >= 1,
+            "empty channel filter should explain what channels are for"
+        );
+        assert!(
+            window
+                .get_by_text(
+                    "Use New channel in the sidebar, then choose agents and edit the title."
+                )
+                .count()?
+                >= 1,
+            "empty channel filter should point to the visible create action"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Plan a change")
+                .count()?,
+            0,
+            "channel onboarding should not show direct-chat starter actions"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("New channel")
+                .count()?,
+            1,
+            "the channel creation action should remain visible in the sidebar"
         );
 
         Ok(())
