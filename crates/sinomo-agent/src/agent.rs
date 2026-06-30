@@ -529,6 +529,15 @@ impl AgentStoragePaths {
             .join("segments.jsonl")
     }
 
+    pub fn session_video_dir_for_session(&self, session_id: &SessionId) -> PathBuf {
+        self.session_dir_for_session(session_id).join("video")
+    }
+
+    pub fn session_video_frames_path_for_session(&self, session_id: &SessionId) -> PathBuf {
+        self.session_video_dir_for_session(session_id)
+            .join("frames.jsonl")
+    }
+
     pub fn channel_dir_for_channel(&self, channel_id: &SessionId) -> PathBuf {
         self.channels_dir.join(channel_id.as_str())
     }

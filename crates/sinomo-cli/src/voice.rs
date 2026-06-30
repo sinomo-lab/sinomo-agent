@@ -17,6 +17,10 @@ pub(crate) struct VoiceCallOptions {
     pub instructions: String,
     pub input: Option<PathBuf>,
     pub output: Option<PathBuf>,
+    pub video_frames: Vec<PathBuf>,
+    pub video_format: Option<sinomo_lm::RealtimeVideoFrameFormat>,
+    pub video_detail: sinomo_lm::RealtimeVideoFrameDetail,
+    pub video_frame_ms: u64,
     pub session_id: Option<SessionId>,
     pub endpoint: Option<String>,
     pub voice: Option<String>,
@@ -26,6 +30,7 @@ pub(crate) struct VoiceCallOptions {
     pub turn_detection: sinomo_lm::RealtimeAudioTurnDetection,
     pub pace: bool,
     pub force_listen: bool,
+    pub audio_input: bool,
     pub receive_timeout_ms: Option<u64>,
 }
 
@@ -38,15 +43,20 @@ impl Default for VoiceCallOptions {
                 .to_string(),
             input: None,
             output: None,
+            video_frames: Vec::new(),
+            video_format: None,
+            video_detail: sinomo_lm::RealtimeVideoFrameDetail::Auto,
+            video_frame_ms: 500,
             session_id: None,
             endpoint: None,
             voice: None,
-            chunk_ms: 1000,
+            chunk_ms: 100,
             input_sample_rate_hz: None,
             input_format: None,
             turn_detection: sinomo_lm::RealtimeAudioTurnDetection::Manual,
             pace: true,
             force_listen: false,
+            audio_input: true,
             receive_timeout_ms: None,
         }
     }
@@ -67,6 +77,7 @@ pub(crate) fn parse_voice_command(args: &[String]) -> Result<VoiceCliCommand, Cl
 
 fn parse_voice_call_options(args: &[String]) -> Result<VoiceCallOptions, CliError> {
     let mut options = VoiceCallOptions::default();
+    let mut input_specified = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -84,6 +95,7 @@ fn parse_voice_call_options(args: &[String]) -> Result<VoiceCallOptions, CliErro
             }
             "--input" => {
                 index += 1;
+                input_specified = true;
                 let value = required_value(args, index, "--input")?;
                 options.input = if value == "-" {
                     None
@@ -99,6 +111,31 @@ fn parse_voice_call_options(args: &[String]) -> Result<VoiceCallOptions, CliErro
                 } else {
                     Some(PathBuf::from(value))
                 };
+            }
+            "--video-frame" | "--image" => {
+                index += 1;
+                options.video_frames.push(PathBuf::from(required_value(
+                    args,
+                    index,
+                    "--video-frame",
+                )?));
+            }
+            "--video-format" | "--image-format" => {
+                index += 1;
+                options.video_format = Some(parse_video_format(required_value(
+                    args,
+                    index,
+                    "--video-format",
+                )?)?);
+            }
+            "--video-detail" | "--image-detail" => {
+                index += 1;
+                options.video_detail =
+                    parse_video_detail(required_value(args, index, "--video-detail")?)?;
+            }
+            "--video-frame-ms" => {
+                index += 1;
+                options.video_frame_ms = parse_u64_option(args, index, "--video-frame-ms")?;
             }
             "--session" | "--session-id" => {
                 index += 1;
@@ -148,6 +185,9 @@ fn parse_voice_call_options(args: &[String]) -> Result<VoiceCallOptions, CliErro
             "--force-listen" => {
                 options.force_listen = true;
             }
+            "--no-audio" | "--no-audio-input" => {
+                options.audio_input = false;
+            }
             "--help" | "-h" => return Err(CliError::Usage),
             other => {
                 return Err(CliError::Parse {
@@ -160,6 +200,19 @@ fn parse_voice_call_options(args: &[String]) -> Result<VoiceCallOptions, CliErro
     if options.chunk_ms == 0 {
         return Err(CliError::Parse {
             detail: "--chunk-ms must be greater than zero".to_string(),
+        });
+    }
+    if options.video_frame_ms == 0 {
+        return Err(CliError::Parse {
+            detail: "--video-frame-ms must be greater than zero".to_string(),
+        });
+    }
+    if !options.video_frames.is_empty() && !input_specified && options.input.is_none() {
+        options.audio_input = false;
+    }
+    if !options.audio_input && options.video_frames.is_empty() {
+        return Err(CliError::Parse {
+            detail: "voice call needs audio input or at least one --video-frame".to_string(),
         });
     }
     Ok(options)
@@ -203,6 +256,40 @@ fn parse_turn_detection(value: &str) -> Result<sinomo_lm::RealtimeAudioTurnDetec
     }
 }
 
+fn parse_video_format(value: &str) -> Result<sinomo_lm::RealtimeVideoFrameFormat, CliError> {
+    match value {
+        "jpg" | "jpeg" | "image/jpeg" => Ok(sinomo_lm::RealtimeVideoFrameFormat::Jpeg),
+        "png" | "image/png" => Ok(sinomo_lm::RealtimeVideoFrameFormat::Png),
+        _ => Err(CliError::Parse {
+            detail: format!("unsupported video frame format `{value}`"),
+        }),
+    }
+}
+
+fn parse_video_detail(value: &str) -> Result<sinomo_lm::RealtimeVideoFrameDetail, CliError> {
+    match value {
+        "auto" => Ok(sinomo_lm::RealtimeVideoFrameDetail::Auto),
+        "low" => Ok(sinomo_lm::RealtimeVideoFrameDetail::Low),
+        "high" => Ok(sinomo_lm::RealtimeVideoFrameDetail::High),
+        _ => Err(CliError::Parse {
+            detail: format!("unsupported video detail `{value}`"),
+        }),
+    }
+}
+
+fn video_format_from_path(path: &Path) -> Option<sinomo_lm::RealtimeVideoFrameFormat> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => Some(sinomo_lm::RealtimeVideoFrameFormat::Jpeg),
+        Some("png") => Some(sinomo_lm::RealtimeVideoFrameFormat::Png),
+        _ => None,
+    }
+}
+
 pub(crate) fn run_voice_command(command: VoiceCliCommand) -> Result<(), CliError> {
     match command {
         VoiceCliCommand::Help => {
@@ -242,6 +329,19 @@ fn run_voice_call(options: VoiceCallOptions) -> Result<(), CliError> {
     if let Some(format) = options.input_format {
         config.input_format = format;
     }
+    if !options.video_frames.is_empty() {
+        config.input_video = Some(sinomo_lm::RealtimeVideoInputConfig {
+            frame_format: options
+                .video_format
+                .unwrap_or(sinomo_lm::RealtimeVideoFrameFormat::Jpeg),
+            detail: options.video_detail,
+            max_frame_rate_hz: Some(
+                (1000_u64 / options.video_frame_ms.max(1))
+                    .max(1)
+                    .min(u32::MAX as u64) as u32,
+            ),
+        });
+    }
     if let Some(endpoint) = options.endpoint.as_deref() {
         if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
             config.websocket_url = Some(endpoint.to_string());
@@ -273,12 +373,14 @@ fn run_voice_call(options: VoiceCallOptions) -> Result<(), CliError> {
         ::std::eprintln!("voice session: {}", report.session_id);
         ::std::eprintln!("provider: {} {}", report.provider, report.model);
         ::std::eprintln!("input chunks: {}", report.input_chunks);
+        ::std::eprintln!("video frames: {}", report.input_video_frames);
         ::std::eprintln!("output chunks: {}", report.output_chunks);
         ::std::eprintln!("output audio: stdout");
     } else {
         println!("voice session: {}", report.session_id);
         println!("provider: {} {}", report.provider, report.model);
         println!("input chunks: {}", report.input_chunks);
+        println!("video frames: {}", report.input_video_frames);
         println!("output chunks: {}", report.output_chunks);
         println!("output audio: {}", output_path.display());
     }
@@ -307,6 +409,7 @@ struct VoiceCallReport {
     provider: String,
     model: String,
     input_chunks: u64,
+    input_video_frames: u64,
     output_chunks: u64,
 }
 
@@ -330,8 +433,25 @@ async fn run_voice_call_async(
         .await
         .map_err(realtime_audio_error)?;
     let mut state = VoiceCallState::default();
-    let mut input = open_voice_input(options.input.as_ref())?;
     let mut output = open_voice_output(&output_path)?;
+    let input_video_frames = send_voice_video_frames(
+        &mut session,
+        &mut state,
+        &store,
+        &session_id,
+        &provider_id,
+        &model,
+        &config,
+        &options,
+        output.as_mut(),
+        &output_path,
+    )
+    .await?;
+    let mut input = if options.audio_input {
+        Some(open_voice_input(options.input.as_ref())?)
+    } else {
+        None
+    };
     let chunk_bytes = voice_chunk_bytes(
         config.input_sample_rate_hz,
         config.input_format,
@@ -339,7 +459,7 @@ async fn run_voice_call_async(
     );
     let mut buffer = vec![0_u8; chunk_bytes];
     let mut input_sequence = 0_u64;
-    loop {
+    while let Some(input) = input.as_mut() {
         let read = input.read(&mut buffer).map_err(|source| CliError::Io {
             path: options
                 .input
@@ -412,7 +532,14 @@ async fn run_voice_call_async(
             .await?;
         }
     }
-    session.flush_turn().await.map_err(realtime_audio_error)?;
+    if input_sequence > 0 {
+        session.flush_turn().await.map_err(realtime_audio_error)?;
+    } else if input_video_frames > 0 {
+        session
+            .request_response()
+            .await
+            .map_err(realtime_audio_error)?;
+    }
 
     loop {
         let event = session
@@ -444,8 +571,80 @@ async fn run_voice_call_async(
         provider: provider_id,
         model,
         input_chunks: input_sequence,
+        input_video_frames,
         output_chunks: state.output_sequence,
     })
+}
+
+async fn send_voice_video_frames(
+    session: &mut sinomo_lm::RealtimeAudioSession,
+    state: &mut VoiceCallState,
+    store: &sinomo_agent::FileAgentSessionStore,
+    session_id: &SessionId,
+    provider_id: &str,
+    model: &str,
+    config: &sinomo_lm::RealtimeAudioSessionConfig,
+    options: &VoiceCallOptions,
+    output: &mut dyn Write,
+    output_path: &Path,
+) -> Result<u64, CliError> {
+    let mut sequence = 0_u64;
+    for frame_path in &options.video_frames {
+        let bytes = fs::read(frame_path).map_err(|source| CliError::Io {
+            path: frame_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let format = options
+            .video_format
+            .or_else(|| video_format_from_path(frame_path))
+            .ok_or_else(|| CliError::Parse {
+                detail: format!(
+                    "cannot infer video frame format for {}; pass --video-format jpeg|png",
+                    frame_path.display()
+                ),
+            })?;
+        let mut frame_input =
+            sinomo_lm::RealtimeVideoFrameInput::new(bytes.clone(), format, sequence);
+        frame_input.detail = options.video_detail;
+        frame_input.timestamp_ms = Some(sequence.saturating_mul(options.video_frame_ms));
+        let mut record_input = sinomo_agent::AgentVideoFrameInput::new(
+            sinomo_agent::AgentVideoDirection::Input,
+            sequence,
+            provider_id.to_string(),
+            model.to_string(),
+            format,
+        );
+        record_input.provider_session_id = state.provider_session_id.clone();
+        record_input.timestamp_ms = frame_input.timestamp_ms;
+        store
+            .append_video_frame(session_id, record_input, &bytes)
+            .map_err(agent_session_store_error)?;
+        session
+            .send_video_frame(&frame_input)
+            .await
+            .map_err(realtime_audio_error)?;
+        sequence = sequence.saturating_add(1);
+        if options.pace {
+            if receive_voice_events_for(
+                session,
+                state,
+                store,
+                session_id,
+                provider_id,
+                model,
+                config,
+                output,
+                output_path,
+                Duration::from_millis(options.video_frame_ms),
+                false,
+            )
+            .await?
+            {
+                break;
+            }
+        }
+    }
+    Ok(sequence)
 }
 
 async fn receive_voice_events_for(
@@ -673,7 +872,51 @@ mod tests {
             Some(sinomo_lm::RealtimeAudioSampleFormat::F32Le)
         );
         assert_eq!(options.input_sample_rate_hz, Some(16_000));
+        assert_eq!(options.chunk_ms, 100);
         assert!(!options.pace);
+    }
+
+    #[test]
+    fn voice_call_options_accept_video_frames_without_stdin_audio() {
+        let command = parse_voice_command(&[
+            "call".to_string(),
+            "--provider".to_string(),
+            "openai".to_string(),
+            "--video-frame".to_string(),
+            "frame-001.jpg".to_string(),
+            "--video-frame".to_string(),
+            "frame-002.png".to_string(),
+            "--video-detail".to_string(),
+            "low".to_string(),
+        ])
+        .expect("voice command");
+        let VoiceCliCommand::Call(options) = command else {
+            panic!("expected call");
+        };
+        assert_eq!(options.video_frames.len(), 2);
+        assert_eq!(
+            options.video_detail,
+            sinomo_lm::RealtimeVideoFrameDetail::Low
+        );
+        assert!(!options.audio_input);
+    }
+
+    #[test]
+    fn voice_call_options_keep_stdin_audio_when_explicit_with_video() {
+        let command = parse_voice_command(&[
+            "call".to_string(),
+            "--video-frame".to_string(),
+            "frame-001.jpg".to_string(),
+            "--input".to_string(),
+            "-".to_string(),
+        ])
+        .expect("voice command");
+        let VoiceCliCommand::Call(options) = command else {
+            panic!("expected call");
+        };
+        assert_eq!(options.video_frames.len(), 1);
+        assert!(options.audio_input);
+        assert_eq!(options.input, None);
     }
 
     #[test]

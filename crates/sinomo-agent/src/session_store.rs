@@ -5,7 +5,7 @@ use crate::agent::{
     AgentSteeringMessage, AgentStopReason, AgentStoragePaths, AgentTaskSnapshot, agent_item_id,
 };
 use serde::{Deserialize, Serialize};
-use sinomo_lm::RealtimeAudioSampleFormat;
+use sinomo_lm::{RealtimeAudioSampleFormat, RealtimeVideoFrameFormat};
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use std::fs::{self, File, OpenOptions};
@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, mpsc};
 
 pub const AGENT_SESSION_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub const AGENT_SESSION_AUDIO_SEGMENT_SCHEMA_VERSION: u32 = 1;
+pub const AGENT_SESSION_VIDEO_FRAME_SCHEMA_VERSION: u32 = 1;
 
 pub trait AgentSessionStore: Send + Sync {
     fn load_session(
@@ -249,6 +250,115 @@ impl AgentAudioSegmentRecord {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentVideoDirection {
+    Input,
+    Output,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentVideoFrameInput {
+    pub direction: AgentVideoDirection,
+    pub sequence: u64,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    pub format: RealtimeVideoFrameFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
+}
+
+impl AgentVideoFrameInput {
+    pub fn new(
+        direction: AgentVideoDirection,
+        sequence: u64,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        format: RealtimeVideoFrameFormat,
+    ) -> Self {
+        Self {
+            direction,
+            sequence,
+            provider: provider.into(),
+            model: model.into(),
+            provider_session_id: None,
+            format,
+            width: None,
+            height: None,
+            timestamp_ms: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentVideoDataRef {
+    pub relative_path: String,
+    pub byte_len: u64,
+    pub blake3: String,
+    pub mime_type: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentVideoFrameRecord {
+    pub schema_version: u32,
+    pub frame_id: TaskId,
+    pub session_id: SessionId,
+    #[serde(with = "time::serde::rfc3339")]
+    pub recorded_at: time::OffsetDateTime,
+    pub direction: AgentVideoDirection,
+    pub sequence: u64,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    pub format: RealtimeVideoFrameFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<u64>,
+    pub frame: AgentVideoDataRef,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
+}
+
+impl AgentVideoFrameRecord {
+    fn new(
+        frame_id: TaskId,
+        session_id: SessionId,
+        input: AgentVideoFrameInput,
+        frame: AgentVideoDataRef,
+    ) -> Self {
+        Self {
+            schema_version: AGENT_SESSION_VIDEO_FRAME_SCHEMA_VERSION,
+            frame_id,
+            session_id,
+            recorded_at: time::OffsetDateTime::now_utc(),
+            direction: input.direction,
+            sequence: input.sequence,
+            provider: input.provider,
+            model: input.model,
+            provider_session_id: input.provider_session_id,
+            format: input.format,
+            width: input.width,
+            height: input.height,
+            timestamp_ms: input.timestamp_ms,
+            frame,
+            metadata: input.metadata,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentSessionStoreRecordKind {
@@ -303,6 +413,21 @@ pub enum AgentSessionStoreRecordKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
         end_of_turn: bool,
+    },
+    VideoFrameAppended {
+        frame_id: TaskId,
+        direction: AgentVideoDirection,
+        sequence: u64,
+        provider: String,
+        model: String,
+        byte_len: u64,
+        format: RealtimeVideoFrameFormat,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp_ms: Option<u64>,
     },
     TaskStatusChanged {
         snapshot: AgentTaskSnapshot,
@@ -457,6 +582,58 @@ impl FileAgentSessionStore {
         Ok(record)
     }
 
+    pub fn append_video_frame(
+        &self,
+        session_id: &SessionId,
+        input: AgentVideoFrameInput,
+        bytes: &[u8],
+    ) -> Result<AgentVideoFrameRecord, AgentSessionStoreError> {
+        let frame_id = TaskId::generate();
+        let file_name = format!(
+            "{:08}-{}-{}.{}",
+            input.sequence,
+            match input.direction {
+                AgentVideoDirection::Input => "input",
+                AgentVideoDirection::Output => "output",
+            },
+            frame_id.as_str(),
+            input.format.extension()
+        );
+        let relative_path = format!("video/{file_name}");
+        let path = self
+            .paths
+            .session_video_dir_for_session(session_id)
+            .join(&file_name);
+        replace_file(&path, bytes)?;
+        let frame = AgentVideoDataRef {
+            relative_path,
+            byte_len: bytes.len() as u64,
+            blake3: blake3::hash(bytes).to_hex().to_string(),
+            mime_type: input.format.mime_type().to_string(),
+        };
+        let record = AgentVideoFrameRecord::new(frame_id, session_id.clone(), input.clone(), frame);
+        append_jsonl_record(
+            &self.paths.session_video_frames_path_for_session(session_id),
+            &record,
+        )?;
+        self.append_record(&AgentSessionStoreRecord::new(
+            session_id.clone(),
+            AgentSessionStoreRecordKind::VideoFrameAppended {
+                frame_id: record.frame_id.clone(),
+                direction: record.direction,
+                sequence: record.sequence,
+                provider: record.provider.clone(),
+                model: record.model.clone(),
+                byte_len: record.frame.byte_len,
+                format: record.format,
+                width: record.width,
+                height: record.height,
+                timestamp_ms: record.timestamp_ms,
+            },
+        ))?;
+        Ok(record)
+    }
+
     pub fn load_audio_segments(
         &self,
         session_id: &SessionId,
@@ -496,6 +673,44 @@ impl FileAgentSessionStore {
             segments.push(record);
         }
         Ok(segments)
+    }
+
+    pub fn load_video_frames(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<AgentVideoFrameRecord>, AgentSessionStoreError> {
+        let path = self.paths.session_video_frames_path_for_session(session_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = File::open(&path).map_err(|source| AgentSessionStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let mut frames = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|source| AgentSessionStoreError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: AgentVideoFrameRecord = serde_json::from_str(&line).map_err(|source| {
+                AgentSessionStoreError::Deserialization {
+                    path: path.display().to_string(),
+                    detail: source.to_string(),
+                }
+            })?;
+            if record.schema_version != AGENT_SESSION_VIDEO_FRAME_SCHEMA_VERSION {
+                return Err(AgentSessionStoreError::UnsupportedSnapshotSchema {
+                    path: path.display().to_string(),
+                    schema_version: record.schema_version,
+                });
+            }
+            frames.push(record);
+        }
+        Ok(frames)
     }
 
     fn publish_record(&self, record: &AgentSessionStoreRecord) {
@@ -771,6 +986,49 @@ mod tests {
         )
         .expect("events");
         assert!(events.contains("\"audio_segment_appended\""));
+    }
+
+    #[test]
+    fn file_session_store_persists_video_sidecars_and_metadata() {
+        let data_dir = SinomoDataDir::new(std::env::temp_dir().join(format!(
+            "sinomo-agent-video-session-store-{}",
+            TaskId::generate()
+        )));
+        let store = FileAgentSessionStore::for_data_dir(&data_dir);
+        let session_id = SessionId::from_legacy_named("sess_video_store").expect("session");
+        let mut input = AgentVideoFrameInput::new(
+            AgentVideoDirection::Input,
+            3,
+            "openai",
+            "gpt-realtime-2",
+            RealtimeVideoFrameFormat::Jpeg,
+        );
+        input.width = Some(640);
+        input.height = Some(480);
+        input.timestamp_ms = Some(1200);
+
+        let record = store
+            .append_video_frame(&session_id, input, &[255, 216, 255, 217])
+            .expect("append frame");
+
+        assert_eq!(record.sequence, 3);
+        assert_eq!(record.frame.byte_len, 4);
+        assert_eq!(record.frame.mime_type, "image/jpeg");
+        let frame_path = AgentStoragePaths::from_data_dir(&data_dir)
+            .session_dir_for_session(&session_id)
+            .join(&record.frame.relative_path);
+        assert_eq!(
+            fs::read(frame_path).expect("video sidecar"),
+            vec![255, 216, 255, 217]
+        );
+        let loaded = store.load_video_frames(&session_id).expect("load frames");
+        assert_eq!(loaded, vec![record]);
+        let events = fs::read_to_string(
+            AgentStoragePaths::from_data_dir(&data_dir)
+                .session_events_path_for_session(&session_id),
+        )
+        .expect("events");
+        assert!(events.contains("\"video_frame_appended\""));
     }
 }
 
