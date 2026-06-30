@@ -6491,6 +6491,36 @@ where
         Ok(())
     }
 
+    pub(crate) fn replace_full_agent_session(
+        &mut self,
+        interaction_session: &InteractionSession,
+        mut agent_session: AgentSession,
+    ) -> Result<(), CliError> {
+        agent_session.session_id = interaction_session.session_id.clone();
+        agent_session.role = self.agent_definition.role.clone();
+        let (previous_session_id, cursor, runtime_handle) = {
+            let runtime = self.ensure_runtime(interaction_session)?;
+            let previous_session_id = runtime.session_snapshot()?.session_id;
+            runtime.replace_session(agent_session)?;
+            (
+                previous_session_id,
+                runtime.runtime_event_cursor()?,
+                runtime.clone(),
+            )
+        };
+        self.unregister_runtime_control_session(&previous_session_id)?;
+        self.register_runtime_control(&runtime_handle)?;
+        self.runtime_cursor = cursor;
+        Ok(())
+    }
+
+    pub(crate) fn agent_session_snapshot(&self) -> Result<Option<AgentSession>, CliError> {
+        let Some(runtime) = self.ready_runtime() else {
+            return Ok(None);
+        };
+        Ok(Some(runtime.session_snapshot()?))
+    }
+
     fn register_runtime_control(&self, runtime: &AgentSessionRuntime<M>) -> Result<(), CliError> {
         self.runtime_control_registry
             .register_runtime(runtime.clone())

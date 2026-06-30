@@ -167,6 +167,9 @@ The generic agent loop has a session/turn split. A session is an internal
 model-turn execution unit, not the user-facing conversation or participant
 model. Chats and channels own visible timelines and participants; sessions drive
 model context, compaction, tool state, traces, steering, and follow-up input.
+An agent is the runtime entity that owns its model runtime and session state;
+chats and channels route visible messages to agents rather than treating the
+model runtime as a chat object.
 
 - `Agent::run` remains the compatibility helper for one-shot calls.
 - `Agent::start_turn`, `continue_turn`, `steer`, `follow_up`, `compact`, and
@@ -175,6 +178,17 @@ model context, compaction, tool state, traces, steering, and follow-up input.
   append-only raw transcript so compaction never destroys source history.
 - Queued steering and follow-up messages are consumed into the next turn as
   explicit queued context.
+
+Chats use the standard session-based loop: one selected agent owns the active
+model session, user input becomes a turn, and the resulting answer is appended
+back to the chat timeline.
+
+Channels use an event loop over the shared visible timeline. A user or agent
+message is appended once, then every other enabled agent can observe it through
+that agent's own session projection and decide whether to publish a reply or
+stay silent. Published replies become new channel messages visible to the other
+agents, so agents can continue a discussion. The runtime bounds each ingress
+with a per-message response limit to prevent unbounded self-sustaining loops.
 
 Every model step assembles a `TurnContext` containing runtime facts, workspace
 facts, current session projection, working state, async updates, workspace
