@@ -3,8 +3,8 @@
 //! The app shares the cluster's data directory and always operates *through a daemon*: on
 //! launch it probes for one and attaches over RPC if present. If none is running it starts its
 //! own daemon **in-process** (a background thread running the daemon control loop) and attaches
-//! to that as a **mobile node**. The app is a pure frontend; runtime/cluster config still goes
-//! through daemon services.
+//! to that as a desktop app surface. The app is a pure frontend; runtime/cluster config still
+//! goes through daemon services.
 //! App-only UI preferences live locally under the Sinomo data directory.
 
 pub mod app_config;
@@ -27,7 +27,7 @@ use sinomo_runtime::daemon::{
     RemoteConfigClient, probe_daemon_status, run_daemon_control_loop_with_services,
 };
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::node::{NodeProfile, NodeRole};
+use sinomo_runtime::node::NodeProfile;
 
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 /// Timeout for config RPCs to a connected daemon.
@@ -50,7 +50,7 @@ pub enum Connection {
     /// Attached to a daemon we did not start (and, through it, possibly a cluster).
     Daemon(Box<DaemonStatus>),
     /// No external daemon was running, so the app started its own in-process daemon and
-    /// attached to it as a mobile node.
+    /// attached to it as a desktop app surface.
     InProcessDaemon(Box<DaemonStatus>),
     /// Degraded: no daemon could be reached or started; reading local config directly.
     LocalFallback,
@@ -99,9 +99,9 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// Probe for a daemon and, failing that, stand up an embedded mobile node. This blocks while
-    /// the in-process daemon starts, so it is meant to run off the UI thread; `progress` reports
-    /// each step for the launch status indicator.
+    /// Probe for a daemon and, failing that, stand up an embedded daemon for this desktop app
+    /// surface. This blocks while the in-process daemon starts, so it is meant to run off the UI
+    /// thread; `progress` reports each step for the launch status indicator.
     pub fn connect(progress: impl Fn(&str)) -> Self {
         progress("Preparing…");
         let data_dir = app_config::default_data_dir();
@@ -110,9 +110,8 @@ impl Backend {
         let data_dir = Arc::new(data_dir);
         let app_runtime = build_app_runtime();
 
-        let mut node = NodeProfile::local("Sinomo App")
+        let node = NodeProfile::local("Sinomo App")
             .unwrap_or_else(|_| panic!("local node profile uses a valid trust domain"));
-        node.role = NodeRole::Mobile;
         let agent_runtime_control = sinomo_agent::AgentRuntimeControlRegistry::new();
 
         progress("Looking for a daemon…");
@@ -126,8 +125,7 @@ impl Backend {
                 (Connection::Daemon(Box::new(status)), None)
             }
             // No usable daemon. The app is near-useless without one, so start our own daemon
-            // in-process and run as a mobile node, falling back to direct config only if that
-            // fails.
+            // in-process, falling back to direct config only if that fails.
             DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
                 progress("Starting a local daemon…");
                 match start_in_process_daemon(&paths, &progress, agent_runtime_control.clone()) {
@@ -183,9 +181,8 @@ impl Backend {
         let data_dir = Arc::new(data_dir);
         let app_runtime = build_app_runtime();
 
-        let mut node = NodeProfile::local("Sinomo App")
+        let node = NodeProfile::local("Sinomo App")
             .unwrap_or_else(|_| panic!("local node profile uses a valid trust domain"));
-        node.role = NodeRole::Mobile;
 
         let connection = Connection::LocalFallback;
         let config = build_config_client(&connection, &data_dir, app_runtime.handle());
@@ -242,7 +239,7 @@ impl Backend {
                             "local"
                         };
                         format!(
-                            "Connected to {kind} daemon at {} (mobile node)",
+                            "Connected to {kind} daemon at {} (desktop app surface)",
                             status.address
                         )
                     }
@@ -359,9 +356,9 @@ fn build_app_runtime() -> Arc<tokio::runtime::Runtime> {
     )
 }
 
-/// Start an in-process daemon (mobile node) on a background thread and wait for it to become
-/// reachable. Returns `None` — leaving the app on the daemonless fallback — if it can't be
-/// started or doesn't come up within [`IN_PROCESS_DAEMON_READY_TIMEOUT`].
+/// Start an in-process daemon on a background thread and wait for it to become reachable. Returns
+/// `None` — leaving the app on the daemonless fallback — if it can't be started or doesn't come up
+/// within [`IN_PROCESS_DAEMON_READY_TIMEOUT`].
 fn start_in_process_daemon(
     paths: &DaemonPaths,
     progress: &impl Fn(&str),
@@ -373,8 +370,8 @@ fn start_in_process_daemon(
     let thread = thread::Builder::new()
         .name("sinomo-app-daemon".to_string())
         .spawn(move || {
-            // A fresh mobile node may still be pre-bootstrap; the daemon serves config and joins
-            // a cluster later if one is available.
+            // A fresh app-started daemon may still be pre-bootstrap; it serves config and joins a
+            // cluster later if one is available.
             let hooks = vec![agent_runtime_control_service_hook(control_host)];
             if let Err(error) =
                 run_daemon_control_loop_with_services(options, loop_paths, "daemon", None, hooks)
@@ -415,6 +412,7 @@ fn agent_runtime_control_service_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_runtime::node::NodeRole;
     use sinomo_runtime::service::ServiceRegistry;
 
     #[test]
@@ -422,6 +420,11 @@ mod tests {
         let default_root = app_config::default_data_dir().root();
         let backend = Backend::local_fallback();
         let root = backend.data_dir.root();
+        assert_eq!(
+            backend.node.role,
+            NodeRole::Workstation,
+            "the desktop app should identify as a workstation app surface"
+        );
 
         assert_ne!(
             root, default_root,
