@@ -2669,6 +2669,7 @@ impl ChatState {
                 self.control.task_count = status.task_count;
                 self.control.terminal_result_count = status.terminal_result_count;
                 self.control.tasks = status.tasks;
+                self.control.runtime_attached = status.runtime_attached;
                 self.notice = Some(format!(
                     "agent control {} at sequence {}",
                     if status.accepted {
@@ -13559,6 +13560,7 @@ mod tests {
             sinomo_cli::app_api::ChatControlStatus {
                 session_id: "sess_ui_control".to_string(),
                 accepted: true,
+                runtime_attached: true,
                 sequence: 3,
                 event_count: 1,
                 active_turn: true,
@@ -13572,6 +13574,8 @@ mod tests {
             state.notice.as_deref(),
             Some("agent control accepted at sequence 3")
         );
+        assert!(state.control.runtime_attached);
+        assert_eq!(state.runtime_health().label, "RUNNING");
 
         state.apply_event(ChatEvent::ControlState(
             sinomo_cli::app_api::ChatControlState {
@@ -13587,6 +13591,34 @@ mod tests {
             state.notice.as_deref(),
             Some("agent control: 2 steering, 1 follow-ups")
         );
+    }
+
+    #[test]
+    fn accepted_control_status_clears_detached_runtime_warning() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.control.runtime_attached = false;
+
+        state.apply_event(ChatEvent::ControlStatus(
+            sinomo_cli::app_api::ChatControlStatus {
+                session_id: "sess_ui_control_done".to_string(),
+                accepted: true,
+                runtime_attached: true,
+                sequence: 4,
+                event_count: 1,
+                active_turn: false,
+                task_count: 0,
+                terminal_result_count: 1,
+                tasks: Vec::new(),
+            },
+        ));
+
+        let health = state.runtime_health();
+        assert_ne!(
+            health.detail, "runtime control metadata is detached",
+            "completed accepted control status should not leave a stale runtime warning"
+        );
+        assert_ne!(health.label, "DEGRADED");
     }
 
     #[test]

@@ -264,6 +264,7 @@ pub struct ChatAttachmentInput {
 pub struct ChatControlStatus {
     pub session_id: String,
     pub accepted: bool,
+    pub runtime_attached: bool,
     pub sequence: u64,
     pub event_count: usize,
     pub active_turn: bool,
@@ -1323,6 +1324,7 @@ fn chat_control_status(result: AgentSessionControlResult) -> ChatControlStatus {
     ChatControlStatus {
         session_id: result.snapshot.session_id.to_string(),
         accepted: result.accepted,
+        runtime_attached: true,
         sequence: result.sequence,
         event_count: result.events.len(),
         active_turn: result.snapshot.active_turn.is_some(),
