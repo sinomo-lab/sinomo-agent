@@ -82,8 +82,8 @@ const MEDIA_CALL_COMPACT_H: f32 = 46.0;
 const COMPOSER_H: f32 = 196.0;
 const PAD: f32 = 16.0;
 const SIDEBAR_ROW_H: f32 = 36.0;
-const SIDEBAR_ROW_EDIT_W: f32 = 46.0;
-const SIDEBAR_ROW_EDIT_H: f32 = 22.0;
+const SIDEBAR_ROW_EDIT_W: f32 = 26.0;
+const SIDEBAR_ROW_EDIT_H: f32 = 24.0;
 const SIDEBAR_ROW_EDIT_GAP: f32 = 8.0;
 const SELECTOR_H: f32 = 30.0;
 const ATTACHMENT_AREA_H: f32 = 56.0;
@@ -5403,12 +5403,12 @@ impl Widget for ChatSessionRow {
             } else {
                 (pal.hover, pal.border.with_alpha(0.72), pal.text_muted)
             };
-            widgets::round_panel(ctx, edit, fill, border, 6.0);
-            widgets::draw_text_in(
+            widgets::round_panel(ctx, edit, fill, border, 7.0);
+            draw_glyph(
                 ctx,
-                Rect::new(edit.x() + 7.0, edit.y() + 3.0, edit.width() - 14.0, 16.0),
-                "Edit",
-                pal.text_style(&theme, 10.5, FontWeight::SEMIBOLD, glyph_color),
+                IconGlyph::MoreHorizontal,
+                edit.inflate(-5.0, -5.0),
+                glyph_color,
             );
         }
 
@@ -11123,7 +11123,7 @@ mod tests {
         assert!(
             edit_button.bounds.width() >= SIDEBAR_ROW_EDIT_W - 0.5
                 && edit_button.bounds.height() >= SIDEBAR_ROW_EDIT_H - 0.5,
-            "row edit button should be a visible text pill, got {:?}",
+            "row edit button should be a compact visible affordance, got {:?}",
             edit_button.bounds
         );
 
