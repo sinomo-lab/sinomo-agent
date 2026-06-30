@@ -506,6 +506,10 @@ async fn run_daemon_background_maintenance_loop(
     let mut dfs_triggered_maintenance_requested = false;
 
     loop {
+        if daemon_shutdown_requested(&shutdown_rx) {
+            break;
+        }
+
         if label == "daemon" {
             let finalization_paths = paths.clone();
             match tokio::task::spawn_blocking(move || {
@@ -530,6 +534,22 @@ async fn run_daemon_background_maintenance_loop(
             }
         }
 
+        if daemon_shutdown_requested(&shutdown_rx) {
+            break;
+        }
+
+        if label == "daemon" && daemon_rollout_handoff_pending(&paths) {
+            tokio::select! {
+                _ = tokio::time::sleep(DAEMON_CLUSTER_TICK_INTERVAL) => {}
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || daemon_shutdown_requested(&shutdown_rx) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
         match cluster_network
             .tick_async(&paths, &options, runtime.clone())
             .await
@@ -544,6 +564,10 @@ async fn run_daemon_background_maintenance_loop(
             Err(error) => {
                 tracing::warn!("sinomo {label} cluster network tick failed: {error}");
             }
+        }
+
+        if daemon_shutdown_requested(&shutdown_rx) {
+            break;
         }
 
         if dfs_maintenance_enabled
@@ -569,6 +593,10 @@ async fn run_daemon_background_maintenance_loop(
                     tracing::warn!("sinomo {label} DFS maintenance probe task failed: {error}");
                 }
             }
+        }
+
+        if daemon_shutdown_requested(&shutdown_rx) {
+            break;
         }
 
         if dfs_maintenance_enabled
@@ -612,6 +640,10 @@ async fn run_daemon_background_maintenance_loop(
                 }
             }
             last_dfs_maintenance = std::time::Instant::now();
+        }
+
+        if daemon_shutdown_requested(&shutdown_rx) {
+            break;
         }
 
         if label == "daemon"
@@ -1617,6 +1649,10 @@ fn daemon_sleep_duration_or_min(duration: Duration) -> Duration {
     }
 }
 
+fn daemon_shutdown_requested(shutdown_rx: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *shutdown_rx.borrow()
+}
+
 fn daemon_maintenance_sleep_duration(
     now: Instant,
     cluster_next_due: Duration,
@@ -1650,14 +1686,20 @@ fn daemon_maintenance_sleep_duration(
     daemon_sleep_duration_or_min(next_due)
 }
 
-fn shadow_rollout_finalization_poll_due_in(paths: &DaemonPaths) -> Duration {
+fn daemon_rollout_handoff_pending(paths: &DaemonPaths) -> bool {
     let Some(data_dir) = paths.root.parent() else {
-        return DAEMON_CLUSTER_TICK_INTERVAL;
+        return false;
     };
     let rollout_paths = SelfRolloutPaths::new(data_dir);
-    if rollout_shadow_finalize_path(&rollout_paths).exists()
+    rollout_shadow_finalize_path(&rollout_paths).exists()
         || rollout_main_activation_path(&rollout_paths).exists()
-    {
+}
+
+fn shadow_rollout_finalization_poll_due_in(paths: &DaemonPaths) -> Duration {
+    if paths.root.parent().is_none() {
+        return DAEMON_CLUSTER_TICK_INTERVAL;
+    }
+    if daemon_rollout_handoff_pending(paths) {
         DAEMON_CLUSTER_TICK_INTERVAL
     } else {
         DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL
@@ -5247,15 +5289,38 @@ mod tests {
             DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL,
             "quiet daemons should not wake every tick just to check absent rollout files"
         );
+        assert!(
+            !daemon_rollout_handoff_pending(&paths),
+            "quiet daemons have no rollout handoff marker"
+        );
 
         std::fs::create_dir_all(&rollout_paths.root).expect("rollout dir");
         std::fs::write(rollout_shadow_finalize_path(&rollout_paths), b"pending")
             .expect("pending shadow marker");
 
+        assert!(
+            daemon_rollout_handoff_pending(&paths),
+            "pending shadow finalization pauses heavy maintenance"
+        );
         assert_eq!(
             shadow_rollout_finalization_poll_due_in(&paths),
             DAEMON_CLUSTER_TICK_INTERVAL,
             "active shadow finalization keeps the short fallback poll interval"
+        );
+
+        std::fs::remove_file(rollout_shadow_finalize_path(&rollout_paths))
+            .expect("remove pending shadow marker");
+        std::fs::write(rollout_main_activation_path(&rollout_paths), b"pending")
+            .expect("pending main activation marker");
+
+        assert!(
+            daemon_rollout_handoff_pending(&paths),
+            "pending main activation pauses heavy maintenance"
+        );
+        assert_eq!(
+            shadow_rollout_finalization_poll_due_in(&paths),
+            DAEMON_CLUSTER_TICK_INTERVAL,
+            "active main activation keeps the short fallback poll interval"
         );
     }
 
