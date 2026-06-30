@@ -713,7 +713,7 @@ impl AgentDefinition {
 
     pub fn main() -> Self {
         let temperature = Some(0.2);
-        let max_output_tokens = Some(900);
+        let max_output_tokens = Some(1600);
         Self {
             schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
             package: AgentPackageDefinition::built_in(),
@@ -1647,7 +1647,14 @@ Operate as a real-time, event-driven agent. Keep live interaction responsive:
 - treat async progress and results as session events;
 - hand cluster maintenance, cleanup, rollout, and diagnostics to the background agent by default;
 - use SIFS as the default filesystem root;
-- use runtime-provided model status and session context to decide when local live inference is enough, and delegate deliberate work to stronger configured models when useful."#
+- use runtime-provided model status and session context to decide when local live inference is enough, and delegate deliberate work to stronger configured models when useful.
+
+For direct model interaction, answer in the current turn when no slow tool or
+background handoff is required. Coding advice, document drafting, image/file
+reasoning from provided context, critique, and role-play should return the
+actual user-facing result in `text`, not a promise that you will produce it.
+Use short progress notes only when you are also starting tools, async work, or
+a background handoff."#
 }
 
 fn background_agent_base_prompt() -> &'static str {
@@ -1763,7 +1770,7 @@ pub fn agent_decision_output_contract() -> &'static str {
     r#"Return only JSON shaped as:
 {
   "response_mode": "answer|acknowledge|clarify|defer|silent",
-  "text": "short user-facing response or a concise working note",
+  "text": "complete user-facing answer or requested artifact; use a concise working note only when tool_calls or background_handoff are present",
   "tool_calls": [
     {
       "tool": "tool name",
@@ -2505,6 +2512,18 @@ mod tests {
             assert!(!names.iter().any(|name| name == excluded), "{excluded}");
         }
         assert!(names.iter().any(|name| name == "handoff_to_background"));
+    }
+
+    #[test]
+    fn main_agent_prompt_keeps_direct_interaction_deliverables_in_text() {
+        let prompt = main_agent_system_prompt(&[]);
+
+        assert!(prompt.contains("actual user-facing result in `text`"));
+        assert!(prompt.contains("not a promise that you will produce it"));
+        assert!(
+            prompt.contains("complete user-facing answer or requested artifact"),
+            "JSON contract should allow complete chat artifacts, not only short status notes"
+        );
     }
 
     #[test]

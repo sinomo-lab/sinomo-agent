@@ -496,18 +496,7 @@ fn paint_header(
         title,
     );
 
-    let links = topology
-        .edges
-        .iter()
-        .filter(|edge| !edge.virtual_lan)
-        .count();
-    let subtitle = format!(
-        "{} nodes · {} topology edges · {} LAN segments · {}",
-        snapshot.nodes.len(),
-        links,
-        topology.lan_segments.len(),
-        source_summary(&snapshot.source)
-    );
+    let subtitle = cluster_header_summary(snapshot, topology);
     let subtitle = if refreshing {
         format!("{subtitle} · refreshing")
     } else {
@@ -966,19 +955,13 @@ fn overview_lines(
     diagnostics_open: bool,
     refreshing: bool,
 ) -> Vec<String> {
-    let direct_edges = topology
-        .edges
-        .iter()
-        .filter(|edge| !edge.virtual_lan)
-        .count();
     let mut lines = vec![
         "Cluster overview".to_string(),
-        format!("source: {}", source_summary(&snapshot.source)),
+        format!("connection: {}", source_summary(&snapshot.source)),
         format!("health: {}", cluster_health_summary(snapshot)),
         format!("public route: {}", public_reachability_summary(snapshot)),
         format!("mode: {}", cluster_route_mode_summary(snapshot)),
-        format!("topology: {direct_edges} edges"),
-        format!("LAN: {} segments", topology.lan_segments.len()),
+        format!("LAN: {}", lan_segment_summary(topology)),
     ];
     let warning = cluster_actionable_warning(snapshot);
     if refreshing {
@@ -998,6 +981,10 @@ fn overview_lines(
             };
             lines.push(format!("{label}: {}", short(warning, 42)));
         }
+        lines.push(format!(
+            "topology: {} direct edges",
+            direct_topology_edge_count(topology)
+        ));
         lines.push(format!("diagnostics: {}", snapshot.source));
         lines.push(format!(
             "cluster: {}",
@@ -1057,6 +1044,23 @@ fn availability_counts(snapshot: &ClusterSnapshot) -> AvailabilityCounts {
     counts
 }
 
+fn cluster_header_summary(snapshot: &ClusterSnapshot, topology: &Topology) -> String {
+    let public = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.public_reachable)
+        .count();
+    format!(
+        "{} · {} · LAN {} · public {}/{} · {}",
+        count_noun(snapshot.nodes.len(), "node", "nodes"),
+        cluster_health_summary(snapshot).replace(" / ", "/"),
+        count_noun(topology.lan_segments.len(), "segment", "segments"),
+        public,
+        snapshot.nodes.len(),
+        source_summary(&snapshot.source)
+    )
+}
+
 fn cluster_health_summary(snapshot: &ClusterSnapshot) -> String {
     let counts = availability_counts(snapshot);
     if counts.total == 0 {
@@ -1071,6 +1075,18 @@ fn cluster_health_summary(snapshot: &ClusterSnapshot) -> String {
         parts.push(plural_count(counts.unknown, "unknown"));
     }
     parts.join(", ")
+}
+
+fn direct_topology_edge_count(topology: &Topology) -> usize {
+    topology
+        .edges
+        .iter()
+        .filter(|edge| !edge.virtual_lan)
+        .count()
+}
+
+fn lan_segment_summary(topology: &Topology) -> String {
+    count_noun(topology.lan_segments.len(), "segment", "segments")
 }
 
 fn public_reachability_summary(snapshot: &ClusterSnapshot) -> String {
@@ -1147,6 +1163,14 @@ fn node_plural(count: usize, state: &str) -> String {
         format!("node {state}")
     } else {
         format!("nodes {state}")
+    }
+}
+
+fn count_noun(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
     }
 }
 
@@ -1986,6 +2010,10 @@ mod tests {
         let topology = build_topology(&snapshot);
         let lines = overview_lines(&snapshot, &topology, false, false);
 
+        assert_eq!(
+            cluster_header_summary(&snapshot, &topology),
+            "2 nodes · 2/2 online · LAN 0 segments · public 1/2 · daemon connected"
+        );
         assert_eq!(lines[0], "Cluster overview");
         assert!(lines.iter().any(|line| line == "health: 2 / 2 online"));
         assert!(lines.iter().any(|line| line == "public route: 1 / 2 nodes"));
@@ -1994,8 +2022,16 @@ mod tests {
                 .iter()
                 .any(|line| line == "mode: public and private routing")
         );
-        assert!(lines.iter().any(|line| line == "topology: 1 edges"));
-        assert!(lines.iter().any(|line| line == "source: daemon connected"));
+        assert!(lines.iter().any(|line| line == "LAN: 0 segments"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "connection: daemon connected")
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("topology:")),
+            "direct topology edge counts belong behind diagnostics"
+        );
         assert!(
             lines
                 .iter()
@@ -2012,6 +2048,7 @@ mod tests {
         );
 
         let open = overview_lines(&snapshot, &topology, true, false);
+        assert!(open.iter().any(|line| line == "topology: 1 direct edges"));
         assert!(
             open.iter()
                 .any(|line| line == "diagnostics: daemon 127.0.0.1:21353")

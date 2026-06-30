@@ -4510,7 +4510,7 @@ fn sifs_metadata_error_next_step(error: &str) -> String {
             "Retry metadata, then inspect Cluster health if it stalls".to_string()
         }
         "SIFS browser stopped unexpectedly." => "Retry the SIFS metadata request".to_string(),
-        _ => "Show metadata details, then refresh placement".to_string(),
+        _ => "Show details, then refresh placement".to_string(),
     }
 }
 
@@ -5203,7 +5203,20 @@ fn unselected_inspector_management(files: &FilesState) -> String {
     }
 }
 
-fn unselected_inspector_health(files: &FilesState) -> Option<String> {
+fn unselected_inspector_health_summary(files: &FilesState) -> Option<String> {
+    if files.source != FilesSourceKind::Sifs {
+        return None;
+    }
+    if let Some(health) = files.sifs_health.as_ref() {
+        return Some(sifs_health_status_summary(health));
+    }
+    if let Some(error) = files.sifs_health_error.as_deref() {
+        return Some(sifs_health_error_status_summary(error));
+    }
+    Some("Not checked yet; refresh this folder to update health".to_string())
+}
+
+fn unselected_inspector_health_detail(files: &FilesState) -> Option<String> {
     if files.source != FilesSourceKind::Sifs {
         return None;
     }
@@ -5226,8 +5239,16 @@ fn unselected_inspector_rows(files: &FilesState) -> Vec<(&'static str, String)> 
             unselected_inspector_status(files.source, files.entries.is_empty()).to_string(),
         ),
     ];
-    if let Some(health) = unselected_inspector_health(files) {
-        rows.push(("DFS health", health));
+    if let Some(health) = unselected_inspector_health_summary(files) {
+        rows.push(("SIFS health", health));
+    }
+    if files.source == FilesSourceKind::Sifs && files.inspector_details_open {
+        if let Some(detail) = files_sifs_connection_detail(files) {
+            rows.push(("Daemon", detail));
+        }
+        if let Some(health) = unselected_inspector_health_detail(files) {
+            rows.push(("DFS detail", health));
+        }
     }
     if unselected_inspector_actions(files).len() <= 1 {
         rows.push(("Next step", unselected_inspector_management(files)));
@@ -6672,14 +6693,12 @@ fn files_list_body(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollS
         .iter()
         .filter_map(|index| {
             let entry = entries.get(*index)?.clone();
-            let detail = {
-                let files = shared.files();
-                entry_row_description(&entry, &files, files.selected == Some(*index))
-            };
             Some(
-                ListItem::new(entry.name.clone())
-                    .detail(detail)
-                    .with_child(SifsEntryRow::new(shared.clone(), *index, entry)),
+                ListItem::new(entry.path.clone()).with_child(SifsEntryRow::new(
+                    shared.clone(),
+                    *index,
+                    entry,
+                )),
             )
         })
         .collect();
@@ -6837,6 +6856,20 @@ fn sifs_health_error_status_detail(error: &str) -> String {
     } else {
         format!("DFS health unavailable: {detail}")
     }
+}
+
+fn sifs_health_status_summary(health: &SifsHealthSummary) -> String {
+    if sifs_health_has_attention(health) {
+        return "Needs attention".to_string();
+    }
+    if sifs_health_has_activity(health) {
+        return "Syncing".to_string();
+    }
+    "Healthy".to_string()
+}
+
+fn sifs_health_error_status_summary(_error: &str) -> String {
+    "Health unavailable; open Connection or Cluster".to_string()
 }
 
 fn files_source_status(files: &FilesState) -> &'static str {
@@ -7078,10 +7111,6 @@ fn files_task_queue_summary(tasks: &[FilesTask]) -> String {
 
 fn files_status_summary(files: &FilesState) -> String {
     let mut summary = files_source_status(files).to_string();
-    if let Some(detail) = files_sifs_connection_detail(files) {
-        summary.push_str(" | ");
-        summary.push_str(&detail);
-    }
     summary.push_str(&format!(
         " | Path {} | {} | {} | {}",
         files.path,
@@ -7089,17 +7118,6 @@ fn files_status_summary(files: &FilesState) -> String {
         files_selection_status(files),
         files_task_status(files),
     ));
-    if files.source == FilesSourceKind::Sifs
-        && let Some(health) = files.sifs_health.as_ref()
-    {
-        summary.push_str(" | ");
-        summary.push_str(&sifs_health_status_detail(health));
-    } else if files.source == FilesSourceKind::Sifs
-        && let Some(error) = files.sifs_health_error.as_deref()
-    {
-        summary.push_str(" | ");
-        summary.push_str(&sifs_health_error_status_detail(error));
-    }
     summary
 }
 
@@ -7554,26 +7572,12 @@ impl Widget for FilesStatusBar {
         let info_x = chip.max_x() + 12.0;
         let info_w = (right.x() - info_x - 12.0).max(0.0);
         let selected = files_status_bar_selection(&files);
-        let mut info_parts = vec![
+        let info_parts = vec![
             middle_short(&files.path, 64),
             files_entry_count_status(&files),
             selected,
         ];
-        if let Some(detail) = files_sifs_connection_detail(&files) {
-            info_parts.insert(1, middle_short(&detail, 48));
-        }
-        let mut info = info_parts.join(" | ");
-        if files.source == FilesSourceKind::Sifs
-            && let Some(health) = files.sifs_health.as_ref()
-        {
-            info.push_str(" | ");
-            info.push_str(&middle_short(&sifs_health_status_detail(health), 48));
-        } else if files.source == FilesSourceKind::Sifs
-            && let Some(error) = files.sifs_health_error.as_deref()
-        {
-            info.push_str(" | ");
-            info.push_str(&middle_short(&sifs_health_error_status_detail(error), 48));
-        }
+        let info = info_parts.join(" | ");
         widgets::draw_text_in(
             ctx,
             Rect::new(info_x, y, info_w, 24.0),
@@ -8290,12 +8294,13 @@ impl InspectorView {
                 task_signature
             ),
             None => format!(
-                "unselected|{:?}|{}|{}|{}|{}|{}",
+                "unselected|{:?}|{}|{}|{}|{}|{}|{}",
                 files.source,
                 files.path,
                 files.clustered,
                 files.entries.len(),
-                unselected_inspector_health(&files).unwrap_or_default(),
+                files.inspector_details_open,
+                unselected_inspector_health_summary(&files).unwrap_or_default(),
                 task_signature
             ),
         }
@@ -8818,9 +8823,9 @@ fn sifs_unavailable_rows(error: &str, details_open: bool) -> Vec<(&'static str, 
 
 fn inspector_detail_button_label(details_open: bool) -> &'static str {
     if details_open {
-        "Hide metadata"
+        "Hide details"
     } else {
-        "Show metadata"
+        "Show details"
     }
 }
 
@@ -8838,6 +8843,13 @@ fn inspector_detail_button_rect(bounds: Rect, tasks: &[FilesTask]) -> Rect {
 
 fn inspector_detail_button_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
     sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(7_401))
+}
+
+fn inspector_details_available(files: &FilesState) -> bool {
+    files.loading
+        || files.error.is_some()
+        || files.selected_entry().is_some()
+        || files.source == FilesSourceKind::Sifs
 }
 
 fn inspector_actions_origin_y(bounds: Rect, tasks: &[FilesTask]) -> f32 {
@@ -9138,7 +9150,7 @@ impl Widget for InspectorView {
 
             let details_hit = {
                 let files = self.shared.files();
-                (files.loading || files.error.is_some() || files.selected_entry().is_some())
+                inspector_details_available(&files)
                     && inspector_detail_button_rect(ctx.bounds(), &files.tasks)
                         .contains(pointer.position)
             };
@@ -9233,6 +9245,8 @@ impl Widget for InspectorView {
         let Some(entry) = files.selected_entry() else {
             let rows = unselected_inspector_rows(&files);
             let actions = unselected_inspector_actions(&files);
+            let details_open =
+                (files.source == FilesSourceKind::Sifs).then_some(files.inspector_details_open);
             self.state_panel(
                 ctx,
                 &theme,
@@ -9243,7 +9257,7 @@ impl Widget for InspectorView {
                 unselected_inspector_title(files.source),
                 &rows,
                 &files.tasks,
-                None,
+                details_open,
             );
             if !actions.is_empty() {
                 self.root_action_buttons(ctx, &theme, &pal, bounds, &files.tasks, &rows, &actions);
@@ -9805,8 +9819,7 @@ impl Widget for InspectorView {
                 selected_actions,
                 root_actions,
                 root_rows,
-                (files.loading || files.error.is_some() || files.selected_entry().is_some())
-                    .then_some(files.inspector_details_open),
+                inspector_details_available(&files).then_some(files.inspector_details_open),
                 files.tasks.clone(),
             )
         };
@@ -12427,7 +12440,7 @@ mod tests {
         }
         assert_eq!(
             inspector.summary(),
-            "unselected|Sifs|/services|false|0|DFS health not loaded|"
+            "unselected|Sifs|/services|false|0|true|Not checked yet; refresh this folder to update health|"
         );
     }
 
@@ -12501,11 +12514,10 @@ mod tests {
         assert!(rows.iter().any(|(label, value)| {
             *label == "Scope" && value == "cluster-backed SIFS namespace"
         }));
-        assert!(
-            rows.iter().any(|(label, value)| {
-                *label == "DFS health" && value == "DFS health not loaded"
-            })
-        );
+        assert!(rows.iter().any(|(label, value)| {
+            *label == "SIFS health"
+                && value == "Not checked yet; refresh this folder to update health"
+        }));
         assert!(rows.iter().any(|(label, value)| {
             *label == "Next step"
                 && value.contains("created SIFS objects expose placement and replica actions")
@@ -12534,7 +12546,7 @@ mod tests {
         assert!(rows.iter().any(|(label, value)| {
             *label == "Next step" && value.contains("switch places to browse another filesystem")
         }));
-        assert!(!rows.iter().any(|(label, _)| *label == "DFS health"));
+        assert!(!rows.iter().any(|(label, _)| *label == "SIFS health"));
     }
 
     #[test]
@@ -12549,16 +12561,91 @@ mod tests {
         files.sifs_health = Some(degraded_sifs_health());
 
         let rows = unselected_inspector_rows(&files);
+        assert!(
+            rows.iter()
+                .any(|(label, value)| { *label == "SIFS health" && value == "Needs attention" })
+        );
+        assert!(!rows.iter().any(|(label, _)| *label == "DFS detail"));
+
+        files.inspector_details_open = true;
+        let rows = unselected_inspector_rows(&files);
         assert!(rows.iter().any(|(label, value)| {
-            *label == "DFS health" && value == "DFS 21 conflicts, 18 repairs, 43 pending writes"
+            *label == "DFS detail" && value == "DFS 21 conflicts, 18 repairs, 43 pending writes"
         }));
 
         files.sifs_health = None;
         files.sifs_health_error = Some("metadata root missing".to_string());
         let rows = unselected_inspector_rows(&files);
         assert!(rows.iter().any(|(label, value)| {
-            *label == "DFS health" && value == "DFS health unavailable: metadata root missing"
+            *label == "SIFS health" && value == "Health unavailable; open Connection or Cluster"
         }));
+        assert!(rows.iter().any(|(label, value)| {
+            *label == "DFS detail" && value == "DFS health unavailable: metadata root missing"
+        }));
+    }
+
+    #[test]
+    fn current_sifs_location_details_button_reveals_diagnostics() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.source = FilesSourceKind::Sifs;
+            files.clustered = true;
+            files.path = "/".to_string();
+            files.daemon_address = Some("127.0.0.1:21353".to_string());
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.sifs_health = Some(degraded_sifs_health());
+        }
+
+        assert!(
+            !unselected_inspector_rows(&shared.files())
+                .iter()
+                .any(|(label, _)| *label == "DFS detail")
+        );
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new().title("Files root details").root(
+                    SizedBox::new()
+                        .width(INSPECTOR_W)
+                        .height(720.0)
+                        .with_child(InspectorView::new(shared.clone())),
+                ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Show details")
+            .click()?;
+        assert!(shared.files().inspector_details_open);
+        let rows = unselected_inspector_rows(&shared.files());
+        assert!(
+            rows.iter()
+                .any(|(label, value)| { *label == "Daemon" && value == "daemon 127.0.0.1:21353" })
+        );
+        assert!(rows.iter().any(|(label, value)| {
+            *label == "DFS detail" && value == "DFS 21 conflicts, 18 repairs, 43 pending writes"
+        }));
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Hide details")
+            .click()?;
+        assert!(!shared.files().inspector_details_open);
+
+        Ok(())
     }
 
     #[test]
@@ -13188,7 +13275,7 @@ mod tests {
         );
         assert_eq!(
             sifs_inspector_next_step(None, true, false, Some("metadata read failed")),
-            "Show metadata details, then refresh placement"
+            "Show details, then refresh placement"
         );
         assert_eq!(
             sifs_inspector_next_step(None, true, false, Some("device authorization was denied")),
@@ -13354,7 +13441,7 @@ mod tests {
         assert_eq!(files_source_status(&state), "SIFS degraded");
         assert_eq!(
             files_status_summary(&state),
-            "SIFS degraded | Path /cluster-tests | 1 entry | 1 entry marked | 1 task done | DFS 21 conflicts, 18 repairs, 43 pending writes"
+            "SIFS degraded | Path /cluster-tests | 1 entry | 1 entry marked | 1 task done"
         );
 
         state.sifs_health = None;
@@ -13362,7 +13449,7 @@ mod tests {
         assert_eq!(files_source_status(&state), "SIFS unknown");
         assert_eq!(
             files_status_summary(&state),
-            "SIFS unknown | Path /cluster-tests | 1 entry | 1 entry marked | 1 task done | DFS health unavailable: metadata root missing"
+            "SIFS unknown | Path /cluster-tests | 1 entry | 1 entry marked | 1 task done"
         );
     }
 
@@ -13382,7 +13469,7 @@ mod tests {
         assert_eq!(files_source_status(&state), "Remote SIFS");
         assert_eq!(
             files_status_summary(&state),
-            "Remote SIFS | remote daemon sodium.sinomo.net:21353 | Path /sinomo/nodes | 0 entries | no selection | idle"
+            "Remote SIFS | Path /sinomo/nodes | 0 entries | no selection | idle"
         );
 
         state.daemon_address = Some("127.0.0.1:21353".to_string());
@@ -16611,13 +16698,13 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Show metadata")
+            .with_name("Show details")
             .click()?;
         assert!(shared.files().inspector_details_open);
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Hide metadata")
+            .with_name("Hide details")
             .click()?;
         assert!(!shared.files().inspector_details_open);
 
@@ -16657,13 +16744,13 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Show metadata")
+            .with_name("Show details")
             .click()?;
         assert!(shared.files().inspector_details_open);
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Hide metadata")
+            .with_name("Hide details")
             .click()?;
         assert!(!shared.files().inspector_details_open);
 

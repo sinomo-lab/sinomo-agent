@@ -4225,9 +4225,14 @@ fn default_visible_toolsets_for_role(role: &crate::AgentRole) -> Vec<String> {
             "cluster",
             "sifs",
         ],
-        crate::AgentRole::Deliberation | crate::AgentRole::Evolution => {
-            &["core", "coding", "local", "interactive", "discovery"]
-        }
+        crate::AgentRole::Deliberation | crate::AgentRole::Evolution => &[
+            "core",
+            "coding",
+            "local",
+            "interactive",
+            "discovery",
+            "version_control",
+        ],
     };
     toolsets.iter().copied().map(str::to_string).collect()
 }
@@ -11077,7 +11082,7 @@ mod tests {
         assert_eq!(config.max_steps, None);
         assert_eq!(config.max_tool_calls_per_step, None);
         assert_eq!(config.max_model_repair_attempts, None);
-        assert_eq!(config.max_output_tokens, Some(900));
+        assert_eq!(config.max_output_tokens, Some(1600));
         assert_eq!(
             config.instruction_file_max_bytes,
             Some(DEFAULT_WORKSPACE_INSTRUCTION_FILE_BYTES)
@@ -14554,6 +14559,10 @@ mod tests {
         );
 
         assert_eq!(plan.readiness_issues(), Vec::new());
+        assert!(plan.is_model_visible("changed_files"));
+        assert!(plan.is_executable("changed_files"));
+        assert!(plan.is_model_visible("git_diff"));
+        assert!(plan.is_executable("git_diff"));
     }
 
     #[test]

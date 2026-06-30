@@ -1,4 +1,4 @@
-//! "Sinomo" tab — the AI chat experience.
+//! "Chat" tab — the AI chat experience.
 //!
 //! Like the Settings and Files tabs, this is a fully *composed* `sui-widgets`
 //! tree: [`view`] returns a responsive host ([`ChatView`]) over pre-built pods
@@ -78,11 +78,12 @@ const SIDEBAR_W: f32 = 250.0;
 const ACTIVITY_RAIL_W: f32 = 286.0;
 const OVERVIEW_H: f32 = 86.0;
 const MEDIA_CALL_H: f32 = 156.0;
+const MEDIA_CALL_COMPACT_H: f32 = 46.0;
 const COMPOSER_H: f32 = 196.0;
 const PAD: f32 = 16.0;
 const SIDEBAR_ROW_H: f32 = 36.0;
-const SIDEBAR_ROW_EDIT_W: f32 = 46.0;
-const SIDEBAR_ROW_EDIT_H: f32 = 22.0;
+const SIDEBAR_ROW_EDIT_W: f32 = 26.0;
+const SIDEBAR_ROW_EDIT_H: f32 = 24.0;
 const SIDEBAR_ROW_EDIT_GAP: f32 = 8.0;
 const SELECTOR_H: f32 = 30.0;
 const ATTACHMENT_AREA_H: f32 = 56.0;
@@ -92,6 +93,8 @@ const COMPOSER_PAD_Y: f32 = 12.0;
 const COMPOSER_SECTION_GAP: f32 = 10.0;
 const INPUT_ACTION_GAP: f32 = 10.0;
 const SEND_BUTTON_SIZE: f32 = 40.0;
+const COMPOSER_DEFAULT_ACTION_W: f32 = SEND_BUTTON_SIZE * 2.0 + 6.0;
+const COMPOSER_REUSE_ACTION_W: f32 = 166.0;
 const COMPOSER_TEXT_SIZE: f32 = 13.5;
 const COMPOSER_LINE_HEIGHT: f32 = 19.0;
 const SESSION_LIST_UI_TIMEOUT: Duration = Duration::from_secs(8);
@@ -289,7 +292,9 @@ enum RecoveryCardAction {
 enum ChatQuickAction {
     PlanChange,
     CheckCluster,
-    ReviewRepo,
+    DraftDocument,
+    ReasonImage,
+    RolePlay,
     ManageChannel,
 }
 
@@ -323,14 +328,27 @@ impl RecoveryCardAction {
 }
 
 impl ChatQuickAction {
-    const CHAT: [Self; 3] = [Self::PlanChange, Self::CheckCluster, Self::ReviewRepo];
-    const CHANNEL: [Self; 3] = [Self::ManageChannel, Self::PlanChange, Self::CheckCluster];
+    const CHAT: [Self; 5] = [
+        Self::PlanChange,
+        Self::DraftDocument,
+        Self::ReasonImage,
+        Self::RolePlay,
+        Self::CheckCluster,
+    ];
+    const CHANNEL: [Self; 4] = [
+        Self::ManageChannel,
+        Self::PlanChange,
+        Self::DraftDocument,
+        Self::RolePlay,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::PlanChange => "Plan a change",
             Self::CheckCluster => "Check cluster",
-            Self::ReviewRepo => "Review repo",
+            Self::DraftDocument => "Draft document",
+            Self::ReasonImage => "Inspect attachment",
+            Self::RolePlay => "Role play",
             Self::ManageChannel => "Manage channel",
         }
     }
@@ -338,13 +356,19 @@ impl ChatQuickAction {
     fn prompt(self) -> Option<&'static str> {
         match self {
             Self::PlanChange => Some(
-                "Plan the next code change in this repository and identify the safest first step.",
+                "Use the coding tools to inspect this repository, then plan the next code change. Return the safest first step, the files or commands you would check first, likely risks, and a focused verification command.",
             ),
             Self::CheckCluster => {
                 Some("Check the local cluster status and explain anything that needs attention.")
             }
-            Self::ReviewRepo => Some(
-                "Review the current repository state and point out the most important issue to fix next.",
+            Self::DraftDocument => Some(
+                "Return a finished Markdown design note now. Start exactly with '# Chat and channel interaction design note'. Include sections: Assumptions, Audience, Goals, Non-goals, Workflow, Risks, Next steps. Do not describe what you will do.",
+            ),
+            Self::ReasonImage => Some(
+                "Inspect the attached file context available to you. If there is no attachment, ask me for the file first. If I expect pixel-level image reasoning or full file contents, say that this chat currently receives SIFS attachment metadata rather than raw file bytes, then ask for a model-visible excerpt or description. Summarize concrete observations from the attachment record and uncertainties.",
+            ),
+            Self::RolePlay => Some(
+                "Role play as a skeptical product reviewer evaluating this chat and channel interface. Stay in character, critique the workflow, and propose specific improvements.",
             ),
             Self::ManageChannel => None,
         }
@@ -354,27 +378,45 @@ impl ChatQuickAction {
         match self {
             Self::PlanChange => IconGlyph::Sparkles,
             Self::CheckCluster => IconGlyph::Storage,
-            Self::ReviewRepo => IconGlyph::Search,
+            Self::DraftDocument => IconGlyph::File,
+            Self::ReasonImage => IconGlyph::Search,
+            Self::RolePlay => IconGlyph::Chat,
             Self::ManageChannel => IconGlyph::Chat,
         }
     }
 
     fn description(self) -> &'static str {
         match self {
-            Self::PlanChange => "Prepare a planning prompt",
-            Self::CheckCluster => "Prepare a cluster status prompt",
-            Self::ReviewRepo => "Prepare a repository review prompt",
+            Self::PlanChange => "Use coding agent to plan repository work",
+            Self::CheckCluster => "Use background agent to inspect cluster status",
+            Self::DraftDocument => "Prepare a polished Markdown note",
+            Self::ReasonImage => "Open attachment controls for file context",
+            Self::RolePlay => "Prepare a role-playing prompt",
             Self::ManageChannel => "Open channel agents and settings",
         }
     }
 
     fn subtitle(self) -> &'static str {
         match self {
-            Self::PlanChange => "Safest first step",
-            Self::CheckCluster => "Daemon health",
-            Self::ReviewRepo => "Highest-risk issue",
+            Self::PlanChange => "coding-agent",
+            Self::CheckCluster => "background-agent",
+            Self::DraftDocument => "Structured note",
+            Self::ReasonImage => "SIFS metadata",
+            Self::RolePlay => "Persona test",
             Self::ManageChannel => "Agents and title",
         }
+    }
+
+    fn preferred_agent_key(self) -> Option<&'static str> {
+        match self {
+            Self::PlanChange => Some("coding-agent"),
+            Self::CheckCluster => Some("background-agent"),
+            Self::DraftDocument | Self::ReasonImage | Self::RolePlay | Self::ManageChannel => None,
+        }
+    }
+
+    fn opens_attachment_controls(self) -> bool {
+        matches!(self, Self::ReasonImage)
     }
 }
 
@@ -617,6 +659,7 @@ pub struct ChatState {
     pub cursor: usize,
     draft_revision: u64,
     attachment_path_input: String,
+    attachment_controls_open: bool,
     attachments: Vec<PendingChatAttachment>,
     pub streaming: bool,
     pub notice: Option<String>,
@@ -627,6 +670,7 @@ pub struct ChatState {
     pub control: ChatControlOverview,
     pub media_call: ChatMediaCallState,
     media_call_runtime: Option<ChatNativeMediaRuntime>,
+    media_call_details_open: bool,
     activity_panel_open: bool,
     pub scroll: f32,
     pub stick_bottom: bool,
@@ -716,6 +760,7 @@ impl ChatState {
             cursor: 0,
             draft_revision: 0,
             attachment_path_input: String::new(),
+            attachment_controls_open: false,
             attachments: Vec::new(),
             streaming: false,
             notice: None,
@@ -726,6 +771,7 @@ impl ChatState {
             control: ChatControlOverview::default(),
             media_call: ChatMediaCallState::default(),
             media_call_runtime: None,
+            media_call_details_open: false,
             activity_panel_open: false,
             scroll: 0.0,
             stick_bottom: true,
@@ -1556,6 +1602,7 @@ impl ChatState {
             return false;
         }
 
+        let show_speaker = self.session_is_channel(session_id);
         let mut transcript = self.load_chat_transcript(session_id).unwrap_or_default();
         let mut messages: Vec<ChatMessage> = transcript
             .messages
@@ -1568,7 +1615,15 @@ impl ChatState {
                 true
             }
             ChatEvent::AgentToken { speaker, text, .. } => {
-                Self::append_model_token_from_speaker(&mut messages, &speaker.agent_name, &text);
+                if show_speaker {
+                    Self::append_model_token_from_speaker(
+                        &mut messages,
+                        &speaker.agent_name,
+                        &text,
+                    );
+                } else {
+                    Self::append_model_token(&mut messages, &text);
+                }
                 true
             }
             ChatEvent::SystemMessage { kind, text, .. } => {
@@ -1698,6 +1753,8 @@ impl ChatState {
         self.messages.clear();
         self.input.clear();
         self.cursor = 0;
+        self.attachment_path_input.clear();
+        self.attachment_controls_open = false;
         self.streaming = false;
         self.notice = preserved_notice;
         self.context = None;
@@ -1705,6 +1762,9 @@ impl ChatState {
         self.activity = preserved_activity;
         self.tool_calls.clear();
         self.control = ChatControlOverview::default();
+        self.media_call = ChatMediaCallState::default();
+        self.media_call_runtime = None;
+        self.media_call_details_open = false;
         self.scroll = 0.0;
         self.stick_bottom = true;
         self.session_edit_id = None;
@@ -1737,6 +1797,13 @@ impl ChatState {
 
     fn current_is_channel(&self) -> bool {
         self.current_session_ref()
+            .is_some_and(|session| session.kind == ConversationKind::Channel)
+    }
+
+    fn session_is_channel(&self, session_id: &str) -> bool {
+        self.sessions
+            .iter()
+            .find(|session| session.id == session_id)
             .is_some_and(|session| session.kind == ConversationKind::Channel)
     }
 
@@ -2169,6 +2236,7 @@ impl ChatState {
         self.control = ChatControlOverview::default();
         self.media_call = ChatMediaCallState::default();
         self.media_call_runtime = None;
+        self.media_call_details_open = false;
         self.scroll = f32::MAX;
         self.stick_bottom = true;
         self.session_edit_id = None;
@@ -2239,6 +2307,7 @@ impl ChatState {
             self.media_call.active = false;
             self.media_call.started_at = None;
             self.media_call_runtime = None;
+            self.media_call_details_open = false;
             self.media_call.notice = Some("call ended".to_string());
             self.notice = Some("media call ended".to_string());
             self.push_activity(
@@ -2253,6 +2322,7 @@ impl ChatState {
         if provider == "provider pending" || model == "model pending" {
             let detail =
                 "choose a realtime-capable provider and model before starting a media call";
+            self.media_call_details_open = true;
             self.media_call.notice = Some(detail.to_string());
             self.notice = Some(detail.to_string());
             self.push_activity("media call", detail, ActivityTone::Warn);
@@ -2263,6 +2333,7 @@ impl ChatState {
         if !started {
             self.media_call.active = false;
             self.media_call.started_at = None;
+            self.media_call_details_open = true;
             self.media_call.notice = Some(native_notice.clone());
             self.notice = Some(format!("media call failed: {native_notice}"));
             self.push_activity("media call", native_notice, ActivityTone::Warn);
@@ -2270,6 +2341,7 @@ impl ChatState {
         }
 
         self.media_call.active = true;
+        self.media_call_details_open = true;
         self.media_call.provider = provider.clone();
         self.media_call.model = model.clone();
         self.media_call.started_at = Some(Instant::now());
@@ -2369,6 +2441,7 @@ impl ChatState {
                 ChatMediaCallWorkerEvent::Error(detail) => {
                     self.media_call.active = false;
                     self.media_call.started_at = None;
+                    self.media_call_details_open = true;
                     self.media_call.notice = Some(format!("media call failed: {detail}"));
                     self.notice = Some(format!("media call failed: {detail}"));
                     self.push_activity("media call", detail, ActivityTone::Warn);
@@ -2378,6 +2451,7 @@ impl ChatState {
                 ChatMediaCallWorkerEvent::Done(detail) => {
                     self.media_call.active = false;
                     self.media_call.started_at = None;
+                    self.media_call_details_open = false;
                     self.media_call.notice = Some(detail);
                     ended = true;
                     break;
@@ -2420,6 +2494,14 @@ impl ChatState {
         };
         self.media_call.notice = Some(detail.to_string());
         self.push_activity("media call", detail, ActivityTone::Neutral);
+    }
+
+    pub fn toggle_media_call_details(&mut self) {
+        self.media_call_details_open = !self.media_call_details_open;
+    }
+
+    fn media_call_details_visible(&self) -> bool {
+        self.media_call_details_open
     }
 
     fn media_call_elapsed_label(&self) -> String {
@@ -2493,13 +2575,23 @@ impl ChatState {
                     self.scroll = f32::MAX;
                 }
             }
-            ChatEvent::AgentToken { speaker, text, .. } => {
+            ChatEvent::AgentToken {
+                session_id,
+                speaker,
+                text,
+            } => {
                 self.notice = None;
-                Self::append_model_token_from_speaker(
-                    &mut self.messages,
-                    &speaker.agent_name,
-                    &text,
-                );
+                if self.session_is_channel(&session_id)
+                    || (session_id.is_empty() && self.current_is_channel())
+                {
+                    Self::append_model_token_from_speaker(
+                        &mut self.messages,
+                        &speaker.agent_name,
+                        &text,
+                    );
+                } else {
+                    Self::append_model_token(&mut self.messages, &text);
+                }
                 if self.stick_bottom {
                     self.scroll = f32::MAX;
                 }
@@ -2579,6 +2671,7 @@ impl ChatState {
                 self.control.task_count = status.task_count;
                 self.control.terminal_result_count = status.terminal_result_count;
                 self.control.tasks = status.tasks;
+                self.control.runtime_attached = status.runtime_attached;
                 self.notice = Some(format!(
                     "agent control {} at sequence {}",
                     if status.accepted {
@@ -2743,6 +2836,8 @@ impl ChatState {
             self.messages.push(ChatMessage::user(text));
             self.input.clear();
             self.cursor = 0;
+            self.attachment_path_input.clear();
+            self.attachment_controls_open = false;
             self.notice = Some("queued follow-up".to_string());
             self.stick_bottom = true;
             self.scroll = f32::MAX;
@@ -2760,6 +2855,7 @@ impl ChatState {
         self.input.clear();
         self.cursor = 0;
         self.attachment_path_input.clear();
+        self.attachment_controls_open = false;
         self.attachments.clear();
         self.streaming = true;
         self.stick_bottom = true;
@@ -2790,6 +2886,36 @@ impl ChatState {
     fn can_send(&self) -> bool {
         (!self.input.trim().is_empty() || !self.attachments.is_empty())
             && !self.providers.is_empty()
+    }
+
+    fn latest_reusable_answer(&self) -> Option<&str> {
+        self.messages.iter().rev().find_map(|message| {
+            (message.source == ChatMessageSource::Model
+                && message.kind == ChatMessageKind::Message
+                && !message.text.trim().is_empty())
+            .then_some(message.text.as_str())
+        })
+    }
+
+    fn can_reuse_latest_answer(&self) -> bool {
+        !self.streaming
+            && !self.providers.is_empty()
+            && self.input.trim().is_empty()
+            && self.attachments.is_empty()
+            && self.attachment_path_input.trim().is_empty()
+            && self.latest_reusable_answer().is_some()
+    }
+
+    fn use_latest_answer_as_draft(&mut self) {
+        let Some(answer) = self.latest_reusable_answer().map(str::to_string) else {
+            return;
+        };
+        self.input = answer;
+        self.cursor = self.input.len();
+        self.attachment_path_input.clear();
+        self.attachment_controls_open = false;
+        self.attachments.clear();
+        self.draft_revision = self.draft_revision.wrapping_add(1);
     }
 
     /// Replace the configured provider-account list after Settings changes it.
@@ -2837,8 +2963,26 @@ impl ChatState {
         self.input.clear();
         self.cursor = 0;
         self.attachment_path_input.clear();
+        self.attachment_controls_open = false;
         self.attachments.clear();
         self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    fn toggle_attachment_controls(&mut self) {
+        if self.attachment_controls_open {
+            let had_path = !self.attachment_path_input.trim().is_empty();
+            self.attachment_path_input.clear();
+            self.attachment_controls_open = false;
+            if had_path {
+                self.draft_revision = self.draft_revision.wrapping_add(1);
+            }
+        } else {
+            self.attachment_controls_open = true;
+        }
+    }
+
+    fn attachment_controls_visible(&self) -> bool {
+        self.attachment_controls_open
     }
 
     fn set_attachment_path_input(&mut self, value: String) {
@@ -2912,12 +3056,40 @@ impl ChatState {
             self.begin_edit_current_session();
             return;
         }
+        self.select_quick_action_agent(action);
         let Some(prompt) = action.prompt() else {
             return;
         };
         self.input = prompt.to_string();
         self.cursor = self.input.len();
+        if action.opens_attachment_controls() {
+            self.attachment_controls_open = true;
+        }
         self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    fn select_quick_action_agent(&mut self, action: ChatQuickAction) {
+        if self.current_is_channel() || self.visible_session_has_started() {
+            return;
+        }
+        let Some(agent_key) = action.preferred_agent_key() else {
+            return;
+        };
+        if self.info.agent == agent_key
+            || self
+                .agents
+                .iter()
+                .any(|agent| agent.name == self.info.agent && agent.key == agent_key)
+        {
+            return;
+        }
+        if let Some(index) = self
+            .agents
+            .iter()
+            .position(|agent| agent.key == agent_key || agent.name == agent_key)
+        {
+            self.select_agent(index);
+        }
     }
 
     /// Select an agent by sidebar index and tell the worker to switch.
@@ -3466,10 +3638,14 @@ fn channel_messages(channel: &AgentChannel) -> Vec<ChatMessage> {
 }
 
 fn visible_channel_message_text(message: &sinomo_agent::AgentChannelMessage) -> String {
+    let mut text = if matches!(&message.author, AgentChannelAuthor::Agent { .. }) {
+        visible_model_message_text(&message.content)
+    } else {
+        message.content.clone()
+    };
     if message.attachments.is_empty() {
-        return message.content.clone();
+        return text;
     }
-    let mut text = message.content.clone();
     append_visible_attachment_summary(
         &mut text,
         message.attachments.iter().map(|attachment| {
@@ -3481,6 +3657,80 @@ fn visible_channel_message_text(message: &sinomo_agent::AgentChannelMessage) -> 
         }),
     );
     text
+}
+
+fn visible_model_message_text(text: &str) -> String {
+    agent_decision_envelope_display_text(text).unwrap_or_else(|| text.to_string())
+}
+
+fn agent_decision_envelope_display_text(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_start();
+    let (speaker, candidate) = split_agent_speaker_prefix(trimmed);
+    let mut stream = serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+    let value = stream.next()?.ok()?;
+    let offset = stream.byte_offset();
+    let object = value.as_object()?;
+    if !is_agent_decision_envelope(object) {
+        return None;
+    }
+
+    let text = object
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let trailing = candidate.get(offset..).unwrap_or_default().trim();
+    let visible = if text.is_empty() {
+        if trailing.is_empty() {
+            "No user-facing message was returned.".to_string()
+        } else {
+            trailing.to_string()
+        }
+    } else if trailing.is_empty() || trailing == text {
+        text.to_string()
+    } else {
+        format!("{text}\n\n{trailing}")
+    };
+
+    Some(match speaker {
+        Some(speaker) if !visible.trim().is_empty() => format!("{speaker}: {visible}"),
+        _ => visible,
+    })
+}
+
+fn split_agent_speaker_prefix(text: &str) -> (Option<&str>, &str) {
+    let Some((speaker, rest)) = text.split_once(':') else {
+        return (None, text);
+    };
+    let speaker = speaker.trim();
+    let rest = rest.trim_start();
+    if rest.starts_with('{') && is_agent_speaker_label(speaker) {
+        (Some(speaker), rest)
+    } else {
+        (None, text)
+    }
+}
+
+fn is_agent_speaker_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > 64 || label.contains('\n') || label.contains('\r') {
+        return false;
+    }
+    if !label
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ' '))
+    {
+        return false;
+    }
+    let lower = label.to_ascii_lowercase();
+    lower == "agent" || lower.ends_with("-agent") || lower.ends_with(" agent")
+}
+
+fn is_agent_decision_envelope(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    object.contains_key("text")
+        && (object.contains_key("response_mode")
+            || object.contains_key("tool_calls")
+            || object.contains_key("background_handoff")
+            || object.contains_key("next_state"))
 }
 
 fn visible_user_message_text(text: &str, attachments: &[PendingChatAttachment]) -> String {
@@ -4365,10 +4615,15 @@ fn usage_summary(chat: &ChatState) -> Option<String> {
 
 fn transcript_message_display_text(message: &ChatMessage) -> String {
     if message.kind != ChatMessageKind::Error {
-        return if message.text.is_empty() {
-            "…".to_string()
+        let text = if message.source == ChatMessageSource::Model {
+            visible_model_message_text(&message.text)
         } else {
             message.text.clone()
+        };
+        return if text.is_empty() {
+            "…".to_string()
+        } else {
+            text
         };
     }
 
@@ -4880,6 +5135,7 @@ fn sessions_scroll_signature(
     String,
     usize,
     bool,
+    bool,
 ) {
     let chat = shared.chat();
     let sessions = chat
@@ -4898,6 +5154,7 @@ fn sessions_scroll_signature(
         chat.pending_delete_id.clone().unwrap_or_default(),
         chat.channel_agent_idx,
         chat.session_list_loading,
+        chat.session_list_slow_notice_shown,
     )
 }
 
@@ -5357,12 +5614,12 @@ impl Widget for ChatSessionRow {
             } else {
                 (pal.hover, pal.border.with_alpha(0.72), pal.text_muted)
             };
-            widgets::round_panel(ctx, edit, fill, border, 6.0);
-            widgets::draw_text_in(
+            widgets::round_panel(ctx, edit, fill, border, 7.0);
+            draw_glyph(
                 ctx,
-                Rect::new(edit.x() + 7.0, edit.y() + 3.0, edit.width() - 14.0, 16.0),
-                "Edit",
-                pal.text_style(&theme, 10.5, FontWeight::SEMIBOLD, glyph_color),
+                IconGlyph::MoreHorizontal,
+                edit.inflate(-5.0, -5.0),
+                glyph_color,
             );
         }
 
@@ -5460,7 +5717,7 @@ fn sidebar(
             move || sidebar_signature(&s)
         },
         move |_sig| {
-            let column = Flex::vertical()
+            let mut column = Flex::vertical()
                 .main_gap(4.0)
                 .align_items(Alignment::Stretch)
                 .with_child(SizedBox::new().height(18.0))
@@ -5490,6 +5747,12 @@ fn sidebar(
                     InsetX::new(sessions_scroll_rebuild(&s, &r, &sessions_scroll_state), 8.0),
                     FlexItem::flex(1.0).min_height(0.0),
                 );
+            if let Some(actions) = slow_session_load_actions(&s, &r) {
+                column = column
+                    .with_child(SizedBox::new().height(8.0))
+                    .with_child(InsetX::new(actions, 8.0))
+                    .with_child(SizedBox::new().height(8.0));
+            }
             WidgetPod::new(Surface::sidebar(column).fill().theme_when(clone_reader(&r)))
         },
     )
@@ -5507,6 +5770,7 @@ fn sidebar_signature(
     String,
     String,
     usize,
+    bool,
     bool,
 ) {
     let chat = shared.chat();
@@ -5532,6 +5796,84 @@ fn sidebar_signature(
         chat.session_delete_confirm_id.clone().unwrap_or_default(),
         chat.channel_agent_idx,
         chat.session_list_loading,
+        chat.session_list_slow_notice_shown,
+    )
+}
+
+fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<impl Widget + use<>> {
+    {
+        let chat = shared.chat();
+        if !(chat.session_list_loading && chat.session_list_slow_notice_shown) {
+            return None;
+        }
+    }
+
+    let retry = {
+        let s = shared.clone();
+        sui::Button::new("Retry")
+            .icon(IconGlyph::Redo)
+            .min_height(28.0)
+            .min_width(78.0)
+            .theme_when(composer_control_reader(reader))
+            .on_press(move || {
+                let waker = { s.borrow().waker.clone() };
+                s.chat_mut().retry_chat_list_with_waker(waker);
+            })
+    };
+    let check_sifs = {
+        let s = shared.clone();
+        sui::Button::new("Check SIFS")
+            .icon(IconGlyph::Storage)
+            .min_height(28.0)
+            .min_width(112.0)
+            .theme_when(secondary_button_theme(reader))
+            .on_press(move || open_files_tab(&s))
+    };
+    let connection = {
+        let s = shared.clone();
+        sui::Button::new("Connection")
+            .icon(IconGlyph::Alert)
+            .min_height(28.0)
+            .min_width(128.0)
+            .theme_when(secondary_button_theme(reader))
+            .on_press(move || open_settings_section(&s, SettingsSection::Connection))
+    };
+
+    let actions = Flex::horizontal()
+        .main_gap(6.0)
+        .align_items(Alignment::Stretch)
+        .with_item(
+            SizedBox::new().height(28.0).with_child(retry),
+            FlexItem::flex(1.0).min_width(78.0),
+        )
+        .with_item(
+            SizedBox::new().height(28.0).with_child(check_sifs),
+            FlexItem::flex(1.35).min_width(112.0),
+        );
+    let body = Flex::vertical()
+        .main_gap(6.0)
+        .align_items(Alignment::Stretch)
+        .with_child(dialog_section_label(shared, "SIFS history is slow").font_size(11.0))
+        .with_child(
+            muted_label(
+                shared,
+                "Chat and channel history stays in SIFS. You can keep chatting while it syncs.",
+            )
+            .font_size(10.5),
+        )
+        .with_child(SizedBox::new().height(28.0).with_child(actions))
+        .with_child(SizedBox::new().height(28.0).with_child(connection));
+
+    Some(
+        Surface::panel(body)
+            .padding(Insets {
+                left: 10.0,
+                top: 10.0,
+                right: 10.0,
+                bottom: 10.0,
+            })
+            .fill_width()
+            .theme_when(clone_reader(reader)),
     )
 }
 
@@ -6713,6 +7055,7 @@ impl Widget for RuntimeOverview {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MediaCallControl {
+    ToggleDetails,
     ToggleCall,
     ToggleMic,
     ToggleCamera,
@@ -6731,6 +7074,26 @@ impl MediaCallPanel {
             hovered: Cell::new(None),
             pressed: Cell::new(None),
         }
+    }
+
+    fn details_rect(bounds: Rect, details_open: bool) -> Rect {
+        let button_w = if details_open {
+            78.0_f32.min((bounds.width() * 0.22).max(64.0))
+        } else {
+            112.0_f32.min((bounds.width() * 0.30).max(84.0))
+        };
+        let button_h = 28.0_f32.min((bounds.height() - 12.0).max(22.0));
+        let button_y = if details_open {
+            bounds.y() + 8.0
+        } else {
+            bounds.y() + (bounds.height() - button_h) * 0.5
+        };
+        Rect::new(
+            bounds.max_x() - PAD - button_w,
+            button_y,
+            button_w,
+            button_h,
+        )
     }
 
     fn control_rects(bounds: Rect) -> [(MediaCallControl, Rect); 3] {
@@ -6756,10 +7119,17 @@ impl MediaCallPanel {
         ]
     }
 
-    fn hit_control(bounds: Rect, position: Point) -> Option<MediaCallControl> {
-        Self::control_rects(bounds)
-            .into_iter()
-            .find_map(|(control, rect)| rect.contains(position).then_some(control))
+    fn hit_control(bounds: Rect, position: Point, details_open: bool) -> Option<MediaCallControl> {
+        if Self::details_rect(bounds, details_open).contains(position) {
+            return Some(MediaCallControl::ToggleDetails);
+        }
+        if details_open {
+            Self::control_rects(bounds)
+                .into_iter()
+                .find_map(|(control, rect)| rect.contains(position).then_some(control))
+        } else {
+            None
+        }
     }
 
     fn refresh(ctx: &mut EventCtx) {
@@ -6772,6 +7142,7 @@ impl MediaCallPanel {
     fn activate(&self, control: MediaCallControl) {
         let mut chat = self.shared.chat_mut();
         match control {
+            MediaCallControl::ToggleDetails => chat.toggle_media_call_details(),
             MediaCallControl::ToggleCall => chat.toggle_media_call(),
             MediaCallControl::ToggleMic => chat.toggle_media_call_mic(),
             MediaCallControl::ToggleCamera => chat.toggle_media_call_camera(),
@@ -6783,7 +7154,8 @@ impl Widget for MediaCallPanel {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
         match event {
             Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
-                let hovered = Self::hit_control(ctx.bounds(), pointer.position);
+                let details_open = self.shared.chat().media_call_details_visible();
+                let hovered = Self::hit_control(ctx.bounds(), pointer.position, details_open);
                 if self.hovered.get() != hovered {
                     self.hovered.set(hovered);
                     Self::refresh(ctx);
@@ -6793,7 +7165,10 @@ impl Widget for MediaCallPanel {
                 if pointer.kind == PointerEventKind::Down
                     && pointer.button == Some(PointerButton::Primary) =>
             {
-                if let Some(control) = Self::hit_control(ctx.bounds(), pointer.position) {
+                let details_open = self.shared.chat().media_call_details_visible();
+                if let Some(control) =
+                    Self::hit_control(ctx.bounds(), pointer.position, details_open)
+                {
                     self.pressed.set(Some(control));
                     ctx.request_pointer_capture(pointer.pointer_id);
                     Self::refresh(ctx);
@@ -6805,7 +7180,10 @@ impl Widget for MediaCallPanel {
                     && pointer.button == Some(PointerButton::Primary) =>
             {
                 if let Some(pressed) = self.pressed.take() {
-                    if Self::hit_control(ctx.bounds(), pointer.position) == Some(pressed) {
+                    let details_open = self.shared.chat().media_call_details_visible();
+                    if Self::hit_control(ctx.bounds(), pointer.position, details_open)
+                        == Some(pressed)
+                    {
                         self.activate(pressed);
                     }
                     ctx.release_pointer_capture(pointer.pointer_id);
@@ -6832,7 +7210,12 @@ impl Widget for MediaCallPanel {
     }
 
     fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        constraints.clamp(Size::new(constraints.max.width, MEDIA_CALL_H))
+        let height = if self.shared.chat().media_call_details_visible() {
+            MEDIA_CALL_H
+        } else {
+            MEDIA_CALL_COMPACT_H
+        };
+        constraints.clamp(Size::new(constraints.max.width, height))
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
@@ -6844,6 +7227,7 @@ impl Widget for MediaCallPanel {
 
         let chat = self.shared.chat();
         let call = &chat.media_call;
+        let details_open = chat.media_call_details_visible();
         let (selected_provider, selected_model) = chat.current_media_provider_model();
         let provider = if call.active {
             call.provider.as_str()
@@ -6866,24 +7250,62 @@ impl Widget for MediaCallPanel {
         let x = bounds.x() + PAD;
         let y = bounds.y() + 10.0;
         let status = if call.active { "LIVE" } else { "READY" };
+        let details = Self::details_rect(bounds, details_open);
+        let details_label = if details_open { "Hide" } else { "Controls" };
+        let details_icon = if details_open {
+            IconGlyph::Close
+        } else {
+            IconGlyph::Chat
+        };
 
         widgets::draw_text_in(
             ctx,
-            Rect::new(x, y, (bounds.width() * 0.48).max(96.0), 18.0),
+            Rect::new(x, y, (details.x() - x - 80.0).max(72.0), 18.0),
             "Media call",
             title_style,
         );
         widgets::draw_text_in(
             ctx,
-            Rect::new(
-                x + (bounds.width() * 0.48).max(96.0),
-                y,
-                (bounds.width() * 0.46).max(72.0),
-                18.0,
-            ),
+            Rect::new((details.x() - 70.0).max(x + 86.0), y, 60.0, 18.0),
             status,
             status_style,
         );
+        draw_media_call_control_button(
+            ctx,
+            &pal,
+            &theme,
+            details,
+            details_label,
+            details_icon,
+            if call.active {
+                ActivityTone::Running
+            } else {
+                ActivityTone::Neutral
+            },
+            details_open,
+            self.hovered.get() == Some(MediaCallControl::ToggleDetails),
+            self.pressed.get() == Some(MediaCallControl::ToggleDetails),
+        );
+
+        if !details_open {
+            let summary = if call.active {
+                chat.media_call_status_summary()
+            } else {
+                format!("{provider} / {model}")
+            };
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(
+                    x,
+                    bounds.y() + 27.0,
+                    (details.x() - x - 10.0).max(72.0),
+                    15.0,
+                ),
+                &compact_line(&summary, 72),
+                meta_style,
+            );
+            return;
+        }
 
         let button_top = bounds.y() + bounds.height() - 42.0;
         let pane_top = y + 24.0;
@@ -6952,6 +7374,12 @@ impl Widget for MediaCallPanel {
             let hovered = self.hovered.get() == Some(control);
             let pressed = self.pressed.get() == Some(control);
             let (label, icon, active, tone) = match control {
+                MediaCallControl::ToggleDetails => (
+                    "Hide",
+                    IconGlyph::Close,
+                    details_open,
+                    ActivityTone::Neutral,
+                ),
                 MediaCallControl::ToggleMic => (
                     if call.mic_enabled { "Mic" } else { "Muted" },
                     if call.mic_enabled {
@@ -6999,8 +7427,33 @@ impl Widget for MediaCallPanel {
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         let chat = self.shared.chat();
+        let details_open = chat.media_call_details_visible();
+        let mut details_node = SemanticsNode::new(
+            sui::WidgetId::new(ctx.widget_id().get().wrapping_mul(53).wrapping_add(18_901)),
+            SemanticsRole::Button,
+            Self::details_rect(ctx.bounds(), details_open),
+        );
+        details_node.parent = Some(ctx.widget_id());
+        details_node.name = Some(
+            if details_open {
+                "Hide media controls"
+            } else {
+                "Show media controls"
+            }
+            .to_string(),
+        );
+        details_node.actions = vec![SemanticsAction::Activate];
+        details_node.state.hovered = self.hovered.get() == Some(MediaCallControl::ToggleDetails);
+        details_node.state.selected = details_open;
+        ctx.push(details_node);
+
+        if !details_open {
+            return;
+        }
+
         for (index, (control, rect)) in Self::control_rects(ctx.bounds()).into_iter().enumerate() {
             let name = match control {
+                MediaCallControl::ToggleDetails => "Hide media controls",
                 MediaCallControl::ToggleCall if chat.media_call.active => "End media call",
                 MediaCallControl::ToggleCall => "Start media call",
                 MediaCallControl::ToggleMic if chat.media_call.mic_enabled => "Mute microphone",
@@ -7903,7 +8356,9 @@ impl TranscriptView {
         match action {
             ChatQuickAction::PlanChange => 176.0,
             ChatQuickAction::CheckCluster => 178.0,
-            ChatQuickAction::ReviewRepo => 166.0,
+            ChatQuickAction::DraftDocument => 176.0,
+            ChatQuickAction::ReasonImage => 190.0,
+            ChatQuickAction::RolePlay => 148.0,
             ChatQuickAction::ManageChannel => 176.0,
         }
     }
@@ -7948,11 +8403,51 @@ impl TranscriptView {
                 .collect();
         }
 
+        if max_w >= 420.0 {
+            let cols = if actions.len() >= 5 && max_w >= 540.0 {
+                3_usize
+            } else {
+                2_usize
+            };
+            let width =
+                ((max_w - gap * cols.saturating_sub(1) as f32) / cols as f32).clamp(148.0, 260.0);
+            let rows = actions.len().div_ceil(cols);
+            let grid_w = cols as f32 * width + gap * cols.saturating_sub(1) as f32;
+            let grid_h = rows as f32 * button_h + gap * rows.saturating_sub(1) as f32;
+            let x0 = area.x() + (area.width() - grid_w) * 0.5;
+            let preferred_y = cy + 62.0;
+            let y0 = preferred_y
+                .min(area.max_y() - PAD - grid_h)
+                .max(cy + 52.0)
+                .max(area.y() + PAD);
+            return actions
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let row = index / cols;
+                    let col = index % cols;
+                    (
+                        *action,
+                        Rect::new(
+                            x0 + col as f32 * (width + gap),
+                            y0 + row as f32 * (button_h + gap),
+                            width,
+                            button_h,
+                        ),
+                    )
+                })
+                .collect();
+        }
+
         let width = max_w.clamp(206.0, 280.0);
         let stack_h =
             button_h * actions.len() as f32 + gap * actions.len().saturating_sub(1) as f32;
         let x = area.x() + (area.width() - width) * 0.5;
-        let y0 = cy + 54.0 - stack_h * 0.5;
+        let preferred_y = cy + 58.0;
+        let y0 = preferred_y
+            .min(area.max_y() - PAD - stack_h)
+            .max(cy + 48.0)
+            .max(area.y() + PAD);
         actions
             .iter()
             .enumerate()
@@ -9000,52 +9495,16 @@ fn open_provider_setup(shared: &Shared) {
     }
 }
 
-fn attachment_signature(shared: &Shared) -> (u64, usize) {
+fn attachment_signature(shared: &Shared) -> (u64, usize, bool) {
     let chat = shared.chat();
-    (chat.draft_revision, chat.attachments.len())
+    (
+        chat.draft_revision,
+        chat.attachments.len(),
+        chat.attachment_controls_visible(),
+    )
 }
 
 fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let path_input = {
-        let s = shared.clone();
-        TextInput::new("chat-attachment-path")
-            .value(shared.chat().attachment_path_input.clone())
-            .placeholder("File path")
-            .leading_icon(IconGlyph::File)
-            .theme_when(composer_control_reader(reader))
-            .on_change(move |value| {
-                s.chat_mut().set_attachment_path_input(value);
-            })
-    };
-
-    let add = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Add, "Attach file")
-            .size(ATTACHMENT_ENTRY_H)
-            .icon_size(15.0)
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || !s.chat().attachment_path_input.trim().is_empty()
-            })
-            .on_press(move || {
-                s.chat_mut().add_attachment_from_path_input();
-            })
-    };
-
-    let entry = ComposerInputRow::new(
-        WidgetPod::new(path_input),
-        WidgetPod::new(
-            Flex::horizontal()
-                .align_items(Alignment::Center)
-                .spacer()
-                .with_child(add),
-        ),
-        ATTACHMENT_ENTRY_H,
-        ATTACHMENT_ENTRY_H,
-        8.0,
-    );
-
     let mut chips = Stack::horizontal()
         .spacing(6.0)
         .alignment(Alignment::Center);
@@ -9086,6 +9545,102 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         );
     }
 
+    if !shared.chat().attachment_controls_visible() {
+        let attach = {
+            let s = shared.clone();
+            sui::Button::new("Attach file")
+                .icon(IconGlyph::File)
+                .min_height(ATTACHMENT_ENTRY_H)
+                .min_width(112.0)
+                .theme_when(secondary_button_theme(reader))
+                .on_press(move || {
+                    s.chat_mut().toggle_attachment_controls();
+                })
+        };
+        let summary: WidgetPod = if shared.chat().attachments.is_empty() {
+            let s = shared.clone();
+            WidgetPod::new(
+                Label::new("No files attached")
+                    .font_size(11.0)
+                    .color_when(move || palette(&s).text_faint),
+            )
+        } else {
+            WidgetPod::new(chips)
+        };
+        let entry = ComposerInputRow::new(
+            summary,
+            WidgetPod::new(
+                Flex::horizontal()
+                    .align_items(Alignment::Center)
+                    .spacer()
+                    .with_child(attach),
+            ),
+            120.0,
+            ATTACHMENT_ENTRY_H,
+            8.0,
+        );
+        return WidgetPod::new(
+            Stack::vertical()
+                .spacing(4.0)
+                .alignment(Alignment::Stretch)
+                .with_child(SizedBox::new().height(ATTACHMENT_ENTRY_H).with_child(entry))
+                .with_child(SizedBox::new().height(ATTACHMENT_CHIPS_H)),
+        );
+    }
+
+    let path_input = {
+        let s = shared.clone();
+        TextInput::new("chat-attachment-path")
+            .value(shared.chat().attachment_path_input.clone())
+            .placeholder("Paste file path")
+            .leading_icon(IconGlyph::File)
+            .theme_when(composer_control_reader(reader))
+            .on_change(move |value| {
+                s.chat_mut().set_attachment_path_input(value);
+            })
+    };
+
+    let hide = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Close, "Hide attachment field")
+            .size(ATTACHMENT_ENTRY_H)
+            .icon_size(13.0)
+            .theme_when(secondary_button_theme(reader))
+            .on_press(move || {
+                s.chat_mut().toggle_attachment_controls();
+            })
+    };
+
+    let add = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Add, "Attach file")
+            .size(ATTACHMENT_ENTRY_H)
+            .icon_size(15.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.chat().attachment_path_input.trim().is_empty()
+            })
+            .on_press(move || {
+                s.chat_mut().add_attachment_from_path_input();
+            })
+    };
+
+    let entry = ComposerInputRow::new(
+        WidgetPod::new(path_input),
+        WidgetPod::new(
+            Flex::horizontal()
+                .main_gap(6.0)
+                .align_items(Alignment::Center)
+                .spacer()
+                .with_child(hide)
+                .with_child(add),
+        ),
+        ATTACHMENT_ENTRY_H * 2.0 + 6.0,
+        ATTACHMENT_ENTRY_H,
+        8.0,
+    );
+
     WidgetPod::new(
         Stack::vertical()
             .spacing(4.0)
@@ -9098,18 +9653,19 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 /// The composer's bottom row: a flexible message `TextArea` and a fixed-size action slot. The input
 /// is bound to the draft via `on_change`; Enter submits normally, or queues a follow-up during an
 /// active stream. The action control swaps from Send to Interrupt while streaming.
-fn composer_action_signature(shared: &Shared) -> (bool, bool) {
+fn composer_action_signature(shared: &Shared) -> (bool, bool, bool) {
     let chat = shared.chat();
     (
         chat.streaming,
         !chat.input.is_empty()
             || !chat.attachments.is_empty()
             || !chat.attachment_path_input.is_empty(),
+        chat.can_reuse_latest_answer(),
     )
 }
 
 fn composer_actions(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let (streaming, has_draft) = composer_action_signature(shared);
+    let (streaming, has_draft, can_reuse_answer) = composer_action_signature(shared);
     if streaming {
         let s = shared.clone();
         WidgetPod::new(
@@ -9157,6 +9713,38 @@ fn composer_actions(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 .align_items(Alignment::Center)
                 .spacer()
                 .with_child(clear)
+                .with_child(send),
+        )
+    } else if can_reuse_answer {
+        let reuse = {
+            let s = shared.clone();
+            sui::Button::new("Use answer")
+                .icon(IconGlyph::Redo)
+                .min_height(SEND_BUTTON_SIZE)
+                .min_width(112.0)
+                .theme_when(secondary_button_theme(reader))
+                .on_press(move || {
+                    s.chat_mut().use_latest_answer_as_draft();
+                })
+        };
+        let s = shared.clone();
+        let send = IconButton::new(IconGlyph::Send, "Send")
+            .size(SEND_BUTTON_SIZE)
+            .icon_size(17.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || s.chat().can_send()
+            })
+            .on_press(move || {
+                s.chat_mut().submit();
+            });
+        WidgetPod::new(
+            Flex::horizontal()
+                .gap(6.0)
+                .align_items(Alignment::Center)
+                .spacer()
+                .with_child(reuse)
                 .with_child(send),
         )
     } else {
@@ -9236,7 +9824,11 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let row = ComposerInputRow::new(
         WidgetPod::new(input),
         action,
-        SEND_BUTTON_SIZE * 2.0 + 6.0,
+        if shared.chat().can_reuse_latest_answer() {
+            COMPOSER_REUSE_ACTION_W
+        } else {
+            COMPOSER_DEFAULT_ACTION_W
+        },
         SEND_BUTTON_SIZE,
         INPUT_ACTION_GAP,
     );
@@ -9332,8 +9924,24 @@ fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 /// request-animation-frame pump lives on [`ChatView`] (a reliable ancestor of every control), so no
 /// invisible overlay widget is needed here.
 fn main_column(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let transcript = widgets::Dock::new(TranscriptView::new(shared.clone()))
-        .top(MEDIA_CALL_H, MediaCallPanel::new(shared.clone()));
+    let transcript = {
+        let key_shared = shared.clone();
+        let build_shared = shared.clone();
+        RebuildOnChange::new(
+            move || key_shared.chat().media_call_details_visible(),
+            move |details_open| {
+                let height = if *details_open {
+                    MEDIA_CALL_H
+                } else {
+                    MEDIA_CALL_COMPACT_H
+                };
+                WidgetPod::new(
+                    widgets::Dock::new(TranscriptView::new(build_shared.clone()))
+                        .top(height, MediaCallPanel::new(build_shared.clone())),
+                )
+            },
+        )
+    };
     widgets::Dock::new(transcript)
         .top(OVERVIEW_H, RuntimeOverview::new(shared.clone()))
         .bottom(COMPOSER_H, composer(shared, reader))
@@ -9544,12 +10152,15 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.current_models().len().hash(&mut h);
     chat.effort_visible().hash(&mut h);
     chat.streaming.hash(&mut h);
+    chat.media_call.active.hash(&mut h);
+    chat.media_call_details_visible().hash(&mut h);
     chat.draft_revision.hash(&mut h);
     chat.attachments.len().hash(&mut h);
     chat.attachment_path_input.is_empty().hash(&mut h);
     chat.models_loading.hash(&mut h);
     chat.activity_panel_visible().hash(&mut h);
     chat.session_list_loading.hash(&mut h);
+    chat.session_list_slow_notice_shown.hash(&mut h);
     chat.session_kind_filter.hash(&mut h);
     chat.visible_session_has_started().hash(&mut h);
     chat.runtime_recovery_target()
@@ -10299,6 +10910,101 @@ mod tests {
     }
 
     #[test]
+    fn rendered_slow_loading_sidebar_exposes_sifs_recovery_actions() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            chat.sessions.clear();
+            chat.session_list_loading = true;
+            chat.session_list_slow_notice_shown = true;
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat sessions slow loading")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::ListItem)
+            .with_name("Still syncing SIFS history...")
+            .with_description("Reading chat and channel metadata from cluster storage")
+            .expect()
+            .to_be_visible()?;
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Retry")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Check SIFS")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Connection")
+                .count()?,
+            1
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Check SIFS")
+            .click()?;
+        assert_eq!(shared.borrow().active_tab, Tab::Files);
+
+        Ok(())
+    }
+
+    #[test]
+    fn slow_loading_sidebar_connection_action_opens_settings() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            chat.sessions.clear();
+            chat.session_list_loading = true;
+            chat.session_list_slow_notice_shown = true;
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat sessions slow loading settings")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Connection")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn empty_sessions_copy_reflects_active_unlisted_chat() {
         let (_backend, mut state) = isolated_chat_state("active-unlisted-chat-copy");
         assert_eq!(
@@ -10486,6 +11192,45 @@ mod tests {
         assert_eq!(
             state.info.agent, "coding-agent",
             "agent selection is allowed again in a fresh chat"
+        );
+    }
+
+    #[test]
+    fn plan_change_quick_action_selects_coding_agent_for_fresh_chat() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_test_agents(&mut state);
+        state.session_id = SessionId::generate().to_string();
+
+        state.apply_quick_action(ChatQuickAction::PlanChange);
+
+        let prompt = ChatQuickAction::PlanChange.prompt().expect("plan prompt");
+        assert_eq!(state.info.agent, "coding-agent");
+        assert_eq!(state.input, prompt);
+        assert_eq!(state.cursor, prompt.len());
+        assert!(
+            prompt.contains("Use the coding tools to inspect this repository"),
+            "the coding preset should ask for repository inspection, not generic planning"
+        );
+    }
+
+    #[test]
+    fn quick_action_agent_routing_keeps_started_chat_agent() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_test_agents(&mut state);
+        state.session_id = SessionId::generate().to_string();
+        state.messages.push(ChatMessage::user("already started"));
+
+        state.apply_quick_action(ChatQuickAction::PlanChange);
+
+        assert_eq!(
+            state.info.agent, "main-agent",
+            "quick actions must not silently switch the agent of an existing transcript"
+        );
+        assert_eq!(
+            state.input,
+            ChatQuickAction::PlanChange.prompt().expect("plan prompt")
         );
     }
 
@@ -10888,7 +11633,7 @@ mod tests {
         assert!(
             edit_button.bounds.width() >= SIDEBAR_ROW_EDIT_W - 0.5
                 && edit_button.bounds.height() >= SIDEBAR_ROW_EDIT_H - 0.5,
-            "row edit button should be a visible text pill, got {:?}",
+            "row edit button should be a compact visible affordance, got {:?}",
             edit_button.bounds
         );
 
@@ -11427,7 +12172,7 @@ mod tests {
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Check cluster")
-            .with_description("Prepare a cluster status prompt")
+            .with_description("Use background agent to inspect cluster status")
             .click()?;
 
         let chat = shared.chat();
@@ -11464,6 +12209,84 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn rendered_latest_answer_can_be_loaded_into_composer() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let answer = "# Design note\n\nThis response should become an editable draft.";
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.sessions.clear();
+            chat.messages = vec![
+                ChatMessage::user("draft a note"),
+                ChatMessage::model(answer),
+            ];
+            chat.input.clear();
+            chat.cursor = 0;
+            chat.session_id = SessionId::generate().to_string();
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat answer reuse")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Use answer")
+                .count()?,
+            1
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Use answer")
+            .click()?;
+        app.run_until_idle()?;
+
+        let chat = shared.chat();
+        assert_eq!(chat.input, answer);
+        assert_eq!(chat.cursor, answer.len());
+        drop(chat);
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Clear draft")
+                .count()?,
+            1,
+            "loading an answer should switch the composer back to draft actions"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn attachment_quick_action_opens_controls_and_sets_metadata_prompt() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.attachment_controls_open = false;
+
+        state.apply_quick_action(ChatQuickAction::ReasonImage);
+
+        assert_eq!(
+            state.input,
+            ChatQuickAction::ReasonImage
+                .prompt()
+                .expect("image prompt action")
+        );
+        assert!(state.input.contains("SIFS attachment metadata"));
+        assert!(state.attachment_controls_visible());
+        assert_eq!(state.cursor, state.input.len());
     }
 
     #[test]
@@ -12050,6 +12873,64 @@ mod tests {
     }
 
     #[test]
+    fn direct_chat_agent_tokens_do_not_prefix_speaker() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let session_id = SessionId::generate().to_string();
+        state.session_id = session_id.clone();
+        state.messages = vec![ChatMessage::user("hi"), ChatMessage::model("")];
+
+        state.apply_event(ChatEvent::AgentToken {
+            session_id,
+            speaker: sinomo_cli::app_api::ChatSpeaker {
+                agent_key: "main-agent".to_string(),
+                agent_name: "main-agent".to_string(),
+                ..Default::default()
+            },
+            text: "Hello".to_string(),
+        });
+
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.messages[1].text, "Hello");
+    }
+
+    #[test]
+    fn channel_agent_tokens_keep_speaker_prefix() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let channel_id = SessionId::generate().to_string();
+        state.session_id = channel_id.clone();
+        state.sessions = vec![SessionRef {
+            id: channel_id.clone(),
+            title: "Release triage".to_string(),
+            kind: ConversationKind::Channel,
+            updated_unix: 1,
+            participant_count: 1,
+            participant_names: vec!["main-agent".to_string()],
+        }];
+        state.messages = vec![ChatMessage::user("hi"), ChatMessage::model("")];
+        let speaker = sinomo_cli::app_api::ChatSpeaker {
+            agent_key: "main-agent".to_string(),
+            agent_name: "main-agent".to_string(),
+            ..Default::default()
+        };
+
+        state.apply_event(ChatEvent::AgentToken {
+            session_id: channel_id.clone(),
+            speaker: speaker.clone(),
+            text: "Hel".to_string(),
+        });
+        state.apply_event(ChatEvent::AgentToken {
+            session_id: channel_id,
+            speaker,
+            text: "lo".to_string(),
+        });
+
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.messages[1].text, "main-agent: Hello");
+    }
+
+    #[test]
     fn stored_message_metadata_distinguishes_system_errors_from_model_text() {
         let stored = ChatMessage::system_error("Error: provider unavailable").to_stored();
 
@@ -12062,6 +12943,39 @@ mod tests {
         assert_eq!(restored.source, ChatMessageSource::System);
         assert_eq!(restored.kind, ChatMessageKind::Error);
         assert_eq!(restored.history_role(), "system");
+    }
+
+    #[test]
+    fn transcript_model_display_hides_decision_envelope() {
+        let raw = format!(
+            "main-agent: {}\nI need a sandbox executor to inspect the repository.",
+            serde_json::json!({
+                "response_mode": "defer",
+                "text": "I need a sandbox executor to inspect the repository.",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "waiting"
+            })
+        );
+
+        let rendered = transcript_message_display_text(&ChatMessage::model(raw));
+
+        assert_eq!(
+            rendered,
+            "main-agent: I need a sandbox executor to inspect the repository."
+        );
+        assert!(!rendered.contains("response_mode"));
+        assert!(!rendered.contains("tool_calls"));
+    }
+
+    #[test]
+    fn transcript_model_display_preserves_non_envelope_json() {
+        let raw = r#"main-agent: {"example":true,"text":"visible"}"#;
+
+        assert_eq!(
+            transcript_message_display_text(&ChatMessage::model(raw)),
+            raw
+        );
     }
 
     #[test]
@@ -12411,8 +13325,10 @@ mod tests {
         seed_default_provider(&mut state);
         state.models_loading = false;
 
+        assert!(!state.media_call_details_visible());
         state.toggle_media_call();
         assert!(state.media_call.active);
+        assert!(state.media_call_details_visible());
         assert_eq!(state.media_call.provider, "OpenAI");
         assert_eq!(state.media_call.model, "gpt-5");
         assert!(state.media_call_status_summary().contains("mic on"));
@@ -12427,7 +13343,96 @@ mod tests {
 
         state.toggle_media_call();
         assert!(!state.media_call.active);
+        assert!(!state.media_call_details_visible());
         assert_eq!(state.media_call.notice.as_deref(), Some("call ended"));
+    }
+
+    #[test]
+    fn rendered_media_call_controls_are_compact_until_opened() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.info.provider = "openai".to_string();
+            chat.info.model = "gpt-5".to_string();
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat media controls")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Show media controls")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Start media call")
+                .count()?,
+            0,
+            "idle media controls should be hidden behind the compact drawer"
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Show media controls")
+            .click()?;
+        assert!(shared.chat().media_call_details_visible());
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Hide media controls")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Start media call")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Mute microphone")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Pause camera")
+                .count()?,
+            1
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Hide media controls")
+            .click()?;
+        assert!(!shared.chat().media_call_details_visible());
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Start media call")
+                .count()?,
+            0
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -12684,6 +13689,7 @@ mod tests {
             sinomo_cli::app_api::ChatControlStatus {
                 session_id: "sess_ui_control".to_string(),
                 accepted: true,
+                runtime_attached: true,
                 sequence: 3,
                 event_count: 1,
                 active_turn: true,
@@ -12697,6 +13703,8 @@ mod tests {
             state.notice.as_deref(),
             Some("agent control accepted at sequence 3")
         );
+        assert!(state.control.runtime_attached);
+        assert_eq!(state.runtime_health().label, "RUNNING");
 
         state.apply_event(ChatEvent::ControlState(
             sinomo_cli::app_api::ChatControlState {
@@ -12712,6 +13720,34 @@ mod tests {
             state.notice.as_deref(),
             Some("agent control: 2 steering, 1 follow-ups")
         );
+    }
+
+    #[test]
+    fn accepted_control_status_clears_detached_runtime_warning() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.control.runtime_attached = false;
+
+        state.apply_event(ChatEvent::ControlStatus(
+            sinomo_cli::app_api::ChatControlStatus {
+                session_id: "sess_ui_control_done".to_string(),
+                accepted: true,
+                runtime_attached: true,
+                sequence: 4,
+                event_count: 1,
+                active_turn: false,
+                task_count: 0,
+                terminal_result_count: 1,
+                tasks: Vec::new(),
+            },
+        ));
+
+        let health = state.runtime_health();
+        assert_ne!(
+            health.detail, "runtime control metadata is detached",
+            "completed accepted control status should not leave a stale runtime warning"
+        );
+        assert_ne!(health.label, "DEGRADED");
     }
 
     #[test]
@@ -13646,6 +14682,44 @@ mod tests {
     }
 
     #[test]
+    fn latest_model_answer_can_be_reused_as_draft() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        let answer = "# Draft\n\nFinished text ready to revise.";
+        state.messages = vec![
+            ChatMessage::user("write a short draft"),
+            ChatMessage::model("old answer"),
+            ChatMessage::system_info("cluster connected"),
+            ChatMessage::model(String::new()),
+            ChatMessage::model(answer),
+        ];
+
+        assert_eq!(state.latest_reusable_answer(), Some(answer));
+        assert!(state.can_reuse_latest_answer());
+
+        state.use_latest_answer_as_draft();
+
+        assert_eq!(state.input, answer);
+        assert_eq!(state.cursor, answer.len());
+        assert!(
+            !state.can_reuse_latest_answer(),
+            "a populated draft should hide the reuse action"
+        );
+        assert!(
+            state.draft_revision > 0,
+            "loading the answer should refresh the composer host"
+        );
+
+        state.clear_draft();
+        state.streaming = true;
+        assert!(
+            !state.can_reuse_latest_answer(),
+            "active streams use the interrupt action instead"
+        );
+    }
+
+    #[test]
     fn attachments_can_be_queued_removed_and_sent_without_text() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
@@ -13693,6 +14767,82 @@ mod tests {
         assert!(state.attachments.is_empty());
         assert_eq!(state.messages.len(), 2);
         assert!(state.messages[0].text.contains("image.png"));
+    }
+
+    #[test]
+    fn attachment_drawer_hides_unqueued_path_input() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+
+        assert!(!state.attachment_controls_visible());
+        state.toggle_attachment_controls();
+        assert!(state.attachment_controls_visible());
+        state.set_attachment_path_input("C:\\tmp\\draft.txt".to_string());
+
+        state.toggle_attachment_controls();
+        assert!(!state.attachment_controls_visible());
+        assert!(
+            state.attachment_path_input.is_empty(),
+            "closing the drawer must not leave a hidden unsent path draft"
+        );
+    }
+
+    #[test]
+    fn rendered_attachment_controls_are_collapsed_until_opened() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat attachment controls")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert!(!shared.chat().attachment_controls_visible());
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Hide attachment field")
+                .count()?,
+            0
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Attach file")
+            .click()?;
+        assert!(shared.chat().attachment_controls_visible());
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Hide attachment field")
+                .count()?,
+            1
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Hide attachment field")
+            .click()?;
+        assert!(!shared.chat().attachment_controls_visible());
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Hide attachment field")
+                .count()?,
+            0
+        );
+
+        Ok(())
     }
 
     #[test]

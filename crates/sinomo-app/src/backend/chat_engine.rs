@@ -473,6 +473,7 @@ fn chat_control_status(result: AgentSessionControlResult) -> ChatControlStatus {
     ChatControlStatus {
         session_id: result.snapshot.session_id.to_string(),
         accepted: result.accepted,
+        runtime_attached: true,
         sequence: result.sequence,
         event_count: result.events.len(),
         active_turn: result.snapshot.active_turn.is_some(),
@@ -892,7 +893,7 @@ mod tests {
         .expect("follow-up status");
         assert!(matches!(
             follow_up,
-            ChatEvent::ControlStatus(status) if status.accepted
+            ChatEvent::ControlStatus(status) if status.accepted && status.runtime_attached
         ));
 
         handle.send_command(ChatCommand::ControlState {

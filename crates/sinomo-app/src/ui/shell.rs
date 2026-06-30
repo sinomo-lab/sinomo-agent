@@ -856,6 +856,13 @@ mod tests {
     use crate::ui::settings::SettingsSection;
 
     #[test]
+    fn product_wordmark_and_chat_tab_use_distinct_labels() {
+        assert_eq!(Tab::Sinomo.title(), "Chat");
+        assert_eq!(tab_label(Tab::Sinomo, false), "Chat");
+        assert_eq!(tab_label(Tab::Sinomo, true), "Chat");
+    }
+
+    #[test]
     fn programmatic_settings_navigation_updates_tab_bar_value() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let mut state = AppState::ready(backend);

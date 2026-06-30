@@ -3714,10 +3714,10 @@ fn short(s: &str, max: usize) -> String {
 
 fn app_surface_summary(role: &str) -> String {
     let role = role.trim();
-    if role.is_empty() {
-        "app surface".to_string()
-    } else {
-        format!("{role} app surface")
+    match role {
+        "" => "app surface".to_string(),
+        "workstation" => "desktop app surface".to_string(),
+        _ => format!("{role} app surface"),
     }
 }
 
@@ -4427,7 +4427,7 @@ mod tests {
             let settings = &mut app.ready.as_mut().expect("ready state").settings;
             settings.open(SettingsSection::Node);
             settings.node_id = "01node-full-id-for-test".to_string();
-            settings.role = "mobile".to_string();
+            settings.role = "workstation".to_string();
             settings.mode_label = "Cluster".to_string();
             settings.status_detail = "Connected to daemon at 127.0.0.1:21353".to_string();
             settings.cluster_node_id = Some("01daemon-full-id-for-test".to_string());
@@ -4445,7 +4445,7 @@ mod tests {
 
         window.get_by_text("App surface").expect().to_be_visible()?;
         window
-            .get_by_text("mobile app surface")
+            .get_by_text("desktop app surface")
             .expect()
             .to_be_visible()?;
         window.get_by_text("Connection").expect().to_be_visible()?;
