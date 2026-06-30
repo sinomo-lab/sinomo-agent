@@ -618,6 +618,7 @@ pub struct ChatState {
     pub cursor: usize,
     draft_revision: u64,
     attachment_path_input: String,
+    attachment_controls_open: bool,
     attachments: Vec<PendingChatAttachment>,
     pub streaming: bool,
     pub notice: Option<String>,
@@ -718,6 +719,7 @@ impl ChatState {
             cursor: 0,
             draft_revision: 0,
             attachment_path_input: String::new(),
+            attachment_controls_open: false,
             attachments: Vec::new(),
             streaming: false,
             notice: None,
@@ -1701,6 +1703,8 @@ impl ChatState {
         self.messages.clear();
         self.input.clear();
         self.cursor = 0;
+        self.attachment_path_input.clear();
+        self.attachment_controls_open = false;
         self.streaming = false;
         self.notice = preserved_notice;
         self.context = None;
@@ -2764,6 +2768,8 @@ impl ChatState {
             self.messages.push(ChatMessage::user(text));
             self.input.clear();
             self.cursor = 0;
+            self.attachment_path_input.clear();
+            self.attachment_controls_open = false;
             self.notice = Some("queued follow-up".to_string());
             self.stick_bottom = true;
             self.scroll = f32::MAX;
@@ -2781,6 +2787,7 @@ impl ChatState {
         self.input.clear();
         self.cursor = 0;
         self.attachment_path_input.clear();
+        self.attachment_controls_open = false;
         self.attachments.clear();
         self.streaming = true;
         self.stick_bottom = true;
@@ -2858,8 +2865,26 @@ impl ChatState {
         self.input.clear();
         self.cursor = 0;
         self.attachment_path_input.clear();
+        self.attachment_controls_open = false;
         self.attachments.clear();
         self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    fn toggle_attachment_controls(&mut self) {
+        if self.attachment_controls_open {
+            let had_path = !self.attachment_path_input.trim().is_empty();
+            self.attachment_path_input.clear();
+            self.attachment_controls_open = false;
+            if had_path {
+                self.draft_revision = self.draft_revision.wrapping_add(1);
+            }
+        } else {
+            self.attachment_controls_open = true;
+        }
+    }
+
+    fn attachment_controls_visible(&self) -> bool {
+        self.attachment_controls_open
     }
 
     fn set_attachment_path_input(&mut self, value: String) {
@@ -9132,52 +9157,16 @@ fn open_provider_setup(shared: &Shared) {
     }
 }
 
-fn attachment_signature(shared: &Shared) -> (u64, usize) {
+fn attachment_signature(shared: &Shared) -> (u64, usize, bool) {
     let chat = shared.chat();
-    (chat.draft_revision, chat.attachments.len())
+    (
+        chat.draft_revision,
+        chat.attachments.len(),
+        chat.attachment_controls_visible(),
+    )
 }
 
 fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let path_input = {
-        let s = shared.clone();
-        TextInput::new("chat-attachment-path")
-            .value(shared.chat().attachment_path_input.clone())
-            .placeholder("File path")
-            .leading_icon(IconGlyph::File)
-            .theme_when(composer_control_reader(reader))
-            .on_change(move |value| {
-                s.chat_mut().set_attachment_path_input(value);
-            })
-    };
-
-    let add = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Add, "Attach file")
-            .size(ATTACHMENT_ENTRY_H)
-            .icon_size(15.0)
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || !s.chat().attachment_path_input.trim().is_empty()
-            })
-            .on_press(move || {
-                s.chat_mut().add_attachment_from_path_input();
-            })
-    };
-
-    let entry = ComposerInputRow::new(
-        WidgetPod::new(path_input),
-        WidgetPod::new(
-            Flex::horizontal()
-                .align_items(Alignment::Center)
-                .spacer()
-                .with_child(add),
-        ),
-        ATTACHMENT_ENTRY_H,
-        ATTACHMENT_ENTRY_H,
-        8.0,
-    );
-
     let mut chips = Stack::horizontal()
         .spacing(6.0)
         .alignment(Alignment::Center);
@@ -9217,6 +9206,102 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
             ),
         );
     }
+
+    if !shared.chat().attachment_controls_visible() {
+        let attach = {
+            let s = shared.clone();
+            sui::Button::new("Attach file")
+                .icon(IconGlyph::File)
+                .min_height(ATTACHMENT_ENTRY_H)
+                .min_width(112.0)
+                .theme_when(secondary_button_theme(reader))
+                .on_press(move || {
+                    s.chat_mut().toggle_attachment_controls();
+                })
+        };
+        let summary: WidgetPod = if shared.chat().attachments.is_empty() {
+            let s = shared.clone();
+            WidgetPod::new(
+                Label::new("No files attached")
+                    .font_size(11.0)
+                    .color_when(move || palette(&s).text_faint),
+            )
+        } else {
+            WidgetPod::new(chips)
+        };
+        let entry = ComposerInputRow::new(
+            summary,
+            WidgetPod::new(
+                Flex::horizontal()
+                    .align_items(Alignment::Center)
+                    .spacer()
+                    .with_child(attach),
+            ),
+            120.0,
+            ATTACHMENT_ENTRY_H,
+            8.0,
+        );
+        return WidgetPod::new(
+            Stack::vertical()
+                .spacing(4.0)
+                .alignment(Alignment::Stretch)
+                .with_child(SizedBox::new().height(ATTACHMENT_ENTRY_H).with_child(entry))
+                .with_child(SizedBox::new().height(ATTACHMENT_CHIPS_H)),
+        );
+    }
+
+    let path_input = {
+        let s = shared.clone();
+        TextInput::new("chat-attachment-path")
+            .value(shared.chat().attachment_path_input.clone())
+            .placeholder("Paste file path")
+            .leading_icon(IconGlyph::File)
+            .theme_when(composer_control_reader(reader))
+            .on_change(move |value| {
+                s.chat_mut().set_attachment_path_input(value);
+            })
+    };
+
+    let hide = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Close, "Hide attachment field")
+            .size(ATTACHMENT_ENTRY_H)
+            .icon_size(13.0)
+            .theme_when(secondary_button_theme(reader))
+            .on_press(move || {
+                s.chat_mut().toggle_attachment_controls();
+            })
+    };
+
+    let add = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Add, "Attach file")
+            .size(ATTACHMENT_ENTRY_H)
+            .icon_size(15.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.chat().attachment_path_input.trim().is_empty()
+            })
+            .on_press(move || {
+                s.chat_mut().add_attachment_from_path_input();
+            })
+    };
+
+    let entry = ComposerInputRow::new(
+        WidgetPod::new(path_input),
+        WidgetPod::new(
+            Flex::horizontal()
+                .main_gap(6.0)
+                .align_items(Alignment::Center)
+                .spacer()
+                .with_child(hide)
+                .with_child(add),
+        ),
+        ATTACHMENT_ENTRY_H * 2.0 + 6.0,
+        ATTACHMENT_ENTRY_H,
+        8.0,
+    );
 
     WidgetPod::new(
         Stack::vertical()
@@ -13934,6 +14019,82 @@ mod tests {
         assert!(state.attachments.is_empty());
         assert_eq!(state.messages.len(), 2);
         assert!(state.messages[0].text.contains("image.png"));
+    }
+
+    #[test]
+    fn attachment_drawer_hides_unqueued_path_input() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+
+        assert!(!state.attachment_controls_visible());
+        state.toggle_attachment_controls();
+        assert!(state.attachment_controls_visible());
+        state.set_attachment_path_input("C:\\tmp\\draft.txt".to_string());
+
+        state.toggle_attachment_controls();
+        assert!(!state.attachment_controls_visible());
+        assert!(
+            state.attachment_path_input.is_empty(),
+            "closing the drawer must not leave a hidden unsent path draft"
+        );
+    }
+
+    #[test]
+    fn rendered_attachment_controls_are_collapsed_until_opened() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat attachment controls")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert!(!shared.chat().attachment_controls_visible());
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Hide attachment field")
+                .count()?,
+            0
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Attach file")
+            .click()?;
+        assert!(shared.chat().attachment_controls_visible());
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Hide attachment field")
+                .count()?,
+            1
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Hide attachment field")
+            .click()?;
+        assert!(!shared.chat().attachment_controls_visible());
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Hide attachment field")
+                .count()?,
+            0
+        );
+
+        Ok(())
     }
 
     #[test]
