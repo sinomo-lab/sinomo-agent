@@ -8880,7 +8880,11 @@ impl TranscriptView {
     }
 
     fn quick_action_height(area: Rect) -> f32 {
-        if area.width() < 460.0 { 44.0 } else { 58.0 }
+        if area.width() <= 480.0 || area.height() < 320.0 {
+            44.0
+        } else {
+            58.0
+        }
     }
 
     fn quick_actions(chat: &ChatState) -> &'static [ChatQuickAction] {
@@ -9732,17 +9736,36 @@ impl TranscriptView {
         } else {
             pal.panel
         };
-        let border = if primary { pal.accent } else { pal.border };
+        let border = if pressed {
+            pal.selected
+        } else if primary {
+            pal.accent
+        } else {
+            pal.border
+        };
         widgets::round_panel(ctx, rect, fill, border, 8.0);
         let icon_side = if rect.height() > 46.0 { 17.0 } else { 14.0 };
         let icon = Rect::new(rect.x() + 12.0, rect.y() + 12.0, icon_side, icon_side);
-        let icon_color = if hovered || primary {
+        let icon_color = if pressed {
+            pal.on_accent
+        } else if hovered || primary {
             pal.accent
         } else {
             pal.text_muted
         };
         draw_glyph(ctx, action.icon(), icon, icon_color);
-        let title_color = if primary { pal.text } else { pal.text_muted };
+        let title_color = if pressed {
+            pal.on_accent
+        } else if primary {
+            pal.text
+        } else {
+            pal.text_muted
+        };
+        let subtitle_color = if pressed {
+            pal.on_accent
+        } else {
+            pal.text_faint
+        };
         widgets::draw_text_in(
             ctx,
             Rect::new(
@@ -9764,7 +9787,7 @@ impl TranscriptView {
                     18.0,
                 ),
                 action.subtitle(),
-                pal.text_style(theme, 10.5, FontWeight::NORMAL, pal.text_faint),
+                pal.text_style(theme, 10.5, FontWeight::NORMAL, subtitle_color),
             );
         }
     }
@@ -12902,20 +12925,33 @@ mod tests {
     }
 
     #[test]
-    fn empty_state_quick_actions_stay_inside_short_transcript_area() {
-        let area = Rect::new(0.0, 0.0, 700.0, 300.0);
-        let rects = TranscriptView::quick_action_rects(area, &ChatQuickAction::CHAT);
+    fn empty_state_quick_actions_stay_inside_transcript_area() {
+        for area in [
+            Rect::new(0.0, 0.0, 700.0, 300.0),
+            Rect::new(0.0, 0.0, 460.0, 300.0),
+            Rect::new(0.0, 0.0, 320.0, 360.0),
+        ] {
+            let rects = TranscriptView::quick_action_rects(area, &ChatQuickAction::CHAT);
 
-        assert_eq!(rects.len(), ChatQuickAction::CHAT.len());
-        for (action, rect) in rects {
-            assert!(
-                rect.y() >= area.y() + PAD,
-                "{action:?} quick action should not render above the transcript area"
-            );
-            assert!(
-                rect.max_y() <= area.max_y() - PAD + 0.5,
-                "{action:?} quick action should not overlap the composer: rect={rect:?}"
-            );
+            assert_eq!(rects.len(), ChatQuickAction::CHAT.len());
+            for (action, rect) in rects {
+                assert!(
+                    rect.x() >= area.x() + PAD - 0.5,
+                    "{action:?} quick action should not render left of the transcript area: rect={rect:?}, area={area:?}"
+                );
+                assert!(
+                    rect.max_x() <= area.max_x() - PAD + 0.5,
+                    "{action:?} quick action should not render right of the transcript area: rect={rect:?}, area={area:?}"
+                );
+                assert!(
+                    rect.y() >= area.y() + PAD,
+                    "{action:?} quick action should not render above the transcript area"
+                );
+                assert!(
+                    rect.max_y() <= area.max_y() - PAD + 0.5,
+                    "{action:?} quick action should not overlap the composer: rect={rect:?}"
+                );
+            }
         }
     }
 
