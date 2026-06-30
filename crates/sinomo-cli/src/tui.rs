@@ -7328,8 +7328,12 @@ fn finalize_minicpm_response(request: &ChatPromptRequest, content: &str) -> Stri
 
 pub(crate) fn starts_structured_agent_json_delta(delta: &str) -> bool {
     let trimmed = delta.trim_start();
-    trimmed.starts_with('{')
-        && (trimmed.contains("\"response_mode\"")
+    if trimmed.starts_with('{') {
+        return true;
+    }
+    trimmed.starts_with("```json")
+        && (trimmed.contains('{')
+            || trimmed.contains("\"response_mode\"")
             || trimmed.contains("\"tool_calls\"")
             || trimmed.contains("\"next_state\""))
 }

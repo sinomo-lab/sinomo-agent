@@ -3420,6 +3420,55 @@ mod tests {
     }
 
     #[test]
+    fn chat_mapper_suppresses_partial_structured_agent_json_delta() {
+        let mut streamed_text = String::new();
+        let mut events = Vec::new();
+        let mut on_event = |event| events.push(chat_event_label(event));
+        let op_id = TaskId::generate();
+
+        let first = runtime_event_to_chat(
+            runtime_event(AgentRuntimeEventPayload::ModelProgress {
+                sequence: 1,
+                op_id: op_id.clone(),
+                event: AgentModelEvent::AssistantTextDelta {
+                    step_index: 0,
+                    delta: "{\n".to_string(),
+                },
+            }),
+            &mut streamed_text,
+            &mut on_event,
+        );
+        let second = runtime_event_to_chat(
+            runtime_event(AgentRuntimeEventPayload::ModelProgress {
+                sequence: 2,
+                op_id: op_id.clone(),
+                event: AgentModelEvent::AssistantTextDelta {
+                    step_index: 0,
+                    delta: r#""response_mode":"answer","text":"ready","tool_calls":[],"background_handoff":null,"next_state":"listening"}"#.to_string(),
+                },
+            }),
+            &mut streamed_text,
+            &mut on_event,
+        );
+        let final_state = runtime_event_to_chat(
+            runtime_event(AgentRuntimeEventPayload::TurnFinalDecision {
+                sequence: 3,
+                op_id,
+                decision: final_decision("ready"),
+                stop_reason: AgentStopReason::FinalDecision,
+            }),
+            &mut streamed_text,
+            &mut on_event,
+        );
+
+        assert!(matches!(first, RuntimeDrainState::Running));
+        assert!(matches!(second, RuntimeDrainState::Running));
+        assert!(matches!(final_state, RuntimeDrainState::Running));
+        assert_eq!(events, vec!["token:ready"]);
+        assert_eq!(streamed_text, "ready");
+    }
+
+    #[test]
     fn progress_lines_are_forwarded_as_notices() {
         let mut events = Vec::new();
         let mut on_event = |event| events.push(chat_event_label(event));

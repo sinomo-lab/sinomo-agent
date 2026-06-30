@@ -3512,10 +3512,14 @@ fn channel_messages(channel: &AgentChannel) -> Vec<ChatMessage> {
 }
 
 fn visible_channel_message_text(message: &sinomo_agent::AgentChannelMessage) -> String {
+    let mut text = if matches!(&message.author, AgentChannelAuthor::Agent { .. }) {
+        visible_model_message_text(&message.content)
+    } else {
+        message.content.clone()
+    };
     if message.attachments.is_empty() {
-        return message.content.clone();
+        return text;
     }
-    let mut text = message.content.clone();
     append_visible_attachment_summary(
         &mut text,
         message.attachments.iter().map(|attachment| {
@@ -3527,6 +3531,80 @@ fn visible_channel_message_text(message: &sinomo_agent::AgentChannelMessage) -> 
         }),
     );
     text
+}
+
+fn visible_model_message_text(text: &str) -> String {
+    agent_decision_envelope_display_text(text).unwrap_or_else(|| text.to_string())
+}
+
+fn agent_decision_envelope_display_text(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_start();
+    let (speaker, candidate) = split_agent_speaker_prefix(trimmed);
+    let mut stream = serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+    let value = stream.next()?.ok()?;
+    let offset = stream.byte_offset();
+    let object = value.as_object()?;
+    if !is_agent_decision_envelope(object) {
+        return None;
+    }
+
+    let text = object
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let trailing = candidate.get(offset..).unwrap_or_default().trim();
+    let visible = if text.is_empty() {
+        if trailing.is_empty() {
+            "No user-facing message was returned.".to_string()
+        } else {
+            trailing.to_string()
+        }
+    } else if trailing.is_empty() || trailing == text {
+        text.to_string()
+    } else {
+        format!("{text}\n\n{trailing}")
+    };
+
+    Some(match speaker {
+        Some(speaker) if !visible.trim().is_empty() => format!("{speaker}: {visible}"),
+        _ => visible,
+    })
+}
+
+fn split_agent_speaker_prefix(text: &str) -> (Option<&str>, &str) {
+    let Some((speaker, rest)) = text.split_once(':') else {
+        return (None, text);
+    };
+    let speaker = speaker.trim();
+    let rest = rest.trim_start();
+    if rest.starts_with('{') && is_agent_speaker_label(speaker) {
+        (Some(speaker), rest)
+    } else {
+        (None, text)
+    }
+}
+
+fn is_agent_speaker_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > 64 || label.contains('\n') || label.contains('\r') {
+        return false;
+    }
+    if !label
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ' '))
+    {
+        return false;
+    }
+    let lower = label.to_ascii_lowercase();
+    lower == "agent" || lower.ends_with("-agent") || lower.ends_with(" agent")
+}
+
+fn is_agent_decision_envelope(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    object.contains_key("text")
+        && (object.contains_key("response_mode")
+            || object.contains_key("tool_calls")
+            || object.contains_key("background_handoff")
+            || object.contains_key("next_state"))
 }
 
 fn visible_user_message_text(text: &str, attachments: &[PendingChatAttachment]) -> String {
@@ -4411,10 +4489,15 @@ fn usage_summary(chat: &ChatState) -> Option<String> {
 
 fn transcript_message_display_text(message: &ChatMessage) -> String {
     if message.kind != ChatMessageKind::Error {
-        return if message.text.is_empty() {
-            "…".to_string()
+        let text = if message.source == ChatMessageSource::Model {
+            visible_model_message_text(&message.text)
         } else {
             message.text.clone()
+        };
+        return if text.is_empty() {
+            "…".to_string()
+        } else {
+            text
         };
     }
 
@@ -12297,6 +12380,39 @@ mod tests {
         assert_eq!(restored.source, ChatMessageSource::System);
         assert_eq!(restored.kind, ChatMessageKind::Error);
         assert_eq!(restored.history_role(), "system");
+    }
+
+    #[test]
+    fn transcript_model_display_hides_decision_envelope() {
+        let raw = format!(
+            "main-agent: {}\nI need a sandbox executor to inspect the repository.",
+            serde_json::json!({
+                "response_mode": "defer",
+                "text": "I need a sandbox executor to inspect the repository.",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "waiting"
+            })
+        );
+
+        let rendered = transcript_message_display_text(&ChatMessage::model(raw));
+
+        assert_eq!(
+            rendered,
+            "main-agent: I need a sandbox executor to inspect the repository."
+        );
+        assert!(!rendered.contains("response_mode"));
+        assert!(!rendered.contains("tool_calls"));
+    }
+
+    #[test]
+    fn transcript_model_display_preserves_non_envelope_json() {
+        let raw = r#"main-agent: {"example":true,"text":"visible"}"#;
+
+        assert_eq!(
+            transcript_message_display_text(&ChatMessage::model(raw)),
+            raw
+        );
     }
 
     #[test]
