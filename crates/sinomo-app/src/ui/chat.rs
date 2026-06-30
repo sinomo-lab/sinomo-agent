@@ -624,7 +624,7 @@ pub struct SessionRef {
     pub participant_names: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ConversationKind {
     Chat,
     Channel,
@@ -3457,10 +3457,25 @@ impl ChatState {
 
     /// Whether `index` is the currently-active agent (matched by key or display name).
     fn is_active_agent(&self, index: usize) -> bool {
-        self.agents
-            .get(index)
-            .map(|a| a.name == self.info.agent || a.key == self.info.agent)
-            .unwrap_or(false)
+        self.active_agent_index() == Some(index)
+    }
+
+    fn active_agent_index(&self) -> Option<usize> {
+        if let Some(index) = self
+            .agents
+            .iter()
+            .position(|agent| agent.name == self.info.agent || agent.key == self.info.agent)
+        {
+            return Some(index);
+        }
+        if self.info.agent.trim().is_empty() {
+            return self
+                .agents
+                .iter()
+                .position(|agent| agent.key == "main-agent" || agent.name == "main-agent")
+                .or_else(|| (!self.agents.is_empty()).then_some(0));
+        }
+        None
     }
 
     /// Start a fresh session from the sidebar "New chat" action.
@@ -3571,12 +3586,13 @@ impl ChatState {
     }
 
     fn default_channel_agent(&self) -> (String, String) {
-        if let Some(agent) = self
-            .agents
-            .iter()
-            .find(|agent| agent.key == self.info.agent || agent.name == self.info.agent)
-            .or_else(|| self.agents.first())
-        {
+        let default_index = self.active_agent_index().or_else(|| {
+            self.agents
+                .iter()
+                .position(|agent| agent.key == "main-agent" || agent.name == "main-agent")
+                .or_else(|| (!self.agents.is_empty()).then_some(0))
+        });
+        if let Some(agent) = default_index.and_then(|index| self.agents.get(index)) {
             return (agent.key.clone(), agent.name.clone());
         }
         let key = if self.info.agent.trim().is_empty() {
@@ -5537,9 +5553,10 @@ fn session_create_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget 
             .icon(IconGlyph::Add)
             .min_height(32.0)
             .theme_when(secondary_button_theme(reader))
-            .on_press(move || {
+            .on_press_with_ctx(move |ctx| {
                 let waker = { s.borrow().waker.clone() };
                 s.chat_mut().new_channel(waker);
+                request_chat_window_relayout(ctx);
             })
     };
 
@@ -5548,6 +5565,16 @@ fn session_create_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget 
         .align_items(Alignment::Stretch)
         .with_child(new_chat)
         .with_child(new_channel)
+}
+
+fn request_chat_window_relayout(ctx: &mut EventCtx) {
+    use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
+
+    let window = InvalidationTarget::Window(ctx.window_id());
+    ctx.request(InvalidationRequest::new(window, InvalidationKind::Measure));
+    ctx.request(InvalidationRequest::new(window, InvalidationKind::Arrange));
+    ctx.request_paint();
+    ctx.request_semantics();
 }
 
 fn session_filter_input(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -6373,7 +6400,8 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .iter()
             .find(|session| session.id == edit_id)
             .cloned()?;
-        let mut participants = if session.kind == ConversationKind::Channel {
+        let creating_channel = chat.channel_create_rx.is_some() && session.id == chat.session_id;
+        let mut participants = if session.kind == ConversationKind::Channel && !creating_channel {
             chat.channel_agent_refs(&session.id)
         } else {
             Vec::new()
@@ -6381,11 +6409,8 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         if session.kind == ConversationKind::Channel && participants.is_empty() {
             participants = ChatState::fallback_channel_agent_refs(&session, &chat.agents);
         }
-        let agent_status = channel_agents_store_status(
-            &participants,
-            chat.channel_create_rx.is_some(),
-            chat.notice.as_deref(),
-        );
+        let agent_status =
+            channel_agents_store_status(&participants, creating_channel, chat.notice.as_deref());
         let agent_keys = chat
             .agents
             .iter()
@@ -10876,6 +10901,11 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.session_list_loading.hash(&mut h);
     chat.session_list_slow_notice_shown.hash(&mut h);
     chat.session_kind_filter.hash(&mut h);
+    chat.session_edit_id.hash(&mut h);
+    chat.session_delete_confirm_id.hash(&mut h);
+    chat.session_edit_details_open.hash(&mut h);
+    chat.channel_agent_idx.hash(&mut h);
+    chat.channel_create_rx.is_some().hash(&mut h);
     chat.visible_session_has_started().hash(&mut h);
     chat.runtime_recovery_target()
         .map(RuntimeRecoveryTarget::key)
@@ -10889,7 +10919,11 @@ fn view_signature(shared: &Shared) -> u64 {
     }
     chat.sessions.len().hash(&mut h);
     for s in &chat.sessions {
+        s.id.hash(&mut h);
+        s.kind.hash(&mut h);
         s.title.hash(&mut h);
+        s.participant_count.hash(&mut h);
+        s.participant_names.hash(&mut h);
     }
     chat.info.agent.hash(&mut h);
     h.finish()
@@ -12240,6 +12274,48 @@ mod tests {
     }
 
     #[test]
+    fn new_channel_defaults_to_main_agent_before_runtime_ready() {
+        let (_backend, mut state) = isolated_chat_state("new-channel-default-agent");
+        state.info.agent.clear();
+        state.agents = vec![
+            AgentSummary {
+                key: "background-agent".to_string(),
+                name: "background-agent".to_string(),
+                description: String::new(),
+                tool_runtime: ChatToolRuntimeSelection::default(),
+            },
+            AgentSummary {
+                key: "main-agent".to_string(),
+                name: "main-agent".to_string(),
+                description: String::new(),
+                tool_runtime: ChatToolRuntimeSelection::default(),
+            },
+        ];
+
+        assert!(state.is_active_agent(1));
+        assert_eq!(
+            state.default_channel_agent(),
+            ("main-agent".to_string(), "main-agent".to_string())
+        );
+
+        state.new_channel(None);
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            state.pending_session_reset.is_none() && state.channel_create_rx.is_none()
+        });
+
+        let parsed = state.session_id.parse::<SessionId>().expect("channel id");
+        let channel = state
+            .agent_channel_store()
+            .expect("channel store")
+            .load_channel(&parsed)
+            .expect("load channel")
+            .expect("channel saved");
+        let participants = channel.enabled_participants_in_order();
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0].agent_key, "main-agent");
+    }
+
+    #[test]
     fn channel_config_adds_selected_agent_and_updates_sidebar_count() {
         let (_backend, mut state) = isolated_chat_state("channel-add-agent");
         seed_test_agents(&mut state);
@@ -12547,7 +12623,13 @@ mod tests {
             chat.models_loading = false;
         }
 
-        let runtime = crate::build_runtime(shared.clone())?;
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Channel editor")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
         app.run_until_idle()?;
@@ -12628,7 +12710,13 @@ mod tests {
             chat.models_loading = false;
         }
 
-        let runtime = crate::build_runtime(shared.clone())?;
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Pending channel editor")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
         app.run_until_idle()?;
@@ -12687,7 +12775,13 @@ mod tests {
             chat.models_loading = false;
         }
 
-        let runtime = crate::build_runtime(shared.clone())?;
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Failed pending channel editor")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
         app.run_until_idle()?;
@@ -13409,11 +13503,21 @@ mod tests {
             "the main pane should expose a direct channel creation action"
         );
         direct_channel_button.click()?;
-        let chat = shared.chat();
+        {
+            let chat = shared.chat();
+            assert_eq!(
+                chat.session_edit_id.as_deref(),
+                Some(chat.session_id.as_str()),
+                "main-pane New channel should open the channel editor"
+            );
+        }
         assert_eq!(
-            chat.session_edit_id.as_deref(),
-            Some(chat.session_id.as_str()),
-            "main-pane New channel should open the channel editor"
+            window
+                .get_by_role(SemanticsRole::Dialog)
+                .with_name("Edit channel")
+                .count()?,
+            1,
+            "main-pane New channel should render the channel editor dialog"
         );
 
         Ok(())
@@ -13463,15 +13567,25 @@ mod tests {
             .get_by_role(SemanticsRole::Button)
             .with_name("New channel")
             .click()?;
-        let chat = shared.chat();
-        assert_ne!(
-            chat.session_id, new_chat_id,
-            "New channel button should start a separate visible session"
-        );
+        {
+            let chat = shared.chat();
+            assert_ne!(
+                chat.session_id, new_chat_id,
+                "New channel button should start a separate visible session"
+            );
+            assert_eq!(
+                chat.session_edit_id.as_deref(),
+                Some(chat.session_id.as_str()),
+                "New channel should open its edit dialog"
+            );
+        }
         assert_eq!(
-            chat.session_edit_id.as_deref(),
-            Some(chat.session_id.as_str()),
-            "New channel should open its edit dialog"
+            window
+                .get_by_role(SemanticsRole::Dialog)
+                .with_name("Edit channel")
+                .count()?,
+            1,
+            "sidebar New channel should render the channel editor dialog"
         );
 
         Ok(())
