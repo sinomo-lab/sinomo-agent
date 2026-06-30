@@ -347,7 +347,7 @@ impl ChatQuickAction {
             Self::PlanChange => "Plan a change",
             Self::CheckCluster => "Check cluster",
             Self::DraftDocument => "Draft document",
-            Self::ReasonImage => "Reason over image",
+            Self::ReasonImage => "Inspect attachment",
             Self::RolePlay => "Role play",
             Self::ManageChannel => "Manage channel",
         }
@@ -365,7 +365,7 @@ impl ChatQuickAction {
                 "Return a finished Markdown design note now. Start exactly with '# Chat and channel interaction design note'. Include sections: Assumptions, Audience, Goals, Non-goals, Workflow, Risks, Next steps. Do not describe what you will do.",
             ),
             Self::ReasonImage => Some(
-                "Analyze the attached image or file. If nothing is attached yet, ask me for the image or file first. Describe concrete observations, likely interpretation, and uncertainties.",
+                "Inspect the attached file context available to you. If there is no attachment, ask me for the file first. If I expect pixel-level image reasoning or full file contents, say that this chat currently receives SIFS attachment metadata rather than raw file bytes, then ask for a model-visible excerpt or description. Summarize concrete observations from the attachment record and uncertainties.",
             ),
             Self::RolePlay => Some(
                 "Role play as a skeptical product reviewer evaluating this chat and channel interface. Stay in character, critique the workflow, and propose specific improvements.",
@@ -390,7 +390,7 @@ impl ChatQuickAction {
             Self::PlanChange => "Use coding agent to plan repository work",
             Self::CheckCluster => "Use background agent to inspect cluster status",
             Self::DraftDocument => "Prepare a polished Markdown note",
-            Self::ReasonImage => "Open attachment controls for image or file analysis",
+            Self::ReasonImage => "Open attachment controls for file context",
             Self::RolePlay => "Prepare a role-playing prompt",
             Self::ManageChannel => "Open channel agents and settings",
         }
@@ -401,7 +401,7 @@ impl ChatQuickAction {
             Self::PlanChange => "coding-agent",
             Self::CheckCluster => "background-agent",
             Self::DraftDocument => "Structured note",
-            Self::ReasonImage => "Attachment analysis",
+            Self::ReasonImage => "SIFS metadata",
             Self::RolePlay => "Persona test",
             Self::ManageChannel => "Agents and title",
         }
@@ -12271,7 +12271,7 @@ mod tests {
     }
 
     #[test]
-    fn image_reasoning_quick_action_opens_attachment_controls() {
+    fn attachment_quick_action_opens_controls_and_sets_metadata_prompt() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
         state.attachment_controls_open = false;
@@ -12284,6 +12284,7 @@ mod tests {
                 .prompt()
                 .expect("image prompt action")
         );
+        assert!(state.input.contains("SIFS attachment metadata"));
         assert!(state.attachment_controls_visible());
         assert_eq!(state.cursor, state.input.len());
     }
