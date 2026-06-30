@@ -78,6 +78,7 @@ const SIDEBAR_W: f32 = 250.0;
 const ACTIVITY_RAIL_W: f32 = 286.0;
 const OVERVIEW_H: f32 = 86.0;
 const MEDIA_CALL_H: f32 = 156.0;
+const MEDIA_CALL_COMPACT_H: f32 = 46.0;
 const COMPOSER_H: f32 = 196.0;
 const PAD: f32 = 16.0;
 const SIDEBAR_ROW_H: f32 = 36.0;
@@ -627,6 +628,7 @@ pub struct ChatState {
     pub control: ChatControlOverview,
     pub media_call: ChatMediaCallState,
     media_call_runtime: Option<ChatNativeMediaRuntime>,
+    media_call_details_open: bool,
     activity_panel_open: bool,
     pub scroll: f32,
     pub stick_bottom: bool,
@@ -726,6 +728,7 @@ impl ChatState {
             control: ChatControlOverview::default(),
             media_call: ChatMediaCallState::default(),
             media_call_runtime: None,
+            media_call_details_open: false,
             activity_panel_open: false,
             scroll: 0.0,
             stick_bottom: true,
@@ -1705,6 +1708,9 @@ impl ChatState {
         self.activity = preserved_activity;
         self.tool_calls.clear();
         self.control = ChatControlOverview::default();
+        self.media_call = ChatMediaCallState::default();
+        self.media_call_runtime = None;
+        self.media_call_details_open = false;
         self.scroll = 0.0;
         self.stick_bottom = true;
         self.session_edit_id = None;
@@ -2169,6 +2175,7 @@ impl ChatState {
         self.control = ChatControlOverview::default();
         self.media_call = ChatMediaCallState::default();
         self.media_call_runtime = None;
+        self.media_call_details_open = false;
         self.scroll = f32::MAX;
         self.stick_bottom = true;
         self.session_edit_id = None;
@@ -2239,6 +2246,7 @@ impl ChatState {
             self.media_call.active = false;
             self.media_call.started_at = None;
             self.media_call_runtime = None;
+            self.media_call_details_open = false;
             self.media_call.notice = Some("call ended".to_string());
             self.notice = Some("media call ended".to_string());
             self.push_activity(
@@ -2253,6 +2261,7 @@ impl ChatState {
         if provider == "provider pending" || model == "model pending" {
             let detail =
                 "choose a realtime-capable provider and model before starting a media call";
+            self.media_call_details_open = true;
             self.media_call.notice = Some(detail.to_string());
             self.notice = Some(detail.to_string());
             self.push_activity("media call", detail, ActivityTone::Warn);
@@ -2263,6 +2272,7 @@ impl ChatState {
         if !started {
             self.media_call.active = false;
             self.media_call.started_at = None;
+            self.media_call_details_open = true;
             self.media_call.notice = Some(native_notice.clone());
             self.notice = Some(format!("media call failed: {native_notice}"));
             self.push_activity("media call", native_notice, ActivityTone::Warn);
@@ -2270,6 +2280,7 @@ impl ChatState {
         }
 
         self.media_call.active = true;
+        self.media_call_details_open = true;
         self.media_call.provider = provider.clone();
         self.media_call.model = model.clone();
         self.media_call.started_at = Some(Instant::now());
@@ -2369,6 +2380,7 @@ impl ChatState {
                 ChatMediaCallWorkerEvent::Error(detail) => {
                     self.media_call.active = false;
                     self.media_call.started_at = None;
+                    self.media_call_details_open = true;
                     self.media_call.notice = Some(format!("media call failed: {detail}"));
                     self.notice = Some(format!("media call failed: {detail}"));
                     self.push_activity("media call", detail, ActivityTone::Warn);
@@ -2378,6 +2390,7 @@ impl ChatState {
                 ChatMediaCallWorkerEvent::Done(detail) => {
                     self.media_call.active = false;
                     self.media_call.started_at = None;
+                    self.media_call_details_open = false;
                     self.media_call.notice = Some(detail);
                     ended = true;
                     break;
@@ -2420,6 +2433,14 @@ impl ChatState {
         };
         self.media_call.notice = Some(detail.to_string());
         self.push_activity("media call", detail, ActivityTone::Neutral);
+    }
+
+    pub fn toggle_media_call_details(&mut self) {
+        self.media_call_details_open = !self.media_call_details_open;
+    }
+
+    fn media_call_details_visible(&self) -> bool {
+        self.media_call_details_open
     }
 
     fn media_call_elapsed_label(&self) -> String {
@@ -6713,6 +6734,7 @@ impl Widget for RuntimeOverview {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MediaCallControl {
+    ToggleDetails,
     ToggleCall,
     ToggleMic,
     ToggleCamera,
@@ -6731,6 +6753,26 @@ impl MediaCallPanel {
             hovered: Cell::new(None),
             pressed: Cell::new(None),
         }
+    }
+
+    fn details_rect(bounds: Rect, details_open: bool) -> Rect {
+        let button_w = if details_open {
+            78.0_f32.min((bounds.width() * 0.22).max(64.0))
+        } else {
+            112.0_f32.min((bounds.width() * 0.30).max(84.0))
+        };
+        let button_h = 28.0_f32.min((bounds.height() - 12.0).max(22.0));
+        let button_y = if details_open {
+            bounds.y() + 8.0
+        } else {
+            bounds.y() + (bounds.height() - button_h) * 0.5
+        };
+        Rect::new(
+            bounds.max_x() - PAD - button_w,
+            button_y,
+            button_w,
+            button_h,
+        )
     }
 
     fn control_rects(bounds: Rect) -> [(MediaCallControl, Rect); 3] {
@@ -6756,10 +6798,17 @@ impl MediaCallPanel {
         ]
     }
 
-    fn hit_control(bounds: Rect, position: Point) -> Option<MediaCallControl> {
-        Self::control_rects(bounds)
-            .into_iter()
-            .find_map(|(control, rect)| rect.contains(position).then_some(control))
+    fn hit_control(bounds: Rect, position: Point, details_open: bool) -> Option<MediaCallControl> {
+        if Self::details_rect(bounds, details_open).contains(position) {
+            return Some(MediaCallControl::ToggleDetails);
+        }
+        if details_open {
+            Self::control_rects(bounds)
+                .into_iter()
+                .find_map(|(control, rect)| rect.contains(position).then_some(control))
+        } else {
+            None
+        }
     }
 
     fn refresh(ctx: &mut EventCtx) {
@@ -6772,6 +6821,7 @@ impl MediaCallPanel {
     fn activate(&self, control: MediaCallControl) {
         let mut chat = self.shared.chat_mut();
         match control {
+            MediaCallControl::ToggleDetails => chat.toggle_media_call_details(),
             MediaCallControl::ToggleCall => chat.toggle_media_call(),
             MediaCallControl::ToggleMic => chat.toggle_media_call_mic(),
             MediaCallControl::ToggleCamera => chat.toggle_media_call_camera(),
@@ -6783,7 +6833,8 @@ impl Widget for MediaCallPanel {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
         match event {
             Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
-                let hovered = Self::hit_control(ctx.bounds(), pointer.position);
+                let details_open = self.shared.chat().media_call_details_visible();
+                let hovered = Self::hit_control(ctx.bounds(), pointer.position, details_open);
                 if self.hovered.get() != hovered {
                     self.hovered.set(hovered);
                     Self::refresh(ctx);
@@ -6793,7 +6844,10 @@ impl Widget for MediaCallPanel {
                 if pointer.kind == PointerEventKind::Down
                     && pointer.button == Some(PointerButton::Primary) =>
             {
-                if let Some(control) = Self::hit_control(ctx.bounds(), pointer.position) {
+                let details_open = self.shared.chat().media_call_details_visible();
+                if let Some(control) =
+                    Self::hit_control(ctx.bounds(), pointer.position, details_open)
+                {
                     self.pressed.set(Some(control));
                     ctx.request_pointer_capture(pointer.pointer_id);
                     Self::refresh(ctx);
@@ -6805,7 +6859,10 @@ impl Widget for MediaCallPanel {
                     && pointer.button == Some(PointerButton::Primary) =>
             {
                 if let Some(pressed) = self.pressed.take() {
-                    if Self::hit_control(ctx.bounds(), pointer.position) == Some(pressed) {
+                    let details_open = self.shared.chat().media_call_details_visible();
+                    if Self::hit_control(ctx.bounds(), pointer.position, details_open)
+                        == Some(pressed)
+                    {
                         self.activate(pressed);
                     }
                     ctx.release_pointer_capture(pointer.pointer_id);
@@ -6832,7 +6889,12 @@ impl Widget for MediaCallPanel {
     }
 
     fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        constraints.clamp(Size::new(constraints.max.width, MEDIA_CALL_H))
+        let height = if self.shared.chat().media_call_details_visible() {
+            MEDIA_CALL_H
+        } else {
+            MEDIA_CALL_COMPACT_H
+        };
+        constraints.clamp(Size::new(constraints.max.width, height))
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
@@ -6844,6 +6906,7 @@ impl Widget for MediaCallPanel {
 
         let chat = self.shared.chat();
         let call = &chat.media_call;
+        let details_open = chat.media_call_details_visible();
         let (selected_provider, selected_model) = chat.current_media_provider_model();
         let provider = if call.active {
             call.provider.as_str()
@@ -6866,24 +6929,62 @@ impl Widget for MediaCallPanel {
         let x = bounds.x() + PAD;
         let y = bounds.y() + 10.0;
         let status = if call.active { "LIVE" } else { "READY" };
+        let details = Self::details_rect(bounds, details_open);
+        let details_label = if details_open { "Hide" } else { "Controls" };
+        let details_icon = if details_open {
+            IconGlyph::Close
+        } else {
+            IconGlyph::Chat
+        };
 
         widgets::draw_text_in(
             ctx,
-            Rect::new(x, y, (bounds.width() * 0.48).max(96.0), 18.0),
+            Rect::new(x, y, (details.x() - x - 80.0).max(72.0), 18.0),
             "Media call",
             title_style,
         );
         widgets::draw_text_in(
             ctx,
-            Rect::new(
-                x + (bounds.width() * 0.48).max(96.0),
-                y,
-                (bounds.width() * 0.46).max(72.0),
-                18.0,
-            ),
+            Rect::new((details.x() - 70.0).max(x + 86.0), y, 60.0, 18.0),
             status,
             status_style,
         );
+        draw_media_call_control_button(
+            ctx,
+            &pal,
+            &theme,
+            details,
+            details_label,
+            details_icon,
+            if call.active {
+                ActivityTone::Running
+            } else {
+                ActivityTone::Neutral
+            },
+            details_open,
+            self.hovered.get() == Some(MediaCallControl::ToggleDetails),
+            self.pressed.get() == Some(MediaCallControl::ToggleDetails),
+        );
+
+        if !details_open {
+            let summary = if call.active {
+                chat.media_call_status_summary()
+            } else {
+                format!("{provider} / {model}")
+            };
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(
+                    x,
+                    bounds.y() + 27.0,
+                    (details.x() - x - 10.0).max(72.0),
+                    15.0,
+                ),
+                &compact_line(&summary, 72),
+                meta_style,
+            );
+            return;
+        }
 
         let button_top = bounds.y() + bounds.height() - 42.0;
         let pane_top = y + 24.0;
@@ -6952,6 +7053,12 @@ impl Widget for MediaCallPanel {
             let hovered = self.hovered.get() == Some(control);
             let pressed = self.pressed.get() == Some(control);
             let (label, icon, active, tone) = match control {
+                MediaCallControl::ToggleDetails => (
+                    "Hide",
+                    IconGlyph::Close,
+                    details_open,
+                    ActivityTone::Neutral,
+                ),
                 MediaCallControl::ToggleMic => (
                     if call.mic_enabled { "Mic" } else { "Muted" },
                     if call.mic_enabled {
@@ -6999,8 +7106,33 @@ impl Widget for MediaCallPanel {
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         let chat = self.shared.chat();
+        let details_open = chat.media_call_details_visible();
+        let mut details_node = SemanticsNode::new(
+            sui::WidgetId::new(ctx.widget_id().get().wrapping_mul(53).wrapping_add(18_901)),
+            SemanticsRole::Button,
+            Self::details_rect(ctx.bounds(), details_open),
+        );
+        details_node.parent = Some(ctx.widget_id());
+        details_node.name = Some(
+            if details_open {
+                "Hide media controls"
+            } else {
+                "Show media controls"
+            }
+            .to_string(),
+        );
+        details_node.actions = vec![SemanticsAction::Activate];
+        details_node.state.hovered = self.hovered.get() == Some(MediaCallControl::ToggleDetails);
+        details_node.state.selected = details_open;
+        ctx.push(details_node);
+
+        if !details_open {
+            return;
+        }
+
         for (index, (control, rect)) in Self::control_rects(ctx.bounds()).into_iter().enumerate() {
             let name = match control {
+                MediaCallControl::ToggleDetails => "Hide media controls",
                 MediaCallControl::ToggleCall if chat.media_call.active => "End media call",
                 MediaCallControl::ToggleCall => "Start media call",
                 MediaCallControl::ToggleMic if chat.media_call.mic_enabled => "Mute microphone",
@@ -9332,8 +9464,24 @@ fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 /// request-animation-frame pump lives on [`ChatView`] (a reliable ancestor of every control), so no
 /// invisible overlay widget is needed here.
 fn main_column(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let transcript = widgets::Dock::new(TranscriptView::new(shared.clone()))
-        .top(MEDIA_CALL_H, MediaCallPanel::new(shared.clone()));
+    let transcript = {
+        let key_shared = shared.clone();
+        let build_shared = shared.clone();
+        RebuildOnChange::new(
+            move || key_shared.chat().media_call_details_visible(),
+            move |details_open| {
+                let height = if *details_open {
+                    MEDIA_CALL_H
+                } else {
+                    MEDIA_CALL_COMPACT_H
+                };
+                WidgetPod::new(
+                    widgets::Dock::new(TranscriptView::new(build_shared.clone()))
+                        .top(height, MediaCallPanel::new(build_shared.clone())),
+                )
+            },
+        )
+    };
     widgets::Dock::new(transcript)
         .top(OVERVIEW_H, RuntimeOverview::new(shared.clone()))
         .bottom(COMPOSER_H, composer(shared, reader))
@@ -9544,6 +9692,8 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.current_models().len().hash(&mut h);
     chat.effort_visible().hash(&mut h);
     chat.streaming.hash(&mut h);
+    chat.media_call.active.hash(&mut h);
+    chat.media_call_details_visible().hash(&mut h);
     chat.draft_revision.hash(&mut h);
     chat.attachments.len().hash(&mut h);
     chat.attachment_path_input.is_empty().hash(&mut h);
@@ -12411,8 +12561,10 @@ mod tests {
         seed_default_provider(&mut state);
         state.models_loading = false;
 
+        assert!(!state.media_call_details_visible());
         state.toggle_media_call();
         assert!(state.media_call.active);
+        assert!(state.media_call_details_visible());
         assert_eq!(state.media_call.provider, "OpenAI");
         assert_eq!(state.media_call.model, "gpt-5");
         assert!(state.media_call_status_summary().contains("mic on"));
@@ -12427,7 +12579,96 @@ mod tests {
 
         state.toggle_media_call();
         assert!(!state.media_call.active);
+        assert!(!state.media_call_details_visible());
         assert_eq!(state.media_call.notice.as_deref(), Some("call ended"));
+    }
+
+    #[test]
+    fn rendered_media_call_controls_are_compact_until_opened() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.info.provider = "openai".to_string();
+            chat.info.model = "gpt-5".to_string();
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat media controls")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Show media controls")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Start media call")
+                .count()?,
+            0,
+            "idle media controls should be hidden behind the compact drawer"
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Show media controls")
+            .click()?;
+        assert!(shared.chat().media_call_details_visible());
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Hide media controls")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Start media call")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Mute microphone")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Pause camera")
+                .count()?,
+            1
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Hide media controls")
+            .click()?;
+        assert!(!shared.chat().media_call_details_visible());
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Start media call")
+                .count()?,
+            0
+        );
+
+        Ok(())
     }
 
     #[test]
