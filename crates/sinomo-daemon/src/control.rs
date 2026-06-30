@@ -49,6 +49,7 @@ pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
 pub const DAEMON_NETWORK_ENVIRONMENT_WATCH_ENV: &str = "SINOMO_DAEMON_NETWORK_ENVIRONMENT_WATCH";
 pub(crate) const ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE: Duration = Duration::from_millis(200);
 const DAEMON_RUNTIME_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+const DAEMON_IROH_PROXY_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_RUNTIME_TASK_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const DAEMON_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const DAEMON_SANDBOX_STREAM_CHANNEL_CAPACITY: usize = 64;
@@ -436,8 +437,8 @@ fn join_daemon_runtime_task(
     if abort_first {
         abort_handle.abort();
     }
-    let result = runtime
-        .block_on(async { tokio::time::timeout(DAEMON_RUNTIME_TASK_JOIN_TIMEOUT, task).await });
+    let join_timeout = daemon_runtime_task_join_timeout(label);
+    let result = runtime.block_on(async { tokio::time::timeout(join_timeout, task).await });
     match result {
         Ok(Ok(())) => {}
         Ok(Err(error)) if error.is_cancelled() => {}
@@ -448,9 +449,16 @@ fn join_daemon_runtime_task(
             abort_handle.abort();
             tracing::warn!(
                 "sinomo daemon {label} task did not stop within {}ms",
-                DAEMON_RUNTIME_TASK_JOIN_TIMEOUT.as_millis()
+                join_timeout.as_millis()
             );
         }
+    }
+}
+
+fn daemon_runtime_task_join_timeout(label: &str) -> Duration {
+    match label {
+        "iroh proxy" => DAEMON_IROH_PROXY_TASK_JOIN_TIMEOUT,
+        _ => DAEMON_RUNTIME_TASK_JOIN_TIMEOUT,
     }
 }
 
@@ -4197,6 +4205,22 @@ mod tests {
     use sinomo_node::NodeId;
     use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn daemon_iroh_proxy_runtime_task_gets_graceful_join_budget() {
+        assert_eq!(
+            daemon_runtime_task_join_timeout("iroh proxy"),
+            DAEMON_IROH_PROXY_TASK_JOIN_TIMEOUT
+        );
+        assert!(
+            daemon_runtime_task_join_timeout("iroh proxy") > DAEMON_RUNTIME_TASK_JOIN_TIMEOUT,
+            "Iroh endpoint close needs more time than generic helper task shutdown"
+        );
+        assert_eq!(
+            daemon_runtime_task_join_timeout("status publisher"),
+            DAEMON_RUNTIME_TASK_JOIN_TIMEOUT
+        );
+    }
 
     fn append_cluster_raft_command(
         paths: &sinomo_network::ClusterPaths,
