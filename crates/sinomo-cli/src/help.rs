@@ -114,6 +114,8 @@ pub(super) fn print_voice_help() {
     println!("Voice:");
     println!("  sinomo voice");
     println!("      Show voice commands.");
+    println!("  sinomo voice devices");
+    println!("      List native microphones, cameras, and speakers visible on this node.");
     println!(
         "  sinomo voice call [--provider openai|minicpm-o] [--model <model>] [--input <raw-pcm>|-] [--video-frame <jpg|png>] [--output <raw-pcm>|-]"
     );
@@ -125,7 +127,7 @@ pub(super) fn print_voice_help() {
         "      MiniCPM-o defaults: MiniCPM-o-4.5, 16 kHz f32-le input and 24 kHz f32-le output."
     );
     println!(
-        "      Useful options: --instructions <text>, --voice <voice-or-base64-ref-audio>, --endpoint <url>, --session <session_id>, --chunk-ms <n> (default 100), --video-detail auto|low|high, --video-frame-ms <n>, --turn manual|semantic-vad, --no-audio, --no-pacing."
+        "      Useful options: --native, --native-mic, --native-camera, --native-speaker, --mic-device <selector>, --camera-device <path-or-name>, --speaker-device <selector>, --call-ms <n>, --instructions <text>, --voice <voice-or-base64-ref-audio>, --endpoint <url>, --session <session_id>, --chunk-ms <n> (default 100), --video-detail auto|low|high, --video-frame-ms <n>, --turn manual|semantic-vad, --no-audio, --no-pacing."
     );
 }
 

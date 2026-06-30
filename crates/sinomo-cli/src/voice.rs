@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum VoiceCliCommand {
     Help,
+    Devices,
     Call(VoiceCallOptions),
 }
 
@@ -31,6 +32,13 @@ pub(crate) struct VoiceCallOptions {
     pub pace: bool,
     pub force_listen: bool,
     pub audio_input: bool,
+    pub native_microphone: bool,
+    pub microphone_device: Option<String>,
+    pub native_camera: bool,
+    pub camera_device: Option<String>,
+    pub native_speaker: bool,
+    pub speaker_device: Option<String>,
+    pub call_ms: Option<u64>,
     pub receive_timeout_ms: Option<u64>,
 }
 
@@ -57,6 +65,13 @@ impl Default for VoiceCallOptions {
             pace: true,
             force_listen: false,
             audio_input: true,
+            native_microphone: false,
+            microphone_device: None,
+            native_camera: false,
+            camera_device: None,
+            native_speaker: false,
+            speaker_device: None,
+            call_ms: None,
             receive_timeout_ms: None,
         }
     }
@@ -68,6 +83,7 @@ pub(crate) fn parse_voice_command(args: &[String]) -> Result<VoiceCliCommand, Cl
         Some((arg, [])) if matches!(arg.as_str(), "help" | "--help" | "-h") => {
             Ok(VoiceCliCommand::Help)
         }
+        Some((command, [])) if command == "devices" => Ok(VoiceCliCommand::Devices),
         Some((command, rest)) if command == "call" => {
             Ok(VoiceCliCommand::Call(parse_voice_call_options(rest)?))
         }
@@ -179,6 +195,41 @@ fn parse_voice_call_options(args: &[String]) -> Result<VoiceCallOptions, CliErro
                 options.receive_timeout_ms =
                     Some(parse_u64_option(args, index, "--receive-timeout-ms")?);
             }
+            "--native" => {
+                options.native_microphone = true;
+                options.native_speaker = true;
+            }
+            "--native-mic" | "--microphone" => {
+                options.native_microphone = true;
+            }
+            "--mic-device" | "--microphone-device" => {
+                index += 1;
+                options.native_microphone = true;
+                options.microphone_device =
+                    Some(required_value(args, index, "--mic-device")?.to_string());
+            }
+            "--native-camera" | "--camera" => {
+                options.native_camera = true;
+            }
+            "--camera-device" => {
+                index += 1;
+                options.native_camera = true;
+                options.camera_device =
+                    Some(required_value(args, index, "--camera-device")?.to_string());
+            }
+            "--native-speaker" | "--speaker" => {
+                options.native_speaker = true;
+            }
+            "--speaker-device" => {
+                index += 1;
+                options.native_speaker = true;
+                options.speaker_device =
+                    Some(required_value(args, index, "--speaker-device")?.to_string());
+            }
+            "--call-ms" | "--duration-ms" => {
+                index += 1;
+                options.call_ms = Some(parse_u64_option(args, index, "--call-ms")?);
+            }
             "--no-pacing" => {
                 options.pace = false;
             }
@@ -207,12 +258,23 @@ fn parse_voice_call_options(args: &[String]) -> Result<VoiceCallOptions, CliErro
             detail: "--video-frame-ms must be greater than zero".to_string(),
         });
     }
+    if options.call_ms == Some(0) {
+        return Err(CliError::Parse {
+            detail: "--call-ms must be greater than zero".to_string(),
+        });
+    }
+    if options.native_microphone && input_specified {
+        return Err(CliError::Parse {
+            detail: "--native-mic cannot be combined with --input".to_string(),
+        });
+    }
     if !options.video_frames.is_empty() && !input_specified && options.input.is_none() {
         options.audio_input = false;
     }
-    if !options.audio_input && options.video_frames.is_empty() {
+    if !options.audio_input && options.video_frames.is_empty() && !options.native_camera {
         return Err(CliError::Parse {
-            detail: "voice call needs audio input or at least one --video-frame".to_string(),
+            detail: "voice call needs audio input, native camera, or at least one --video-frame"
+                .to_string(),
         });
     }
     Ok(options)
@@ -296,7 +358,56 @@ pub(crate) fn run_voice_command(command: VoiceCliCommand) -> Result<(), CliError
             print_voice_help();
             Ok(())
         }
+        VoiceCliCommand::Devices => run_voice_devices(),
         VoiceCliCommand::Call(options) => run_voice_call(options),
+    }
+}
+
+fn run_voice_devices() -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let node_id = voice_local_node_id(&data_dir);
+    let inventory = sinomo_runtime::device::enumerate_native_devices(node_id);
+    println!("native devices for node {}", inventory.node_id);
+    if inventory.devices.is_empty() {
+        println!("  none");
+    }
+    for device in &inventory.devices {
+        println!(
+            "  {}{} [{}] {}",
+            if device.is_default { "* " } else { "  " },
+            device.native_id,
+            native_device_kind_label(&device.profile.kind),
+            device.profile.display_name
+        );
+        if let Some(detail) = device.detail.as_deref().filter(|detail| !detail.is_empty()) {
+            println!("      {detail}");
+        }
+    }
+    for issue in inventory.issues {
+        println!("  warning: {issue}");
+    }
+    Ok(())
+}
+
+fn voice_local_node_id(data_dir: &SinomoDataDir) -> NodeId {
+    let paths = ClusterPaths::new(data_dir);
+    network::read_cluster_state(&paths)
+        .map(|state| state.local_node_id)
+        .unwrap_or_else(|_| NodeId::from_legacy_named("node_cli").expect("valid node id"))
+}
+
+fn native_device_kind_label(kind: &sinomo_runtime::device::DeviceKind) -> &'static str {
+    match kind {
+        sinomo_runtime::device::DeviceKind::Microphone => "microphone",
+        sinomo_runtime::device::DeviceKind::Camera => "camera",
+        sinomo_runtime::device::DeviceKind::Speaker => "speaker",
+        sinomo_runtime::device::DeviceKind::Screen => "screen",
+        sinomo_runtime::device::DeviceKind::Keyboard => "keyboard",
+        sinomo_runtime::device::DeviceKind::Mouse => "mouse",
+        sinomo_runtime::device::DeviceKind::Filesystem => "filesystem",
+        sinomo_runtime::device::DeviceKind::Gpu => "gpu",
+        sinomo_runtime::device::DeviceKind::NotificationSurface => "notification",
+        sinomo_runtime::device::DeviceKind::Other => "other",
     }
 }
 
@@ -329,7 +440,7 @@ fn run_voice_call(options: VoiceCallOptions) -> Result<(), CliError> {
     if let Some(format) = options.input_format {
         config.input_format = format;
     }
-    if !options.video_frames.is_empty() {
+    if !options.video_frames.is_empty() || options.native_camera {
         config.input_video = Some(sinomo_lm::RealtimeVideoInputConfig {
             frame_format: options
                 .video_format
@@ -419,6 +530,12 @@ struct VoiceCallState {
     output_sequence: u64,
 }
 
+#[derive(Debug, Default)]
+struct NativeVoiceLoopReport {
+    input_chunks: u64,
+    input_video_frames: u64,
+}
+
 async fn run_voice_call_async(
     data_dir: SinomoDataDir,
     session_id: SessionId,
@@ -434,6 +551,20 @@ async fn run_voice_call_async(
         .map_err(realtime_audio_error)?;
     let mut state = VoiceCallState::default();
     let mut output = open_voice_output(&output_path)?;
+    let speaker = if options.native_speaker {
+        Some(
+            sinomo_audio::start_native_speaker_playback(
+                sinomo_audio::NativeSpeakerPlaybackConfig {
+                    device: options.speaker_device.clone(),
+                    input_sample_rate_hz: config.output_sample_rate_hz,
+                    input_sample_format: native_audio_format(config.output_format),
+                },
+            )
+            .map_err(native_audio_error)?,
+        )
+    } else {
+        None
+    };
     let input_video_frames = send_voice_video_frames(
         &mut session,
         &mut state,
@@ -445,8 +576,103 @@ async fn run_voice_call_async(
         &options,
         output.as_mut(),
         &output_path,
+        speaker.as_ref(),
     )
     .await?;
+    let input_sequence;
+    let mut input_video_frames = input_video_frames;
+    if options.native_microphone || options.native_camera {
+        let native_report = run_native_voice_loop(
+            &mut session,
+            &mut state,
+            &store,
+            &session_id,
+            &provider_id,
+            &model,
+            &config,
+            &options,
+            output.as_mut(),
+            &output_path,
+            speaker.as_ref(),
+            input_video_frames,
+        )
+        .await?;
+        input_sequence = native_report.input_chunks;
+        input_video_frames = native_report.input_video_frames;
+    } else {
+        input_sequence = run_raw_voice_input_loop(
+            &mut session,
+            &mut state,
+            &store,
+            &session_id,
+            &provider_id,
+            &model,
+            &config,
+            &options,
+            output.as_mut(),
+            &output_path,
+            speaker.as_ref(),
+        )
+        .await?;
+    }
+    if input_sequence > 0 {
+        session.flush_turn().await.map_err(realtime_audio_error)?;
+    } else if input_video_frames > 0 {
+        session
+            .request_response()
+            .await
+            .map_err(realtime_audio_error)?;
+    }
+
+    loop {
+        let event = session
+            .receive_event()
+            .await
+            .map_err(realtime_audio_error)?;
+        if handle_voice_event(
+            event,
+            &mut state,
+            &store,
+            &session_id,
+            &provider_id,
+            &model,
+            &config,
+            output.as_mut(),
+            &output_path,
+            speaker.as_ref(),
+            true,
+        )? {
+            break;
+        }
+    }
+    let _ = session.close().await;
+    output.flush().map_err(|source| CliError::Io {
+        path: output_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(VoiceCallReport {
+        session_id,
+        provider: provider_id,
+        model,
+        input_chunks: input_sequence,
+        input_video_frames,
+        output_chunks: state.output_sequence,
+    })
+}
+
+async fn run_raw_voice_input_loop(
+    session: &mut sinomo_lm::RealtimeAudioSession,
+    state: &mut VoiceCallState,
+    store: &sinomo_agent::FileAgentSessionStore,
+    session_id: &SessionId,
+    provider_id: &str,
+    model: &str,
+    config: &sinomo_lm::RealtimeAudioSessionConfig,
+    options: &VoiceCallOptions,
+    output: &mut dyn Write,
+    output_path: &Path,
+    speaker: Option<&sinomo_audio::NativeSpeakerPlayback>,
+) -> Result<u64, CliError> {
     let mut input = if options.audio_input {
         Some(open_voice_input(options.input.as_ref())?)
     } else {
@@ -475,8 +701,8 @@ async fn run_voice_call_async(
         let mut segment = sinomo_agent::AgentAudioSegmentInput::new(
             sinomo_agent::AgentAudioDirection::Input,
             input_sequence,
-            provider_id.clone(),
-            model.clone(),
+            provider_id.to_string(),
+            model.to_string(),
             config.input_sample_rate_hz,
             config.input_format,
         );
@@ -499,15 +725,16 @@ async fn run_voice_call_async(
         input_sequence = input_sequence.saturating_add(1);
         if options.pace {
             if receive_voice_events_for(
-                &mut session,
-                &mut state,
-                &store,
-                &session_id,
-                &provider_id,
-                &model,
-                &config,
-                output.as_mut(),
-                &output_path,
+                session,
+                state,
+                store,
+                session_id,
+                provider_id,
+                model,
+                config,
+                output,
+                output_path,
+                speaker,
                 Duration::from_millis(options.chunk_ms),
                 false,
             )
@@ -517,63 +744,225 @@ async fn run_voice_call_async(
             }
         } else {
             let _ = receive_voice_events_for(
-                &mut session,
-                &mut state,
-                &store,
-                &session_id,
-                &provider_id,
-                &model,
-                &config,
-                output.as_mut(),
-                &output_path,
+                session,
+                state,
+                store,
+                session_id,
+                provider_id,
+                model,
+                config,
+                output,
+                output_path,
+                speaker,
                 Duration::from_millis(1),
                 false,
             )
             .await?;
         }
     }
-    if input_sequence > 0 {
-        session.flush_turn().await.map_err(realtime_audio_error)?;
-    } else if input_video_frames > 0 {
-        session
-            .request_response()
-            .await
-            .map_err(realtime_audio_error)?;
-    }
+    Ok(input_sequence)
+}
 
-    loop {
-        let event = session
-            .receive_event()
+async fn run_native_voice_loop(
+    session: &mut sinomo_lm::RealtimeAudioSession,
+    state: &mut VoiceCallState,
+    store: &sinomo_agent::FileAgentSessionStore,
+    session_id: &SessionId,
+    provider_id: &str,
+    model: &str,
+    config: &sinomo_lm::RealtimeAudioSessionConfig,
+    options: &VoiceCallOptions,
+    output: &mut dyn Write,
+    output_path: &Path,
+    speaker: Option<&sinomo_audio::NativeSpeakerPlayback>,
+    initial_video_frames: u64,
+) -> Result<NativeVoiceLoopReport, CliError> {
+    let microphone = if options.native_microphone {
+        let mut capture_config = sinomo_audio::NativeAudioCaptureConfig::new(
+            config.input_sample_rate_hz,
+            native_audio_format(config.input_format),
+        );
+        capture_config.device = options.microphone_device.clone();
+        capture_config.chunk_ms = options.chunk_ms;
+        Some(
+            sinomo_audio::start_native_microphone_capture(capture_config)
+                .map_err(native_audio_error)?,
+        )
+    } else {
+        None
+    };
+    let camera = if options.native_camera {
+        let camera_config = sinomo_video::NativeVideoCaptureConfig {
+            device: options.camera_device.clone(),
+            frame_interval_ms: options.video_frame_ms,
+            ..Default::default()
+        };
+        Some(sinomo_video::start_native_camera_capture(camera_config).map_err(native_video_error)?)
+    } else {
+        None
+    };
+    let deadline = Instant::now() + Duration::from_millis(options.call_ms.unwrap_or(30_000).max(1));
+    let mut input_sequence = 0_u64;
+    let mut video_sequence = initial_video_frames;
+    while Instant::now() < deadline {
+        let mut progressed = false;
+        if let Some(microphone) = &microphone {
+            if let Some(chunk) = microphone
+                .recv_timeout(Duration::from_millis(5))
+                .map_err(native_audio_error)?
+            {
+                send_voice_audio_chunk(
+                    session,
+                    state,
+                    store,
+                    session_id,
+                    provider_id,
+                    model,
+                    config,
+                    options,
+                    input_sequence,
+                    chunk.audio,
+                )
+                .await?;
+                input_sequence = input_sequence.saturating_add(1);
+                progressed = true;
+            }
+        }
+        if let Some(camera) = &camera {
+            if let Some(frame) = camera
+                .recv_timeout(Duration::from_millis(1))
+                .map_err(native_video_error)?
+            {
+                send_voice_video_frame_bytes(
+                    session,
+                    state,
+                    store,
+                    session_id,
+                    provider_id,
+                    model,
+                    options,
+                    frame.bytes,
+                    sinomo_lm::RealtimeVideoFrameFormat::Jpeg,
+                    video_sequence,
+                    Some(video_sequence.saturating_mul(options.video_frame_ms)),
+                    Some(frame.width),
+                    Some(frame.height),
+                )
+                .await?;
+                video_sequence = video_sequence.saturating_add(1);
+                progressed = true;
+            }
+        }
+        match session
+            .receive_event_with_timeout(Duration::from_millis(1))
             .await
-            .map_err(realtime_audio_error)?;
-        if handle_voice_event(
-            event,
-            &mut state,
-            &store,
-            &session_id,
-            &provider_id,
-            &model,
-            &config,
-            output.as_mut(),
-            &output_path,
-            true,
-        )? {
-            break;
+        {
+            Ok(event) => {
+                if handle_voice_event(
+                    event,
+                    state,
+                    store,
+                    session_id,
+                    provider_id,
+                    model,
+                    config,
+                    output,
+                    output_path,
+                    speaker,
+                    false,
+                )? {
+                    break;
+                }
+                progressed = true;
+            }
+            Err(sinomo_lm::RealtimeAudioError::Timeout { .. }) => {}
+            Err(error) => return Err(realtime_audio_error(error)),
+        }
+        if !progressed {
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
-    let _ = session.close().await;
-    output.flush().map_err(|source| CliError::Io {
-        path: output_path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    Ok(VoiceCallReport {
-        session_id,
-        provider: provider_id,
-        model,
+    Ok(NativeVoiceLoopReport {
         input_chunks: input_sequence,
-        input_video_frames,
-        output_chunks: state.output_sequence,
+        input_video_frames: video_sequence,
     })
+}
+
+async fn send_voice_audio_chunk(
+    session: &mut sinomo_lm::RealtimeAudioSession,
+    state: &mut VoiceCallState,
+    store: &sinomo_agent::FileAgentSessionStore,
+    session_id: &SessionId,
+    provider_id: &str,
+    model: &str,
+    config: &sinomo_lm::RealtimeAudioSessionConfig,
+    options: &VoiceCallOptions,
+    sequence: u64,
+    bytes: Vec<u8>,
+) -> Result<(), CliError> {
+    let mut segment = sinomo_agent::AgentAudioSegmentInput::new(
+        sinomo_agent::AgentAudioDirection::Input,
+        sequence,
+        provider_id.to_string(),
+        model.to_string(),
+        config.input_sample_rate_hz,
+        config.input_format,
+    );
+    segment.provider_session_id = state.provider_session_id.clone();
+    segment.duration_ms = audio_duration_ms(
+        bytes.len(),
+        config.input_sample_rate_hz,
+        config.input_format,
+        1,
+    );
+    store
+        .append_audio_segment(session_id, segment, &bytes)
+        .map_err(agent_session_store_error)?;
+    let mut chunk = sinomo_lm::RealtimeAudioInputChunk::new(bytes);
+    chunk.force_listen = options.force_listen;
+    session
+        .send_audio(&chunk)
+        .await
+        .map_err(realtime_audio_error)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_voice_video_frame_bytes(
+    session: &mut sinomo_lm::RealtimeAudioSession,
+    state: &mut VoiceCallState,
+    store: &sinomo_agent::FileAgentSessionStore,
+    session_id: &SessionId,
+    provider_id: &str,
+    model: &str,
+    options: &VoiceCallOptions,
+    bytes: Vec<u8>,
+    format: sinomo_lm::RealtimeVideoFrameFormat,
+    sequence: u64,
+    timestamp_ms: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<(), CliError> {
+    let mut frame_input = sinomo_lm::RealtimeVideoFrameInput::new(bytes.clone(), format, sequence);
+    frame_input.detail = options.video_detail;
+    frame_input.timestamp_ms = timestamp_ms;
+    let mut record_input = sinomo_agent::AgentVideoFrameInput::new(
+        sinomo_agent::AgentVideoDirection::Input,
+        sequence,
+        provider_id.to_string(),
+        model.to_string(),
+        format,
+    );
+    record_input.provider_session_id = state.provider_session_id.clone();
+    record_input.timestamp_ms = frame_input.timestamp_ms;
+    record_input.width = width;
+    record_input.height = height;
+    store
+        .append_video_frame(session_id, record_input, &bytes)
+        .map_err(agent_session_store_error)?;
+    session
+        .send_video_frame(&frame_input)
+        .await
+        .map_err(realtime_audio_error)
 }
 
 async fn send_voice_video_frames(
@@ -587,6 +976,7 @@ async fn send_voice_video_frames(
     options: &VoiceCallOptions,
     output: &mut dyn Write,
     output_path: &Path,
+    speaker: Option<&sinomo_audio::NativeSpeakerPlayback>,
 ) -> Result<u64, CliError> {
     let mut sequence = 0_u64;
     for frame_path in &options.video_frames {
@@ -635,6 +1025,7 @@ async fn send_voice_video_frames(
                 config,
                 output,
                 output_path,
+                speaker,
                 Duration::from_millis(options.video_frame_ms),
                 false,
             )
@@ -657,6 +1048,7 @@ async fn receive_voice_events_for(
     config: &sinomo_lm::RealtimeAudioSessionConfig,
     output: &mut dyn Write,
     output_path: &Path,
+    speaker: Option<&sinomo_audio::NativeSpeakerPlayback>,
     duration: Duration,
     stop_on_turn_end: bool,
 ) -> Result<bool, CliError> {
@@ -676,6 +1068,7 @@ async fn receive_voice_events_for(
                     config,
                     output,
                     output_path,
+                    speaker,
                     stop_on_turn_end,
                 )? {
                     return Ok(true);
@@ -698,6 +1091,7 @@ fn handle_voice_event(
     config: &sinomo_lm::RealtimeAudioSessionConfig,
     output: &mut dyn Write,
     output_path: &Path,
+    speaker: Option<&sinomo_audio::NativeSpeakerPlayback>,
     stop_on_turn_end: bool,
 ) -> Result<bool, CliError> {
     match event {
@@ -720,6 +1114,9 @@ fn handle_voice_event(
                 path: output_path.display().to_string(),
                 detail: source.to_string(),
             })?;
+            if let Some(speaker) = speaker {
+                speaker.write(&audio).map_err(native_audio_error)?;
+            }
             let mut segment = sinomo_agent::AgentAudioSegmentInput::new(
                 sinomo_agent::AgentAudioDirection::Output,
                 state.output_sequence,
@@ -837,6 +1234,29 @@ fn realtime_audio_error(error: sinomo_lm::RealtimeAudioError) -> CliError {
     }
 }
 
+fn native_audio_format(
+    format: sinomo_lm::RealtimeAudioSampleFormat,
+) -> sinomo_audio::NativeAudioSampleFormat {
+    match format {
+        sinomo_lm::RealtimeAudioSampleFormat::Pcm16Le => {
+            sinomo_audio::NativeAudioSampleFormat::Pcm16Le
+        }
+        sinomo_lm::RealtimeAudioSampleFormat::F32Le => sinomo_audio::NativeAudioSampleFormat::F32Le,
+    }
+}
+
+fn native_audio_error(error: sinomo_audio::NativeAudioError) -> CliError {
+    CliError::Parse {
+        detail: error.to_string(),
+    }
+}
+
+fn native_video_error(error: sinomo_video::NativeVideoError) -> CliError {
+    CliError::Parse {
+        detail: error.to_string(),
+    }
+}
+
 fn agent_session_store_error(error: sinomo_agent::AgentSessionStoreError) -> CliError {
     CliError::Io {
         path: "agent session store".to_string(),
@@ -917,6 +1337,30 @@ mod tests {
         assert_eq!(options.video_frames.len(), 1);
         assert!(options.audio_input);
         assert_eq!(options.input, None);
+    }
+
+    #[test]
+    fn voice_call_options_accept_native_media_devices() {
+        let command = parse_voice_command(&[
+            "call".to_string(),
+            "--native-mic".to_string(),
+            "--camera-device".to_string(),
+            "/dev/video0".to_string(),
+            "--speaker-device".to_string(),
+            "default".to_string(),
+            "--call-ms".to_string(),
+            "1500".to_string(),
+        ])
+        .expect("voice command");
+        let VoiceCliCommand::Call(options) = command else {
+            panic!("expected call");
+        };
+        assert!(options.native_microphone);
+        assert!(options.native_camera);
+        assert!(options.native_speaker);
+        assert_eq!(options.camera_device.as_deref(), Some("/dev/video0"));
+        assert_eq!(options.speaker_device.as_deref(), Some("default"));
+        assert_eq!(options.call_ms, Some(1500));
     }
 
     #[test]

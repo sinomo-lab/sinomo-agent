@@ -448,6 +448,45 @@ pub struct ChatMediaCallState {
     pub notice: Option<String>,
 }
 
+#[cfg_attr(test, allow(dead_code))]
+struct ChatNativeMediaRuntime {
+    control_tx: mpsc::Sender<ChatMediaCallControl>,
+    event_rx: Receiver<ChatMediaCallWorkerEvent>,
+}
+
+#[cfg_attr(test, allow(dead_code))]
+impl ChatNativeMediaRuntime {
+    fn send_control(&self, control: ChatMediaCallControl) {
+        let _ = self.control_tx.send(control);
+    }
+}
+
+impl Drop for ChatNativeMediaRuntime {
+    fn drop(&mut self) {
+        let _ = self.control_tx.send(ChatMediaCallControl::Stop);
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+#[derive(Clone, Debug)]
+enum ChatMediaCallControl {
+    Stop,
+    SetMicEnabled(bool),
+    SetCameraEnabled(bool),
+}
+
+#[cfg_attr(test, allow(dead_code))]
+#[derive(Debug)]
+enum ChatMediaCallWorkerEvent {
+    Ready(String),
+    InputAudioChunk,
+    InputVideoFrame,
+    OutputAudioChunk,
+    Notice(String),
+    Error(String),
+    Done(String),
+}
+
 impl Default for ChatMediaCallState {
     fn default() -> Self {
         Self {
@@ -584,6 +623,7 @@ pub struct ChatState {
     pub tool_calls: Vec<ChatToolActivity>,
     pub control: ChatControlOverview,
     pub media_call: ChatMediaCallState,
+    media_call_runtime: Option<ChatNativeMediaRuntime>,
     activity_panel_open: bool,
     pub scroll: f32,
     pub stick_bottom: bool,
@@ -682,6 +722,7 @@ impl ChatState {
             tool_calls: Vec::new(),
             control: ChatControlOverview::default(),
             media_call: ChatMediaCallState::default(),
+            media_call_runtime: None,
             activity_panel_open: false,
             scroll: 0.0,
             stick_bottom: true,
@@ -2086,6 +2127,7 @@ impl ChatState {
         self.tool_calls.clear();
         self.control = ChatControlOverview::default();
         self.media_call = ChatMediaCallState::default();
+        self.media_call_runtime = None;
         self.scroll = f32::MAX;
         self.stick_bottom = true;
         self.session_edit_id = None;
@@ -2155,6 +2197,7 @@ impl ChatState {
             let model = self.media_call.model.clone();
             self.media_call.active = false;
             self.media_call.started_at = None;
+            self.media_call_runtime = None;
             self.media_call.notice = Some("call ended".to_string());
             self.notice = Some("media call ended".to_string());
             self.push_activity(
@@ -2175,6 +2218,16 @@ impl ChatState {
             return;
         }
 
+        let (started, native_notice) = self.start_native_media_call_runtime(&provider, &model);
+        if !started {
+            self.media_call.active = false;
+            self.media_call.started_at = None;
+            self.media_call.notice = Some(native_notice.clone());
+            self.notice = Some(format!("media call failed: {native_notice}"));
+            self.push_activity("media call", native_notice, ActivityTone::Warn);
+            return;
+        }
+
         self.media_call.active = true;
         self.media_call.provider = provider.clone();
         self.media_call.model = model.clone();
@@ -2182,17 +2235,127 @@ impl ChatState {
         self.media_call.input_audio_chunks = 0;
         self.media_call.input_video_frames = 0;
         self.media_call.output_audio_chunks = 0;
-        self.media_call.notice = Some("connected".to_string());
+        self.media_call.notice = Some(native_notice.clone());
         self.notice = Some("media call started".to_string());
         self.push_activity(
             "media call",
-            format!("started {provider} / {model}"),
+            format!("started {provider} / {model} · {native_notice}"),
             ActivityTone::Running,
         );
     }
 
+    fn start_native_media_call_runtime(&mut self, provider: &str, model: &str) -> (bool, String) {
+        #[cfg(test)]
+        {
+            let _ = (provider, model);
+            self.media_call_runtime = None;
+            return (true, "native media disabled in tests".to_string());
+        }
+        #[cfg(not(test))]
+        {
+            let provider_id = self
+                .current_provider()
+                .map(|provider| provider.id.clone())
+                .filter(|provider| !provider.trim().is_empty())
+                .unwrap_or_else(|| provider.to_string());
+            let model = if model.trim().is_empty() || model == "model pending" {
+                self.info.model.clone()
+            } else {
+                model.to_string()
+            };
+            let (event_tx, event_rx) = mpsc::channel();
+            let (control_tx, control_rx) = mpsc::channel();
+            let data_dir = self.data_dir.clone();
+            match thread::Builder::new()
+                .name("sinomo-app-media-call".to_string())
+                .spawn(move || {
+                    run_chat_media_call_worker(data_dir, provider_id, model, event_tx, control_rx);
+                }) {
+                Ok(_worker) => {
+                    self.media_call_runtime = Some(ChatNativeMediaRuntime {
+                        control_tx,
+                        event_rx,
+                    });
+                    (true, "native media connecting".to_string())
+                }
+                Err(error) => {
+                    self.media_call_runtime = None;
+                    (
+                        false,
+                        format!("native media worker failed to start: {error}"),
+                    )
+                }
+            }
+        }
+    }
+
+    fn pump_media_call_runtime(&mut self) -> bool {
+        if !self.media_call.active {
+            return false;
+        }
+        let Some(runtime) = self.media_call_runtime.as_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        let mut ended = false;
+        loop {
+            let event = match runtime.event_rx.try_recv() {
+                Ok(event) => event,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    ended = true;
+                    ChatMediaCallWorkerEvent::Done("media call worker stopped".to_string())
+                }
+            };
+            changed = true;
+            match event {
+                ChatMediaCallWorkerEvent::Ready(detail)
+                | ChatMediaCallWorkerEvent::Notice(detail) => {
+                    self.media_call.notice = Some(detail);
+                }
+                ChatMediaCallWorkerEvent::InputAudioChunk => {
+                    self.media_call.input_audio_chunks =
+                        self.media_call.input_audio_chunks.saturating_add(1);
+                }
+                ChatMediaCallWorkerEvent::InputVideoFrame => {
+                    self.media_call.input_video_frames =
+                        self.media_call.input_video_frames.saturating_add(1);
+                }
+                ChatMediaCallWorkerEvent::OutputAudioChunk => {
+                    self.media_call.output_audio_chunks =
+                        self.media_call.output_audio_chunks.saturating_add(1);
+                }
+                ChatMediaCallWorkerEvent::Error(detail) => {
+                    self.media_call.active = false;
+                    self.media_call.started_at = None;
+                    self.media_call.notice = Some(format!("media call failed: {detail}"));
+                    self.notice = Some(format!("media call failed: {detail}"));
+                    self.push_activity("media call", detail, ActivityTone::Warn);
+                    ended = true;
+                    break;
+                }
+                ChatMediaCallWorkerEvent::Done(detail) => {
+                    self.media_call.active = false;
+                    self.media_call.started_at = None;
+                    self.media_call.notice = Some(detail);
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        if ended {
+            self.media_call_runtime = None;
+        }
+        changed
+    }
+
     pub fn toggle_media_call_mic(&mut self) {
         self.media_call.mic_enabled = !self.media_call.mic_enabled;
+        if let Some(runtime) = &self.media_call_runtime {
+            runtime.send_control(ChatMediaCallControl::SetMicEnabled(
+                self.media_call.mic_enabled,
+            ));
+        }
         let detail = if self.media_call.mic_enabled {
             "microphone enabled"
         } else {
@@ -2204,6 +2367,11 @@ impl ChatState {
 
     pub fn toggle_media_call_camera(&mut self) {
         self.media_call.camera_enabled = !self.media_call.camera_enabled;
+        if let Some(runtime) = &self.media_call_runtime {
+            runtime.send_control(ChatMediaCallControl::SetCameraEnabled(
+                self.media_call.camera_enabled,
+            ));
+        }
         let detail = if self.media_call.camera_enabled {
             "camera enabled"
         } else {
@@ -3398,6 +3566,362 @@ fn composer_control_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 
         theme.typography.body_font_size = COMPOSER_TEXT_SIZE;
         theme.typography.body_line_height = COMPOSER_LINE_HEIGHT;
         theme
+    }
+}
+
+#[cfg(not(test))]
+fn run_chat_media_call_worker(
+    data_dir: Arc<SinomoDataDir>,
+    provider_id: String,
+    model: String,
+    event_tx: mpsc::Sender<ChatMediaCallWorkerEvent>,
+    control_rx: Receiver<ChatMediaCallControl>,
+) {
+    let result_tx = event_tx.clone();
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("tokio runtime failed: {error}"))
+        .and_then(|runtime| {
+            runtime.block_on(run_chat_media_call_async(
+                data_dir,
+                provider_id,
+                model,
+                event_tx,
+                control_rx,
+            ))
+        });
+    match result {
+        Ok(()) => {
+            let _ = result_tx.send(ChatMediaCallWorkerEvent::Done("call ended".to_string()));
+        }
+        Err(error) => {
+            let _ = result_tx.send(ChatMediaCallWorkerEvent::Error(error));
+        }
+    }
+}
+
+#[cfg(not(test))]
+async fn run_chat_media_call_async(
+    data_dir: Arc<SinomoDataDir>,
+    provider_id: String,
+    model: String,
+    event_tx: mpsc::Sender<ChatMediaCallWorkerEvent>,
+    control_rx: Receiver<ChatMediaCallControl>,
+) -> Result<(), String> {
+    let provider = sinomo_lm::RealtimeAudioProvider::from_id(&provider_id)
+        .ok_or_else(|| format!("unsupported realtime provider `{provider_id}`"))?;
+    let model = if model.trim().is_empty() {
+        provider.default_model().to_string()
+    } else {
+        model
+    };
+    let mut config = sinomo_lm::RealtimeAudioSessionConfig::new(provider, model);
+    config.turn_detection = sinomo_lm::RealtimeAudioTurnDetection::SemanticVad;
+    config.api_key = chat_media_realtime_api_key(&data_dir, provider)?;
+
+    let mut issues = Vec::new();
+    let mut microphone = {
+        let capture_config = sinomo_audio::NativeAudioCaptureConfig::new(
+            config.input_sample_rate_hz,
+            app_native_audio_format(config.input_format),
+        );
+        match sinomo_audio::start_native_microphone_capture(capture_config) {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                issues.push(format!("mic unavailable: {error}"));
+                None
+            }
+        }
+    };
+    let mut camera = match sinomo_video::start_native_camera_capture(Default::default()) {
+        Ok(capture) => Some(capture),
+        Err(error) => {
+            issues.push(format!("camera unavailable: {error}"));
+            None
+        }
+    };
+    let speaker = {
+        let playback_config = sinomo_audio::NativeSpeakerPlaybackConfig::new(
+            config.output_sample_rate_hz,
+            app_native_audio_format(config.output_format),
+        );
+        match sinomo_audio::start_native_speaker_playback(playback_config) {
+            Ok(playback) => Some(playback),
+            Err(error) => {
+                issues.push(format!("speaker unavailable: {error}"));
+                None
+            }
+        }
+    };
+    if microphone.is_none() && camera.is_none() {
+        return Err(format!(
+            "native mic/camera unavailable: {}",
+            issues.join("; ")
+        ));
+    }
+    if camera.is_some() {
+        config.input_video = Some(sinomo_lm::RealtimeVideoInputConfig {
+            frame_format: sinomo_lm::RealtimeVideoFrameFormat::Jpeg,
+            detail: sinomo_lm::RealtimeVideoFrameDetail::Auto,
+            max_frame_rate_hz: Some(2),
+        });
+    }
+
+    let _ = event_tx.send(ChatMediaCallWorkerEvent::Ready(chat_media_ready_notice(
+        microphone.is_some(),
+        camera.is_some(),
+        speaker.is_some(),
+        &issues,
+    )));
+    let mut mic_enabled = true;
+    let mut camera_enabled = true;
+    if drain_chat_media_controls(&control_rx, &mut mic_enabled, &mut camera_enabled) {
+        return Ok(());
+    }
+
+    let mut session = sinomo_lm::RealtimeAudioSession::connect(config.clone())
+        .await
+        .map_err(|error| format!("realtime connect failed: {error}"))?;
+    let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(
+        "realtime session connected".to_string(),
+    ));
+
+    while !drain_chat_media_controls(&control_rx, &mut mic_enabled, &mut camera_enabled) {
+        let mut progressed = false;
+        let mut microphone_stopped = false;
+        if mic_enabled && let Some(capture) = microphone.as_ref() {
+            for _ in 0..4 {
+                match capture.recv_timeout(Duration::ZERO) {
+                    Ok(Some(chunk)) => {
+                        let input = sinomo_lm::RealtimeAudioInputChunk::new(chunk.audio);
+                        session
+                            .send_audio(&input)
+                            .await
+                            .map_err(|error| format!("realtime audio send failed: {error}"))?;
+                        let _ = event_tx.send(ChatMediaCallWorkerEvent::InputAudioChunk);
+                        progressed = true;
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(format!(
+                            "microphone stopped: {error}"
+                        )));
+                        microphone_stopped = true;
+                        progressed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if microphone_stopped {
+            microphone = None;
+        }
+
+        let mut camera_stopped = false;
+        if camera_enabled && let Some(capture) = camera.as_ref() {
+            for _ in 0..2 {
+                match capture.recv_timeout(Duration::ZERO) {
+                    Ok(Some(frame)) => {
+                        let mut input = sinomo_lm::RealtimeVideoFrameInput::new(
+                            frame.bytes,
+                            sinomo_lm::RealtimeVideoFrameFormat::Jpeg,
+                            frame.sequence,
+                        );
+                        input.detail = sinomo_lm::RealtimeVideoFrameDetail::Auto;
+                        input.timestamp_ms = Some(frame.sequence.saturating_mul(500));
+                        session
+                            .send_video_frame(&input)
+                            .await
+                            .map_err(|error| format!("realtime video send failed: {error}"))?;
+                        let _ = event_tx.send(ChatMediaCallWorkerEvent::InputVideoFrame);
+                        progressed = true;
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(format!(
+                            "camera stopped: {error}"
+                        )));
+                        camera_stopped = true;
+                        progressed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if camera_stopped {
+            camera = None;
+        }
+        if microphone.is_none() && camera.is_none() {
+            return Err("native mic/camera input stopped".to_string());
+        }
+
+        match session
+            .receive_event_with_timeout(Duration::from_millis(1))
+            .await
+        {
+            Ok(event) => {
+                if handle_chat_media_realtime_event(event, speaker.as_ref(), &event_tx)? {
+                    break;
+                }
+                progressed = true;
+            }
+            Err(sinomo_lm::RealtimeAudioError::Timeout { .. }) => {}
+            Err(error) => return Err(format!("realtime receive failed: {error}")),
+        }
+        if !progressed {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    let _ = session.close().await;
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn drain_chat_media_controls(
+    control_rx: &Receiver<ChatMediaCallControl>,
+    mic_enabled: &mut bool,
+    camera_enabled: &mut bool,
+) -> bool {
+    loop {
+        match control_rx.try_recv() {
+            Ok(ChatMediaCallControl::Stop) | Err(TryRecvError::Disconnected) => return true,
+            Ok(ChatMediaCallControl::SetMicEnabled(enabled)) => *mic_enabled = enabled,
+            Ok(ChatMediaCallControl::SetCameraEnabled(enabled)) => *camera_enabled = enabled,
+            Err(TryRecvError::Empty) => return false,
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn handle_chat_media_realtime_event(
+    event: sinomo_lm::RealtimeAudioEvent,
+    speaker: Option<&sinomo_audio::NativeSpeakerPlayback>,
+    event_tx: &mpsc::Sender<ChatMediaCallWorkerEvent>,
+) -> Result<bool, String> {
+    match event {
+        sinomo_lm::RealtimeAudioEvent::SessionQueued {
+            position,
+            estimated_wait_s,
+        } => {
+            let detail = match (position, estimated_wait_s) {
+                (Some(position), Some(wait)) => {
+                    format!("realtime queued: position {position}, about {wait:.0}s")
+                }
+                (Some(position), None) => format!("realtime queued: position {position}"),
+                _ => "realtime queued".to_string(),
+            };
+            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(detail));
+        }
+        sinomo_lm::RealtimeAudioEvent::SessionCreated { .. } => {
+            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(
+                "realtime session ready".to_string(),
+            ));
+        }
+        sinomo_lm::RealtimeAudioEvent::SessionUpdated => {}
+        sinomo_lm::RealtimeAudioEvent::Listening { .. } => {
+            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(
+                "model listening".to_string(),
+            ));
+        }
+        sinomo_lm::RealtimeAudioEvent::InputSpeechStarted => {
+            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(
+                "speech detected".to_string(),
+            ));
+        }
+        sinomo_lm::RealtimeAudioEvent::InputSpeechStopped => {
+            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice("speech ended".to_string()));
+        }
+        sinomo_lm::RealtimeAudioEvent::OutputAudioDelta { audio, .. } => {
+            if !audio.is_empty() {
+                if let Some(speaker) = speaker {
+                    speaker
+                        .write(&audio)
+                        .map_err(|error| format!("speaker playback failed: {error}"))?;
+                }
+                let _ = event_tx.send(ChatMediaCallWorkerEvent::OutputAudioChunk);
+            }
+        }
+        sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta { delta } => {
+            if !delta.trim().is_empty() {
+                let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(delta));
+            }
+        }
+        sinomo_lm::RealtimeAudioEvent::ResponseDone => {
+            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(
+                "response complete".to_string(),
+            ));
+        }
+        sinomo_lm::RealtimeAudioEvent::Closed { reason } => {
+            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(format!(
+                "realtime closed: {reason}"
+            )));
+            return Ok(true);
+        }
+        sinomo_lm::RealtimeAudioEvent::Error { code, message } => {
+            return Err(format!("realtime error {code}: {message}"));
+        }
+        sinomo_lm::RealtimeAudioEvent::Raw { .. } => {}
+    }
+    Ok(false)
+}
+
+#[cfg(not(test))]
+fn chat_media_ready_notice(
+    microphone: bool,
+    camera: bool,
+    speaker: bool,
+    issues: &[String],
+) -> String {
+    let mut ready = Vec::new();
+    if microphone {
+        ready.push("mic");
+    }
+    if camera {
+        ready.push("camera");
+    }
+    if speaker {
+        ready.push("speaker");
+    }
+    if issues.is_empty() {
+        format!("native {} ready", ready.join(", "))
+    } else {
+        format!("native {} ready; {}", ready.join(", "), issues.join("; "))
+    }
+}
+
+#[cfg(not(test))]
+fn chat_media_realtime_api_key(
+    data_dir: &SinomoDataDir,
+    provider: sinomo_lm::RealtimeAudioProvider,
+) -> Result<Option<String>, String> {
+    match provider {
+        sinomo_lm::RealtimeAudioProvider::OpenAi => sinomo_lm::OpenAiProvider::default()
+            .api_key()
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        sinomo_lm::RealtimeAudioProvider::MiniCpmO => {
+            if let Some((api_key, _source)) =
+                sinomo_lm::provider_api_key_from_env(provider.provider_id())
+            {
+                return Ok(Some(api_key));
+            }
+            sinomo_lm::stored_provider_api_key_in_data_dir(data_dir, provider.provider_id())
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn app_native_audio_format(
+    format: sinomo_lm::RealtimeAudioSampleFormat,
+) -> sinomo_audio::NativeAudioSampleFormat {
+    match format {
+        sinomo_lm::RealtimeAudioSampleFormat::Pcm16Le => {
+            sinomo_audio::NativeAudioSampleFormat::Pcm16Le
+        }
+        sinomo_lm::RealtimeAudioSampleFormat::F32Le => sinomo_audio::NativeAudioSampleFormat::F32Le,
     }
 }
 
@@ -8900,9 +9424,15 @@ impl ChatView {
             let list_changed = chat.pump_session_list();
             let delete_changed = chat.pump_delete();
             let channel_create_changed = chat.pump_channel_create();
-            worker_changed || list_changed || delete_changed || channel_create_changed
+            let media_changed = chat.pump_media_call_runtime();
+            worker_changed
+                || list_changed
+                || delete_changed
+                || channel_create_changed
+                || media_changed
         };
         let streaming = self.shared.chat().streaming;
+        let media_call_active = self.shared.chat().media_call.active;
 
         // Recompute the coarse signature each tick: a worker event (RuntimeInfo / Models / TurnDone,
         // or a token that resolved the selection) may have changed the selector option lists, the
@@ -8924,7 +9454,7 @@ impl ChatView {
             self.idle_frames
                 .set(self.idle_frames.get().saturating_add(1));
         }
-        if streaming || self.idle_frames.get() < PUMP_IDLE_BUDGET {
+        if streaming || media_call_active || self.idle_frames.get() < PUMP_IDLE_BUDGET {
             ctx.request_animation_frame();
             self.pump_alive.set(true);
         }
