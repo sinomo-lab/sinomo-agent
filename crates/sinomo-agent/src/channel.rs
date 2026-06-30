@@ -9,7 +9,7 @@ use sinomo_lm::{
 };
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -530,6 +530,52 @@ pub trait AgentChannelStore: Send + Sync {
         file_name: &str,
         bytes: &[u8],
     ) -> Result<String, AgentChannelStoreError>;
+}
+
+impl<T> AgentChannelStore for &T
+where
+    T: AgentChannelStore + ?Sized,
+{
+    fn save_channel(&self, channel: &AgentChannel) -> Result<(), AgentChannelStoreError> {
+        (**self).save_channel(channel)
+    }
+
+    fn load_channel(
+        &self,
+        channel_id: &SessionId,
+    ) -> Result<Option<AgentChannel>, AgentChannelStoreError> {
+        (**self).load_channel(channel_id)
+    }
+
+    fn list_channels(&self) -> Result<Vec<AgentChannel>, AgentChannelStoreError> {
+        (**self).list_channels()
+    }
+
+    fn append_message(
+        &self,
+        channel_id: &SessionId,
+        message: &AgentChannelMessage,
+    ) -> Result<(), AgentChannelStoreError> {
+        (**self).append_message(channel_id, message)
+    }
+
+    fn append_turn(
+        &self,
+        channel_id: &SessionId,
+        turn: &AgentChannelTurn,
+    ) -> Result<(), AgentChannelStoreError> {
+        (**self).append_turn(channel_id, turn)
+    }
+
+    fn save_attachment(
+        &self,
+        channel_id: &SessionId,
+        attachment_id: &TaskId,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<String, AgentChannelStoreError> {
+        (**self).save_attachment(channel_id, attachment_id, file_name, bytes)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1066,7 +1112,22 @@ pub enum AgentChannelRuntimeError {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentChannelTurnReport {
     pub turn: AgentChannelTurn,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<AgentChannelTurn>,
     pub latest_user_message: AgentChannelMessage,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentChannelLoopConfig {
+    pub max_agent_messages_per_ingress: usize,
+}
+
+impl Default for AgentChannelLoopConfig {
+    fn default() -> Self {
+        Self {
+            max_agent_messages_per_ingress: 8,
+        }
+    }
 }
 
 pub struct AgentChannelRuntime<S, E>
@@ -1078,6 +1139,7 @@ where
     store: S,
     executor: E,
     sessions: BTreeMap<TaskId, AgentSession>,
+    loop_config: AgentChannelLoopConfig,
 }
 
 impl<S, E> AgentChannelRuntime<S, E>
@@ -1104,7 +1166,13 @@ where
             store,
             executor,
             sessions,
+            loop_config: AgentChannelLoopConfig::default(),
         }
+    }
+
+    pub fn with_loop_config(mut self, loop_config: AgentChannelLoopConfig) -> Self {
+        self.loop_config = loop_config;
+        self
     }
 
     pub fn channel(&self) -> &AgentChannel {
@@ -1187,22 +1255,134 @@ where
         source: AgentChannelSource,
         on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
     ) -> Result<AgentChannelTurnReport, AgentChannelRuntimeError> {
+        self.send_user_message_from_with_attachments(
+            user_id,
+            display_name,
+            content,
+            source,
+            Vec::new(),
+            on_event,
+        )
+    }
+
+    pub fn send_user_message_from_with_attachments(
+        &mut self,
+        user_id: impl Into<String>,
+        display_name: impl Into<String>,
+        content: impl Into<String>,
+        source: AgentChannelSource,
+        attachments: Vec<AgentChannelAttachment>,
+        on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
+    ) -> Result<AgentChannelTurnReport, AgentChannelRuntimeError> {
         if self.channel.is_deleted() {
             return Err(AgentChannelRuntimeError::Deleted);
         }
-        let latest_user_message =
-            self.channel
-                .append_user_message(user_id, display_name, content, source);
+        let latest_user_message = self.channel.append_user_message_with_attachments(
+            user_id,
+            display_name,
+            content,
+            source,
+            attachments,
+        );
         self.store
             .append_message(&self.channel.channel_id, &latest_user_message)?;
         self.store.save_channel(&self.channel)?;
 
+        let turns = self.process_pending_channel_messages(latest_user_message.clone(), on_event)?;
+        let turn = turns.first().cloned().unwrap_or_else(|| AgentChannelTurn {
+            turn_id: TaskId::generate(),
+            channel_id: self.channel.channel_id.clone(),
+            trigger_message_id: latest_user_message.message_id.clone(),
+            decisions: Vec::new(),
+            response_message_ids: Vec::new(),
+            system_message_ids: Vec::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+        });
+        Ok(AgentChannelTurnReport {
+            turn,
+            turns,
+            latest_user_message,
+        })
+    }
+
+    fn process_pending_channel_messages(
+        &mut self,
+        initial_message: AgentChannelMessage,
+        on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
+    ) -> Result<Vec<AgentChannelTurn>, AgentChannelRuntimeError> {
+        let mut queue = VecDeque::from([(initial_message, true)]);
+        let mut turns = Vec::new();
+        let mut emitted_agent_messages = 0usize;
+        let mut limit_notice_emitted = false;
+
+        while let Some((trigger_message, emit_no_response_if_silent)) = queue.pop_front() {
+            let outcome = self.process_trigger_message(
+                &trigger_message,
+                emit_no_response_if_silent,
+                &mut emitted_agent_messages,
+                &mut limit_notice_emitted,
+                on_event,
+            )?;
+            for message in outcome.response_messages {
+                if emitted_agent_messages < self.loop_config.max_agent_messages_per_ingress {
+                    queue.push_back((message, false));
+                }
+            }
+            turns.push(outcome.turn);
+            if emitted_agent_messages >= self.loop_config.max_agent_messages_per_ingress {
+                queue.clear();
+            }
+        }
+
+        self.store.save_channel(&self.channel)?;
+        Ok(turns)
+    }
+
+    fn process_trigger_message(
+        &mut self,
+        trigger_message: &AgentChannelMessage,
+        emit_no_response_if_silent: bool,
+        emitted_agent_messages: &mut usize,
+        limit_notice_emitted: &mut bool,
+        on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
+    ) -> Result<AgentChannelTriggerOutcome, AgentChannelRuntimeError> {
         let mut decisions = Vec::new();
         let mut response_message_ids = Vec::new();
         let mut system_message_ids = Vec::new();
+        let mut response_messages = Vec::new();
         let participants = self.channel.enabled_participants_in_order();
+        let trigger_author_participant_id = trigger_agent_participant_id(trigger_message);
         for participant in participants {
             let participant_id = participant.participant_id.clone();
+            if trigger_author_participant_id.as_ref() == Some(&participant_id) {
+                continue;
+            }
+            if *emitted_agent_messages >= self.loop_config.max_agent_messages_per_ingress {
+                if !*limit_notice_emitted {
+                    let system = self.channel.append_system_info(
+                        format!(
+                            "Agent channel paused after reaching the per-message response limit ({}).",
+                            self.loop_config.max_agent_messages_per_ingress
+                        ),
+                        AgentChannelSource::system(serde_json::json!({
+                            "channel_id": self.channel.channel_id,
+                            "event_type": "agent_channel_response_limit",
+                            "max_agent_messages_per_ingress": self.loop_config.max_agent_messages_per_ingress
+                        })),
+                    );
+                    self.store
+                        .append_message(&self.channel.channel_id, &system)?;
+                    on_event(AgentChannelRuntimeEvent::System {
+                        channel_id: self.channel.channel_id.clone(),
+                        message_id: system.message_id.clone(),
+                        message_kind: system.message_kind.clone(),
+                        text: system.content.clone(),
+                    });
+                    system_message_ids.push(system.message_id);
+                    *limit_notice_emitted = true;
+                }
+                break;
+            }
             self.ensure_session_for_participant(&participant);
             self.sync_participant(&participant_id)?;
             let current_participant = self
@@ -1220,7 +1400,7 @@ where
             let decision = match self.executor.decide_speak(
                 &self.channel,
                 &current_participant,
-                &latest_user_message,
+                trigger_message,
                 session,
             ) {
                 Ok(decision) => decision,
@@ -1306,13 +1486,15 @@ where
             self.store
                 .append_message(&self.channel.channel_id, &message)?;
             response_message_ids.push(message.message_id.clone());
+            response_messages.push(message.clone());
+            *emitted_agent_messages = (*emitted_agent_messages).saturating_add(1);
             if let Some(participant) = self.channel.participant_mut(&participant_id) {
                 participant.observed_through_sequence =
                     participant.observed_through_sequence.max(message.sequence);
             }
         }
 
-        if response_message_ids.is_empty() {
+        if emit_no_response_if_silent && response_message_ids.is_empty() {
             let system = self.channel.append_system_info(
                 "No agent responded.",
                 AgentChannelSource::system(serde_json::json!({
@@ -1334,17 +1516,16 @@ where
         let turn = AgentChannelTurn {
             turn_id: TaskId::generate(),
             channel_id: self.channel.channel_id.clone(),
-            trigger_message_id: latest_user_message.message_id.clone(),
+            trigger_message_id: trigger_message.message_id.clone(),
             decisions,
             response_message_ids,
             system_message_ids,
             created_at: time::OffsetDateTime::now_utc(),
         };
         self.store.append_turn(&self.channel.channel_id, &turn)?;
-        self.store.save_channel(&self.channel)?;
-        Ok(AgentChannelTurnReport {
+        Ok(AgentChannelTriggerOutcome {
             turn,
-            latest_user_message,
+            response_messages,
         })
     }
 
@@ -1376,6 +1557,18 @@ where
         };
         sync_participant_session(&channel, participant, session);
         Ok(())
+    }
+}
+
+struct AgentChannelTriggerOutcome {
+    turn: AgentChannelTurn,
+    response_messages: Vec<AgentChannelMessage>,
+}
+
+fn trigger_agent_participant_id(message: &AgentChannelMessage) -> Option<TaskId> {
+    match &message.author {
+        AgentChannelAuthor::Agent { participant_id, .. } => Some(participant_id.clone()),
+        AgentChannelAuthor::User { .. } | AgentChannelAuthor::System => None,
     }
 }
 
@@ -1633,7 +1826,10 @@ mod tests {
             .with_response("coding-agent", "Second reply");
         let seen = executor.seen_by_speaker();
         let mut runtime =
-            AgentChannelRuntime::new(channel, MemoryChannelStore::default(), executor);
+            AgentChannelRuntime::new(channel, MemoryChannelStore::default(), executor)
+                .with_loop_config(AgentChannelLoopConfig {
+                    max_agent_messages_per_ingress: 2,
+                });
         let mut events = Vec::new();
         let report = runtime
             .send_user_message("What should we do?", &mut |event| events.push(event))
@@ -1661,6 +1857,45 @@ mod tests {
                 .filter(|message| matches!(message.author, AgentChannelAuthor::Agent { .. }))
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn agent_replies_can_trigger_other_agents_without_echoing_to_author() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        channel.ensure_participant("main-agent", "Main");
+        channel.ensure_participant("coding-agent", "Coding");
+        let executor = ScriptExecutor::new()
+            .with_decision("main-agent", true)
+            .with_response("main-agent", "Main proposes a plan.")
+            .with_decision("coding-agent", true)
+            .with_response("coding-agent", "Coding adds implementation detail.");
+        let seen = executor.seen_by_speaker();
+        let mut runtime =
+            AgentChannelRuntime::new(channel, MemoryChannelStore::default(), executor)
+                .with_loop_config(AgentChannelLoopConfig {
+                    max_agent_messages_per_ingress: 3,
+                });
+
+        let report = runtime
+            .send_user_message("Discuss this.", &mut |_| {})
+            .expect("send");
+
+        assert_eq!(report.turns.len(), 2);
+        assert_eq!(report.turns[0].response_message_ids.len(), 2);
+        assert!(
+            report.turns[1].response_message_ids.len() == 1,
+            "the queued agent reply should trigger one other-agent response"
+        );
+        let seen = seen.lock().expect("seen lock").clone();
+        assert!(
+            seen.iter().any(|(agent_key, transcript)| {
+                agent_key == "coding-agent"
+                    && transcript
+                        .iter()
+                        .any(|content| content.contains("Main: Main proposes a plan."))
+            }),
+            "other agents should see the authoring agent's reply: {seen:?}"
         );
     }
 

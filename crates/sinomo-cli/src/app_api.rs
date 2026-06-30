@@ -13,16 +13,18 @@ use std::time::{Duration, Instant};
 
 use sinomo_agent::{
     AGENT_CHANNEL_APP_USER_ID, AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION, AgentCatalog, AgentChannel,
-    AgentChannelAttachment, AgentChannelAuthor, AgentChannelKind, AgentChannelMessage,
-    AgentChannelMessageKind, AgentChannelParticipant, AgentChannelSource, AgentChannelStore,
-    AgentChannelStoreError, AgentChannelTurn, AgentChannelUser, AgentContextAttachment,
-    AgentDefinition, AgentItem, AgentModelEvent, AgentRuntimeControlHost,
-    AgentRuntimeControlRegistry, AgentRuntimeEvent, AgentRuntimeEventPayload,
-    AgentSessionControlResult, AgentSessionFollowUpRequest, AgentSessionInterruptRequest,
-    AgentSessionReattachState, AgentSessionResumeRequest, AgentSessionResumeResponse,
-    AgentSessionSteerRequest, AgentTaskLifecycleStatus, AgentTaskSnapshot, AgentToolProgressEvent,
-    ContextAssemblyReport, InteractionOutput, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, TaskId, safe_agent_channel_attachment_file_name,
+    AgentChannelAttachment, AgentChannelAuthor, AgentChannelExecutorError, AgentChannelKind,
+    AgentChannelLoopConfig, AgentChannelMessage, AgentChannelMessageKind, AgentChannelParticipant,
+    AgentChannelRuntime, AgentChannelRuntimeEvent, AgentChannelSource, AgentChannelSpeakDecision,
+    AgentChannelStore, AgentChannelStoreError, AgentChannelTurn, AgentChannelTurnExecutor,
+    AgentChannelUser, AgentContextAttachment, AgentDefinition, AgentItem, AgentModelEvent,
+    AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentRuntimeEvent,
+    AgentRuntimeEventPayload, AgentSession, AgentSessionControlResult, AgentSessionFollowUpRequest,
+    AgentSessionInterruptRequest, AgentSessionReattachState, AgentSessionResumeRequest,
+    AgentSessionResumeResponse, AgentSessionSteerRequest, AgentTaskLifecycleStatus,
+    AgentTaskSnapshot, AgentToolProgressEvent, ContextAssemblyReport, InteractionOutput,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, TaskId,
+    safe_agent_channel_attachment_file_name,
 };
 use sinomo_lm::{
     AnthropicConfig, CLAUDE_DEFAULT_MODEL, ClaudeCodeConfig, CodexCliConfig, GeminiConfig,
@@ -828,6 +830,9 @@ impl AgentChat {
         on_event: &mut dyn FnMut(ChatStreamEvent),
     ) -> Result<(), CliError> {
         self.reload_current_channel_best_effort();
+        if self.channel.channel_kind == AgentChannelKind::Channel {
+            return self.send_channel_with_attachments(text, attachments, on_event);
+        }
         let speaker = self.primary_speaker();
         let attachments = self.store_chat_attachments(attachments)?;
         let mut source = AgentChannelSource::app();
@@ -943,6 +948,60 @@ impl AgentChat {
             }
         }
         Ok(())
+    }
+
+    fn send_channel_with_attachments(
+        &mut self,
+        text: &str,
+        attachments: &[ChatAttachmentInput],
+        on_event: &mut dyn FnMut(ChatStreamEvent),
+    ) -> Result<(), CliError> {
+        let attachments = self.store_chat_attachments(attachments)?;
+        let mut source = AgentChannelSource::app();
+        if !attachments.is_empty() {
+            source.metadata = serde_json::json!({
+                "attachment_count": attachments.len()
+            });
+        }
+        let context_attachments = agent_context_attachments_from_channel_attachments(&attachments);
+        let data_dir = self.data_dir.clone();
+        let daemon_connected = self.daemon_connected;
+        let previous_agent = self.runtime_info().agent;
+        let mut channel = self.channel.clone();
+        for participant in &mut channel.participants {
+            participant.observed_through_sequence = 0;
+        }
+        let executor = AppAgentChannelExecutor {
+            data_dir: &data_dir,
+            daemon_connected,
+            runtime: &mut self.runtime,
+            context_attachments,
+        };
+        let store = self.channel_store.as_ref();
+        let mut channel_runtime = AgentChannelRuntime::new(channel, store, executor)
+            .with_loop_config(AgentChannelLoopConfig::default());
+        let mut channel_event = |event| forward_channel_runtime_event(event, on_event);
+        let result = channel_runtime.send_user_message_from_with_attachments(
+            AGENT_CHANNEL_APP_USER_ID,
+            "User",
+            text,
+            source,
+            attachments,
+            &mut channel_event,
+        );
+        self.channel = channel_runtime.channel().clone();
+        drop(channel_runtime);
+        if let Some(definition) = resolve_agent(&data_dir, &previous_agent) {
+            let _ = tui::app_switch_agent(
+                self.runtime.handler_mut(),
+                &data_dir,
+                definition,
+                daemon_connected,
+            );
+        }
+        result.map(|_| ()).map_err(|source| CliError::Parse {
+            detail: format!("channel turn failed: {source}"),
+        })
     }
 
     fn store_chat_attachments(
@@ -1087,6 +1146,177 @@ impl AgentChat {
         if let Ok(Some(channel)) = self.channel_store.load_channel(&self.channel.channel_id) {
             self.channel = channel;
         }
+    }
+}
+
+struct AppAgentChannelExecutor<'a> {
+    data_dir: &'a SinomoDataDir,
+    daemon_connected: bool,
+    runtime: &'a mut InteractionRuntime<InMemoryEventStore, Handler>,
+    context_attachments: Vec<AgentContextAttachment>,
+}
+
+impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
+    fn decide_speak(
+        &mut self,
+        _channel: &AgentChannel,
+        participant: &AgentChannelParticipant,
+        _latest_user_message: &AgentChannelMessage,
+        _session: &AgentSession,
+    ) -> Result<AgentChannelSpeakDecision, AgentChannelExecutorError> {
+        Ok(AgentChannelSpeakDecision::speak(
+            participant,
+            "agent session will decide whether to publish or stay silent",
+            1.0,
+        ))
+    }
+
+    fn speak(
+        &mut self,
+        channel: &AgentChannel,
+        participant: &AgentChannelParticipant,
+        session: &mut AgentSession,
+        on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
+    ) -> Result<String, AgentChannelExecutorError> {
+        let definition = resolve_agent(self.data_dir, &participant.agent_key).ok_or_else(|| {
+            AgentChannelExecutorError::new(format!(
+                "unknown channel agent `{}`",
+                participant.agent_key
+            ))
+        })?;
+        tui::app_switch_agent(
+            self.runtime.handler_mut(),
+            self.data_dir,
+            definition,
+            self.daemon_connected,
+        )
+        .map_err(channel_executor_cli_error)?;
+
+        let interaction_session = app_session(Some(&participant.agent_session_id.to_string()));
+        self.runtime
+            .replace_store_and_session(InMemoryEventStore::new(), interaction_session.clone());
+        self.runtime
+            .handler_mut()
+            .replace_full_agent_session(&interaction_session, session.clone())
+            .map_err(channel_executor_cli_error)?;
+
+        let mut streamed_answer = String::new();
+        let mut forward = |event: ChatStreamEvent| {
+            if let ChatStreamEvent::Token(text) = event {
+                streamed_answer.push_str(&text);
+                on_event(AgentChannelRuntimeEvent::Token {
+                    channel_id: channel.channel_id.clone(),
+                    participant_id: participant.participant_id.clone(),
+                    agent_key: participant.agent_key.clone(),
+                    agent_name: participant.agent_name.clone(),
+                    agent_session_id: participant.agent_session_id.clone(),
+                    text,
+                });
+            }
+        };
+        let mut emit = |output: InteractionOutput| forward_output(output, &mut forward);
+        let prompt = channel_agent_turn_prompt(channel, participant);
+        let trailing = self
+            .runtime
+            .ingest_user_input_with_context_attachments_streaming(
+                &prompt,
+                self.context_attachments.clone(),
+                &mut emit,
+            )
+            .map_err(channel_executor_cli_error)?;
+        for output in trailing {
+            forward_output(output, &mut forward);
+        }
+        drain_runtime_events(self.runtime, &mut forward).map_err(channel_executor_cli_error)?;
+        if let Some(updated_session) = self
+            .runtime
+            .handler()
+            .agent_session_snapshot()
+            .map_err(channel_executor_cli_error)?
+        {
+            *session = updated_session;
+        }
+        Ok(streamed_answer)
+    }
+}
+
+fn channel_executor_cli_error(error: CliError) -> AgentChannelExecutorError {
+    AgentChannelExecutorError::new(error.to_string())
+}
+
+fn channel_agent_turn_prompt(
+    channel: &AgentChannel,
+    participant: &AgentChannelParticipant,
+) -> String {
+    let latest = channel
+        .transcript
+        .last()
+        .map(render_visible_channel_message)
+        .unwrap_or_else(|| "No visible channel messages yet.".to_string());
+    format!(
+        "You are {agent_name} ({agent_key}) in the shared Sinomo channel `{title}`.\n\
+Every visible channel message is shared with every other enabled agent. \
+Decide whether you should publish a reply to the latest visible message.\n\
+If you have nothing useful, non-duplicative, or timely to add, return response_mode `silent` with empty text. \
+If you reply, make `text` the exact message to publish in the channel.\n\n\
+Latest visible channel message:\n{latest}",
+        agent_name = participant.agent_name,
+        agent_key = participant.agent_key,
+        title = channel.title,
+    )
+}
+
+fn render_visible_channel_message(message: &AgentChannelMessage) -> String {
+    let author = match &message.author {
+        AgentChannelAuthor::User { display_name, .. } => display_name.as_str(),
+        AgentChannelAuthor::Agent { agent_name, .. } => agent_name.as_str(),
+        AgentChannelAuthor::System => "System",
+    };
+    format!(
+        "[{}] {author}: {}",
+        message.sequence,
+        channel_message_content_for_agent(message)
+    )
+}
+
+fn forward_channel_runtime_event(
+    event: AgentChannelRuntimeEvent,
+    on_event: &mut dyn FnMut(ChatStreamEvent),
+) {
+    match event {
+        AgentChannelRuntimeEvent::Token {
+            channel_id,
+            participant_id,
+            agent_key,
+            agent_name,
+            agent_session_id,
+            text,
+        } => on_event(ChatStreamEvent::AgentToken {
+            speaker: ChatSpeaker {
+                channel_id: channel_id.to_string(),
+                participant_id: participant_id.to_string(),
+                agent_key,
+                agent_name,
+                agent_session_id: agent_session_id.to_string(),
+            },
+            text,
+        }),
+        AgentChannelRuntimeEvent::System {
+            channel_id,
+            message_id,
+            message_kind,
+            text,
+        } => on_event(ChatStreamEvent::ChannelSystem {
+            channel_id: channel_id.to_string(),
+            message_id: message_id.to_string(),
+            kind: match message_kind {
+                AgentChannelMessageKind::Normal => "message",
+                AgentChannelMessageKind::Info => "info",
+                AgentChannelMessageKind::Error => "error",
+            }
+            .to_string(),
+            text,
+        }),
     }
 }
 
@@ -3366,5 +3596,55 @@ mod tests {
             error.contains("sinomo providers auth codex"),
             "error should include the operator auth command: {error}"
         );
+    }
+
+    #[test]
+    fn app_chat_send_to_explicit_channel_uses_channel_runtime() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-runtime");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Team channel");
+        channel.ensure_user(AgentChannelUser::app_local());
+        channel.ensure_participant("main-agent", "main-agent");
+        store.save_channel(&channel).expect("save channel");
+
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        chat.resume_session(&channel_id.to_string(), &[])
+            .expect("resume channel");
+        chat.set_model(
+            sinomo_lm::CODEX_PROVIDER_ID,
+            "gpt-5.2-codex",
+            sinomo_lm::DEFAULT_PROVIDER_ACCOUNT,
+        )
+        .expect("switch to codex");
+
+        let mut events = Vec::new();
+        let mut on_event = |event| events.push(chat_event_label(event));
+        chat.send("hello channel", &mut on_event)
+            .expect("channel runtime converts provider failure into a channel system event");
+
+        assert!(
+            events.iter().any(|event| {
+                event.starts_with("system:error:")
+                    && event.contains("authentication required for codex")
+            }),
+            "channel runtime should surface participant failures as channel system events: {events:?}"
+        );
+        let saved = SifsAgentChannelStore::open(&data_dir)
+            .expect("reopen channel store")
+            .load_channel(&channel_id)
+            .expect("load channel")
+            .expect("channel saved");
+        assert!(saved.transcript.iter().any(|message| {
+            matches!(message.author, AgentChannelAuthor::User { .. })
+                && message.content == "hello channel"
+        }));
+        assert!(saved.transcript.iter().any(|message| {
+            message.message_kind == AgentChannelMessageKind::Error
+                && message
+                    .content
+                    .contains("authentication required for codex")
+        }));
     }
 }
