@@ -209,4 +209,15 @@ mod tests {
         assert_eq!(frame.height, 480);
         assert_eq!(frame.bytes, vec![1, 2, 3]);
     }
+
+    #[test]
+    fn native_video_capture_defaults_mirror_raw_camera_defaults() {
+        let raw = sinomo_runtime::device::NativeCameraCaptureConfig::default();
+        let wrapped = NativeVideoCaptureConfig::default();
+
+        assert_eq!(wrapped.device, raw.device);
+        assert_eq!(wrapped.width, raw.width);
+        assert_eq!(wrapped.height, raw.height);
+        assert_eq!(wrapped.frame_interval_ms, raw.frame_interval_ms);
+    }
 }

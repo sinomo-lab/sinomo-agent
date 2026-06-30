@@ -7597,8 +7597,10 @@ dependencies = [
 name = "sinomo"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "sinomo-cli",
  "sinomo-evolution",
+ "sinomo-testdir",
 ]
 
 [[package]]

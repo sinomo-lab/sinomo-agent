@@ -203,13 +203,12 @@ pub struct NativeSpeakerPlayback {
 impl NativeSpeakerPlayback {
     pub fn write(&self, bytes: &[u8]) -> Result<(), NativeAudioError> {
         let output_format = self.raw.format();
-        let decoded = decode_audio_samples(bytes, self.input_sample_format);
-        let resampled = resample_block(
-            &decoded,
+        let encoded = convert_model_audio_to_raw_output(
+            bytes,
             self.input_sample_rate_hz,
-            output_format.sample_rate_hz,
+            self.input_sample_format,
+            output_format,
         );
-        let encoded = encode_raw_interleaved_audio(&resampled, output_format);
         self.raw.write_raw_interleaved(&encoded)?;
         Ok(())
     }
@@ -428,6 +427,17 @@ fn encode_raw_interleaved_audio(
     out
 }
 
+fn convert_model_audio_to_raw_output(
+    bytes: &[u8],
+    input_sample_rate_hz: u32,
+    input_format: NativeAudioSampleFormat,
+    output_format: device::NativeRawAudioFormat,
+) -> Vec<u8> {
+    let decoded = decode_audio_samples(bytes, input_format);
+    let resampled = resample_block(&decoded, input_sample_rate_hz, output_format.sample_rate_hz);
+    encode_raw_interleaved_audio(&resampled, output_format)
+}
+
 fn resample_block(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
     if samples.is_empty() || source_rate == 0 || target_rate == 0 {
         return Vec::new();
@@ -505,6 +515,68 @@ mod tests {
     }
 
     #[test]
+    fn native_audio_resample_block_handles_boundaries() {
+        assert!(resample_block(&[], 24_000, 16_000).is_empty());
+        assert!(resample_block(&[0.0, 1.0], 0, 16_000).is_empty());
+        assert_eq!(
+            resample_block(&[0.25, -0.25], 16_000, 16_000),
+            vec![0.25, -0.25]
+        );
+
+        let downsampled = resample_block(&[0.0, 0.25, 0.5, 0.75], 4, 2);
+        assert_eq!(downsampled, vec![0.0, 0.5]);
+    }
+
+    #[test]
+    fn native_audio_capture_state_downmixes_stereo_raw_input_to_mono_target_chunks() {
+        let raw_format = sinomo_runtime::device::NativeRawAudioFormat {
+            sample_rate_hz: 1_000,
+            channels: 2,
+            sample_format: sinomo_runtime::device::NativeRawAudioSampleFormat::I16Le,
+        };
+        let mut raw = Vec::new();
+        for (left, right) in [
+            (1_000_i16, 3_000_i16),
+            (2_000, 4_000),
+            (3_000, 5_000),
+            (4_000, 6_000),
+            (5_000, 7_000),
+            (6_000, 8_000),
+        ] {
+            raw.extend_from_slice(&left.to_le_bytes());
+            raw.extend_from_slice(&right.to_le_bytes());
+        }
+        let chunk = sinomo_runtime::device::NativeRawAudioChunk {
+            sequence: 0,
+            format: raw_format,
+            captured_at_unix_ms: 123,
+            audio: raw,
+        };
+        let mut state = AudioCaptureState::new(1_000, NativeAudioSampleFormat::Pcm16Le, 4 * 2);
+
+        state.process_raw_chunk(chunk).expect("process raw chunk");
+
+        let chunk = state.pending_chunks.pop_front().expect("target chunk");
+        assert_eq!(chunk.sequence, 0);
+        assert_eq!(chunk.channels, 1);
+        assert_eq!(chunk.sample_rate_hz, 1_000);
+        assert_eq!(chunk.sample_format, NativeAudioSampleFormat::Pcm16Le);
+        assert_eq!(chunk.captured_at_unix_ms, 123);
+        assert_eq!(chunk.audio.len(), 8);
+        let samples: Vec<i16> = chunk
+            .audio
+            .chunks_exact(2)
+            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect();
+        for (actual, expected) in samples.iter().zip([2_000_i16, 3_000, 4_000, 5_000]) {
+            assert!(
+                (*actual as i32 - expected as i32).abs() <= 1,
+                "expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
     fn native_audio_encodes_mono_to_raw_interleaved_device_format() {
         let format = sinomo_runtime::device::NativeRawAudioFormat {
             sample_rate_hz: 48_000,
@@ -519,5 +591,72 @@ mod tests {
         let right = i16::from_le_bytes([encoded[2], encoded[3]]);
         assert_eq!(left, right);
         assert!(left > 0);
+    }
+
+    #[test]
+    fn native_audio_converts_model_audio_to_all_raw_speaker_formats() {
+        let mut pcm16 = Vec::new();
+        for sample in [-16_384_i16, 0, 16_384] {
+            pcm16.extend_from_slice(&sample.to_le_bytes());
+        }
+        let output_i16 = sinomo_runtime::device::NativeRawAudioFormat {
+            sample_rate_hz: 24_000,
+            channels: 2,
+            sample_format: sinomo_runtime::device::NativeRawAudioSampleFormat::I16Le,
+        };
+        let i16_bytes = convert_model_audio_to_raw_output(
+            &pcm16,
+            24_000,
+            NativeAudioSampleFormat::Pcm16Le,
+            output_i16,
+        );
+        assert_eq!(i16_bytes.len(), 12);
+        assert_eq!(
+            i16::from_le_bytes([i16_bytes[0], i16_bytes[1]]),
+            i16::from_le_bytes([i16_bytes[2], i16_bytes[3]])
+        );
+
+        let mut f32le = Vec::new();
+        for sample in [-0.5_f32, 0.0, 0.5] {
+            f32le.extend_from_slice(&sample.to_le_bytes());
+        }
+        let output_f32 = sinomo_runtime::device::NativeRawAudioFormat {
+            sample_rate_hz: 24_000,
+            channels: 1,
+            sample_format: sinomo_runtime::device::NativeRawAudioSampleFormat::F32Le,
+        };
+        let f32_bytes = convert_model_audio_to_raw_output(
+            &f32le,
+            24_000,
+            NativeAudioSampleFormat::F32Le,
+            output_f32,
+        );
+        assert_eq!(f32_bytes.len(), 12);
+        assert_eq!(
+            f32::from_le_bytes([f32_bytes[0], f32_bytes[1], f32_bytes[2], f32_bytes[3]]),
+            -0.5
+        );
+
+        let output_u16 = sinomo_runtime::device::NativeRawAudioFormat {
+            sample_rate_hz: 12_000,
+            channels: 1,
+            sample_format: sinomo_runtime::device::NativeRawAudioSampleFormat::U16Le,
+        };
+        let u16_bytes = convert_model_audio_to_raw_output(
+            &pcm16,
+            24_000,
+            NativeAudioSampleFormat::Pcm16Le,
+            output_u16,
+        );
+        assert_eq!(
+            u16_bytes.len(),
+            2,
+            "24 kHz to 12 kHz downsamples three model samples to one raw sample"
+        );
+        let first = u16::from_le_bytes([u16_bytes[0], u16_bytes[1]]);
+        assert!(
+            first < 32_768,
+            "negative model audio maps below unsigned silence"
+        );
     }
 }
