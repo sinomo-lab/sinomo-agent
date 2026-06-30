@@ -81,6 +81,74 @@ impl RealtimeAudioSampleFormat {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+pub enum RealtimeVideoFrameFormat {
+    Jpeg,
+    Png,
+}
+
+impl RealtimeVideoFrameFormat {
+    pub fn mime_type(self) -> &'static str {
+        match self {
+            Self::Jpeg => "image/jpeg",
+            Self::Png => "image/png",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpg",
+            Self::Png => "png",
+        }
+    }
+
+    pub fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpeg",
+            Self::Png => "png",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RealtimeVideoFrameDetail {
+    #[default]
+    Auto,
+    Low,
+    High,
+}
+
+impl RealtimeVideoFrameDetail {
+    pub fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Low => "low",
+            Self::High => "high",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RealtimeVideoInputConfig {
+    pub frame_format: RealtimeVideoFrameFormat,
+    #[serde(default)]
+    pub detail: RealtimeVideoFrameDetail,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_frame_rate_hz: Option<u32>,
+}
+
+impl Default for RealtimeVideoInputConfig {
+    fn default() -> Self {
+        Self {
+            frame_format: RealtimeVideoFrameFormat::Jpeg,
+            detail: RealtimeVideoFrameDetail::Auto,
+            max_frame_rate_hz: Some(2),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
 pub enum RealtimeAudioTurnDetection {
     Manual,
     SemanticVad,
@@ -107,6 +175,8 @@ pub struct RealtimeAudioSessionConfig {
     pub safety_identifier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_video: Option<RealtimeVideoInputConfig>,
     pub input_sample_rate_hz: u32,
     pub output_sample_rate_hz: u32,
     pub input_format: RealtimeAudioSampleFormat,
@@ -152,6 +222,7 @@ impl RealtimeAudioSessionConfig {
             websocket_url: None,
             safety_identifier: None,
             voice: None,
+            input_video: None,
             input_sample_rate_hz,
             output_sample_rate_hz,
             input_format,
@@ -189,7 +260,9 @@ impl RealtimeAudioSessionConfig {
             .unwrap_or_else(|| self.provider.default_base_url());
         match self.provider {
             RealtimeAudioProvider::OpenAi => openai_realtime_ws_url(base_url, &self.model),
-            RealtimeAudioProvider::MiniCpmO => minicpm_realtime_ws_url(base_url),
+            RealtimeAudioProvider::MiniCpmO => {
+                minicpm_realtime_ws_url_for_video(base_url, self.input_video.is_some())
+            }
         }
     }
 
@@ -219,6 +292,11 @@ impl RealtimeAudioSessionConfig {
         }
         Ok(())
     }
+
+    pub fn with_video_input(mut self, config: RealtimeVideoInputConfig) -> Self {
+        self.input_video = Some(config);
+        self
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -233,6 +311,29 @@ impl RealtimeAudioInputChunk {
         Self {
             audio,
             force_listen: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RealtimeVideoFrameInput {
+    pub frame: Vec<u8>,
+    pub format: RealtimeVideoFrameFormat,
+    #[serde(default)]
+    pub detail: RealtimeVideoFrameDetail,
+    pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<u64>,
+}
+
+impl RealtimeVideoFrameInput {
+    pub fn new(frame: Vec<u8>, format: RealtimeVideoFrameFormat, sequence: u64) -> Self {
+        Self {
+            frame,
+            format,
+            detail: RealtimeVideoFrameDetail::Auto,
+            sequence,
+            timestamp_ms: None,
         }
     }
 }
@@ -412,16 +513,36 @@ impl RealtimeAudioSession {
         self.send_json(payload).await
     }
 
+    pub async fn send_video_frame(
+        &mut self,
+        frame: &RealtimeVideoFrameInput,
+    ) -> Result<(), RealtimeAudioError> {
+        if self.config.input_video.is_none() {
+            return Err(RealtimeAudioError::InvalidConfig {
+                detail: "realtime session is not configured for video input".to_string(),
+            });
+        }
+        let payload = match self.config.provider {
+            RealtimeAudioProvider::OpenAi => openai_input_video_frame_payload(frame),
+            RealtimeAudioProvider::MiniCpmO => minicpm_input_video_frame_payload(frame),
+        };
+        self.send_json(payload).await
+    }
+
     pub async fn flush_turn(&mut self) -> Result<(), RealtimeAudioError> {
         if self.config.provider == RealtimeAudioProvider::OpenAi
             && self.config.turn_detection == RealtimeAudioTurnDetection::Manual
         {
             self.send_json(serde_json::json!({ "type": "input_audio_buffer.commit" }))
                 .await?;
-            self.send_json(serde_json::json!({ "type": "response.create" }))
-                .await?;
+            self.request_response().await?;
         }
         Ok(())
+    }
+
+    pub async fn request_response(&mut self) -> Result<(), RealtimeAudioError> {
+        self.send_json(serde_json::json!({ "type": "response.create" }))
+            .await
     }
 
     pub async fn close(&mut self) -> Result<(), RealtimeAudioError> {
@@ -536,6 +657,13 @@ pub fn openai_realtime_ws_url(base_url: &str, model: &str) -> Result<String, Rea
 }
 
 pub fn minicpm_realtime_ws_url(base_url: &str) -> Result<String, RealtimeAudioError> {
+    minicpm_realtime_ws_url_for_video(base_url, false)
+}
+
+pub fn minicpm_realtime_ws_url_for_video(
+    base_url: &str,
+    video: bool,
+) -> Result<String, RealtimeAudioError> {
     let mut base = base_url.trim().trim_end_matches('/').to_string();
     if base.is_empty() {
         base = MINICPM_DEFAULT_REALTIME_BASE_URL.to_string();
@@ -551,7 +679,8 @@ pub fn minicpm_realtime_ws_url(base_url: &str) -> Result<String, RealtimeAudioEr
             detail: format!("unsupported MiniCPM-o realtime base URL `{base_url}`"),
         });
     };
-    Ok(format!("{base}/v1/realtime?mode=audio"))
+    let mode = if video { "omni" } else { "audio" };
+    Ok(format!("{base}/v1/realtime?mode={mode}"))
 }
 
 pub fn openai_session_update_payload(config: &RealtimeAudioSessionConfig) -> serde_json::Value {
@@ -620,6 +749,41 @@ pub fn minicpm_input_audio_append_payload(chunk: &RealtimeAudioInputChunk) -> se
     });
     if chunk.force_listen {
         payload["force_listen"] = serde_json::json!(true);
+    }
+    payload
+}
+
+pub fn openai_input_video_frame_payload(frame: &RealtimeVideoFrameInput) -> serde_json::Value {
+    let image_url = format!(
+        "data:{};base64,{}",
+        frame.format.mime_type(),
+        base64::engine::general_purpose::STANDARD.encode(&frame.frame)
+    );
+    serde_json::json!({
+        "type": "conversation.item.create",
+        "item": {
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_image",
+                "image_url": image_url,
+                "detail": frame.detail.as_config_value()
+            }]
+        }
+    })
+}
+
+pub fn minicpm_input_video_frame_payload(frame: &RealtimeVideoFrameInput) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "type": "input_image_buffer.append",
+        "image": base64::engine::general_purpose::STANDARD.encode(&frame.frame),
+        "mime_type": frame.format.mime_type(),
+        "format": frame.format.as_config_value(),
+        "sequence": frame.sequence,
+        "detail": frame.detail.as_config_value(),
+    });
+    if let Some(timestamp_ms) = frame.timestamp_ms {
+        payload["timestamp_ms"] = serde_json::json!(timestamp_ms);
     }
     payload
 }
@@ -765,6 +929,11 @@ mod tests {
             minicpm_realtime_ws_url("https://minicpmo45.modelbest.cn").expect("url"),
             "wss://minicpmo45.modelbest.cn/v1/realtime?mode=audio"
         );
+        assert_eq!(
+            minicpm_realtime_ws_url_for_video("https://minicpmo45.modelbest.cn", true)
+                .expect("url"),
+            "wss://minicpmo45.modelbest.cn/v1/realtime?mode=omni"
+        );
     }
 
     #[test]
@@ -796,6 +965,36 @@ mod tests {
         assert_eq!(payload["type"], "input_audio_buffer.append");
         assert_eq!(payload["audio"], "AAECAw==");
         assert_eq!(payload["force_listen"], true);
+    }
+
+    #[test]
+    fn openai_video_frame_uses_input_image_item() {
+        let mut frame =
+            RealtimeVideoFrameInput::new(vec![0, 1, 2, 3], RealtimeVideoFrameFormat::Jpeg, 7);
+        frame.detail = RealtimeVideoFrameDetail::Low;
+        let payload = openai_input_video_frame_payload(&frame);
+
+        assert_eq!(payload["type"], "conversation.item.create");
+        assert_eq!(payload["item"]["content"][0]["type"], "input_image");
+        assert_eq!(payload["item"]["content"][0]["detail"], "low");
+        assert_eq!(
+            payload["item"]["content"][0]["image_url"],
+            "data:image/jpeg;base64,AAECAw=="
+        );
+    }
+
+    #[test]
+    fn minicpm_video_frame_uses_image_buffer_append() {
+        let mut frame =
+            RealtimeVideoFrameInput::new(vec![0, 1, 2, 3], RealtimeVideoFrameFormat::Png, 7);
+        frame.timestamp_ms = Some(1234);
+        let payload = minicpm_input_video_frame_payload(&frame);
+
+        assert_eq!(payload["type"], "input_image_buffer.append");
+        assert_eq!(payload["image"], "AAECAw==");
+        assert_eq!(payload["mime_type"], "image/png");
+        assert_eq!(payload["sequence"], 7);
+        assert_eq!(payload["timestamp_ms"], 1234);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::{
     AgentCancellationToken, AgentProcessSnapshot, AgentToolCall, AgentToolKind, AgentToolSpec,
-    AgentVerificationState, InteractionSession, TaskId,
+    AgentVerificationState, InteractionSession, SkillCatalogEntry, TaskId,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_runtime::core::{HotSwapState, ModuleLoaderState};
@@ -484,6 +484,16 @@ pub struct AgentSkillDescriptor {
     pub required_capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedded_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_base_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_manifest_path: Option<String>,
 }
 
 impl AgentSkillDescriptor {
@@ -501,6 +511,11 @@ impl AgentSkillDescriptor {
             activation_tags: Vec::new(),
             required_capabilities: Vec::new(),
             embedded_text: None,
+            catalog_version: None,
+            catalog_content_hash: None,
+            catalog_base_hash: None,
+            catalog_status: None,
+            catalog_manifest_path: None,
         }
     }
 
@@ -526,6 +541,11 @@ impl AgentSkillDescriptor {
                 .map(|capability| capability.as_str().to_string())
                 .collect(),
             embedded_text: resource.embedded_text.clone(),
+            catalog_version: None,
+            catalog_content_hash: None,
+            catalog_base_hash: None,
+            catalog_status: None,
+            catalog_manifest_path: None,
         }
     }
 }
@@ -535,6 +555,7 @@ impl AgentSkillDescriptor {
 pub enum AgentSkillSource {
     Package,
     Module,
+    Catalog,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -551,6 +572,20 @@ impl AgentSkillPlan {
         package_skills: impl IntoIterator<Item = impl Into<String>>,
         module_projection: &AgentModuleToolProjection,
         agent_keys: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self::from_package_modules_and_catalog(
+            package_skills,
+            module_projection,
+            agent_keys,
+            std::iter::empty::<AgentSkillDescriptor>(),
+        )
+    }
+
+    pub fn from_package_modules_and_catalog(
+        package_skills: impl IntoIterator<Item = impl Into<String>>,
+        module_projection: &AgentModuleToolProjection,
+        agent_keys: impl IntoIterator<Item = impl Into<String>>,
+        catalog_skills: impl IntoIterator<Item = AgentSkillDescriptor>,
     ) -> Self {
         let mut descriptors = BTreeMap::<String, AgentSkillDescriptor>::new();
         let package_skill_ids = package_skills
@@ -585,9 +620,28 @@ impl AgentSkillPlan {
                 );
             }
         }
+        for skill in catalog_skills {
+            descriptors.insert(skill.id.clone(), skill);
+        }
         Self {
             skills: descriptors.into_values().collect(),
         }
+    }
+
+    pub fn from_package_modules_and_catalog_entries<'a>(
+        package_skills: impl IntoIterator<Item = impl Into<String>>,
+        module_projection: &AgentModuleToolProjection,
+        agent_keys: impl IntoIterator<Item = impl Into<String>>,
+        catalog_entries: impl IntoIterator<Item = &'a SkillCatalogEntry>,
+    ) -> Self {
+        Self::from_package_modules_and_catalog(
+            package_skills,
+            module_projection,
+            agent_keys,
+            catalog_entries
+                .into_iter()
+                .map(|entry| entry.to_agent_descriptor(None)),
+        )
     }
 
     pub fn get(&self, skill_id: &str) -> Option<&AgentSkillDescriptor> {
@@ -628,6 +682,18 @@ fn skill_matches_query(skill: &AgentSkillDescriptor, query: &str) -> bool {
             .path
             .as_deref()
             .is_some_and(|path| path.to_ascii_lowercase().contains(query))
+        || skill
+            .catalog_version
+            .as_deref()
+            .is_some_and(|version| version.to_ascii_lowercase().contains(query))
+        || skill
+            .catalog_status
+            .as_deref()
+            .is_some_and(|status| status.to_ascii_lowercase().contains(query))
+        || skill
+            .catalog_content_hash
+            .as_deref()
+            .is_some_and(|hash| hash.to_ascii_lowercase().contains(query))
         || skill
             .target_agents
             .iter()

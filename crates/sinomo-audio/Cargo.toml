@@ -12,9 +12,8 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "r2"
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sinomo-gateway = { path = "../sinomo-gateway" }
-
 sinomo-runtime = { path = "../sinomo-runtime" }
-[dev-dependencies]
-sinomo-device = { path = "../sinomo-device" }
+thiserror.workspace = true

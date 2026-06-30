@@ -36,6 +36,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -55,9 +56,9 @@ use sinomo_agent::{
     AgentChannel, AgentChannelAuthor, AgentChannelKind, AgentChannelMessageKind, AgentChannelStore,
 };
 use sinomo_cli::app_api::{
-    AgentChatSifsStorage, AgentSummary, ChatContextSnapshot, ChatHistoryMessage,
-    ChatProcessSnapshot, ChatTaskSnapshot, ChatToolCallSnapshot, ChatUsageSnapshot,
-    ProviderSummary, SifsAgentChannelStore, agent_summaries, reasoning_efforts,
+    AgentChatSifsStorage, AgentSummary, ChatAttachmentInput, ChatContextSnapshot,
+    ChatHistoryMessage, ChatProcessSnapshot, ChatTaskSnapshot, ChatToolCallSnapshot,
+    ChatUsageSnapshot, ProviderSummary, SifsAgentChannelStore, agent_summaries, reasoning_efforts,
 };
 use sinomo_runtime::{events::SessionId, local::SinomoDataDir};
 
@@ -76,13 +77,17 @@ const WIDE_THRESHOLD: f32 = 620.0;
 const SIDEBAR_W: f32 = 250.0;
 const ACTIVITY_RAIL_W: f32 = 286.0;
 const OVERVIEW_H: f32 = 86.0;
-const COMPOSER_H: f32 = 132.0;
+const MEDIA_CALL_H: f32 = 156.0;
+const COMPOSER_H: f32 = 196.0;
 const PAD: f32 = 16.0;
 const SIDEBAR_ROW_H: f32 = 36.0;
 const SIDEBAR_ROW_EDIT_W: f32 = 46.0;
 const SIDEBAR_ROW_EDIT_H: f32 = 22.0;
 const SIDEBAR_ROW_EDIT_GAP: f32 = 8.0;
 const SELECTOR_H: f32 = 30.0;
+const ATTACHMENT_AREA_H: f32 = 56.0;
+const ATTACHMENT_ENTRY_H: f32 = 30.0;
+const ATTACHMENT_CHIPS_H: f32 = 22.0;
 const COMPOSER_PAD_Y: f32 = 12.0;
 const COMPOSER_SECTION_GAP: f32 = 10.0;
 const INPUT_ACTION_GAP: f32 = 10.0;
@@ -433,6 +438,76 @@ pub struct ChatControlOverview {
 }
 
 #[derive(Clone, Debug)]
+pub struct ChatMediaCallState {
+    pub active: bool,
+    pub mic_enabled: bool,
+    pub camera_enabled: bool,
+    pub provider: String,
+    pub model: String,
+    pub started_at: Option<Instant>,
+    pub input_audio_chunks: u64,
+    pub input_video_frames: u64,
+    pub output_audio_chunks: u64,
+    pub notice: Option<String>,
+}
+
+#[cfg_attr(test, allow(dead_code))]
+struct ChatNativeMediaRuntime {
+    control_tx: mpsc::Sender<ChatMediaCallControl>,
+    event_rx: Receiver<ChatMediaCallWorkerEvent>,
+}
+
+#[cfg_attr(test, allow(dead_code))]
+impl ChatNativeMediaRuntime {
+    fn send_control(&self, control: ChatMediaCallControl) {
+        let _ = self.control_tx.send(control);
+    }
+}
+
+impl Drop for ChatNativeMediaRuntime {
+    fn drop(&mut self) {
+        let _ = self.control_tx.send(ChatMediaCallControl::Stop);
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+#[derive(Clone, Debug)]
+enum ChatMediaCallControl {
+    Stop,
+    SetMicEnabled(bool),
+    SetCameraEnabled(bool),
+}
+
+#[cfg_attr(test, allow(dead_code))]
+#[derive(Debug)]
+enum ChatMediaCallWorkerEvent {
+    Ready(String),
+    InputAudioChunk,
+    InputVideoFrame,
+    OutputAudioChunk,
+    Notice(String),
+    Error(String),
+    Done(String),
+}
+
+impl Default for ChatMediaCallState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            mic_enabled: true,
+            camera_enabled: true,
+            provider: String::new(),
+            model: String::new(),
+            started_at: None,
+            input_audio_chunks: 0,
+            input_video_frames: 0,
+            output_audio_chunks: 0,
+            notice: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ChatToolActivity {
     pub step_index: usize,
     pub call_index: Option<usize>,
@@ -523,6 +598,13 @@ enum ChannelAgentsStoreStatus {
     Failed(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingChatAttachment {
+    path: PathBuf,
+    file_name: String,
+    size_bytes: u64,
+}
+
 /// State backing the chat tab.
 pub struct ChatState {
     pub data_dir: Arc<SinomoDataDir>,
@@ -534,6 +616,8 @@ pub struct ChatState {
     pub input: String,
     pub cursor: usize,
     draft_revision: u64,
+    attachment_path_input: String,
+    attachments: Vec<PendingChatAttachment>,
     pub streaming: bool,
     pub notice: Option<String>,
     pub context: Option<ChatContextSnapshot>,
@@ -541,6 +625,8 @@ pub struct ChatState {
     pub activity: Vec<ChatActivityEntry>,
     pub tool_calls: Vec<ChatToolActivity>,
     pub control: ChatControlOverview,
+    pub media_call: ChatMediaCallState,
+    media_call_runtime: Option<ChatNativeMediaRuntime>,
     activity_panel_open: bool,
     pub scroll: f32,
     pub stick_bottom: bool,
@@ -629,6 +715,8 @@ impl ChatState {
             input: String::new(),
             cursor: 0,
             draft_revision: 0,
+            attachment_path_input: String::new(),
+            attachments: Vec::new(),
             streaming: false,
             notice: None,
             context: None,
@@ -636,6 +724,8 @@ impl ChatState {
             activity: Vec::new(),
             tool_calls: Vec::new(),
             control: ChatControlOverview::default(),
+            media_call: ChatMediaCallState::default(),
+            media_call_runtime: None,
             activity_panel_open: false,
             scroll: 0.0,
             stick_bottom: true,
@@ -2077,6 +2167,8 @@ impl ChatState {
         self.activity.clear();
         self.tool_calls.clear();
         self.control = ChatControlOverview::default();
+        self.media_call = ChatMediaCallState::default();
+        self.media_call_runtime = None;
         self.scroll = f32::MAX;
         self.stick_bottom = true;
         self.session_edit_id = None;
@@ -2111,6 +2203,254 @@ impl ChatState {
         } else {
             String::new()
         }
+    }
+
+    fn current_media_provider_model(&self) -> (String, String) {
+        let provider = self
+            .current_provider()
+            .map(|provider| {
+                if provider.name.trim().is_empty() {
+                    provider.id.clone()
+                } else {
+                    provider.name.clone()
+                }
+            })
+            .filter(|provider| !provider.trim().is_empty())
+            .or_else(|| (!self.info.provider.trim().is_empty()).then(|| self.info.provider.clone()))
+            .unwrap_or_else(|| "provider pending".to_string());
+        let model = self.current_model();
+        let model = if model.trim().is_empty() {
+            self.info.model.clone()
+        } else {
+            model
+        };
+        let model = if model.trim().is_empty() {
+            "model pending".to_string()
+        } else {
+            model
+        };
+        (provider, model)
+    }
+
+    pub fn toggle_media_call(&mut self) {
+        if self.media_call.active {
+            let provider = self.media_call.provider.clone();
+            let model = self.media_call.model.clone();
+            self.media_call.active = false;
+            self.media_call.started_at = None;
+            self.media_call_runtime = None;
+            self.media_call.notice = Some("call ended".to_string());
+            self.notice = Some("media call ended".to_string());
+            self.push_activity(
+                "media call",
+                format!("ended {provider} / {model}"),
+                ActivityTone::Neutral,
+            );
+            return;
+        }
+
+        let (provider, model) = self.current_media_provider_model();
+        if provider == "provider pending" || model == "model pending" {
+            let detail =
+                "choose a realtime-capable provider and model before starting a media call";
+            self.media_call.notice = Some(detail.to_string());
+            self.notice = Some(detail.to_string());
+            self.push_activity("media call", detail, ActivityTone::Warn);
+            return;
+        }
+
+        let (started, native_notice) = self.start_native_media_call_runtime(&provider, &model);
+        if !started {
+            self.media_call.active = false;
+            self.media_call.started_at = None;
+            self.media_call.notice = Some(native_notice.clone());
+            self.notice = Some(format!("media call failed: {native_notice}"));
+            self.push_activity("media call", native_notice, ActivityTone::Warn);
+            return;
+        }
+
+        self.media_call.active = true;
+        self.media_call.provider = provider.clone();
+        self.media_call.model = model.clone();
+        self.media_call.started_at = Some(Instant::now());
+        self.media_call.input_audio_chunks = 0;
+        self.media_call.input_video_frames = 0;
+        self.media_call.output_audio_chunks = 0;
+        self.media_call.notice = Some(native_notice.clone());
+        self.notice = Some("media call started".to_string());
+        self.push_activity(
+            "media call",
+            format!("started {provider} / {model} · {native_notice}"),
+            ActivityTone::Running,
+        );
+    }
+
+    fn start_native_media_call_runtime(&mut self, provider: &str, model: &str) -> (bool, String) {
+        #[cfg(test)]
+        {
+            let _ = (provider, model);
+            self.media_call_runtime = None;
+            return (true, "native media disabled in tests".to_string());
+        }
+        #[cfg(not(test))]
+        {
+            let provider_id = self
+                .current_provider()
+                .map(|provider| provider.id.clone())
+                .filter(|provider| !provider.trim().is_empty())
+                .unwrap_or_else(|| provider.to_string());
+            let model = if model.trim().is_empty() || model == "model pending" {
+                self.info.model.clone()
+            } else {
+                model.to_string()
+            };
+            let (event_tx, event_rx) = mpsc::channel();
+            let (control_tx, control_rx) = mpsc::channel();
+            let data_dir = self.data_dir.clone();
+            match thread::Builder::new()
+                .name("sinomo-app-media-call".to_string())
+                .spawn(move || {
+                    run_chat_media_call_worker(data_dir, provider_id, model, event_tx, control_rx);
+                }) {
+                Ok(_worker) => {
+                    self.media_call_runtime = Some(ChatNativeMediaRuntime {
+                        control_tx,
+                        event_rx,
+                    });
+                    (true, "native media connecting".to_string())
+                }
+                Err(error) => {
+                    self.media_call_runtime = None;
+                    (
+                        false,
+                        format!("native media worker failed to start: {error}"),
+                    )
+                }
+            }
+        }
+    }
+
+    fn pump_media_call_runtime(&mut self) -> bool {
+        if !self.media_call.active {
+            return false;
+        }
+        let Some(runtime) = self.media_call_runtime.as_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        let mut ended = false;
+        loop {
+            let event = match runtime.event_rx.try_recv() {
+                Ok(event) => event,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    ended = true;
+                    ChatMediaCallWorkerEvent::Done("media call worker stopped".to_string())
+                }
+            };
+            changed = true;
+            match event {
+                ChatMediaCallWorkerEvent::Ready(detail)
+                | ChatMediaCallWorkerEvent::Notice(detail) => {
+                    self.media_call.notice = Some(detail);
+                }
+                ChatMediaCallWorkerEvent::InputAudioChunk => {
+                    self.media_call.input_audio_chunks =
+                        self.media_call.input_audio_chunks.saturating_add(1);
+                }
+                ChatMediaCallWorkerEvent::InputVideoFrame => {
+                    self.media_call.input_video_frames =
+                        self.media_call.input_video_frames.saturating_add(1);
+                }
+                ChatMediaCallWorkerEvent::OutputAudioChunk => {
+                    self.media_call.output_audio_chunks =
+                        self.media_call.output_audio_chunks.saturating_add(1);
+                }
+                ChatMediaCallWorkerEvent::Error(detail) => {
+                    self.media_call.active = false;
+                    self.media_call.started_at = None;
+                    self.media_call.notice = Some(format!("media call failed: {detail}"));
+                    self.notice = Some(format!("media call failed: {detail}"));
+                    self.push_activity("media call", detail, ActivityTone::Warn);
+                    ended = true;
+                    break;
+                }
+                ChatMediaCallWorkerEvent::Done(detail) => {
+                    self.media_call.active = false;
+                    self.media_call.started_at = None;
+                    self.media_call.notice = Some(detail);
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        if ended {
+            self.media_call_runtime = None;
+        }
+        changed
+    }
+
+    pub fn toggle_media_call_mic(&mut self) {
+        self.media_call.mic_enabled = !self.media_call.mic_enabled;
+        if let Some(runtime) = &self.media_call_runtime {
+            runtime.send_control(ChatMediaCallControl::SetMicEnabled(
+                self.media_call.mic_enabled,
+            ));
+        }
+        let detail = if self.media_call.mic_enabled {
+            "microphone enabled"
+        } else {
+            "microphone muted"
+        };
+        self.media_call.notice = Some(detail.to_string());
+        self.push_activity("media call", detail, ActivityTone::Neutral);
+    }
+
+    pub fn toggle_media_call_camera(&mut self) {
+        self.media_call.camera_enabled = !self.media_call.camera_enabled;
+        if let Some(runtime) = &self.media_call_runtime {
+            runtime.send_control(ChatMediaCallControl::SetCameraEnabled(
+                self.media_call.camera_enabled,
+            ));
+        }
+        let detail = if self.media_call.camera_enabled {
+            "camera enabled"
+        } else {
+            "camera paused"
+        };
+        self.media_call.notice = Some(detail.to_string());
+        self.push_activity("media call", detail, ActivityTone::Neutral);
+    }
+
+    fn media_call_elapsed_label(&self) -> String {
+        let Some(started_at) = self.media_call.started_at else {
+            return "00:00".to_string();
+        };
+        let elapsed = started_at.elapsed().as_secs();
+        format!("{:02}:{:02}", elapsed / 60, elapsed % 60)
+    }
+
+    fn media_call_status_summary(&self) -> String {
+        if self.media_call.active {
+            return format!(
+                "{} · mic {} · camera {}",
+                self.media_call_elapsed_label(),
+                if self.media_call.mic_enabled {
+                    "on"
+                } else {
+                    "muted"
+                },
+                if self.media_call.camera_enabled {
+                    "on"
+                } else {
+                    "paused"
+                }
+            );
+        }
+        self.media_call
+            .notice
+            .clone()
+            .unwrap_or_else(|| "ready".to_string())
     }
 
     /// Whether the reasoning-effort selector should be shown: only for models that take one.
@@ -2382,7 +2722,8 @@ impl ChatState {
 
     fn submit(&mut self) {
         let text = self.input.trim().to_string();
-        if text.is_empty() {
+        let attachments = self.attachment_inputs();
+        if text.is_empty() && attachments.is_empty() {
             return;
         }
         if self.providers.is_empty() {
@@ -2391,6 +2732,10 @@ impl ChatState {
         }
         let session_id = self.ensure_visible_session_id();
         if self.streaming {
+            if !attachments.is_empty() {
+                self.notice = Some("send attachments after the current response".to_string());
+                return;
+            }
             self.handle.send_command(ChatCommand::FollowUp {
                 session_id: session_id.clone(),
                 message: text.clone(),
@@ -2404,7 +2749,8 @@ impl ChatState {
             self.persist();
             return;
         }
-        self.messages.push(ChatMessage::user(text.clone()));
+        let visible_text = visible_user_message_text(&text, &self.attachments);
+        self.messages.push(ChatMessage::user(visible_text));
         self.messages.push(ChatMessage::model(String::new()));
         self.context = None;
         self.usage = None;
@@ -2413,13 +2759,18 @@ impl ChatState {
         self.control.active_turn = true;
         self.input.clear();
         self.cursor = 0;
+        self.attachment_path_input.clear();
+        self.attachments.clear();
         self.streaming = true;
         self.stick_bottom = true;
         self.scroll = f32::MAX;
         self.notice = Some("thinking…".to_string());
         self.persist();
-        self.handle
-            .send_command(ChatCommand::Send { session_id, text });
+        self.handle.send_command(ChatCommand::Send {
+            session_id,
+            text,
+            attachments,
+        });
     }
 
     fn interrupt_turn(&mut self) {
@@ -2437,7 +2788,8 @@ impl ChatState {
 
     /// Whether the composer has a non-empty draft that can be submitted.
     fn can_send(&self) -> bool {
-        !self.input.trim().is_empty() && !self.providers.is_empty()
+        (!self.input.trim().is_empty() || !self.attachments.is_empty())
+            && !self.providers.is_empty()
     }
 
     /// Replace the configured provider-account list after Settings changes it.
@@ -2476,12 +2828,83 @@ impl ChatState {
     }
 
     fn clear_draft(&mut self) {
-        if self.input.is_empty() {
+        if self.input.is_empty()
+            && self.attachments.is_empty()
+            && self.attachment_path_input.is_empty()
+        {
             return;
         }
         self.input.clear();
         self.cursor = 0;
+        self.attachment_path_input.clear();
+        self.attachments.clear();
         self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    fn set_attachment_path_input(&mut self, value: String) {
+        self.attachment_path_input = value;
+    }
+
+    fn add_attachment_from_path_input(&mut self) {
+        let value = self.attachment_path_input.clone();
+        match self.queue_attachment_path(&value) {
+            Ok(()) => {
+                self.attachment_path_input.clear();
+                self.draft_revision = self.draft_revision.wrapping_add(1);
+            }
+            Err(error) => {
+                self.notice = Some(error);
+            }
+        }
+    }
+
+    fn queue_attachment_path(&mut self, value: &str) -> Result<(), String> {
+        let normalized = normalize_attachment_path(value)
+            .ok_or_else(|| "paste a file path before attaching".to_string())?;
+        let path = PathBuf::from(normalized);
+        let metadata =
+            std::fs::metadata(&path).map_err(|error| format!("attachment unavailable: {error}"))?;
+        if !metadata.is_file() {
+            return Err("attachment must be a file".to_string());
+        }
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        if self
+            .attachments
+            .iter()
+            .any(|attachment| attachment.path == path)
+        {
+            return Ok(());
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "attachment".to_string());
+        self.attachments.push(PendingChatAttachment {
+            path,
+            file_name,
+            size_bytes: metadata.len(),
+        });
+        Ok(())
+    }
+
+    fn remove_attachment(&mut self, index: usize) {
+        if index >= self.attachments.len() {
+            return;
+        }
+        self.attachments.remove(index);
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    fn attachment_inputs(&self) -> Vec<ChatAttachmentInput> {
+        self.attachments
+            .iter()
+            .map(|attachment| ChatAttachmentInput {
+                path: attachment.path.clone(),
+            })
+            .collect()
     }
 
     fn apply_quick_action(&mut self, action: ChatQuickAction) {
@@ -3016,29 +3439,111 @@ fn channel_messages(channel: &AgentChannel) -> Vec<ChatMessage> {
         .transcript
         .iter()
         .filter_map(|message| {
-            if message.content.trim().is_empty() {
+            if message.content.trim().is_empty() && message.attachments.is_empty() {
                 return None;
             }
+            let content = visible_channel_message_text(message);
             match &message.author {
-                AgentChannelAuthor::User { .. } => Some(ChatMessage::user(message.content.clone())),
+                AgentChannelAuthor::User { .. } => Some(ChatMessage::user(content)),
                 AgentChannelAuthor::Agent { agent_name, .. } => {
                     let label = if agent_name.trim().is_empty() {
                         "Agent"
                     } else {
                         agent_name
                     };
-                    Some(ChatMessage::model(format!("{label}: {}", message.content)))
+                    Some(ChatMessage::model(format!("{label}: {content}")))
                 }
                 AgentChannelAuthor::System => {
                     if message.message_kind == AgentChannelMessageKind::Error {
-                        Some(ChatMessage::system_error(message.content.clone()))
+                        Some(ChatMessage::system_error(content))
                     } else {
-                        Some(ChatMessage::system_info(message.content.clone()))
+                        Some(ChatMessage::system_info(content))
                     }
                 }
             }
         })
         .collect()
+}
+
+fn visible_channel_message_text(message: &sinomo_agent::AgentChannelMessage) -> String {
+    if message.attachments.is_empty() {
+        return message.content.clone();
+    }
+    let mut text = message.content.clone();
+    append_visible_attachment_summary(
+        &mut text,
+        message.attachments.iter().map(|attachment| {
+            (
+                attachment.file_name.as_str(),
+                attachment.size_bytes,
+                Some(attachment.stored_path.as_str()),
+            )
+        }),
+    );
+    text
+}
+
+fn visible_user_message_text(text: &str, attachments: &[PendingChatAttachment]) -> String {
+    let mut visible = text.to_string();
+    append_visible_attachment_summary(
+        &mut visible,
+        attachments
+            .iter()
+            .map(|attachment| (attachment.file_name.as_str(), attachment.size_bytes, None)),
+    );
+    visible
+}
+
+fn append_visible_attachment_summary<'a>(
+    text: &mut String,
+    attachments: impl IntoIterator<Item = (&'a str, u64, Option<&'a str>)>,
+) {
+    let attachments = attachments.into_iter().collect::<Vec<_>>();
+    if attachments.is_empty() {
+        return;
+    }
+    if !text.trim().is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str("Attachments:\n");
+    for (name, size_bytes, stored_path) in attachments {
+        text.push_str("- ");
+        text.push_str(name);
+        text.push_str(" (");
+        text.push_str(&format_bytes(size_bytes.min(usize::MAX as u64) as usize));
+        text.push(')');
+        if let Some(stored_path) = stored_path {
+            text.push_str(" at ");
+            text.push_str(stored_path);
+        }
+        text.push('\n');
+    }
+    while text.ends_with('\n') {
+        text.pop();
+    }
+}
+
+fn normalize_attachment_path(value: &str) -> Option<String> {
+    let mut path = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+    if path.is_empty() {
+        return None;
+    }
+    if let Some(rest) = path.strip_prefix("file://") {
+        path = rest.to_string();
+        #[cfg(windows)]
+        if path.len() >= 3 && path.as_bytes().first() == Some(&b'/') && path.as_bytes()[2] == b':' {
+            path.remove(0);
+        }
+    }
+    if path.trim().is_empty() {
+        None
+    } else {
+        Some(path)
+    }
 }
 
 fn open_agent_channel_store(
@@ -3102,6 +3607,362 @@ fn composer_control_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 
         theme.typography.body_font_size = COMPOSER_TEXT_SIZE;
         theme.typography.body_line_height = COMPOSER_LINE_HEIGHT;
         theme
+    }
+}
+
+#[cfg(not(test))]
+fn run_chat_media_call_worker(
+    data_dir: Arc<SinomoDataDir>,
+    provider_id: String,
+    model: String,
+    event_tx: mpsc::Sender<ChatMediaCallWorkerEvent>,
+    control_rx: Receiver<ChatMediaCallControl>,
+) {
+    let result_tx = event_tx.clone();
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("tokio runtime failed: {error}"))
+        .and_then(|runtime| {
+            runtime.block_on(run_chat_media_call_async(
+                data_dir,
+                provider_id,
+                model,
+                event_tx,
+                control_rx,
+            ))
+        });
+    match result {
+        Ok(()) => {
+            let _ = result_tx.send(ChatMediaCallWorkerEvent::Done("call ended".to_string()));
+        }
+        Err(error) => {
+            let _ = result_tx.send(ChatMediaCallWorkerEvent::Error(error));
+        }
+    }
+}
+
+#[cfg(not(test))]
+async fn run_chat_media_call_async(
+    data_dir: Arc<SinomoDataDir>,
+    provider_id: String,
+    model: String,
+    event_tx: mpsc::Sender<ChatMediaCallWorkerEvent>,
+    control_rx: Receiver<ChatMediaCallControl>,
+) -> Result<(), String> {
+    let provider = sinomo_lm::RealtimeAudioProvider::from_id(&provider_id)
+        .ok_or_else(|| format!("unsupported realtime provider `{provider_id}`"))?;
+    let model = if model.trim().is_empty() {
+        provider.default_model().to_string()
+    } else {
+        model
+    };
+    let mut config = sinomo_lm::RealtimeAudioSessionConfig::new(provider, model);
+    config.turn_detection = sinomo_lm::RealtimeAudioTurnDetection::SemanticVad;
+    config.api_key = chat_media_realtime_api_key(&data_dir, provider)?;
+
+    let mut issues = Vec::new();
+    let mut microphone = {
+        let capture_config = sinomo_audio::NativeAudioCaptureConfig::new(
+            config.input_sample_rate_hz,
+            app_native_audio_format(config.input_format),
+        );
+        match sinomo_audio::start_native_microphone_capture(capture_config) {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                issues.push(format!("mic unavailable: {error}"));
+                None
+            }
+        }
+    };
+    let mut camera = match sinomo_video::start_native_camera_capture(Default::default()) {
+        Ok(capture) => Some(capture),
+        Err(error) => {
+            issues.push(format!("camera unavailable: {error}"));
+            None
+        }
+    };
+    let speaker = {
+        let playback_config = sinomo_audio::NativeSpeakerPlaybackConfig::new(
+            config.output_sample_rate_hz,
+            app_native_audio_format(config.output_format),
+        );
+        match sinomo_audio::start_native_speaker_playback(playback_config) {
+            Ok(playback) => Some(playback),
+            Err(error) => {
+                issues.push(format!("speaker unavailable: {error}"));
+                None
+            }
+        }
+    };
+    if microphone.is_none() && camera.is_none() {
+        return Err(format!(
+            "native mic/camera unavailable: {}",
+            issues.join("; ")
+        ));
+    }
+    if camera.is_some() {
+        config.input_video = Some(sinomo_lm::RealtimeVideoInputConfig {
+            frame_format: sinomo_lm::RealtimeVideoFrameFormat::Jpeg,
+            detail: sinomo_lm::RealtimeVideoFrameDetail::Auto,
+            max_frame_rate_hz: Some(2),
+        });
+    }
+
+    let _ = event_tx.send(ChatMediaCallWorkerEvent::Ready(chat_media_ready_notice(
+        microphone.is_some(),
+        camera.is_some(),
+        speaker.is_some(),
+        &issues,
+    )));
+    let mut mic_enabled = true;
+    let mut camera_enabled = true;
+    if drain_chat_media_controls(&control_rx, &mut mic_enabled, &mut camera_enabled) {
+        return Ok(());
+    }
+
+    let mut session = sinomo_lm::RealtimeAudioSession::connect(config.clone())
+        .await
+        .map_err(|error| format!("realtime connect failed: {error}"))?;
+    let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(
+        "realtime session connected".to_string(),
+    ));
+
+    while !drain_chat_media_controls(&control_rx, &mut mic_enabled, &mut camera_enabled) {
+        let mut progressed = false;
+        let mut microphone_stopped = false;
+        if mic_enabled && let Some(capture) = microphone.as_ref() {
+            for _ in 0..4 {
+                match capture.recv_timeout(Duration::ZERO) {
+                    Ok(Some(chunk)) => {
+                        let input = sinomo_lm::RealtimeAudioInputChunk::new(chunk.audio);
+                        session
+                            .send_audio(&input)
+                            .await
+                            .map_err(|error| format!("realtime audio send failed: {error}"))?;
+                        let _ = event_tx.send(ChatMediaCallWorkerEvent::InputAudioChunk);
+                        progressed = true;
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(format!(
+                            "microphone stopped: {error}"
+                        )));
+                        microphone_stopped = true;
+                        progressed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if microphone_stopped {
+            microphone = None;
+        }
+
+        let mut camera_stopped = false;
+        if camera_enabled && let Some(capture) = camera.as_ref() {
+            for _ in 0..2 {
+                match capture.recv_timeout(Duration::ZERO) {
+                    Ok(Some(frame)) => {
+                        let mut input = sinomo_lm::RealtimeVideoFrameInput::new(
+                            frame.bytes,
+                            sinomo_lm::RealtimeVideoFrameFormat::Jpeg,
+                            frame.sequence,
+                        );
+                        input.detail = sinomo_lm::RealtimeVideoFrameDetail::Auto;
+                        input.timestamp_ms = Some(frame.sequence.saturating_mul(500));
+                        session
+                            .send_video_frame(&input)
+                            .await
+                            .map_err(|error| format!("realtime video send failed: {error}"))?;
+                        let _ = event_tx.send(ChatMediaCallWorkerEvent::InputVideoFrame);
+                        progressed = true;
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(format!(
+                            "camera stopped: {error}"
+                        )));
+                        camera_stopped = true;
+                        progressed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if camera_stopped {
+            camera = None;
+        }
+        if microphone.is_none() && camera.is_none() {
+            return Err("native mic/camera input stopped".to_string());
+        }
+
+        match session
+            .receive_event_with_timeout(Duration::from_millis(1))
+            .await
+        {
+            Ok(event) => {
+                if handle_chat_media_realtime_event(event, speaker.as_ref(), &event_tx)? {
+                    break;
+                }
+                progressed = true;
+            }
+            Err(sinomo_lm::RealtimeAudioError::Timeout { .. }) => {}
+            Err(error) => return Err(format!("realtime receive failed: {error}")),
+        }
+        if !progressed {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    let _ = session.close().await;
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn drain_chat_media_controls(
+    control_rx: &Receiver<ChatMediaCallControl>,
+    mic_enabled: &mut bool,
+    camera_enabled: &mut bool,
+) -> bool {
+    loop {
+        match control_rx.try_recv() {
+            Ok(ChatMediaCallControl::Stop) | Err(TryRecvError::Disconnected) => return true,
+            Ok(ChatMediaCallControl::SetMicEnabled(enabled)) => *mic_enabled = enabled,
+            Ok(ChatMediaCallControl::SetCameraEnabled(enabled)) => *camera_enabled = enabled,
+            Err(TryRecvError::Empty) => return false,
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn handle_chat_media_realtime_event(
+    event: sinomo_lm::RealtimeAudioEvent,
+    speaker: Option<&sinomo_audio::NativeSpeakerPlayback>,
+    event_tx: &mpsc::Sender<ChatMediaCallWorkerEvent>,
+) -> Result<bool, String> {
+    match event {
+        sinomo_lm::RealtimeAudioEvent::SessionQueued {
+            position,
+            estimated_wait_s,
+        } => {
+            let detail = match (position, estimated_wait_s) {
+                (Some(position), Some(wait)) => {
+                    format!("realtime queued: position {position}, about {wait:.0}s")
+                }
+                (Some(position), None) => format!("realtime queued: position {position}"),
+                _ => "realtime queued".to_string(),
+            };
+            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(detail));
+        }
+        sinomo_lm::RealtimeAudioEvent::SessionCreated { .. } => {
+            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(
+                "realtime session ready".to_string(),
+            ));
+        }
+        sinomo_lm::RealtimeAudioEvent::SessionUpdated => {}
+        sinomo_lm::RealtimeAudioEvent::Listening { .. } => {
+            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(
+                "model listening".to_string(),
+            ));
+        }
+        sinomo_lm::RealtimeAudioEvent::InputSpeechStarted => {
+            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(
+                "speech detected".to_string(),
+            ));
+        }
+        sinomo_lm::RealtimeAudioEvent::InputSpeechStopped => {
+            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice("speech ended".to_string()));
+        }
+        sinomo_lm::RealtimeAudioEvent::OutputAudioDelta { audio, .. } => {
+            if !audio.is_empty() {
+                if let Some(speaker) = speaker {
+                    speaker
+                        .write(&audio)
+                        .map_err(|error| format!("speaker playback failed: {error}"))?;
+                }
+                let _ = event_tx.send(ChatMediaCallWorkerEvent::OutputAudioChunk);
+            }
+        }
+        sinomo_lm::RealtimeAudioEvent::OutputTranscriptDelta { delta } => {
+            if !delta.trim().is_empty() {
+                let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(delta));
+            }
+        }
+        sinomo_lm::RealtimeAudioEvent::ResponseDone => {
+            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(
+                "response complete".to_string(),
+            ));
+        }
+        sinomo_lm::RealtimeAudioEvent::Closed { reason } => {
+            let _ = event_tx.send(ChatMediaCallWorkerEvent::Notice(format!(
+                "realtime closed: {reason}"
+            )));
+            return Ok(true);
+        }
+        sinomo_lm::RealtimeAudioEvent::Error { code, message } => {
+            return Err(format!("realtime error {code}: {message}"));
+        }
+        sinomo_lm::RealtimeAudioEvent::Raw { .. } => {}
+    }
+    Ok(false)
+}
+
+#[cfg(not(test))]
+fn chat_media_ready_notice(
+    microphone: bool,
+    camera: bool,
+    speaker: bool,
+    issues: &[String],
+) -> String {
+    let mut ready = Vec::new();
+    if microphone {
+        ready.push("mic");
+    }
+    if camera {
+        ready.push("camera");
+    }
+    if speaker {
+        ready.push("speaker");
+    }
+    if issues.is_empty() {
+        format!("native {} ready", ready.join(", "))
+    } else {
+        format!("native {} ready; {}", ready.join(", "), issues.join("; "))
+    }
+}
+
+#[cfg(not(test))]
+fn chat_media_realtime_api_key(
+    data_dir: &SinomoDataDir,
+    provider: sinomo_lm::RealtimeAudioProvider,
+) -> Result<Option<String>, String> {
+    match provider {
+        sinomo_lm::RealtimeAudioProvider::OpenAi => sinomo_lm::OpenAiProvider::default()
+            .api_key()
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        sinomo_lm::RealtimeAudioProvider::MiniCpmO => {
+            if let Some((api_key, _source)) =
+                sinomo_lm::provider_api_key_from_env(provider.provider_id())
+            {
+                return Ok(Some(api_key));
+            }
+            sinomo_lm::stored_provider_api_key_in_data_dir(data_dir, provider.provider_id())
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn app_native_audio_format(
+    format: sinomo_lm::RealtimeAudioSampleFormat,
+) -> sinomo_audio::NativeAudioSampleFormat {
+    match format {
+        sinomo_lm::RealtimeAudioSampleFormat::Pcm16Le => {
+            sinomo_audio::NativeAudioSampleFormat::Pcm16Le
+        }
+        sinomo_lm::RealtimeAudioSampleFormat::F32Le => sinomo_audio::NativeAudioSampleFormat::F32Le,
     }
 }
 
@@ -5850,6 +6711,408 @@ impl Widget for RuntimeOverview {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaCallControl {
+    ToggleCall,
+    ToggleMic,
+    ToggleCamera,
+}
+
+struct MediaCallPanel {
+    shared: Shared,
+    hovered: Cell<Option<MediaCallControl>>,
+    pressed: Cell<Option<MediaCallControl>>,
+}
+
+impl MediaCallPanel {
+    fn new(shared: Shared) -> Self {
+        Self {
+            shared,
+            hovered: Cell::new(None),
+            pressed: Cell::new(None),
+        }
+    }
+
+    fn control_rects(bounds: Rect) -> [(MediaCallControl, Rect); 3] {
+        let gap = 8.0;
+        let available = (bounds.width() - PAD * 2.0).max(90.0);
+        let button_w = ((available - gap * 2.0) / 3.0).max(48.0);
+        let button_h = 30.0;
+        let y = bounds.y() + bounds.height() - button_h - 12.0;
+        let x = bounds.x() + PAD;
+        [
+            (
+                MediaCallControl::ToggleMic,
+                Rect::new(x, y, button_w, button_h),
+            ),
+            (
+                MediaCallControl::ToggleCall,
+                Rect::new(x + button_w + gap, y, button_w, button_h),
+            ),
+            (
+                MediaCallControl::ToggleCamera,
+                Rect::new(x + (button_w + gap) * 2.0, y, button_w, button_h),
+            ),
+        ]
+    }
+
+    fn hit_control(bounds: Rect, position: Point) -> Option<MediaCallControl> {
+        Self::control_rects(bounds)
+            .into_iter()
+            .find_map(|(control, rect)| rect.contains(position).then_some(control))
+    }
+
+    fn refresh(ctx: &mut EventCtx) {
+        ctx.request_measure();
+        ctx.request_arrange();
+        ctx.request_paint();
+        ctx.request_semantics();
+    }
+
+    fn activate(&self, control: MediaCallControl) {
+        let mut chat = self.shared.chat_mut();
+        match control {
+            MediaCallControl::ToggleCall => chat.toggle_media_call(),
+            MediaCallControl::ToggleMic => chat.toggle_media_call_mic(),
+            MediaCallControl::ToggleCamera => chat.toggle_media_call_camera(),
+        }
+    }
+}
+
+impl Widget for MediaCallPanel {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        match event {
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
+                let hovered = Self::hit_control(ctx.bounds(), pointer.position);
+                if self.hovered.get() != hovered {
+                    self.hovered.set(hovered);
+                    Self::refresh(ctx);
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Down
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                if let Some(control) = Self::hit_control(ctx.bounds(), pointer.position) {
+                    self.pressed.set(Some(control));
+                    ctx.request_pointer_capture(pointer.pointer_id);
+                    Self::refresh(ctx);
+                    ctx.set_handled();
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Up
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                if let Some(pressed) = self.pressed.take() {
+                    if Self::hit_control(ctx.bounds(), pointer.position) == Some(pressed) {
+                        self.activate(pressed);
+                    }
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    Self::refresh(ctx);
+                    ctx.set_handled();
+                }
+            }
+            Event::Pointer(pointer)
+                if matches!(
+                    pointer.kind,
+                    PointerEventKind::Leave | PointerEventKind::Cancel
+                ) =>
+            {
+                let had_state =
+                    self.hovered.replace(None).is_some() || self.pressed.take().is_some();
+                if had_state {
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    Self::refresh(ctx);
+                    ctx.set_handled();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        constraints.clamp(Size::new(constraints.max.width, MEDIA_CALL_H))
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let pal = palette(&self.shared);
+        let bounds = ctx.bounds();
+        ctx.fill_bounds(pal.panel);
+        widgets::hairline_bottom(ctx, bounds, pal.border);
+
+        let chat = self.shared.chat();
+        let call = &chat.media_call;
+        let (selected_provider, selected_model) = chat.current_media_provider_model();
+        let provider = if call.active {
+            call.provider.as_str()
+        } else {
+            selected_provider.as_str()
+        };
+        let model = if call.active {
+            call.model.as_str()
+        } else {
+            selected_model.as_str()
+        };
+        let title_style = pal.text_style(&theme, 12.5, FontWeight::SEMIBOLD, pal.text);
+        let meta_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
+        let status_color = if call.active {
+            pal.good
+        } else {
+            pal.text_faint
+        };
+        let status_style = pal.text_style(&theme, 10.5, FontWeight::SEMIBOLD, status_color);
+        let x = bounds.x() + PAD;
+        let y = bounds.y() + 10.0;
+        let status = if call.active { "LIVE" } else { "READY" };
+
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x, y, (bounds.width() * 0.48).max(96.0), 18.0),
+            "Media call",
+            title_style,
+        );
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(
+                x + (bounds.width() * 0.48).max(96.0),
+                y,
+                (bounds.width() * 0.46).max(72.0),
+                18.0,
+            ),
+            status,
+            status_style,
+        );
+
+        let button_top = bounds.y() + bounds.height() - 42.0;
+        let pane_top = y + 24.0;
+        let pane_h = (button_top - pane_top - 10.0).max(44.0);
+        let inner_w = (bounds.width() - PAD * 2.0).max(0.0);
+        let local_w = (inner_w * 0.34).clamp(88.0, 156.0).min(inner_w * 0.45);
+        let gap = 10.0_f32.min(inner_w * 0.05);
+        let remote_w = (inner_w - local_w - gap).max(96.0);
+        let remote = Rect::new(x, pane_top, remote_w, pane_h);
+        let local = Rect::new(remote.x() + remote.width() + gap, pane_top, local_w, pane_h);
+
+        draw_media_call_video_pane(
+            ctx,
+            &pal,
+            &theme,
+            remote,
+            model,
+            provider,
+            if call.active {
+                "duplex audio/video"
+            } else {
+                "standby"
+            },
+            call.active,
+            false,
+        );
+        draw_media_call_video_pane(
+            ctx,
+            &pal,
+            &theme,
+            local,
+            if call.camera_enabled {
+                "Local"
+            } else {
+                "Camera"
+            },
+            if call.camera_enabled {
+                "preview"
+            } else {
+                "paused"
+            },
+            if call.mic_enabled {
+                "mic on"
+            } else {
+                "mic muted"
+            },
+            call.camera_enabled,
+            true,
+        );
+
+        let summary = format!(
+            "{} · in {} audio / {} frames · out {} audio",
+            chat.media_call_status_summary(),
+            call.input_audio_chunks,
+            call.input_video_frames,
+            call.output_audio_chunks
+        );
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x, button_top - 20.0, inner_w, 16.0),
+            &summary,
+            meta_style,
+        );
+
+        for (control, rect) in Self::control_rects(bounds) {
+            let hovered = self.hovered.get() == Some(control);
+            let pressed = self.pressed.get() == Some(control);
+            let (label, icon, active, tone) = match control {
+                MediaCallControl::ToggleMic => (
+                    if call.mic_enabled { "Mic" } else { "Muted" },
+                    if call.mic_enabled {
+                        IconGlyph::Check
+                    } else {
+                        IconGlyph::Close
+                    },
+                    call.mic_enabled,
+                    if call.mic_enabled {
+                        ActivityTone::Good
+                    } else {
+                        ActivityTone::Warn
+                    },
+                ),
+                MediaCallControl::ToggleCall => (
+                    if call.active { "End" } else { "Start" },
+                    IconGlyph::Chat,
+                    call.active,
+                    if call.active {
+                        ActivityTone::Bad
+                    } else {
+                        ActivityTone::Good
+                    },
+                ),
+                MediaCallControl::ToggleCamera => (
+                    if call.camera_enabled { "Cam" } else { "Paused" },
+                    if call.camera_enabled {
+                        IconGlyph::Check
+                    } else {
+                        IconGlyph::Close
+                    },
+                    call.camera_enabled,
+                    if call.camera_enabled {
+                        ActivityTone::Good
+                    } else {
+                        ActivityTone::Warn
+                    },
+                ),
+            };
+            draw_media_call_control_button(
+                ctx, &pal, &theme, rect, label, icon, tone, active, hovered, pressed,
+            );
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let chat = self.shared.chat();
+        for (index, (control, rect)) in Self::control_rects(ctx.bounds()).into_iter().enumerate() {
+            let name = match control {
+                MediaCallControl::ToggleCall if chat.media_call.active => "End media call",
+                MediaCallControl::ToggleCall => "Start media call",
+                MediaCallControl::ToggleMic if chat.media_call.mic_enabled => "Mute microphone",
+                MediaCallControl::ToggleMic => "Enable microphone",
+                MediaCallControl::ToggleCamera if chat.media_call.camera_enabled => "Pause camera",
+                MediaCallControl::ToggleCamera => "Enable camera",
+            };
+            let mut node = SemanticsNode::new(
+                sui::WidgetId::new(
+                    ctx.widget_id()
+                        .get()
+                        .wrapping_mul(53)
+                        .wrapping_add(19_001 + index as u64),
+                ),
+                SemanticsRole::Button,
+                rect,
+            );
+            node.parent = Some(ctx.widget_id());
+            node.name = Some(name.to_string());
+            node.actions = vec![SemanticsAction::Activate];
+            node.state.hovered = self.hovered.get() == Some(control);
+            ctx.push(node);
+        }
+    }
+}
+
+fn draw_media_call_video_pane(
+    ctx: &mut PaintCtx,
+    pal: &Palette,
+    theme: &DefaultTheme,
+    rect: Rect,
+    title: &str,
+    subtitle: &str,
+    status: &str,
+    active: bool,
+    local: bool,
+) {
+    let fill = if active { pal.field } else { pal.titlebar };
+    widgets::fill_round_rect(ctx, rect, fill, 6.0);
+    let glyph_rect = Rect::new(rect.x() + 10.0, rect.y() + 10.0, 18.0, 18.0);
+    draw_glyph(
+        ctx,
+        if local {
+            IconGlyph::File
+        } else {
+            IconGlyph::Sparkles
+        },
+        glyph_rect,
+        if active { pal.accent } else { pal.text_faint },
+    );
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(rect.x() + 34.0, rect.y() + 8.0, rect.width() - 42.0, 18.0),
+        &compact_line(title, 42),
+        pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, pal.text),
+    );
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(rect.x() + 34.0, rect.y() + 28.0, rect.width() - 42.0, 16.0),
+        &compact_line(subtitle, 36),
+        pal.text_style(theme, 10.0, FontWeight::NORMAL, pal.text_faint),
+    );
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(
+            rect.x() + 10.0,
+            rect.y() + rect.height() - 22.0,
+            rect.width() - 20.0,
+            16.0,
+        ),
+        status,
+        pal.text_style(theme, 10.0, FontWeight::MEDIUM, pal.text_muted),
+    );
+}
+
+fn draw_media_call_control_button(
+    ctx: &mut PaintCtx,
+    pal: &Palette,
+    theme: &DefaultTheme,
+    rect: Rect,
+    label: &str,
+    icon: IconGlyph,
+    tone: ActivityTone,
+    active: bool,
+    hovered: bool,
+    pressed: bool,
+) {
+    let fill = if pressed {
+        pal.selected
+    } else if hovered {
+        pal.hover
+    } else if active {
+        pal.field
+    } else {
+        pal.titlebar
+    };
+    widgets::fill_round_rect(ctx, rect, fill, 6.0);
+    let color = tone_color(pal, tone);
+    draw_glyph(
+        ctx,
+        icon,
+        Rect::new(rect.x() + 9.0, rect.y() + 7.0, 14.0, 14.0),
+        color,
+    );
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(rect.x() + 29.0, rect.y() + 6.0, rect.width() - 34.0, 18.0),
+        label,
+        pal.text_style(theme, 10.5, FontWeight::SEMIBOLD, color),
+    );
+}
+
 fn draw_health_chip(
     ctx: &mut PaintCtx,
     pal: &Palette,
@@ -7737,12 +9000,112 @@ fn open_provider_setup(shared: &Shared) {
     }
 }
 
+fn attachment_signature(shared: &Shared) -> (u64, usize) {
+    let chat = shared.chat();
+    (chat.draft_revision, chat.attachments.len())
+}
+
+fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let path_input = {
+        let s = shared.clone();
+        TextInput::new("chat-attachment-path")
+            .value(shared.chat().attachment_path_input.clone())
+            .placeholder("File path")
+            .leading_icon(IconGlyph::File)
+            .theme_when(composer_control_reader(reader))
+            .on_change(move |value| {
+                s.chat_mut().set_attachment_path_input(value);
+            })
+    };
+
+    let add = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Add, "Attach file")
+            .size(ATTACHMENT_ENTRY_H)
+            .icon_size(15.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.chat().attachment_path_input.trim().is_empty()
+            })
+            .on_press(move || {
+                s.chat_mut().add_attachment_from_path_input();
+            })
+    };
+
+    let entry = ComposerInputRow::new(
+        WidgetPod::new(path_input),
+        WidgetPod::new(
+            Flex::horizontal()
+                .align_items(Alignment::Center)
+                .spacer()
+                .with_child(add),
+        ),
+        ATTACHMENT_ENTRY_H,
+        ATTACHMENT_ENTRY_H,
+        8.0,
+    );
+
+    let mut chips = Stack::horizontal()
+        .spacing(6.0)
+        .alignment(Alignment::Center);
+    for (index, attachment) in shared.chat().attachments.iter().take(3).enumerate() {
+        let label = format!(
+            "{} · {}",
+            compact_line(&attachment.file_name, 22),
+            format_bytes(attachment.size_bytes.min(usize::MAX as u64) as usize)
+        );
+        let remove = {
+            let s = shared.clone();
+            IconButton::new(IconGlyph::Close, format!("Remove {}", attachment.file_name))
+                .size(ATTACHMENT_CHIPS_H)
+                .icon_size(12.0)
+                .theme_when(secondary_button_theme(reader))
+                .on_press(move || {
+                    s.chat_mut().remove_attachment(index);
+                })
+        };
+        chips = chips
+            .with_child(SizedBox::new().height(ATTACHMENT_CHIPS_H).with_child(
+                Label::new(label).font_size(11.0).color_when({
+                    let s = shared.clone();
+                    move || palette(&s).text_muted
+                }),
+            ))
+            .with_child(remove);
+    }
+    if shared.chat().attachments.len() > 3 {
+        let extra = shared.chat().attachments.len() - 3;
+        let s = shared.clone();
+        chips = chips.with_child(
+            SizedBox::new().height(ATTACHMENT_CHIPS_H).with_child(
+                Label::new(format!("+{extra}"))
+                    .font_size(11.0)
+                    .color_when(move || palette(&s).text_faint),
+            ),
+        );
+    }
+
+    WidgetPod::new(
+        Stack::vertical()
+            .spacing(4.0)
+            .alignment(Alignment::Stretch)
+            .with_child(SizedBox::new().height(ATTACHMENT_ENTRY_H).with_child(entry))
+            .with_child(SizedBox::new().height(ATTACHMENT_CHIPS_H).with_child(chips)),
+    )
+}
+
 /// The composer's bottom row: a flexible message `TextArea` and a fixed-size action slot. The input
 /// is bound to the draft via `on_change`; Enter submits normally, or queues a follow-up during an
 /// active stream. The action control swaps from Send to Interrupt while streaming.
 fn composer_action_signature(shared: &Shared) -> (bool, bool) {
     let chat = shared.chat();
-    (chat.streaming, !chat.input.is_empty())
+    (
+        chat.streaming,
+        !chat.input.is_empty()
+            || !chat.attachments.is_empty()
+            || !chat.attachment_path_input.is_empty(),
+    )
 }
 
 fn composer_actions(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -7918,13 +9281,35 @@ fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         )
     };
 
-    let input_h =
-        (COMPOSER_H - (COMPOSER_PAD_Y * 2.0) - SELECTOR_H - COMPOSER_SECTION_GAP).max(48.0);
+    let attachment_host = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::new(
+            {
+                let s = s.clone();
+                move || attachment_signature(&s)
+            },
+            move |_sig| attachment_controls(&s, &r),
+        )
+    };
+
+    let input_h = (COMPOSER_H
+        - (COMPOSER_PAD_Y * 2.0)
+        - SELECTOR_H
+        - ATTACHMENT_AREA_H
+        - (COMPOSER_SECTION_GAP * 2.0))
+        .max(48.0);
     let body = Stack::vertical()
         .spacing(0.0)
         .alignment(Alignment::Stretch)
         .with_child(SizedBox::new().height(COMPOSER_PAD_Y))
         .with_child(InsetX::new(selector_host, PAD))
+        .with_child(SizedBox::new().height(COMPOSER_SECTION_GAP))
+        .with_child(
+            SizedBox::new()
+                .height(ATTACHMENT_AREA_H)
+                .with_child(InsetX::new(attachment_host, PAD)),
+        )
         .with_child(SizedBox::new().height(COMPOSER_SECTION_GAP))
         .with_child(
             SizedBox::new()
@@ -7947,7 +9332,9 @@ fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 /// request-animation-frame pump lives on [`ChatView`] (a reliable ancestor of every control), so no
 /// invisible overlay widget is needed here.
 fn main_column(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    widgets::Dock::new(TranscriptView::new(shared.clone()))
+    let transcript = widgets::Dock::new(TranscriptView::new(shared.clone()))
+        .top(MEDIA_CALL_H, MediaCallPanel::new(shared.clone()));
+    widgets::Dock::new(transcript)
         .top(OVERVIEW_H, RuntimeOverview::new(shared.clone()))
         .bottom(COMPOSER_H, composer(shared, reader))
 }
@@ -8106,9 +9493,15 @@ impl ChatView {
             let list_changed = chat.pump_session_list();
             let delete_changed = chat.pump_delete();
             let channel_create_changed = chat.pump_channel_create();
-            worker_changed || list_changed || delete_changed || channel_create_changed
+            let media_changed = chat.pump_media_call_runtime();
+            worker_changed
+                || list_changed
+                || delete_changed
+                || channel_create_changed
+                || media_changed
         };
         let streaming = self.shared.chat().streaming;
+        let media_call_active = self.shared.chat().media_call.active;
 
         // Recompute the coarse signature each tick: a worker event (RuntimeInfo / Models / TurnDone,
         // or a token that resolved the selection) may have changed the selector option lists, the
@@ -8130,7 +9523,7 @@ impl ChatView {
             self.idle_frames
                 .set(self.idle_frames.get().saturating_add(1));
         }
-        if streaming || self.idle_frames.get() < PUMP_IDLE_BUDGET {
+        if streaming || media_call_active || self.idle_frames.get() < PUMP_IDLE_BUDGET {
             ctx.request_animation_frame();
             self.pump_alive.set(true);
         }
@@ -8151,6 +9544,9 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.current_models().len().hash(&mut h);
     chat.effort_visible().hash(&mut h);
     chat.streaming.hash(&mut h);
+    chat.draft_revision.hash(&mut h);
+    chat.attachments.len().hash(&mut h);
+    chat.attachment_path_input.is_empty().hash(&mut h);
     chat.models_loading.hash(&mut h);
     chat.activity_panel_visible().hash(&mut h);
     chat.session_list_loading.hash(&mut h);
@@ -8659,6 +10055,32 @@ mod tests {
             },
         ];
         state.info.agent = "main-agent".to_string();
+    }
+
+    struct TempAttachmentFile {
+        path: PathBuf,
+        dir: PathBuf,
+    }
+
+    impl Drop for TempAttachmentFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn temp_attachment_file(slug: &str, file_name: &str, contents: &[u8]) -> TempAttachmentFile {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "sinomo-app-chat-attachment-{slug}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp attachment dir");
+        let path = dir.join(file_name);
+        std::fs::write(&path, contents).expect("write temp attachment");
+        TempAttachmentFile { path, dir }
     }
 
     #[test]
@@ -10983,6 +12405,32 @@ mod tests {
     }
 
     #[test]
+    fn media_call_state_tracks_selected_runtime_and_controls() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.models_loading = false;
+
+        state.toggle_media_call();
+        assert!(state.media_call.active);
+        assert_eq!(state.media_call.provider, "OpenAI");
+        assert_eq!(state.media_call.model, "gpt-5");
+        assert!(state.media_call_status_summary().contains("mic on"));
+        assert!(state.media_call_status_summary().contains("camera on"));
+
+        state.toggle_media_call_mic();
+        state.toggle_media_call_camera();
+        assert!(!state.media_call.mic_enabled);
+        assert!(!state.media_call.camera_enabled);
+        assert!(state.media_call_status_summary().contains("mic muted"));
+        assert!(state.media_call_status_summary().contains("camera paused"));
+
+        state.toggle_media_call();
+        assert!(!state.media_call.active);
+        assert_eq!(state.media_call.notice.as_deref(), Some("call ended"));
+    }
+
+    #[test]
     fn activity_rail_detail_toggle_expands_latest_warning() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -12195,6 +13643,56 @@ mod tests {
             state.can_send(),
             "a pending new-session ack must not disable the Send button"
         );
+    }
+
+    #[test]
+    fn attachments_can_be_queued_removed_and_sent_without_text() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let attachment = temp_attachment_file("queue", "report.txt", b"hello");
+
+        state
+            .queue_attachment_path(&format!("\"{}\"", attachment.path.display()))
+            .expect("queue attachment");
+        assert_eq!(state.attachments.len(), 1);
+        assert_eq!(state.attachments[0].file_name, "report.txt");
+        assert!(!state.can_send(), "provider setup is still required");
+
+        seed_default_provider(&mut state);
+        assert!(
+            state.can_send(),
+            "a queued attachment can be sent without text"
+        );
+
+        let visible = visible_user_message_text("", &state.attachments);
+        assert!(visible.contains("Attachments:"));
+        assert!(visible.contains("report.txt"));
+
+        state.remove_attachment(0);
+        assert!(state.attachments.is_empty());
+        assert!(
+            !state.can_send(),
+            "removing the only attachment disables send"
+        );
+    }
+
+    #[test]
+    fn submit_sends_file_only_attachment_turn() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        let attachment = temp_attachment_file("submit", "image.png", b"png");
+        state
+            .queue_attachment_path(attachment.path.to_str().expect("utf8 path"))
+            .expect("queue attachment");
+
+        state.submit();
+
+        assert!(state.streaming, "attachment-only submit starts a turn");
+        assert!(state.input.is_empty());
+        assert!(state.attachments.is_empty());
+        assert_eq!(state.messages.len(), 2);
+        assert!(state.messages[0].text.contains("image.png"));
     }
 
     #[test]

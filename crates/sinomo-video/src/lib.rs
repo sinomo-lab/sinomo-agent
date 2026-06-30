@@ -1,11 +1,15 @@
 //! Video and screen perception event producer skeleton.
 
+use serde::{Deserialize, Serialize};
 use sinomo_gateway::{InputChunk, InputModality};
 use sinomo_runtime::core::{
     Confidence, EventEnvelope, EventKind, EventSpan, LatencyClass, PrivacyClass, RoutingMetadata,
     RoutingScope, Salience, Source,
 };
+use sinomo_runtime::device;
 use sinomo_runtime::events::EventId;
+use std::time::Duration;
+use thiserror::Error;
 
 #[derive(Clone, Debug, Default)]
 pub struct VideoPerceptionWorker;
@@ -72,6 +76,97 @@ fn base_event(
     event
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeVideoFrameFormat {
+    Jpeg,
+}
+
+impl NativeVideoFrameFormat {
+    pub fn mime_type(self) -> &'static str {
+        match self {
+            Self::Jpeg => "image/jpeg",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NativeVideoCaptureConfig {
+    pub device: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub frame_interval_ms: u64,
+}
+
+impl Default for NativeVideoCaptureConfig {
+    fn default() -> Self {
+        let raw = device::NativeCameraCaptureConfig::default();
+        Self {
+            device: raw.device,
+            width: raw.width,
+            height: raw.height,
+            frame_interval_ms: raw.frame_interval_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NativeVideoFrame {
+    pub sequence: u64,
+    pub format: NativeVideoFrameFormat,
+    pub width: u32,
+    pub height: u32,
+    pub captured_at_unix_ms: u128,
+    pub bytes: Vec<u8>,
+}
+
+pub struct NativeVideoCapture {
+    raw: device::NativeCameraCapture,
+}
+
+impl NativeVideoCapture {
+    pub fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<NativeVideoFrame>, NativeVideoError> {
+        self.raw
+            .recv_timeout(timeout)
+            .map(|frame| frame.map(native_video_frame_from_device))
+            .map_err(NativeVideoError::Device)
+    }
+}
+
+#[derive(Debug, Error, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub enum NativeVideoError {
+    #[error("native video device error: {0}")]
+    Device(#[from] device::NativeDeviceError),
+}
+
+pub fn start_native_camera_capture(
+    config: NativeVideoCaptureConfig,
+) -> Result<NativeVideoCapture, NativeVideoError> {
+    let raw = device::start_native_camera_capture(device::NativeCameraCaptureConfig {
+        device: config.device,
+        width: config.width,
+        height: config.height,
+        frame_interval_ms: config.frame_interval_ms,
+    })?;
+    Ok(NativeVideoCapture { raw })
+}
+
+fn native_video_frame_from_device(frame: device::NativeVideoFrame) -> NativeVideoFrame {
+    NativeVideoFrame {
+        sequence: frame.sequence,
+        format: match frame.format {
+            device::NativeVideoFrameFormat::Jpeg => NativeVideoFrameFormat::Jpeg,
+        },
+        width: frame.width,
+        height: frame.height,
+        captured_at_unix_ms: frame.captured_at_unix_ms,
+        bytes: frame.bytes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +189,35 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind.as_str(), "vision.observation.screen");
         assert_eq!(events[0].origin_device_id, Some(device.device_id));
+    }
+
+    #[test]
+    fn native_video_frame_mapping_preserves_raw_device_metadata() {
+        let frame = native_video_frame_from_device(sinomo_runtime::device::NativeVideoFrame {
+            sequence: 7,
+            format: sinomo_runtime::device::NativeVideoFrameFormat::Jpeg,
+            width: 640,
+            height: 480,
+            captured_at_unix_ms: 42,
+            bytes: vec![1, 2, 3],
+        });
+
+        assert_eq!(frame.sequence, 7);
+        assert_eq!(frame.format, NativeVideoFrameFormat::Jpeg);
+        assert_eq!(frame.format.mime_type(), "image/jpeg");
+        assert_eq!(frame.width, 640);
+        assert_eq!(frame.height, 480);
+        assert_eq!(frame.bytes, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn native_video_capture_defaults_mirror_raw_camera_defaults() {
+        let raw = sinomo_runtime::device::NativeCameraCaptureConfig::default();
+        let wrapped = NativeVideoCaptureConfig::default();
+
+        assert_eq!(wrapped.device, raw.device);
+        assert_eq!(wrapped.width, raw.width);
+        assert_eq!(wrapped.height, raw.height);
+        assert_eq!(wrapped.frame_interval_ms, raw.frame_interval_ms);
     }
 }

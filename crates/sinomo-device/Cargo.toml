@@ -12,9 +12,14 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "r1"
 
 [dependencies]
+cpal.workspace = true
 serde.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 sinomo-node = { path = "../sinomo-node" }
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+v4l.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

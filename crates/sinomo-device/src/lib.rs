@@ -1,8 +1,12 @@
 //! Device profile, permission, and capability metadata.
 
+mod native;
+
 use serde::{Deserialize, Serialize};
 use sinomo_core::{CapabilityName, DeviceCapability};
 use sinomo_node::NodeId;
+
+pub use native::*;
 
 pub type DeviceId = sinomo_core::Id;
 
@@ -30,6 +34,11 @@ impl DeviceProfile {
             permissions: Vec::new(),
             state: DeviceState::available(),
         }
+    }
+
+    pub fn with_device_id(mut self, device_id: DeviceId) -> Self {
+        self.device_id = device_id;
+        self
     }
 
     pub fn mock_microphone(node_id: NodeId) -> Self {

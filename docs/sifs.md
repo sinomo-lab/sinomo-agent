@@ -25,6 +25,9 @@ The baseline SIFS layout is:
 `/users` is reserved for cluster-level user data and user-facing shared workspaces.
 
 `/services` is reserved for service-owned state. For example, a web service can publish and update files under `/services/web/...`.
+Sinomo-managed agent skills live under `/services/sinomo/skills`: skill bodies
+are `SKILL.md` files, while catalog indexes, active pointers, and conflict
+records are stored as SOBJ metadata.
 
 ## Mixed Architecture
 

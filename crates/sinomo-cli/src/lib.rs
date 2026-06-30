@@ -846,6 +846,13 @@ fn run_cli_closure_with_capture(
     run_cli_closure_with_cli_output_capture(f, false)
 }
 
+#[cfg(test)]
+fn run_cli_closure_with_process_stdio_capture(
+    f: impl FnOnce() -> Result<(), CliError>,
+) -> CliCommandCaptureExecution {
+    run_cli_closure_with_cli_output_capture(f, true)
+}
+
 fn run_cli_closure_with_cli_output_capture(
     f: impl FnOnce() -> Result<(), CliError>,
     capture_process_stdio: bool,
@@ -3139,6 +3146,12 @@ fn format_unbounded_runtime_limit<T: std::fmt::Display>(value: Option<T>) -> Str
         .unwrap_or_else(|| "unbounded".to_string())
 }
 
+pub(crate) fn best_effort_reconciled_skill_catalog(
+    data_dir: &SinomoDataDir,
+) -> sinomo_agent::SkillCatalog {
+    sinomo_agent::load_reconciled_skill_catalog_from_sifs(data_dir).unwrap_or_default()
+}
+
 pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let account = if let Some(account_name) = options.account.as_deref() {
@@ -3164,6 +3177,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     let model = options.model.clone();
     let (runtime_config, _) = load_model_runtime_config_for_node(&data_dir)?;
     let tool_registry = main_agent_config_tool_registry(&data_dir)?;
+    let skill_catalog = best_effort_reconciled_skill_catalog(&data_dir);
     let loop_model = ConfiguredInteractionModel {
         data_dir: data_dir.clone(),
         provider: provider.clone(),
@@ -3172,8 +3186,11 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         runtime_config,
         managed_pytorch: Mutex::new(None),
     };
-    let agent = Agent::new(loop_model, provider, model)
+    let agent_config = sinomo_agent::AgentConfig::new(provider.clone(), model.clone())
         .with_agent_definition(AgentDefinition::main())
+        .with_skill_catalog(skill_catalog);
+    let agent = Agent::new(loop_model, provider, model)
+        .with_config(agent_config)
         .with_tool_registry(tool_registry)
         .with_tool_surface(sinomo_agent::AgentToolSurface::default_for_role(
             AgentRole::Main,
