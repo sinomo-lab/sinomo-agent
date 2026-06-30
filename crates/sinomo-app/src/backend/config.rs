@@ -334,6 +334,40 @@ mod tests {
         assert_eq!(config.default_account.as_deref(), Some("default"));
         assert_eq!(config.default_model.as_deref(), Some("deepseek-v4-flash"));
     }
+
+    #[test]
+    fn setting_provider_chat_default_updates_account_and_model() {
+        let (client, _root) = test_client("set-chat-default-account");
+        add_provider_account(&client, "openai", "work", "sk-work", "gpt-5", "")
+            .expect("add work account");
+        add_provider_account(
+            &client,
+            "openai",
+            "personal",
+            "sk-personal",
+            "gpt-5-mini",
+            "",
+        )
+        .expect("add personal account");
+
+        set_provider_chat_default(&client, "openai", "personal")
+            .expect("set personal as chat default");
+
+        let config = load_provider_config(&client).expect("provider config");
+        assert_eq!(config.default_provider.as_deref(), Some("openai"));
+        assert_eq!(config.default_account.as_deref(), Some("personal"));
+        assert_eq!(config.default_model.as_deref(), Some("gpt-5-mini"));
+
+        let forms = provider_forms(&client);
+        assert!(forms.iter().any(|form| {
+            form.account == "personal" && form.default_model == "gpt-5-mini" && form.is_default
+        }));
+        assert!(
+            forms
+                .iter()
+                .any(|form| form.account == "work" && !form.is_default)
+        );
+    }
 }
 
 /// Resolve the `lm.providers` config object into a `ModelConfig` via the client.
@@ -586,6 +620,37 @@ pub fn set_provider_model(
     update_provider_account(client, provider, account, move |account| {
         account.default_model = (!model.is_empty()).then_some(model);
     })
+}
+
+/// Set a provider account as the configured chat default in `lm.providers`.
+pub fn set_provider_chat_default(
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+) -> Result<(), String> {
+    let provider = normalize_configurable_provider(provider)?;
+    let account_name = normalize_provider_account_name(Some(account));
+    let mut config = load_provider_config(client).unwrap_or_default();
+    let default_model = config
+        .accounts
+        .iter()
+        .find(|candidate| {
+            normalize_model_provider(&candidate.provider).as_deref() == Some(provider.as_str())
+                && normalize_provider_account_name(Some(&candidate.account)) == account_name
+        })
+        .map(|candidate| candidate.default_model.clone())
+        .ok_or_else(|| {
+            format!(
+                "{} account {} was not found",
+                provider_display_name(&provider),
+                account_name
+            )
+        })?;
+
+    config.default_provider = Some(provider);
+    config.default_account = Some(account_name);
+    config.default_model = default_model;
+    write_provider_config(client, &config)
 }
 
 /// Set a provider's API base URL in `lm.providers` (empty clears it).

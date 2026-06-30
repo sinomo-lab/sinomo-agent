@@ -37,8 +37,8 @@ use crate::backend::config::{
     add_provider_account, cluster_provider_summaries, cycle_provider_reasoning_effort,
     provider_default_model, provider_display_name, provider_forms, reasoning_effort_index,
     remove_provider_account, resolve_items, run_provider_device_login, set_bool,
-    set_provider_api_key, set_provider_base_url, set_provider_effort, set_provider_enabled,
-    set_provider_model, set_value,
+    set_provider_api_key, set_provider_base_url, set_provider_chat_default, set_provider_effort,
+    set_provider_enabled, set_provider_model, set_value,
 };
 use crate::rendering::AppRenderMode;
 use crate::state::{Shared, Tab};
@@ -571,6 +571,28 @@ impl SettingsState {
             return true;
         }
         false
+    }
+
+    fn set_provider_chat_default(&mut self, index: usize) -> bool {
+        let Some(form) = self.provider_forms.get(index) else {
+            return false;
+        };
+        let provider = form.provider.clone();
+        let account = form.account.clone();
+        match set_provider_chat_default(self.config.as_ref(), &provider, &account) {
+            Ok(()) => {
+                self.provider_action_error = None;
+                self.provider_remove_confirming = None;
+                self.reload();
+                self.set_provider_status(provider, account, "Chat default saved to lm.providers");
+                true
+            }
+            Err(error) => {
+                self.provider_action_error = Some(error);
+                self.provider_action_status = None;
+                false
+            }
+        }
     }
 
     fn remove_provider(&mut self, index: usize) -> bool {
@@ -2033,6 +2055,32 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         "Authentication",
         provider_auth_summary(&form),
     ));
+    let chat_default_control = if form.is_default {
+        Stack::horizontal()
+            .alignment(Alignment::Center)
+            .with_child(positive_label(shared, "Chat default"))
+    } else {
+        let s = shared.clone();
+        let ready_for_chat = form.enabled && form.signed_in;
+        let button = sui::Button::new("Use for chat")
+            .icon(sui::IconGlyph::Check)
+            .theme_when(secondary_button_theme(reader))
+            .enabled(ready_for_chat)
+            .on_press(move || {
+                let changed = { s.settings_mut().set_provider_chat_default(index) };
+                if changed {
+                    refresh_chat_provider_summaries(&s);
+                }
+            });
+        Stack::horizontal()
+            .alignment(Alignment::Center)
+            .with_child(button)
+    };
+    body = body.with_child(
+        FormRow::new("Chat", chat_default_control)
+            .inline()
+            .theme_when(clone_reader(reader)),
+    );
     let provider_status = shared
         .settings()
         .provider_action_status
@@ -3745,6 +3793,21 @@ mod tests {
         Some((state, idx))
     }
 
+    fn provider_section_signature_for_state(settings: &SettingsState) -> String {
+        let mut parts = vec![
+            format!("action-error:{:?}", settings.provider_action_error),
+            format!("action-status:{:?}", settings.provider_action_status),
+            format!("remove:{:?}", settings.provider_remove_confirming),
+        ];
+        parts.extend(settings.provider_forms.iter().map(|form| {
+            format!(
+                "{}@{}:{}:{}",
+                form.provider, form.account, form.is_default, form.default_model
+            )
+        }));
+        parts.join("\u{1f}")
+    }
+
     #[test]
     fn set_value_with_invalid_input_errors_and_preserves_prior_value() {
         // A typed (Number/Json) key: writing garbage returns Err and the stored value is unchanged.
@@ -3861,6 +3924,55 @@ mod tests {
             before_signature,
             provider_section_signature(&shared),
             "provider saved status must invalidate the retained provider section"
+        );
+    }
+
+    #[test]
+    fn provider_chat_default_action_reports_status_and_persists() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        add_provider_account(
+            state.config.as_ref(),
+            "openai",
+            "work",
+            "sk-work",
+            "gpt-5",
+            "",
+        )
+        .expect("add openai provider account");
+        add_provider_account(
+            state.config.as_ref(),
+            "deepseek",
+            "default",
+            "sk-deep",
+            "deepseek-v4-flash",
+            "",
+        )
+        .expect("add deepseek provider account");
+        state.reload();
+        let before_signature = provider_section_signature_for_state(&state);
+
+        assert!(state.set_provider_chat_default(1));
+
+        assert_eq!(
+            state.provider_action_status.as_ref(),
+            Some(&ProviderActionStatus {
+                provider: "deepseek".to_string(),
+                account: "default".to_string(),
+                message: "Chat default saved to lm.providers".to_string(),
+            })
+        );
+        let config = crate::backend::config::load_provider_config(state.config.as_ref())
+            .expect("provider config");
+        assert_eq!(config.default_provider.as_deref(), Some("deepseek"));
+        assert_eq!(config.default_account.as_deref(), Some("default"));
+        assert_eq!(config.default_model.as_deref(), Some("deepseek-v4-flash"));
+        assert!(state.provider_forms[1].is_default);
+        assert!(!state.provider_forms[0].is_default);
+        assert_ne!(
+            before_signature,
+            provider_section_signature_for_state(&state),
+            "chat-default changes must invalidate the retained provider section"
         );
     }
 
@@ -4017,6 +4129,65 @@ mod tests {
             window.get_by_text("OpenAI (work) / gpt-5").count()? >= 1,
             "provider overview should report the chat default and model"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_card_can_set_chat_default_from_card_action() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let config = shared.settings().config.clone();
+            add_provider_account(config.as_ref(), "openai", "work", "sk-work", "gpt-5", "")
+                .expect("add openai provider account");
+            add_provider_account(
+                config.as_ref(),
+                "deepseek",
+                "default",
+                "sk-deep",
+                "deepseek-v4-flash",
+                "",
+            )
+            .expect("add deepseek provider account");
+        }
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            settings.reload();
+            settings.open(SettingsSection::Providers);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings provider chat default")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert!(
+            window.get_by_text("Chat default").count()? >= 1,
+            "provider card should identify the current chat default"
+        );
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Use for chat")
+            .click()?;
+        window
+            .get_by_text("Chat default saved to lm.providers")
+            .expect()
+            .to_be_visible()?;
+
+        let config =
+            crate::backend::config::load_provider_config(shared.settings().config.as_ref())
+                .expect("provider config");
+        assert_eq!(config.default_provider.as_deref(), Some("deepseek"));
+        assert_eq!(config.default_account.as_deref(), Some("default"));
+        assert_eq!(config.default_model.as_deref(), Some("deepseek-v4-flash"));
 
         Ok(())
     }
