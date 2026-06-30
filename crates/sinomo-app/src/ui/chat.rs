@@ -290,7 +290,9 @@ enum RecoveryCardAction {
 enum ChatQuickAction {
     PlanChange,
     CheckCluster,
-    ReviewRepo,
+    DraftDocument,
+    ReasonImage,
+    RolePlay,
     ManageChannel,
 }
 
@@ -324,14 +326,27 @@ impl RecoveryCardAction {
 }
 
 impl ChatQuickAction {
-    const CHAT: [Self; 3] = [Self::PlanChange, Self::CheckCluster, Self::ReviewRepo];
-    const CHANNEL: [Self; 3] = [Self::ManageChannel, Self::PlanChange, Self::CheckCluster];
+    const CHAT: [Self; 5] = [
+        Self::PlanChange,
+        Self::DraftDocument,
+        Self::ReasonImage,
+        Self::RolePlay,
+        Self::CheckCluster,
+    ];
+    const CHANNEL: [Self; 4] = [
+        Self::ManageChannel,
+        Self::PlanChange,
+        Self::DraftDocument,
+        Self::RolePlay,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::PlanChange => "Plan a change",
             Self::CheckCluster => "Check cluster",
-            Self::ReviewRepo => "Review repo",
+            Self::DraftDocument => "Draft document",
+            Self::ReasonImage => "Reason over image",
+            Self::RolePlay => "Role play",
             Self::ManageChannel => "Manage channel",
         }
     }
@@ -344,8 +359,14 @@ impl ChatQuickAction {
             Self::CheckCluster => {
                 Some("Check the local cluster status and explain anything that needs attention.")
             }
-            Self::ReviewRepo => Some(
-                "Review the current repository state and point out the most important issue to fix next.",
+            Self::DraftDocument => Some(
+                "Return a finished Markdown design note now. Start exactly with '# Chat and channel interaction design note'. Include sections: Assumptions, Audience, Goals, Non-goals, Workflow, Risks, Next steps. Do not describe what you will do.",
+            ),
+            Self::ReasonImage => Some(
+                "Analyze the attached image or file. If nothing is attached yet, ask me for the image or file first. Describe concrete observations, likely interpretation, and uncertainties.",
+            ),
+            Self::RolePlay => Some(
+                "Role play as a skeptical product reviewer evaluating this chat and channel interface. Stay in character, critique the workflow, and propose specific improvements.",
             ),
             Self::ManageChannel => None,
         }
@@ -355,7 +376,9 @@ impl ChatQuickAction {
         match self {
             Self::PlanChange => IconGlyph::Sparkles,
             Self::CheckCluster => IconGlyph::Storage,
-            Self::ReviewRepo => IconGlyph::Search,
+            Self::DraftDocument => IconGlyph::File,
+            Self::ReasonImage => IconGlyph::Search,
+            Self::RolePlay => IconGlyph::Chat,
             Self::ManageChannel => IconGlyph::Chat,
         }
     }
@@ -364,7 +387,9 @@ impl ChatQuickAction {
         match self {
             Self::PlanChange => "Prepare a planning prompt",
             Self::CheckCluster => "Prepare a cluster status prompt",
-            Self::ReviewRepo => "Prepare a repository review prompt",
+            Self::DraftDocument => "Prepare a document drafting prompt",
+            Self::ReasonImage => "Prepare an image or file reasoning prompt",
+            Self::RolePlay => "Prepare a role-playing prompt",
             Self::ManageChannel => "Open channel agents and settings",
         }
     }
@@ -373,9 +398,15 @@ impl ChatQuickAction {
         match self {
             Self::PlanChange => "Safest first step",
             Self::CheckCluster => "Daemon health",
-            Self::ReviewRepo => "Highest-risk issue",
+            Self::DraftDocument => "Structured note",
+            Self::ReasonImage => "Attachment analysis",
+            Self::RolePlay => "Persona test",
             Self::ManageChannel => "Agents and title",
         }
+    }
+
+    fn opens_attachment_controls(self) -> bool {
+        matches!(self, Self::ReasonImage)
     }
 }
 
@@ -1561,6 +1592,7 @@ impl ChatState {
             return false;
         }
 
+        let show_speaker = self.session_is_channel(session_id);
         let mut transcript = self.load_chat_transcript(session_id).unwrap_or_default();
         let mut messages: Vec<ChatMessage> = transcript
             .messages
@@ -1573,7 +1605,15 @@ impl ChatState {
                 true
             }
             ChatEvent::AgentToken { speaker, text, .. } => {
-                Self::append_model_token_from_speaker(&mut messages, &speaker.agent_name, &text);
+                if show_speaker {
+                    Self::append_model_token_from_speaker(
+                        &mut messages,
+                        &speaker.agent_name,
+                        &text,
+                    );
+                } else {
+                    Self::append_model_token(&mut messages, &text);
+                }
                 true
             }
             ChatEvent::SystemMessage { kind, text, .. } => {
@@ -1747,6 +1787,13 @@ impl ChatState {
 
     fn current_is_channel(&self) -> bool {
         self.current_session_ref()
+            .is_some_and(|session| session.kind == ConversationKind::Channel)
+    }
+
+    fn session_is_channel(&self, session_id: &str) -> bool {
+        self.sessions
+            .iter()
+            .find(|session| session.id == session_id)
             .is_some_and(|session| session.kind == ConversationKind::Channel)
     }
 
@@ -2518,13 +2565,23 @@ impl ChatState {
                     self.scroll = f32::MAX;
                 }
             }
-            ChatEvent::AgentToken { speaker, text, .. } => {
+            ChatEvent::AgentToken {
+                session_id,
+                speaker,
+                text,
+            } => {
                 self.notice = None;
-                Self::append_model_token_from_speaker(
-                    &mut self.messages,
-                    &speaker.agent_name,
-                    &text,
-                );
+                if self.session_is_channel(&session_id)
+                    || (session_id.is_empty() && self.current_is_channel())
+                {
+                    Self::append_model_token_from_speaker(
+                        &mut self.messages,
+                        &speaker.agent_name,
+                        &text,
+                    );
+                } else {
+                    Self::append_model_token(&mut self.messages, &text);
+                }
                 if self.stick_bottom {
                     self.scroll = f32::MAX;
                 }
@@ -2963,6 +3020,9 @@ impl ChatState {
         };
         self.input = prompt.to_string();
         self.cursor = self.input.len();
+        if action.opens_attachment_controls() {
+            self.attachment_controls_open = true;
+        }
         self.draft_revision = self.draft_revision.wrapping_add(1);
     }
 
@@ -8143,7 +8203,9 @@ impl TranscriptView {
         match action {
             ChatQuickAction::PlanChange => 176.0,
             ChatQuickAction::CheckCluster => 178.0,
-            ChatQuickAction::ReviewRepo => 166.0,
+            ChatQuickAction::DraftDocument => 176.0,
+            ChatQuickAction::ReasonImage => 190.0,
+            ChatQuickAction::RolePlay => 148.0,
             ChatQuickAction::ManageChannel => 176.0,
         }
     }
@@ -8188,11 +8250,51 @@ impl TranscriptView {
                 .collect();
         }
 
+        if max_w >= 420.0 {
+            let cols = if actions.len() >= 5 && max_w >= 540.0 {
+                3_usize
+            } else {
+                2_usize
+            };
+            let width =
+                ((max_w - gap * cols.saturating_sub(1) as f32) / cols as f32).clamp(148.0, 260.0);
+            let rows = actions.len().div_ceil(cols);
+            let grid_w = cols as f32 * width + gap * cols.saturating_sub(1) as f32;
+            let grid_h = rows as f32 * button_h + gap * rows.saturating_sub(1) as f32;
+            let x0 = area.x() + (area.width() - grid_w) * 0.5;
+            let preferred_y = cy + 62.0;
+            let y0 = preferred_y
+                .min(area.max_y() - PAD - grid_h)
+                .max(cy + 52.0)
+                .max(area.y() + PAD);
+            return actions
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let row = index / cols;
+                    let col = index % cols;
+                    (
+                        *action,
+                        Rect::new(
+                            x0 + col as f32 * (width + gap),
+                            y0 + row as f32 * (button_h + gap),
+                            width,
+                            button_h,
+                        ),
+                    )
+                })
+                .collect();
+        }
+
         let width = max_w.clamp(206.0, 280.0);
         let stack_h =
             button_h * actions.len() as f32 + gap * actions.len().saturating_sub(1) as f32;
         let x = area.x() + (area.width() - width) * 0.5;
-        let y0 = cy + 54.0 - stack_h * 0.5;
+        let preferred_y = cy + 58.0;
+        let y0 = preferred_y
+            .min(area.max_y() - PAD - stack_h)
+            .max(cy + 48.0)
+            .max(area.y() + PAD);
         actions
             .iter()
             .enumerate()
@@ -11785,6 +11887,24 @@ mod tests {
     }
 
     #[test]
+    fn image_reasoning_quick_action_opens_attachment_controls() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.attachment_controls_open = false;
+
+        state.apply_quick_action(ChatQuickAction::ReasonImage);
+
+        assert_eq!(
+            state.input,
+            ChatQuickAction::ReasonImage
+                .prompt()
+                .expect("image prompt action")
+        );
+        assert!(state.attachment_controls_visible());
+        assert_eq!(state.cursor, state.input.len());
+    }
+
+    #[test]
     fn rendered_empty_channel_surfaces_active_agent_count() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let data_dir = backend.data_dir.clone();
@@ -12365,6 +12485,64 @@ mod tests {
             "TurnDone clears the active turn marker"
         );
         assert!(state.notice.is_none());
+    }
+
+    #[test]
+    fn direct_chat_agent_tokens_do_not_prefix_speaker() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let session_id = SessionId::generate().to_string();
+        state.session_id = session_id.clone();
+        state.messages = vec![ChatMessage::user("hi"), ChatMessage::model("")];
+
+        state.apply_event(ChatEvent::AgentToken {
+            session_id,
+            speaker: sinomo_cli::app_api::ChatSpeaker {
+                agent_key: "main-agent".to_string(),
+                agent_name: "main-agent".to_string(),
+                ..Default::default()
+            },
+            text: "Hello".to_string(),
+        });
+
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.messages[1].text, "Hello");
+    }
+
+    #[test]
+    fn channel_agent_tokens_keep_speaker_prefix() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let channel_id = SessionId::generate().to_string();
+        state.session_id = channel_id.clone();
+        state.sessions = vec![SessionRef {
+            id: channel_id.clone(),
+            title: "Release triage".to_string(),
+            kind: ConversationKind::Channel,
+            updated_unix: 1,
+            participant_count: 1,
+            participant_names: vec!["main-agent".to_string()],
+        }];
+        state.messages = vec![ChatMessage::user("hi"), ChatMessage::model("")];
+        let speaker = sinomo_cli::app_api::ChatSpeaker {
+            agent_key: "main-agent".to_string(),
+            agent_name: "main-agent".to_string(),
+            ..Default::default()
+        };
+
+        state.apply_event(ChatEvent::AgentToken {
+            session_id: channel_id.clone(),
+            speaker: speaker.clone(),
+            text: "Hel".to_string(),
+        });
+        state.apply_event(ChatEvent::AgentToken {
+            session_id: channel_id,
+            speaker,
+            text: "lo".to_string(),
+        });
+
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.messages[1].text, "main-agent: Hello");
     }
 
     #[test]
