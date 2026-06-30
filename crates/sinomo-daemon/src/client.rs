@@ -107,10 +107,9 @@ pub(crate) fn send_daemon_rpc_raw(
     )
 }
 
-/// Like [`send_daemon_rpc`], but with an idle deadline on the stream as well
-/// as the connect timeout. Use for RPCs that must never hang on a silent
-/// peer (e.g. cluster join, where an unresponsive introducer otherwise wedges
-/// the caller forever).
+/// Like [`send_daemon_rpc`], but lets callers provide separate connect and idle
+/// deadlines. Use an idle deadline for RPCs that must never hang on a silent
+/// peer, and omit it for long-running operations that report progress elsewhere.
 pub fn send_daemon_rpc_with_timeouts(
     address: &str,
     request: &ObjectRpcRequest,
@@ -294,6 +293,14 @@ pub fn send_daemon_rpc_to_endpoint(
     timeout: Duration,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let timeouts = sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout);
+    send_daemon_rpc_to_endpoint_with_timeouts(endpoint, request, timeouts)
+}
+
+pub fn send_daemon_rpc_to_endpoint_with_timeouts(
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    timeouts: sinomo_network::DaemonRpcTimeouts,
+) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         return if matches!(
             handle.runtime_flavor(),
@@ -564,6 +571,19 @@ where
     decode(&response).map_err(Into::into)
 }
 
+fn send_daemon_rpc_request_with_decoder_and_timeouts<Resp, DecodeError>(
+    address: &str,
+    request: &ObjectRpcRequest,
+    timeouts: sinomo_network::DaemonRpcTimeouts,
+    decode: impl FnOnce(&sinomo_network::ObjectRpcResponse) -> Result<Resp, DecodeError>,
+) -> Result<Resp, DaemonError>
+where
+    DecodeError: Into<DaemonError>,
+{
+    let response = send_daemon_rpc_with_timeouts(address, request, timeouts)?;
+    decode(&response).map_err(Into::into)
+}
+
 fn send_daemon_rpc_request_to_endpoint_with_decoder<Resp, DecodeError>(
     endpoint: &ClusterEndpointRecord,
     request: &ObjectRpcRequest,
@@ -574,6 +594,19 @@ where
     DecodeError: Into<DaemonError>,
 {
     let response = send_daemon_rpc_to_endpoint(endpoint, request, timeout)?;
+    decode(&response).map_err(Into::into)
+}
+
+fn send_daemon_rpc_request_to_endpoint_with_decoder_and_timeouts<Resp, DecodeError>(
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    timeouts: sinomo_network::DaemonRpcTimeouts,
+    decode: impl FnOnce(&sinomo_network::ObjectRpcResponse) -> Result<Resp, DecodeError>,
+) -> Result<Resp, DaemonError>
+where
+    DecodeError: Into<DaemonError>,
+{
+    let response = send_daemon_rpc_to_endpoint_with_timeouts(endpoint, request, timeouts)?;
     decode(&response).map_err(Into::into)
 }
 
@@ -1306,13 +1339,23 @@ pub fn send_daemon_rollout_build(
     request: &ClusterRolloutBuildRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_rpc_body(
+    send_daemon_rollout_build_with_timeouts(
         address,
-        ROLLOUT_BUILD_ROUTE,
-        ROLLOUT_RPC_CATEGORY,
         request,
-        timeout,
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
     )
+}
+
+pub fn send_daemon_rollout_build_with_timeouts(
+    address: &str,
+    request: &ClusterRolloutBuildRequest,
+    timeouts: sinomo_network::DaemonRpcTimeouts,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    let request =
+        ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
+    send_daemon_rpc_request_with_decoder_and_timeouts(address, &request, timeouts, |response| {
+        response.decode_body()
+    })
 }
 
 pub fn send_daemon_rollout_build_to_endpoint(
@@ -1320,12 +1363,25 @@ pub fn send_daemon_rollout_build_to_endpoint(
     request: &ClusterRolloutBuildRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_rpc_body_to_endpoint(
+    send_daemon_rollout_build_to_endpoint_with_timeouts(
         endpoint,
-        ROLLOUT_BUILD_ROUTE,
-        ROLLOUT_RPC_CATEGORY,
         request,
-        timeout,
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
+    )
+}
+
+pub fn send_daemon_rollout_build_to_endpoint_with_timeouts(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterRolloutBuildRequest,
+    timeouts: sinomo_network::DaemonRpcTimeouts,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    let request =
+        ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
+    send_daemon_rpc_request_to_endpoint_with_decoder_and_timeouts(
+        endpoint,
+        &request,
+        timeouts,
+        |response| response.decode_body(),
     )
 }
 

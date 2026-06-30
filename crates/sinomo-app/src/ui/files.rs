@@ -61,7 +61,7 @@ const INSPECTOR_W: f32 = 340.0;
 const ROW_H: f32 = 34.0;
 const ROW_ACTION_SIDE: f32 = 24.0;
 const ROW_ACTION_GAP: f32 = 4.0;
-const ROW_ACTION_COUNT: f32 = 7.0;
+const ROW_ACTION_COUNT: f32 = 4.0;
 const CONTENT_PAD: f32 = 16.0;
 const HEADER_H: f32 = 78.0;
 const HEADER_COMMAND_GAP: f32 = 8.0;
@@ -1753,6 +1753,24 @@ impl FilesState {
             },
             "Repair replicas".to_string(),
             entry.path,
+            waker,
+        );
+    }
+
+    fn start_current_location_replica_repair(&mut self, waker: Option<sui::UiHandle>) {
+        if self.source != FilesSourceKind::Sifs {
+            return;
+        }
+        let path = self.path.clone();
+        self.start_operation(
+            FilesOperation {
+                kind: FilesOperationKind::RepairReplicas,
+                path: path.clone(),
+                target: None,
+                directory: true,
+            },
+            "Repair replicas".to_string(),
+            path,
             waker,
         );
     }
@@ -5417,10 +5435,14 @@ enum SifsEntryRowHit {
     Inspect,
     Copy,
     Transfer,
-    Move,
-    Rename,
-    Delete,
 }
+
+const ROW_INLINE_ACTIONS: [SifsEntryRowHit; 4] = [
+    SifsEntryRowHit::Select,
+    SifsEntryRowHit::Inspect,
+    SifsEntryRowHit::Copy,
+    SifsEntryRowHit::Transfer,
+];
 
 struct SifsEntryRow {
     shared: Shared,
@@ -5472,15 +5494,7 @@ impl SifsEntryRow {
         if !bounds.contains(position) {
             return None;
         }
-        for action in [
-            SifsEntryRowHit::Select,
-            SifsEntryRowHit::Inspect,
-            SifsEntryRowHit::Copy,
-            SifsEntryRowHit::Transfer,
-            SifsEntryRowHit::Move,
-            SifsEntryRowHit::Rename,
-            SifsEntryRowHit::Delete,
-        ] {
+        for action in ROW_INLINE_ACTIONS {
             if !self.action_enabled(action) {
                 continue;
             }
@@ -5497,9 +5511,6 @@ impl SifsEntryRow {
             SifsEntryRowHit::Inspect => 8_317,
             SifsEntryRowHit::Copy => 8_329,
             SifsEntryRowHit::Transfer => 8_333,
-            SifsEntryRowHit::Move => 8_341,
-            SifsEntryRowHit::Rename => 8_351,
-            SifsEntryRowHit::Delete => 8_389,
             SifsEntryRowHit::Row => 8_401,
         };
         sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(salt))
@@ -5512,9 +5523,6 @@ fn row_action_slot(action: SifsEntryRowHit) -> Option<usize> {
         SifsEntryRowHit::Inspect => Some(1),
         SifsEntryRowHit::Copy => Some(2),
         SifsEntryRowHit::Transfer => Some(3),
-        SifsEntryRowHit::Move => Some(4),
-        SifsEntryRowHit::Rename => Some(5),
-        SifsEntryRowHit::Delete => Some(6),
         SifsEntryRowHit::Row => None,
     }
 }
@@ -5623,24 +5631,6 @@ impl Widget for SifsEntryRow {
                             files.open_action_prompt(prompt_kind);
                             request_files_overlay_rebuild(ctx);
                         }
-                        SifsEntryRowHit::Move => {
-                            let mut files = self.shared.files_mut();
-                            files.select_entry(self.index);
-                            files.open_action_prompt(FileActionPromptKind::Move);
-                            request_files_overlay_rebuild(ctx);
-                        }
-                        SifsEntryRowHit::Rename => {
-                            let mut files = self.shared.files_mut();
-                            files.select_entry(self.index);
-                            files.open_action_prompt(FileActionPromptKind::Rename);
-                            request_files_overlay_rebuild(ctx);
-                        }
-                        SifsEntryRowHit::Delete => {
-                            let mut files = self.shared.files_mut();
-                            files.select_entry(self.index);
-                            files.open_action_prompt(FileActionPromptKind::Delete);
-                            request_files_overlay_rebuild(ctx);
-                        }
                     }
                     ctx.request_measure();
                     ctx.request_paint();
@@ -5740,17 +5730,6 @@ impl Widget for SifsEntryRow {
                 row_transfer_glyph(source),
                 pal.accent,
             ),
-            (
-                SifsEntryRowHit::Move,
-                IconGlyph::ChevronRight,
-                pal.text_muted,
-            ),
-            (
-                SifsEntryRowHit::Rename,
-                IconGlyph::MoreHorizontal,
-                pal.text_muted,
-            ),
-            (SifsEntryRowHit::Delete, IconGlyph::Trash, pal.warn),
         ] {
             if !self.action_enabled(action) {
                 continue;
@@ -5855,25 +5834,6 @@ impl Widget for SifsEntryRow {
                 SifsEntryRowHit::Transfer,
                 row_transfer_label(source, &self.entry.name),
                 row_transfer_description(source, &self.entry.path),
-            ),
-            (
-                SifsEntryRowHit::Move,
-                format!("Move {}", self.entry.name),
-                format!(
-                    "Move {} to another {} path",
-                    self.entry.path,
-                    source.operation_scope()
-                ),
-            ),
-            (
-                SifsEntryRowHit::Rename,
-                format!("Rename {}", self.entry.name),
-                format!("Rename {}", self.entry.path),
-            ),
-            (
-                SifsEntryRowHit::Delete,
-                format!("Delete {}", self.entry.name),
-                format!("Delete {}", self.entry.path),
             ),
         ] {
             if !self.action_enabled(action) {
@@ -6900,12 +6860,52 @@ fn files_source_status(files: &FilesState) -> &'static str {
         {
             "SIFS syncing"
         }
+        FilesSourceKind::Sifs if files_sifs_daemon_is_remote(files) => "Remote SIFS",
         FilesSourceKind::Sifs if files.clustered => "SIFS online",
         FilesSourceKind::Sifs => "Local SIFS",
         FilesSourceKind::Local if files.error.is_some() => "Local unavailable",
         FilesSourceKind::Local if files.loading => "Loading local",
         FilesSourceKind::Local => "Local files",
     }
+}
+
+fn files_sifs_connection_detail(files: &FilesState) -> Option<String> {
+    if files.source != FilesSourceKind::Sifs {
+        return None;
+    }
+    files.daemon_address.as_deref().map(|address| {
+        let label = if daemon_address_is_remote(address) {
+            "remote daemon"
+        } else {
+            "daemon"
+        };
+        format!("{label} {}", middle_short(address, 44))
+    })
+}
+
+fn files_sifs_daemon_is_remote(files: &FilesState) -> bool {
+    files
+        .daemon_address
+        .as_deref()
+        .is_some_and(daemon_address_is_remote)
+}
+
+fn daemon_address_is_remote(address: &str) -> bool {
+    let host = daemon_address_host(address);
+    !matches!(host, "" | "localhost" | "::1") && !host.starts_with("127.") && host != "0.0.0.0"
+}
+
+fn daemon_address_host(address: &str) -> &str {
+    let trimmed = address.trim();
+    if let Some(rest) = trimmed.strip_prefix('[')
+        && let Some((host, _)) = rest.split_once(']')
+    {
+        return host;
+    }
+    trimmed
+        .rsplit_once(':')
+        .map(|(host, _)| host.trim_matches(['[', ']']))
+        .unwrap_or(trimmed)
 }
 
 fn files_entry_count_status(files: &FilesState) -> String {
@@ -7077,14 +7077,18 @@ fn files_task_queue_summary(tasks: &[FilesTask]) -> String {
 }
 
 fn files_status_summary(files: &FilesState) -> String {
-    let mut summary = format!(
-        "{} | Path {} | {} | {} | {}",
-        files_source_status(files),
+    let mut summary = files_source_status(files).to_string();
+    if let Some(detail) = files_sifs_connection_detail(files) {
+        summary.push_str(" | ");
+        summary.push_str(&detail);
+    }
+    summary.push_str(&format!(
+        " | Path {} | {} | {} | {}",
         files.path,
         files_entry_count_status(files),
         files_selection_status(files),
         files_task_status(files),
-    );
+    ));
     if files.source == FilesSourceKind::Sifs
         && let Some(health) = files.sifs_health.as_ref()
     {
@@ -7284,8 +7288,8 @@ fn files_places(files: &FilesState) -> Vec<FilePlace> {
     );
     push_unique_place(
         &mut places,
-        "Current local",
-        "host filesystem",
+        "Working folder",
+        "app working dir",
         FilesSourceKind::Local,
         files.local_path.clone(),
         IconGlyph::Folder,
@@ -7550,12 +7554,15 @@ impl Widget for FilesStatusBar {
         let info_x = chip.max_x() + 12.0;
         let info_w = (right.x() - info_x - 12.0).max(0.0);
         let selected = files_status_bar_selection(&files);
-        let mut info = format!(
-            "{} | {} | {}",
+        let mut info_parts = vec![
             middle_short(&files.path, 64),
             files_entry_count_status(&files),
             selected,
-        );
+        ];
+        if let Some(detail) = files_sifs_connection_detail(&files) {
+            info_parts.insert(1, middle_short(&detail, 48));
+        }
+        let mut info = info_parts.join(" | ");
         if files.source == FilesSourceKind::Sifs
             && let Some(health) = files.sifs_health.as_ref()
         {
@@ -8571,6 +8578,7 @@ fn inspector_min_content_h(tasks: &[FilesTask]) -> f32 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RootInspectorAction {
     RefreshFolder,
+    RepairReplicas,
     OpenCluster,
     ConnectionSettings,
 }
@@ -8579,6 +8587,7 @@ impl RootInspectorAction {
     fn label(self) -> &'static str {
         match self {
             Self::RefreshFolder => "Refresh folder",
+            Self::RepairReplicas => "Repair replicas",
             Self::OpenCluster => "Open Cluster",
             Self::ConnectionSettings => "Connection settings",
         }
@@ -8587,6 +8596,7 @@ impl RootInspectorAction {
     fn glyph(self) -> IconGlyph {
         match self {
             Self::RefreshFolder => IconGlyph::Redo,
+            Self::RepairReplicas => IconGlyph::Redo,
             Self::OpenCluster => IconGlyph::Storage,
             Self::ConnectionSettings => IconGlyph::Alert,
         }
@@ -8595,6 +8605,7 @@ impl RootInspectorAction {
     fn description(self) -> &'static str {
         match self {
             Self::RefreshFolder => "Reload the current file listing and SIFS health summary",
+            Self::RepairReplicas => "Request SIFS replica repair for the current location",
             Self::OpenCluster => "Open Cluster health and routing diagnostics",
             Self::ConnectionSettings => "Open Connection settings for daemon and SIFS recovery",
         }
@@ -8608,6 +8619,13 @@ fn unselected_inspector_actions(files: &FilesState) -> Vec<RootInspectorAction> 
 
     let mut actions = vec![RootInspectorAction::RefreshFolder];
     if files.source == FilesSourceKind::Sifs {
+        if files
+            .sifs_health
+            .as_ref()
+            .is_some_and(|health| health.pending_repair_count > 0)
+        {
+            actions.push(RootInspectorAction::RepairReplicas);
+        }
         if files.sifs_health.as_ref().is_some_and(|health| {
             sifs_health_has_attention(health) || sifs_health_has_activity(health)
         }) {
@@ -8900,6 +8918,7 @@ fn root_inspector_action_button_widget_id(
 ) -> sui::WidgetId {
     let salt = match action {
         RootInspectorAction::RefreshFolder => 7_701,
+        RootInspectorAction::RepairReplicas => 7_702,
         RootInspectorAction::OpenCluster => 7_703,
         RootInspectorAction::ConnectionSettings => 7_707,
     };
@@ -9017,6 +9036,13 @@ impl Widget for InspectorView {
                 match action {
                     RootInspectorAction::RefreshFolder => {
                         self.shared.files_mut().reload();
+                        request_files_overlay_rebuild(ctx);
+                    }
+                    RootInspectorAction::RepairReplicas => {
+                        let waker = { self.shared.borrow().waker.clone() };
+                        self.shared
+                            .files_mut()
+                            .start_current_location_replica_repair(waker);
                         request_files_overlay_rebuild(ctx);
                     }
                     RootInspectorAction::OpenCluster => {
@@ -10095,6 +10121,7 @@ impl InspectorView {
     ) {
         let (fill, border, text, icon) = match action {
             RootInspectorAction::RefreshFolder => (pal.field, pal.border, pal.text, pal.accent),
+            RootInspectorAction::RepairReplicas => (pal.field, pal.border, pal.accent, pal.accent),
             RootInspectorAction::OpenCluster => (pal.field, pal.border, pal.text, pal.accent),
             RootInspectorAction::ConnectionSettings => (pal.field, pal.warn, pal.warn, pal.warn),
         };
@@ -11751,7 +11778,8 @@ mod tests {
                 && place.action == FilePlaceAction::OpenPathPrompt
         }));
         assert!(places.iter().any(|place| {
-            place.label == "Current local"
+            place.label == "Working folder"
+                && place.detail == "app working dir"
                 && place.source == FilesSourceKind::Local
                 && place.path == root.to_string_lossy()
         }));
@@ -12597,6 +12625,72 @@ mod tests {
     }
 
     #[test]
+    fn unselected_sifs_inspector_action_repairs_current_location() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let (tx, rx) = mpsc::channel();
+        let (_result_tx, result_rx) = mpsc::channel();
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.source = FilesSourceKind::Sifs;
+            files.clustered = true;
+            files.path = "/cluster-tests".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/cluster-tests/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.sifs_health = Some(degraded_sifs_health());
+            files.worker_tx = Some(tx);
+            files.worker_rx = Some(result_rx);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files root repair action")
+                    .root(
+                        SizedBox::new()
+                            .width(INSPECTOR_W)
+                            .height(720.0)
+                            .with_child(InspectorView::new(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Repair replicas")
+            .click()?;
+
+        assert_eq!(shared.files().tasks[0].title, "Repair replicas");
+        match rx.try_recv().expect("replica repair command") {
+            FilesWorkerCommand::Operation {
+                request_id,
+                source,
+                operation,
+            } => {
+                assert_eq!(request_id, shared.files().tasks[0].id);
+                assert_eq!(source, FilesSourceKind::Sifs);
+                assert_eq!(operation.kind, FilesOperationKind::RepairReplicas);
+                assert_eq!(operation.path, "/cluster-tests");
+                assert!(operation.directory);
+            }
+            FilesWorkerCommand::List { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Details { .. } => panic!("expected operation command"),
+            FilesWorkerCommand::Preview { .. } => panic!("expected operation command"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn unselected_sifs_inspector_action_opens_cluster() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -13269,6 +13363,33 @@ mod tests {
         assert_eq!(
             files_status_summary(&state),
             "SIFS unknown | Path /cluster-tests | 1 entry | 1 entry marked | 1 task done | DFS health unavailable: metadata root missing"
+        );
+    }
+
+    #[test]
+    fn files_status_summary_distinguishes_remote_sifs_daemon() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.loaded = true;
+        state.loading = false;
+        state.path = "/sinomo/nodes".to_string();
+        state.daemon_address = Some("sodium.sinomo.net:21353".to_string());
+        state.clustered = true;
+
+        assert_eq!(daemon_address_host("127.0.0.1:21353"), "127.0.0.1");
+        assert!(!daemon_address_is_remote("127.0.0.1:21353"));
+        assert!(daemon_address_is_remote("sodium.sinomo.net:21353"));
+        assert_eq!(files_source_status(&state), "Remote SIFS");
+        assert_eq!(
+            files_status_summary(&state),
+            "Remote SIFS | remote daemon sodium.sinomo.net:21353 | Path /sinomo/nodes | 0 entries | no selection | idle"
+        );
+
+        state.daemon_address = Some("127.0.0.1:21353".to_string());
+        assert_eq!(files_source_status(&state), "SIFS online");
+        assert_eq!(
+            files_sifs_connection_detail(&state).as_deref(),
+            Some("daemon 127.0.0.1:21353")
         );
     }
 
@@ -15151,7 +15272,7 @@ mod tests {
     }
 
     #[test]
-    fn row_action_buttons_open_copy_transfer_move_rename_and_delete_prompts() -> sui::Result<()> {
+    fn row_action_buttons_expose_quick_copy_and_transfer_only() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -15220,55 +15341,19 @@ mod tests {
             .click()?;
         assert!(shared.files().action_prompt.is_none());
 
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Move artifact.txt")
-            .click()?;
-        {
-            let files = shared.files();
-            let prompt = files.action_prompt.as_ref().expect("move prompt");
-            assert_eq!(prompt.kind, FileActionPromptKind::Move);
-            assert_eq!(prompt.target_path.as_deref(), Some("/artifact.txt"));
-            assert_eq!(prompt.input, "artifact.txt");
-            assert_eq!(files.selected, Some(0));
-        }
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Cancel")
-            .click()?;
-        assert!(shared.files().action_prompt.is_none());
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Rename artifact.txt")
-            .click()?;
-        {
-            let files = shared.files();
-            let prompt = files.action_prompt.as_ref().expect("rename prompt");
-            assert_eq!(prompt.kind, FileActionPromptKind::Rename);
-            assert_eq!(prompt.target_path.as_deref(), Some("/artifact.txt"));
-            assert_eq!(prompt.input, "artifact.txt");
-            assert_eq!(files.selected, Some(0));
-        }
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Cancel")
-            .click()?;
-        assert!(shared.files().action_prompt.is_none());
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Delete artifact.txt")
-            .click()?;
-        {
-            let files = shared.files();
-            let prompt = files.action_prompt.as_ref().expect("delete prompt");
-            assert_eq!(prompt.kind, FileActionPromptKind::Delete);
-            assert_eq!(prompt.target_path.as_deref(), Some("/artifact.txt"));
-            assert_eq!(prompt.target_name, "artifact.txt");
-            assert_eq!(files.selected, Some(0));
+        let snapshot = window.snapshot()?;
+        for hidden_name in [
+            "Move artifact.txt",
+            "Rename artifact.txt",
+            "Delete artifact.txt",
+        ] {
+            assert!(
+                !snapshot.accessibility.nodes.iter().any(|node| {
+                    node.role == sui::SemanticsRole::Button
+                        && node.name.as_deref() == Some(hidden_name)
+                }),
+                "{hidden_name} should stay in the labeled inspector actions, not the compact row"
+            );
         }
 
         Ok(())

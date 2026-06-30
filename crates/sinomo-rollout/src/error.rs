@@ -99,3 +99,14 @@ impl From<sinomo_module::NativeDylibModuleInstallError> for RolloutError {
         }
     }
 }
+
+impl From<sinomo_module::ModuleLoaderStoreError> for RolloutError {
+    fn from(error: sinomo_module::ModuleLoaderStoreError) -> Self {
+        match error {
+            sinomo_module::ModuleLoaderStoreError::Io { path, detail } => Self::Io { path, detail },
+            sinomo_module::ModuleLoaderStoreError::Object { path, detail } => {
+                Self::Object { path, detail }
+            }
+        }
+    }
+}

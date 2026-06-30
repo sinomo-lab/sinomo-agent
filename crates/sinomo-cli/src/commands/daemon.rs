@@ -276,10 +276,11 @@ pub(crate) fn start_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
 }
 
 pub(crate) fn start_shadow_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
-    let main_binary = env::current_exe().map_err(|source| CliError::Io {
+    let invoked_exe = env::current_exe().map_err(|source| CliError::Io {
         path: "current executable".to_string(),
         detail: source.to_string(),
     })?;
+    let main_binary = daemon_main_binary_for_shadow_start(&invoked_exe);
     let extra_env = vec![
         (SHADOW_MAIN_BINARY_ENV, main_binary.display().to_string()),
         (SHADOW_MAIN_HOST_ENV, options.host.clone()),

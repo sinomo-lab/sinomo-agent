@@ -3,11 +3,13 @@ use crate::{
 };
 use std::path::Path;
 
+const ROLLOUT_NATIVE_DYLIB_INACTIVE_CACHE_RETENTION_PER_KEY: usize = 2;
+
 pub fn install_local_rollout_native_dylib_modules(
     data_dir: &Path,
     artifacts: &[LocalRolloutNativeDylibModuleArtifact],
 ) -> Result<Vec<sinomo_module::NativeDylibModuleInstallResult>, RolloutError> {
-    artifacts
+    let installed = artifacts
         .iter()
         .map(|artifact| {
             sinomo_module::install_native_dylib_module_from_file(
@@ -23,14 +25,21 @@ pub fn install_local_rollout_native_dylib_modules(
             )
             .map_err(Into::into)
         })
-        .collect()
+        .collect::<Result<Vec<_>, RolloutError>>()?;
+    if !installed.is_empty() {
+        sinomo_module::prune_inactive_native_dylib_module_cache(
+            data_dir,
+            ROLLOUT_NATIVE_DYLIB_INACTIVE_CACHE_RETENTION_PER_KEY,
+        )?;
+    }
+    Ok(installed)
 }
 
 pub fn install_cluster_rollout_native_dylib_modules(
     data_dir: &Path,
     artifacts: &[ClusterRolloutNativeDylibModuleArtifact],
 ) -> Result<Vec<sinomo_module::NativeDylibModuleInstallResult>, RolloutError> {
-    artifacts
+    let installed = artifacts
         .iter()
         .map(|artifact| {
             sinomo_module::install_native_dylib_module_from_bytes(
@@ -46,7 +55,14 @@ pub fn install_cluster_rollout_native_dylib_modules(
             )
             .map_err(Into::into)
         })
-        .collect()
+        .collect::<Result<Vec<_>, RolloutError>>()?;
+    if !installed.is_empty() {
+        sinomo_module::prune_inactive_native_dylib_module_cache(
+            data_dir,
+            ROLLOUT_NATIVE_DYLIB_INACTIVE_CACHE_RETENTION_PER_KEY,
+        )?;
+    }
+    Ok(installed)
 }
 
 pub fn native_dylib_module_install_request(

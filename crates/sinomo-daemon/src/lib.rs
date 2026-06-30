@@ -448,12 +448,14 @@ pub use client::{
     send_daemon_rollout_binary_upload_chunk_to_endpoint,
     send_daemon_rollout_binary_upload_finalize,
     send_daemon_rollout_binary_upload_finalize_to_endpoint, send_daemon_rollout_build,
-    send_daemon_rollout_build_to_endpoint, send_daemon_rollout_clear_status,
+    send_daemon_rollout_build_to_endpoint, send_daemon_rollout_build_to_endpoint_with_timeouts,
+    send_daemon_rollout_build_with_timeouts, send_daemon_rollout_clear_status,
     send_daemon_rollout_clear_status_to_endpoint, send_daemon_rollout_diagnostics,
     send_daemon_rollout_diagnostics_to_endpoint, send_daemon_rollout_native_dylib_module,
     send_daemon_rollout_native_dylib_module_to_endpoint, send_daemon_rpc, send_daemon_rpc_async,
     send_daemon_rpc_stream, send_daemon_rpc_stream_async, send_daemon_rpc_to_endpoint,
-    send_daemon_rpc_to_endpoint_async, send_daemon_rpc_with_timeouts, send_daemon_shutdown_request,
+    send_daemon_rpc_to_endpoint_async, send_daemon_rpc_to_endpoint_with_timeouts,
+    send_daemon_rpc_with_timeouts, send_daemon_shutdown_request,
     send_dfs_metadata_journal_batch_to_endpoint_async,
     send_dfs_metadata_snapshot_install_to_endpoint_async, send_dfs_object_rpc_to_target,
     send_dfs_object_rpc_to_target_async,
@@ -495,12 +497,12 @@ pub(crate) use observe::{
     OperationalSeverity, append_operational_event_best_effort, append_operational_log_best_effort,
 };
 pub use paths::DaemonPaths;
-pub use process::start_daemon_command_process;
 pub(crate) use process::{
     CandidateMainDiagnostics, build_daemon_async_runtime, main_exit_observation_from_status,
     prepare_background_command, spawn_candidate_main_daemon_process, spawn_main_daemon_process,
     spawn_shadow_rollout_recovery_helper_process,
 };
+pub use process::{daemon_main_binary_for_shadow_start, start_daemon_command_process};
 pub use rollout::{
     LocalRolloutMainActivationPlan, handle_daemon_rollout_build_request,
     handle_daemon_rollout_native_dylib_module_request, handle_deferred_shadow_rollout_completion,

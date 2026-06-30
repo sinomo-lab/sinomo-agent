@@ -54,6 +54,8 @@ const SHADOW_MAIN_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(250)
 const SHADOW_MAIN_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHADOW_MAIN_RESTART_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
 const SHADOW_RUNTIME_TASK_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
+const SHADOW_IROH_PROXY_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+const SHADOW_STATUS_PUBLISHER_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 const SHADOW_RUNTIME_TASK_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const SHADOW_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -556,8 +558,8 @@ fn join_shadow_runtime_task(
     if abort_first {
         abort_handle.abort();
     }
-    let result = runtime
-        .block_on(async { tokio::time::timeout(SHADOW_RUNTIME_TASK_JOIN_TIMEOUT, task).await });
+    let join_timeout = shadow_runtime_task_join_timeout(label);
+    let result = runtime.block_on(async { tokio::time::timeout(join_timeout, task).await });
     match result {
         Ok(Ok(())) => {}
         Ok(Err(error)) if error.is_cancelled() => {}
@@ -568,9 +570,17 @@ fn join_shadow_runtime_task(
             abort_handle.abort();
             tracing::warn!(
                 "sinomo shadow daemon {label} task did not stop within {}ms",
-                SHADOW_RUNTIME_TASK_JOIN_TIMEOUT.as_millis()
+                join_timeout.as_millis()
             );
         }
+    }
+}
+
+fn shadow_runtime_task_join_timeout(label: &str) -> Duration {
+    match label {
+        "iroh proxy" => SHADOW_IROH_PROXY_TASK_JOIN_TIMEOUT,
+        "status publisher" => SHADOW_STATUS_PUBLISHER_TASK_JOIN_TIMEOUT,
+        _ => SHADOW_RUNTIME_TASK_JOIN_TIMEOUT,
     }
 }
 
@@ -790,7 +800,10 @@ pub fn run_shadow_daemon_supervision_loop(
                 &main_probe_status,
                 supervised_main.as_ref().map(|child| child.id()),
             ) {
-                let _ = promote_shadow_main_rollout(
+                let promoted_main_binary = pending.activation.main_binary.clone();
+                let promoted_source = pending.activation.source.clone();
+                let promoted_requested_at = pending.activation.requested_at.clone();
+                let promoted_main_options = promote_shadow_main_rollout(
                     &rollout_paths,
                     pending,
                     &options.host,
@@ -802,14 +815,23 @@ pub fn run_shadow_daemon_supervision_loop(
                     "shadow-daemon",
                     "rollout.stage.accepted",
                     "candidate main became healthy; promoting shadow main rollout",
-                    Some(&pending.activation.requested_at),
+                    Some(&promoted_requested_at),
                     serde_json::json!({
-                        "source": pending.activation.source,
-                        "requested_at": pending.activation.requested_at,
-                        "main_binary": main_binary.display().to_string(),
+                        "source": promoted_source,
+                        "requested_at": promoted_requested_at,
+                        "main_binary": promoted_main_binary.display().to_string(),
                     }),
                 );
-                break;
+                main_binary = promoted_main_binary;
+                main_options = promoted_main_options;
+                main_probe_status = probe_daemon_status(&main_paths, probe_timeout);
+                last_main_probe = Instant::now();
+                pending_rollout = None;
+                if shadow_reexec_request_path(&rollout_paths).exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(200));
+                continue;
             } else if Instant::now() >= pending.deadline {
                 let detail = "candidate main did not become healthy before rollout timeout";
                 if let Some(child) = supervised_main.as_mut() {
@@ -3471,6 +3493,26 @@ mod tests {
     fn pending_shadow_rollout_uses_fast_main_health_probe() {
         assert!(shadow_main_probe_interval(true) < Duration::from_secs(1));
         assert!(shadow_main_probe_interval(false) >= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn shadow_iroh_proxy_runtime_task_gets_graceful_join_budget() {
+        assert_eq!(
+            shadow_runtime_task_join_timeout("iroh proxy"),
+            SHADOW_IROH_PROXY_TASK_JOIN_TIMEOUT
+        );
+        assert_eq!(
+            shadow_runtime_task_join_timeout("status publisher"),
+            SHADOW_STATUS_PUBLISHER_TASK_JOIN_TIMEOUT
+        );
+        assert!(
+            shadow_runtime_task_join_timeout("iroh proxy") > SHADOW_RUNTIME_TASK_JOIN_TIMEOUT,
+            "Iroh endpoint close needs more time than generic helper task shutdown"
+        );
+        assert_eq!(
+            shadow_runtime_task_join_timeout("control accept"),
+            SHADOW_RUNTIME_TASK_JOIN_TIMEOUT
+        );
     }
 
     #[test]

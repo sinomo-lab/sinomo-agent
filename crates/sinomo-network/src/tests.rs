@@ -2834,6 +2834,13 @@ fn iroh_daemon_proxy_admission_limit_releases_permits() {
         crate::roaming::IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS
             >= crate::roaming::IROH_DAEMON_PROXY_MAX_CONNECTIONS
     );
+    let estimated_proxy_fd_budget = crate::roaming::IROH_DAEMON_PROXY_MAX_CONNECTIONS
+        + crate::roaming::IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS.saturating_mul(2)
+        + 64;
+    assert!(
+        estimated_proxy_fd_budget <= 512,
+        "proxy admission should leave room under a 1024 open-file soft limit"
+    );
     assert!(
         crate::roaming::IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES
             >= crate::IROH_DAEMON_COMMAND_MAX_BYTES.saturating_add(12)
@@ -25404,6 +25411,53 @@ fn cluster_iroh_endpoint_advertisement_updates_state_once() {
         "stable re-advertisement should avoid state writes"
     );
     assert_eq!(state.updated_at, unchanged_at);
+}
+
+#[test]
+fn cluster_iroh_endpoint_advertisement_folds_local_shadow_record() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_shadow_iroh_advertisement").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_shadow_iroh_advertisement").expect("node");
+    let shadow_node_id = sinomo_node::shadow_daemon_node_id(&node_id);
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "shadow iroh advertisement",
+        node_id.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let record = IrohEndpointRecord {
+        cluster_id,
+        node_id: shadow_node_id,
+        endpoint_public_key: "shadow_advertised_iroh_public_key".to_string(),
+        direct_addresses: Vec::new(),
+        relay_url: Some("https://relay.example/".to_string()),
+        relay_mode: IrohRelayMode::Custom {
+            relay_url: "https://relay.example/".to_string(),
+        },
+        expires_after_tick: 10,
+    };
+
+    let published = apply_cluster_iroh_endpoint_advertisement(
+        &mut state,
+        record,
+        Some(&[]),
+        now + time::Duration::seconds(1),
+    )
+    .expect("main member to publish shadow endpoint");
+
+    assert_eq!(published.node_id, node_id);
+    assert_eq!(state.updated_at, now + time::Duration::seconds(1));
+    assert!(published.endpoints.iter().any(|endpoint| {
+        endpoint.transport == ClusterTransportKind::Iroh
+            && endpoint.node_id == node_id
+            && endpoint.endpoint_id
+                == stable_iroh_endpoint_id(&node_id, "shadow_advertised_iroh_public_key")
+            && endpoint.address
+                == "iroh://shadow_advertised_iroh_public_key?relay=https://relay.example/"
+    }));
 }
 
 #[test]

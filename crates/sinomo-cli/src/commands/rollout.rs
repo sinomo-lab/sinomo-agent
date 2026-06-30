@@ -2221,19 +2221,27 @@ fn send_daemon_rollout_build_direct(
     request: &ClusterRolloutBuildRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
     if let Some(endpoint) = &target.endpoint {
-        daemon_send_daemon_rollout_build_to_endpoint(
+        daemon_send_daemon_rollout_build_to_endpoint_with_timeouts(
             endpoint,
             request,
-            remote_build_rollout_timeout(),
+            remote_build_rollout_timeouts(),
         )
         .map_err(Into::into)
     } else {
-        daemon_send_daemon_rollout_build(&target.address, request, remote_build_rollout_timeout())
-            .map_err(Into::into)
+        daemon_send_daemon_rollout_build_with_timeouts(
+            &target.address,
+            request,
+            remote_build_rollout_timeouts(),
+        )
+        .map_err(Into::into)
     }
 }
 
-fn remote_build_rollout_timeout() -> Duration {
+pub(crate) fn remote_build_rollout_timeouts() -> network::DaemonRpcTimeouts {
+    network::DaemonRpcTimeouts::connect_only(remote_build_rollout_connect_timeout())
+}
+
+pub(crate) fn remote_build_rollout_connect_timeout() -> Duration {
     Duration::from_secs(15 * 60)
 }
 

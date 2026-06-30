@@ -48,9 +48,9 @@ const IROH_SECRET_KEY_LOCK_RETRY_MAX: Duration = Duration::from_millis(40);
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) const IROH_DAEMON_PROXY_ERROR_ROUTE: &str = "/iroh-daemon-proxy/error";
 #[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const IROH_DAEMON_PROXY_MAX_CONNECTIONS: usize = 128;
+pub(crate) const IROH_DAEMON_PROXY_MAX_CONNECTIONS: usize = 64;
 #[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS: usize = 512;
+pub(crate) const IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS: usize = 128;
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) const IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES: usize =
     IROH_DAEMON_COMMAND_MAX_BYTES.saturating_add(12);
@@ -1313,8 +1313,9 @@ async fn run_iroh_daemon_proxy(
             return Err(error);
         }
     };
-    let _ = tokio::time::timeout(IROH_DAEMON_ONLINE_TIMEOUT, endpoint.online()).await;
-    let record = iroh_endpoint_record_from_addr(&cluster_id, &node_id, endpoint.addr());
+    let endpoint = IrohEndpointCloseGuard::new(runtime.clone(), endpoint);
+    let _ = tokio::time::timeout(IROH_DAEMON_ONLINE_TIMEOUT, endpoint.endpoint().online()).await;
+    let record = iroh_endpoint_record_from_addr(&cluster_id, &node_id, endpoint.endpoint().addr());
     let persist_result = write_iroh_endpoint_record_async(&runtime, &paths, &record)
         .await
         .map_err(|error| match error {
@@ -1336,16 +1337,26 @@ async fn run_iroh_daemon_proxy(
         IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS,
     ));
     let command_byte_budget = IrohProxyByteBudget::new(IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES);
+    let mut connection_tasks = tokio::task::JoinSet::new();
     loop {
         let connecting = tokio::select! {
-            connecting = endpoint.accept() => connecting,
+            biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || iroh_daemon_proxy_shutdown_requested(&shutdown) {
-                    close_iroh_endpoint(&endpoint).await;
+                    endpoint.close().await;
+                    abort_and_drain_iroh_daemon_proxy_tasks(&mut connection_tasks, "connection")
+                        .await;
                     return Ok(());
                 }
                 continue;
             }
+            joined = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Some(result) = joined {
+                    log_iroh_daemon_proxy_task_join("connection", result);
+                }
+                continue;
+            }
+            connecting = endpoint.endpoint().accept() => connecting,
         };
         let Some(connecting) = connecting else {
             break;
@@ -1360,19 +1371,37 @@ async fn run_iroh_daemon_proxy(
         let daemon_address = daemon_address.clone();
         let command_limiter = command_limiter.clone();
         let command_byte_budget = command_byte_budget.clone();
-        let connection_runtime = runtime.clone();
-        runtime.spawn(async move {
+        let mut connection_shutdown = shutdown.clone();
+        connection_tasks.spawn(async move {
             let _connection_permit = connection_permit;
             let Ok(connection) = connecting.await else {
                 return;
             };
+            let mut command_tasks = tokio::task::JoinSet::new();
             loop {
-                let (mut send, mut recv) = match accept_iroh_proxy_command_stream_with_idle_timeout(
-                    connection.accept_bi(),
-                    IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT,
-                )
-                .await
-                {
+                let accepted = tokio::select! {
+                    biased;
+                    changed = connection_shutdown.changed() => {
+                        if changed.is_err()
+                            || iroh_daemon_proxy_shutdown_requested(&connection_shutdown)
+                        {
+                            connection.close(0_u8.into(), b"daemon shutdown");
+                            break;
+                        }
+                        continue;
+                    }
+                    joined = command_tasks.join_next(), if !command_tasks.is_empty() => {
+                        if let Some(result) = joined {
+                            log_iroh_daemon_proxy_task_join("command", result);
+                        }
+                        continue;
+                    }
+                    accepted = accept_iroh_proxy_command_stream_with_idle_timeout(
+                        connection.accept_bi(),
+                        IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT,
+                    ) => accepted,
+                };
+                let (mut send, mut recv) = match accepted {
                     Ok(Some(streams)) => streams,
                     Ok(None) => {
                         connection.close(0_u8.into(), b"idle timeout");
@@ -1415,7 +1444,7 @@ async fn run_iroh_daemon_proxy(
                 };
                 let daemon_address = daemon_address.clone();
                 let command_byte_budget = command_byte_budget.clone();
-                connection_runtime.spawn(async move {
+                command_tasks.spawn(async move {
                     let _command_permit = command_permit;
                     let (request, request_budget_permit) =
                         match read_iroh_proxy_frame_async_with_idle_timeout(
@@ -1489,10 +1518,34 @@ async fn run_iroh_daemon_proxy(
                     drop(response_budget_permit);
                 });
             }
+            abort_and_drain_iroh_daemon_proxy_tasks(&mut command_tasks, "command").await;
         });
     }
-    close_iroh_endpoint(&endpoint).await;
+    endpoint.close().await;
+    abort_and_drain_iroh_daemon_proxy_tasks(&mut connection_tasks, "connection").await;
     Ok(())
+}
+
+#[cfg(feature = "iroh-transport")]
+fn log_iroh_daemon_proxy_task_join(label: &str, result: Result<(), tokio::task::JoinError>) {
+    match result {
+        Ok(()) => {}
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => {
+            eprintln!("sinomo iroh daemon proxy {label} task stopped: {error}");
+        }
+    }
+}
+
+#[cfg(feature = "iroh-transport")]
+async fn abort_and_drain_iroh_daemon_proxy_tasks(
+    tasks: &mut tokio::task::JoinSet<()>,
+    label: &str,
+) {
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        log_iroh_daemon_proxy_task_join(label, result);
+    }
 }
 
 #[cfg(any(feature = "iroh-transport", test))]
@@ -1720,17 +1773,20 @@ async fn send_iroh_daemon_control_request_attempt_async(
             }
         }
     };
+    let endpoint = IrohEndpointCloseGuard::new(tokio::runtime::Handle::current(), endpoint);
     if let Some(connect_timeout) = timeouts.connect_timeout {
         let online_timeout = connect_timeout.min(Duration::from_millis(1000));
-        let _ = tokio::time::timeout(online_timeout, endpoint.online()).await;
+        let _ = tokio::time::timeout(online_timeout, endpoint.endpoint().online()).await;
     }
 
-    let connect = endpoint.connect(remote_addr, IROH_ROAMING_PROTOCOL.as_bytes());
+    let connect = endpoint
+        .endpoint()
+        .connect(remote_addr, IROH_ROAMING_PROTOCOL.as_bytes());
     let connection = if let Some(connect_timeout) = timeouts.connect_timeout {
         match tokio::time::timeout(connect_timeout, connect).await {
             Ok(Ok(connection)) => connection,
             Ok(Err(source)) => {
-                close_iroh_endpoint(&endpoint).await;
+                endpoint.close().await;
                 return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
                     NetworkError::Io {
                         operation: "connect iroh endpoint".to_string(),
@@ -1739,7 +1795,7 @@ async fn send_iroh_daemon_control_request_attempt_async(
                 ));
             }
             Err(_) => {
-                close_iroh_endpoint(&endpoint).await;
+                endpoint.close().await;
                 return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
                     iroh_daemon_command_timeout_error(connect_timeout),
                 ));
@@ -1749,7 +1805,7 @@ async fn send_iroh_daemon_control_request_attempt_async(
         match connect.await {
             Ok(connection) => connection,
             Err(source) => {
-                close_iroh_endpoint(&endpoint).await;
+                endpoint.close().await;
                 return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
                     NetworkError::Io {
                         operation: "connect iroh endpoint".to_string(),
@@ -1767,7 +1823,7 @@ async fn send_iroh_daemon_control_request_attempt_async(
             Ok(Err(source)) => {
                 connection.close(0_u8.into(), b"open stream failed");
                 drop(connection);
-                close_iroh_endpoint(&endpoint).await;
+                endpoint.close().await;
                 return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
                     NetworkError::Io {
                         operation: "open iroh daemon stream".to_string(),
@@ -1778,7 +1834,7 @@ async fn send_iroh_daemon_control_request_attempt_async(
             Err(_) => {
                 connection.close(0_u8.into(), b"open stream timed out");
                 drop(connection);
-                close_iroh_endpoint(&endpoint).await;
+                endpoint.close().await;
                 return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
                     iroh_daemon_command_timeout_error(connect_timeout),
                 ));
@@ -1790,7 +1846,7 @@ async fn send_iroh_daemon_control_request_attempt_async(
             Err(source) => {
                 connection.close(0_u8.into(), b"open stream failed");
                 drop(connection);
-                close_iroh_endpoint(&endpoint).await;
+                endpoint.close().await;
                 return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
                     NetworkError::Io {
                         operation: "open iroh daemon stream".to_string(),
@@ -1818,7 +1874,7 @@ async fn send_iroh_daemon_control_request_attempt_async(
             drop(send);
             drop(recv);
             drop(connection);
-            close_iroh_endpoint(&endpoint).await;
+            endpoint.close().await;
             return Err(IrohDaemonControlAttemptError::AfterRequestAccepted(source));
         }
     }
@@ -1827,7 +1883,7 @@ async fn send_iroh_daemon_control_request_attempt_async(
         drop(send);
         drop(recv);
         drop(connection);
-        close_iroh_endpoint(&endpoint).await;
+        endpoint.close().await;
         return Err(IrohDaemonControlAttemptError::AfterRequestAccepted(
             NetworkError::Io {
                 operation: "finish iroh daemon command".to_string(),
@@ -1841,14 +1897,14 @@ async fn send_iroh_daemon_control_request_attempt_async(
             connection.close(0_u8.into(), b"read failed");
             drop(recv);
             drop(connection);
-            close_iroh_endpoint(&endpoint).await;
+            endpoint.close().await;
             return Err(IrohDaemonControlAttemptError::AfterRequestAccepted(error));
         }
     };
     connection.close(0_u8.into(), b"done");
     drop(recv);
     drop(connection);
-    close_iroh_endpoint(&endpoint).await;
+    endpoint.close().await;
     Ok(response)
 }
 
@@ -2068,6 +2124,56 @@ fn iroh_daemon_response_frame_error(error: NetworkError) -> NetworkError {
 #[cfg(feature = "iroh-transport")]
 async fn close_iroh_endpoint(endpoint: &iroh::Endpoint) {
     endpoint.close().await;
+}
+
+#[cfg(feature = "iroh-transport")]
+struct IrohEndpointCloseGuard {
+    endpoint: Option<iroh::Endpoint>,
+    runtime: tokio::runtime::Handle,
+}
+
+#[cfg(feature = "iroh-transport")]
+impl IrohEndpointCloseGuard {
+    fn new(runtime: tokio::runtime::Handle, endpoint: iroh::Endpoint) -> Self {
+        Self {
+            endpoint: Some(endpoint),
+            runtime,
+        }
+    }
+
+    fn endpoint(&self) -> &iroh::Endpoint {
+        self.endpoint
+            .as_ref()
+            .expect("iroh endpoint close guard missing endpoint")
+    }
+
+    async fn close(mut self) {
+        if let Some(endpoint) = self.endpoint.take() {
+            close_iroh_endpoint(&endpoint).await;
+        }
+    }
+}
+
+#[cfg(feature = "iroh-transport")]
+impl Drop for IrohEndpointCloseGuard {
+    fn drop(&mut self) {
+        let Some(endpoint) = self.endpoint.take() else {
+            return;
+        };
+        if endpoint.is_closed() {
+            return;
+        }
+        let endpoint_for_close = endpoint.clone();
+        let spawn_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.runtime.spawn(async move {
+                endpoint_for_close.close().await;
+            })
+        }));
+        if spawn_result.is_err() {
+            eprintln!("sinomo iroh endpoint close guard could not schedule close");
+            std::mem::forget(endpoint);
+        }
+    }
 }
 
 #[cfg(feature = "iroh-transport")]

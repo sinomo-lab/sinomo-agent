@@ -992,12 +992,13 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
                 }
                 continue;
             };
+            let endpoint_node_id = daemon_iroh_proxy_node_id(&current_cluster);
             if proxy_handle.is_none() {
                 match sinomo_network::start_iroh_daemon_proxy(
                     runtime.clone(),
                     cluster_paths.clone(),
                     current_cluster.cluster_id.clone(),
-                    current_cluster.node_id.clone(),
+                    endpoint_node_id.clone(),
                     daemon_address.clone(),
                 )
                 .await
@@ -1036,7 +1037,7 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
                         next_republish = Instant::now()
                             + sinomo_network::cluster_network_publish_interval_for_node(
                                 &cluster_paths,
-                                &current_cluster.node_id,
+                                &endpoint_node_id,
                             );
                     }
                     Err(error) if error.to_string().contains("without iroh-transport") => {
@@ -1050,7 +1051,7 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
                                 proxy_start_failures,
                                 sinomo_network::cluster_network_publish_interval_for_node(
                                     &cluster_paths,
-                                    &current_cluster.node_id,
+                                    &endpoint_node_id,
                                 ),
                         );
                         proxy_start_failures = proxy_start_failures.saturating_add(1);
@@ -1141,6 +1142,14 @@ fn daemon_iroh_proxy_start_key(paths: &DaemonPaths, label: &str) -> String {
     format!("{}\0{label}", paths.root.display())
 }
 
+fn daemon_iroh_proxy_node_id(cluster: &DaemonClusterStatus) -> NodeId {
+    if cluster.process == sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE {
+        shadow_daemon_node_id(&cluster.node_id)
+    } else {
+        cluster.node_id.clone()
+    }
+}
+
 fn claim_daemon_iroh_proxy_start(key: &str) -> Result<bool, DaemonError> {
     let starts = DAEMON_IROH_PROXY_STARTS.get_or_init(|| Mutex::new(BTreeSet::new()));
     let mut starts = starts.lock().map_err(|error| DaemonError::Io {
@@ -1179,7 +1188,8 @@ fn refresh_daemon_iroh_repair_route_with_runtime(
         return Ok(false);
     };
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    match IrohEndpointRecord::read(&cluster_paths, &cluster.node_id) {
+    let endpoint_node_id = daemon_iroh_proxy_node_id(&cluster);
+    match IrohEndpointRecord::read(&cluster_paths, &endpoint_node_id) {
         Ok(record) => {
             advertise_daemon_iroh_endpoint_with_runtime(paths, record, runtime)?;
             Ok(true)
@@ -5777,6 +5787,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn daemon_iroh_proxy_node_id_uses_process_specific_identity() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_iroh_proxy_node").expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_daemon_iroh_proxy_node").expect("node id");
+        let main = DaemonClusterStatus {
+            cluster_id: cluster_id.clone(),
+            node_id: node_id.clone(),
+            process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+            member_role: ClusterMemberRole::Voter,
+            member_state: ClusterMemberState::Voter,
+        };
+        let mut shadow = main.clone();
+        shadow.process = sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE.to_string();
+
+        assert_eq!(daemon_iroh_proxy_node_id(&main), node_id.clone());
+        assert_eq!(
+            daemon_iroh_proxy_node_id(&shadow),
+            shadow_daemon_node_id(&node_id)
+        );
+    }
+
     fn run_cluster_network_maintenance_tick_for_test(
         maintenance: &mut ClusterNetworkMaintenance,
         paths: &DaemonPaths,
@@ -8714,7 +8746,7 @@ mod tests {
         .expect("write shadow status");
         IrohEndpointRecord::from_relay_url(
             state.cluster_id.clone(),
-            state.local_node_id.clone(),
+            shadow_daemon_node_id(&state.local_node_id),
             "iroh_public_key_shadow_repair_route",
             "https://relay.example./",
         )

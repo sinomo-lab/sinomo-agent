@@ -31,7 +31,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -158,6 +158,13 @@ pub struct NativeDylibModuleCacheEntry {
     pub native_abi_version: u32,
     pub interface_version: String,
     pub library_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeDylibModuleCachePruneReport {
+    pub retained_active_variants: usize,
+    pub retained_inactive_variants: usize,
+    pub removed_inactive_variants: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -2126,6 +2133,175 @@ pub fn read_native_dylib_module_cache_entries_excluding_cache_keys(
             .then(left.library_path.cmp(&right.library_path))
     });
     Ok(entries)
+}
+
+pub fn prune_inactive_native_dylib_module_cache(
+    data_dir_root: &Path,
+    retain_inactive_variants_per_cache_key: usize,
+) -> Result<NativeDylibModuleCachePruneReport, ModuleLoaderStoreError> {
+    let cache_root = native_dylib_module_cache_dir(data_dir_root);
+    if !cache_root.exists() {
+        return Ok(NativeDylibModuleCachePruneReport {
+            retained_active_variants: 0,
+            retained_inactive_variants: 0,
+            removed_inactive_variants: Vec::new(),
+        });
+    }
+    let active_variant_dirs = read_native_dylib_module_loader_states(data_dir_root)?
+        .into_iter()
+        .filter_map(|state| {
+            native_module_cache_path(
+                data_dir_root,
+                &state.cache_key,
+                &state.content_hash,
+                &state.library_name,
+            )
+            .parent()
+            .map(Path::to_path_buf)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut retained_active_variants = 0usize;
+    let mut inactive_by_cache_key =
+        BTreeMap::<String, Vec<NativeDylibModuleCacheVariantDir>>::new();
+    for variant in native_dylib_module_cache_variant_dirs(&cache_root)? {
+        if active_variant_dirs.contains(&variant.path) {
+            retained_active_variants += 1;
+            continue;
+        }
+        inactive_by_cache_key
+            .entry(variant.cache_key.clone())
+            .or_default()
+            .push(variant);
+    }
+
+    let mut retained_inactive_variants = 0usize;
+    let mut removed_inactive_variants = Vec::new();
+    for mut variants in inactive_by_cache_key.into_values() {
+        variants.sort_by(|left, right| {
+            right
+                .modified
+                .cmp(&left.modified)
+                .then(left.path.cmp(&right.path))
+        });
+        retained_inactive_variants += variants.len().min(retain_inactive_variants_per_cache_key);
+        for variant in variants
+            .into_iter()
+            .skip(retain_inactive_variants_per_cache_key)
+        {
+            fs::remove_dir_all(&variant.path).map_err(|source| ModuleLoaderStoreError::Io {
+                path: variant.path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            removed_inactive_variants.push(variant.path);
+        }
+    }
+    removed_inactive_variants.sort();
+    Ok(NativeDylibModuleCachePruneReport {
+        retained_active_variants,
+        retained_inactive_variants,
+        removed_inactive_variants,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeDylibModuleCacheVariantDir {
+    cache_key: String,
+    path: PathBuf,
+    modified: SystemTime,
+}
+
+fn native_dylib_module_cache_variant_dirs(
+    cache_root: &Path,
+) -> Result<Vec<NativeDylibModuleCacheVariantDir>, ModuleLoaderStoreError> {
+    let mut variants = Vec::new();
+    collect_native_dylib_module_cache_variant_dirs(cache_root, cache_root, &mut variants)?;
+    variants.sort_by(|left, right| {
+        left.cache_key
+            .cmp(&right.cache_key)
+            .then(left.path.cmp(&right.path))
+    });
+    Ok(variants)
+}
+
+fn collect_native_dylib_module_cache_variant_dirs(
+    cache_root: &Path,
+    dir: &Path,
+    variants: &mut Vec<NativeDylibModuleCacheVariantDir>,
+) -> Result<(), ModuleLoaderStoreError> {
+    for entry in fs::read_dir(dir).map_err(|source| ModuleLoaderStoreError::Io {
+        path: dir.display().to_string(),
+        detail: source.to_string(),
+    })? {
+        let entry = entry.map_err(|source| ModuleLoaderStoreError::Io {
+            path: dir.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|source| ModuleLoaderStoreError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        if path.file_name().and_then(|name| name.to_str()) == Some(".staged") {
+            continue;
+        }
+        if let Some(variant) = native_dylib_module_cache_variant_dir_from_path(cache_root, &path)? {
+            variants.push(variant);
+            continue;
+        }
+        collect_native_dylib_module_cache_variant_dirs(cache_root, &path, variants)?;
+    }
+    Ok(())
+}
+
+fn native_dylib_module_cache_variant_dir_from_path(
+    cache_root: &Path,
+    path: &Path,
+) -> Result<Option<NativeDylibModuleCacheVariantDir>, ModuleLoaderStoreError> {
+    let relative = path
+        .strip_prefix(cache_root)
+        .map_err(|source| ModuleLoaderStoreError::Io {
+            path: path.display().to_string(),
+            detail: format!(
+                "native module cache path is not under {}: {source}",
+                cache_root.display()
+            ),
+        })?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value.to_string_lossy().into_owned(),
+            _ => String::new(),
+        })
+        .collect::<Vec<_>>();
+    let Some(hash_key) = components.last() else {
+        return Ok(None);
+    };
+    if !hash_key.starts_with("blake3_")
+        || components.len() < 2
+        || components.iter().any(|component| component.is_empty())
+    {
+        return Ok(None);
+    }
+    let cache_key = components[..components.len() - 1].join("/");
+    validate_native_dylib_module_cache_key(&cache_key).map_err(|source| {
+        ModuleLoaderStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }
+    })?;
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    Ok(Some(NativeDylibModuleCacheVariantDir {
+        cache_key,
+        path: path.to_path_buf(),
+        modified,
+    }))
 }
 
 fn collect_native_dylib_module_cache_files(
@@ -5002,6 +5178,59 @@ mod tests {
             .expect("read unload record")
             .expect("record");
         assert_eq!(read_back, record);
+    }
+
+    #[test]
+    fn native_dylib_cache_prune_keeps_active_and_retained_inactive_variants() {
+        let root = unique_temp("native-dylib-cache-prune");
+        let module_id = ModuleId::from_legacy_named("module.sandbox.wasix").expect("module");
+        let state = NativeDylibModuleLoaderState {
+            module_id,
+            artifact_id: None,
+            content_hash: "blake3:active".to_string(),
+            cache_key: "module/sandbox/wasix".to_string(),
+            library_name: "libsinomo_sandbox_wasix_module.so".to_string(),
+            platform_triple: "x86_64-unknown-linux-gnu".to_string(),
+            native_abi_version: 1,
+            interface_version: "sinomo.sandbox.wasix.v1".to_string(),
+            activated_at: module_loader_applied_at_now(),
+            source: "local".to_string(),
+        };
+        write_native_dylib_module_loader_state(&root, &state).expect("write state");
+
+        let cache_root = native_dylib_module_cache_dir(&root)
+            .join("module")
+            .join("sandbox")
+            .join("wasix");
+        let active_dir = cache_root.join("blake3_active");
+        let stale_a = cache_root.join("blake3_stale_a");
+        let stale_b = cache_root.join("blake3_stale_b");
+        let unrelated = native_dylib_module_cache_dir(&root)
+            .join("module")
+            .join("remote")
+            .join("management")
+            .join("blake3_stale_remote");
+        for dir in [&active_dir, &stale_a, &stale_b, &unrelated] {
+            std::fs::create_dir_all(dir).expect("variant dir");
+            std::fs::write(
+                dir.join("libsinomo_sandbox_wasix_module.so"),
+                b"dummy native module bytes",
+            )
+            .expect("variant file");
+        }
+
+        let report =
+            prune_inactive_native_dylib_module_cache(&root, 1).expect("prune inactive variants");
+
+        assert_eq!(report.retained_active_variants, 1);
+        assert_eq!(report.retained_inactive_variants, 2);
+        assert_eq!(report.removed_inactive_variants.len(), 1);
+        assert!(active_dir.exists());
+        assert_eq!(
+            usize::from(stale_a.exists()) + usize::from(stale_b.exists()),
+            1
+        );
+        assert!(unrelated.exists());
     }
 
     #[test]

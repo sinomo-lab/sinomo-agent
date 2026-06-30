@@ -231,7 +231,9 @@ impl Widget for ClusterView {
                     let cluster = self.shared.cluster();
                     (
                         cluster.selected.is_none(),
-                        cluster.selected.is_none() && !cluster.snapshot.warnings.is_empty(),
+                        cluster.selected.is_none()
+                            && !cluster.refreshing
+                            && cluster_actionable_warning(&cluster.snapshot).is_some(),
                     )
                 };
                 if overview_refresh_action
@@ -385,7 +387,9 @@ impl Widget for ClusterView {
             let cluster = self.shared.cluster();
             let selected = cluster.selected.clone();
             (
-                cluster.selected.is_none() && !cluster.snapshot.warnings.is_empty(),
+                cluster.selected.is_none()
+                    && !cluster.refreshing
+                    && cluster_actionable_warning(&cluster.snapshot).is_some(),
                 overview_detail_toggle_visible(&cluster.snapshot, cluster.selected.as_ref()),
                 cluster.diagnostics_open,
                 selected.clone(),
@@ -825,8 +829,9 @@ fn paint_detail_panel(
 
     let lines = selection
         .map(|selection| detail_lines(snapshot, topology, selection, diagnostics_open))
-        .unwrap_or_else(|| overview_lines(snapshot, topology, diagnostics_open));
-    let show_warning_action = selection.is_none() && !snapshot.warnings.is_empty();
+        .unwrap_or_else(|| overview_lines(snapshot, topology, diagnostics_open, refreshing));
+    let show_warning_action =
+        selection.is_none() && !refreshing && cluster_actionable_warning(snapshot).is_some();
     let show_overview_details = overview_detail_toggle_visible(snapshot, selection);
     let selected_warning_action = selected_node_needs_connection_settings(snapshot, selection);
     let title_style = pal.text_style(theme, 15.0, FontWeight::SEMIBOLD, pal.text);
@@ -959,6 +964,7 @@ fn overview_lines(
     snapshot: &ClusterSnapshot,
     topology: &Topology,
     diagnostics_open: bool,
+    refreshing: bool,
 ) -> Vec<String> {
     let direct_edges = topology
         .edges
@@ -974,16 +980,23 @@ fn overview_lines(
         format!("topology: {direct_edges} edges"),
         format!("LAN: {} segments", topology.lan_segments.len()),
     ];
-    let warning = snapshot.warnings.first();
-    if let Some(warning) = warning {
+    let warning = cluster_actionable_warning(snapshot);
+    if refreshing {
+        lines.push("status: refreshing current health".to_string());
+    } else if let Some(warning) = warning {
         lines.push(format!(
             "attention: {}",
             cluster_attention_summary(snapshot, warning)
         ));
     }
     if diagnostics_open {
-        if let Some(warning) = warning {
-            lines.push(format!("warning detail: {}", short(warning, 42)));
+        if let Some(warning) = snapshot.warnings.first() {
+            let label = if refreshing {
+                "previous warning detail"
+            } else {
+                "warning detail"
+            };
+            lines.push(format!("{label}: {}", short(warning, 42)));
         }
         lines.push(format!("diagnostics: {}", snapshot.source));
         lines.push(format!(
@@ -1004,8 +1017,13 @@ fn overview_lines(
         ));
     } else {
         lines.push(if warning.is_some() {
-            "hint: Show diagnostics for warning detail, source, and cluster identifiers."
-                .to_string()
+            if refreshing {
+                "hint: Refreshing current health; show diagnostics for previous warning detail."
+                    .to_string()
+            } else {
+                "hint: Show diagnostics for warning detail, source, and cluster identifiers."
+                    .to_string()
+            }
         } else {
             "hint: Show diagnostics for source and cluster identifiers.".to_string()
         });
@@ -1101,6 +1119,27 @@ fn cluster_attention_summary(snapshot: &ClusterSnapshot, warning: &str) -> Strin
         );
     }
     cluster_warning_summary(warning).to_string()
+}
+
+fn cluster_actionable_warning(snapshot: &ClusterSnapshot) -> Option<&str> {
+    let warning = snapshot.warnings.first()?.as_str();
+    let counts = availability_counts(snapshot);
+    if counts.offline > 0 || counts.unknown > 0 {
+        return Some(warning);
+    }
+    if counts.total > 0
+        && counts.online == counts.total
+        && cluster_warning_is_direct_probe_fallback(warning)
+    {
+        return None;
+    }
+    Some(warning)
+}
+
+fn cluster_warning_is_direct_probe_fallback(warning: &str) -> bool {
+    let lower = warning.to_ascii_lowercase();
+    lower.contains("daemon health aggregation unavailable")
+        && lower.contains("showing direct cluster probes")
 }
 
 fn node_plural(count: usize, state: &str) -> String {
@@ -1945,7 +1984,7 @@ mod tests {
             ..ClusterSnapshot::default()
         };
         let topology = build_topology(&snapshot);
-        let lines = overview_lines(&snapshot, &topology, false);
+        let lines = overview_lines(&snapshot, &topology, false, false);
 
         assert_eq!(lines[0], "Cluster overview");
         assert!(lines.iter().any(|line| line == "health: 2 / 2 online"));
@@ -1972,7 +2011,7 @@ mod tests {
             "cluster identifiers belong in diagnostics"
         );
 
-        let open = overview_lines(&snapshot, &topology, true);
+        let open = overview_lines(&snapshot, &topology, true, false);
         assert!(
             open.iter()
                 .any(|line| line == "diagnostics: daemon 127.0.0.1:21353")
@@ -1992,7 +2031,7 @@ mod tests {
             ..ClusterSnapshot::default()
         };
         let topology = build_topology(&snapshot);
-        let lines = overview_lines(&snapshot, &topology, false);
+        let lines = overview_lines(&snapshot, &topology, false, false);
 
         assert!(lines.iter().any(|line| line == "health: 3 / 3 online"));
         assert!(lines.iter().any(|line| line == "public route: 0 / 3 nodes"));
@@ -2016,7 +2055,7 @@ mod tests {
         };
         let topology = build_topology(&snapshot);
 
-        let closed = overview_lines(&snapshot, &topology, false);
+        let closed = overview_lines(&snapshot, &topology, false, false);
         assert!(
             closed
                 .iter()
@@ -2029,7 +2068,7 @@ mod tests {
             "raw warning belongs in diagnostics"
         );
 
-        let open = overview_lines(&snapshot, &topology, true);
+        let open = overview_lines(&snapshot, &topology, true, false);
         assert!(
             open.iter()
                 .any(|line| line == "warning detail: daemon health unavailable: network error")
@@ -2051,7 +2090,7 @@ mod tests {
         };
         let topology = build_topology(&snapshot);
 
-        let closed = overview_lines(&snapshot, &topology, false);
+        let closed = overview_lines(&snapshot, &topology, false, false);
         assert!(
             closed
                 .iter()
@@ -2068,11 +2107,88 @@ mod tests {
             "raw aggregation error belongs behind diagnostics"
         );
 
-        let open = overview_lines(&snapshot, &topology, true);
+        let open = overview_lines(&snapshot, &topology, true, false);
         assert!(
             open.iter()
                 .any(|line| line
                     .starts_with("warning detail: daemon health aggregation unavailable"))
+        );
+    }
+
+    #[test]
+    fn refreshing_overview_does_not_surface_stale_warning_as_attention() {
+        let mut offline = node("node-c");
+        offline.availability = "offline".to_string();
+        let snapshot = ClusterSnapshot {
+            source: "daemon 127.0.0.1:21353".to_string(),
+            nodes: vec![node("node-a"), node("node-b"), offline],
+            warnings: vec![
+                "daemon health aggregation unavailable: rpc failed; showing direct cluster probes"
+                    .to_string(),
+            ],
+            ..ClusterSnapshot::default()
+        };
+        let topology = build_topology(&snapshot);
+
+        let closed = overview_lines(&snapshot, &topology, false, true);
+        assert!(
+            closed
+                .iter()
+                .any(|line| line == "health: 2 / 3 online, 1 offline"),
+            "the stale snapshot counts remain visible while the refresh runs"
+        );
+        assert!(
+            closed
+                .iter()
+                .any(|line| line == "status: refreshing current health")
+        );
+        assert!(
+            !closed.iter().any(|line| line.starts_with("attention:")),
+            "stale refresh snapshots should not read as confirmed current attention"
+        );
+
+        let open = overview_lines(&snapshot, &topology, true, true);
+        assert!(
+            open.iter().any(|line| line
+                .starts_with("previous warning detail: daemon health aggregation unavailable")),
+            "diagnostics should still expose the stale warning source"
+        );
+        assert!(
+            !open.iter().any(|line| line.starts_with("warning detail:")),
+            "refreshing warnings should be labeled as previous evidence"
+        );
+    }
+
+    #[test]
+    fn overview_direct_probe_fallback_is_diagnostic_only_when_all_nodes_online() {
+        let snapshot = ClusterSnapshot {
+            source: "daemon 127.0.0.1:21353".to_string(),
+            nodes: vec![node("node-a"), node("node-b"), node("node-c")],
+            warnings: vec![
+                "daemon health aggregation unavailable: rpc failed; showing direct cluster probes"
+                    .to_string(),
+            ],
+            ..ClusterSnapshot::default()
+        };
+        let topology = build_topology(&snapshot);
+
+        let closed = overview_lines(&snapshot, &topology, false, false);
+        assert!(closed.iter().any(|line| line == "health: 3 / 3 online"));
+        assert!(
+            !closed.iter().any(|line| line.starts_with("attention:")),
+            "direct probe fallback should not surface as attention when every node is online"
+        );
+        assert!(
+            cluster_actionable_warning(&snapshot).is_none(),
+            "all-online direct-probe fallback should stay diagnostics-only"
+        );
+
+        let open = overview_lines(&snapshot, &topology, true, false);
+        assert!(
+            open.iter()
+                .any(|line| line
+                    .starts_with("warning detail: daemon health aggregation unavailable")),
+            "technical fallback detail should remain available behind diagnostics"
         );
     }
 
@@ -2173,6 +2289,54 @@ mod tests {
         assert_eq!(
             shared.settings().selected,
             Some(SettingsSection::Connection)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn refreshing_overview_hides_warning_recovery_action() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let mut offline = node("node-b");
+        offline.availability = "offline".to_string();
+        {
+            let mut cluster = shared.cluster_mut();
+            cluster.snapshot = ClusterSnapshot {
+                source: "daemon 127.0.0.1:21353".to_string(),
+                nodes: vec![node("node-a"), offline],
+                warnings: vec!["daemon health unavailable: network error".to_string()],
+                ..ClusterSnapshot::default()
+            };
+            cluster.selected = None;
+            cluster.refreshing = true;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Cluster refreshing warning action")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Connection settings")
+                .with_description("Open connection settings for cluster warning")
+                .count()?,
+            0
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Refreshing")
+                .with_description("Refresh cluster health and topology")
+                .count()?,
+            1
         );
 
         Ok(())

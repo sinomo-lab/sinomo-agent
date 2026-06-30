@@ -130,33 +130,41 @@ pub fn rollout_build_dev_artifacts(
     build_log: &Path,
 ) -> Result<RolloutBuiltArtifacts, RolloutError> {
     let modules = discover_default_native_dylib_module_builds(repo)?;
-    let build_args = rollout_build_args(&modules);
     let _source_guards = prepare_rollout_build_source(repo)?;
-    let build = rollout_cargo_build_command(repo, &build_args)?
-        .output()
-        .map_err(|source| RolloutError::Io {
-            path: format!("cargo {}", build_args.join(" ")),
+
+    let binary_build_args = rollout_binary_build_args();
+    let (binary_command, binary_build) = run_rollout_cargo_build(repo, &binary_build_args)?;
+    let mut log = rollout_build_log_section(repo, &binary_command, &binary_build);
+    if !binary_build.status.success() {
+        fs::write(build_log, &log).map_err(|source| RolloutError::Io {
+            path: build_log.display().to_string(),
             detail: source.to_string(),
         })?;
-    let command = format!("cargo {}", build_args.join(" "));
-    let log = format!(
-        "command: {command}\nrepo: {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
-        repo.display(),
-        build.status,
-        String::from_utf8_lossy(&build.stdout),
-        String::from_utf8_lossy(&build.stderr)
-    );
-    fs::write(build_log, log).map_err(|source| RolloutError::Io {
+        return Err(rollout_build_process_error(binary_command, &binary_build));
+    }
+
+    if !modules.is_empty() {
+        let module_build_args = rollout_module_build_args(&modules);
+        let (module_command, module_build) = run_rollout_cargo_build(repo, &module_build_args)?;
+        log.push_str("\n---\n\n");
+        log.push_str(&rollout_build_log_section(
+            repo,
+            &module_command,
+            &module_build,
+        ));
+        if !module_build.status.success() {
+            fs::write(build_log, &log).map_err(|source| RolloutError::Io {
+                path: build_log.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            return Err(rollout_build_process_error(module_command, &module_build));
+        }
+    }
+
+    fs::write(build_log, &log).map_err(|source| RolloutError::Io {
         path: build_log.display().to_string(),
         detail: source.to_string(),
     })?;
-    if !build.status.success() {
-        return Err(RolloutError::Process {
-            command,
-            status: build.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&build.stderr).trim().to_string(),
-        });
-    }
     let built_binary = repo
         .join("target")
         .join("debug")
@@ -281,6 +289,11 @@ pub fn rollout_build_dev_native_dylib_module(
     Ok(LocalRolloutNativeDylibModuleArtifact::from(module))
 }
 
+fn rollout_binary_build_args() -> Vec<String> {
+    vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()]
+}
+
+#[cfg(test)]
 fn rollout_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> Vec<String> {
     let mut args = vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
     append_native_dylib_module_build_args(&mut args, modules);
@@ -341,6 +354,38 @@ fn rollout_cargo_build_command(
         .current_dir(repo)
         .env(ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV, commit);
     Ok(command)
+}
+
+fn run_rollout_cargo_build(
+    repo: &Path,
+    build_args: &[String],
+) -> Result<(String, std::process::Output), RolloutError> {
+    let command = format!("cargo {}", build_args.join(" "));
+    let build = rollout_cargo_build_command(repo, build_args)?
+        .output()
+        .map_err(|source| RolloutError::Io {
+            path: command.clone(),
+            detail: source.to_string(),
+        })?;
+    Ok((command, build))
+}
+
+fn rollout_build_log_section(repo: &Path, command: &str, build: &std::process::Output) -> String {
+    format!(
+        "command: {command}\nrepo: {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
+        repo.display(),
+        build.status,
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    )
+}
+
+fn rollout_build_process_error(command: String, build: &std::process::Output) -> RolloutError {
+    RolloutError::Process {
+        command,
+        status: build.status.code().unwrap_or(-1),
+        stderr: String::from_utf8_lossy(&build.stderr).trim().to_string(),
+    }
 }
 
 struct RolloutBuildSourceGuards {

@@ -134,6 +134,7 @@ pub struct SettingsState {
     pub provider_add_base_url: String,
     pub provider_add_error: Option<String>,
     pub provider_action_error: Option<String>,
+    pub provider_action_status: Option<ProviderActionStatus>,
     connection_detail_expanded: Vec<Tab>,
     node_detail_expanded: bool,
     advanced_detail_expanded: Vec<String>,
@@ -172,6 +173,13 @@ pub enum DeviceLoginStatus {
     Done,
     /// The flow failed (expired, denied, network).
     Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderActionStatus {
+    pub provider: String,
+    pub account: String,
+    pub message: String,
 }
 
 /// Messages from the device-login worker thread.
@@ -243,6 +251,7 @@ impl SettingsState {
             provider_add_base_url: String::new(),
             provider_add_error: None,
             provider_action_error: None,
+            provider_action_status: None,
             connection_detail_expanded: Vec::new(),
             node_detail_expanded: false,
             advanced_detail_expanded: Vec::new(),
@@ -262,6 +271,7 @@ impl SettingsState {
         self.provider_add_open = true;
         self.provider_add_error = None;
         self.provider_action_error = None;
+        self.provider_action_status = None;
         self.provider_remove_confirming = None;
         if self.provider_add_model.trim().is_empty() {
             self.provider_add_model = provider_default_model(self.provider_add_provider());
@@ -354,6 +364,7 @@ impl SettingsState {
             return;
         };
         self.provider_action_error = None;
+        self.provider_action_status = None;
         self.provider_remove_confirming = Some((form.provider.clone(), form.account.clone()));
     }
 
@@ -429,11 +440,17 @@ impl SettingsState {
                 self.provider_add_base_url.clear();
                 self.provider_add_model = provider_default_model(self.provider_add_provider());
                 self.reload();
+                self.set_provider_status(
+                    provider.clone(),
+                    account.clone(),
+                    "Account added to lm.providers",
+                );
                 Ok((provider, account, uses_device_login))
             }
             Err(error) => {
                 self.provider_add_error = Some(error.clone());
                 self.provider_action_error = None;
+                self.provider_action_status = None;
                 Err(error)
             }
         }
@@ -542,6 +559,15 @@ impl SettingsState {
             self.provider_action_error = None;
             self.provider_remove_confirming = None;
             self.reload();
+            self.set_provider_status(
+                provider,
+                account,
+                if enabled {
+                    "Provider enabled in lm.providers"
+                } else {
+                    "Provider disabled in lm.providers"
+                },
+            );
             return true;
         }
         false
@@ -563,12 +589,14 @@ impl SettingsState {
                     self.device_login = None;
                 }
                 self.provider_action_error = None;
+                self.provider_action_status = None;
                 self.provider_remove_confirming = None;
                 self.reload();
                 true
             }
             Err(error) => {
                 self.provider_action_error = Some(error);
+                self.provider_action_status = None;
                 false
             }
         }
@@ -599,12 +627,27 @@ impl SettingsState {
             Ok(()) => {
                 self.field_errors.remove(&row);
                 self.provider_action_error = None;
+                self.set_provider_status(provider, account, provider_field_saved_message(field));
                 self.provider_remove_confirming = None;
             }
             Err(error) => {
                 self.field_errors.insert(row, error);
+                self.provider_action_status = None;
             }
         }
+    }
+
+    fn set_provider_status(
+        &mut self,
+        provider: impl Into<String>,
+        account: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.provider_action_status = Some(ProviderActionStatus {
+            provider: provider.into(),
+            account: account.into(),
+            message: message.into(),
+        });
     }
 
     /// Cycle a provider's reasoning effort to the next option (legacy click-to-cycle path; retained
@@ -631,6 +674,7 @@ impl SettingsState {
         let account = form.account.clone();
         if set_provider_effort(self.config.as_ref(), &provider, &account, effort_index).is_ok() {
             self.reload();
+            self.set_provider_status(provider, account, "Reasoning effort saved to lm.providers");
         }
     }
 
@@ -712,8 +756,18 @@ impl SettingsState {
         if let (Some(login), Some(status)) = (self.device_login.as_mut(), next_status) {
             login.status = status;
         }
+        let done_account = if done {
+            self.device_login
+                .as_ref()
+                .map(|login| (login.provider.clone(), login.account.clone()))
+        } else {
+            None
+        };
         if done {
             self.reload();
+            if let Some((provider, account)) = done_account {
+                self.set_provider_status(provider, account, "Sign-in saved to lm.providers");
+            }
             self.device_login = None;
         }
         true
@@ -733,6 +787,14 @@ fn provider_field_key(provider: &str, account: &str, field: ProviderField) -> St
         ProviderField::BaseUrl => "base_url",
     };
     format!("provider:{provider}:{account}:{suffix}")
+}
+
+fn provider_field_saved_message(field: ProviderField) -> &'static str {
+    match field {
+        ProviderField::ApiKey => "API key saved to lm.providers",
+        ProviderField::Model => "Default model saved to lm.providers",
+        ProviderField::BaseUrl => "API base URL saved to lm.providers",
+    }
 }
 
 fn provider_account_key(provider: &str, account: &str) -> String {
@@ -948,6 +1010,11 @@ fn palette(shared: &Shared) -> Palette {
 fn muted_label(shared: &Shared, text: impl Into<String>) -> Label {
     let s = shared.clone();
     Label::new(text).color_when(move || palette(&s).text_muted)
+}
+
+fn positive_label(shared: &Shared, text: impl Into<String>) -> Label {
+    let s = shared.clone();
+    Label::new(text).color_when(move || palette(&s).good)
 }
 
 /// A read-only value row: `label` on the left, a muted value `Label` on the right.
@@ -1671,6 +1738,12 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
     if clustered {
         body = body.with_child(value_row(shared, reader, "Cluster", cluster_summary));
 
+        body = body.with_child(
+            FormRow::new("Health", cluster_dashboard_button(shared, reader))
+                .inline()
+                .theme_when(clone_reader(reader)),
+        );
+
         let generate = {
             let s = shared.clone();
             sui::Button::new("Generate invitation")
@@ -1784,6 +1857,12 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             .with_child(value_row(shared, reader, "State", "running locally"))
             .with_child(value_row(shared, reader, "Nodes", "this device only"));
 
+        body = body.with_child(
+            FormRow::new("Health", cluster_dashboard_button(shared, reader))
+                .inline()
+                .theme_when(clone_reader(reader)),
+        );
+
         let join_on_change = {
             let s = shared.clone();
             move |value: String| {
@@ -1839,6 +1918,14 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
     }
 
     FormSection::new("Cluster", body).theme_when(clone_reader(reader))
+}
+
+fn cluster_dashboard_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    sui::Button::new("Open Cluster dashboard")
+        .icon(sui::IconGlyph::Storage)
+        .theme_when(secondary_button_theme(reader))
+        .on_press(move || open_tab(&s, Tab::Cluster))
 }
 
 fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -1946,6 +2033,19 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         "Authentication",
         provider_auth_summary(&form),
     ));
+    let provider_status = shared
+        .settings()
+        .provider_action_status
+        .as_ref()
+        .filter(|status| status.provider == form.provider && status.account == form.account)
+        .map(|status| status.message.clone());
+    if let Some(message) = provider_status {
+        body = body.with_child(
+            FormRow::new("Last change", positive_label(shared, message))
+                .inline()
+                .theme_when(clone_reader(reader)),
+        );
+    }
 
     // Default model.
     body = body.with_child(text_row(
@@ -2196,6 +2296,7 @@ fn provider_section_signature(shared: &Shared) -> String {
         format!("add-provider:{}", settings.provider_add_provider_index),
         format!("error:{:?}", settings.provider_add_error),
         format!("action-error:{:?}", settings.provider_action_error),
+        format!("action-status:{:?}", settings.provider_action_status),
         format!("remove:{:?}", settings.provider_remove_confirming),
         format!("expanded:{:?}", settings.provider_detail_expanded),
         format!(
@@ -3723,6 +3824,47 @@ mod tests {
     }
 
     #[test]
+    fn provider_model_edit_reports_saved_status_and_persists() {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let config = shared.settings().config.clone();
+            add_provider_account(config.as_ref(), "openai", "work", "sk-work", "gpt-5", "")
+                .expect("add provider account");
+        }
+        shared.settings_mut().reload();
+        let before_signature = provider_section_signature(&shared);
+
+        shared
+            .settings_mut()
+            .set_provider_field(0, ProviderField::Model, "gpt-5.1");
+
+        assert_eq!(
+            shared.settings().provider_action_status.clone(),
+            Some(ProviderActionStatus {
+                provider: "openai".to_string(),
+                account: "work".to_string(),
+                message: "Default model saved to lm.providers".to_string(),
+            })
+        );
+        let config_client = shared.settings().config.clone();
+        let config = crate::backend::config::load_provider_config(config_client.as_ref())
+            .expect("provider config");
+        let account = config
+            .accounts
+            .iter()
+            .find(|account| account.provider == "openai" && account.account == "work")
+            .expect("work account");
+        assert_eq!(account.default_model.as_deref(), Some("gpt-5.1"));
+
+        assert_ne!(
+            before_signature,
+            provider_section_signature(&shared),
+            "provider saved status must invalidate the retained provider section"
+        );
+    }
+
+    #[test]
     fn provider_add_requires_api_key_for_key_based_providers() {
         let backend = Backend::local_fallback();
         let mut state = SettingsState::new(&backend);
@@ -3948,6 +4090,45 @@ mod tests {
             .with_name("Remove account")
             .expect()
             .to_be_visible()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_card_exposes_last_saved_status() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let config = shared.settings().config.clone();
+            add_provider_account(config.as_ref(), "openai", "work", "sk-work", "gpt-5", "")
+                .expect("add provider account");
+        }
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            settings.reload();
+            settings.open(SettingsSection::Providers);
+            settings.set_provider_status("openai", "work", "Default model saved to lm.providers");
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings provider saved status")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert!(
+            window
+                .get_by_text("Default model saved to lm.providers")
+                .count()?
+                >= 1,
+            "provider card should expose write-through save feedback"
+        );
 
         Ok(())
     }
@@ -4576,6 +4757,39 @@ mod tests {
             .with_name("Cancel")
             .click()?;
         assert!(!shared.settings().leave_confirming);
+
+        Ok(())
+    }
+
+    #[test]
+    fn cluster_settings_open_dashboard_action_switches_to_cluster_tab() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            settings.open(SettingsSection::Cluster);
+            settings.clustered = true;
+            settings.cluster_summary = Some("cluster test · voter".to_string());
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Cluster settings dashboard action")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open Cluster dashboard")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Cluster);
 
         Ok(())
     }

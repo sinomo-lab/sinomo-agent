@@ -81,6 +81,9 @@ const MEDIA_CALL_H: f32 = 156.0;
 const COMPOSER_H: f32 = 196.0;
 const PAD: f32 = 16.0;
 const SIDEBAR_ROW_H: f32 = 36.0;
+const SIDEBAR_ROW_EDIT_W: f32 = 46.0;
+const SIDEBAR_ROW_EDIT_H: f32 = 22.0;
+const SIDEBAR_ROW_EDIT_GAP: f32 = 8.0;
 const SELECTOR_H: f32 = 30.0;
 const ATTACHMENT_AREA_H: f32 = 56.0;
 const ATTACHMENT_ENTRY_H: f32 = 30.0;
@@ -777,7 +780,7 @@ impl ChatState {
             .unwrap_or_else(|| "New chat".to_string())
     }
 
-    /// Persist the current chat and refresh the sidebar list.
+    /// Persist the current chat and update the sidebar row after SIFS confirms the write.
     fn persist(&mut self) {
         let session_id = self.session_id.clone();
         let messages = self.messages.clone();
@@ -796,7 +799,13 @@ impl ChatState {
         let title = Self::title_from_messages(messages);
         let stored: Vec<StoredMessage> = messages.iter().map(ChatMessage::to_stored).collect();
         match self.save_chat_record(session_id, &title, &stored) {
-            Ok(_) => {}
+            Ok(_) => {
+                if let Some(session) =
+                    self.session_ref_after_chat_save(session_id, &title, messages)
+                {
+                    self.upsert_session_ref(session);
+                }
+            }
             Err(error) if report_visible_failures => {
                 let detail = error.to_string();
                 self.notice = Some(format!("chat save failed: {detail}"));
@@ -804,7 +813,39 @@ impl ChatState {
             }
             Err(_) => {}
         }
-        self.refresh_sessions();
+    }
+
+    fn session_ref_after_chat_save(
+        &self,
+        session_id: &str,
+        fallback_title: &str,
+        messages: &[ChatMessage],
+    ) -> Option<SessionRef> {
+        let existing = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id);
+        if existing.is_some_and(|session| session.kind == ConversationKind::Channel) {
+            return None;
+        }
+        if existing.is_none() && session_id != self.session_id {
+            return None;
+        }
+        Some(SessionRef {
+            id: session_id.to_string(),
+            title: existing
+                .map(|session| session.title.clone())
+                .unwrap_or_else(|| fallback_title.to_string()),
+            kind: ConversationKind::Chat,
+            updated_unix: current_unix_timestamp(),
+            participant_count: 1,
+            participant_names: Vec::new(),
+        })
+        .filter(|_| {
+            messages
+                .iter()
+                .any(|message| message.role == ChatRole::User)
+        })
     }
 
     fn refresh_sessions(&mut self) {
@@ -4606,6 +4647,20 @@ fn empty_sessions_copy(
     }
 }
 
+fn loading_sessions_copy(chat: &ChatState) -> (&'static str, &'static str) {
+    if chat.session_list_slow_notice_shown {
+        (
+            "Still syncing SIFS history...",
+            "Reading chat and channel metadata from cluster storage",
+        )
+    } else {
+        (
+            "Syncing SIFS history...",
+            "Reading chats and channels from cluster storage",
+        )
+    }
+}
+
 fn plural_agents(count: usize) -> String {
     if count == 1 {
         "1 agent".to_string()
@@ -4622,14 +4677,18 @@ fn active_agents_label(count: usize) -> String {
     }
 }
 
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn session_updated_label(updated_unix: i64) -> String {
     if updated_unix <= 0 {
         return "not saved".to_string();
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(updated_unix);
+    let now = current_unix_timestamp().max(updated_unix);
     let age = now.saturating_sub(updated_unix);
     if age < 60 {
         "just now".to_string()
@@ -4721,8 +4780,13 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         })
         .collect::<Vec<_>>();
     if loading && sessions.is_empty() {
+        let (label, detail) = {
+            let chat = shared.chat();
+            loading_sessions_copy(&chat)
+        };
         items.push(
-            ListItem::new("Loading chats...")
+            ListItem::new(label)
+                .detail(detail)
                 .leading_text("...")
                 .disabled(),
         );
@@ -5109,12 +5173,13 @@ impl ChatSessionRow {
     }
 
     fn edit_rect(&self, bounds: Rect) -> Rect {
-        let side = 22.0_f32.min(bounds.height()).max(0.0);
+        let width = SIDEBAR_ROW_EDIT_W.min((bounds.width() - 30.0).max(0.0));
+        let height = SIDEBAR_ROW_EDIT_H.min(bounds.height()).max(0.0);
         Rect::new(
-            bounds.max_x() - side - 2.0,
-            bounds.y() + (bounds.height() - side) * 0.5,
-            side,
-            side,
+            bounds.max_x() - width - 2.0,
+            bounds.y() + (bounds.height() - height) * 0.5,
+            width,
+            height,
         )
     }
 
@@ -5122,7 +5187,7 @@ impl ChatSessionRow {
         if !bounds.contains(position) {
             return None;
         }
-        if self.edit_rect(bounds).contains(position) {
+        if self.show_edit_button() && self.edit_rect(bounds).contains(position) {
             Some(ChatSessionRowHit::Edit)
         } else {
             Some(ChatSessionRowHit::Row)
@@ -5293,15 +5358,19 @@ impl Widget for ChatSessionRow {
                 (pal.hover, pal.border.with_alpha(0.72), pal.text_muted)
             };
             widgets::round_panel(ctx, edit, fill, border, 6.0);
-            draw_glyph(
+            widgets::draw_text_in(
                 ctx,
-                IconGlyph::MoreHorizontal,
-                edit.inflate(-4.0, -4.0),
-                glyph_color,
+                Rect::new(edit.x() + 7.0, edit.y() + 3.0, edit.width() - 14.0, 16.0),
+                "Edit",
+                pal.text_style(&theme, 10.5, FontWeight::SEMIBOLD, glyph_color),
             );
         }
 
-        let edit_gap = if show_edit { 28.0 } else { 0.0 };
+        let edit_gap = if show_edit {
+            edit.width() + SIDEBAR_ROW_EDIT_GAP
+        } else {
+            0.0
+        };
         let title_x = icon_panel.max_x() + 7.0;
         let title_right = bounds.max_x() - edit_gap - 5.0;
         let title_rect = Rect::new(
@@ -10146,6 +10215,22 @@ mod tests {
     fn chat_session_counts_distinguish_empty_loading_from_empty_loaded() {
         let (_backend, mut state) = isolated_chat_state("chat-list-loading-label");
 
+        assert_eq!(
+            loading_sessions_copy(&state),
+            (
+                "Syncing SIFS history...",
+                "Reading chats and channels from cluster storage"
+            )
+        );
+        state.session_list_slow_notice_shown = true;
+        assert_eq!(
+            loading_sessions_copy(&state),
+            (
+                "Still syncing SIFS history...",
+                "Reading chat and channel metadata from cluster storage"
+            )
+        );
+        state.session_list_slow_notice_shown = false;
         state.session_list_loading = true;
         assert_eq!(chats_heading_text(&state), "CONVERSATIONS · loading");
         assert_eq!(
@@ -10180,6 +10265,37 @@ mod tests {
             session_kind_filter_count_label(&state.sessions, SessionKindFilter::All, true),
             "1"
         );
+    }
+
+    #[test]
+    fn rendered_empty_loading_sidebar_explains_sifs_storage() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            chat.sessions.clear();
+            chat.session_list_loading = true;
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat sessions loading")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::ListItem)
+            .with_name("Syncing SIFS history...")
+            .with_description("Reading chats and channels from cluster storage")
+            .expect()
+            .to_be_visible()?;
+
+        Ok(())
     }
 
     #[test]
@@ -10758,6 +10874,23 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
+
+        let snapshot = window.snapshot()?;
+        let edit_button = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("Edit Dialog chat")
+            })
+            .expect("chat row edit button");
+        assert!(
+            edit_button.bounds.width() >= SIDEBAR_ROW_EDIT_W - 0.5
+                && edit_button.bounds.height() >= SIDEBAR_ROW_EDIT_H - 0.5,
+            "row edit button should be a visible text pill, got {:?}",
+            edit_button.bounds
+        );
 
         window
             .get_by_role(SemanticsRole::Button)
@@ -11794,6 +11927,82 @@ mod tests {
         assert_eq!(background.messages[1].text, "background answer");
         assert_eq!(background.messages[1].source.as_deref(), Some("model"));
         assert_eq!(background.messages[1].kind.as_deref(), Some("message"));
+    }
+
+    #[test]
+    fn chat_save_upserts_visible_row_without_relisting_sifs() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let other_session_id = SessionId::from_legacy_named("sess_saved_elsewhere")
+            .expect("other session id")
+            .to_string();
+        sessions::save(
+            &state.data_dir,
+            &other_session_id,
+            "Saved elsewhere",
+            &[StoredMessage::new("user", "other", "user", "message")],
+        )
+        .expect("save unrelated SIFS chat");
+        state.sessions.clear();
+
+        let visible_session_id = SessionId::from_legacy_named("sess_visible_save")
+            .expect("visible session id")
+            .to_string();
+        state.session_id = visible_session_id.clone();
+        let messages = vec![
+            ChatMessage::user("visible saved prompt"),
+            ChatMessage::model("visible saved answer"),
+        ];
+
+        state.persist_messages(&visible_session_id, &messages, true);
+
+        assert!(
+            state
+                .sessions
+                .iter()
+                .any(|session| session.id == visible_session_id
+                    && session.kind == ConversationKind::Chat
+                    && session.title == "visible saved prompt"),
+            "the just-saved visible chat should appear immediately"
+        );
+        assert!(
+            state
+                .sessions
+                .iter()
+                .all(|session| session.id != other_session_id),
+            "saving one chat should not synchronously relist unrelated SIFS records"
+        );
+        assert!(
+            sessions::load_transcript(&state.data_dir, &visible_session_id).is_some(),
+            "the upsert happens only after SIFS confirms the transcript"
+        );
+    }
+
+    #[test]
+    fn chat_save_preserves_existing_channel_sidebar_row() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let channel_id = SessionId::from_legacy_named("sess_channel_save")
+            .expect("channel session id")
+            .to_string();
+        state.session_id = channel_id.clone();
+        state.sessions = vec![SessionRef {
+            id: channel_id.clone(),
+            title: "Release triage".to_string(),
+            kind: ConversationKind::Channel,
+            updated_unix: 7,
+            participant_count: 2,
+            participant_names: vec!["main-agent".to_string(), "coding-agent".to_string()],
+        }];
+        let messages = vec![ChatMessage::user("channel prompt")];
+
+        state.persist_messages(&channel_id, &messages, true);
+
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].id, channel_id);
+        assert_eq!(state.sessions[0].title, "Release triage");
+        assert_eq!(state.sessions[0].kind, ConversationKind::Channel);
+        assert_eq!(state.sessions[0].participant_count, 2);
     }
 
     #[test]
