@@ -365,7 +365,7 @@ impl ChatQuickAction {
                 "Return a finished Markdown design note now. Start exactly with '# Chat and channel interaction design note'. Include sections: Assumptions, Audience, Goals, Non-goals, Workflow, Risks, Next steps. Do not describe what you will do.",
             ),
             Self::ReasonImage => Some(
-                "Inspect the attached file context available to you. If there is no attachment, ask me for the file first. If I expect pixel-level image reasoning or full file contents, say that this chat currently receives SIFS attachment metadata rather than raw file bytes, then ask for a model-visible excerpt or description. Summarize concrete observations from the attachment record and uncertainties.",
+                "Inspect the attached file context available to you. If there is no attachment, ask me for the file first. Use the SIFS attachment metadata and any bounded text excerpt included in context. If I expect pixel-level image reasoning or full file contents, say that this chat does not yet send raw image pixels or complete large files as model input, then ask for a model-visible excerpt or description. Summarize concrete observations and uncertainties.",
             ),
             Self::RolePlay => Some(
                 "Role play as a skeptical product reviewer evaluating this chat and channel interface. Stay in character, critique the workflow, and propose specific improvements.",

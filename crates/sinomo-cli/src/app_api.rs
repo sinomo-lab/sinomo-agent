@@ -51,6 +51,7 @@ type Handler = RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>;
 const APP_CHAT_RUNTIME_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 const APP_CHAT_RUNTIME_START_TIMEOUT: Duration = Duration::from_secs(5);
 const APP_CHAT_RUNTIME_SILENCE_TIMEOUT: Duration = Duration::from_secs(45);
+const APP_CHAT_ATTACHMENT_TEXT_EXCERPT_BYTES: usize = 24 * 1024;
 pub const SIFS_AGENT_CHANNELS_ROOT: &str = "/services/sinomo-agent/channels";
 
 /// Lightweight channel metadata for list views.
@@ -1025,6 +1026,9 @@ impl AgentChat {
                 detail: source.to_string(),
             })?;
             let file_name = attachment_file_name(path);
+            let content_type = detect_attachment_content_type(path, &bytes);
+            let model_visible =
+                model_visible_attachment_projection(&file_name, &bytes, content_type.as_deref());
             let attachment_id = TaskId::generate();
             let stored_path = self
                 .channel_store
@@ -1038,12 +1042,14 @@ impl AgentChat {
                 original_path: path.display().to_string(),
                 stored_path,
                 size_bytes: metadata.len(),
-                content_type: None,
+                content_type: content_type.clone(),
                 created_at: time::OffsetDateTime::now_utc(),
                 source: AgentChannelSource {
                     metadata: serde_json::json!({
                         "ingress": "local-file",
-                        "original_path": path.display().to_string()
+                        "original_path": path.display().to_string(),
+                        "content_type": content_type,
+                        "model_visible": model_visible
                     }),
                     ..AgentChannelSource::app()
                 },
@@ -1504,12 +1510,239 @@ fn agent_context_attachments_from_channel_attachments(
                 "stored_path": attachment.stored_path,
                 "size_bytes": attachment.size_bytes,
                 "content_type": attachment.content_type,
+                "model_visible": attachment
+                    .source
+                    .metadata
+                    .get("model_visible")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
                 "channel_source": attachment.source
             }),
             payload_original_bytes: Some(attachment.size_bytes.min(usize::MAX as u64) as usize),
             payload_model_visible_truncated: false,
         })
         .collect()
+}
+
+fn detect_attachment_content_type(path: &Path, bytes: &[u8]) -> Option<String> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png".to_string());
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("image/jpeg".to_string());
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif".to_string());
+    }
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)?;
+    let content_type = match extension.as_str() {
+        "txt" | "text" | "log" => "text/plain",
+        "md" | "markdown" => "text/markdown",
+        "json" | "jsonl" => "application/json",
+        "toml" => "application/toml",
+        "yaml" | "yml" => "application/yaml",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "xml" => "application/xml",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" | "cjs" => "text/javascript",
+        "ts" | "tsx" => "text/typescript",
+        "rs" => "text/x-rust",
+        "py" => "text/x-python",
+        "sh" | "bash" | "zsh" | "ps1" => "text/x-shellscript",
+        "sql" => "application/sql",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        _ => return None,
+    };
+    Some(content_type.to_string())
+}
+
+fn model_visible_attachment_projection(
+    file_name: &str,
+    bytes: &[u8],
+    content_type: Option<&str>,
+) -> serde_json::Value {
+    if let Some(text) = text_attachment_excerpt(bytes, content_type) {
+        return text;
+    }
+    if let Some(image) = image_attachment_metadata(file_name, bytes, content_type) {
+        return image;
+    }
+    serde_json::json!({
+        "projection": "metadata_only",
+        "note": "Attachment bytes are stored in SIFS; this model-visible context includes metadata only for this file type."
+    })
+}
+
+fn text_attachment_excerpt(bytes: &[u8], content_type: Option<&str>) -> Option<serde_json::Value> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    if !is_text_attachment(content_type) && !looks_like_text(text) {
+        return None;
+    }
+    let (excerpt, truncated) = utf8_prefix(text, APP_CHAT_ATTACHMENT_TEXT_EXCERPT_BYTES);
+    Some(serde_json::json!({
+        "projection": "text_excerpt",
+        "encoding": "utf-8",
+        "bytes_included": excerpt.len(),
+        "truncated": truncated,
+        "text": excerpt
+    }))
+}
+
+fn is_text_attachment(content_type: Option<&str>) -> bool {
+    let Some(content_type) = content_type else {
+        return false;
+    };
+    content_type.starts_with("text/")
+        || matches!(
+            content_type,
+            "application/json"
+                | "application/toml"
+                | "application/yaml"
+                | "application/xml"
+                | "application/sql"
+        )
+}
+
+fn looks_like_text(text: &str) -> bool {
+    let sample = text.chars().take(2048);
+    let mut count = 0usize;
+    let mut control = 0usize;
+    for ch in sample {
+        count += 1;
+        if ch.is_control() && !matches!(ch, '\n' | '\r' | '\t') {
+            control += 1;
+        }
+    }
+    count > 0 && control * 20 <= count
+}
+
+fn utf8_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
+fn image_attachment_metadata(
+    file_name: &str,
+    bytes: &[u8],
+    content_type: Option<&str>,
+) -> Option<serde_json::Value> {
+    let (format, dimensions) = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        ("png", png_dimensions(bytes))
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        ("jpeg", jpeg_dimensions(bytes))
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        ("gif", gif_dimensions(bytes))
+    } else if matches!(
+        content_type,
+        Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
+    ) {
+        (
+            content_type?.strip_prefix("image/").unwrap_or("image"),
+            None,
+        )
+    } else {
+        return None;
+    };
+    Some(serde_json::json!({
+        "projection": "image_metadata",
+        "format": format,
+        "content_type": content_type,
+        "dimensions": dimensions.map(|(width, height)| serde_json::json!({
+            "width": width,
+            "height": height
+        })),
+        "note": format!(
+            "{file_name} is stored in SIFS. Pixel-level image reasoning is not available through the current text-only chat request path."
+        )
+    }))
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return None;
+    }
+    Some((
+        u32::from_be_bytes(bytes[16..20].try_into().ok()?),
+        u32::from_be_bytes(bytes[20..24].try_into().ok()?),
+    ))
+}
+
+fn gif_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 10 || !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        return None;
+    }
+    Some((
+        u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32,
+        u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32,
+    ))
+}
+
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || !bytes.starts_with(b"\xff\xd8") {
+        return None;
+    }
+    let mut index = 2usize;
+    while index + 3 < bytes.len() {
+        if bytes[index] != 0xff {
+            index += 1;
+            continue;
+        }
+        while index < bytes.len() && bytes[index] == 0xff {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            return None;
+        }
+        let marker = bytes[index];
+        index += 1;
+        if matches!(marker, 0xd8 | 0xd9 | 0x01) || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        if index + 1 >= bytes.len() {
+            return None;
+        }
+        let segment_len = u16::from_be_bytes([bytes[index], bytes[index + 1]]) as usize;
+        if segment_len < 2 || index + segment_len > bytes.len() {
+            return None;
+        }
+        if matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        ) && segment_len >= 7
+        {
+            let height = u16::from_be_bytes([bytes[index + 3], bytes[index + 4]]) as u32;
+            let width = u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]) as u32;
+            return Some((width, height));
+        }
+        index += segment_len;
+    }
+    None
 }
 
 fn attachment_file_name(path: &Path) -> String {
@@ -3417,6 +3650,97 @@ mod tests {
 
     fn runtime_event(payload: AgentRuntimeEventPayload) -> AgentRuntimeEvent {
         AgentRuntimeEvent::new(SessionId::generate(), payload)
+    }
+
+    #[test]
+    fn app_chat_text_attachment_projection_includes_bounded_excerpt() {
+        let text = format!(
+            "heading\n{}\nTAIL",
+            "a".repeat(APP_CHAT_ATTACHMENT_TEXT_EXCERPT_BYTES + 512)
+        );
+        let projection =
+            model_visible_attachment_projection("note.md", text.as_bytes(), Some("text/markdown"));
+
+        assert_eq!(
+            projection
+                .get("projection")
+                .and_then(serde_json::Value::as_str),
+            Some("text_excerpt")
+        );
+        assert_eq!(
+            projection
+                .get("truncated")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let excerpt = projection
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .expect("excerpt");
+        assert!(excerpt.starts_with("heading"));
+        assert!(!excerpt.contains("TAIL"));
+    }
+
+    #[test]
+    fn app_chat_image_attachment_projection_reports_dimensions() {
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&640u32.to_be_bytes());
+        png.extend_from_slice(&360u32.to_be_bytes());
+
+        let projection = model_visible_attachment_projection("screen.png", &png, Some("image/png"));
+
+        assert_eq!(
+            projection
+                .get("projection")
+                .and_then(serde_json::Value::as_str),
+            Some("image_metadata")
+        );
+        assert_eq!(projection["dimensions"]["width"].as_u64(), Some(640));
+        assert_eq!(projection["dimensions"]["height"].as_u64(), Some(360));
+        assert!(
+            projection
+                .get("note")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|note| note.contains("Pixel-level image reasoning"))
+        );
+    }
+
+    #[test]
+    fn app_chat_context_attachment_carries_model_visible_projection() {
+        let attachment_id = TaskId::generate();
+        let attachment = AgentChannelAttachment {
+            attachment_id,
+            file_name: "brief.txt".to_string(),
+            original_path: "C:\\input\\brief.txt".to_string(),
+            stored_path: "/services/sinomo-agent/channels/demo/attachments/brief.txt".to_string(),
+            size_bytes: 5,
+            content_type: Some("text/plain".to_string()),
+            created_at: time::OffsetDateTime::now_utc(),
+            source: AgentChannelSource {
+                metadata: serde_json::json!({
+                    "model_visible": {
+                        "projection": "text_excerpt",
+                        "text": "hello"
+                    }
+                }),
+                ..AgentChannelSource::app()
+            },
+        };
+
+        let context = agent_context_attachments_from_channel_attachments(&[attachment]);
+
+        assert_eq!(context.len(), 1);
+        assert_eq!(
+            context[0].payload_json["model_visible"]["projection"].as_str(),
+            Some("text_excerpt")
+        );
+        assert_eq!(
+            context[0].payload_json["model_visible"]["text"].as_str(),
+            Some("hello")
+        );
     }
 
     #[test]
