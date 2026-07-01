@@ -4,8 +4,10 @@
 //! materialized tables. This module owns the small validation helpers used by
 //! replay paths so backend code can focus on applying mutations.
 
-use crate::metadata_backend::{MetadataBackendError, Result};
+use crate::metadata_backend::{DfsMetadataBackend, MetadataBackendError, Result};
+use crate::metadata_receipt::receipt_for_replica_from_backend;
 use crate::metadata_records::{DfsMetadataJournalEntry, DfsMetadataMutation};
+use crate::metadata_tables::DfsMetadataTables;
 
 pub(crate) fn required_replay_payload<'a, T>(
     entry: &DfsMetadataJournalEntry,
@@ -36,6 +38,102 @@ pub(crate) fn journal_entry_has_replay_payloads(entry: &DfsMetadataJournalEntry)
         DfsMetadataMutation::PutConflict { conflict, .. } => conflict.is_some(),
         DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => transaction.is_some(),
     }
+}
+
+pub(crate) fn hydrate_journal_entry_payload<B: DfsMetadataBackend + ?Sized>(
+    backend: &B,
+    tables: &DfsMetadataTables,
+    mut entry: DfsMetadataJournalEntry,
+    receipt_page_size: usize,
+) -> Result<DfsMetadataJournalEntry> {
+    match &mut entry.mutation {
+        DfsMetadataMutation::PutFileSystem {
+            file_system_id,
+            file_system,
+        } if file_system.is_none() => {
+            *file_system = backend.get_file_system(file_system_id)?;
+        }
+        DfsMetadataMutation::PutObject {
+            object_id, object, ..
+        } if object.is_none() => {
+            *object = backend.get_object(object_id)?;
+        }
+        DfsMetadataMutation::PutVersion {
+            object_id,
+            version,
+            version_record,
+            ..
+        } if version_record.is_none() => {
+            *version_record = backend.get_version(object_id, version)?;
+        }
+        DfsMetadataMutation::PutReceipt {
+            object_id,
+            version,
+            replica_node_id,
+            receipt,
+            ..
+        } if receipt.is_none() => {
+            *receipt = receipt_for_replica_from_backend(
+                backend,
+                object_id,
+                version,
+                replica_node_id,
+                receipt_page_size,
+            )?;
+        }
+        DfsMetadataMutation::PutIntent {
+            object_id,
+            intent_id,
+            intent,
+            ..
+        } if intent.is_none() => {
+            *intent = backend.get_intent(object_id, intent_id)?;
+        }
+        DfsMetadataMutation::PutConflict {
+            object_id,
+            conflict_id,
+            conflict,
+            ..
+        } if conflict.is_none() => {
+            *conflict = backend.get_conflict(object_id, conflict_id)?;
+        }
+        DfsMetadataMutation::CommitVisibleVersion {
+            object_id,
+            committed_version,
+            committed_object,
+            visible_version,
+            ..
+        } if committed_object.is_none() || visible_version.is_none() => {
+            let commit_key = (object_id.clone(), committed_version.clone());
+            if let Some(commit) = tables.visible_commits.get(&commit_key) {
+                if committed_object.is_none() {
+                    *committed_object = Some(commit.committed_object.clone());
+                }
+                if visible_version.is_none() {
+                    *visible_version = Some(commit.visible_version.clone());
+                }
+            } else {
+                if committed_object.is_none()
+                    && let Some(object) = backend.get_object(object_id)?
+                    && object.version == *committed_version
+                {
+                    *committed_object = Some(object);
+                }
+                if visible_version.is_none() {
+                    *visible_version = backend.get_version(object_id, committed_version)?;
+                }
+            }
+        }
+        DfsMetadataMutation::ApplyNamespaceTransaction {
+            transaction_id,
+            transaction,
+            ..
+        } if transaction.is_none() => {
+            *transaction = backend.get_namespace_transaction(transaction_id)?;
+        }
+        _ => {}
+    }
+    Ok(entry)
 }
 
 #[cfg(test)]

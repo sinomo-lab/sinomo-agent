@@ -23,6 +23,7 @@ mod local_state;
 mod maintenance;
 mod message_transport;
 mod metadata_backend;
+mod metadata_cursor;
 mod metadata_hardlink;
 mod metadata_io;
 mod metadata_journal;

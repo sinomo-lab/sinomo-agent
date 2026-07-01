@@ -11,6 +11,7 @@ use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_storage::durable_file;
 
 use crate::metadata_backend::{MetadataBackendError, Result};
+use crate::metadata_cursor;
 use crate::metadata_io::{
     create_dir_all, metadata_durable_file_error, read_dir, read_sobj, read_sobj_optional,
     remove_file_if_exists, sync_dir, write_sobj_atomic,
@@ -88,10 +89,7 @@ fn journal_head_matches_local_materialization_cursor(
     if head_next_sequence <= 1 {
         return Ok(false);
     }
-    let cursor_path = root
-        .join("records")
-        .join("local-materialization")
-        .join("cursor.sobj");
+    let cursor_path = metadata_cursor::local_materialization_cursor_path(root);
     let Some(cursor) = read_sobj_optional::<DfsMetadataReplayCursor>(&cursor_path)? else {
         return Ok(false);
     };

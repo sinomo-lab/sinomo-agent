@@ -5,13 +5,18 @@
 //! already materialized, recoverable after an interrupted write, or needs
 //! object-location repair from its visible version record.
 
-use crate::metadata_keys::{normalize_node_locations, normalize_path};
+use crate::metadata_keys::{
+    normalize_node_locations, normalize_path, normalized_node_location_list,
+};
 use crate::metadata_object_index::object_index_table_ops_with_previous;
 use crate::metadata_records::{
-    DfsMetadataTableOp, DfsVisibleVersionCommitRecord, normalized_version_record,
+    DfsMetadataTableOp, DfsObjectVersionRecord, DfsVisibleVersionCommitRecord,
+    normalized_object_metadata, normalized_version_record,
 };
 use crate::metadata_tables::DfsMetadataTables;
 use crate::{DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion};
+use sinomo_node::NodeId;
+use time::OffsetDateTime;
 
 pub(crate) fn object_by_path_from_tables(
     tables: &DfsMetadataTables,
@@ -64,6 +69,22 @@ pub(crate) fn visible_commit_already_materialized(
         .versions
         .get(&(object_id.clone(), committed_version.clone()))
         == Some(&visible_version)
+}
+
+pub(crate) fn visible_commit_record_from_parts(
+    expected_version: &DfsVersion,
+    committed_object: &DfsObjectMetadata,
+    visible_version: &DfsObjectVersionRecord,
+    required_replica_node_ids: &[NodeId],
+    created_at: OffsetDateTime,
+) -> DfsVisibleVersionCommitRecord {
+    DfsVisibleVersionCommitRecord {
+        expected_version: expected_version.clone(),
+        committed_object: normalized_object_metadata(committed_object),
+        visible_version: normalized_version_record(visible_version),
+        required_replica_node_ids: normalized_node_location_list(required_replica_node_ids),
+        created_at,
+    }
 }
 
 pub(crate) fn visible_commit_table_ops(
@@ -289,6 +310,38 @@ mod tests {
         assert!(ops.iter().any(|op| {
             matches!(op, DfsMetadataTableOp::PutVersion { version } if version == &commit.visible_version)
         }));
+    }
+
+    #[test]
+    fn visible_commit_record_from_parts_normalizes_locations() {
+        let mut committed_object = object(version("version_visible_new"));
+        committed_object.current_locations = vec![node("node_b"), node("node_a"), node("node_a")];
+        let mut visible_version = version_record(
+            &committed_object,
+            vec![node("node_c"), node("node_b"), node("node_b")],
+        );
+        visible_version.version = committed_object.version.clone();
+
+        let commit = visible_commit_record_from_parts(
+            &version("version_visible_old"),
+            &committed_object,
+            &visible_version,
+            &[node("node_c"), node("node_b"), node("node_b")],
+            OffsetDateTime::UNIX_EPOCH,
+        );
+
+        assert_eq!(
+            commit.committed_object.current_locations,
+            vec![node("node_b"), node("node_a")]
+        );
+        assert_eq!(
+            commit.visible_version.locations,
+            vec![node("node_c"), node("node_b")]
+        );
+        assert_eq!(
+            commit.required_replica_node_ids,
+            vec![node("node_c"), node("node_b")]
+        );
     }
 
     #[test]

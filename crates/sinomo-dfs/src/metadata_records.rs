@@ -334,6 +334,65 @@ pub enum DfsMetadataMutation {
     },
 }
 
+impl DfsMetadataMutation {
+    pub(crate) fn put_file_system(file_system: &DfsFileSystem) -> Self {
+        Self::PutFileSystem {
+            file_system_id: file_system.file_system_id.clone(),
+            file_system: Some(file_system.clone()),
+        }
+    }
+
+    pub(crate) fn put_object(object: &DfsObjectMetadata) -> Self {
+        Self::PutObject {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            path: object.path.clone(),
+            object: Some(object.clone()),
+        }
+    }
+
+    pub(crate) fn put_version(version: &DfsObjectVersionRecord) -> Self {
+        Self::PutVersion {
+            file_system_id: version.file_system_id.clone(),
+            object_id: version.object_id.clone(),
+            version: version.version.clone(),
+            version_record: Some(version.clone()),
+        }
+    }
+
+    pub(crate) fn put_receipt(receipt: &DfsReplicaReceiptRecord) -> Self {
+        Self::PutReceipt {
+            file_system_id: receipt.receipt.file_system_id.clone(),
+            object_id: receipt.receipt.object_id.clone(),
+            version: receipt.receipt.committed_version.clone(),
+            replica_node_id: receipt.replica_node_id.clone(),
+            receipt: Some(receipt.clone()),
+        }
+    }
+
+    pub(crate) fn put_intent(intent: &DfsWriteIntentRecord) -> Self {
+        Self::PutIntent {
+            file_system_id: intent.file_system_id.clone(),
+            object_id: intent.object_id.clone(),
+            intent_id: intent.intent_id.clone(),
+            status: intent.status.clone(),
+            intent: Some(intent.clone()),
+        }
+    }
+
+    pub(crate) fn commit_visible_version(commit: &DfsVisibleVersionCommitRecord) -> Self {
+        Self::CommitVisibleVersion {
+            file_system_id: commit.committed_object.file_system_id.clone(),
+            object_id: commit.committed_object.object_id.clone(),
+            previous_version: commit.expected_version.clone(),
+            committed_version: commit.committed_object.version.clone(),
+            committed_object: Some(commit.committed_object.clone()),
+            visible_version: Some(commit.visible_version.clone()),
+            required_replica_node_ids: commit.required_replica_node_ids.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataSubscription {
     pub shard_id: DfsMetadataShardId,
@@ -1045,4 +1104,164 @@ pub(crate) fn put_visible_version_record_if_changed(
 
 pub(crate) fn remote_read_rejection_prunes_location(reason: &str) -> bool {
     reason.contains("is not a current location for DFS object")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_core::DfsObjectPolicy;
+
+    fn node(value: &str) -> NodeId {
+        NodeId::from_legacy_named(value).expect("valid node id")
+    }
+
+    fn file_system_id() -> DfsFileSystemId {
+        DfsFileSystemId::from_legacy_named("sifs").expect("valid filesystem id")
+    }
+
+    fn object_id() -> DfsObjectId {
+        DfsObjectId::from_legacy_named("obj_mutation").expect("valid object id")
+    }
+
+    fn version(value: &str) -> DfsVersion {
+        DfsVersion::from_legacy_named(value).expect("valid version")
+    }
+
+    fn object(object_version: DfsVersion) -> DfsObjectMetadata {
+        DfsObjectMetadata {
+            object_id: object_id(),
+            file_system_id: file_system_id(),
+            path: "/docs/mutation.md".to_string(),
+            kind: DfsObjectKind::File,
+            owner_node_id: node("node_owner"),
+            current_locations: vec![node("node_owner")],
+            content_hash: Some("blake3:mutation".to_string()),
+            content_size_bytes: Some(32),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 1,
+            modified_at_unix_nanos: 1,
+            created_at_unix_nanos: 1,
+            changed_at_unix_nanos: 1,
+            version: object_version,
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        }
+    }
+
+    fn version_record(object: &DfsObjectMetadata) -> DfsObjectVersionRecord {
+        DfsObjectVersionRecord {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version: object.version.clone(),
+            content_hash: object.content_hash.clone(),
+            size_bytes: object.content_size_bytes,
+            locations: object.current_locations.clone(),
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        }
+    }
+
+    #[test]
+    fn mutation_constructors_copy_identity_fields_from_payloads() {
+        let object = object(version("version_mutation_1"));
+        let version_record = version_record(&object);
+        let receipt = DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                committed_version: object.version.clone(),
+                owner_node_id: object.owner_node_id.clone(),
+                event_id: EventId::generate(),
+            },
+            replica_node_id: node("node_replica"),
+            content_hash: object.content_hash.clone(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let intent = DfsWriteIntentRecord {
+            intent_id: "intent_mutation".to_string(),
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            base_version: None,
+            target_version: object.version.clone(),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 0,
+            desired_replica_node_ids: vec![node("node_replica")],
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            status: DfsWriteIntentStatus::Staging,
+            content_hash: object.content_hash.clone(),
+            object_metadata: Some(object.clone()),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+        };
+
+        assert_eq!(
+            DfsMetadataMutation::put_object(&object),
+            DfsMetadataMutation::PutObject {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                path: object.path.clone(),
+                object: Some(object.clone()),
+            }
+        );
+        assert_eq!(
+            DfsMetadataMutation::put_version(&version_record),
+            DfsMetadataMutation::PutVersion {
+                file_system_id: version_record.file_system_id.clone(),
+                object_id: version_record.object_id.clone(),
+                version: version_record.version.clone(),
+                version_record: Some(version_record.clone()),
+            }
+        );
+        assert_eq!(
+            DfsMetadataMutation::put_receipt(&receipt),
+            DfsMetadataMutation::PutReceipt {
+                file_system_id: receipt.receipt.file_system_id.clone(),
+                object_id: receipt.receipt.object_id.clone(),
+                version: receipt.receipt.committed_version.clone(),
+                replica_node_id: receipt.replica_node_id.clone(),
+                receipt: Some(receipt.clone()),
+            }
+        );
+        assert_eq!(
+            DfsMetadataMutation::put_intent(&intent),
+            DfsMetadataMutation::PutIntent {
+                file_system_id: intent.file_system_id.clone(),
+                object_id: intent.object_id.clone(),
+                intent_id: intent.intent_id.clone(),
+                status: intent.status.clone(),
+                intent: Some(intent),
+            }
+        );
+    }
+
+    #[test]
+    fn visible_commit_mutation_constructor_uses_commit_record_fields() {
+        let committed_object = object(version("version_mutation_2"));
+        let visible_version = version_record(&committed_object);
+        let commit = DfsVisibleVersionCommitRecord {
+            expected_version: version("version_mutation_1"),
+            committed_object: committed_object.clone(),
+            visible_version: visible_version.clone(),
+            required_replica_node_ids: vec![node("node_replica")],
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+
+        assert_eq!(
+            DfsMetadataMutation::commit_visible_version(&commit),
+            DfsMetadataMutation::CommitVisibleVersion {
+                file_system_id: committed_object.file_system_id,
+                object_id: committed_object.object_id,
+                previous_version: commit.expected_version,
+                committed_version: committed_object.version,
+                committed_object: Some(commit.committed_object),
+                visible_version: Some(visible_version),
+                required_replica_node_ids: commit.required_replica_node_ids,
+            }
+        );
+    }
 }

@@ -9,17 +9,20 @@
 use crate::DfsReplicationPolicy;
 use crate::control_plane::{DfsMetadataShardConfig, select_metadata_shard_config_for_path};
 use crate::intent::write_intent_status_is_active;
+use crate::metadata_cursor;
 use crate::metadata_hardlink::{
     hardlink_object_from_path_record, object_is_hardlink_to_target, sort_hardlinks_by_path,
 };
-use crate::metadata_io::{create_dir_all, read_dir, read_sobj_optional, write_sobj_atomic};
+use crate::metadata_io::create_dir_all;
 #[cfg(test)]
-use crate::metadata_io::{read_sobj, remove_file_if_exists, sync_dir};
+use crate::metadata_io::{read_dir, read_sobj, remove_file_if_exists, sync_dir, write_sobj_atomic};
+#[cfg(test)]
+use crate::metadata_journal::DfsMetadataJournalHead;
 use crate::metadata_journal::{
-    DfsMetadataJournalHead, DfsMetadataReplayCursor, append_segmented_journal_entries,
-    append_segmented_journal_entry, bounded_metadata_journal_batch, current_next_journal_sequence,
-    journal_entries_since_limited, journal_entries_since_limited_with_next_sequence,
-    journal_segment_id, migrate_legacy_journal_entries, read_segmented_journal_file_since_limited,
+    DfsMetadataReplayCursor, append_segmented_journal_entries, append_segmented_journal_entry,
+    bounded_metadata_journal_batch, current_next_journal_sequence, journal_entries_since_limited,
+    journal_entries_since_limited_with_next_sequence, journal_segment_id,
+    migrate_legacy_journal_entries, read_segmented_journal_file_since_limited,
     recover_next_journal_sequence, segmented_journal_entry_at_sequence,
 };
 use crate::metadata_keys::{
@@ -27,12 +30,11 @@ use crate::metadata_keys::{
     directory_page_cursor_with_shard, directory_page_key, id_lower_bound, key_segment,
     local_directory_page_cursor, local_object_page_cursor, local_object_version_page_cursor,
     local_replica_receipt_page_cursor, local_write_intent_page_cursor, normalize_path,
-    normalize_posix_path, normalized_node_location_list, object_page_cursor,
-    object_page_cursor_with_shard, object_page_key, object_version_page_cursor_with_shard,
-    object_version_scan_cursor, object_version_scan_key, posix_path_is_at_or_under_prefix,
-    replica_receipt_page_cursor_with_shard, replica_receipt_scan_cursor, replica_receipt_scan_key,
-    write_intent_page_cursor, write_intent_page_cursor_with_shard, write_intent_scan_cursor,
-    write_intent_scan_order,
+    normalize_posix_path, object_page_cursor, object_page_cursor_with_shard, object_page_key,
+    object_version_page_cursor_with_shard, object_version_scan_cursor, object_version_scan_key,
+    posix_path_is_at_or_under_prefix, replica_receipt_page_cursor_with_shard,
+    replica_receipt_scan_cursor, replica_receipt_scan_key, write_intent_page_cursor,
+    write_intent_page_cursor_with_shard, write_intent_scan_cursor, write_intent_scan_order,
 };
 use crate::metadata_lock::{MetadataWriteLock, metadata_write_lock};
 use crate::metadata_namespace_transaction::{
@@ -47,9 +49,11 @@ use crate::metadata_pages::{
     version_records_page_from_tables, versions_for_object_page_from_tables,
     write_intents_page_from_tables,
 };
-use crate::metadata_receipt::receipt_for_replica_from_backend;
+use crate::metadata_receipt::{receipt_for_replica_from_backend, replay_receipt_matches_existing};
 use crate::metadata_records::*;
-use crate::metadata_replay::{journal_entry_has_replay_payloads, required_replay_payload};
+use crate::metadata_replay::{
+    hydrate_journal_entry_payload, journal_entry_has_replay_payloads, required_replay_payload,
+};
 #[cfg(test)]
 use crate::metadata_shard_index::object_shard_index_path;
 use crate::metadata_shard_index::{
@@ -84,8 +88,9 @@ use crate::metadata_tables::{
 };
 use crate::metadata_tombstone::{metadata_now_unix_nanos, plan_tombstone_compaction};
 use crate::metadata_visible_commit::{
-    object_by_path_from_tables, visible_commit_already_materialized, visible_commit_recovery_order,
-    visible_commit_should_recover, visible_commit_table_ops, visible_object_location_recovery_ops,
+    object_by_path_from_tables, visible_commit_already_materialized,
+    visible_commit_record_from_parts, visible_commit_recovery_order, visible_commit_should_recover,
+    visible_commit_table_ops, visible_object_location_recovery_ops,
 };
 use crate::{DfsFileSystem, DfsObjectKind, DfsObjectMetadata};
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
@@ -114,7 +119,6 @@ use time::OffsetDateTime;
 pub const DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT: usize = 512;
 pub const DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES: u64 = 64 * 1024 * 1024;
-const LOCAL_MATERIALIZATION_CURSOR_FLUSH_INTERVAL: u64 = 512;
 const OBJECT_LOCAL_METADATA_PAGE_SIZE: usize = 4096;
 const SHARD_MIGRATION_PAGE_SIZE: usize = 1024;
 
@@ -3326,7 +3330,6 @@ impl LocalSobjMetadataBackend {
 
     pub fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
         let _lock = self.begin_metadata_write()?;
-        let mut applied = 0usize;
         let mut local_cursor = self.local_materialization_cursor()?;
         let mut local_cursor_advanced = false;
         let mut replay_cursors = BTreeMap::<DfsMetadataShardId, DfsMetadataReplayCursor>::new();
@@ -3334,12 +3337,7 @@ impl LocalSobjMetadataBackend {
         let mut replay_entries = Vec::new();
         for entry in &batch.entries {
             if !replay_cursors.contains_key(&entry.shard_id) {
-                let replay_cursor_path = self.replay_cursor_path(&entry.shard_id);
-                let cursor = read_sobj_optional::<DfsMetadataReplayCursor>(&replay_cursor_path)?
-                    .unwrap_or(DfsMetadataReplayCursor {
-                        shard_id: entry.shard_id.clone(),
-                        last_sequence: 0,
-                    });
+                let cursor = metadata_cursor::read_replay_cursor(&self.root, &entry.shard_id)?;
                 replay_cursors.insert(entry.shard_id.clone(), cursor);
             }
             let cursor = replay_cursors
@@ -3360,24 +3358,17 @@ impl LocalSobjMetadataBackend {
 
         let mut table_ops = Vec::new();
         let mut rollback = DfsMetadataTableRollback::default();
-        let mut table_sequence = 0u64;
-        let replay_result = (|| -> Result<()> {
-            for entry in replay_entries {
-                if self.materialize_replayed_journal_entry_into_batch(
-                    entry,
-                    &mut table_ops,
-                    &mut rollback,
-                )? {
-                    applied = applied.saturating_add(1);
-                    table_sequence = entry.sequence;
-                }
+        let (applied, table_sequence) = match self.plan_replayed_journal_entries_into_batch(
+            replay_entries.iter().copied(),
+            &mut table_ops,
+            &mut rollback,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                rollback.rollback(&mut self.tables);
+                return Err(error);
             }
-            Ok(())
-        })();
-        if let Err(error) = replay_result {
-            rollback.rollback(&mut self.tables);
-            return Err(error);
-        }
+        };
         self.append_preapplied_table_ops(table_sequence, table_ops, rollback)?;
         if local_cursor_advanced {
             self.materialized_through_sequence = self
@@ -3387,7 +3378,7 @@ impl LocalSobjMetadataBackend {
         }
         for shard_id in advanced_cursors {
             if let Some(cursor) = replay_cursors.get(&shard_id) {
-                write_sobj_atomic(&self.replay_cursor_path(&cursor.shard_id), cursor)?;
+                metadata_cursor::write_replay_cursor(&self.root, cursor)?;
             }
         }
         Ok(applied)
@@ -3427,8 +3418,8 @@ impl LocalSobjMetadataBackend {
             Some(self.materialized_through_sequence),
         )?;
         self.table_snapshot_fingerprint = metadata_table_snapshot_fingerprint(&self.root)?;
-        write_sobj_atomic(
-            &self.replay_cursor_path(&source_shard_id),
+        metadata_cursor::write_replay_cursor(
+            &self.root,
             &DfsMetadataReplayCursor {
                 shard_id: source_shard_id,
                 last_sequence: replayed_through_sequence,
@@ -3438,12 +3429,7 @@ impl LocalSobjMetadataBackend {
             shard_id: self.shard_id.clone(),
             last_sequence: replayed_through_sequence,
         })?;
-        write_sobj_atomic(
-            &self.journal_head_path(),
-            &DfsMetadataJournalHead {
-                next_sequence: self.next_sequence,
-            },
-        )?;
+        metadata_cursor::write_journal_head(&self.root, self.next_sequence)?;
         Ok(archived_existing)
     }
 
@@ -3535,224 +3521,48 @@ impl LocalSobjMetadataBackend {
             return Ok(());
         }
         self.next_sequence = next_sequence;
-        write_sobj_atomic(
-            &self.journal_head_path(),
-            &DfsMetadataJournalHead {
-                next_sequence: self.next_sequence,
-            },
-        )
+        metadata_cursor::write_journal_head(&self.root, self.next_sequence)
     }
 
     fn materialize_replayed_journal_entry_unlocked(
         &mut self,
         entry: &DfsMetadataJournalEntry,
     ) -> Result<bool> {
-        match &entry.mutation {
-            DfsMetadataMutation::PutFileSystem {
-                file_system_id,
-                file_system,
-            } => {
-                let file_system =
-                    required_replay_payload(entry, "put-file-system", file_system.as_ref())?;
-                if self.get_file_system(file_system_id)?.as_ref() == Some(file_system) {
-                    return Ok(false);
-                }
-                self.materialize_local_journal_entry(entry)?;
-                Ok(true)
+        let mut table_ops = Vec::new();
+        let mut rollback = DfsMetadataTableRollback::default();
+        let changed = match self.materialize_replayed_journal_entry_into_batch(
+            entry,
+            &mut table_ops,
+            &mut rollback,
+        ) {
+            Ok(changed) => changed,
+            Err(error) => {
+                rollback.rollback(&mut self.tables);
+                return Err(error);
             }
-            DfsMetadataMutation::PutObject {
-                object_id, object, ..
-            } => {
-                let object = required_replay_payload(entry, "put-object", object.as_ref())?;
-                let object = normalized_object_metadata(object);
-                if self.get_object(object_id)? == Some(object.clone())
-                    || self.tables.compacted_tombstone_matches(&object)
-                {
-                    return Ok(false);
-                }
-                self.materialize_local_journal_entry(entry)?;
-                Ok(true)
-            }
-            DfsMetadataMutation::PutVersion {
-                object_id,
-                version,
-                version_record,
-                ..
-            } => {
-                let version_record =
-                    required_replay_payload(entry, "put-version", version_record.as_ref())?;
-                if self.get_version(object_id, version)?
-                    == Some(normalized_version_record(version_record))
-                {
-                    return Ok(false);
-                }
-                self.materialize_local_journal_entry(entry)?;
-                Ok(true)
-            }
-            DfsMetadataMutation::PutReceipt {
-                object_id,
-                version,
-                replica_node_id,
-                receipt,
-                ..
-            } => {
-                let receipt = required_replay_payload(entry, "put-receipt", receipt.as_ref())?;
-                if let Some(existing) = receipt_for_replica_from_backend(
-                    self,
-                    object_id,
-                    version,
-                    replica_node_id,
-                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                )? {
-                    if &existing == receipt {
-                        return Ok(false);
-                    }
-                    if existing.receipt.file_system_id == receipt.receipt.file_system_id
-                        && existing.receipt.object_id == receipt.receipt.object_id
-                        && existing.receipt.committed_version == receipt.receipt.committed_version
-                        && existing.replica_node_id == receipt.replica_node_id
-                        && existing.content_hash == receipt.content_hash
-                    {
-                        return Ok(false);
-                    }
-                    return Err(MetadataBackendError::Serde(format!(
-                        "metadata journal entry {}:{} conflicts with an existing receipt for replica {}",
-                        entry.shard_id.0, entry.sequence, replica_node_id
-                    )));
-                }
-                self.materialize_local_journal_entry(entry)?;
-                Ok(true)
-            }
-            DfsMetadataMutation::RemoveReceipt {
-                object_id,
-                version,
-                replica_node_id,
-                ..
-            } => {
-                if receipt_for_replica_from_backend(
-                    self,
-                    object_id,
-                    version,
-                    replica_node_id,
-                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                )?
-                .is_none()
-                {
-                    return Ok(false);
-                }
-                self.materialize_local_journal_entry(entry)?;
-                Ok(true)
-            }
-            DfsMetadataMutation::PutIntent {
-                object_id,
-                intent_id,
-                intent,
-                ..
-            } => {
-                let intent = required_replay_payload(entry, "put-intent", intent.as_ref())?;
-                if self.get_intent(object_id, intent_id)?.as_ref() == Some(intent) {
-                    return Ok(false);
-                }
-                self.materialize_local_journal_entry(entry)?;
-                Ok(true)
-            }
-            DfsMetadataMutation::CommitVisibleVersion {
-                object_id,
-                previous_version,
-                committed_version,
-                committed_object,
-                visible_version,
-                required_replica_node_ids,
-                ..
-            } => {
-                let committed_object = required_replay_payload(
-                    entry,
-                    "commit-visible-version committed object",
-                    committed_object.as_ref(),
-                )?;
-                let visible_version = required_replay_payload(
-                    entry,
-                    "commit-visible-version visible version",
-                    visible_version.as_ref(),
-                )?;
-                let commit_record = DfsVisibleVersionCommitRecord {
-                    expected_version: previous_version.clone(),
-                    committed_object: normalized_object_metadata(committed_object),
-                    visible_version: normalized_version_record(visible_version),
-                    required_replica_node_ids: normalized_node_location_list(
-                        required_replica_node_ids,
-                    ),
-                    created_at: entry.created_at,
-                };
-                if self
-                    .get_object(object_id)?
-                    .as_ref()
-                    .is_some_and(|object| &object.version == committed_version)
-                    && self.get_version(object_id, committed_version)?.as_ref()
-                        == Some(&normalized_version_record(visible_version))
-                {
-                    return Ok(false);
-                }
-                if visible_commit_already_materialized(
-                    &self.tables,
-                    object_id,
-                    committed_version,
-                    &commit_record,
-                ) {
-                    return Ok(false);
-                }
-                let current = self.get_object(object_id)?.ok_or_else(|| {
-                    MetadataBackendError::UnknownObject {
-                        object_id: object_id.clone(),
-                    }
-                })?;
-                if &current.version != previous_version {
-                    return Err(MetadataBackendError::Conflict {
-                        object_id: object_id.clone(),
-                        expected: previous_version.clone(),
-                        current: current.version,
-                    });
-                }
-                // A replayed commit entry is authoritative after source validation. Short
-                // read-your-write replay windows can arrive without every receipt entry; the
-                // commit payload is still enough to make the object/version visible locally.
-                self.materialize_visible_version_commit(&commit_record, entry.sequence)?;
-                Ok(true)
-            }
-            DfsMetadataMutation::PutConflict {
-                object_id,
-                conflict_id,
-                conflict,
-                ..
-            } => {
-                if let Some(conflict) = conflict.as_ref() {
-                    if self.get_conflict(object_id, conflict_id)?.as_ref() == Some(conflict) {
-                        return Ok(false);
-                    }
-                } else if self.get_conflict(object_id, conflict_id)?.is_none() {
-                    return Ok(false);
-                }
-                self.materialize_local_journal_entry(entry)?;
-                Ok(true)
-            }
-            DfsMetadataMutation::ApplyNamespaceTransaction {
-                transaction_id,
-                transaction,
-                ..
-            } => {
-                let transaction = required_replay_payload(
-                    entry,
-                    "apply-namespace-transaction",
-                    transaction.as_ref(),
-                )?;
-                let normalized = normalized_namespace_transaction(transaction);
-                if self.tables.namespace_transactions.get(transaction_id) == Some(&normalized) {
-                    return Ok(false);
-                }
-                self.materialize_local_journal_entry(entry)?;
-                Ok(true)
+        };
+        if !changed {
+            return Ok(false);
+        }
+        self.append_preapplied_table_ops(entry.sequence, table_ops, rollback)?;
+        Ok(true)
+    }
+
+    fn plan_replayed_journal_entries_into_batch<'a>(
+        &mut self,
+        entries: impl IntoIterator<Item = &'a DfsMetadataJournalEntry>,
+        table_ops: &mut Vec<DfsMetadataTableOp>,
+        rollback: &mut DfsMetadataTableRollback,
+    ) -> Result<(usize, u64)> {
+        let mut changed_count = 0usize;
+        let mut last_materialized_sequence = 0u64;
+        for entry in entries {
+            if self.materialize_replayed_journal_entry_into_batch(entry, table_ops, rollback)? {
+                changed_count = changed_count.saturating_add(1);
+                last_materialized_sequence = entry.sequence;
             }
         }
+        Ok((changed_count, last_materialized_sequence))
     }
 
     fn materialize_replayed_journal_entry_into_batch(
@@ -3840,15 +3650,7 @@ impl LocalSobjMetadataBackend {
                     replica_node_id,
                     OBJECT_LOCAL_METADATA_PAGE_SIZE,
                 )? {
-                    if &existing == receipt {
-                        return Ok(false);
-                    }
-                    if existing.receipt.file_system_id == receipt.receipt.file_system_id
-                        && existing.receipt.object_id == receipt.receipt.object_id
-                        && existing.receipt.committed_version == receipt.receipt.committed_version
-                        && existing.replica_node_id == receipt.replica_node_id
-                        && existing.content_hash == receipt.content_hash
-                    {
+                    if replay_receipt_matches_existing(&existing, receipt) {
                         return Ok(false);
                     }
                     return Err(MetadataBackendError::Serde(format!(
@@ -3931,15 +3733,13 @@ impl LocalSobjMetadataBackend {
                     "commit-visible-version visible version",
                     visible_version.as_ref(),
                 )?;
-                let commit_record = DfsVisibleVersionCommitRecord {
-                    expected_version: previous_version.clone(),
-                    committed_object: normalized_object_metadata(committed_object),
-                    visible_version: normalized_version_record(visible_version),
-                    required_replica_node_ids: normalized_node_location_list(
-                        required_replica_node_ids,
-                    ),
-                    created_at: entry.created_at,
-                };
+                let commit_record = visible_commit_record_from_parts(
+                    previous_version,
+                    committed_object,
+                    visible_version,
+                    required_replica_node_ids,
+                    entry.created_at,
+                );
                 if self
                     .get_object(object_id)?
                     .as_ref()
@@ -4033,7 +3833,14 @@ impl LocalSobjMetadataBackend {
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
         entries
             .into_iter()
-            .map(|entry| self.hydrate_journal_entry_payload(entry))
+            .map(|entry| {
+                hydrate_journal_entry_payload(
+                    self,
+                    &self.tables,
+                    entry,
+                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
+                )
+            })
             .collect()
     }
 
@@ -4060,7 +3867,12 @@ impl LocalSobjMetadataBackend {
         let entries = self.journal_since_limited(after_sequence, max_entries)?;
         let mut hydrated = Vec::with_capacity(entries.len().min(max_entries));
         for entry in entries {
-            hydrated.push(self.hydrate_journal_entry_payload(entry)?);
+            hydrated.push(hydrate_journal_entry_payload(
+                self,
+                &self.tables,
+                entry,
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?);
         }
         bounded_metadata_journal_batch(
             self.shard_id.clone(),
@@ -4072,119 +3884,7 @@ impl LocalSobjMetadataBackend {
     }
 
     fn replay_cursor_statuses(&self) -> Result<Vec<DfsMetadataReplayCursorStatus>> {
-        let cursor_dir = self.records_root().join("replay-cursors");
-        if !cursor_dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut cursors = Vec::new();
-        for entry in read_dir(&cursor_dir)? {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("sobj") {
-                continue;
-            }
-            if let Some(cursor) = read_sobj_optional::<DfsMetadataReplayCursor>(&path)? {
-                cursors.push(DfsMetadataReplayCursorStatus {
-                    source_shard_id: cursor.shard_id,
-                    replayed_through_sequence: cursor.last_sequence,
-                });
-            }
-        }
-        cursors.sort_by(|left, right| left.source_shard_id.cmp(&right.source_shard_id));
-        Ok(cursors)
-    }
-
-    fn hydrate_journal_entry_payload(
-        &self,
-        mut entry: DfsMetadataJournalEntry,
-    ) -> Result<DfsMetadataJournalEntry> {
-        match &mut entry.mutation {
-            DfsMetadataMutation::PutFileSystem {
-                file_system_id,
-                file_system,
-            } if file_system.is_none() => {
-                *file_system = self.get_file_system(file_system_id)?;
-            }
-            DfsMetadataMutation::PutObject {
-                object_id, object, ..
-            } if object.is_none() => {
-                *object = self.get_object(object_id)?;
-            }
-            DfsMetadataMutation::PutVersion {
-                object_id,
-                version,
-                version_record,
-                ..
-            } if version_record.is_none() => {
-                *version_record = self.get_version(object_id, version)?;
-            }
-            DfsMetadataMutation::PutReceipt {
-                object_id,
-                version,
-                replica_node_id,
-                receipt,
-                ..
-            } if receipt.is_none() => {
-                *receipt = receipt_for_replica_from_backend(
-                    self,
-                    object_id,
-                    version,
-                    replica_node_id,
-                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                )?;
-            }
-            DfsMetadataMutation::PutIntent {
-                object_id,
-                intent_id,
-                intent,
-                ..
-            } if intent.is_none() => {
-                *intent = self.get_intent(object_id, intent_id)?;
-            }
-            DfsMetadataMutation::PutConflict {
-                object_id,
-                conflict_id,
-                conflict,
-                ..
-            } if conflict.is_none() => {
-                *conflict = self.get_conflict(object_id, conflict_id)?;
-            }
-            DfsMetadataMutation::CommitVisibleVersion {
-                object_id,
-                committed_version,
-                committed_object,
-                visible_version,
-                ..
-            } if committed_object.is_none() || visible_version.is_none() => {
-                let commit_key = (object_id.clone(), committed_version.clone());
-                if let Some(commit) = self.tables.visible_commits.get(&commit_key) {
-                    if committed_object.is_none() {
-                        *committed_object = Some(commit.committed_object.clone());
-                    }
-                    if visible_version.is_none() {
-                        *visible_version = Some(commit.visible_version.clone());
-                    }
-                } else {
-                    if committed_object.is_none()
-                        && let Some(object) = self.get_object(object_id)?
-                        && object.version == *committed_version
-                    {
-                        *committed_object = Some(object);
-                    }
-                    if visible_version.is_none() {
-                        *visible_version = self.get_version(object_id, committed_version)?;
-                    }
-                }
-            }
-            DfsMetadataMutation::ApplyNamespaceTransaction {
-                transaction_id,
-                transaction,
-                ..
-            } if transaction.is_none() => {
-                *transaction = self.get_namespace_transaction(transaction_id)?;
-            }
-            _ => {}
-        }
-        Ok(entry)
+        metadata_cursor::replay_cursor_statuses(&self.root)
     }
 
     #[cfg(test)]
@@ -4271,67 +3971,51 @@ impl LocalSobjMetadataBackend {
     }
 
     fn ensure_local_materialization_cursor(&self) -> Result<()> {
-        if self.local_materialization_cursor_path().is_file() {
-            return Ok(());
-        }
-        let last_sequence = if self.tables.has_materialized_state() {
-            self.next_sequence.saturating_sub(1)
-        } else {
-            0
-        };
-        write_sobj_atomic(
-            &self.local_materialization_cursor_path(),
-            &DfsMetadataReplayCursor {
-                shard_id: self.shard_id.clone(),
-                last_sequence,
-            },
+        metadata_cursor::ensure_local_materialization_cursor(
+            &self.root,
+            &self.shard_id,
+            self.next_sequence,
+            self.tables.has_materialized_state(),
         )
     }
 
     fn local_materialization_cursor(&self) -> Result<DfsMetadataReplayCursor> {
-        Ok(read_sobj_optional::<DfsMetadataReplayCursor>(
-            &self.local_materialization_cursor_path(),
-        )?
-        .unwrap_or(DfsMetadataReplayCursor {
-            shard_id: self.shard_id.clone(),
-            last_sequence: self.next_sequence.saturating_sub(1),
-        }))
+        metadata_cursor::local_materialization_cursor(
+            &self.root,
+            &self.shard_id,
+            self.next_sequence,
+        )
     }
 
     fn advance_local_materialization_cursor(&self, sequence: u64) -> Result<()> {
-        let mut cursor = self.local_materialization_cursor()?;
-        if sequence <= cursor.last_sequence {
-            return Ok(());
-        }
-        cursor.last_sequence = sequence;
-        self.write_local_materialization_cursor(&cursor)
+        metadata_cursor::advance_local_materialization_cursor(
+            &self.root,
+            &self.shard_id,
+            self.next_sequence,
+            sequence,
+        )
     }
 
     fn reconcile_local_materialization_cursor(&self, materialized_sequence: u64) -> Result<()> {
-        if materialized_sequence == 0 {
-            return Ok(());
-        }
-        self.advance_local_materialization_cursor(
-            materialized_sequence.min(self.next_sequence.saturating_sub(1)),
+        metadata_cursor::reconcile_local_materialization_cursor(
+            &self.root,
+            &self.shard_id,
+            self.next_sequence,
+            materialized_sequence,
         )
     }
 
     fn checkpoint_local_materialization_cursor_if_due(&self, sequence: u64) -> Result<()> {
-        let cursor = self.local_materialization_cursor()?;
-        if sequence <= cursor.last_sequence
-            || sequence.saturating_sub(cursor.last_sequence)
-                < LOCAL_MATERIALIZATION_CURSOR_FLUSH_INTERVAL
-        {
-            return Ok(());
-        }
-        self.write_local_materialization_cursor(&DfsMetadataReplayCursor {
-            shard_id: cursor.shard_id,
-            last_sequence: sequence,
-        })
+        metadata_cursor::checkpoint_local_materialization_cursor_if_due(
+            &self.root,
+            &self.shard_id,
+            self.next_sequence,
+            sequence,
+        )
     }
 
     fn write_local_materialization_cursor(&self, cursor: &DfsMetadataReplayCursor) -> Result<()> {
-        write_sobj_atomic(&self.local_materialization_cursor_path(), cursor)
+        metadata_cursor::write_local_materialization_cursor(&self.root, cursor)
     }
 
     fn recover_unmaterialized_local_journal_entries(&mut self) -> Result<()> {
@@ -4463,15 +4147,13 @@ impl LocalSobjMetadataBackend {
                 let Some(visible_version) = visible_version.as_ref() else {
                     return Ok(());
                 };
-                let commit_record = DfsVisibleVersionCommitRecord {
-                    expected_version: previous_version.clone(),
-                    committed_object: normalized_object_metadata(committed_object),
-                    visible_version: normalized_version_record(visible_version),
-                    required_replica_node_ids: normalized_node_location_list(
-                        required_replica_node_ids,
-                    ),
-                    created_at: entry.created_at,
-                };
+                let commit_record = visible_commit_record_from_parts(
+                    previous_version,
+                    committed_object,
+                    visible_version,
+                    required_replica_node_ids,
+                    entry.created_at,
+                );
                 self.materialize_visible_version_commit(&commit_record, entry.sequence)
             }
             DfsMetadataMutation::PutConflict { conflict, .. } => {
@@ -4509,39 +4191,27 @@ impl LocalSobjMetadataBackend {
         }
     }
 
-    fn records_root(&self) -> PathBuf {
-        self.root.join("records")
-    }
-
+    #[cfg(test)]
     fn replay_cursor_path(&self, shard_id: &DfsMetadataShardId) -> PathBuf {
-        self.records_root()
-            .join("replay-cursors")
-            .join(format!("{}.sobj", key_segment(&shard_id.0)))
+        metadata_cursor::replay_cursor_path(&self.root, shard_id)
     }
 
+    #[cfg(test)]
     fn local_materialization_cursor_path(&self) -> PathBuf {
-        self.records_root()
-            .join("local-materialization")
-            .join("cursor.sobj")
+        metadata_cursor::local_materialization_cursor_path(&self.root)
     }
 
+    #[cfg(test)]
     fn metadata_replication_cursor_path(
         &self,
         target_node_id: &NodeId,
         shard_id: &DfsMetadataShardId,
     ) -> PathBuf {
-        self.records_root()
-            .join("metadata-replication-cursors")
-            .join(key_segment(target_node_id))
-            .join(format!("{}.sobj", key_segment(&shard_id.0)))
-    }
-
-    fn journal_head_path(&self) -> PathBuf {
-        self.root.join("journal").join("head.sobj")
+        metadata_cursor::metadata_replication_cursor_path(&self.root, target_node_id, shard_id)
     }
 
     fn journal_write_lock_path(&self) -> PathBuf {
-        self.root.join("journal").join("write.lock")
+        metadata_cursor::journal_write_lock_path(&self.root)
     }
 
     fn metadata_write_lock(&self) -> Result<MetadataWriteLock> {
@@ -4837,10 +4507,8 @@ impl LocalSobjMetadataBackend {
 impl DfsMetadataBackend for LocalSobjMetadataBackend {
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
-        let entry = self.write_journal_unlocked(DfsMetadataMutation::PutFileSystem {
-            file_system_id: file_system.file_system_id.clone(),
-            file_system: Some(file_system.clone()),
-        })?;
+        let entry =
+            self.write_journal_unlocked(DfsMetadataMutation::put_file_system(file_system))?;
         self.append_and_apply_table_ops(
             entry.sequence,
             vec![DfsMetadataTableOp::PutFileSystem {
@@ -4871,12 +4539,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         }
 
         let previous = self.get_object(&object.object_id)?;
-        let entry = self.write_journal_unlocked(DfsMetadataMutation::PutObject {
-            file_system_id: object.file_system_id.clone(),
-            object_id: object.object_id.clone(),
-            path: object.path.clone(),
-            object: Some(object.clone()),
-        })?;
+        let entry = self.write_journal_unlocked(DfsMetadataMutation::put_object(&object))?;
         self.materialize_object_indexes_with_previous(&object, previous.as_ref(), entry.sequence)?;
         self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         Ok(entry)
@@ -4904,12 +4567,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         let entries = self.write_journal_entries_unlocked(
             objects
                 .iter()
-                .map(|object| DfsMetadataMutation::PutObject {
-                    file_system_id: object.file_system_id.clone(),
-                    object_id: object.object_id.clone(),
-                    path: object.path.clone(),
-                    object: Some(object.clone()),
-                })
+                .map(DfsMetadataMutation::put_object)
                 .collect(),
         )?;
         let mut table_ops = Vec::new();
@@ -5284,12 +4942,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
         let version = normalized_version_record(version);
-        let entry = self.write_journal_unlocked(DfsMetadataMutation::PutVersion {
-            file_system_id: version.file_system_id.clone(),
-            object_id: version.object_id.clone(),
-            version: version.version.clone(),
-            version_record: Some(version),
-        })?;
+        let entry = self.write_journal_unlocked(DfsMetadataMutation::put_version(&version))?;
         if let DfsMetadataMutation::PutVersion {
             version_record: Some(version),
             ..
@@ -5329,18 +4982,8 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         }
         let previous = self.get_object(&object.object_id)?;
         let entries = self.write_journal_entries_unlocked(vec![
-            DfsMetadataMutation::PutObject {
-                file_system_id: object.file_system_id.clone(),
-                object_id: object.object_id.clone(),
-                path: object.path.clone(),
-                object: Some(object.clone()),
-            },
-            DfsMetadataMutation::PutVersion {
-                file_system_id: version.file_system_id.clone(),
-                object_id: version.object_id.clone(),
-                version: version.version.clone(),
-                version_record: Some(version.clone()),
-            },
+            DfsMetadataMutation::put_object(&object),
+            DfsMetadataMutation::put_version(&version),
         ])?;
         let mut table_ops = Vec::new();
         let mut rollback = DfsMetadataTableRollback::default();
@@ -5412,36 +5055,10 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         let validate_ms = validate_started.elapsed().as_millis();
         let build_started = Instant::now();
         let mut mutations = Vec::with_capacity(3 + receipts.len());
-        mutations.push(DfsMetadataMutation::PutObject {
-            file_system_id: object.file_system_id.clone(),
-            object_id: object.object_id.clone(),
-            path: object.path.clone(),
-            object: Some(object.clone()),
-        });
-        mutations.push(DfsMetadataMutation::PutVersion {
-            file_system_id: version.file_system_id.clone(),
-            object_id: version.object_id.clone(),
-            version: version.version.clone(),
-            version_record: Some(version.clone()),
-        });
-        mutations.push(DfsMetadataMutation::PutIntent {
-            file_system_id: intent.file_system_id.clone(),
-            object_id: intent.object_id.clone(),
-            intent_id: intent.intent_id.clone(),
-            status: intent.status.clone(),
-            intent: Some(intent.clone()),
-        });
-        mutations.extend(
-            receipts
-                .iter()
-                .map(|receipt| DfsMetadataMutation::PutReceipt {
-                    file_system_id: receipt.receipt.file_system_id.clone(),
-                    object_id: receipt.receipt.object_id.clone(),
-                    version: receipt.receipt.committed_version.clone(),
-                    replica_node_id: receipt.replica_node_id.clone(),
-                    receipt: Some(receipt.clone()),
-                }),
-        );
+        mutations.push(DfsMetadataMutation::put_object(&object));
+        mutations.push(DfsMetadataMutation::put_version(&version));
+        mutations.push(DfsMetadataMutation::put_intent(intent));
+        mutations.extend(receipts.iter().map(DfsMetadataMutation::put_receipt));
         let build_ms = build_started.elapsed().as_millis();
         let journal_started = Instant::now();
         let entries = self.write_journal_entries_unlocked(mutations)?;
@@ -5449,23 +5066,17 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         let materialize_started = Instant::now();
         let mut table_ops = Vec::new();
         let mut rollback = DfsMetadataTableRollback::default();
-        let mut last_materialized_sequence = 0u64;
-        let materialize_result = (|| -> Result<()> {
-            for entry in &entries {
-                if self.materialize_replayed_journal_entry_into_batch(
-                    entry,
-                    &mut table_ops,
-                    &mut rollback,
-                )? {
-                    last_materialized_sequence = entry.sequence;
-                }
+        let last_materialized_sequence = match self.plan_replayed_journal_entries_into_batch(
+            &entries,
+            &mut table_ops,
+            &mut rollback,
+        ) {
+            Ok((_, last_materialized_sequence)) => last_materialized_sequence,
+            Err(error) => {
+                rollback.rollback(&mut self.tables);
+                return Err(error);
             }
-            Ok(())
-        })();
-        if let Err(error) = materialize_result {
-            rollback.rollback(&mut self.tables);
-            return Err(error);
-        }
+        };
         let materialize_ms = materialize_started.elapsed().as_millis();
         let table_append_started = Instant::now();
         self.append_preapplied_table_ops(last_materialized_sequence, table_ops, rollback)?;
@@ -5629,13 +5240,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         receipt: &DfsReplicaReceiptRecord,
     ) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
-        let entry = self.write_journal_unlocked(DfsMetadataMutation::PutReceipt {
-            file_system_id: receipt.receipt.file_system_id.clone(),
-            object_id: receipt.receipt.object_id.clone(),
-            version: receipt.receipt.committed_version.clone(),
-            replica_node_id: receipt.replica_node_id.clone(),
-            receipt: Some(receipt.clone()),
-        })?;
+        let entry = self.write_journal_unlocked(DfsMetadataMutation::put_receipt(receipt))?;
         self.append_and_apply_table_ops(
             entry.sequence,
             vec![DfsMetadataTableOp::PutReceipt {
@@ -5721,13 +5326,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
 
     fn put_intent(&mut self, intent: &DfsWriteIntentRecord) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
-        let entry = self.write_journal_unlocked(DfsMetadataMutation::PutIntent {
-            file_system_id: intent.file_system_id.clone(),
-            object_id: intent.object_id.clone(),
-            intent_id: intent.intent_id.clone(),
-            status: intent.status.clone(),
-            intent: Some(intent.clone()),
-        })?;
+        let entry = self.write_journal_unlocked(DfsMetadataMutation::put_intent(intent))?;
         self.append_and_apply_table_ops(
             entry.sequence,
             vec![DfsMetadataTableOp::PutIntent {
@@ -5747,44 +5346,22 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         let _ = object;
         let _lock = self.begin_metadata_write()?;
         let mut mutations = Vec::with_capacity(1 + receipts.len());
-        mutations.push(DfsMetadataMutation::PutIntent {
-            file_system_id: intent.file_system_id.clone(),
-            object_id: intent.object_id.clone(),
-            intent_id: intent.intent_id.clone(),
-            status: intent.status.clone(),
-            intent: Some(intent.clone()),
-        });
-        mutations.extend(
-            receipts
-                .iter()
-                .map(|receipt| DfsMetadataMutation::PutReceipt {
-                    file_system_id: receipt.receipt.file_system_id.clone(),
-                    object_id: receipt.receipt.object_id.clone(),
-                    version: receipt.receipt.committed_version.clone(),
-                    replica_node_id: receipt.replica_node_id.clone(),
-                    receipt: Some(receipt.clone()),
-                }),
-        );
+        mutations.push(DfsMetadataMutation::put_intent(intent));
+        mutations.extend(receipts.iter().map(DfsMetadataMutation::put_receipt));
         let entries = self.write_journal_entries_unlocked(mutations)?;
         let mut table_ops = Vec::new();
         let mut rollback = DfsMetadataTableRollback::default();
-        let mut last_materialized_sequence = 0u64;
-        let materialize_result = (|| -> Result<()> {
-            for entry in &entries {
-                if self.materialize_replayed_journal_entry_into_batch(
-                    entry,
-                    &mut table_ops,
-                    &mut rollback,
-                )? {
-                    last_materialized_sequence = entry.sequence;
-                }
+        let last_materialized_sequence = match self.plan_replayed_journal_entries_into_batch(
+            &entries,
+            &mut table_ops,
+            &mut rollback,
+        ) {
+            Ok((_, last_materialized_sequence)) => last_materialized_sequence,
+            Err(error) => {
+                rollback.rollback(&mut self.tables);
+                return Err(error);
             }
-            Ok(())
-        })();
-        if let Err(error) = materialize_result {
-            rollback.rollback(&mut self.tables);
-            return Err(error);
-        }
+        };
         self.append_preapplied_table_ops(last_materialized_sequence, table_ops, rollback)?;
         if let Some(last_sequence) = entries.last().map(|entry| entry.sequence) {
             self.checkpoint_local_materialization_cursor_if_due(last_sequence)?;
@@ -5898,22 +5475,15 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             }
         }
 
-        let commit_record = DfsVisibleVersionCommitRecord {
-            expected_version: expected_version.clone(),
-            committed_object: normalized_object_metadata(committed_object),
-            visible_version: normalized_version_record(visible_version),
-            required_replica_node_ids: normalized_node_location_list(required_replica_node_ids),
-            created_at: OffsetDateTime::now_utc(),
-        };
-        let entry = self.write_journal_unlocked(DfsMetadataMutation::CommitVisibleVersion {
-            file_system_id: committed_object.file_system_id.clone(),
-            object_id: committed_object.object_id.clone(),
-            previous_version: expected_version.clone(),
-            committed_version: committed_object.version.clone(),
-            committed_object: Some(commit_record.committed_object.clone()),
-            visible_version: Some(commit_record.visible_version.clone()),
-            required_replica_node_ids: commit_record.required_replica_node_ids.clone(),
-        })?;
+        let commit_record = visible_commit_record_from_parts(
+            expected_version,
+            committed_object,
+            visible_version,
+            required_replica_node_ids,
+            OffsetDateTime::now_utc(),
+        );
+        let entry = self
+            .write_journal_unlocked(DfsMetadataMutation::commit_visible_version(&commit_record))?;
         self.materialize_visible_version_commit(&commit_record, entry.sequence)?;
         self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         Ok(entry)
@@ -6201,11 +5771,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         target_node_id: &NodeId,
         shard_id: &DfsMetadataShardId,
     ) -> Result<u64> {
-        Ok(read_sobj_optional::<DfsMetadataReplayCursor>(
-            &self.metadata_replication_cursor_path(target_node_id, shard_id),
-        )?
-        .map(|cursor| cursor.last_sequence)
-        .unwrap_or(0))
+        metadata_cursor::metadata_replication_cursor(&self.root, target_node_id, shard_id)
     }
 
     fn put_metadata_replication_cursor(
@@ -6215,17 +5781,11 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         next_after_sequence: u64,
     ) -> Result<()> {
         let _lock = self.begin_metadata_write()?;
-        let current_sequence = self.metadata_replication_cursor(target_node_id, shard_id)?;
-        let next_after_sequence = next_after_sequence.max(current_sequence);
-        if next_after_sequence == current_sequence {
-            return Ok(());
-        }
-        write_sobj_atomic(
-            &self.metadata_replication_cursor_path(target_node_id, shard_id),
-            &DfsMetadataReplayCursor {
-                shard_id: shard_id.clone(),
-                last_sequence: next_after_sequence,
-            },
+        metadata_cursor::put_metadata_replication_cursor(
+            &self.root,
+            target_node_id,
+            shard_id,
+            next_after_sequence,
         )
     }
 
@@ -6435,15 +5995,8 @@ impl LocalSobjMetadataBackend {
             return Ok(());
         }
 
-        let entry = self.write_journal_unlocked(DfsMetadataMutation::CommitVisibleVersion {
-            file_system_id: commit.committed_object.file_system_id.clone(),
-            object_id: commit.committed_object.object_id.clone(),
-            previous_version: commit.expected_version.clone(),
-            committed_version: commit.committed_object.version.clone(),
-            committed_object: Some(commit.committed_object.clone()),
-            visible_version: Some(commit.visible_version.clone()),
-            required_replica_node_ids: commit.required_replica_node_ids.clone(),
-        })?;
+        let entry =
+            self.write_journal_unlocked(DfsMetadataMutation::commit_visible_version(commit))?;
         self.materialize_visible_version_commit(commit, entry.sequence)?;
         Ok(())
     }
