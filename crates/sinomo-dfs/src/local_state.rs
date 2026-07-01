@@ -32,6 +32,34 @@ pub fn default_dfs_metadata_shards_root(data_dir: &SinomoDataDir) -> PathBuf {
     data_dir.dfs_dir().join("metadata")
 }
 
+pub(crate) fn dfs_path_safe_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub fn local_dfs_metadata_shard_path(
+    data_dir: &SinomoDataDir,
+    shard_id: &DfsMetadataShardId,
+) -> PathBuf {
+    default_dfs_metadata_shards_root(data_dir).join(dfs_path_safe_segment(&shard_id.0))
+}
+
+pub fn open_local_metadata_shard_backend(
+    data_dir: &SinomoDataDir,
+    shard_id: DfsMetadataShardId,
+) -> Result<LocalSobjMetadataBackend, DfsError> {
+    let path = local_dfs_metadata_shard_path(data_dir, &shard_id);
+    Ok(LocalSobjMetadataBackend::new(shard_id, path)?)
+}
+
 pub const DFS_IMPORTS_NAMESPACE_ROOT: &str = "/sinomo/imports";
 
 pub fn dfs_import_namespace_root(source_cluster_id: impl std::fmt::Display) -> String {
