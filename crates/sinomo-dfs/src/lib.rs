@@ -56,6 +56,9 @@ mod mounted_sifs;
 mod namespace;
 mod operator;
 mod posix;
+mod posix_model;
+mod posix_object;
+mod posix_path;
 mod protocol;
 mod repair;
 mod routes;
@@ -346,7 +349,7 @@ pub use operator::{
     DfsOperatorUseConflictVersionReport, DfsPinAddRequest, DfsPinMode, DfsPinRecord,
     DfsPinStoreError, LocalDfsPinStore, resolve_dfs_conflicts, use_dfs_conflict_version,
 };
-pub use posix::{
+pub use posix_model::{
     DfsDirEntry, DfsDirEntryPage, DfsNamespaceJobFailure, DfsNamespaceJobMaintenanceReport,
     DfsPosixError, DfsPosixFileRangeReadStream, DfsPosixFileReadStream, DfsStat, DfsWriteOptions,
 };

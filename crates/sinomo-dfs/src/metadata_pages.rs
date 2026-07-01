@@ -13,9 +13,8 @@ use crate::metadata_keys::{
     conflict_page_cursor, conflict_scan_cursor, directory_inode_id,
     directory_page_cursor_with_dentry, directory_page_key, id_lower_bound, normalize_path,
     normalize_posix_path, object_page_cursor, object_page_key, object_version_page_cursor,
-    object_version_scan_cursor, posix_path_is_at_or_under_prefix, replica_receipt_page_cursor,
-    replica_receipt_scan_cursor, write_intent_page_cursor, write_intent_scan_cursor,
-    write_intent_scan_cursor_key,
+    object_version_scan_cursor, replica_receipt_page_cursor, replica_receipt_scan_cursor,
+    write_intent_page_cursor, write_intent_scan_cursor, write_intent_scan_cursor_key,
 };
 use crate::metadata_records::{
     DfsConflictPage, DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor,
@@ -27,6 +26,7 @@ use crate::metadata_records::{
     DfsWriteIntentScanCursor, DfsWriteIntentScanPage,
 };
 use crate::metadata_tables::DfsMetadataTables;
+use crate::posix_path::posix_path_is_at_or_under_prefix;
 use crate::{DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion};
 
 #[derive(Clone, Debug)]

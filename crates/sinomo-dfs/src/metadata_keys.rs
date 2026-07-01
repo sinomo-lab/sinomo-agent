@@ -386,16 +386,6 @@ pub(crate) fn normalize_posix_path(path: &str) -> String {
     }
 }
 
-pub(crate) fn posix_path_is_at_or_under_prefix(path: &str, prefix: &str) -> bool {
-    let path = normalize_posix_path(path);
-    let prefix = normalize_posix_path(prefix);
-    prefix == "/"
-        || path == prefix
-        || path
-            .strip_prefix(&prefix)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
 pub(crate) fn path_hash(path: &str) -> String {
     blake3::hash(normalize_path(path).as_bytes())
         .to_hex()

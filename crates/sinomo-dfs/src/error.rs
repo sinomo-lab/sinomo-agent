@@ -79,10 +79,10 @@ pub(crate) fn distributed_write_rejection_current_primary(error: &DfsError) -> O
 }
 
 pub(crate) fn namespace_rejection_current_primary(
-    error: &crate::posix::DfsPosixError,
+    error: &crate::posix_model::DfsPosixError,
 ) -> Option<NodeId> {
     match error {
-        crate::posix::DfsPosixError::Dfs(error) => dfs_error_current_primary(error),
+        crate::posix_model::DfsPosixError::Dfs(error) => dfs_error_current_primary(error),
         _ => None,
     }
 }

@@ -528,6 +528,6 @@ pub(crate) fn path_index_key(
     file_system_id: &DfsFileSystemId,
     path: &str,
 ) -> Option<(DfsFileSystemId, String)> {
-    crate::posix::normalized_posix_path_key(path)
+    crate::posix_path::normalized_posix_path_key(path)
         .map(|normalized| (file_system_id.clone(), normalized))
 }

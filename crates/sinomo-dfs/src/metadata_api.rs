@@ -11,9 +11,7 @@ use crate::intent::write_intent_status_is_active;
 use crate::metadata_error::Result;
 use crate::metadata_hardlink::{object_is_hardlink_to_target, sort_hardlinks_by_path};
 use crate::metadata_journal::bounded_metadata_journal_batch;
-use crate::metadata_keys::{
-    normalize_posix_path, posix_path_is_at_or_under_prefix, write_intent_page_cursor,
-};
+use crate::metadata_keys::{normalize_posix_path, write_intent_page_cursor};
 use crate::metadata_limits::OBJECT_LOCAL_METADATA_PAGE_SIZE;
 use crate::metadata_pages::{
     collect_filtered_cursor_page, collect_filtered_metadata_pages, collect_metadata_pages,
@@ -21,6 +19,7 @@ use crate::metadata_pages::{
 };
 use crate::metadata_records::*;
 use crate::metadata_summary::count_pending_repairs_for_object;
+use crate::posix_path::posix_path_is_at_or_under_prefix;
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
 };

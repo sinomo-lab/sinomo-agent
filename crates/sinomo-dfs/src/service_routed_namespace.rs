@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use sinomo_node::NodeId;
 
 use crate::*;
+use crate::{posix_model, posix_path};
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn synced_namespace_object_for_operation(
@@ -24,7 +25,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn synced_mkdir_all_paths(path: &str) -> Vec<String> {
-        let Some(normalized) = posix::normalized_posix_path_key(path) else {
+        let Some(normalized) = posix_path::normalized_posix_path_key(path) else {
             return Vec::new();
         };
         if normalized == "/" {
@@ -48,13 +49,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let paths: Vec<String> = match operation {
             DfsNamespaceOperation::SyncPath { path }
             | DfsNamespaceOperation::LookupPath { path }
-            | DfsNamespaceOperation::Mkdir { path } => {
-                posix::normalized_posix_path_key(path).into_iter().collect()
-            }
+            | DfsNamespaceOperation::Mkdir { path } => posix_path::normalized_posix_path_key(path)
+                .into_iter()
+                .collect(),
             DfsNamespaceOperation::MkdirAll { path } => Self::synced_mkdir_all_paths(path),
             DfsNamespaceOperation::LookupPaths { paths } => paths
                 .iter()
-                .filter_map(|path| posix::normalized_posix_path_key(path))
+                .filter_map(|path| posix_path::normalized_posix_path_key(path))
                 .collect(),
             _ => return Ok(Vec::new()),
         };
@@ -72,7 +73,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) -> Result<Option<DfsObjectMetadata>, DfsError> {
-        let normalized_path = match posix::normalized_posix_path_key(path) {
+        let normalized_path = match posix_path::normalized_posix_path_key(path) {
             Some(path) => path,
             None => return Ok(None),
         };
@@ -204,7 +205,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         }
                         (Some(shard), _) => {
                             authority_redirect = Some(shard.primary_node_id.clone());
-                            Err(crate::posix::DfsPosixError::Dfs(DfsError::Distributed {
+                            Err(posix_model::DfsPosixError::Dfs(DfsError::Distributed {
                                 message: format!(
                                     "node {} is not the metadata primary for shard {} (primary {}, epoch {})",
                                     self.node_id,
@@ -221,7 +222,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         Err(error) => DfsNamespaceResult::Rejected {
                             current_primary_node_id: authority_redirect
                                 .or_else(|| namespace_rejection_current_primary(&error)),
-                            posix_error: crate::posix::namespace_posix_error_for(&error),
+                            posix_error: posix_model::namespace_posix_error_for(&error),
                             reason: error.to_string(),
                         },
                     }

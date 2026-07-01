@@ -20,9 +20,9 @@ use crate::metadata_keys::{
     local_directory_page_cursor, local_object_page_cursor, local_object_version_page_cursor,
     local_replica_receipt_page_cursor, local_write_intent_page_cursor, normalize_path,
     normalize_posix_path, object_page_cursor_with_shard, object_page_key,
-    object_version_scan_cursor, object_version_scan_key, posix_path_is_at_or_under_prefix,
-    replica_receipt_scan_cursor, replica_receipt_scan_key, write_intent_page_cursor,
-    write_intent_page_cursor_with_shard, write_intent_scan_cursor, write_intent_scan_order,
+    object_version_scan_cursor, object_version_scan_key, replica_receipt_scan_cursor,
+    replica_receipt_scan_key, write_intent_page_cursor, write_intent_page_cursor_with_shard,
+    write_intent_scan_cursor, write_intent_scan_order,
 };
 use crate::metadata_limits::{OBJECT_LOCAL_METADATA_PAGE_SIZE, SHARD_MIGRATION_PAGE_SIZE};
 use crate::metadata_pages::{
@@ -51,6 +51,7 @@ use crate::metadata_summary::{
     metadata_summary_from_tables,
 };
 use crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION;
+use crate::posix_path::posix_path_is_at_or_under_prefix;
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
 };

@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use sinomo_node::NodeId;
 
 use crate::*;
+use crate::{posix_model, posix_path};
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Adoption operations install records minted by another shard authority;
@@ -31,7 +32,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self.control_plane.is_none() {
             return Ok(None);
         }
-        let Some(normalized) = crate::posix::normalized_posix_path_key(source_path) else {
+        let Some(normalized) = posix_path::normalized_posix_path_key(source_path) else {
             return Ok(Some(format!(
                 "adoption carries an invalid source path: {source_path}"
             )));
@@ -102,12 +103,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut candidate_paths = BTreeSet::new();
         for object in &transaction.objects {
             let normalized =
-                crate::posix::normalized_posix_path_key(&object.path).ok_or_else(|| {
+                posix_path::normalized_posix_path_key(&object.path).ok_or_else(|| {
                     DfsError::Distributed {
                         message: format!("invalid namespace transaction path: {}", object.path),
                     }
                 })?;
-            if let Some(parent) = crate::posix::parent_posix_path(&normalized) {
+            if let Some(parent) = posix_path::parent_posix_path(&normalized) {
                 candidate_paths.insert(parent);
             }
             candidate_paths.insert(normalized);
@@ -145,11 +146,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(Vec::new());
         }
         let normalized =
-            crate::posix::normalized_posix_path_key(path).ok_or_else(|| DfsError::Distributed {
+            posix_path::normalized_posix_path_key(path).ok_or_else(|| DfsError::Distributed {
                 message: format!("invalid namespace operation path: {path}"),
             })?;
         let mut candidates = vec![normalized.clone()];
-        if let Some(parent) = crate::posix::parent_posix_path(&normalized) {
+        if let Some(parent) = posix_path::parent_posix_path(&normalized) {
             candidates.push(parent);
         }
         let mut shards: Vec<DfsMetadataShardConfig> = Vec::new();
@@ -185,9 +186,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         from: &str,
         to: &str,
-    ) -> crate::posix::Result<()> {
+    ) -> posix_model::Result<()> {
         if self.routed_namespace_settle_depth >= DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH {
-            return Err(crate::posix::DfsPosixError::Dfs(DfsError::Busy {
+            return Err(posix_model::DfsPosixError::Dfs(DfsError::Busy {
                 path: from.to_string(),
             }));
         }
@@ -215,9 +216,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         existing_path: &str,
         link_path: &str,
-    ) -> crate::posix::Result<()> {
+    ) -> posix_model::Result<()> {
         if self.routed_namespace_settle_depth >= DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH {
-            return Err(crate::posix::DfsPosixError::Dfs(DfsError::Busy {
+            return Err(posix_model::DfsPosixError::Dfs(DfsError::Busy {
                 path: existing_path.to_string(),
             }));
         }
@@ -247,20 +248,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         source_path: &str,
         destination_path: &str,
-    ) -> crate::posix::Result<Option<NodeId>> {
+    ) -> posix_model::Result<Option<NodeId>> {
         let source_shards = self.namespace_shards_for_path(file_system_id, source_path)?;
         if let Some(shard) = source_shards
             .iter()
             .find(|shard| shard.primary_node_id != self.node_id)
         {
-            return Err(crate::posix::DfsPosixError::Dfs(
-                DfsError::StaleOwnerEpoch {
-                    file_system_id: file_system_id.clone(),
-                    local_node_id: self.node_id.clone(),
-                    primary_node_id: shard.primary_node_id.clone(),
-                    epoch: shard.epoch,
-                },
-            ));
+            return Err(posix_model::DfsPosixError::Dfs(DfsError::StaleOwnerEpoch {
+                file_system_id: file_system_id.clone(),
+                local_node_id: self.node_id.clone(),
+                primary_node_id: shard.primary_node_id.clone(),
+                epoch: shard.epoch,
+            }));
         }
         let destination_shards =
             self.namespace_shards_for_path(file_system_id, destination_path)?;
@@ -271,7 +270,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             match &foreign_primary {
                 Some(existing) if existing != &shard.primary_node_id => {
-                    return Err(crate::posix::DfsPosixError::InvalidPath {
+                    return Err(posix_model::DfsPosixError::InvalidPath {
                         path: format!(
                             "{destination_path} spans metadata shards with different primaries"
                         ),
@@ -292,7 +291,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) {
-        let Some(normalized) = crate::posix::normalized_posix_path_key(path) else {
+        let Some(normalized) = posix_path::normalized_posix_path_key(path) else {
             return;
         };
         self.cross_shard_namespace_locks
@@ -304,7 +303,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) {
-        let Some(normalized) = crate::posix::normalized_posix_path_key(path) else {
+        let Some(normalized) = posix_path::normalized_posix_path_key(path) else {
             return;
         };
         self.cross_shard_namespace_locks
@@ -319,7 +318,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self.cross_shard_namespace_locks.is_empty() {
             return Ok(());
         }
-        let Some(normalized) = crate::posix::normalized_posix_path_key(path) else {
+        let Some(normalized) = posix_path::normalized_posix_path_key(path) else {
             return Ok(());
         };
         let blocked =
@@ -327,13 +326,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .iter()
                 .any(|(locked_file_system_id, locked_path)| {
                     locked_file_system_id == file_system_id
-                        && (crate::posix::posix_path_is_at_or_under_prefix(
-                            &normalized,
-                            locked_path,
-                        ) || crate::posix::posix_path_is_at_or_under_prefix(
-                            locked_path,
-                            &normalized,
-                        ))
+                        && (posix_path::posix_path_is_at_or_under_prefix(&normalized, locked_path)
+                            || posix_path::posix_path_is_at_or_under_prefix(
+                                locked_path,
+                                &normalized,
+                            ))
                 });
         if blocked {
             return Err(DfsError::Busy {

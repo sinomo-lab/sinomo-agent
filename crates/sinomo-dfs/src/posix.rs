@@ -6,23 +6,39 @@
 //! behavior over SIFS while the lower DFS layers handle placement, receipts,
 //! repair, and metadata journaling.
 
+use crate::dfs_now_unix_nanos as now_unix_nanos;
 use crate::metadata_pages::{try_walk_metadata_pages, walk_metadata_pages};
 use crate::metadata_shard_migration::collect_object_metadata_family;
 use crate::namespace::{
     initial_version, metadata_path, namespace_transaction_id_for_path, next_version,
     object_id_for_path,
 };
+use crate::posix_model::{
+    DfsDirEntry, DfsDirEntryPage, DfsNamespaceJobFailure, DfsNamespaceJobMaintenanceReport,
+    DfsPosixError, DfsPosixFileRangeReadStream, DfsPosixFileReadStream, DfsStat, DfsWriteOptions,
+    Result, posix_error_for_namespace_rejection, read_conflict_error,
+};
+use crate::posix_object::{
+    new_posix_metadata_object, object_mode_or_default, object_timestamp_or_default,
+    recreated_posix_metadata_object, set_object_create_timestamps,
+};
+use crate::posix_path::{
+    append_posix_components, hidden_alias_tombstone_path, join_posix_path, normalize_posix_path,
+    normalize_posix_path_with_trailing_directory, normalized_posix_path_key, parent_posix_path,
+    posix_path_is_at_or_under_prefix, resolve_posix_symlink_target, subtree_prefix,
+    validate_posix_symlink_target,
+};
 use crate::{
     DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest, DfsControlPlaneStore,
     DfsDirectoryPage, DfsDirectoryPageCursor, DfsError, DfsFileSystem, DfsMessageTransport,
     DfsMetadataShardConfig, DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobRecord,
-    DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNamespacePosixError, DfsNamespaceResult,
-    DfsNamespaceTransaction, DfsNetworkMessage, DfsObjectKind, DfsObjectMetadata,
-    DfsObjectVersionRecord, DfsReadData, DfsReadRangeData, DfsReadResult, DfsReplicaReceiptRecord,
-    DfsReplicationPolicy, DfsWriteIntentState, DfsWriteIntentStatus, NetworkedDfsRangeReadOutcome,
+    DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNamespaceResult, DfsNamespaceTransaction,
+    DfsNetworkMessage, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord, DfsReadData,
+    DfsReadRangeData, DfsReadResult, DfsReplicaReceiptRecord, DfsReplicationPolicy,
+    DfsWriteIntentState, DfsWriteIntentStatus, NetworkedDfsRangeReadOutcome,
     NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
     NetworkedDfsReadStreamOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
-    NetworkedDfsWriteOutcome, ObjectVersionReader, object_version_record, sifs_file_system_id,
+    NetworkedDfsWriteOutcome, object_version_record, sifs_file_system_id,
 };
 use crate::{DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsVersion};
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
@@ -31,7 +47,6 @@ use sinomo_node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::time::{Duration, Instant};
-use thiserror::Error;
 
 const POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT: usize = 8;
 const POSIX_WAIT_FOR_COMMIT_IDLE_SLEEP: Duration = Duration::from_millis(10);
@@ -80,122 +95,6 @@ enum PosixBulkReadPlan {
     Fallback,
 }
 
-#[derive(Debug, Error)]
-pub enum DfsPosixError {
-    #[error("DFS error: {0}")]
-    Dfs(#[from] DfsError),
-    #[error("metadata backend error: {0}")]
-    Metadata(#[from] crate::MetadataBackendError),
-    #[error("not found: {path}")]
-    NotFound { path: String },
-    #[error("already exists: {path}")]
-    AlreadyExists { path: String },
-    #[error("not a directory: {path}")]
-    NotDirectory { path: String },
-    #[error("is a directory: {path}")]
-    IsDirectory { path: String },
-    #[error("not a symbolic link: {path}")]
-    NotSymlink { path: String },
-    #[error("parent directory does not exist: {path}")]
-    MissingParent { path: String },
-    #[error("invalid DFS path: {path}")]
-    InvalidPath { path: String },
-    #[error(
-        "write did not commit yet: {intent_id} ({durable_receipts}/{required_receipts} receipts)"
-    )]
-    PendingWrite {
-        intent_id: String,
-        durable_receipts: usize,
-        required_receipts: usize,
-    },
-    #[error("write conflicted at {path}: {reason}")]
-    Conflict { path: String, reason: String },
-    #[error("directory is not empty: {path}")]
-    DirectoryNotEmpty { path: String },
-}
-
-pub type Result<T> = std::result::Result<T, DfsPosixError>;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DfsStat {
-    pub file_system_id: DfsFileSystemId,
-    pub object_id: DfsObjectId,
-    pub path: String,
-    pub kind: DfsObjectKind,
-    pub version: DfsVersion,
-    pub content_hash: Option<String>,
-    pub size_bytes: Option<u64>,
-    pub link_count: u64,
-    pub mode: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub accessed_at_unix_nanos: u64,
-    pub modified_at_unix_nanos: u64,
-    pub created_at_unix_nanos: u64,
-    pub changed_at_unix_nanos: u64,
-    pub policy: DfsObjectPolicy,
-    pub current_locations: Vec<NodeId>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DfsDirEntry {
-    pub name: String,
-    pub path: String,
-    pub kind: DfsObjectKind,
-    pub object_id: DfsObjectId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DfsDirEntryPage {
-    pub entries: Vec<DfsDirEntry>,
-    pub next_cursor: Option<DfsDirectoryPageCursor>,
-}
-
-#[derive(Debug)]
-pub struct DfsPosixFileReadStream {
-    pub object_id: DfsObjectId,
-    pub version: DfsVersion,
-    pub content_hash: Option<String>,
-    pub size_bytes: u64,
-    pub reader: ObjectVersionReader,
-}
-
-#[derive(Debug)]
-pub struct DfsPosixFileRangeReadStream {
-    pub object_id: DfsObjectId,
-    pub version: DfsVersion,
-    pub content_hash: Option<String>,
-    pub offset: u64,
-    pub total_size_bytes: u64,
-    pub range_size_bytes: u64,
-    pub reader: ObjectVersionReader,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DfsWriteOptions {
-    pub policy: DfsReplicationPolicy,
-    pub replica_candidates: Vec<NodeId>,
-    pub wait_for_commit: bool,
-    pub foreground_replica_repair: bool,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DfsNamespaceJobMaintenanceReport {
-    pub scanned_job_count: usize,
-    pub resumed_job_count: usize,
-    pub completed_job_count: usize,
-    pub failed_job_count: usize,
-    pub remaining_running_job_count: usize,
-    pub failures: Vec<DfsNamespaceJobFailure>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DfsNamespaceJobFailure {
-    pub job_id: String,
-    pub kind: DfsNamespaceJobKind,
-    pub reason: String,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RoutedNamespaceNetworkRecovery {
     Completed,
@@ -226,18 +125,6 @@ fn namespace_job_kind_is_cross_shard(kind: &DfsNamespaceJobKind) -> bool {
             | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
             | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
     )
-}
-
-impl DfsWriteOptions {
-    pub fn replicated_eventual(replica_candidates: Vec<NodeId>) -> Self {
-        let desired = replica_candidates.len().max(1).min(2);
-        Self {
-            policy: DfsReplicationPolicy::new(1, desired).expect("valid default policy"),
-            replica_candidates,
-            wait_for_commit: true,
-            foreground_replica_repair: true,
-        }
-    }
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -1902,7 +1789,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return self.stat_object(&object);
         }
         self.ensure_parent_directory(&path)?;
-        let object = self.metadata_object_for_new_path(&path, DfsObjectKind::Directory);
+        let object = new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::Directory);
         self.add_object_metadata(object.clone())?;
         self.touch_parent_directory_modified(&path)?;
         self.stat_object(&object)
@@ -2055,14 +1942,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 Some(object) if object.kind == DfsObjectKind::Tombstone => {
                     let object =
-                        self.metadata_object_for_recreated_path(&path, DfsObjectKind::File);
+                        recreated_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
                     link_count_hint = Some(1);
                     object
                 }
                 Some(object) => object,
                 None => {
                     link_count_hint = Some(1);
-                    self.metadata_object_for_new_path(&path, DfsObjectKind::File)
+                    new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File)
                 }
             };
             if !seen_objects.insert(object.object_id.clone()) {
@@ -2148,7 +2035,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if !existing_children.insert(child_name.to_string()) {
                 return Err(DfsPosixError::AlreadyExists { path });
             }
-            let object = self.metadata_object_for_new_path(&path, DfsObjectKind::File);
+            let object = new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
             if !seen_objects.insert(object.object_id.clone()) {
                 return Err(DfsPosixError::AlreadyExists { path });
             }
@@ -2197,7 +2084,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .content
             .put_object_version_blobs_only(content_versions)
             .map_err(DfsError::from)?;
-        let write_time = crate::dfs_now_unix_nanos();
+        let write_time = now_unix_nanos();
         let mut committed_objects = Vec::with_capacity(prepared.len());
         for (write, manifest) in prepared.iter().zip(manifests.iter()) {
             let mut object = write.object.clone();
@@ -2377,14 +2264,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.resolve_hardlink_target(&object)?
             }
             Some(object) if object.kind == DfsObjectKind::Tombstone => {
-                let object = self.metadata_object_for_recreated_path(&path, DfsObjectKind::File);
+                let object =
+                    recreated_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
                 self.add_transient_object_metadata(object.clone())?;
                 transient_create = true;
                 object
             }
             Some(object) => object,
             None => {
-                let object = self.metadata_object_for_new_path(&path, DfsObjectKind::File);
+                let object = new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
                 self.add_transient_object_metadata(object.clone())?;
                 transient_create = true;
                 object
@@ -2490,7 +2378,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     })
                     .collect();
                 committed_object.content_size_bytes = Some(manifest.size_bytes);
-                let now = crate::dfs_now_unix_nanos();
+                let now = now_unix_nanos();
                 committed_object.modified_at_unix_nanos = now;
                 committed_object.changed_at_unix_nanos = now;
                 committed_object.last_modified_by_event_id = Some(EventId::generate());
@@ -2533,7 +2421,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 pending_object.content_hash = Some(manifest.content_hash);
                 pending_object.current_locations = vec![self.node_id.clone()];
                 pending_object.content_size_bytes = Some(manifest.size_bytes);
-                let now = crate::dfs_now_unix_nanos();
+                let now = now_unix_nanos();
                 pending_object.modified_at_unix_nanos = now;
                 pending_object.changed_at_unix_nanos = now;
                 pending_object.last_modified_by_event_id = Some(EventId::generate());
@@ -2638,14 +2526,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.resolve_hardlink_target(&object)?
             }
             Some(object) if object.kind == DfsObjectKind::Tombstone => {
-                let object = self.metadata_object_for_recreated_path(&path, DfsObjectKind::File);
+                let object =
+                    recreated_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
                 self.add_transient_object_metadata(object.clone())?;
                 transient_create = true;
                 object
             }
             Some(object) => object,
             None => {
-                let object = self.metadata_object_for_new_path(&path, DfsObjectKind::File);
+                let object = new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
                 self.add_transient_object_metadata(object.clone())?;
                 transient_create = true;
                 object
@@ -2710,7 +2599,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .collect();
                 committed_object.content_size_bytes =
                     self.object_content_size_hint(&committed_object)?;
-                let now = crate::dfs_now_unix_nanos();
+                let now = now_unix_nanos();
                 committed_object.modified_at_unix_nanos = now;
                 committed_object.changed_at_unix_nanos = now;
                 committed_object.last_modified_by_event_id = Some(EventId::generate());
@@ -3976,13 +3865,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(DfsPosixError::AlreadyExists { path: link_path });
             }
             Some(_) => {
-                let object =
-                    self.metadata_object_for_recreated_path(&link_path, DfsObjectKind::Symlink);
+                let object = recreated_posix_metadata_object(
+                    &self.node_id,
+                    &link_path,
+                    DfsObjectKind::Symlink,
+                );
                 self.add_transient_object_metadata(object.clone())?;
                 object
             }
             None => {
-                let object = self.metadata_object_for_new_path(&link_path, DfsObjectKind::Symlink);
+                let object =
+                    new_posix_metadata_object(&self.node_id, &link_path, DfsObjectKind::Symlink);
                 self.add_transient_object_metadata(object.clone())?;
                 object
             }
@@ -6452,42 +6345,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    fn metadata_object_for_new_path(&self, path: &str, kind: DfsObjectKind) -> DfsObjectMetadata {
-        let mode = default_mode_for_kind(&kind);
-        DfsObjectMetadata {
-            object_id: object_id_for_path(path),
-            file_system_id: sifs_file_system_id(),
-            path: path.to_string(),
-            kind,
-            owner_node_id: self.node_id.clone(),
-            current_locations: vec![self.node_id.clone()],
-            content_hash: None,
-            content_size_bytes: None,
-            link_target_object_id: None,
-            mode,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: now_unix_nanos(),
-            modified_at_unix_nanos: now_unix_nanos(),
-            created_at_unix_nanos: now_unix_nanos(),
-            changed_at_unix_nanos: now_unix_nanos(),
-            version: initial_version(),
-            policy: DfsObjectPolicy::ReplicatedEventual,
-            created_by_event_id: None,
-            last_modified_by_event_id: None,
-        }
-    }
-
-    fn metadata_object_for_recreated_path(
-        &self,
-        path: &str,
-        kind: DfsObjectKind,
-    ) -> DfsObjectMetadata {
-        let mut object = self.metadata_object_for_new_path(path, kind);
-        object.object_id = DfsObjectId::generate();
-        object
-    }
-
     fn stat_object(&self, object: &DfsObjectMetadata) -> Result<DfsStat> {
         self.stat_object_for_path(object, &object.path)
     }
@@ -6638,203 +6495,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 }
 
-fn object_timestamp_or_default(value: u64) -> u64 {
-    if value == 0 { 1_000_000_000 } else { value }
-}
-
-fn object_mode_or_default(object: &DfsObjectMetadata) -> u32 {
-    object.mode & 0o7777
-}
-
-fn default_mode_for_kind(kind: &DfsObjectKind) -> u32 {
-    match kind {
-        DfsObjectKind::Directory => 0o755,
-        DfsObjectKind::Symlink => 0o777,
-        DfsObjectKind::Tombstone => 0,
-        _ => 0o644,
-    }
-}
-
-/// Wire form of a namespace `DfsPosixError` so routed operations surface the
-/// same errno semantics as local ones. Transport/internal errors map to
-/// `None` and travel as plain rejection reasons.
-pub(crate) fn namespace_posix_error_for(error: &DfsPosixError) -> Option<DfsNamespacePosixError> {
-    match error {
-        DfsPosixError::NotFound { path } => {
-            Some(DfsNamespacePosixError::NotFound { path: path.clone() })
-        }
-        DfsPosixError::AlreadyExists { path } => {
-            Some(DfsNamespacePosixError::AlreadyExists { path: path.clone() })
-        }
-        DfsPosixError::NotDirectory { path } => {
-            Some(DfsNamespacePosixError::NotDirectory { path: path.clone() })
-        }
-        DfsPosixError::IsDirectory { path } => {
-            Some(DfsNamespacePosixError::IsDirectory { path: path.clone() })
-        }
-        DfsPosixError::NotSymlink { path } => {
-            Some(DfsNamespacePosixError::NotSymlink { path: path.clone() })
-        }
-        DfsPosixError::MissingParent { path } => {
-            Some(DfsNamespacePosixError::MissingParent { path: path.clone() })
-        }
-        DfsPosixError::InvalidPath { path } => {
-            Some(DfsNamespacePosixError::InvalidPath { path: path.clone() })
-        }
-        DfsPosixError::DirectoryNotEmpty { path } => {
-            Some(DfsNamespacePosixError::DirectoryNotEmpty { path: path.clone() })
-        }
-        DfsPosixError::Conflict { path, reason } => Some(DfsNamespacePosixError::Conflict {
-            path: path.clone(),
-            reason: reason.clone(),
-        }),
-        DfsPosixError::Dfs(DfsError::Busy { path }) => {
-            Some(DfsNamespacePosixError::Busy { path: path.clone() })
-        }
-        DfsPosixError::Dfs(_) | DfsPosixError::Metadata(_) | DfsPosixError::PendingWrite { .. } => {
-            None
-        }
-    }
-}
-
-fn posix_error_for_namespace_rejection(
-    reason: String,
-    posix_error: Option<DfsNamespacePosixError>,
-) -> DfsPosixError {
-    match posix_error {
-        Some(DfsNamespacePosixError::NotFound { path }) => DfsPosixError::NotFound { path },
-        Some(DfsNamespacePosixError::AlreadyExists { path }) => {
-            DfsPosixError::AlreadyExists { path }
-        }
-        Some(DfsNamespacePosixError::NotDirectory { path }) => DfsPosixError::NotDirectory { path },
-        Some(DfsNamespacePosixError::IsDirectory { path }) => DfsPosixError::IsDirectory { path },
-        Some(DfsNamespacePosixError::NotSymlink { path }) => DfsPosixError::NotSymlink { path },
-        Some(DfsNamespacePosixError::MissingParent { path }) => {
-            DfsPosixError::MissingParent { path }
-        }
-        Some(DfsNamespacePosixError::InvalidPath { path }) => DfsPosixError::InvalidPath { path },
-        Some(DfsNamespacePosixError::DirectoryNotEmpty { path }) => {
-            DfsPosixError::DirectoryNotEmpty { path }
-        }
-        Some(DfsNamespacePosixError::Conflict { path, reason }) => {
-            DfsPosixError::Conflict { path, reason }
-        }
-        Some(DfsNamespacePosixError::Busy { path }) => DfsPosixError::Dfs(DfsError::Busy { path }),
-        None => DfsPosixError::Dfs(DfsError::Distributed { message: reason }),
-    }
-}
-
-fn read_conflict_error(path: String, conflicts: Vec<crate::DfsConflictReadView>) -> DfsPosixError {
-    let reason = conflicts
-        .into_iter()
-        .map(|conflict| conflict.reason)
-        .next()
-        .unwrap_or_else(|| "object has an open DFS conflict".to_string());
-    DfsPosixError::Conflict { path, reason }
-}
-
-pub(crate) fn parent_posix_path(path: &str) -> Option<String> {
-    if path == "/" {
-        return None;
-    }
-    let (parent, _) = path.rsplit_once('/')?;
-    Some(if parent.is_empty() {
-        "/".to_string()
-    } else {
-        parent.to_string()
-    })
-}
-
-fn join_posix_path(parent: &str, child: &str) -> String {
-    if parent == "/" {
-        format!("/{child}")
-    } else {
-        format!("{}/{}", parent.trim_end_matches('/'), child)
-    }
-}
-
-fn append_posix_components(path: String, components: &[String]) -> Result<String> {
-    let mut current = path;
-    for component in components {
-        current = join_posix_path(&current, component);
-    }
-    normalize_posix_path(&current)
-}
-
-fn resolve_posix_symlink_target(link_path: &str, target: &str) -> Result<String> {
-    validate_posix_symlink_target(target)?;
-    if target.starts_with('/') {
-        return normalize_posix_path(target);
-    }
-    let parent = parent_posix_path(link_path).unwrap_or_else(|| "/".to_string());
-    normalize_posix_path(&join_posix_path(&parent, target))
-}
-
-fn set_object_create_timestamps(object: &mut DfsObjectMetadata) {
-    let now = now_unix_nanos();
-    object.accessed_at_unix_nanos = now;
-    object.modified_at_unix_nanos = now;
-    object.created_at_unix_nanos = now;
-    object.changed_at_unix_nanos = now;
-}
-
-fn now_unix_nanos() -> u64 {
-    time::OffsetDateTime::now_utc()
-        .unix_timestamp_nanos()
-        .try_into()
-        .unwrap_or(1_000_000_000)
-}
-
-/// Returns the canonical POSIX path key used to index objects by path, or
-/// `None` when the path cannot be normalized. This must match the normalization
-/// applied when looking objects up by path so the index and lookups agree.
-pub(crate) fn normalized_posix_path_key(path: &str) -> Option<String> {
-    normalize_posix_path(path).ok()
-}
-
-fn normalize_posix_path(path: &str) -> Result<String> {
-    if !path.starts_with('/') {
-        return Err(DfsPosixError::InvalidPath {
-            path: path.to_string(),
-        });
-    }
-    if path.bytes().any(|byte| byte == 0) {
-        return Err(DfsPosixError::InvalidPath {
-            path: path.to_string(),
-        });
-    }
-    let mut parts = Vec::new();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            value => parts.push(value),
-        }
-    }
-    if parts.is_empty() {
-        Ok("/".to_string())
-    } else {
-        Ok(format!("/{}", parts.join("/")))
-    }
-}
-
-fn normalize_posix_path_with_trailing_directory(path: &str) -> Result<(String, bool)> {
-    let normalized = normalize_posix_path(path)?;
-    let requires_directory = normalized != "/" && path.ends_with('/');
-    Ok((normalized, requires_directory))
-}
-
-fn validate_posix_symlink_target(target: &str) -> Result<()> {
-    if target.is_empty() || target.bytes().any(|byte| byte == 0) {
-        return Err(DfsPosixError::InvalidPath {
-            path: target.to_string(),
-        });
-    }
-    Ok(())
-}
-
 fn namespace_job_id(
     kind: &str,
     file_system_id: &DfsFileSystemId,
@@ -6873,26 +6533,6 @@ fn namespace_operation_routing_path(operation: &DfsNamespaceOperation) -> Option
         DfsNamespaceOperation::AdoptObjectAtPath { object, .. } => Some(object.path.as_str()),
         DfsNamespaceOperation::AdoptHardlinkAlias { alias, .. } => Some(alias.path.as_str()),
     }
-}
-
-fn subtree_prefix(path: &str) -> String {
-    if path == "/" {
-        "/".to_string()
-    } else {
-        format!("{}/", path.trim_end_matches('/'))
-    }
-}
-
-pub(crate) fn posix_path_is_at_or_under_prefix(path: &str, prefix: &str) -> bool {
-    prefix == "/"
-        || path == prefix
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
-fn hidden_alias_tombstone_path(object_id: &DfsObjectId) -> String {
-    format!("/.sinomo/deleted-hardlinks/{object_id}")
 }
 
 #[allow(dead_code)]
