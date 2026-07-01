@@ -6264,7 +6264,7 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 .with_child(source),
             FlexItem::fixed(108.0),
         )
-        .with_item(breadcrumb, FlexItem::fill())
+        .with_item(breadcrumb, FlexItem::fill().min_width(160.0))
         .with_item(
             toolbar_tooltip(
                 format!("Refresh {}", shared.files().source.label()),
@@ -6313,11 +6313,7 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     Stack::vertical()
         .alignment(Alignment::Stretch)
         .with_child(SizedBox::new().height(HEADER_PAD_Y))
-        .with_child(
-            SizedBox::new()
-                .height(HEADER_CONTROL_H)
-                .with_child(toolbar_row),
-        )
+        .with_child(toolbar_row)
         .with_child(SizedBox::new().height(HEADER_PAD_Y))
 }
 
