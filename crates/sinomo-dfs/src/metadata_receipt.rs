@@ -2,7 +2,8 @@
 
 use sinomo_node::NodeId;
 
-use crate::metadata_backend::{DfsMetadataBackend, Result};
+use crate::metadata_api::DfsMetadataBackend;
+use crate::metadata_error::Result;
 use crate::metadata_records::DfsReplicaReceiptRecord;
 use crate::{DfsObjectId, DfsVersion};
 

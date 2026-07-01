@@ -12,13 +12,19 @@ use crate::metadata_keys::{
 };
 use crate::metadata_records::{
     DfsConflictPage, DfsConflictPageCursor, DfsConflictScanCursor, DfsConflictScanPage,
-    DfsObjectVersionPage, DfsObjectVersionPageCursor, DfsObjectVersionScanCursor,
-    DfsObjectVersionScanPage, DfsReplicaReceiptPage, DfsReplicaReceiptPageCursor,
-    DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage, DfsWriteIntentPage,
-    DfsWriteIntentPageCursor, DfsWriteIntentScanCursor, DfsWriteIntentScanPage,
+    DfsDirectoryPageCursor, DfsObjectVersionPage, DfsObjectVersionPageCursor,
+    DfsObjectVersionScanCursor, DfsObjectVersionScanPage, DfsReplicaReceiptPage,
+    DfsReplicaReceiptPageCursor, DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage,
+    DfsWriteIntentPage, DfsWriteIntentPageCursor, DfsWriteIntentScanCursor, DfsWriteIntentScanPage,
 };
 use crate::metadata_tables::DfsMetadataTables;
-use crate::{DfsObjectId, DfsVersion};
+use crate::{DfsObjectId, DfsObjectMetadata, DfsVersion};
+
+#[derive(Clone, Debug)]
+pub(crate) struct DfsDirectoryPageEntries {
+    pub(crate) entries: Vec<(DfsObjectMetadata, DfsDirectoryPageCursor)>,
+    pub(crate) next_cursor: Option<DfsDirectoryPageCursor>,
+}
 
 pub(crate) fn versions_for_object_page_from_tables(
     tables: &DfsMetadataTables,

@@ -22,23 +22,29 @@ mod local_service;
 mod local_state;
 mod maintenance;
 mod message_transport;
+mod metadata_api;
 mod metadata_backend;
 mod metadata_cursor;
+mod metadata_error;
 mod metadata_hardlink;
 mod metadata_io;
 mod metadata_journal;
 mod metadata_keys;
+mod metadata_limits;
 mod metadata_lock;
 mod metadata_namespace_transaction;
 mod metadata_object_index;
 mod metadata_pages;
+mod metadata_read_snapshot;
 mod metadata_receipt;
 mod metadata_records;
 mod metadata_replay;
 mod metadata_replication;
 mod metadata_shard_index;
 mod metadata_shard_migration;
+mod metadata_sharded_backend;
 mod metadata_summary;
+mod metadata_table_apply;
 mod metadata_table_store;
 mod metadata_tables;
 mod metadata_tombstone;
@@ -222,10 +228,11 @@ pub use message_transport::{
     AsyncDfsMessageTransport, DfsMessageTransport, DfsMessageTransportFuture, DfsTransferProfile,
     DfsTransportIdentity,
 };
-pub use metadata_backend::{
+pub use metadata_api::DfsMetadataBackend;
+pub use metadata_backend::LocalSobjMetadataBackend;
+pub use metadata_error::MetadataBackendError;
+pub use metadata_limits::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-    DfsMetadataBackend, LocalShardedMetadataBackend, LocalSobjMetadataBackend,
-    MetadataBackendError,
 };
 pub use metadata_records::{
     DfsConflictPage, DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor,
@@ -296,6 +303,7 @@ pub(crate) use metadata_replication::{
     metadata_replication_rejection_is_topology_mismatch,
     prepare_dfs_metadata_journal_publish_with_host,
 };
+pub use metadata_sharded_backend::LocalShardedMetadataBackend;
 pub use model::{
     DfsFileSystem, DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics,
     DfsPolicyViolation, DfsReadOutcome, DfsServiceEvent, DfsSubtreePolicy, DfsWriteOutcome,

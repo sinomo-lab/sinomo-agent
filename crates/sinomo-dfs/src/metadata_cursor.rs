@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use sinomo_node::NodeId;
 
-use crate::metadata_backend::Result;
+use crate::metadata_error::Result;
 use crate::metadata_io::{read_dir, read_sobj_optional, write_sobj_atomic};
 use crate::metadata_journal::{DfsMetadataJournalHead, DfsMetadataReplayCursor};
 use crate::metadata_keys::key_segment;

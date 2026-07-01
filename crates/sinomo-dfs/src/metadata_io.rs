@@ -8,7 +8,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_storage::durable_file;
 
-use crate::metadata_backend::{MetadataBackendError, Result};
+use crate::metadata_error::{MetadataBackendError, Result};
 
 pub(crate) fn create_dir_all(path: PathBuf) -> Result<()> {
     fs::create_dir_all(&path).map_err(|source| MetadataBackendError::Io { path, source })

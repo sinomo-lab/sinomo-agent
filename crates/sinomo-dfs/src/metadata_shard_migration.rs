@@ -4,7 +4,8 @@
 //! mechanics of copying an object's durable metadata family between shard
 //! backends and leaving an eviction tombstone in the source shard.
 
-use crate::metadata_backend::{DfsMetadataBackend, MetadataBackendError, Result};
+use crate::metadata_api::DfsMetadataBackend;
+use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_receipt::receipt_for_replica_from_backend;
 use crate::metadata_records::{
     DfsConflictRecord, DfsMetadataShardId, DfsObjectVersionRecord, DfsReplicaReceiptRecord,

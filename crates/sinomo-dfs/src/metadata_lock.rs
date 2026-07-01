@@ -4,7 +4,7 @@
 //! `write.lock` file, so multiple handles in one process and multiple
 //! processes serialize writes through the same path.
 
-use crate::metadata_backend::{MetadataBackendError, Result};
+use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_io::create_dir_all;
 use fs2::FileExt;
 use std::collections::BTreeSet;

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::metadata_backend::Result;
+use crate::metadata_error::Result;
 use crate::metadata_io::{
     encode_sobj, read_sobj_optional, remove_file_if_exists, write_sobj_atomic,
     write_sobj_files_create_new_relaxed,

@@ -11,7 +11,7 @@ use sinomo_node::NodeId;
 use std::time::Duration;
 use time::OffsetDateTime;
 
-use crate::metadata_backend::DfsMetadataBackend;
+use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_keys::{normalize_node_locations, object_inode_id};
 use crate::{
     DfsConflictReadView, DfsError, DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind,

@@ -4,7 +4,8 @@
 //! materialized tables. This module owns the small validation helpers used by
 //! replay paths so backend code can focus on applying mutations.
 
-use crate::metadata_backend::{DfsMetadataBackend, MetadataBackendError, Result};
+use crate::metadata_api::DfsMetadataBackend;
+use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_receipt::receipt_for_replica_from_backend;
 use crate::metadata_records::{DfsMetadataJournalEntry, DfsMetadataMutation};
 use crate::metadata_tables::DfsMetadataTables;
