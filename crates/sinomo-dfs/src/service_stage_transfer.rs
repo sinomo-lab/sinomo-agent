@@ -1,0 +1,394 @@
+//! Stage-transfer response helpers.
+//!
+//! Stage blob, stage patch, and chunked stage handlers all report the same
+//! `StageBlobResponse` protocol and produce the same staged/rejected service
+//! events. This module keeps that response shape and pending-stage validation
+//! in one place while the remaining transfer handlers own byte assembly.
+
+use sinomo_node::NodeId;
+
+use crate::*;
+
+impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    pub(crate) fn send_stage_blob_response(
+        &mut self,
+        requester_node_id: &NodeId,
+        request_id: String,
+        intent_id: String,
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        result: DfsBlobTransferResult,
+    ) -> Result<(), DfsError> {
+        self.send_dfs_message_if_routable(
+            requester_node_id,
+            DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
+                request_id,
+                intent_id,
+                file_system_id,
+                object_id,
+                version,
+                replica_node_id: self.node_id.clone(),
+                result,
+            }),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn stage_blob_result_event(
+        &self,
+        intent_id: String,
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        result: DfsBlobTransferResult,
+    ) -> NetworkedDfsServiceEvent {
+        match result {
+            DfsBlobTransferResult::Durable { content_hash }
+            | DfsBlobTransferResult::Committed { content_hash } => {
+                NetworkedDfsServiceEvent::BlobStaged {
+                    intent_id,
+                    object_id,
+                    version,
+                    replica_node_id: self.node_id.clone(),
+                    content_hash,
+                }
+            }
+            DfsBlobTransferResult::Rejected { reason } => {
+                NetworkedDfsServiceEvent::BlobStageRejected {
+                    intent_id,
+                    object_id,
+                    replica_node_id: self.node_id.clone(),
+                    reason,
+                }
+            }
+        }
+    }
+
+    pub(crate) fn handle_commit_version(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsCommitVersionCommand,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let result = match self
+            .ensure_replica_command_authorized_with_metadata(
+                &requester_node_id,
+                &command.intent_id,
+                &command.object_id,
+                command.object_metadata.as_ref(),
+                command.authority_shard.as_ref(),
+            )
+            .and_then(|()| self.ensure_replica_object_metadata(command.object_metadata.as_ref()))
+            .and_then(|()| {
+                self.ensure_replica_command_hash_matches_intent(
+                    &command.intent_id,
+                    &command.object_id,
+                    &command.content_hash,
+                )
+            })
+            .and_then(|()| {
+                self.ensure_no_conflicting_pending_replica_write(
+                    "commit",
+                    &requester_node_id,
+                    &command.intent_id,
+                    &command.object_id,
+                    &command.version,
+                    &command.content_hash,
+                )
+            })
+            .and_then(|()| {
+                self.content
+                    .read_manifest(command.object_id.as_str(), command.version.as_str())
+                    .map_err(DfsError::from)
+            })
+            .and_then(|manifest| {
+                if manifest.content_hash != command.content_hash {
+                    return Err(DfsError::ContentHashMismatch {
+                        expected: command.content_hash.clone(),
+                        actual: manifest.content_hash,
+                    });
+                }
+                if !self.content.manifest_content_available(&manifest)? {
+                    return Err(DfsError::ContentStore {
+                        message: format!(
+                            "committed content bytes are missing for {} {}",
+                            command.object_id, command.version
+                        ),
+                    });
+                }
+                Ok(())
+            })
+            .and_then(|()| {
+                self.ensure_command_base_matches_current(
+                    "commit",
+                    &command.object_id,
+                    command.expected_base_version.as_ref(),
+                    &command.version,
+                    &command.content_hash,
+                )
+            })
+            .and_then(|()| {
+                let local_node_id = self.node_id.clone();
+                self.commit_replica_metadata_cache(
+                    &command.file_system_id,
+                    &command.object_id,
+                    &command.version,
+                    &local_node_id,
+                    &command.content_hash,
+                    command.object_metadata.as_ref(),
+                )
+            }) {
+            Ok(()) => {
+                // The version is now durably committed on this replica, so the
+                // in-flight stage guard for it is no longer active.
+                self.clear_active_replica_stage(&command.object_id, &command.version);
+                DfsBlobTransferResult::Committed {
+                    content_hash: command.content_hash.clone(),
+                }
+            }
+            Err(error) => DfsBlobTransferResult::Rejected {
+                reason: error.to_string(),
+            },
+        };
+        self.send_commit_version_response(
+            &requester_node_id,
+            command.request_id.clone(),
+            command.intent_id.clone(),
+            command.file_system_id.clone(),
+            command.object_id.clone(),
+            command.version.clone(),
+            result.clone(),
+        )?;
+        Ok(self.commit_version_result_event(command, result))
+    }
+
+    fn send_commit_version_response(
+        &mut self,
+        requester_node_id: &NodeId,
+        request_id: String,
+        intent_id: String,
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        result: DfsBlobTransferResult,
+    ) -> Result<(), DfsError> {
+        self.send_dfs_message_if_routable(
+            requester_node_id,
+            DfsNetworkMessage::CommitVersionResponse(DfsCommitVersionResponse {
+                request_id,
+                intent_id,
+                file_system_id,
+                object_id,
+                version,
+                replica_node_id: self.node_id.clone(),
+                result,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn commit_version_result_event(
+        &self,
+        command: DfsCommitVersionCommand,
+        result: DfsBlobTransferResult,
+    ) -> NetworkedDfsServiceEvent {
+        match result {
+            DfsBlobTransferResult::Committed { content_hash }
+            | DfsBlobTransferResult::Durable { content_hash } => {
+                NetworkedDfsServiceEvent::VersionCommitted {
+                    intent_id: command.intent_id,
+                    object_id: command.object_id,
+                    version: command.version,
+                    content_hash,
+                }
+            }
+            DfsBlobTransferResult::Rejected { reason } => {
+                NetworkedDfsServiceEvent::RepairRejected {
+                    intent_id: command.intent_id,
+                    object_id: command.object_id,
+                    replica_node_id: self.node_id.clone(),
+                    reason,
+                }
+            }
+        }
+    }
+
+    pub(crate) fn handle_stage_blob_response(
+        &mut self,
+        frame_source_node_id: NodeId,
+        response: DfsStageBlobResponse,
+    ) -> Result<Option<NetworkedDfsServiceEvent>, DfsError> {
+        if frame_source_node_id != response.replica_node_id {
+            let reason = format!(
+                "DFS stage response source mismatch: frame source {}, payload replica {}",
+                frame_source_node_id, response.replica_node_id
+            );
+            return Ok(Some(NetworkedDfsServiceEvent::BlobStageRejected {
+                intent_id: response.intent_id,
+                object_id: response.object_id,
+                replica_node_id: frame_source_node_id,
+                reason,
+            }));
+        }
+        match response.result {
+            DfsBlobTransferResult::Durable { ref content_hash }
+            | DfsBlobTransferResult::Committed { ref content_hash } => {
+                if self
+                    .coordinator
+                    .intent(&response.intent_id)
+                    .is_some_and(|intent| {
+                        matches!(
+                            intent.state,
+                            DfsWriteIntentState::Aborted
+                                | DfsWriteIntentState::Rejected
+                                | DfsWriteIntentState::Conflict
+                        )
+                    })
+                {
+                    let intent_id = response.intent_id.clone();
+                    return Ok(Some(NetworkedDfsServiceEvent::BlobStageRejected {
+                        intent_id: response.intent_id,
+                        object_id: response.object_id,
+                        replica_node_id: response.replica_node_id,
+                        reason: format!("missing pending write for stage response: {intent_id}"),
+                    }));
+                }
+                self.restore_pending_write_for_intent_if_missing(
+                    &response.intent_id,
+                    &response.object_id,
+                )?;
+                if let Err(error) =
+                    self.ensure_stage_response_matches_pending(&response, content_hash)
+                {
+                    return Ok(Some(NetworkedDfsServiceEvent::BlobStageRejected {
+                        intent_id: response.intent_id,
+                        object_id: response.object_id,
+                        replica_node_id: response.replica_node_id,
+                        reason: error.to_string(),
+                    }));
+                }
+                self.put_metadata_receipt(
+                    &response.file_system_id,
+                    &response.object_id,
+                    &response.version,
+                    &response.replica_node_id,
+                    content_hash,
+                )?;
+                let updated_intent = self.coordinator.record_durable_receipt(
+                    &response.intent_id,
+                    response.replica_node_id.clone(),
+                )?;
+                let event = NetworkedDfsServiceEvent::BlobStaged {
+                    intent_id: response.intent_id.clone(),
+                    object_id: response.object_id.clone(),
+                    version: response.version.clone(),
+                    replica_node_id: response.replica_node_id.clone(),
+                    content_hash: content_hash.clone(),
+                };
+                self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
+                self.send_untracked_completed_routed_write_response_if_committed(
+                    &updated_intent.intent_id,
+                    &response.object_id,
+                )?;
+                if let Some(pending) = self.pending_writes.get_mut(&response.intent_id) {
+                    pending
+                        .stage_inflight_request_ids
+                        .remove(&response.replica_node_id);
+                    pending
+                        .stage_next_chunk_indexes
+                        .remove(&response.replica_node_id);
+                    pending.stage_retries.remove(&response.replica_node_id);
+                }
+                self.cleanup_committed_pending_write_if_repaired(&response.intent_id);
+                Ok(Some(event))
+            }
+            DfsBlobTransferResult::Rejected { ref reason } => {
+                match self.ensure_stage_response_request_matches_pending(&response) {
+                    Ok(()) => {
+                        self.record_stage_patch_fallback(
+                            &response.intent_id,
+                            &response.replica_node_id,
+                        );
+                        self.record_stage_retry_scheduled(
+                            &response.intent_id,
+                            &response.replica_node_id,
+                        );
+                        Ok(Some(NetworkedDfsServiceEvent::BlobStageRejected {
+                            intent_id: response.intent_id,
+                            object_id: response.object_id,
+                            replica_node_id: response.replica_node_id,
+                            reason: reason.clone(),
+                        }))
+                    }
+                    Err(error) => Ok(Some(NetworkedDfsServiceEvent::BlobStageRejected {
+                        intent_id: response.intent_id,
+                        object_id: response.object_id,
+                        replica_node_id: response.replica_node_id,
+                        reason: error.to_string(),
+                    })),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn ensure_stage_response_request_matches_pending(
+        &self,
+        response: &DfsStageBlobResponse,
+    ) -> Result<(), DfsError> {
+        let Some(pending) = self.pending_writes.get(&response.intent_id) else {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "missing pending write for stage response: {}",
+                    response.intent_id
+                ),
+            });
+        };
+        let expected_request_id = pending
+            .stage_inflight_request_ids
+            .get(&response.replica_node_id);
+        if let Some(expected_request_id) = expected_request_id {
+            if expected_request_id != &response.request_id {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "unexpected DFS stage response request id for intent {} from {}: expected {}, actual {}",
+                        response.intent_id,
+                        response.replica_node_id,
+                        expected_request_id,
+                        response.request_id
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        if !pending.stage_inflight_request_ids.is_empty() {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "unexpected DFS stage response source for intent {}: {}",
+                    response.intent_id, response.replica_node_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_stage_response_matches_pending(
+        &self,
+        response: &DfsStageBlobResponse,
+        content_hash: &str,
+    ) -> Result<(), DfsError> {
+        self.ensure_stage_response_request_matches_pending(response)?;
+        let pending = self
+            .pending_writes
+            .get(&response.intent_id)
+            .expect("pending write validated");
+        self.ensure_response_matches_pending_write(
+            "stage",
+            &response.intent_id,
+            &response.file_system_id,
+            &response.object_id,
+            &response.version,
+            &response.replica_node_id,
+            content_hash,
+            pending,
+        )
+    }
+}
