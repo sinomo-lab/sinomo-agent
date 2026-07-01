@@ -9,6 +9,7 @@ use std::io::Read;
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse};
 
+use crate::DfsError;
 use crate::content_store::{BlobReader, LocalContentStore};
 use crate::protocol::{
     DfsDirectReadRequest, DfsReadData, DfsReadRequest, DfsReadResponse, DfsReadResult,
@@ -16,7 +17,7 @@ use crate::protocol::{
 #[cfg(test)]
 use crate::protocol::{DfsMessageCommand, DfsMessageResponse, DfsNetworkMessage, DfsRoutedMessage};
 use crate::routes::{DFS_DIRECT_READ_ROUTE, DFS_RPC_CATEGORY};
-use crate::{DfsError, dfs_byte_count_to_usize};
+use crate::transfer::dfs_byte_count_to_usize;
 
 pub(crate) const DFS_DIRECT_READ_STATUS_METADATA_KEY: &str = "sinomo.dfs.direct-read.status";
 pub(crate) const DFS_DIRECT_READ_STATUS_FOUND: &str = "found";

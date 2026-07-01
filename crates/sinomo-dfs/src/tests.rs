@@ -9,7 +9,10 @@ use sinomo_network::{
 };
 use sinomo_object::Value;
 
-use crate::transfer::{DFS_STAGE_CHUNK_WINDOW_SIZE, dfs_adaptive_chunk_window_size};
+use crate::transfer::{
+    DFS_READ_CHUNK_WINDOW_SIZE, DFS_STAGE_CHUNK_WINDOW_SIZE, blob_transfer_key,
+    dfs_adaptive_chunk_window_size,
+};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};

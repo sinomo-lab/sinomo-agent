@@ -10651,11 +10651,6 @@ fn current_next_journal_sequence(root: &Path) -> Result<u64> {
     let head_next_sequence =
         read_sobj_optional::<DfsMetadataJournalHead>(&journal_dir.join("head.sobj"))?
             .and_then(|head| (head.next_sequence > 0).then_some(head.next_sequence));
-    if let Some(head_next_sequence) = head_next_sequence
-        && journal_head_matches_local_materialization_cursor(root, head_next_sequence)?
-    {
-        return Ok(head_next_sequence);
-    }
     let mut max_sequence = head_next_sequence
         .map(|next_sequence| next_sequence.saturating_sub(1))
         .unwrap_or(0);
