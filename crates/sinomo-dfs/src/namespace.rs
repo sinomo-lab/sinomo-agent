@@ -2,7 +2,7 @@
 
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
-    DfsSubtreePolicy, DfsVersion, metadata_backend::DfsObjectVersionRecord, sifs_file_system_id,
+    DfsObjectVersionRecord, DfsSubtreePolicy, DfsVersion, sifs_file_system_id,
 };
 use sinomo_core::DfsObjectPolicy;
 use sinomo_node::NodeId;

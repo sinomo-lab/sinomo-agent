@@ -2,9 +2,9 @@ use sinomo_node::NodeId;
 use time::OffsetDateTime;
 
 use crate::{
-    DfsConflictReadView, DfsDistributedError, DfsDistributedWriteCommand, DfsObjectId,
-    DfsObjectMetadata, DfsVersion, DfsWriteIntentState, DistributedWriteIntent, content_hash,
-    metadata_backend::{DfsConflictRecord, DfsWriteIntentRecord, DfsWriteIntentStatus},
+    DfsConflictReadView, DfsConflictRecord, DfsDistributedError, DfsDistributedWriteCommand,
+    DfsObjectId, DfsObjectMetadata, DfsVersion, DfsWriteIntentRecord, DfsWriteIntentState,
+    DfsWriteIntentStatus, DistributedWriteIntent, content_hash,
 };
 
 pub(crate) fn routed_write_command_content_hash(command: &DfsDistributedWriteCommand) -> String {

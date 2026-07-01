@@ -2,7 +2,7 @@
 
 use time::OffsetDateTime;
 
-use crate::metadata_backend::{
+use crate::metadata_records::{
     DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor, DfsDentryPageCursor,
     DfsDirFragmentId, DfsDirectoryPageCursor, DfsInodeId, DfsMetadataShardId, DfsObjectPageCursor,
     DfsObjectVersionPageCursor, DfsObjectVersionRecord, DfsObjectVersionScanCursor, DfsPathRecord,

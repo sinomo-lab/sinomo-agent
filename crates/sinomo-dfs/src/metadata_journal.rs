@@ -10,13 +10,13 @@ use serde::{Deserialize, Serialize};
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_storage::durable_file;
 
-use crate::metadata_backend::{
-    DfsMetadataJournalBatch, DfsMetadataJournalEntry, DfsMetadataShardId, MetadataBackendError,
-    Result,
-};
+use crate::metadata_backend::{MetadataBackendError, Result};
 use crate::metadata_io::{
     create_dir_all, metadata_durable_file_error, read_dir, read_sobj, read_sobj_optional,
     remove_file_if_exists, sync_dir, write_sobj_atomic,
+};
+use crate::metadata_records::{
+    DfsMetadataJournalBatch, DfsMetadataJournalEntry, DfsMetadataShardId,
 };
 
 pub(crate) const JOURNAL_SEGMENT_ENTRY_LIMIT: u64 = 8192;
