@@ -4,8 +4,8 @@ use sinomo_kv::InProcessKvStore;
 use sinomo_network::{AsyncInProcessNetwork, InProcessNetwork};
 use sinomo_object::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::Path;
-use std::sync::atomic::AtomicUsize;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
