@@ -4,6 +4,7 @@
 //! module owns the reusable cursor-walk helpers and the pure table-range scans
 //! used by local metadata reads.
 
+use std::cmp::Ordering;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 
 use crate::metadata_error::Result;
@@ -90,6 +91,16 @@ pub(crate) fn finish_cursor_page<T, C: Clone>(
         entries.into_iter().map(|(record, _)| record).collect(),
         next_cursor,
     )
+}
+
+/// Sort then finish a cursor page represented as `(record, cursor)` pairs.
+pub(crate) fn finish_sorted_cursor_page<T, C: Clone>(
+    mut entries: Vec<(T, C)>,
+    max_entries: usize,
+    mut compare_records: impl FnMut(&T, &T) -> Ordering,
+) -> (Vec<T>, Option<C>) {
+    entries.sort_by(|left, right| compare_records(&left.0, &right.0));
+    finish_cursor_page(entries, max_entries)
 }
 
 pub(crate) fn objects_for_file_system_page_from_tables(

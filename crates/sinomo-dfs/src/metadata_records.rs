@@ -428,161 +428,234 @@ pub struct DfsNamespaceTransaction {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Cursor for object scans within one filesystem.
 pub struct DfsObjectPageCursor {
+    /// Normalized object path at the end of the current page.
     pub path: String,
+    /// Object id at the end of the current page.
     pub object_id: DfsObjectId,
+    /// Metadata shard to resume from when the page came from a sharded backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_id: Option<DfsMetadataShardId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Page of object metadata records.
 pub struct DfsObjectPage {
+    /// Objects returned by this page.
     pub objects: Vec<DfsObjectMetadata>,
+    /// Cursor to pass to the next page request, if more objects remain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<DfsObjectPageCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Cursor for conflict records belonging to one object.
 pub struct DfsConflictPageCursor {
+    /// Conflict id at the end of the current page.
     pub conflict_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Page of conflicts for one object.
 pub struct DfsConflictPage {
+    /// Conflict records returned by this page.
     pub conflicts: Vec<DfsConflictRecord>,
+    /// Cursor to pass to the next page request, if more conflicts remain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<DfsConflictPageCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Cursor for version records belonging to one object.
 pub struct DfsObjectVersionPageCursor {
+    /// Version id at the end of the current page.
     pub version: DfsVersion,
+    /// Metadata shard to resume from when the page came from a sharded backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_id: Option<DfsMetadataShardId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Page of version records for one object.
 pub struct DfsObjectVersionPage {
+    /// Versions returned by this page.
     pub versions: Vec<DfsObjectVersionRecord>,
+    /// Cursor to pass to the next page request, if more versions remain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<DfsObjectVersionPageCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Cursor for replica receipt records belonging to one object version.
 pub struct DfsReplicaReceiptPageCursor {
+    /// Replica node id at the end of the current page.
     pub replica_node_id: NodeId,
+    /// Metadata shard to resume from when the page came from a sharded backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_id: Option<DfsMetadataShardId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Page of replica receipt records for one object version.
 pub struct DfsReplicaReceiptPage {
+    /// Receipts returned by this page.
     pub receipts: Vec<DfsReplicaReceiptRecord>,
+    /// Cursor to pass to the next page request, if more receipts remain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<DfsReplicaReceiptPageCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Cursor for write intent records belonging to one object.
 pub struct DfsWriteIntentPageCursor {
+    /// Intent id at the end of the current page.
     pub intent_id: String,
+    /// Metadata shard to resume from when the page came from a sharded backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_id: Option<DfsMetadataShardId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Page of write intent records for one object or object version.
 pub struct DfsWriteIntentPage {
+    /// Write intents returned by this page.
     pub intents: Vec<DfsWriteIntentRecord>,
+    /// Cursor to pass to the next page request, if more intents remain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<DfsWriteIntentPageCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Cursor for global write-intent scans.
 pub struct DfsWriteIntentScanCursor {
+    /// Intent creation time at the end of the current page.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Intent id at the end of the current page.
     pub intent_id: String,
+    /// Object id at the end of the current page.
     pub object_id: DfsObjectId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Page of write intents from a global metadata scan.
 pub struct DfsWriteIntentScanPage {
+    /// Write intents returned by this page.
     pub intents: Vec<DfsWriteIntentRecord>,
+    /// Cursor to pass to the next scan request, if more intents remain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<DfsWriteIntentScanCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Cursor for global object-version scans.
 pub struct DfsObjectVersionScanCursor {
+    /// Object id at the end of the current page.
     pub object_id: DfsObjectId,
+    /// Version id at the end of the current page.
     pub version: DfsVersion,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Page of object versions from a global metadata scan.
 pub struct DfsObjectVersionScanPage {
+    /// Version records returned by this page.
     pub versions: Vec<DfsObjectVersionRecord>,
+    /// Cursor to pass to the next scan request, if more versions remain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<DfsObjectVersionScanCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Cursor for global replica-receipt scans.
 pub struct DfsReplicaReceiptScanCursor {
+    /// Object id at the end of the current page.
     pub object_id: DfsObjectId,
+    /// Version id at the end of the current page.
     pub version: DfsVersion,
+    /// Replica node id at the end of the current page.
     pub replica_node_id: NodeId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Page of replica receipts from a global metadata scan.
 pub struct DfsReplicaReceiptScanPage {
+    /// Replica receipts returned by this page.
     pub receipts: Vec<DfsReplicaReceiptRecord>,
+    /// Cursor to pass to the next scan request, if more receipts remain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<DfsReplicaReceiptScanCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Cursor for global conflict scans.
 pub struct DfsConflictScanCursor {
+    /// Object id at the end of the current page.
     pub object_id: DfsObjectId,
+    /// Conflict id at the end of the current page.
     pub conflict_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Page of conflicts from a global metadata scan.
 pub struct DfsConflictScanPage {
+    /// Conflicts returned by this page.
     pub conflicts: Vec<DfsConflictRecord>,
+    /// Cursor to pass to the next scan request, if more conflicts remain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<DfsConflictScanCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Cursor for direct child object pages under one directory.
 pub struct DfsDirectoryPageCursor {
+    /// Child path at the end of the current page.
     pub path: String,
+    /// Child object id at the end of the current page.
     pub object_id: DfsObjectId,
+    /// Dentry cursor used by backends with fragmented directory indexes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dentry: Option<DfsDentryPageCursor>,
+    /// Metadata shard to resume from when the page came from a sharded backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_id: Option<DfsMetadataShardId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Directory-entry cursor within one directory fragment.
 pub struct DfsDentryPageCursor {
+    /// Directory fragment id at the end of the current page.
     pub dirfrag_id: DfsDirFragmentId,
+    /// Dentry name hash at the end of the current page.
     pub name_hash: u64,
+    /// Dentry name at the end of the current page.
     pub name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Page of direct child objects under one directory.
 pub struct DfsDirectoryPage {
+    /// Direct children returned by this page.
     pub objects: Vec<DfsObjectMetadata>,
+    /// Cursor to pass to the next page request, if more children remain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<DfsDirectoryPageCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Cursor for namespace background job scans.
 pub struct DfsNamespaceJobPageCursor {
+    /// Job id at the end of the current page.
     pub job_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Page of namespace background jobs.
 pub struct DfsNamespaceJobPage {
+    /// Namespace jobs returned by this page.
     pub jobs: Vec<DfsNamespaceJobRecord>,
+    /// Cursor to pass to the next page request, if more jobs remain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<DfsNamespaceJobPageCursor>,
 }

@@ -42,6 +42,7 @@ mod metadata_replay;
 mod metadata_replication;
 mod metadata_shard_index;
 mod metadata_shard_migration;
+mod metadata_shard_pages;
 mod metadata_sharded_backend;
 mod metadata_summary;
 mod metadata_table_apply;
@@ -242,12 +243,14 @@ pub use metadata_records::{
     DfsMetadataReplayCursorStatus, DfsMetadataReplicaLagStatus, DfsMetadataShardId,
     DfsMetadataShardMigrationReport, DfsMetadataShardStatus, DfsMetadataSubscription,
     DfsMetadataSummary, DfsMetadataTableSnapshot, DfsNamespaceJobFrame, DfsNamespaceJobKind,
-    DfsNamespaceJobRecord, DfsNamespaceJobStatus, DfsNamespaceTransaction, DfsObjectPage,
-    DfsObjectPageCursor, DfsObjectVersionPage, DfsObjectVersionPageCursor, DfsObjectVersionRecord,
-    DfsObjectVersionScanCursor, DfsObjectVersionScanPage, DfsPathRecord, DfsReplicaReceiptPage,
-    DfsReplicaReceiptPageCursor, DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor,
-    DfsReplicaReceiptScanPage, DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport,
-    DfsWriteIntentPage, DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentStatus,
+    DfsNamespaceJobPage, DfsNamespaceJobPageCursor, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
+    DfsNamespaceTransaction, DfsObjectPage, DfsObjectPageCursor, DfsObjectVersionPage,
+    DfsObjectVersionPageCursor, DfsObjectVersionRecord, DfsObjectVersionScanCursor,
+    DfsObjectVersionScanPage, DfsPathRecord, DfsReplicaReceiptPage, DfsReplicaReceiptPageCursor,
+    DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage,
+    DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport, DfsWriteIntentPage,
+    DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentScanCursor,
+    DfsWriteIntentScanPage, DfsWriteIntentStatus,
 };
 pub(crate) use metadata_records::{
     dfs_now_unix_nanos, metadata_journal_batch_file_system_id, object_version_record,
