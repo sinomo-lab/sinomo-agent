@@ -17,11 +17,13 @@ use crate::metadata_io::create_dir_all;
 use crate::metadata_io::{read_dir, read_sobj, remove_file_if_exists, sync_dir, write_sobj_atomic};
 #[cfg(test)]
 use crate::metadata_journal::DfsMetadataJournalHead;
+#[cfg(test)]
+use crate::metadata_journal::persist_replayed_journal_entry;
 use crate::metadata_journal::{
     DfsMetadataReplayCursor, bounded_metadata_journal_batch, journal_entries_since_limited,
     journal_entries_since_limited_with_next_sequence, migrate_legacy_journal_entries,
-    persist_replayed_journal_entries, persist_replayed_journal_entry,
-    recover_next_journal_sequence, write_local_journal_entries, write_local_journal_entry,
+    persist_replayed_journal_entries, recover_next_journal_sequence, write_local_journal_entries,
+    write_local_journal_entry,
 };
 use crate::metadata_limits::{
     DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, OBJECT_LOCAL_METADATA_PAGE_SIZE,
@@ -128,6 +130,12 @@ pub struct LocalSobjMetadataBackend {
 }
 
 impl LocalSobjMetadataBackend {
+    /// Open or initialize one durable metadata shard under `root`.
+    ///
+    /// Construction performs local recovery before returning: it migrates any
+    /// legacy journal layout, loads the materialized table state, replays local
+    /// journal entries not yet reflected in tables, and finishes interrupted
+    /// namespace or visible-version commits.
     pub fn new(shard_id: DfsMetadataShardId, root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         create_dir_all(root.join("records"))?;
@@ -163,10 +171,16 @@ impl LocalSobjMetadataBackend {
         Ok(backend)
     }
 
+    /// Metadata shard owned by this local backend handle.
     pub fn shard_id(&self) -> &DfsMetadataShardId {
         &self.shard_id
     }
 
+    /// Persist and materialize a replicated journal batch from a metadata peer.
+    ///
+    /// Entries whose replay cursor is already past their sequence are skipped.
+    /// New entries are written to the local replicated journal, materialized
+    /// into table batches, and then acknowledged by advancing replay cursors.
     pub fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
         let _lock = self.begin_metadata_write()?;
         let mut local_cursor = self.local_materialization_cursor()?;
@@ -223,10 +237,12 @@ impl LocalSobjMetadataBackend {
         Ok(applied)
     }
 
+    /// Last local or replayed journal sequence visible to this shard.
     pub fn journal_last_sequence(&self) -> u64 {
         self.next_sequence.saturating_sub(1)
     }
 
+    /// Export the current materialized table state for replica snapshot repair.
     pub fn export_table_snapshot(&self) -> DfsMetadataTableSnapshot {
         DfsMetadataTableSnapshot {
             format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
@@ -236,6 +252,10 @@ impl LocalSobjMetadataBackend {
         }
     }
 
+    /// Replace local shard tables with an authoritative replicated snapshot.
+    ///
+    /// The previous shard state is archived before replacement. The return
+    /// value reports whether existing local state was archived.
     pub fn replace_with_replicated_snapshot(
         &mut self,
         source_shard_id: DfsMetadataShardId,
@@ -272,7 +292,8 @@ impl LocalSobjMetadataBackend {
         Ok(archived_existing)
     }
 
-    pub fn apply_journal_entry(
+    #[cfg(test)]
+    pub(crate) fn apply_journal_entry(
         &mut self,
         entry: &DfsMetadataJournalEntry,
     ) -> Result<Option<DfsMetadataJournalEntry>> {
@@ -287,6 +308,7 @@ impl LocalSobjMetadataBackend {
         }
     }
 
+    #[cfg(test)]
     fn persist_replayed_journal_entry_unlocked(
         &mut self,
         entry: &DfsMetadataJournalEntry,
@@ -671,13 +693,19 @@ impl LocalSobjMetadataBackend {
         }
     }
 
-    pub fn hydrate_journal_entry_payloads(
+    #[cfg(test)]
+    pub(crate) fn hydrate_journal_entry_payloads(
         &self,
         entries: Vec<DfsMetadataJournalEntry>,
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
         hydrate_journal_entry_payloads(self, &self.tables, entries, OBJECT_LOCAL_METADATA_PAGE_SIZE)
     }
 
+    /// Read at most `max_entries` journal entries after `after_sequence`.
+    ///
+    /// This lower-level reader is mainly for diagnostics and compatibility.
+    /// Replication should prefer `journal_batch_since_limited`, which hydrates
+    /// record payloads and enforces encoded-size bounds.
     pub fn journal_since_limited(
         &self,
         after_sequence: u64,
@@ -692,6 +720,11 @@ impl LocalSobjMetadataBackend {
         )
     }
 
+    /// Build a bounded, payload-complete journal batch after `after_sequence`.
+    ///
+    /// The returned batch is suitable for metadata replication. Legacy journal
+    /// entries are hydrated from materialized records before byte bounds are
+    /// applied so receivers do not need the source record store.
     pub fn journal_batch_since_limited(
         &self,
         after_sequence: u64,
@@ -785,6 +818,7 @@ impl LocalSobjMetadataBackend {
         )
     }
 
+    #[cfg(test)]
     fn advance_local_materialization_cursor(&self, sequence: u64) -> Result<()> {
         metadata_cursor::advance_local_materialization_cursor(
             &self.root,

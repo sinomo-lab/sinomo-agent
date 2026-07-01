@@ -1,7 +1,8 @@
-//! Cursor pagination over materialized metadata tables.
+//! Cursor pagination helpers and materialized metadata table scans.
 //!
 //! Backend implementations own snapshot freshness and sharded routing. This
-//! module owns the pure table-range scans used by local metadata reads.
+//! module owns the reusable cursor-walk helpers and the pure table-range scans
+//! used by local metadata reads.
 
 use std::ops::Bound::{Excluded, Included, Unbounded};
 
@@ -33,20 +34,62 @@ pub(crate) struct DfsDirectoryPageEntries {
     pub(crate) next_cursor: Option<DfsDirectoryPageCursor>,
 }
 
+/// Drain a paged metadata API into a materialized vector.
+///
+/// Prefer bounded page APIs for normal service paths. This helper is for
+/// compatibility callers, tests, and backend-internal recovery paths that need
+/// a complete record list.
 pub(crate) fn collect_metadata_pages<T, C>(
     mut fetch_page: impl FnMut(Option<&C>) -> Result<(Vec<T>, Option<C>)>,
 ) -> Result<Vec<T>> {
     let mut records = Vec::new();
+    walk_metadata_pages(|cursor| {
+        let (page_records, next_cursor) = fetch_page(cursor)?;
+        records.extend(page_records);
+        Ok(next_cursor)
+    })?;
+    Ok(records)
+}
+
+/// Walk a cursor-paged metadata API until it returns no next cursor.
+///
+/// The closure receives the current cursor and returns the next cursor after
+/// processing that page. This centralizes cursor progression without forcing
+/// all callers into the same record container shape.
+pub(crate) fn walk_metadata_pages<C>(
+    mut fetch_page: impl FnMut(Option<&C>) -> Result<Option<C>>,
+) -> Result<()> {
     let mut cursor = None;
     loop {
-        let (page_records, next_cursor) = fetch_page(cursor.as_ref())?;
-        records.extend(page_records);
+        let next_cursor = fetch_page(cursor.as_ref())?;
         let Some(next_cursor) = next_cursor else {
             break;
         };
         cursor = Some(next_cursor);
     }
-    Ok(records)
+    Ok(())
+}
+
+/// Finish a cursor page represented as `(record, cursor_after_record)` pairs.
+///
+/// Callers may collect one extra pair to detect that another page exists. This
+/// helper trims the extra record and returns the cursor for the last included
+/// record as the page's next cursor.
+pub(crate) fn finish_cursor_page<T, C: Clone>(
+    mut entries: Vec<(T, C)>,
+    max_entries: usize,
+) -> (Vec<T>, Option<C>) {
+    let has_more = entries.len() > max_entries;
+    if has_more {
+        entries.truncate(max_entries);
+    }
+    let next_cursor = has_more
+        .then(|| entries.last().map(|(_, cursor)| cursor.clone()))
+        .flatten();
+    (
+        entries.into_iter().map(|(record, _)| record).collect(),
+        next_cursor,
+    )
 }
 
 pub(crate) fn objects_for_file_system_page_from_tables(
@@ -65,9 +108,7 @@ pub(crate) fn objects_for_file_system_page_from_tables(
         Some(after) => Excluded((file_system_id.clone(), after.path.clone())),
         None => Included((file_system_id.clone(), String::new())),
     };
-    let mut objects = Vec::new();
-    let mut last_cursor = None;
-    let mut has_more = false;
+    let mut entries = Vec::new();
     for ((record_file_system_id, _), path_record) in tables
         .paths
         .range((start, Unbounded))
@@ -90,16 +131,16 @@ pub(crate) fn objects_for_file_system_page_from_tables(
         {
             continue;
         }
-        if objects.len() >= max_entries {
-            has_more = true;
+        let cursor = object_page_cursor(&object);
+        entries.push((object, cursor));
+        if entries.len() > max_entries {
             break;
         }
-        last_cursor = Some(object_page_cursor(&object));
-        objects.push(object);
     }
+    let (objects, next_cursor) = finish_cursor_page(entries, max_entries);
     DfsObjectPage {
         objects,
-        next_cursor: has_more.then_some(last_cursor).flatten(),
+        next_cursor,
     }
 }
 
@@ -282,9 +323,7 @@ pub(crate) fn hardlinks_to_object_page_from_tables(
         )),
         None => Included((target_object_id.clone(), String::new(), id_lower_bound())),
     };
-    let mut objects = Vec::new();
-    let mut last_cursor = None;
-    let mut has_more = false;
+    let mut entries = Vec::new();
     for ((record_target_object_id, _, _), path_record) in
         tables.hardlink_paths.range((start, Unbounded)).take_while(
             |((record_target_object_id, _, _), _)| record_target_object_id == target_object_id,
@@ -298,16 +337,16 @@ pub(crate) fn hardlinks_to_object_page_from_tables(
         else {
             continue;
         };
-        if objects.len() >= max_entries {
-            has_more = true;
+        let cursor = object_page_cursor(&object);
+        entries.push((object, cursor));
+        if entries.len() > max_entries {
             break;
         }
-        last_cursor = Some(object_page_cursor(&object));
-        objects.push(object);
     }
+    let (objects, next_cursor) = finish_cursor_page(entries, max_entries);
     DfsObjectPage {
         objects,
-        next_cursor: has_more.then_some(last_cursor).flatten(),
+        next_cursor,
     }
 }
 
@@ -388,23 +427,18 @@ pub(crate) fn namespace_jobs_page_from_tables(
         Some(after) => Excluded(after.job_id.clone()),
         None => Included(String::new()),
     };
-    let mut jobs = Vec::new();
-    let mut last_cursor = None;
-    let mut has_more = false;
+    let mut entries = Vec::new();
     for (job_id, job) in tables.namespace_jobs.range((start, Unbounded)) {
-        if jobs.len() >= max_entries {
-            has_more = true;
+        let cursor = DfsNamespaceJobPageCursor {
+            job_id: job_id.clone(),
+        };
+        entries.push((job.clone(), cursor));
+        if entries.len() > max_entries {
             break;
         }
-        last_cursor = Some(DfsNamespaceJobPageCursor {
-            job_id: job_id.clone(),
-        });
-        jobs.push(job.clone());
     }
-    DfsNamespaceJobPage {
-        jobs,
-        next_cursor: has_more.then_some(last_cursor).flatten(),
-    }
+    let (jobs, next_cursor) = finish_cursor_page(entries, max_entries);
+    DfsNamespaceJobPage { jobs, next_cursor }
 }
 
 pub(crate) fn conflicts_for_object_from_tables(
@@ -437,9 +471,7 @@ pub(crate) fn versions_for_object_page_from_tables(
         Some(after) => Excluded((object_id.clone(), after.version.clone())),
         None => Included((object_id.clone(), id_lower_bound())),
     };
-    let mut versions = Vec::new();
-    let mut last_cursor = None;
-    let mut has_more = false;
+    let mut entries = Vec::new();
     for ((record_object_id, _), version) in tables
         .versions
         .range((start, Unbounded))
@@ -448,16 +480,16 @@ pub(crate) fn versions_for_object_page_from_tables(
         if record_object_id != object_id || version.object_id != *object_id {
             continue;
         }
-        if versions.len() >= max_entries {
-            has_more = true;
+        let cursor = object_version_page_cursor(version);
+        entries.push((version.clone(), cursor));
+        if entries.len() > max_entries {
             break;
         }
-        last_cursor = Some(object_version_page_cursor(version));
-        versions.push(version.clone());
     }
+    let (versions, next_cursor) = finish_cursor_page(entries, max_entries);
     DfsObjectVersionPage {
         versions,
-        next_cursor: has_more.then_some(last_cursor).flatten(),
+        next_cursor,
     }
 }
 
@@ -476,23 +508,21 @@ pub(crate) fn version_records_page_from_tables(
         Some(after) => Excluded((after.object_id.clone(), after.version.clone())),
         None => Included((id_lower_bound(), id_lower_bound())),
     };
-    let mut versions = Vec::new();
-    let mut last_cursor = None;
-    let mut has_more = false;
+    let mut entries = Vec::new();
     for ((record_object_id, record_version), version) in tables.versions.range((start, Unbounded)) {
         if record_object_id != &version.object_id || record_version != &version.version {
             continue;
         }
-        if versions.len() >= max_entries {
-            has_more = true;
+        let cursor = object_version_scan_cursor(version);
+        entries.push((version.clone(), cursor));
+        if entries.len() > max_entries {
             break;
         }
-        last_cursor = Some(object_version_scan_cursor(version));
-        versions.push(version.clone());
     }
+    let (versions, next_cursor) = finish_cursor_page(entries, max_entries);
     DfsObjectVersionScanPage {
         versions,
-        next_cursor: has_more.then_some(last_cursor).flatten(),
+        next_cursor,
     }
 }
 
@@ -517,9 +547,7 @@ pub(crate) fn receipts_for_version_page_from_tables(
         )),
         None => Included((object_id.clone(), version.clone(), id_lower_bound())),
     };
-    let mut receipts = Vec::new();
-    let mut last_cursor = None;
-    let mut has_more = false;
+    let mut entries = Vec::new();
     for ((record_object_id, record_version, _), receipt) in tables
         .receipts
         .range((start, Unbounded))
@@ -534,16 +562,16 @@ pub(crate) fn receipts_for_version_page_from_tables(
         {
             continue;
         }
-        if receipts.len() >= max_entries {
-            has_more = true;
+        let cursor = replica_receipt_page_cursor(receipt);
+        entries.push((receipt.clone(), cursor));
+        if entries.len() > max_entries {
             break;
         }
-        last_cursor = Some(replica_receipt_page_cursor(receipt));
-        receipts.push(receipt.clone());
     }
+    let (receipts, next_cursor) = finish_cursor_page(entries, max_entries);
     DfsReplicaReceiptPage {
         receipts,
-        next_cursor: has_more.then_some(last_cursor).flatten(),
+        next_cursor,
     }
 }
 
@@ -566,9 +594,7 @@ pub(crate) fn receipt_records_page_from_tables(
         )),
         None => Included((id_lower_bound(), id_lower_bound(), id_lower_bound())),
     };
-    let mut receipts = Vec::new();
-    let mut last_cursor = None;
-    let mut has_more = false;
+    let mut entries = Vec::new();
     for ((record_object_id, record_version, record_replica_node_id), receipt) in
         tables.receipts.range((start, Unbounded))
     {
@@ -578,16 +604,16 @@ pub(crate) fn receipt_records_page_from_tables(
         {
             continue;
         }
-        if receipts.len() >= max_entries {
-            has_more = true;
+        let cursor = replica_receipt_scan_cursor(receipt);
+        entries.push((receipt.clone(), cursor));
+        if entries.len() > max_entries {
             break;
         }
-        last_cursor = Some(replica_receipt_scan_cursor(receipt));
-        receipts.push(receipt.clone());
     }
+    let (receipts, next_cursor) = finish_cursor_page(entries, max_entries);
     DfsReplicaReceiptScanPage {
         receipts,
-        next_cursor: has_more.then_some(last_cursor).flatten(),
+        next_cursor,
     }
 }
 
@@ -607,9 +633,7 @@ pub(crate) fn intents_for_object_page_from_tables(
         Some(after) => Excluded((object_id.clone(), after.intent_id.clone())),
         None => Included((object_id.clone(), String::new())),
     };
-    let mut intents = Vec::new();
-    let mut last_cursor = None;
-    let mut has_more = false;
+    let mut entries = Vec::new();
     for ((record_object_id, _), intent) in tables
         .intents
         .range((start, Unbounded))
@@ -618,16 +642,16 @@ pub(crate) fn intents_for_object_page_from_tables(
         if record_object_id != object_id || intent.object_id != *object_id {
             continue;
         }
-        if intents.len() >= max_entries {
-            has_more = true;
+        let cursor = write_intent_page_cursor(intent);
+        entries.push((intent.clone(), cursor));
+        if entries.len() > max_entries {
             break;
         }
-        last_cursor = Some(write_intent_page_cursor(intent));
-        intents.push(intent.clone());
     }
+    let (intents, next_cursor) = finish_cursor_page(entries, max_entries);
     DfsWriteIntentPage {
         intents,
-        next_cursor: has_more.then_some(last_cursor).flatten(),
+        next_cursor,
     }
 }
 
@@ -652,9 +676,7 @@ pub(crate) fn intents_for_object_version_page_from_tables(
         )),
         None => Included((object_id.clone(), target_version.clone(), String::new())),
     };
-    let mut intents = Vec::new();
-    let mut last_cursor = None;
-    let mut has_more = false;
+    let mut entries = Vec::new();
     for ((record_object_id, record_version, _), intent_key) in tables
         .intent_targets
         .range((start, Unbounded))
@@ -671,16 +693,16 @@ pub(crate) fn intents_for_object_version_page_from_tables(
         if intent.object_id != *object_id || intent.target_version != *target_version {
             continue;
         }
-        if intents.len() >= max_entries {
-            has_more = true;
+        let cursor = write_intent_page_cursor(intent);
+        entries.push((intent.clone(), cursor));
+        if entries.len() > max_entries {
             break;
         }
-        last_cursor = Some(write_intent_page_cursor(intent));
-        intents.push(intent.clone());
     }
+    let (intents, next_cursor) = finish_cursor_page(entries, max_entries);
     DfsWriteIntentPage {
         intents,
-        next_cursor: has_more.then_some(last_cursor).flatten(),
+        next_cursor,
     }
 }
 
@@ -695,19 +717,14 @@ pub(crate) fn write_intents_page_from_tables(
             next_cursor: None,
         };
     }
-    let mut intents = Vec::new();
-    let mut last_cursor = None;
-    let mut has_more = false;
+    let mut entries = Vec::new();
     let mut collect_intent = |intent_key: &(DfsObjectId, String)| -> bool {
         let Some(intent) = tables.intents.get(intent_key) else {
             return false;
         };
-        if intents.len() >= max_entries {
-            return true;
-        }
-        last_cursor = Some(write_intent_scan_cursor(intent));
-        intents.push(intent.clone());
-        false
+        let cursor = write_intent_scan_cursor(intent);
+        entries.push((intent.clone(), cursor));
+        entries.len() > max_entries
     };
     match after {
         Some(after) => {
@@ -716,7 +733,6 @@ pub(crate) fn write_intents_page_from_tables(
                 .range((Excluded(write_intent_scan_cursor_key(after)), Unbounded))
             {
                 if collect_intent(intent_key) {
-                    has_more = true;
                     break;
                 }
             }
@@ -724,15 +740,15 @@ pub(crate) fn write_intents_page_from_tables(
         None => {
             for intent_key in tables.intent_order.values() {
                 if collect_intent(intent_key) {
-                    has_more = true;
                     break;
                 }
             }
         }
     }
+    let (intents, next_cursor) = finish_cursor_page(entries, max_entries);
     DfsWriteIntentScanPage {
         intents,
-        next_cursor: has_more.then_some(last_cursor).flatten(),
+        next_cursor,
     }
 }
 
@@ -752,9 +768,7 @@ pub(crate) fn conflicts_for_object_page_from_tables(
         Some(after) => Excluded((object_id.clone(), after.conflict_id.clone())),
         None => Included((object_id.clone(), String::new())),
     };
-    let mut conflicts = Vec::new();
-    let mut last_cursor = None;
-    let mut has_more = false;
+    let mut entries = Vec::new();
     for ((record_object_id, _), conflict) in tables
         .conflicts
         .range((start, Unbounded))
@@ -763,16 +777,16 @@ pub(crate) fn conflicts_for_object_page_from_tables(
         if record_object_id != object_id || conflict.object_id != *object_id {
             continue;
         }
-        if conflicts.len() >= max_entries {
-            has_more = true;
+        let cursor = conflict_page_cursor(conflict);
+        entries.push((conflict.clone(), cursor));
+        if entries.len() > max_entries {
             break;
         }
-        last_cursor = Some(conflict_page_cursor(conflict));
-        conflicts.push(conflict.clone());
     }
+    let (conflicts, next_cursor) = finish_cursor_page(entries, max_entries);
     DfsConflictPage {
         conflicts,
-        next_cursor: has_more.then_some(last_cursor).flatten(),
+        next_cursor,
     }
 }
 
@@ -791,25 +805,23 @@ pub(crate) fn conflict_records_page_from_tables(
         Some(after) => Excluded((after.object_id.clone(), after.conflict_id.clone())),
         None => Included((id_lower_bound(), String::new())),
     };
-    let mut conflicts = Vec::new();
-    let mut last_cursor = None;
-    let mut has_more = false;
+    let mut entries = Vec::new();
     for ((record_object_id, record_conflict_id), conflict) in
         tables.conflicts.range((start, Unbounded))
     {
         if record_object_id != &conflict.object_id || record_conflict_id != &conflict.conflict_id {
             continue;
         }
-        if conflicts.len() >= max_entries {
-            has_more = true;
+        let cursor = conflict_scan_cursor(conflict);
+        entries.push((conflict.clone(), cursor));
+        if entries.len() > max_entries {
             break;
         }
-        last_cursor = Some(conflict_scan_cursor(conflict));
-        conflicts.push(conflict.clone());
     }
+    let (conflicts, next_cursor) = finish_cursor_page(entries, max_entries);
     DfsConflictScanPage {
         conflicts,
-        next_cursor: has_more.then_some(last_cursor).flatten(),
+        next_cursor,
     }
 }
 

@@ -347,6 +347,7 @@ pub(crate) fn write_local_journal_entries(
     Ok(entries)
 }
 
+#[cfg(test)]
 pub(crate) fn persist_replayed_journal_entry(
     root: &Path,
     entry: &DfsMetadataJournalEntry,

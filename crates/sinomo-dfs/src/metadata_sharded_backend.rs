@@ -26,6 +26,7 @@ use crate::metadata_keys::{
     write_intent_page_cursor_with_shard, write_intent_scan_cursor, write_intent_scan_order,
 };
 use crate::metadata_limits::{OBJECT_LOCAL_METADATA_PAGE_SIZE, SHARD_MIGRATION_PAGE_SIZE};
+use crate::metadata_pages::finish_cursor_page;
 use crate::metadata_records::*;
 #[cfg(test)]
 use crate::metadata_shard_index::object_shard_index_path;
@@ -48,21 +49,23 @@ use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
 };
 
-fn finish_sharded_cursor_page<T, C: Clone>(
-    mut entries: Vec<(T, C)>,
-    max_entries: usize,
-) -> (Vec<T>, Option<C>) {
-    let has_more = entries.len() > max_entries;
-    if has_more {
-        entries.truncate(max_entries);
+fn shard_is_before_resume(
+    shard_id: &DfsMetadataShardId,
+    resume_shard_id: Option<&DfsMetadataShardId>,
+) -> bool {
+    resume_shard_id.is_some_and(|resume_shard_id| shard_id < resume_shard_id)
+}
+
+fn local_cursor_for_resumed_shard<O, C>(
+    after: Option<&O>,
+    resume_shard_id: Option<&DfsMetadataShardId>,
+    shard_id: &DfsMetadataShardId,
+    map_cursor: impl FnOnce(&O) -> C,
+) -> Option<C> {
+    if resume_shard_id.is_some_and(|resume_shard_id| resume_shard_id != shard_id) {
+        return None;
     }
-    let next_cursor = has_more
-        .then(|| entries.last().map(|(_, cursor)| cursor.clone()))
-        .flatten();
-    (
-        entries.into_iter().map(|(record, _)| record).collect(),
-        next_cursor,
-    )
+    after.map(map_cursor)
 }
 
 /// Local sharded metadata router.
@@ -79,6 +82,12 @@ pub struct LocalShardedMetadataBackend {
 }
 
 impl LocalShardedMetadataBackend {
+    /// Open or initialize a local router over the configured metadata shards.
+    ///
+    /// Each shard config gets its own `LocalSobjMetadataBackend` under `root`.
+    /// Cross-shard object placement is tracked in this backend's shard-index
+    /// directory, while shard-local tables and journals stay inside each local
+    /// shard backend.
     pub fn new(root: impl Into<PathBuf>, shards: Vec<DfsMetadataShardConfig>) -> Result<Self> {
         let root = root.into();
         if shards.is_empty() {
@@ -113,7 +122,7 @@ impl LocalShardedMetadataBackend {
         })
     }
 
-    pub fn shard_ids(&self) -> Vec<DfsMetadataShardId> {
+    pub(crate) fn shard_ids(&self) -> Vec<DfsMetadataShardId> {
         self.shards.keys().cloned().collect()
     }
 
@@ -184,6 +193,23 @@ impl LocalShardedMetadataBackend {
             .filter(|shard| shard.file_system_id == *file_system_id)
             .cloned()
             .collect()
+    }
+
+    fn configured_shard_ids_for_file_system(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Vec<DfsMetadataShardId>> {
+        let shard_ids = self
+            .shard_configs_for_file_system(file_system_id)
+            .into_iter()
+            .map(|shard| DfsMetadataShardId::new(shard.shard_id))
+            .collect::<Vec<_>>();
+        if shard_ids.is_empty() {
+            return Err(MetadataBackendError::UnknownFileSystem {
+                file_system_id: file_system_id.clone(),
+            });
+        }
+        Ok(shard_ids)
     }
 
     fn select_shard_id_for_path(
@@ -365,20 +391,11 @@ impl LocalShardedMetadataBackend {
         Ok(best)
     }
 
-    pub fn ensure_file_system_on_all_shards(
+    pub(crate) fn ensure_file_system_on_all_shards(
         &mut self,
         file_system: &DfsFileSystem,
     ) -> Result<usize> {
-        let shard_ids = self
-            .shard_configs_for_file_system(&file_system.file_system_id)
-            .into_iter()
-            .map(|shard| DfsMetadataShardId::new(shard.shard_id))
-            .collect::<Vec<_>>();
-        if shard_ids.is_empty() {
-            return Err(MetadataBackendError::UnknownFileSystem {
-                file_system_id: file_system.file_system_id.clone(),
-            });
-        }
+        let shard_ids = self.configured_shard_ids_for_file_system(&file_system.file_system_id)?;
         let mut written = 0usize;
         for shard_id in shard_ids {
             let backend = self.shard_backend_mut(&shard_id)?;
@@ -391,7 +408,7 @@ impl LocalShardedMetadataBackend {
         Ok(written)
     }
 
-    pub fn migrate_objects_to_configured_shards(
+    pub(crate) fn migrate_objects_to_configured_shards(
         &mut self,
         file_system_id: &DfsFileSystemId,
         max_migrations: usize,
@@ -554,16 +571,7 @@ impl LocalShardedMetadataBackend {
 
 impl DfsMetadataBackend for LocalShardedMetadataBackend {
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry> {
-        let shard_ids = self
-            .shard_configs_for_file_system(&file_system.file_system_id)
-            .into_iter()
-            .map(|shard| DfsMetadataShardId::new(shard.shard_id))
-            .collect::<Vec<_>>();
-        if shard_ids.is_empty() {
-            return Err(MetadataBackendError::UnknownFileSystem {
-                file_system_id: file_system.file_system_id.clone(),
-            });
-        }
+        let shard_ids = self.configured_shard_ids_for_file_system(&file_system.file_system_id)?;
         let mut last_entry = None;
         for shard_id in shard_ids {
             last_entry = Some(
@@ -580,16 +588,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         &mut self,
         file_system: &DfsFileSystem,
     ) -> Result<Option<DfsMetadataJournalEntry>> {
-        let shard_ids = self
-            .shard_configs_for_file_system(&file_system.file_system_id)
-            .into_iter()
-            .map(|shard| DfsMetadataShardId::new(shard.shard_id))
-            .collect::<Vec<_>>();
-        if shard_ids.is_empty() {
-            return Err(MetadataBackendError::UnknownFileSystem {
-                file_system_id: file_system.file_system_id.clone(),
-            });
-        }
+        let shard_ids = self.configured_shard_ids_for_file_system(&file_system.file_system_id)?;
         let mut last_entry = None;
         for shard_id in shard_ids {
             let backend = self.shard_backend_mut(&shard_id)?;
@@ -717,18 +716,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let resume_shard_id = after.and_then(|cursor| cursor.shard_id.as_ref());
         let mut entries = Vec::<(DfsObjectMetadata, DfsObjectPageCursor)>::new();
         'shards: for (shard_id, backend) in &self.shards {
-            if let Some(resume_shard_id) = resume_shard_id
-                && shard_id < resume_shard_id
-            {
+            if shard_is_before_resume(shard_id, resume_shard_id) {
                 continue;
             }
-            let mut local_after = match resume_shard_id {
-                Some(resume_shard_id) if resume_shard_id == shard_id => {
-                    after.map(local_object_page_cursor)
-                }
-                Some(_) => None,
-                None => after.map(local_object_page_cursor),
-            };
+            let mut local_after = local_cursor_for_resumed_shard(
+                after,
+                resume_shard_id,
+                shard_id,
+                local_object_page_cursor,
+            );
             loop {
                 let page = backend.objects_for_file_system_page(
                     file_system_id,
@@ -752,7 +748,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 local_after = Some(next_local_cursor);
             }
         }
-        let (objects, next_cursor) = finish_sharded_cursor_page(entries, max_entries);
+        let (objects, next_cursor) = finish_cursor_page(entries, max_entries);
         Ok(DfsObjectPage {
             objects,
             next_cursor,
@@ -786,18 +782,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let resume_shard_id = after.and_then(|cursor| cursor.shard_id.as_ref());
         let mut entries = Vec::<(DfsObjectMetadata, DfsDirectoryPageCursor)>::new();
         'shards: for (shard_id, backend) in &self.shards {
-            if let Some(resume_shard_id) = resume_shard_id
-                && shard_id < resume_shard_id
-            {
+            if shard_is_before_resume(shard_id, resume_shard_id) {
                 continue;
             }
-            let mut local_after = match resume_shard_id {
-                Some(resume_shard_id) if resume_shard_id == shard_id => {
-                    after.map(local_directory_page_cursor)
-                }
-                Some(_) => None,
-                None => after.map(local_directory_page_cursor),
-            };
+            let mut local_after = local_cursor_for_resumed_shard(
+                after,
+                resume_shard_id,
+                shard_id,
+                local_directory_page_cursor,
+            );
             loop {
                 let page = backend.child_objects_for_directory_page_entries(
                     file_system_id,
@@ -824,7 +817,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 local_after = Some(next_local_cursor);
             }
         }
-        let (objects, next_cursor) = finish_sharded_cursor_page(entries, max_entries);
+        let (objects, next_cursor) = finish_cursor_page(entries, max_entries);
         Ok(DfsDirectoryPage {
             objects,
             next_cursor,
@@ -871,18 +864,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let resume_shard_id = after.and_then(|cursor| cursor.shard_id.as_ref());
         let mut entries = Vec::<(DfsObjectMetadata, DfsObjectPageCursor)>::new();
         'shards: for (shard_id, backend) in &self.shards {
-            if let Some(resume_shard_id) = resume_shard_id
-                && shard_id < resume_shard_id
-            {
+            if shard_is_before_resume(shard_id, resume_shard_id) {
                 continue;
             }
-            let mut local_after = match resume_shard_id {
-                Some(resume_shard_id) if resume_shard_id == shard_id => {
-                    after.map(local_object_page_cursor)
-                }
-                Some(_) => None,
-                None => after.map(local_object_page_cursor),
-            };
+            let mut local_after = local_cursor_for_resumed_shard(
+                after,
+                resume_shard_id,
+                shard_id,
+                local_object_page_cursor,
+            );
             loop {
                 let page = backend.hardlinks_to_object_page(
                     file_system_id,
@@ -907,7 +897,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 local_after = Some(next_local_cursor);
             }
         }
-        let (objects, next_cursor) = finish_sharded_cursor_page(entries, max_entries);
+        let (objects, next_cursor) = finish_cursor_page(entries, max_entries);
         Ok(DfsObjectPage {
             objects,
             next_cursor,
@@ -1283,18 +1273,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let mut entries = Vec::<(DfsWriteIntentRecord, DfsWriteIntentPageCursor)>::new();
         let mut seen_intent_ids = BTreeSet::<String>::new();
         'shards: for (shard_id, backend) in &self.shards {
-            if let Some(resume_shard_id) = resume_shard_id
-                && shard_id < resume_shard_id
-            {
+            if shard_is_before_resume(shard_id, resume_shard_id) {
                 continue;
             }
-            let mut local_after = match resume_shard_id {
-                Some(resume_shard_id) if resume_shard_id == shard_id => {
-                    after.map(local_write_intent_page_cursor)
-                }
-                Some(_) => None,
-                None => after.map(local_write_intent_page_cursor),
-            };
+            let mut local_after = local_cursor_for_resumed_shard(
+                after,
+                resume_shard_id,
+                shard_id,
+                local_write_intent_page_cursor,
+            );
             loop {
                 let page = backend.intents_for_object_page(
                     object_id,
@@ -1321,7 +1308,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 local_after = Some(next_local_cursor);
             }
         }
-        let (intents, next_cursor) = finish_sharded_cursor_page(entries, max_entries);
+        let (intents, next_cursor) = finish_cursor_page(entries, max_entries);
         Ok(DfsWriteIntentPage {
             intents,
             next_cursor,
@@ -1363,18 +1350,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let mut entries = Vec::<(DfsWriteIntentRecord, DfsWriteIntentPageCursor)>::new();
         let mut seen_intent_ids = BTreeSet::<String>::new();
         'shards: for (shard_id, backend) in &self.shards {
-            if let Some(resume_shard_id) = resume_shard_id
-                && shard_id < resume_shard_id
-            {
+            if shard_is_before_resume(shard_id, resume_shard_id) {
                 continue;
             }
-            let mut local_after = match resume_shard_id {
-                Some(resume_shard_id) if resume_shard_id == shard_id => {
-                    after.map(local_write_intent_page_cursor)
-                }
-                Some(_) => None,
-                None => after.map(local_write_intent_page_cursor),
-            };
+            let mut local_after = local_cursor_for_resumed_shard(
+                after,
+                resume_shard_id,
+                shard_id,
+                local_write_intent_page_cursor,
+            );
             loop {
                 let page = backend.intents_for_object_version_page(
                     object_id,
@@ -1405,7 +1389,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 local_after = Some(next_local_cursor);
             }
         }
-        let (intents, next_cursor) = finish_sharded_cursor_page(entries, max_entries);
+        let (intents, next_cursor) = finish_cursor_page(entries, max_entries);
         Ok(DfsWriteIntentPage {
             intents,
             next_cursor,
@@ -1424,7 +1408,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             });
         }
         let per_shard_limit = max_entries.saturating_add(1);
-        let mut intents = Vec::new();
+        let mut entries = Vec::new();
         let mut seen = BTreeSet::<(DfsObjectId, String)>::new();
         for (shard_id, backend) in &self.shards {
             let mut cursor = after.cloned();
@@ -1437,7 +1421,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                         continue;
                     }
                     if seen.insert((intent.object_id.clone(), intent.intent_id.clone())) {
-                        intents.push(intent);
+                        let cursor = write_intent_scan_cursor(&intent);
+                        entries.push((intent, cursor));
                         shard_intents = shard_intents.saturating_add(1);
                     }
                     if shard_intents > max_entries {
@@ -1453,16 +1438,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 cursor = Some(next_cursor);
             }
         }
-        intents.sort_by(write_intent_scan_order);
-        let has_more = intents.len() > max_entries;
-        if has_more {
-            intents.truncate(max_entries);
-        }
-        let next_cursor = if has_more {
-            intents.last().map(write_intent_scan_cursor)
-        } else {
-            None
-        };
+        entries.sort_by(|left, right| write_intent_scan_order(&left.0, &right.0));
+        let (intents, next_cursor) = finish_cursor_page(entries, max_entries);
         Ok(DfsWriteIntentScanPage {
             intents,
             next_cursor,
@@ -1481,7 +1458,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             });
         }
         let per_shard_limit = max_entries.saturating_add(1);
-        let mut versions = Vec::new();
+        let mut entries = Vec::new();
         let mut seen = BTreeSet::<(DfsObjectId, DfsVersion)>::new();
         for (shard_id, backend) in &self.shards {
             let mut cursor = after.cloned();
@@ -1497,7 +1474,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                         continue;
                     }
                     if seen.insert((version.object_id.clone(), version.version.clone())) {
-                        versions.push(version);
+                        let cursor = object_version_scan_cursor(&version);
+                        entries.push((version, cursor));
                         shard_versions = shard_versions.saturating_add(1);
                     }
                     if shard_versions > max_entries {
@@ -1513,18 +1491,10 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 cursor = Some(next_cursor);
             }
         }
-        versions.sort_by(|left, right| {
-            object_version_scan_key(left).cmp(&object_version_scan_key(right))
+        entries.sort_by(|left, right| {
+            object_version_scan_key(&left.0).cmp(&object_version_scan_key(&right.0))
         });
-        let has_more = versions.len() > max_entries;
-        if has_more {
-            versions.truncate(max_entries);
-        }
-        let next_cursor = if has_more {
-            versions.last().map(object_version_scan_cursor)
-        } else {
-            None
-        };
+        let (versions, next_cursor) = finish_cursor_page(entries, max_entries);
         Ok(DfsObjectVersionScanPage {
             versions,
             next_cursor,
@@ -1543,7 +1513,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             });
         }
         let per_shard_limit = max_entries.saturating_add(1);
-        let mut receipts = Vec::new();
+        let mut entries = Vec::new();
         let mut seen = BTreeSet::<(DfsObjectId, DfsVersion, NodeId)>::new();
         for (shard_id, backend) in &self.shards {
             let mut cursor = after.cloned();
@@ -1564,7 +1534,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                         receipt.replica_node_id.clone(),
                     );
                     if seen.insert(key) {
-                        receipts.push(receipt);
+                        let cursor = replica_receipt_scan_cursor(&receipt);
+                        entries.push((receipt, cursor));
                         shard_receipts = shard_receipts.saturating_add(1);
                     }
                     if shard_receipts > max_entries {
@@ -1580,18 +1551,10 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 cursor = Some(next_cursor);
             }
         }
-        receipts.sort_by(|left, right| {
-            replica_receipt_scan_key(left).cmp(&replica_receipt_scan_key(right))
+        entries.sort_by(|left, right| {
+            replica_receipt_scan_key(&left.0).cmp(&replica_receipt_scan_key(&right.0))
         });
-        let has_more = receipts.len() > max_entries;
-        if has_more {
-            receipts.truncate(max_entries);
-        }
-        let next_cursor = if has_more {
-            receipts.last().map(replica_receipt_scan_cursor)
-        } else {
-            None
-        };
+        let (receipts, next_cursor) = finish_cursor_page(entries, max_entries);
         Ok(DfsReplicaReceiptScanPage {
             receipts,
             next_cursor,
@@ -1610,7 +1573,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             });
         }
         let per_shard_limit = max_entries.saturating_add(1);
-        let mut conflicts = Vec::new();
+        let mut entries = Vec::new();
         let mut seen = BTreeSet::<(DfsObjectId, String)>::new();
         for (shard_id, backend) in &self.shards {
             let mut cursor = after.cloned();
@@ -1626,7 +1589,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                         continue;
                     }
                     if seen.insert((conflict.object_id.clone(), conflict.conflict_id.clone())) {
-                        conflicts.push(conflict);
+                        let cursor = conflict_scan_cursor(&conflict);
+                        entries.push((conflict, cursor));
                         shard_conflicts = shard_conflicts.saturating_add(1);
                     }
                     if shard_conflicts > max_entries {
@@ -1642,16 +1606,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 cursor = Some(next_cursor);
             }
         }
-        conflicts.sort_by(|left, right| conflict_scan_key(left).cmp(&conflict_scan_key(right)));
-        let has_more = conflicts.len() > max_entries;
-        if has_more {
-            conflicts.truncate(max_entries);
-        }
-        let next_cursor = if has_more {
-            conflicts.last().map(conflict_scan_cursor)
-        } else {
-            None
-        };
+        entries.sort_by(|left, right| conflict_scan_key(&left.0).cmp(&conflict_scan_key(&right.0)));
+        let (conflicts, next_cursor) = finish_cursor_page(entries, max_entries);
         Ok(DfsConflictScanPage {
             conflicts,
             next_cursor,
