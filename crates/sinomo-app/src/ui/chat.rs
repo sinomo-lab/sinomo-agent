@@ -76,21 +76,21 @@ use crate::ui::widgets;
 /// Below this content width the sidebar collapses away (transcript + composer only).
 const WIDE_THRESHOLD: f32 = 620.0;
 const SIDEBAR_W: f32 = 250.0;
-const ACTIVITY_RAIL_W: f32 = 286.0;
-const OVERVIEW_H: f32 = 86.0;
 const MEDIA_CALL_H: f32 = 156.0;
 const MEDIA_CALL_COMPACT_H: f32 = 46.0;
-const COMPOSER_H: f32 = 232.0;
+const COMPOSER_H: f32 = 260.0;
 const PAD: f32 = 16.0;
 const SIDEBAR_ROW_H: f32 = 36.0;
 const SIDEBAR_ROW_EDIT_W: f32 = 26.0;
 const SIDEBAR_ROW_EDIT_H: f32 = 24.0;
 const SIDEBAR_ROW_EDIT_GAP: f32 = 8.0;
 const SELECTOR_H: f32 = 30.0;
-const ATTACHMENT_AREA_H: f32 = 56.0;
+const CONTROL_ROW_H: f32 = 34.0;
+const CONTROL_ROW_GAP: f32 = 8.0;
+const COMPOSER_POPUP_H: f32 = 132.0;
 const ATTACHMENT_ENTRY_H: f32 = 30.0;
 const ATTACHMENT_CHIPS_H: f32 = 22.0;
-const SCENARIO_ACTION_H: f32 = 28.0;
+const COMPOSER_ATTACHMENT_CHIP_W: f32 = 136.0;
 const COMPOSER_PAD_Y: f32 = 12.0;
 const COMPOSER_SECTION_GAP: f32 = 10.0;
 const INPUT_ACTION_GAP: f32 = 10.0;
@@ -356,30 +356,6 @@ impl ChatQuickAction {
             Self::RolePlay => "Role play",
             Self::ManageChannel => "Manage channel",
             Self::NewChannel => "New channel",
-        }
-    }
-
-    fn compact_label(self) -> &'static str {
-        match self {
-            Self::PlanChange => "Code",
-            Self::CheckCluster => "Cluster",
-            Self::DraftDocument => "Doc",
-            Self::ReasonImage => "Attach",
-            Self::RolePlay => "Role",
-            Self::ManageChannel => "Manage",
-            Self::NewChannel => "New",
-        }
-    }
-
-    fn compact_min_width(self) -> f32 {
-        match self {
-            Self::PlanChange => 66.0,
-            Self::CheckCluster => 82.0,
-            Self::DraftDocument => 62.0,
-            Self::ReasonImage => 76.0,
-            Self::RolePlay => 64.0,
-            Self::ManageChannel => 86.0,
-            Self::NewChannel => 66.0,
         }
     }
 
@@ -701,6 +677,14 @@ struct PendingChatAttachment {
     size_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ComposerPopup {
+    Model,
+    Context,
+    Attachments,
+    Activity,
+}
+
 /// State backing the chat tab.
 pub struct ChatState {
     pub data_dir: Arc<SinomoDataDir>,
@@ -728,6 +712,7 @@ pub struct ChatState {
     media_call_runtime: Option<ChatNativeMediaRuntime>,
     media_call_details_open: bool,
     activity_panel_open: bool,
+    composer_popup: Option<ComposerPopup>,
     pub scroll: f32,
     pub stick_bottom: bool,
     pub agents: Vec<AgentSummary>,
@@ -852,6 +837,7 @@ impl ChatState {
             media_call_runtime: None,
             media_call_details_open: false,
             activity_panel_open: false,
+            composer_popup: None,
             scroll: 0.0,
             stick_bottom: true,
             agents,
@@ -1650,23 +1636,48 @@ impl ChatState {
         }
     }
 
-    fn activity_panel_needs_attention(&self) -> bool {
-        matches!(
-            self.runtime_health().tone,
-            ActivityTone::Warn | ActivityTone::Bad
-        )
-    }
-
     fn activity_panel_visible(&self) -> bool {
-        self.activity_panel_open || self.activity_panel_needs_attention()
+        self.composer_popup == Some(ComposerPopup::Activity)
     }
 
     fn toggle_activity_panel(&mut self) {
-        self.activity_panel_open = !self.activity_panel_open;
+        self.toggle_composer_popup(ComposerPopup::Activity);
     }
 
     fn close_activity_panel(&mut self) {
-        self.activity_panel_open = false;
+        if self.activity_panel_visible() {
+            self.set_composer_popup(None);
+        }
+    }
+
+    fn composer_popup(&self) -> Option<ComposerPopup> {
+        self.composer_popup
+    }
+
+    fn toggle_composer_popup(&mut self, popup: ComposerPopup) {
+        if self.composer_popup == Some(popup) {
+            self.set_composer_popup(None);
+        } else {
+            self.set_composer_popup(Some(popup));
+        }
+    }
+
+    fn set_composer_popup(&mut self, popup: Option<ComposerPopup>) {
+        if self.composer_popup == Some(ComposerPopup::Attachments)
+            && popup != Some(ComposerPopup::Attachments)
+        {
+            let had_path = !self.attachment_path_input.trim().is_empty();
+            self.attachment_path_input.clear();
+            self.attachment_controls_open = false;
+            if had_path {
+                self.draft_revision = self.draft_revision.wrapping_add(1);
+            }
+        }
+        if popup == Some(ComposerPopup::Attachments) {
+            self.attachment_controls_open = true;
+        }
+        self.activity_panel_open = popup == Some(ComposerPopup::Activity);
+        self.composer_popup = popup;
     }
 
     fn runtime_degraded_detail(&self) -> Option<String> {
@@ -2027,6 +2038,8 @@ impl ChatState {
         self.media_call = ChatMediaCallState::default();
         self.media_call_runtime = None;
         self.media_call_details_open = false;
+        self.activity_panel_open = false;
+        self.composer_popup = None;
         self.scroll = 0.0;
         self.stick_bottom = true;
         self.session_edit_id = None;
@@ -3302,6 +3315,9 @@ impl ChatState {
             self.cursor = 0;
             self.attachment_path_input.clear();
             self.attachment_controls_open = false;
+            if self.composer_popup == Some(ComposerPopup::Attachments) {
+                self.composer_popup = None;
+            }
             self.notice = Some("queued follow-up".to_string());
             self.stick_bottom = true;
             self.scroll = f32::MAX;
@@ -3327,6 +3343,9 @@ impl ChatState {
         self.cursor = 0;
         self.attachment_path_input.clear();
         self.attachment_controls_open = false;
+        if self.composer_popup == Some(ComposerPopup::Attachments) {
+            self.composer_popup = None;
+        }
         self.attachments.clear();
         self.streaming = true;
         self.stick_bottom = true;
@@ -3437,20 +3456,18 @@ impl ChatState {
         self.cursor = 0;
         self.attachment_path_input.clear();
         self.attachment_controls_open = false;
+        if self.composer_popup == Some(ComposerPopup::Attachments) {
+            self.composer_popup = None;
+        }
         self.attachments.clear();
         self.draft_revision = self.draft_revision.wrapping_add(1);
     }
 
     fn toggle_attachment_controls(&mut self) {
         if self.attachment_controls_open {
-            let had_path = !self.attachment_path_input.trim().is_empty();
-            self.attachment_path_input.clear();
-            self.attachment_controls_open = false;
-            if had_path {
-                self.draft_revision = self.draft_revision.wrapping_add(1);
-            }
+            self.set_composer_popup(None);
         } else {
-            self.attachment_controls_open = true;
+            self.set_composer_popup(Some(ComposerPopup::Attachments));
         }
     }
 
@@ -5238,6 +5255,7 @@ fn activity_button_label(chat: &ChatState) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn activity_button_description(chat: &ChatState) -> String {
     let health = chat.runtime_health();
     let status = activity_status_summary(&health.detail);
@@ -5249,21 +5267,7 @@ fn activity_button_description(chat: &ChatState) -> String {
     )
 }
 
-fn media_call_button_description(chat: &ChatState) -> String {
-    let (provider, model) = chat.current_media_provider_model();
-    if chat.media_call.active {
-        format!(
-            "Show or hide live media call controls. {}.",
-            chat.media_call_status_summary()
-        )
-    } else {
-        format!(
-            "Open realtime audio and video controls for {} / {}.",
-            provider, model
-        )
-    }
-}
-
+#[cfg(test)]
 fn usage_summary(chat: &ChatState) -> Option<String> {
     chat.usage.as_ref().map(|usage| {
         let output = usage
@@ -7640,317 +7644,6 @@ impl Widget for ChatDialogHost {
     }
 }
 
-struct RuntimeOverview {
-    shared: Shared,
-    activity_hovered: Cell<bool>,
-    activity_pressed: Cell<bool>,
-    call_hovered: Cell<bool>,
-    call_pressed: Cell<bool>,
-}
-
-impl RuntimeOverview {
-    fn new(shared: Shared) -> Self {
-        Self {
-            shared,
-            activity_hovered: Cell::new(false),
-            activity_pressed: Cell::new(false),
-            call_hovered: Cell::new(false),
-            call_pressed: Cell::new(false),
-        }
-    }
-
-    fn health_chip_width(bounds: Rect) -> f32 {
-        112.0_f32.min((bounds.width() * 0.34).max(92.0))
-    }
-
-    fn health_chip_rect(bounds: Rect) -> Rect {
-        let chip_w = Self::health_chip_width(bounds);
-        let top = bounds.y() + 10.0;
-        Rect::new(
-            bounds.x() + bounds.width() - PAD - chip_w,
-            top - 1.0,
-            chip_w,
-            20.0,
-        )
-    }
-
-    fn activity_button_rect(bounds: Rect) -> Option<Rect> {
-        let chip = Self::health_chip_rect(bounds);
-        let button_w = 94.0_f32.min((bounds.width() * 0.24).max(78.0));
-        let rect = Rect::new(chip.x() - 8.0 - button_w, chip.y(), button_w, chip.height());
-        (rect.x() >= bounds.x() + PAD + 88.0).then_some(rect)
-    }
-
-    fn call_button_rect(bounds: Rect) -> Option<Rect> {
-        let activity = Self::activity_button_rect(bounds)?;
-        let button_w = 72.0_f32.min((bounds.width() * 0.18).max(60.0));
-        let rect = Rect::new(
-            activity.x() - 8.0 - button_w,
-            activity.y(),
-            button_w,
-            activity.height(),
-        );
-        (rect.x() >= bounds.x() + PAD + 140.0).then_some(rect)
-    }
-
-    fn activity_button_hit(&self, bounds: Rect, position: Point) -> bool {
-        Self::activity_button_rect(bounds).is_some_and(|rect| rect.contains(position))
-    }
-
-    fn call_button_hit(&self, bounds: Rect, position: Point) -> bool {
-        Self::call_button_rect(bounds).is_some_and(|rect| rect.contains(position))
-    }
-
-    fn request_activity_refresh(ctx: &mut EventCtx) {
-        ctx.request_measure();
-        ctx.request_arrange();
-        ctx.request_paint();
-        ctx.request_semantics();
-    }
-}
-
-impl Widget for RuntimeOverview {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        match event {
-            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
-                let hovered = self.activity_button_hit(ctx.bounds(), pointer.position);
-                let call_hovered = !hovered && self.call_button_hit(ctx.bounds(), pointer.position);
-                if self.activity_hovered.get() != hovered || self.call_hovered.get() != call_hovered
-                {
-                    self.activity_hovered.set(hovered);
-                    self.call_hovered.set(call_hovered);
-                    Self::request_activity_refresh(ctx);
-                }
-            }
-            Event::Pointer(pointer)
-                if pointer.kind == PointerEventKind::Down
-                    && pointer.button == Some(PointerButton::Primary) =>
-            {
-                if self.activity_button_hit(ctx.bounds(), pointer.position) {
-                    self.activity_pressed.set(true);
-                    ctx.request_pointer_capture(pointer.pointer_id);
-                    Self::request_activity_refresh(ctx);
-                    ctx.set_handled();
-                } else if self.call_button_hit(ctx.bounds(), pointer.position) {
-                    self.call_pressed.set(true);
-                    ctx.request_pointer_capture(pointer.pointer_id);
-                    Self::request_activity_refresh(ctx);
-                    ctx.set_handled();
-                }
-            }
-            Event::Pointer(pointer)
-                if pointer.kind == PointerEventKind::Up
-                    && pointer.button == Some(PointerButton::Primary) =>
-            {
-                if self.activity_pressed.take() {
-                    if self.activity_button_hit(ctx.bounds(), pointer.position) {
-                        self.shared.chat_mut().toggle_activity_panel();
-                    }
-                    ctx.release_pointer_capture(pointer.pointer_id);
-                    Self::request_activity_refresh(ctx);
-                    ctx.set_handled();
-                } else if self.call_pressed.take() {
-                    if self.call_button_hit(ctx.bounds(), pointer.position) {
-                        self.shared.chat_mut().toggle_media_call_details();
-                    }
-                    ctx.release_pointer_capture(pointer.pointer_id);
-                    Self::request_activity_refresh(ctx);
-                    ctx.set_handled();
-                }
-            }
-            Event::Pointer(pointer)
-                if matches!(
-                    pointer.kind,
-                    PointerEventKind::Leave | PointerEventKind::Cancel
-                ) =>
-            {
-                let had_state = self.activity_hovered.replace(false)
-                    || self.activity_pressed.take()
-                    || self.call_hovered.replace(false)
-                    || self.call_pressed.take();
-                if had_state {
-                    ctx.release_pointer_capture(pointer.pointer_id);
-                    Self::request_activity_refresh(ctx);
-                    ctx.set_handled();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        constraints.clamp(Size::new(constraints.max.width, OVERVIEW_H))
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        let theme = self.shared.theme();
-        let pal = palette(&self.shared);
-        let bounds = ctx.bounds();
-        ctx.fill_bounds(pal.titlebar);
-        widgets::hairline_bottom(ctx, bounds, pal.border);
-
-        let chat = self.shared.chat();
-        let title_style = pal.text_style(&theme, 12.5, FontWeight::SEMIBOLD, pal.text);
-        let meta_style = pal.text_style(&theme, 11.5, FontWeight::NORMAL, pal.text_faint);
-        let label_style = pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text_muted);
-        let x = bounds.x() + PAD;
-        let top = bounds.y() + 10.0;
-        let health = chat.runtime_health();
-        let chip = Self::health_chip_rect(bounds);
-        let activity_button = Self::activity_button_rect(bounds);
-        let call_button = Self::call_button_rect(bounds);
-        if let Some(button) = call_button {
-            draw_overview_button(
-                ctx,
-                &pal,
-                &theme,
-                button,
-                if chat.media_call.active {
-                    "Live"
-                } else {
-                    "Call"
-                },
-                IconGlyph::Chat,
-                if chat.media_call.active {
-                    ActivityTone::Running
-                } else {
-                    ActivityTone::Neutral
-                },
-                chat.media_call_panel_visible(),
-                self.call_hovered.get(),
-                self.call_pressed.get(),
-            );
-        }
-        if let Some(button) = activity_button {
-            let activity_label = activity_button_label(&chat);
-            draw_activity_overview_button(
-                ctx,
-                &pal,
-                &theme,
-                button,
-                activity_label,
-                chat.activity_panel_visible(),
-                chat.activity_panel_needs_attention(),
-                self.activity_hovered.get(),
-                self.activity_pressed.get(),
-            );
-        }
-        draw_health_chip(ctx, &pal, &theme, chip, &health);
-        let title_right = call_button
-            .or(activity_button)
-            .map_or(chip.x(), |button| button.x());
-        let title_w = (title_right - x - 10.0).max(80.0);
-        let runtime = runtime_overview_title(&chat);
-        widgets::draw_text_in(ctx, Rect::new(x, top, title_w, 18.0), &runtime, title_style);
-
-        let usage = usage_summary(&chat);
-        let monitor = activity_work_summary(&chat);
-        let monitor = if matches!(health.tone, ActivityTone::Warn | ActivityTone::Bad) {
-            let visible_detail = activity_status_summary(&health.detail);
-            format!("{} · {monitor}", compact_line(&visible_detail, 42))
-        } else {
-            monitor
-        };
-        let monitor = if let Some(usage) = usage {
-            format!("{monitor} · {usage}")
-        } else {
-            monitor
-        };
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x, top + 20.0, title_w, 16.0),
-            &monitor,
-            meta_style,
-        );
-
-        let bar = Rect::new(
-            x,
-            bounds.y() + 58.0,
-            (bounds.width() - PAD * 2.0).max(0.0),
-            10.0,
-        );
-        widgets::fill_round_rect(ctx, bar, pal.field, 5.0);
-        if let Some(context) = &chat.context {
-            let denominator = context_capacity_bytes(context);
-            let mut offset = 0.0;
-            let used_w = (bar.width() * (context.total_bytes as f32 / denominator as f32))
-                .clamp(2.0, bar.width());
-            let lane_total: usize = context.lanes.iter().map(|lane| lane.bytes).sum();
-            if lane_total > 0 {
-                for lane in &context.lanes {
-                    if lane.bytes == 0 {
-                        continue;
-                    }
-                    let lane_w = (used_w * lane.bytes as f32 / lane_total as f32)
-                        .max(2.0)
-                        .min(used_w - offset);
-                    if lane_w <= 0.0 {
-                        continue;
-                    }
-                    let segment = Rect::new(bar.x() + offset, bar.y(), lane_w, bar.height());
-                    widgets::fill_round_rect(
-                        ctx,
-                        segment,
-                        context_lane_color(&pal, lane.kind.as_str()),
-                        5.0,
-                    );
-                    offset += lane_w;
-                    if offset >= used_w {
-                        break;
-                    }
-                }
-            }
-        }
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x, bounds.y() + 40.0, bounds.width() - PAD * 2.0, 16.0),
-            &context_overview_summary(&chat),
-            label_style,
-        );
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let Some(rect) = Self::activity_button_rect(ctx.bounds()) else {
-            return;
-        };
-        let chat = self.shared.chat();
-        let mut node = SemanticsNode::new(
-            sui::WidgetId::new(ctx.widget_id().get().wrapping_mul(47).wrapping_add(12_101)),
-            SemanticsRole::Button,
-            rect,
-        );
-        node.parent = Some(ctx.widget_id());
-        node.name = Some(activity_button_label(&chat).to_string());
-        node.description = Some(activity_button_description(&chat));
-        node.actions = vec![SemanticsAction::Activate];
-        node.state.hovered = self.activity_hovered.get();
-        node.state.selected = chat.activity_panel_visible();
-        ctx.push(node);
-
-        if let Some(rect) = Self::call_button_rect(ctx.bounds()) {
-            let mut node = SemanticsNode::new(
-                sui::WidgetId::new(ctx.widget_id().get().wrapping_mul(47).wrapping_add(12_203)),
-                SemanticsRole::Button,
-                rect,
-            );
-            node.parent = Some(ctx.widget_id());
-            node.name = Some(
-                if chat.media_call.active {
-                    "Live call"
-                } else {
-                    "Call"
-                }
-                .to_string(),
-            );
-            node.description = Some(media_call_button_description(&chat));
-            node.actions = vec![SemanticsAction::Activate];
-            node.state.hovered = self.call_hovered.get();
-            node.state.selected = chat.media_call_panel_visible();
-            ctx.push(node);
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MediaCallControl {
     ToggleDetails,
@@ -8487,79 +8180,6 @@ fn draw_health_chip(
     );
 }
 
-fn draw_activity_overview_button(
-    ctx: &mut PaintCtx,
-    pal: &Palette,
-    theme: &DefaultTheme,
-    rect: Rect,
-    label: &str,
-    active: bool,
-    attention: bool,
-    hovered: bool,
-    pressed: bool,
-) {
-    let tone = if attention {
-        ActivityTone::Warn
-    } else if active {
-        ActivityTone::Good
-    } else {
-        ActivityTone::Neutral
-    };
-    draw_overview_button(
-        ctx,
-        pal,
-        theme,
-        rect,
-        label,
-        if attention {
-            IconGlyph::Alert
-        } else {
-            IconGlyph::History
-        },
-        tone,
-        active,
-        hovered,
-        pressed,
-    );
-}
-
-fn draw_overview_button(
-    ctx: &mut PaintCtx,
-    pal: &Palette,
-    theme: &DefaultTheme,
-    rect: Rect,
-    label: &str,
-    icon: IconGlyph,
-    tone: ActivityTone,
-    active: bool,
-    hovered: bool,
-    pressed: bool,
-) {
-    let fill = if pressed {
-        pal.selected
-    } else if active {
-        pal.field
-    } else if hovered {
-        pal.hover
-    } else {
-        pal.titlebar
-    };
-    widgets::fill_round_rect(ctx, rect, fill, 6.0);
-    let color = tone_color(pal, tone);
-    draw_glyph(
-        ctx,
-        icon,
-        Rect::new(rect.x() + 6.0, rect.y() + 4.0, 12.0, 12.0),
-        color,
-    );
-    widgets::draw_text_in(
-        ctx,
-        Rect::new(rect.x() + 22.0, rect.y() + 2.0, rect.width() - 26.0, 16.0),
-        label,
-        pal.text_style(theme, 10.0, FontWeight::SEMIBOLD, color),
-    );
-}
-
 fn context_lane_color(pal: &Palette, kind: &str) -> Color {
     match kind {
         "fixed_prompt" => pal.accent,
@@ -8571,6 +8191,7 @@ fn context_lane_color(pal: &Palette, kind: &str) -> Color {
     }
 }
 
+#[cfg(test)]
 fn format_token_count(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}m", tokens as f32 / 1_000_000.0)
@@ -8621,7 +8242,7 @@ impl ActivityRail {
     }
 
     fn can_close(chat: &ChatState) -> bool {
-        chat.activity_panel_open && !chat.activity_panel_needs_attention()
+        chat.activity_panel_open
     }
 
     fn status_card_rect(bounds: Rect) -> Rect {
@@ -10599,46 +10220,499 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     )
 }
 
-fn scenario_action_signature(shared: &Shared) -> bool {
-    shared.chat().current_is_channel()
+fn model_button_label(chat: &ChatState) -> String {
+    runtime_overview_title(chat)
 }
 
-fn scenario_action_row_visible(chat: &ChatState) -> bool {
-    !chat.messages.is_empty()
+fn attachment_button_label(chat: &ChatState) -> String {
+    match chat.attachments.len() {
+        0 => "Attach file".to_string(),
+        1 => "1 attachment".to_string(),
+        count => format!("{count} attachments"),
+    }
 }
 
-fn scenario_actions(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let actions = {
-        let chat = shared.chat();
-        quick_actions_for_chat(&chat).to_vec()
-    };
-    let mut row = Flex::horizontal()
-        .main_gap(6.0)
-        .align_items(Alignment::Stretch);
-    for action in actions {
+fn composer_controls_signature(
+    shared: &Shared,
+) -> (
+    Option<ComposerPopup>,
+    String,
+    String,
+    usize,
+    u64,
+    String,
+    bool,
+    bool,
+) {
+    let chat = shared.chat();
+    (
+        chat.composer_popup(),
+        model_button_label(&chat),
+        context_overview_summary(&chat),
+        chat.attachments.len(),
+        chat.draft_revision,
+        activity_button_label(&chat).to_string(),
+        chat.media_call.active,
+        chat.media_call_details_visible(),
+    )
+}
+
+fn context_popup_signature(shared: &Shared) -> (String, usize, usize, usize, bool) {
+    let chat = shared.chat();
+    (
+        context_overview_summary(&chat),
+        chat.context
+            .as_ref()
+            .map(|context| context.total_bytes)
+            .unwrap_or_default(),
+        chat.context
+            .as_ref()
+            .map(|context| context.included_count)
+            .unwrap_or_default(),
+        chat.context
+            .as_ref()
+            .map(|context| context.omitted_count)
+            .unwrap_or_default(),
+        chat.streaming,
+    )
+}
+
+fn close_popup_button(shared: &Shared, reader: &ThemeReader, label: &'static str) -> IconButton {
+    let s = shared.clone();
+    IconButton::new(IconGlyph::Close, label)
+        .size(26.0)
+        .icon_size(13.0)
+        .theme_when(secondary_button_theme(reader))
+        .on_press_with_ctx(move |ctx| {
+            s.chat_mut().set_composer_popup(None);
+            request_chat_window_relayout(ctx);
+        })
+}
+
+fn popup_header(
+    shared: &Shared,
+    reader: &ThemeReader,
+    title: &'static str,
+    close_label: &'static str,
+) -> impl Widget + use<> {
+    Flex::horizontal()
+        .align_items(Alignment::Center)
+        .with_child(dialog_section_label(shared, title))
+        .spacer()
+        .with_child(close_popup_button(shared, reader, close_label))
+}
+
+fn composer_model_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let selector_host = {
         let s = shared.clone();
-        let button = sui::Button::new(action.compact_label())
-            .icon(action.icon())
-            .icon_size(13.0)
-            .icon_gap(5.0)
-            .min_height(SCENARIO_ACTION_H)
-            .min_width(action.compact_min_width())
-            .padding(Insets {
-                left: 8.0,
-                top: 4.0,
-                right: 8.0,
-                bottom: 4.0,
-            })
-            .theme_when(secondary_button_theme(reader))
-            .on_press(move || {
-                s.chat_mut().apply_quick_action(action);
-            });
-        row = row.with_item(
-            SizedBox::new().height(SCENARIO_ACTION_H).with_child(button),
-            FlexItem::flex(1.0).min_width(action.compact_min_width()),
+        let r = Rc::clone(reader);
+        RebuildOnChange::new(
+            {
+                let s = s.clone();
+                move || selector_signature(&s)
+            },
+            move |_sig| selectors(&s, &r),
+        )
+    };
+    let detail = {
+        let chat = shared.chat();
+        if chat.models_loading {
+            "Refreshing available models from the provider".to_string()
+        } else if let Some(provider) = chat.current_provider() {
+            format!(
+                "{} models available for {}",
+                chat.current_models().len(),
+                provider.name
+            )
+        } else {
+            "Choose a provider before sending.".to_string()
+        }
+    };
+    let body = Stack::vertical()
+        .spacing(8.0)
+        .alignment(Alignment::Stretch)
+        .with_child(popup_header(
+            shared,
+            reader,
+            "Model selector",
+            "Close model selector",
+        ))
+        .with_child(SizedBox::new().height(SELECTOR_H).with_child(selector_host))
+        .with_child(muted_label(shared, detail));
+    WidgetPod::new(
+        Surface::new(SurfaceRole::Titlebar, InsetX::new(body, PAD))
+            .fill()
+            .theme_when(clone_reader(reader)),
+    )
+}
+
+fn composer_context_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let content = {
+        let s = shared.clone();
+        RebuildOnChange::new(
+            {
+                let s = s.clone();
+                move || context_popup_signature(&s)
+            },
+            move |_sig| {
+                let chat = s.chat();
+                let mut body = Stack::vertical()
+                    .spacing(5.0)
+                    .alignment(Alignment::Stretch)
+                    .with_child(muted_label(&s, context_overview_summary(&chat)));
+                if let Some(context) = &chat.context {
+                    body = body
+                        .with_child(muted_label(
+                            &s,
+                            format!(
+                                "Step {} · {} / {}",
+                                context.step_index,
+                                compact_line(&context.provider, 18),
+                                compact_line(&context.model, 28)
+                            ),
+                        ))
+                        .with_child(muted_label(
+                            &s,
+                            format!(
+                                "{} included · {} omitted",
+                                context_count_label(context.included_count, "source", "sources"),
+                                context_count_label(context.omitted_count, "source", "sources")
+                            ),
+                        ));
+                    let lane_total: usize = context.lanes.iter().map(|lane| lane.bytes).sum();
+                    for lane in context.lanes.iter().filter(|lane| lane.bytes > 0).take(3) {
+                        let label = if lane.label.trim().is_empty() {
+                            lane.kind.as_str()
+                        } else {
+                            lane.label.as_str()
+                        };
+                        body = body.with_child(muted_label(
+                            &s,
+                            context_lane_summary(label, lane.bytes, lane_total),
+                        ));
+                    }
+                }
+                WidgetPod::new(body)
+            },
+        )
+    };
+    let body = Stack::vertical()
+        .spacing(8.0)
+        .alignment(Alignment::Stretch)
+        .with_child(popup_header(
+            shared,
+            reader,
+            "Context",
+            "Close context details",
+        ))
+        .with_child(content);
+    WidgetPod::new(
+        Surface::new(SurfaceRole::Titlebar, InsetX::new(body, PAD))
+            .fill()
+            .theme_when(clone_reader(reader)),
+    )
+}
+
+fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let controls = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::new(
+            {
+                let s = s.clone();
+                move || attachment_signature(&s)
+            },
+            move |_sig| attachment_controls(&s, &r),
+        )
+    };
+    let body = Stack::vertical()
+        .spacing(8.0)
+        .alignment(Alignment::Stretch)
+        .with_child(popup_header(
+            shared,
+            reader,
+            "Attachments",
+            "Close attachments",
+        ))
+        .with_child(controls);
+    WidgetPod::new(
+        Surface::new(SurfaceRole::Titlebar, InsetX::new(body, PAD))
+            .fill()
+            .theme_when(clone_reader(reader)),
+    )
+}
+
+fn composer_activity_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    if shared.chat().runtime_recovery_target().is_some() {
+        let health = shared.chat().runtime_health();
+        let status = activity_status_summary(&health.detail);
+        let mut actions = Flex::horizontal().gap(8.0).align_items(Alignment::Center);
+        let mut action_count = 0usize;
+        if let Some(action) = retry_chat_list_button(shared, reader) {
+            actions = actions.with_child(action);
+            action_count += 1;
+        }
+        if let Some(action) = check_sifs_button(shared, reader) {
+            actions = actions.with_child(action);
+            action_count += 1;
+        }
+        if let Some(action) = runtime_recovery_button(shared, reader) {
+            actions = actions.with_child(action);
+            action_count += 1;
+        }
+
+        let mut body = Stack::vertical()
+            .spacing(8.0)
+            .alignment(Alignment::Stretch)
+            .with_child(popup_header(shared, reader, "Activity", "Close activity"))
+            .with_child(muted_label(
+                shared,
+                format!("{} · {}", health.label, compact_line(&status, 84)),
+            ))
+            .with_child(muted_label(shared, activity_work_summary(&shared.chat())));
+        if action_count > 0 {
+            body = body.with_child(actions);
+        }
+        return WidgetPod::new(
+            Surface::new(SurfaceRole::Titlebar, InsetX::new(body, PAD))
+                .fill()
+                .theme_when(clone_reader(reader)),
         );
     }
-    WidgetPod::new(row)
+
+    WidgetPod::new(
+        Surface::new(
+            SurfaceRole::Titlebar,
+            SizedBox::new()
+                .height(COMPOSER_POPUP_H)
+                .with_child(ActivityRail::new(shared.clone())),
+        )
+        .fill()
+        .theme_when(clone_reader(reader)),
+    )
+}
+
+fn composer_popup_panel(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    match shared.chat().composer_popup() {
+        Some(ComposerPopup::Model) => composer_model_popup(shared, reader),
+        Some(ComposerPopup::Context) => composer_context_popup(shared, reader),
+        Some(ComposerPopup::Attachments) => composer_attachments_popup(shared, reader),
+        Some(ComposerPopup::Activity) => composer_activity_popup(shared, reader),
+        None => WidgetPod::new(SizedBox::new().height(0.0)),
+    }
+}
+
+fn composer_popup_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || s.chat().composer_popup()
+        },
+        move |_popup| composer_popup_panel(&s, &r),
+    )
+}
+
+fn composer_attachment_chip(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    attachment: &PendingChatAttachment,
+) -> impl Widget + use<> {
+    let label = format!(
+        "{} · {}",
+        compact_line(&attachment.file_name, 18),
+        format_bytes(attachment.size_bytes.min(usize::MAX as u64) as usize)
+    );
+    let remove_label = format!("Remove {}", attachment.file_name);
+    let s = shared.clone();
+    let remove = IconButton::new(IconGlyph::Close, remove_label)
+        .size(22.0)
+        .icon_size(11.0)
+        .theme_when(secondary_button_theme(reader))
+        .on_press_with_ctx(move |ctx| {
+            s.chat_mut().remove_attachment(index);
+            request_chat_window_relayout(ctx);
+        });
+    let s = shared.clone();
+    SizedBox::new()
+        .width(COMPOSER_ATTACHMENT_CHIP_W)
+        .height(28.0)
+        .with_child(
+            Flex::horizontal()
+                .gap(4.0)
+                .align_items(Alignment::Center)
+                .with_item(
+                    Label::new(label)
+                        .font_size(11.0)
+                        .color_when(move || palette(&s).text_muted),
+                    FlexItem::flex(1.0).min_width(72.0),
+                )
+                .with_child(remove),
+        )
+}
+
+fn composer_attachment_inline_width(count: usize) -> f32 {
+    if count == 0 {
+        0.0
+    } else {
+        count as f32 * COMPOSER_ATTACHMENT_CHIP_W + count as f32 * 6.0 + CONTROL_ROW_H
+    }
+}
+
+fn composer_attachment_collapsed_width(count: usize) -> f32 {
+    if count == 0 { 118.0 } else { 132.0 }
+}
+
+fn composer_attachment_control_width(count: usize, inline: bool) -> f32 {
+    if inline && (1..=2).contains(&count) {
+        composer_attachment_inline_width(count)
+    } else {
+        composer_attachment_collapsed_width(count)
+    }
+}
+
+fn composer_attachments_inline_for_width(chat: &ChatState, width: f32) -> bool {
+    let count = chat.attachments.len();
+    if !(1..=2).contains(&count) {
+        return false;
+    }
+    let required = 188.0
+        + composer_attachment_inline_width(count)
+        + 98.0
+        + 78.0
+        + 96.0
+        + CONTROL_ROW_GAP * 4.0;
+    width >= required
+}
+
+fn composer_attachments_control(shared: &Shared, reader: &ThemeReader, inline: bool) -> WidgetPod {
+    let attachment_count = shared.chat().attachments.len();
+    if !inline || attachment_count == 0 || attachment_count > 2 {
+        let s = shared.clone();
+        let button = sui::Button::new(attachment_button_label(&shared.chat()))
+            .icon(IconGlyph::File)
+            .min_height(CONTROL_ROW_H)
+            .theme_when(secondary_button_theme(reader))
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut()
+                    .set_composer_popup(Some(ComposerPopup::Attachments));
+                request_chat_window_relayout(ctx);
+            });
+        return WidgetPod::new(SizedBox::new().height(CONTROL_ROW_H).with_child(button));
+    }
+
+    let mut row = Flex::horizontal().gap(6.0).align_items(Alignment::Center);
+    for (index, attachment) in shared.chat().attachments.iter().enumerate() {
+        row = row.with_child(composer_attachment_chip(shared, reader, index, attachment));
+    }
+    let s = shared.clone();
+    let add = IconButton::new(IconGlyph::Add, "Attach file")
+        .size(CONTROL_ROW_H)
+        .icon_size(14.0)
+        .theme_when(secondary_button_theme(reader))
+        .on_press_with_ctx(move |ctx| {
+            s.chat_mut()
+                .set_composer_popup(Some(ComposerPopup::Attachments));
+            request_chat_window_relayout(ctx);
+        });
+    row = row.with_child(add);
+    WidgetPod::new(SizedBox::new().height(CONTROL_ROW_H).with_child(row))
+}
+
+fn composer_attachments_control_host(
+    shared: &Shared,
+    reader: &ThemeReader,
+    inline: bool,
+) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || attachment_signature(&s)
+        },
+        move |_sig| composer_attachments_control(&s, &r, inline),
+    )
+}
+
+fn composer_control_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    inline_attachments: bool,
+) -> WidgetPod {
+    let attachment_width =
+        composer_attachment_control_width(shared.chat().attachments.len(), inline_attachments);
+    let model = {
+        let s = shared.clone();
+        WidgetPod::new(
+            sui::Button::new(model_button_label(&shared.chat()))
+                .icon(IconGlyph::Sparkles)
+                .min_height(CONTROL_ROW_H)
+                .theme_when(composer_control_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().toggle_composer_popup(ComposerPopup::Model);
+                    request_chat_window_relayout(ctx);
+                }),
+        )
+    };
+
+    let context = {
+        let s = shared.clone();
+        WidgetPod::new(
+            sui::Button::new(context_overview_summary(&shared.chat()))
+                .icon(IconGlyph::History)
+                .min_height(CONTROL_ROW_H)
+                .theme_when(secondary_button_theme(reader))
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().toggle_composer_popup(ComposerPopup::Context);
+                    request_chat_window_relayout(ctx);
+                }),
+        )
+    };
+
+    let activity = {
+        let s = shared.clone();
+        WidgetPod::new(
+            sui::Button::new(activity_button_label(&shared.chat()))
+                .icon(IconGlyph::History)
+                .min_height(CONTROL_ROW_H)
+                .theme_when(secondary_button_theme(reader))
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().toggle_activity_panel();
+                    request_chat_window_relayout(ctx);
+                }),
+        )
+    };
+
+    let call = {
+        let s = shared.clone();
+        WidgetPod::new(
+            sui::Button::new("Call")
+                .icon(IconGlyph::Chat)
+                .min_height(CONTROL_ROW_H)
+                .theme_when(secondary_button_theme(reader))
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().toggle_media_call();
+                    request_chat_window_relayout(ctx);
+                }),
+        )
+    };
+
+    WidgetPod::new(ComposerControlStrip::new(
+        model,
+        context,
+        WidgetPod::new(composer_attachments_control_host(
+            shared,
+            reader,
+            inline_attachments,
+        )),
+        activity,
+        call,
+        attachment_width,
+        inline_attachments,
+    ))
 }
 
 /// The composer's bottom row: a flexible message `TextArea` and a fixed-size action slot. The input
@@ -10826,23 +10900,15 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     WidgetPod::new(row)
 }
 
-fn composer_layout_signature(shared: &Shared) -> bool {
-    scenario_action_row_visible(&shared.chat())
+fn composer_layout_signature(shared: &Shared) -> Option<ComposerPopup> {
+    shared.chat().composer_popup()
 }
 
-fn composer_body(shared: &Shared, reader: &ThemeReader, show_scenario_actions: bool) -> WidgetPod {
-    let selector_host = {
-        let s = shared.clone();
-        let r = Rc::clone(reader);
-        RebuildOnChange::new(
-            {
-                let s = s.clone();
-                move || selector_signature(&s)
-            },
-            move |_sig| selectors(&s, &r),
-        )
-    };
-
+fn composer_body(
+    shared: &Shared,
+    reader: &ThemeReader,
+    active_popup: Option<ComposerPopup>,
+) -> WidgetPod {
     // The input row is rebuilt when the streaming flag flips (Send <-> Interrupt), when provider
     // availability changes (editable composer <-> setup-required read-only state), and when a
     // programmatic quick action replaces the draft. Normal typing does not bump the revision, so the
@@ -10866,58 +10932,44 @@ fn composer_body(shared: &Shared, reader: &ThemeReader, show_scenario_actions: b
         )
     };
 
-    let attachment_host = {
+    let controls_host = {
         let s = shared.clone();
         let r = Rc::clone(reader);
         RebuildOnChange::new(
             {
                 let s = s.clone();
-                move || attachment_signature(&s)
+                move || composer_controls_signature(&s)
             },
-            move |_sig| attachment_controls(&s, &r),
+            move |_sig| WidgetPod::new(ResponsiveComposerControlRow::new(s.clone(), Rc::clone(&r))),
         )
     };
 
-    let scenario_host = {
-        let s = shared.clone();
-        let r = Rc::clone(reader);
-        RebuildOnChange::new(
-            {
-                let s = s.clone();
-                move || scenario_action_signature(&s)
-            },
-            move |_sig| scenario_actions(&s, &r),
-        )
-    };
-
-    let stacked_chrome_h = if show_scenario_actions {
-        SCENARIO_ACTION_H + COMPOSER_SECTION_GAP * 3.0
+    let popup_h = if active_popup.is_some() {
+        COMPOSER_POPUP_H + COMPOSER_SECTION_GAP
     } else {
-        COMPOSER_SECTION_GAP * 2.0
+        0.0
     };
     let input_h =
-        (COMPOSER_H - (COMPOSER_PAD_Y * 2.0) - SELECTOR_H - ATTACHMENT_AREA_H - stacked_chrome_h)
+        (COMPOSER_H - (COMPOSER_PAD_Y * 2.0) - popup_h - CONTROL_ROW_H - COMPOSER_SECTION_GAP)
             .max(48.0);
     let mut body = Stack::vertical()
         .spacing(0.0)
         .alignment(Alignment::Stretch)
-        .with_child(SizedBox::new().height(COMPOSER_PAD_Y))
-        .with_child(InsetX::new(selector_host, PAD))
-        .with_child(SizedBox::new().height(COMPOSER_SECTION_GAP));
-    if show_scenario_actions {
+        .with_child(SizedBox::new().height(COMPOSER_PAD_Y));
+    if active_popup.is_some() {
         body = body
             .with_child(
                 SizedBox::new()
-                    .height(SCENARIO_ACTION_H)
-                    .with_child(InsetX::new(scenario_host, PAD)),
+                    .height(COMPOSER_POPUP_H)
+                    .with_child(InsetX::new(composer_popup_host(shared, reader), PAD)),
             )
             .with_child(SizedBox::new().height(COMPOSER_SECTION_GAP));
     }
     body = body
         .with_child(
             SizedBox::new()
-                .height(ATTACHMENT_AREA_H)
-                .with_child(InsetX::new(attachment_host, PAD)),
+                .height(CONTROL_ROW_H)
+                .with_child(InsetX::new(controls_host, PAD)),
         )
         .with_child(SizedBox::new().height(COMPOSER_SECTION_GAP))
         .with_child(
@@ -10985,30 +11037,11 @@ fn main_column(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             },
         )
     };
-    widgets::Dock::new(transcript)
-        .top(OVERVIEW_H, RuntimeOverview::new(shared.clone()))
-        .bottom(COMPOSER_H, composer(shared, reader))
+    widgets::Dock::new(transcript).bottom(COMPOSER_H, composer(shared, reader))
 }
 
-fn chat_work_area(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<bool> {
-    let key_shared = shared.clone();
-    let build_shared = shared.clone();
-    let build_reader = Rc::clone(reader);
-    RebuildOnChange::new(
-        move || key_shared.chat().activity_panel_visible(),
-        move |activity_visible| {
-            if *activity_visible {
-                WidgetPod::new(Split::right_fixed(
-                    main_column(&build_shared, &build_reader),
-                    ActivityRail::new(build_shared.clone()),
-                    ACTIVITY_RAIL_W,
-                    &build_reader,
-                ))
-            } else {
-                WidgetPod::new(main_column(&build_shared, &build_reader))
-            }
-        },
-    )
+fn chat_work_area(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    main_column(shared, reader)
 }
 
 fn wide_pod(
@@ -11212,7 +11245,17 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.attachments.len().hash(&mut h);
     chat.attachment_path_input.is_empty().hash(&mut h);
     chat.models_loading.hash(&mut h);
+    chat.composer_popup().hash(&mut h);
     chat.activity_panel_visible().hash(&mut h);
+    context_overview_summary(&chat).hash(&mut h);
+    chat.activity.len().hash(&mut h);
+    chat.tool_calls.len().hash(&mut h);
+    chat.control.task_count.hash(&mut h);
+    chat.control.active_turn.hash(&mut h);
+    chat.usage
+        .as_ref()
+        .and_then(|usage| usage.output_tokens)
+        .hash(&mut h);
     chat.session_id.hash(&mut h);
     chat.transcript_load_pending().hash(&mut h);
     chat.transcript_load_slow_notice_shown.hash(&mut h);
@@ -11405,6 +11448,256 @@ impl<K: PartialEq + Clone + 'static> Widget for RebuildOnChange<K> {
     }
 }
 
+struct ResponsiveComposerControlRow {
+    shared: Shared,
+    reader: ThemeReader,
+    inline_attachments: bool,
+    child: WidgetPod,
+}
+
+impl ResponsiveComposerControlRow {
+    fn new(shared: Shared, reader: ThemeReader) -> Self {
+        let inline_attachments = false;
+        let child = composer_control_row(&shared, &reader, inline_attachments);
+        Self {
+            shared,
+            reader,
+            inline_attachments,
+            child,
+        }
+    }
+
+    fn refresh_for_width(&mut self, width: f32) -> bool {
+        let inline_attachments =
+            composer_attachments_inline_for_width(&self.shared.chat(), width.max(0.0));
+        if inline_attachments == self.inline_attachments {
+            return false;
+        }
+        self.inline_attachments = inline_attachments;
+        self.child = composer_control_row(&self.shared, &self.reader, inline_attachments);
+        true
+    }
+}
+
+impl Widget for ResponsiveComposerControlRow {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        let pointer_up = matches!(
+            event,
+            Event::Pointer(pointer) if matches!(pointer.kind, PointerEventKind::Up)
+        );
+        if pointer_up && self.refresh_for_width(ctx.bounds().width()) {
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_paint();
+        }
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let width = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            constraints.min.width.max(360.0)
+        };
+        self.refresh_for_width(width);
+        self.child
+            .measure(ctx, Constraints::tight(Size::new(width, CONTROL_ROW_H)));
+        constraints.clamp(Size::new(width, CONTROL_ROW_H))
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+struct ComposerControlStrip {
+    model: WidgetPod,
+    context: WidgetPod,
+    attachments: WidgetPod,
+    activity: WidgetPod,
+    call: WidgetPod,
+    attachment_width: f32,
+    inline_attachments: bool,
+}
+
+impl ComposerControlStrip {
+    fn new(
+        model: WidgetPod,
+        context: WidgetPod,
+        attachments: WidgetPod,
+        activity: WidgetPod,
+        call: WidgetPod,
+        attachment_width: f32,
+        inline_attachments: bool,
+    ) -> Self {
+        Self {
+            model,
+            context,
+            attachments,
+            activity,
+            call,
+            attachment_width: attachment_width.max(0.0),
+            inline_attachments,
+        }
+    }
+
+    fn shrink_width(value: &mut f32, minimum: f32, deficit: &mut f32) {
+        if *deficit <= 0.0 {
+            return;
+        }
+        let removable = (*value - minimum).max(0.0).min(*deficit);
+        *value -= removable;
+        *deficit -= removable;
+    }
+
+    fn layout_widths(&self, total: f32) -> (f32, f32, f32, f32, f32, f32) {
+        let total = total.max(0.0);
+        let compact = total < 640.0;
+        let mut gap = if compact { 6.0 } else { CONTROL_ROW_GAP };
+        let mut model = if compact { 160.0 } else { 188.0 };
+        let mut attachments = self.attachment_width;
+        let mut activity = if compact { 88.0 } else { 98.0 };
+        let mut call = if compact { 70.0 } else { 78.0 };
+        let preferred_context = if compact { 72.0 } else { 96.0 };
+        let attachment_floor = if self.inline_attachments {
+            CONTROL_ROW_H
+        } else {
+            92.0
+        };
+
+        let fixed = model + attachments + activity + call + gap * 4.0;
+        let mut context = (total - fixed).max(0.0);
+        if context < preferred_context {
+            let mut deficit = preferred_context - context;
+            Self::shrink_width(&mut model, 136.0, &mut deficit);
+            Self::shrink_width(&mut attachments, attachment_floor, &mut deficit);
+            Self::shrink_width(&mut activity, 76.0, &mut deficit);
+            Self::shrink_width(&mut call, 60.0, &mut deficit);
+            let mut gap_total = gap * 4.0;
+            Self::shrink_width(&mut gap_total, 16.0, &mut deficit);
+            gap = gap_total / 4.0;
+            context = (total - (model + attachments + activity + call + gap * 4.0)).max(0.0);
+        }
+
+        let mut overflow =
+            (model + context + attachments + activity + call + gap * 4.0 - total).max(0.0);
+        Self::shrink_width(&mut context, 0.0, &mut overflow);
+        Self::shrink_width(&mut model, 96.0, &mut overflow);
+        Self::shrink_width(&mut attachments, 42.0, &mut overflow);
+        Self::shrink_width(&mut activity, 52.0, &mut overflow);
+        Self::shrink_width(&mut call, 42.0, &mut overflow);
+        let mut gap_total = gap * 4.0;
+        Self::shrink_width(&mut gap_total, 0.0, &mut overflow);
+        gap = gap_total / 4.0;
+
+        (model, context, attachments, activity, call, gap)
+    }
+
+    fn layout_rects(&self, bounds: Rect) -> (Rect, Rect, Rect, Rect, Rect) {
+        let (model_w, context_w, attachment_w, activity_w, call_w, gap) =
+            self.layout_widths(bounds.width());
+        let mut x = bounds.x();
+        let y = bounds.y();
+        let h = bounds.height();
+        let model = Rect::new(x, y, model_w, h);
+        x += model_w + gap;
+        let context = Rect::new(x, y, context_w, h);
+        x += context_w + gap;
+        let attachments = Rect::new(x, y, attachment_w, h);
+        x += attachment_w + gap;
+        let activity = Rect::new(x, y, activity_w, h);
+        x += activity_w + gap;
+        let call = Rect::new(x, y, call_w, h);
+        (model, context, attachments, activity, call)
+    }
+
+    fn measure_child(pod: &mut WidgetPod, ctx: &mut MeasureCtx, rect: Rect) {
+        pod.measure(
+            ctx,
+            Constraints::tight(Size::new(rect.width(), rect.height())),
+        );
+    }
+}
+
+impl Widget for ComposerControlStrip {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let width = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            constraints.min.width.max(360.0)
+        };
+        let height = if constraints.max.height.is_finite() {
+            constraints.max.height
+        } else {
+            constraints.min.height.max(CONTROL_ROW_H)
+        };
+        let bounds = Rect::new(0.0, 0.0, width, height);
+        let (model, context, attachments, activity, call) = self.layout_rects(bounds);
+        Self::measure_child(&mut self.model, ctx, model);
+        Self::measure_child(&mut self.context, ctx, context);
+        Self::measure_child(&mut self.attachments, ctx, attachments);
+        Self::measure_child(&mut self.activity, ctx, activity);
+        Self::measure_child(&mut self.call, ctx, call);
+        constraints.clamp(Size::new(width, height))
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let (model, context, attachments, activity, call) = self.layout_rects(bounds);
+        self.model.arrange(ctx, model);
+        self.context.arrange(ctx, context);
+        self.attachments.arrange(ctx, attachments);
+        self.activity.arrange(ctx, activity);
+        self.call.arrange(ctx, call);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.model.paint(ctx);
+        self.context.paint(ctx);
+        self.attachments.paint(ctx);
+        self.activity.paint(ctx);
+        self.call.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.model.semantics(ctx);
+        self.context.semantics(ctx);
+        self.attachments.semantics(ctx);
+        self.activity.semantics(ctx);
+        self.call.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.model);
+        visitor.visit(&self.context);
+        visitor.visit(&self.attachments);
+        visitor.visit(&self.activity);
+        visitor.visit(&self.call);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.model);
+        visitor.visit(&mut self.context);
+        visitor.visit(&mut self.attachments);
+        visitor.visit(&mut self.activity);
+        visitor.visit(&mut self.call);
+    }
+}
+
 struct ComposerInputRow {
     input: WidgetPod,
     action: WidgetPod,
@@ -11536,21 +11829,6 @@ impl Split {
             right: WidgetPod::new(right),
             fixed_width: left_width.max(0.0),
             fixed_is_left: true,
-        }
-    }
-
-    /// Right pane fixed `right_width`, left pane flexible.
-    fn right_fixed<L, R>(left: L, right: R, right_width: f32, reader: &ThemeReader) -> Self
-    where
-        L: Widget + 'static,
-        R: Widget + 'static,
-    {
-        Self {
-            left: WidgetPod::new(left),
-            separator: WidgetPod::new(Separator::vertical().theme_when(clone_reader(reader))),
-            right: WidgetPod::new(right),
-            fixed_width: right_width.max(0.0),
-            fixed_is_left: false,
         }
     }
 
@@ -11760,6 +12038,14 @@ mod tests {
         let path = dir.join(file_name);
         std::fs::write(&path, contents).expect("write temp attachment");
         TempAttachmentFile { path, dir }
+    }
+
+    fn pending_attachment(file_name: &str, size_bytes: u64) -> PendingChatAttachment {
+        PendingChatAttachment {
+            path: PathBuf::from(format!("C:\\tmp\\{file_name}")),
+            file_name: file_name.to_string(),
+            size_bytes,
+        }
     }
 
     #[test]
@@ -13694,7 +13980,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_started_chat_keeps_scenario_actions_available() -> sui::Result<()> {
+    fn rendered_started_chat_uses_single_control_row_popups() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -13715,41 +14001,53 @@ mod tests {
         let runtime = sui::Application::new()
             .window(
                 sui::WindowBuilder::new()
-                    .title("Started chat scenario actions")
+                    .title("Started chat control row")
                     .root(view(shared.clone())),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
-        for label in ["Code", "Doc", "Attach", "Role", "Cluster"] {
+        for label in ["Code", "Doc", "Role", "Cluster"] {
             assert_eq!(
                 window
                     .get_by_role(SemanticsRole::Button)
                     .with_name(label)
                     .count()?,
-                1,
-                "{label} scenario action should stay available after a chat has history"
+                0,
+                "{label} compact scenario action should not render in the composer control row"
             );
         }
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Doc")
+            .with_name("OpenAI / gpt-5")
             .click()?;
+        assert_eq!(
+            window.get_by_text("Model selector").count()?,
+            1,
+            "model button should open the model selector popup"
+        );
 
-        let chat = shared.chat();
-        let prompt = ChatQuickAction::DraftDocument
-            .prompt()
-            .expect("document prompt");
-        assert_eq!(chat.input, prompt);
-        assert_eq!(chat.cursor, prompt.len());
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Close model selector")
+            .click()?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Context will refresh on the next send")
+            .click()?;
+        assert_eq!(
+            window.get_by_text("Context").count()?,
+            1,
+            "context bar should open context details"
+        );
 
         Ok(())
     }
 
     #[test]
-    fn rendered_started_channel_scenario_manage_opens_edit_dialog() -> sui::Result<()> {
+    fn rendered_started_channel_hides_compact_manage_action() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         let channel_id = SessionId::generate().to_string();
@@ -13778,7 +14076,7 @@ mod tests {
         let runtime = sui::Application::new()
             .window(
                 sui::WindowBuilder::new()
-                    .title("Started channel scenario actions")
+                    .title("Started channel control row")
                     .root(view(shared.clone())),
             )
             .build()?;
@@ -13791,19 +14089,18 @@ mod tests {
                     .get_by_role(SemanticsRole::Button)
                     .with_name(label)
                     .count()?,
-                1,
-                "{label} channel scenario action should stay available after channel history"
+                0,
+                "{label} compact channel action should not render in the composer control row"
             );
         }
 
-        window
-            .get_by_role(SemanticsRole::Button)
-            .with_name("Manage")
-            .click()?;
         assert_eq!(
-            shared.chat().session_edit_id.as_deref(),
-            Some(channel_id.as_str()),
-            "Manage should open the same channel edit dialog as the sidebar row action"
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Activity")
+                .count()?,
+            1,
+            "the started channel should still expose the activity popup button"
         );
 
         Ok(())
@@ -14770,7 +15067,7 @@ mod tests {
 
         assert!(
             !state.activity_panel_visible(),
-            "ready idle chat should leave the activity rail closed"
+            "ready idle chat should leave the activity popup closed"
         );
 
         state.toggle_activity_panel();
@@ -14781,7 +15078,7 @@ mod tests {
         state.streaming = true;
         assert!(
             !state.activity_panel_visible(),
-            "active streaming should stay in the overview unless the user opens Monitor"
+            "active streaming should keep the activity popup closed until the user opens Monitor"
         );
         assert_eq!(activity_button_label(&state), "Monitor");
         state.toggle_activity_panel();
@@ -14799,9 +15096,10 @@ mod tests {
             ActivityTone::Warn,
         );
         assert!(
-            state.activity_panel_visible(),
-            "connection warnings should force the activity rail open"
+            !state.activity_panel_visible(),
+            "connection warnings should change the button label without forcing a popup open"
         );
+        assert_eq!(activity_button_label(&state), "Review");
     }
 
     #[test]
@@ -15033,7 +15331,7 @@ mod tests {
             .click()?;
         assert!(
             shared.chat().activity_panel_visible(),
-            "Activity button should open the idle activity rail"
+            "Activity button should open the idle activity popup"
         );
 
         window
@@ -15042,7 +15340,7 @@ mod tests {
             .click()?;
         assert!(
             !shared.chat().activity_panel_visible(),
-            "Activity button should close the idle activity rail"
+            "Activity button should close the idle activity popup"
         );
 
         Ok(())
@@ -15073,7 +15371,7 @@ mod tests {
 
         assert!(
             !shared.chat().activity_panel_visible(),
-            "running state should not force the activity rail open"
+            "running state should not force the activity popup open"
         );
         assert_eq!(
             window
@@ -15081,7 +15379,7 @@ mod tests {
                 .with_name("Close activity")
                 .count()?,
             0,
-            "the right rail should not be mounted until Monitor is opened"
+            "the activity popup should not be mounted until Monitor is opened"
         );
 
         window
@@ -15138,7 +15436,7 @@ mod tests {
             .click()?;
         assert!(
             !shared.chat().activity_panel_visible(),
-            "Close activity should hide a manually-opened idle activity rail"
+            "Close activity should hide a manually-opened idle activity popup"
         );
 
         Ok(())
@@ -15221,7 +15519,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_media_call_controls_are_hidden_until_opened_from_overview() -> sui::Result<()> {
+    fn rendered_call_button_starts_media_call_and_opens_controls() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -15270,6 +15568,7 @@ mod tests {
             .get_by_role(SemanticsRole::Button)
             .with_name("Call")
             .click()?;
+        assert!(shared.chat().media_call.active);
         assert!(shared.chat().media_call_details_visible());
         assert_eq!(
             window
@@ -15281,7 +15580,7 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Start media call")
+                .with_name("End media call")
                 .count()?,
             1
         );
@@ -15306,15 +15605,15 @@ mod tests {
             .click()?;
         assert!(!shared.chat().media_call_details_visible());
         assert!(
-            !shared.chat().media_call_panel_visible(),
-            "hiding inactive controls should remove the media row again"
+            shared.chat().media_call_panel_visible(),
+            "hiding active controls should keep the compact media row visible"
         );
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Start media call")
+                .with_name("Show media controls")
                 .count()?,
-            0
+            1
         );
 
         Ok(())
@@ -15351,13 +15650,6 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Live call")
-                .count()?,
-            1
-        );
-        assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
                 .with_name("Show media controls")
                 .count()?,
             1,
@@ -15388,7 +15680,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_rail_detail_toggle_expands_latest_warning() -> sui::Result<()> {
+    fn activity_review_popup_exposes_recovery_actions() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -15412,34 +15704,41 @@ mod tests {
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
-        window
-            .get_by_role(SemanticsRole::Button)
-            .with_name("Show detail")
-            .with_description("Activity detail")
-            .click()?;
-
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Hide detail")
-                .with_description("Activity detail")
+                .with_name("Check SIFS")
                 .count()?,
-            1
+            1,
+            "the empty recovery card should expose one SIFS diagnostic action"
         );
-
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Hide detail")
-            .with_description("Activity detail")
+            .with_name("Review")
             .click()?;
-
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Check SIFS")
+                .count()?,
+            2,
+            "opening Activity should add the popup SIFS diagnostic action"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Connection")
+                .count()?,
+            1,
+            "storage recovery should expose connection settings"
+        );
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
                 .with_name("Show detail")
-                .with_description("Activity detail")
                 .count()?,
-            1
+            0,
+            "recovery activity now uses direct action buttons instead of the detail rail"
         );
 
         Ok(())
@@ -16108,6 +16407,10 @@ mod tests {
 
         window
             .get_by_role(SemanticsRole::Button)
+            .with_name("Review")
+            .click()?;
+        window
+            .get_by_role(SemanticsRole::Button)
             .with_name("Retry chat list")
             .click()?;
 
@@ -16346,7 +16649,7 @@ mod tests {
         ))))?;
         app.run_until_idle()?;
 
-        let pos = Point::new(580.0, 402.0);
+        let pos = Point::new(724.0, 296.0);
         root.dispatch_event(Event::Pointer(PointerEvent::new(
             PointerEventKind::Move,
             pos,
@@ -16450,15 +16753,19 @@ mod tests {
                 .with_name("Retry chat list")
                 .count()?,
             0,
-            "the footer should not offer chat-list retry for channel failures"
+            "the activity popup should not offer chat-list retry for channel failures"
         );
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Review")
+            .click()?;
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
                 .with_name("Check SIFS")
                 .count()?,
             1,
-            "the footer should still expose the SIFS diagnostic path for channel failures"
+            "the activity popup should expose the SIFS diagnostic path for channel failures"
         );
 
         window
@@ -16499,6 +16806,10 @@ mod tests {
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Review")
+            .click()?;
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Connection")
@@ -16829,6 +17140,73 @@ mod tests {
                 .with_name("Hide attachment field")
                 .count()?,
             0
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_attachment_chips_collapse_when_control_row_is_narrow() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+            chat.attachments
+                .push(pending_attachment("report-a.txt", 1_024));
+            chat.attachments
+                .push(pending_attachment("report-b.txt", 2_048));
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat attachment responsive controls")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Remove report-a.txt")
+                .count()?,
+            1,
+            "desktop-width composer should show removable attachment chips"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("2 attachments")
+                .count()?,
+            0
+        );
+
+        window
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                560.0, 720.0,
+            ))))?;
+        window.run_until_idle()?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Remove report-a.txt")
+                .count()?,
+            0,
+            "narrow composer should collapse attachment chips"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("2 attachments")
+                .count()?,
+            1,
+            "narrow composer should expose attachments through the dropdown"
         );
 
         Ok(())
