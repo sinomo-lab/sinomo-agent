@@ -1,31 +1,40 @@
-//! Local-first distributed filesystem metadata skeleton.
+//! Distributed filesystem services, storage, protocol, and operator APIs.
+//!
+//! `sinomo-dfs` owns Sinomo filesystem semantics: SIFS bootstrap data,
+//! metadata shards and journals, content storage, repair, replication, POSIX
+//! operations, object-RPC routes, and the networked DFS service. The public
+//! interface is intentionally exported from this crate root so callers do not
+//! couple to the internal module layout.
 
 mod cluster_service;
-pub mod content_store;
-pub mod control_plane;
+mod content_store;
+mod control_plane;
 mod default_cluster;
 mod direct_read;
-pub mod discovery;
-pub mod distributed;
+mod discovery;
+mod distributed;
 mod endpoint_transport;
 mod error;
 mod identity;
 mod intent;
-pub mod local_owned;
+mod local_owned;
 mod local_service;
 mod local_state;
 mod maintenance;
 mod message_transport;
-pub mod metadata_backend;
+mod metadata_backend;
+mod metadata_io;
+mod metadata_journal;
+mod metadata_keys;
 mod metadata_records;
 mod metadata_replication;
 mod model;
 mod module_surface;
 mod mounted_sifs;
-pub mod namespace;
-pub mod operator;
-pub mod posix;
-pub mod protocol;
+mod namespace;
+mod operator;
+mod posix;
+mod protocol;
 mod repair;
 mod routes;
 mod service;
@@ -284,7 +293,8 @@ pub use mounted_sifs::{MountedSifsService, OpenedMountedSifsService, open_mounte
 pub use namespace::{
     SIFS_NODES_PATH, SIFS_ROOT_PATH, SIFS_SERVICES_PATH, SIFS_SINOMO_PATH, SIFS_USERS_PATH,
     directory_object, distributed_sifs, distributed_sifs_bootstrap_objects,
-    distributed_sifs_bootstrap_objects_for_nodes, sifs_node_files_path, sifs_node_path,
+    distributed_sifs_bootstrap_objects_for_nodes, object_id_for_path, sifs_node_files_path,
+    sifs_node_path,
 };
 pub(crate) use namespace::{
     metadata_path, namespace_transaction_id_for_batch, namespace_transaction_id_for_object,
@@ -357,9 +367,13 @@ pub(crate) use service_content::object_content_identity;
 pub(crate) use service_outbound::read_small_blob_from_reader;
 pub(crate) use service_repair::DFS_CHUNK_TRANSFER_IDLE_TIMEOUT;
 
+/// Identifier for a DFS filesystem such as the default `sifs`.
 pub type DfsFileSystemId = sinomo_core::Id;
+/// Identifier for a node participating in DFS placement or routing.
 pub type DfsNodeId = NodeId;
+/// Identifier for a DFS object within a filesystem.
 pub type DfsObjectId = sinomo_core::Id;
+/// Identifier for a committed DFS object version.
 pub type DfsVersion = sinomo_core::Id;
 
 pub use service::{
@@ -367,29 +381,30 @@ pub use service::{
     DfsService, register_data_plane_services, register_services,
 };
 pub(crate) use service_state::{
-    ActiveReplicaStage, CachedSifsMetadataShards, NetworkedDfsRangeReadStream,
-    NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadStream, NetworkedDfsReadStreamOutcome,
-    PendingMetadataReplication, PendingRemoteWriteResponse, PendingRoutedNamespaceOp,
-    PendingRoutedNamespaceResult, PendingRoutedWrite, StageBlobSendOutcome,
-    retained_networked_dfs_service_events,
+    ActiveReplicaStage, CachedSifsMetadataShards, DFS_BLOB_INLINE_LIMIT_BYTES,
+    DFS_CONFLICT_SCAN_PAGE_SIZE, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
+    DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT, DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH,
+    DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE, DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
+    DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE, DFS_METADATA_OBJECT_VERSION_PAGE_SIZE,
+    DFS_REMOTE_READ_RETRY_DELAY, DFS_ROUTED_NAMESPACE_IDLE_WAIT,
+    DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT, DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT,
+    NetworkedDfsRangeReadStream, NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadStream,
+    NetworkedDfsReadStreamOutcome, PendingMetadataReplication, PendingRemoteWriteResponse,
+    PendingRoutedNamespaceOp, PendingRoutedNamespaceResult, PendingRoutedWrite,
+    StageBlobSendOutcome, retained_networked_dfs_service_events,
 };
 pub use service_state::{
+    DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT,
     DfsConfirmedTimeoutAction, DfsConfirmedTimeoutOutcome, DfsConflictReadView,
-    DfsMetadataReplicationOutcome, DfsOwnerHandoffOutcome, DfsReconnectReconciliation,
-    NetworkedDfsRangeReadOutcome, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
-    NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
+    DfsMessageProcessResult, DfsMetadataReplicationOutcome, DfsOwnerHandoffOutcome,
+    DfsReconnectReconciliation, NetworkedDfsRangeReadOutcome, NetworkedDfsReadFreshness,
+    NetworkedDfsReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
+    NetworkedDfsWriteOutcome,
 };
 pub(crate) use service_trace::{
     dfs_distributed_write_result_trace_label, dfs_namespace_operation_trace_label,
     dfs_network_message_trace_label, dfs_perf_trace, dfs_perf_trace_enabled,
 };
-#[cfg(test)]
-use sinomo_core::DfsObjectPolicy;
-use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
-#[cfg(test)]
-use sinomo_events::EventId;
-#[cfg(test)]
-use sinomo_network::NetworkError;
 use sinomo_node::NodeId;
 pub(crate) use smoke::run_cluster_dfs_smoke_with_message_sender;
 pub use smoke::{
@@ -400,12 +415,6 @@ pub use smoke::{
 pub(crate) use smoke::{
     dfs_smoke_content_node_ids, dfs_smoke_replica_candidate_sets, run_cluster_dfs_smoke,
 };
-use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
-use std::io::Read;
-use std::time::{Duration, Instant};
-#[cfg(test)]
-use time::OffsetDateTime;
 #[cfg(test)]
 use transfer::{
     DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES, DFS_BLOB_CHUNK_BYTES, DFS_LAN_CHUNK_WINDOW_SIZE,
@@ -414,85 +423,5 @@ use transfer::{
     repair_replica_chunk_start_and_window, repair_retry_delay_ticks,
     repair_transfer_inflight_timeout_ticks,
 };
-use transfer::{
-    InProgressBlobTransfer, InProgressFetchBlobTransfer, InProgressPatchTransfer,
-    InProgressReadMemoryTransfer, InProgressReadTransfer, PendingNetworkedRead,
-    PendingNetworkedWrite,
-};
-
-pub(crate) const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 1024 * 1024;
-const DFS_REMOTE_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
-const DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE: usize = 4096;
-const DFS_METADATA_OBJECT_VERSION_PAGE_SIZE: usize = 1024;
-const DFS_METADATA_OBJECT_INTENT_PAGE_SIZE: usize = 1024;
-const DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE: usize = 1024;
-#[cfg(not(test))]
-const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 1024;
-#[cfg(test)]
-const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 2;
-
-#[derive(Debug)]
-pub struct NetworkedDfsService<T> {
-    node_id: NodeId,
-    metadata: DfsMetadataStore,
-    tombstones_by_metadata_path: BTreeMap<(DfsFileSystemId, String), DfsObjectMetadata>,
-    content: LocalContentStore,
-    coordinator: DistributedEventualCoordinator,
-    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
-    cached_sifs_metadata_shards: Option<CachedSifsMetadataShards>,
-    metadata_backend: Option<Box<dyn DfsMetadataBackend>>,
-    active_replica_stages: BTreeMap<DfsObjectId, ActiveReplicaStage>,
-    pending_writes: BTreeMap<String, PendingNetworkedWrite>,
-    pending_reads: BTreeMap<String, PendingNetworkedRead>,
-    repair_attempt_records: BTreeMap<(String, NodeId), DfsRepairAttemptRecord>,
-    transient_remote_read_pruned_locations:
-        BTreeMap<(DfsObjectId, DfsVersion, Option<String>), BTreeSet<NodeId>>,
-    incoming_read_transfers: BTreeMap<String, InProgressReadTransfer>,
-    incoming_read_memory_transfers: BTreeMap<String, InProgressReadMemoryTransfer>,
-    incoming_fetch_transfers: BTreeMap<String, InProgressFetchBlobTransfer>,
-    incoming_blob_transfers: BTreeMap<String, InProgressBlobTransfer>,
-    incoming_patch_transfers: BTreeMap<String, InProgressPatchTransfer>,
-    metadata_replication_cursors: BTreeMap<(NodeId, DfsMetadataShardId), u64>,
-    recent_namespace_freshness_syncs:
-        BTreeMap<(DfsFileSystemId, DfsMetadataShardId, NodeId), Instant>,
-    pending_metadata_replications: BTreeMap<String, PendingMetadataReplication>,
-    pending_routed_writes: BTreeMap<String, PendingRoutedWrite>,
-    pending_remote_write_responses: BTreeMap<String, PendingRemoteWriteResponse>,
-    deferred_routed_create_parent_touches: BTreeSet<String>,
-    deferred_untracked_routed_write_responses: BTreeMap<String, DfsObjectId>,
-    pending_routed_namespace_ops: BTreeMap<String, PendingRoutedNamespaceOp>,
-    routed_namespace_settle_depth: usize,
-    cross_shard_namespace_locks: BTreeSet<(DfsFileSystemId, String)>,
-    last_events: Vec<NetworkedDfsServiceEvent>,
-    transport: T,
-    repair_retry_tick: u64,
-    next_frame_id: u64,
-    next_message_id: u64,
-    next_request_id: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct DfsMessageProcessResult {
-    pub response: DfsMessageResponse,
-    pub events: Vec<NetworkedDfsServiceEvent>,
-}
-
-const DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT: usize = 8;
-// Cross-shard coordination (rename/hardlink sagas) does several primary-to-
-// primary roundtrips plus journal publication before the requester's answer;
-// over bridge-relayed segments that legitimately exceeds a small budget.
-pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Nested coordination depth (serving a namespace request while settling
-/// another) beyond which new coordination rejects as Busy instead of growing
-/// the stack.
-const DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH: usize = 8;
-/// Journal batches a primary ships in one routed-operation response.
-pub const DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT: usize = 16;
-const DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT: usize = 3;
-const DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT: u64 = DFS_BLOB_INLINE_LIMIT_BYTES as u64;
-const DFS_ROUTED_NAMESPACE_IDLE_WAIT: Duration = Duration::from_millis(10);
-
-const DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES: usize = 64;
-
 #[cfg(test)]
 mod tests;

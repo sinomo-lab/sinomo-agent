@@ -9657,7 +9657,7 @@ fn networked_sifs_remote_read_returns_after_all_locations_miss() {
         .bootstrap_distributed_sifs()
         .expect("reader bootstrap");
     let path = "/services/missing-content.txt";
-    let object_id = sinomo_dfs::namespace::object_id_for_path(path);
+    let object_id = sinomo_dfs::object_id_for_path(path);
     let metadata = DfsObjectMetadata {
         object_id: object_id.clone(),
         file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),

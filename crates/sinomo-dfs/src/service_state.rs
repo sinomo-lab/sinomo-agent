@@ -1,16 +1,100 @@
-//! Networked DFS service outcome, event, and pending-state types.
+//! Networked DFS service state, outcome, event, and pending-state types.
 
-use std::time::Instant;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sinomo_node::NodeId;
 
-use crate::{
-    DfsBulkReadItemResponse, DfsConflictRecord, DfsConflictStatus, DfsDistributedWriteCommand,
-    DfsDistributedWriteResult, DfsError, DfsFileSystemId, DfsMetadataShardConfig,
-    DfsMetadataShardId, DfsNamespaceResult, DfsObjectId, DfsObjectMetadata, DfsReadData,
-    DfsReadRangeData, DfsReadResult, DfsVersion, DistributedRepairJob, ObjectVersionReader,
+use crate::transfer::{
+    InProgressBlobTransfer, InProgressFetchBlobTransfer, InProgressPatchTransfer,
+    InProgressReadMemoryTransfer, InProgressReadTransfer, PendingNetworkedRead,
+    PendingNetworkedWrite,
 };
+use crate::{
+    DfsBulkReadItemResponse, DfsConflictRecord, DfsConflictStatus, DfsControlPlaneKvClient,
+    DfsDistributedWriteCommand, DfsDistributedWriteResult, DfsError, DfsFileSystemId,
+    DfsMessageResponse, DfsMetadataBackend, DfsMetadataShardConfig, DfsMetadataShardId,
+    DfsMetadataStore, DfsNamespaceResult, DfsObjectId, DfsObjectMetadata, DfsReadData,
+    DfsReadRangeData, DfsReadResult, DfsRepairAttemptRecord, DfsVersion,
+    DistributedEventualCoordinator, DistributedRepairJob, LocalContentStore, ObjectVersionReader,
+};
+
+pub(crate) const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 1024 * 1024;
+pub(crate) const DFS_REMOTE_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
+pub(crate) const DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE: usize = 4096;
+pub(crate) const DFS_METADATA_OBJECT_VERSION_PAGE_SIZE: usize = 1024;
+pub(crate) const DFS_METADATA_OBJECT_INTENT_PAGE_SIZE: usize = 1024;
+pub(crate) const DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE: usize = 1024;
+#[cfg(not(test))]
+pub(crate) const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 1024;
+#[cfg(test)]
+pub(crate) const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 2;
+
+pub(crate) const DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT: usize = 8;
+// Cross-shard coordination (rename/hardlink sagas) does several primary-to-
+// primary roundtrips plus journal publication before the requester's answer;
+// over bridge-relayed segments that legitimately exceeds a small budget.
+pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Nested coordination depth (serving a namespace request while settling
+/// another) beyond which new coordination rejects as Busy instead of growing
+/// the stack.
+pub(crate) const DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH: usize = 8;
+/// Journal batches a primary ships in one routed-operation response.
+pub const DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT: usize = 16;
+pub(crate) const DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT: usize = 3;
+pub(crate) const DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT: u64 = DFS_BLOB_INLINE_LIMIT_BYTES as u64;
+pub(crate) const DFS_ROUTED_NAMESPACE_IDLE_WAIT: Duration = Duration::from_millis(10);
+
+pub(crate) const DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES: usize = 64;
+
+/// Stateful networked DFS data-plane and metadata coordinator.
+#[derive(Debug)]
+pub struct NetworkedDfsService<T> {
+    pub(crate) node_id: NodeId,
+    pub(crate) metadata: DfsMetadataStore,
+    pub(crate) tombstones_by_metadata_path: BTreeMap<(DfsFileSystemId, String), DfsObjectMetadata>,
+    pub(crate) content: LocalContentStore,
+    pub(crate) coordinator: DistributedEventualCoordinator,
+    pub(crate) control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    pub(crate) cached_sifs_metadata_shards: Option<CachedSifsMetadataShards>,
+    pub(crate) metadata_backend: Option<Box<dyn DfsMetadataBackend>>,
+    pub(crate) active_replica_stages: BTreeMap<DfsObjectId, ActiveReplicaStage>,
+    pub(crate) pending_writes: BTreeMap<String, PendingNetworkedWrite>,
+    pub(crate) pending_reads: BTreeMap<String, PendingNetworkedRead>,
+    pub(crate) repair_attempt_records: BTreeMap<(String, NodeId), DfsRepairAttemptRecord>,
+    pub(crate) transient_remote_read_pruned_locations:
+        BTreeMap<(DfsObjectId, DfsVersion, Option<String>), BTreeSet<NodeId>>,
+    pub(crate) incoming_read_transfers: BTreeMap<String, InProgressReadTransfer>,
+    pub(crate) incoming_read_memory_transfers: BTreeMap<String, InProgressReadMemoryTransfer>,
+    pub(crate) incoming_fetch_transfers: BTreeMap<String, InProgressFetchBlobTransfer>,
+    pub(crate) incoming_blob_transfers: BTreeMap<String, InProgressBlobTransfer>,
+    pub(crate) incoming_patch_transfers: BTreeMap<String, InProgressPatchTransfer>,
+    pub(crate) metadata_replication_cursors: BTreeMap<(NodeId, DfsMetadataShardId), u64>,
+    pub(crate) recent_namespace_freshness_syncs:
+        BTreeMap<(DfsFileSystemId, DfsMetadataShardId, NodeId), Instant>,
+    pub(crate) pending_metadata_replications: BTreeMap<String, PendingMetadataReplication>,
+    pub(crate) pending_routed_writes: BTreeMap<String, PendingRoutedWrite>,
+    pub(crate) pending_remote_write_responses: BTreeMap<String, PendingRemoteWriteResponse>,
+    pub(crate) deferred_routed_create_parent_touches: BTreeSet<String>,
+    pub(crate) deferred_untracked_routed_write_responses: BTreeMap<String, DfsObjectId>,
+    pub(crate) pending_routed_namespace_ops: BTreeMap<String, PendingRoutedNamespaceOp>,
+    pub(crate) routed_namespace_settle_depth: usize,
+    pub(crate) cross_shard_namespace_locks: BTreeSet<(DfsFileSystemId, String)>,
+    pub(crate) last_events: Vec<NetworkedDfsServiceEvent>,
+    pub(crate) transport: T,
+    pub(crate) repair_retry_tick: u64,
+    pub(crate) next_frame_id: u64,
+    pub(crate) next_message_id: u64,
+    pub(crate) next_request_id: u64,
+}
+
+/// Result from serving one DFS message command through a networked service.
+#[derive(Clone, Debug)]
+pub struct DfsMessageProcessResult {
+    pub response: DfsMessageResponse,
+    pub events: Vec<NetworkedDfsServiceEvent>,
+}
 
 /// Result of a networked DFS write after the service has applied routing,
 /// policy, and replica-receipt rules.

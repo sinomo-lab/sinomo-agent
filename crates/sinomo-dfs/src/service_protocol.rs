@@ -7,8 +7,9 @@
 //! with the remaining transfer protocol code.
 
 use std::collections::BTreeSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use sinomo_core::DfsWriteRequest;
 use sinomo_node::NodeId;
 
 use crate::*;

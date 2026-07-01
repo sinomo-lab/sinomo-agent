@@ -15,6 +15,7 @@ use sinomo_events::EventId;
 use sinomo_node::NodeId;
 use time::OffsetDateTime;
 
+use crate::transfer::PendingNetworkedWrite;
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {

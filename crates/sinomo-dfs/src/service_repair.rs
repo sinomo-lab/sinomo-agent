@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use sinomo_node::NodeId;
 
 use crate::transfer::{
-    DFS_REPAIR_RETRY_SUPPRESSED_TICK, fetch_inflight_timeout_ticks,
+    DFS_REPAIR_RETRY_SUPPRESSED_TICK, PendingNetworkedWrite, fetch_inflight_timeout_ticks,
     repair_retry_delay_nanos_for_ticks, repair_retry_delay_ticks, repair_retry_state_is_suppressed,
     repair_transfer_inflight_timeout_ticks, stage_inflight_retry_delay_ticks,
     wake_repair_retry_state,

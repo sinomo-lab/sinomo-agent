@@ -15,7 +15,7 @@ use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_events::EventId;
 use sinomo_node::NodeId;
 
-use crate::transfer::PendingNetworkedWritePatch;
+use crate::transfer::{PendingNetworkedWrite, PendingNetworkedWritePatch};
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {

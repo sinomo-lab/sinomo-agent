@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 
+use sinomo_core::DfsWriteReceipt;
 use sinomo_events::EventId;
 use time::OffsetDateTime;
 
