@@ -16,6 +16,7 @@ use crate::transfer::{
     blob_transfer_key, chunk_hash, chunk_prefix_bytes, dfs_byte_count_to_usize,
     fetch_response_window_end, range_transfer_size_bytes, read_response_window_range_len,
     validate_chunk_bytes, validate_chunk_hash, validate_chunked_transfer_shape,
+    wake_repair_retry_state,
 };
 use crate::*;
 
