@@ -74,6 +74,8 @@ mod service_protocol;
 mod service_read;
 mod service_repair;
 mod service_replica;
+mod service_routed_journal;
+mod service_routed_write;
 mod service_state;
 mod service_trace;
 mod service_transfer;

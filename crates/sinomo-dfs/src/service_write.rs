@@ -1649,6 +1649,45 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(outcome)
     }
 
+    fn metadata_primary_unroutable_error(
+        shard: &DfsMetadataShardConfig,
+        primary_node_id: &NodeId,
+    ) -> DfsError {
+        DfsError::Network {
+            message: format!(
+                "metadata shard {} primary {} is not routable",
+                shard.shard_id, primary_node_id
+            ),
+        }
+    }
+
+    fn track_pending_routed_write(
+        &mut self,
+        request_id: String,
+        object_id: DfsObjectId,
+        primary_node_id: NodeId,
+        command: DfsDistributedWriteCommand,
+    ) -> NetworkedDfsWriteOutcome {
+        self.pending_routed_writes.insert(
+            request_id.clone(),
+            PendingRoutedWrite {
+                object_id,
+                primary_node_id,
+                command,
+                authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
+                remote_intent_id: None,
+                durable_receipts: 0,
+                required_receipts: 1,
+                result: None,
+            },
+        );
+        NetworkedDfsWriteOutcome::Pending {
+            intent_id: request_id,
+            durable_receipts: 0,
+            required_receipts: 1,
+        }
+    }
+
     pub(crate) fn route_distributed_write_to_metadata_primary(
         &mut self,
         request: DfsWriteRequest,
@@ -1692,31 +1731,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNetworkMessage::DistributedWriteRequest(command.clone()),
         )?;
         if !sent {
-            return Err(DfsError::Network {
-                message: format!(
-                    "metadata shard {} primary {} is not routable",
-                    shard.shard_id, primary_node_id
-                ),
-            });
+            return Err(Self::metadata_primary_unroutable_error(
+                &shard,
+                &primary_node_id,
+            ));
         }
-        self.pending_routed_writes.insert(
-            request_id.clone(),
-            PendingRoutedWrite {
-                object_id: object.object_id,
-                primary_node_id,
-                command,
-                authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
-                remote_intent_id: None,
-                durable_receipts: 0,
-                required_receipts: 1,
-                result: None,
-            },
-        );
-        Ok(NetworkedDfsWriteOutcome::Pending {
-            intent_id: request_id,
-            durable_receipts: 0,
-            required_receipts: 1,
-        })
+        Ok(self.track_pending_routed_write(request_id, object.object_id, primary_node_id, command))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1764,31 +1784,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.send_dfs_message_if_routable(&primary_node_id, message)?
         };
         if !sent {
-            return Err(DfsError::Network {
-                message: format!(
-                    "metadata shard {} primary {} is not routable",
-                    shard.shard_id, primary_node_id
-                ),
-            });
+            return Err(Self::metadata_primary_unroutable_error(
+                &shard,
+                &primary_node_id,
+            ));
         }
-        self.pending_routed_writes.insert(
-            request_id.clone(),
-            PendingRoutedWrite {
-                object_id: object.object_id,
-                primary_node_id,
-                command,
-                authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
-                remote_intent_id: None,
-                durable_receipts: 0,
-                required_receipts: 1,
-                result: None,
-            },
-        );
-        Ok(NetworkedDfsWriteOutcome::Pending {
-            intent_id: request_id,
-            durable_receipts: 0,
-            required_receipts: 1,
-        })
+        Ok(self.track_pending_routed_write(request_id, object.object_id, primary_node_id, command))
     }
 
     pub(crate) fn route_distributed_write_from_reader_to_metadata_primary<R: Read>(
@@ -1903,30 +1904,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             sent
         ));
         if !sent {
-            return Err(DfsError::Network {
-                message: format!(
-                    "metadata shard {} primary {} is not routable",
-                    shard.shard_id, primary_node_id
-                ),
-            });
+            return Err(Self::metadata_primary_unroutable_error(
+                &shard,
+                &primary_node_id,
+            ));
         }
-        self.pending_routed_writes.insert(
-            request_id.clone(),
-            PendingRoutedWrite {
-                object_id: object.object_id,
-                primary_node_id,
-                command,
-                authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
-                remote_intent_id: None,
-                durable_receipts: 0,
-                required_receipts: 1,
-                result: None,
-            },
-        );
-        Ok(NetworkedDfsWriteOutcome::Pending {
-            intent_id: request_id,
-            durable_receipts: 0,
-            required_receipts: 1,
-        })
+        Ok(self.track_pending_routed_write(request_id, object.object_id, primary_node_id, command))
     }
 }

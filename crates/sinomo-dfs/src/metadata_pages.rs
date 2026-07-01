@@ -112,8 +112,19 @@ pub(crate) fn collect_filtered_cursor_page<T, U, SourceCursor, OutputCursor: Clo
 /// processing that page. This centralizes cursor progression without forcing
 /// all callers into the same record container shape.
 pub(crate) fn walk_metadata_pages<C>(
-    mut fetch_page: impl FnMut(Option<&C>) -> Result<Option<C>>,
+    fetch_page: impl FnMut(Option<&C>) -> Result<Option<C>>,
 ) -> Result<()> {
+    try_walk_metadata_pages(fetch_page)
+}
+
+/// Walk a cursor-paged metadata API using the caller's error type.
+///
+/// Use this variant when page processing also mutates service state and can
+/// fail with a higher-level service error. Metadata-only readers should keep
+/// using [`walk_metadata_pages`] so backend error inference stays narrow.
+pub(crate) fn try_walk_metadata_pages<C, E>(
+    mut fetch_page: impl FnMut(Option<&C>) -> std::result::Result<Option<C>, E>,
+) -> std::result::Result<(), E> {
     let mut cursor = None;
     loop {
         let next_cursor = fetch_page(cursor.as_ref())?;

@@ -6,7 +6,7 @@
 //! behavior over SIFS while the lower DFS layers handle placement, receipts,
 //! repair, and metadata journaling.
 
-use crate::metadata_pages::walk_metadata_pages;
+use crate::metadata_pages::{try_walk_metadata_pages, walk_metadata_pages};
 use crate::metadata_shard_migration::collect_object_metadata_family;
 use crate::namespace::{
     initial_version, metadata_path, namespace_transaction_id_for_path, next_version,
@@ -5044,19 +5044,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     fn posix_collect_resolved_dir(&self, path: &str) -> Result<Vec<DfsDirEntry>> {
         let mut entries = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = self.posix_list_resolved_dir_page(
-                path,
-                cursor.as_ref(),
-                POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
-            )?;
+        try_walk_metadata_pages(|cursor| {
+            let page =
+                self.posix_list_resolved_dir_page(path, cursor, POSIX_LIST_DIR_COLLECT_PAGE_SIZE)?;
             entries.extend(page.entries);
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            cursor = Some(next_cursor);
-        }
+            Ok::<_, DfsPosixError>(page.next_cursor)
+        })?;
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
     }
@@ -5391,20 +5384,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let file_system_id = sifs_file_system_id();
         if let Some(backend) = self.metadata_backend.as_ref() {
             let mut children = Vec::new();
-            let mut cursor = None;
-            loop {
+            try_walk_metadata_pages(|cursor| {
                 let page = backend.child_objects_for_directory_page(
                     &file_system_id,
                     path,
-                    cursor.as_ref(),
+                    cursor,
                     POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
                 )?;
                 children.extend(page.objects);
-                let Some(next_cursor) = page.next_cursor else {
-                    break;
-                };
-                cursor = Some(next_cursor);
-            }
+                Ok::<_, DfsPosixError>(page.next_cursor)
+            })?;
             return Ok(children);
         }
         let prefix = if path == "/" {
@@ -5540,24 +5529,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     fn child_directory_count_for_sifs_dir(&self, path: &str) -> Result<u64> {
         let mut count = 0u64;
-        let mut cursor = None;
-        loop {
-            let page = self.child_objects_for_sifs_dir_page(
-                path,
-                cursor.as_ref(),
-                POSIX_LINK_COUNT_PAGE_SIZE,
-            )?;
+        try_walk_metadata_pages(|cursor| {
+            let page =
+                self.child_objects_for_sifs_dir_page(path, cursor, POSIX_LINK_COUNT_PAGE_SIZE)?;
             count = count.saturating_add(
                 page.objects
                     .iter()
                     .filter(|child| child.kind == DfsObjectKind::Directory)
                     .count() as u64,
             );
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            cursor = Some(next_cursor);
-        }
+            Ok::<_, DfsPosixError>(page.next_cursor)
+        })?;
         Ok(count)
     }
 
@@ -5652,12 +5634,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Ok(path) => path,
             Err(_) => return Ok(None),
         };
-        let mut cursor = None;
-        loop {
-            let page = backend.list_namespace_jobs_page(
-                cursor.as_ref(),
-                POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE,
-            )?;
+        let mut existing_job = None;
+        try_walk_metadata_pages(|cursor| {
+            let page = backend
+                .list_namespace_jobs_page(cursor, POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE)?;
             for job in page.jobs {
                 if job.file_system_id != *file_system_id
                     || job.status != DfsNamespaceJobStatus::Running
@@ -5678,14 +5658,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     continue;
                 };
                 if job_target_path == target_path {
-                    return Ok(Some(job));
+                    existing_job = Some(job);
+                    return Ok(None);
                 }
             }
-            let Some(next_cursor) = page.next_cursor else {
-                return Ok(None);
-            };
-            cursor = Some(next_cursor);
-        }
+            Ok::<_, DfsPosixError>(page.next_cursor)
+        })?;
+        Ok(existing_job)
     }
 
     fn persist_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {

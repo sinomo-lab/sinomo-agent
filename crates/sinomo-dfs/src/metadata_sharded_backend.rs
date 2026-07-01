@@ -412,23 +412,21 @@ impl LocalShardedMetadataBackend {
         let shard_ids = self.shard_ids();
         let mut visited_object_ids = BTreeSet::<DfsObjectId>::new();
         for source_shard_id in shard_ids {
-            let mut cursor = None;
-            loop {
+            walk_metadata_pages(|cursor| {
                 let page = self
                     .shard_backend(&source_shard_id)?
                     .objects_for_file_system_page(
                         file_system_id,
-                        cursor.as_ref(),
+                        cursor,
                         SHARD_MIGRATION_PAGE_SIZE,
                     )?;
-                let next_cursor = page.next_cursor;
                 for object in page.objects {
                     if visited_object_ids.contains(&object.object_id) {
                         continue;
                     }
                     if report.migrated_objects >= max_migrations {
                         report.reached_limit = true;
-                        return Ok(report);
+                        return Ok(None);
                     }
                     report.scanned_objects = report.scanned_objects.saturating_add(1);
                     if let Some(index) = self.read_object_shard_index(&object.object_id)?
@@ -486,10 +484,10 @@ impl LocalShardedMetadataBackend {
                     )?;
                     report.migrated_objects = report.migrated_objects.saturating_add(1);
                 }
-                let Some(next_cursor) = next_cursor else {
-                    break;
-                };
-                cursor = Some(next_cursor);
+                Ok(page.next_cursor)
+            })?;
+            if report.reached_limit {
+                return Ok(report);
             }
         }
         Ok(report)

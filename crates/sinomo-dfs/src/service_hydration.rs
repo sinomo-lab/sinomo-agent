@@ -10,7 +10,7 @@ use sinomo_core::DfsWriteReceipt;
 use sinomo_events::EventId;
 use time::OffsetDateTime;
 
-use crate::metadata_pages::walk_metadata_pages;
+use crate::metadata_pages::{try_walk_metadata_pages, walk_metadata_pages};
 use crate::transfer::PendingNetworkedWrite;
 use crate::*;
 
@@ -80,15 +80,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         for file_system in &file_systems {
-            let mut cursor = None;
-            loop {
+            try_walk_metadata_pages(|cursor| {
                 let page = self
                     .metadata_backend
                     .as_ref()
                     .expect("metadata backend checked above")
                     .objects_for_file_system_page(
                         &file_system.file_system_id,
-                        cursor.as_ref(),
+                        cursor,
                         DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE,
                     )?;
                 for object in page.objects {
@@ -102,24 +101,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
                     self.add_backend_conflict_pages_to_memory(&object.object_id)?;
                 }
-                let Some(next_cursor) = page.next_cursor else {
-                    break;
-                };
-                cursor = Some(next_cursor);
-            }
+                Ok::<_, DfsError>(page.next_cursor)
+            })?;
         }
 
         let mut pending_write_records = Vec::new();
-        let mut intent_scan_cursor = None;
-        loop {
+        try_walk_metadata_pages(|intent_scan_cursor| {
             let intent_page = self
                 .metadata_backend
                 .as_ref()
                 .expect("metadata backend checked above")
-                .write_intents_page(
-                    intent_scan_cursor.as_ref(),
-                    DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
-                )?;
+                .write_intents_page(intent_scan_cursor, DFS_METADATA_OBJECT_INTENT_PAGE_SIZE)?;
             for mut intent_record in intent_page.intents {
                 if self.metadata.object(&intent_record.object_id).is_none() {
                     continue;
@@ -195,7 +187,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         }
                         continue;
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(DfsError::from(error)),
                 }
                 self.restore_backend_receipt_pages_for_intent(&intent_record)?;
                 self.restore_visible_committed_object_location_receipts(&intent_record)?;
@@ -208,11 +200,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     pending_write_records.push(intent_record);
                 }
             }
-            let Some(next_cursor) = intent_page.next_cursor else {
-                break;
-            };
-            intent_scan_cursor = Some(next_cursor);
-        }
+            Ok(intent_page.next_cursor)
+        })?;
 
         let repair_intent_ids: BTreeSet<String> = self
             .coordinator

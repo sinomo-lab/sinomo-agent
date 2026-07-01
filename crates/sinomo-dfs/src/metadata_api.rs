@@ -323,24 +323,19 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         prefix: &str,
     ) -> Result<Option<DfsObjectMetadata>> {
         let prefix = normalize_posix_path(prefix);
-        let mut cursor = None;
-        loop {
-            let page = self.hardlinks_to_object_page(
-                file_system_id,
-                target_object_id,
-                cursor.as_ref(),
-                1024,
-            )?;
+        let mut found = None;
+        walk_metadata_pages(|cursor| {
+            let page =
+                self.hardlinks_to_object_page(file_system_id, target_object_id, cursor, 1024)?;
             for object in page.objects {
                 if !posix_path_is_at_or_under_prefix(&object.path, &prefix) {
-                    return Ok(Some(object));
+                    found = Some(object);
+                    return Ok(None);
                 }
             }
-            let Some(next_cursor) = page.next_cursor else {
-                return Ok(None);
-            };
-            cursor = Some(next_cursor);
-        }
+            Ok(page.next_cursor)
+        })?;
+        Ok(found)
     }
 
     /// Create or replace an object-version record and journal the mutation.
