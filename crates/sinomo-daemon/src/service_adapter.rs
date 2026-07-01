@@ -1394,7 +1394,7 @@ impl DaemonDfsBrowserBackend {
         let path = normalize_sifs_browser_path(&request.path)?;
         let mut service = self.lock_service()?;
         self.refresh_endpoint_targets(&mut service);
-        let entries = match service.posix_list_dir_distributed(&path) {
+        let mut entries: Vec<_> = match service.posix_list_dir_distributed(&path) {
             Ok(entries) => entries,
             Err(sinomo_dfs::DfsPosixError::NotFound { .. }) if request.missing_is_empty => {
                 Vec::new()
@@ -1409,9 +1409,20 @@ impl DaemonDfsBrowserBackend {
             size: None,
         })
         .collect();
+        sort_daemon_dfs_browser_entries(&mut entries, &request.sort_key, &request.sort_direction);
+        let total_count = entries.len();
+        let offset = request.offset.min(total_count);
+        let limit = request.limit;
+        let entries = match limit {
+            Some(limit) => entries.into_iter().skip(offset).take(limit).collect(),
+            None => entries.into_iter().skip(offset).collect(),
+        };
         Ok(crate::DaemonDfsBrowserListResponse {
             node_id: service.node_id().to_string(),
             entries,
+            total_count,
+            offset,
+            limit,
         })
     }
 
@@ -2103,6 +2114,54 @@ fn daemon_dfs_browser_stat_response(
         health,
         metadata_shard,
     }
+}
+
+fn sort_daemon_dfs_browser_entries(
+    entries: &mut [crate::DaemonDfsBrowserEntry],
+    sort_key: &crate::DaemonDfsBrowserSortKey,
+    sort_direction: &crate::DaemonDfsBrowserSortDirection,
+) {
+    entries.sort_by(|left, right| {
+        let directory_order = daemon_dfs_browser_kind_rank(&left.kind)
+            .cmp(&daemon_dfs_browser_kind_rank(&right.kind));
+        if directory_order != std::cmp::Ordering::Equal {
+            return directory_order;
+        }
+        let ordering = match sort_key {
+            crate::DaemonDfsBrowserSortKey::Name => compare_daemon_dfs_browser_names(left, right),
+            crate::DaemonDfsBrowserSortKey::Kind => daemon_dfs_browser_kind_rank(&left.kind)
+                .cmp(&daemon_dfs_browser_kind_rank(&right.kind))
+                .then_with(|| compare_daemon_dfs_browser_names(left, right)),
+            crate::DaemonDfsBrowserSortKey::Size => left
+                .size
+                .unwrap_or(0)
+                .cmp(&right.size.unwrap_or(0))
+                .then_with(|| compare_daemon_dfs_browser_names(left, right)),
+        };
+        match sort_direction {
+            crate::DaemonDfsBrowserSortDirection::Ascending => ordering,
+            crate::DaemonDfsBrowserSortDirection::Descending => ordering.reverse(),
+        }
+    });
+}
+
+fn daemon_dfs_browser_kind_rank(kind: &sinomo_dfs::DfsObjectKind) -> u8 {
+    match kind {
+        sinomo_dfs::DfsObjectKind::Directory | sinomo_dfs::DfsObjectKind::Mount => 0,
+        sinomo_dfs::DfsObjectKind::Symlink | sinomo_dfs::DfsObjectKind::Hardlink => 1,
+        sinomo_dfs::DfsObjectKind::File | sinomo_dfs::DfsObjectKind::Artifact => 2,
+        sinomo_dfs::DfsObjectKind::Tombstone => 3,
+    }
+}
+
+fn compare_daemon_dfs_browser_names(
+    left: &crate::DaemonDfsBrowserEntry,
+    right: &crate::DaemonDfsBrowserEntry,
+) -> std::cmp::Ordering {
+    left.name
+        .to_ascii_lowercase()
+        .cmp(&right.name.to_ascii_lowercase())
+        .then_with(|| left.name.cmp(&right.name))
 }
 
 fn daemon_dfs_browser_metadata_shard(

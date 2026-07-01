@@ -6,21 +6,16 @@
 //! Like the Settings tab, this is a fully *composed* `sui-widgets` tree: [`view`]
 //! returns a responsive host ([`FilesView`]) over pre-built pods (wide split with
 //! the inspector, narrow list-only), each assembled from stock `Breadcrumb` /
-//! `IconButton` / `ListView` / `ScrollView` / `Separator` / `PanelSection` /
+//! `IconButton` / `VirtualTable` / `ScrollView` / `Separator` / `PanelSection` /
 //! `PropertyRow` / `Label` widgets. State lives entirely in [`FilesState`]; the
 //! interactive app lists SIFS on a background worker so tab layout never blocks
 //! on DFS metadata or network work.
 //!
-//! The one new wrinkle vs. Settings: the file *listing* changes on navigation, so
-//! the list/breadcrumb items aren't fixed at build time. `ListView::items()` takes
-//! a fixed `Vec<ListItem>` (there is no reactive `items_when` builder), so we wrap
-//! the listing in a small [`RebuildOnChange`] widget keyed on the current path: it
-//! diffs the path on each frame and rebuilds its child pod from the new listing
-//! when it changes. The selection (which only repaints the highlight and updates
-//! the inspector) stays reactive via `ListView::selected_when` + the live-reading
-//! [`InspectorView`] — so selecting a file does *not* rebuild the list (the scroll
-//! position is preserved), only navigation does. Directory rows also expose an inline inspect
-//! action so object placement remains reachable without changing paths.
+//! The file listing changes on navigation and sort. It is rebuilt by
+//! [`RebuildOnChange`] and rendered with [`VirtualTable`], so large folders only
+//! paint visible rows while the header stays pinned. Sorting and pagination are
+//! requested through the worker/daemon boundary instead of doing heavy listing
+//! work on the UI path.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -35,16 +30,18 @@ use std::time::Duration;
 
 use sui::{
     Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, Color, Constraints,
-    DefaultTheme, Event, EventCtx, Flex, FlexItem, FontWeight, IconButton, IconGlyph, KeyState,
-    ListItem, ListView, MeasureCtx, PaintCtx, Point, PointerButton, PointerEventKind, Rect,
-    ScrollState, ScrollView, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole,
-    SemanticsValue, Separator, Size, SizedBox, Stack, StackHostOptions, Tooltip, TooltipPlacement,
-    Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, draw_glyph,
+    DefaultTheme, Event, EventCtx, Flex, FlexItem, FontWeight, IconButton, IconGlyph, MeasureCtx,
+    PaintCtx, Point, PointerButton, PointerEventKind, Rect, ScrollState, ScrollView,
+    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator, Size,
+    SizedBox, Stack, StackHostOptions, Tooltip, TooltipPlacement, VirtualTable, VirtualTableColumn,
+    VirtualTableRowActivationKind, VirtualTableRowContext, VirtualTableSortDirection, Widget,
+    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, draw_glyph,
 };
 
 use sinomo_cli::app_api::{
-    SifsBrowser, SifsEntry, SifsFileRead, SifsHealthSummary, SifsMetadataShardDetails,
-    SifsObjectDetails, SifsObjectHealth,
+    SifsBrowser, SifsEntry, SifsEntryPage, SifsFileRead, SifsHealthSummary, SifsListOptions,
+    SifsListSortDirection, SifsListSortKey, SifsMetadataShardDetails, SifsObjectDetails,
+    SifsObjectHealth,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use time::format_description::well_known::Rfc3339;
@@ -59,9 +56,8 @@ use crate::ui::widgets;
 const WIDE_THRESHOLD: f32 = 640.0;
 const INSPECTOR_W: f32 = 340.0;
 const ROW_H: f32 = 34.0;
-const ROW_ACTION_SIDE: f32 = 24.0;
-const ROW_ACTION_GAP: f32 = 4.0;
-const ROW_ACTION_COUNT: f32 = 4.0;
+const ROW_SELECT_SIDE: f32 = 22.0;
+const ROW_THUMBNAIL_SIDE: f32 = 20.0;
 const CONTENT_PAD: f32 = 16.0;
 const HEADER_H: f32 = 48.0;
 const HEADER_CONTROL_H: f32 = 30.0;
@@ -69,8 +65,8 @@ const HEADER_COMMAND_GAP: f32 = 6.0;
 const HEADER_PAD_Y: f32 = 9.0;
 const FILES_STATUS_H: f32 = 38.0;
 const LIST_HEADER_H: f32 = 36.0;
-const LIST_FILTER_H: f32 = 72.0;
 const LIST_TASK_STRIP_H: f32 = 88.0;
+const FILES_LIST_PAGE_SIZE: usize = 512;
 const PLACES_W: f32 = 190.0;
 const PLACE_ROW_H: f32 = 42.0;
 const FILE_PREVIEW_MAX_BYTES: u64 = 32 * 1024;
@@ -111,6 +107,7 @@ impl FilesSourceKind {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileActionPromptKind {
     GoTo,
@@ -128,6 +125,7 @@ enum FileActionPromptKind {
     DeleteSelected,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum FileSortMode {
     #[default]
@@ -139,30 +137,57 @@ enum FileSortMode {
 }
 
 impl FileSortMode {
-    const ALL: [Self; 5] = [
-        Self::NameAsc,
-        Self::NameDesc,
-        Self::Kind,
-        Self::SizeDesc,
-        Self::SizeAsc,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::NameAsc => "Name A-Z",
-            Self::NameDesc => "Name Z-A",
-            Self::Kind => "Kind",
-            Self::SizeDesc => "Size largest",
-            Self::SizeAsc => "Size smallest",
+    fn sifs_options(self, offset: usize, limit: Option<usize>) -> SifsListOptions {
+        let (sort_key, sort_direction) = match self {
+            Self::NameAsc => (SifsListSortKey::Name, SifsListSortDirection::Ascending),
+            Self::NameDesc => (SifsListSortKey::Name, SifsListSortDirection::Descending),
+            Self::Kind => (SifsListSortKey::Kind, SifsListSortDirection::Ascending),
+            Self::SizeDesc => (SifsListSortKey::Size, SifsListSortDirection::Descending),
+            Self::SizeAsc => (SifsListSortKey::Size, SifsListSortDirection::Ascending),
+        };
+        SifsListOptions {
+            sort_key,
+            sort_direction,
+            offset,
+            limit,
         }
     }
 
-    fn options() -> Vec<String> {
-        Self::ALL
-            .iter()
-            .map(|mode| mode.label().to_string())
-            .collect()
+    fn next_for_column(self, column: FilesSortColumn) -> Self {
+        match column {
+            FilesSortColumn::Name => match self {
+                Self::NameAsc => Self::NameDesc,
+                _ => Self::NameAsc,
+            },
+            FilesSortColumn::KindSize => match self {
+                Self::SizeDesc => Self::SizeAsc,
+                _ => Self::SizeDesc,
+            },
+        }
     }
+
+    fn name_sort_direction(self) -> Option<VirtualTableSortDirection> {
+        match self {
+            Self::NameAsc => Some(VirtualTableSortDirection::Ascending),
+            Self::NameDesc => Some(VirtualTableSortDirection::Descending),
+            _ => None,
+        }
+    }
+
+    fn meta_sort_direction(self) -> Option<VirtualTableSortDirection> {
+        match self {
+            Self::Kind => Some(VirtualTableSortDirection::Ascending),
+            Self::SizeAsc => Some(VirtualTableSortDirection::Ascending),
+            Self::SizeDesc => Some(VirtualTableSortDirection::Descending),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FilesSortColumn {
+    Name,
+    KindSize,
 }
 
 impl FileActionPromptKind {
@@ -385,6 +410,7 @@ pub struct FilesState {
     history_back: Vec<FilesLocation>,
     history_forward: Vec<FilesLocation>,
     pub entries: Vec<SifsEntry>,
+    pub entries_total_count: usize,
     pub selected: Option<usize>,
     pub selected_details: Option<SifsObjectDetails>,
     selected_local_details: Option<LocalObjectDetails>,
@@ -398,7 +424,6 @@ pub struct FilesState {
     preview_error: Option<String>,
     action_prompt: Option<FileActionPrompt>,
     marked_entries: BTreeSet<usize>,
-    filter_query: String,
     sort_mode: FileSortMode,
     tasks: Vec<FilesTask>,
     pending_select_path: Option<String>,
@@ -411,6 +436,7 @@ pub struct FilesState {
     worker_cancellations: Arc<Mutex<BTreeSet<u64>>>,
     next_request_id: u64,
     pending_request_id: Option<u64>,
+    pending_append_request_id: Option<u64>,
     completed_request_id: Option<u64>,
     pending_details_request_id: Option<u64>,
     pending_preview_request_id: Option<u64>,
@@ -437,6 +463,7 @@ impl FilesState {
             history_back: Vec::new(),
             history_forward: Vec::new(),
             entries: Vec::new(),
+            entries_total_count: 0,
             selected: None,
             selected_details: None,
             selected_local_details: None,
@@ -450,7 +477,6 @@ impl FilesState {
             preview_error: None,
             action_prompt: None,
             marked_entries: BTreeSet::new(),
-            filter_query: String::new(),
             sort_mode: FileSortMode::default(),
             tasks: Vec::new(),
             pending_select_path: None,
@@ -463,6 +489,7 @@ impl FilesState {
             worker_cancellations: Arc::new(Mutex::new(BTreeSet::new())),
             next_request_id: 0,
             pending_request_id: None,
+            pending_append_request_id: None,
             completed_request_id: None,
             pending_details_request_id: None,
             pending_preview_request_id: None,
@@ -548,15 +575,27 @@ impl FilesState {
         self.clear_selected_details();
         self.list_slow_after_secs = None;
         self.completed_request_id = None;
+        self.pending_append_request_id = None;
         self.loading = false;
         let path = self.path.clone();
         let listing = match self.source {
-            FilesSourceKind::Sifs => self.browser.as_ref().map(|b| b.list_shallow(&path)),
-            FilesSourceKind::Local => Some(list_local_dir(&path)),
+            FilesSourceKind::Sifs => self.browser.as_ref().map(|b| {
+                b.list_shallow_page(
+                    &path,
+                    self.sort_mode.sifs_options(0, Some(FILES_LIST_PAGE_SIZE)),
+                )
+            }),
+            FilesSourceKind::Local => Some(list_local_dir_page(
+                &path,
+                self.sort_mode,
+                0,
+                Some(FILES_LIST_PAGE_SIZE),
+            )),
         };
         match listing {
-            Some(Ok(entries)) => {
-                self.entries = entries;
+            Some(Ok(page)) => {
+                self.entries_total_count = page.total_count;
+                self.entries = page.entries;
                 self.error = None;
                 if self.source == FilesSourceKind::Local {
                     self.node_id = local_node_label();
@@ -586,6 +625,7 @@ impl FilesState {
             }
             Some(Err(error)) => {
                 self.entries.clear();
+                self.entries_total_count = 0;
                 self.error = Some(error);
             }
             None => {}
@@ -605,14 +645,20 @@ impl FilesState {
         self.clear_selected_details();
         self.list_slow_after_secs = None;
         self.completed_request_id = None;
+        self.pending_append_request_id = None;
         self.loading = true;
         self.error = None;
         self.entries.clear();
+        self.entries_total_count = 0;
         self.list_revision = self.list_revision.wrapping_add(1);
         let command = FilesWorkerCommand::List {
             request_id,
             source: self.source,
             path: self.path.clone(),
+            sort_mode: self.sort_mode,
+            offset: 0,
+            limit: Some(FILES_LIST_PAGE_SIZE),
+            append: false,
         };
         if tx.send(command).is_err() {
             self.pending_request_id = None;
@@ -634,6 +680,7 @@ impl FilesState {
                         request_id,
                         source,
                         path,
+                        append: false,
                         result: FilesListResult::Slow {
                             elapsed_secs: LOAD_TIMEOUT.as_secs(),
                         },
@@ -664,10 +711,45 @@ impl FilesState {
         self.reload();
     }
 
+    fn request_more_entries(&mut self, waker: Option<sui::UiHandle>) {
+        if self.loading
+            || self.pending_request_id.is_some()
+            || self.pending_append_request_id.is_some()
+            || self.error.is_some()
+            || self.entries.len() >= self.entries_total_count
+        {
+            return;
+        }
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        let Some(tx) = self.worker_tx.clone() else {
+            return;
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.pending_append_request_id = Some(request_id);
+        let command = FilesWorkerCommand::List {
+            request_id,
+            source: self.source,
+            path: self.path.clone(),
+            sort_mode: self.sort_mode,
+            offset: self.entries.len(),
+            limit: Some(FILES_LIST_PAGE_SIZE),
+            append: true,
+        };
+        if tx.send(command).is_err() {
+            self.pending_append_request_id = None;
+            self.error = Some("SIFS browser worker stopped".to_string());
+            self.list_revision = self.list_revision.wrapping_add(1);
+        }
+    }
+
     fn reset_for_retry(&mut self) {
         self.browser = None;
         self.error = None;
         self.entries.clear();
+        self.entries_total_count = 0;
         self.selected = None;
         self.marked_entries.clear();
         self.clear_selected_details();
@@ -679,6 +761,7 @@ impl FilesState {
         self.loaded = self.source == FilesSourceKind::Local;
         self.loading = false;
         self.pending_request_id = None;
+        self.pending_append_request_id = None;
         self.completed_request_id = None;
         self.pending_details_request_id = None;
         self.pending_preview_request_id = None;
@@ -779,9 +862,14 @@ impl FilesState {
                 request_id,
                 source,
                 path,
+                append,
                 result,
             } => {
-                if self.pending_request_id != Some(request_id) {
+                if append {
+                    if self.pending_append_request_id != Some(request_id) {
+                        return false;
+                    }
+                } else if self.pending_request_id != Some(request_id) {
                     return false;
                 }
                 if self.source != source {
@@ -789,18 +877,28 @@ impl FilesState {
                 }
                 match result {
                     FilesListResult::Ok(listing) => {
-                        self.pending_request_id = None;
-                        self.completed_request_id = Some(request_id);
-                        self.loading = false;
+                        if append {
+                            self.pending_append_request_id = None;
+                        } else {
+                            self.pending_request_id = None;
+                            self.completed_request_id = Some(request_id);
+                            self.loading = false;
+                        }
                         self.list_slow_after_secs = None;
                         self.path = path;
                         self.store_active_path();
                         self.node_id = listing.node_id;
                         self.sifs_health = listing.health;
                         self.sifs_health_error = listing.health_error;
-                        self.entries = listing.entries;
+                        self.entries_total_count = listing.total_count;
+                        if append {
+                            self.entries.extend(listing.entries);
+                        } else {
+                            self.entries = listing.entries;
+                        }
                         self.error = None;
-                        if let Some(select_path) = self.pending_select_path.take()
+                        if !append
+                            && let Some(select_path) = self.pending_select_path.take()
                             && let Some(index) = self
                                 .entries
                                 .iter()
@@ -811,15 +909,22 @@ impl FilesState {
                         }
                     }
                     FilesListResult::Err(error) => {
-                        self.pending_request_id = None;
-                        self.completed_request_id = None;
-                        self.loading = false;
+                        if append {
+                            self.pending_append_request_id = None;
+                        } else {
+                            self.pending_request_id = None;
+                            self.completed_request_id = None;
+                            self.loading = false;
+                        }
                         self.list_slow_after_secs = None;
                         self.path = path;
                         self.store_active_path();
-                        self.entries.clear();
-                        self.sifs_health = None;
-                        self.sifs_health_error = None;
+                        if !append {
+                            self.entries.clear();
+                            self.entries_total_count = 0;
+                            self.sifs_health = None;
+                            self.sifs_health_error = None;
+                        }
                         self.error = Some(error);
                     }
                     FilesListResult::Slow { elapsed_secs } => {
@@ -987,10 +1092,12 @@ impl FilesState {
             self.source = source;
             self.error = None;
             self.entries.clear();
+            self.entries_total_count = 0;
             self.selected = None;
             self.clear_selected_details();
             self.loading = false;
             self.pending_request_id = None;
+            self.pending_append_request_id = None;
             self.completed_request_id = None;
             self.pending_details_request_id = None;
             self.pending_preview_request_id = None;
@@ -1132,13 +1239,6 @@ impl FilesState {
 
     fn clear_marked_entries(&mut self) {
         self.marked_entries.clear();
-    }
-
-    fn mark_visible_entries(&mut self) {
-        let filter = normalized_files_filter(&self.filter_query);
-        self.marked_entries = visible_file_indices(&self.entries, &filter, self.sort_mode)
-            .into_iter()
-            .collect();
     }
 
     fn request_selected_details(&mut self) {
@@ -1303,7 +1403,7 @@ impl FilesState {
             | FileActionPromptKind::DeleteSelected
                 if targets.is_empty() =>
             {
-                Some("mark one or more entries first".to_string())
+                Some("select one or more entries first".to_string())
             }
             _ => None,
         };
@@ -1329,26 +1429,17 @@ impl FilesState {
         }
     }
 
-    fn set_filter_query(&mut self, query: String) {
-        self.filter_query = query;
-        let filter = normalized_files_filter(&self.filter_query);
-        let entries = &self.entries;
-        self.marked_entries.retain(|index| {
-            entries
-                .get(*index)
-                .is_some_and(|entry| file_entry_matches_filter(entry, &filter))
-        });
-        let selected_matches = self
-            .selected_entry()
-            .is_some_and(|entry| file_entry_matches_filter(entry, &filter));
-        if !selected_matches {
-            self.selected = None;
-            self.clear_selected_details();
+    fn set_sort_mode(&mut self, mode: FileSortMode) {
+        if self.sort_mode == mode {
+            return;
         }
+        self.sort_mode = mode;
+        self.reload();
     }
 
-    fn set_sort_mode(&mut self, mode: FileSortMode) {
-        self.sort_mode = mode;
+    fn toggle_sort_column(&mut self, column: FilesSortColumn) {
+        let mode = self.sort_mode.next_for_column(column);
+        self.set_sort_mode(mode);
     }
 
     fn submit_action_prompt(&mut self, waker: Option<sui::UiHandle>) {
@@ -1375,7 +1466,7 @@ impl FilesState {
         if prompt.kind == FileActionPromptKind::DeleteSelected {
             if prompt.targets.is_empty() {
                 if let Some(current) = &mut self.action_prompt {
-                    current.error = Some("mark one or more entries first".to_string());
+                    current.error = Some("select one or more entries first".to_string());
                 }
                 return;
             }
@@ -1436,7 +1527,7 @@ impl FilesState {
             FileActionPromptKind::CopySelected
             | FileActionPromptKind::TransferSelected
             | FileActionPromptKind::MoveSelected => {
-                unreachable!("marked-entry prompts queue individual operations")
+                unreachable!("selected-entry prompts queue individual operations")
             }
             FileActionPromptKind::NewFile => {
                 let path = self.join_child(&prompt.input)?;
@@ -1594,7 +1685,7 @@ impl FilesState {
         prompt: &FileActionPrompt,
     ) -> Result<Vec<FilesQueuedOperation>, String> {
         if prompt.targets.is_empty() {
-            return Err("mark one or more entries first".to_string());
+            return Err("select one or more entries first".to_string());
         }
         let (operation_kind, destination_source, title) = match prompt.kind {
             FileActionPromptKind::CopySelected => {
@@ -1615,7 +1706,7 @@ impl FilesState {
                     "Copy selected to SIFS",
                 ),
             },
-            _ => return Err("prompt does not support marked entries".to_string()),
+            _ => return Err("prompt does not support selected entries".to_string()),
         };
         let destination_root =
             self.resolve_destination_folder(destination_source, &prompt.input)?;
@@ -2064,8 +2155,18 @@ impl FilesState {
         true
     }
 
-    /// Click a listing row: navigate into a directory, otherwise select the file. Returns whether
-    /// the navigation changed the *path* (so the caller can relayout the rebuilt list/breadcrumb).
+    fn click_row(&mut self, index: usize, activation: VirtualTableRowActivationKind) -> bool {
+        match activation {
+            VirtualTableRowActivationKind::Single => {
+                self.select_entry(index);
+                false
+            }
+            VirtualTableRowActivationKind::Double => self.activate_row(index),
+        }
+    }
+
+    /// Activate a listing row from keyboard or double-click: directories navigate, files select.
+    /// Returns whether the navigation changed the *path*.
     fn activate_row(&mut self, index: usize) -> bool {
         let is_dir = self.entries.get(index).map(|e| e.is_dir).unwrap_or(false);
         if is_dir {
@@ -2101,6 +2202,7 @@ struct FilesListing {
     health: Option<SifsHealthSummary>,
     health_error: Option<String>,
     entries: Vec<SifsEntry>,
+    total_count: usize,
 }
 
 enum FilesListResult {
@@ -2121,6 +2223,7 @@ enum FilesWorkerResult {
         request_id: u64,
         source: FilesSourceKind,
         path: String,
+        append: bool,
         result: FilesListResult,
     },
     Health {
@@ -2157,6 +2260,10 @@ enum FilesWorkerCommand {
         request_id: u64,
         source: FilesSourceKind,
         path: String,
+        sort_mode: FileSortMode,
+        offset: usize,
+        limit: Option<usize>,
+        append: bool,
     },
     Details {
         request_id: u64,
@@ -2216,6 +2323,10 @@ fn files_worker_loop(
                 request_id,
                 source,
                 path,
+                sort_mode,
+                offset,
+                limit,
+                append,
             } => {
                 let requested_path = normalize_source_path(source, &path);
                 let (path, result) = if source == FilesSourceKind::Local {
@@ -2224,6 +2335,7 @@ fn files_worker_loop(
                             request_id,
                             source,
                             path: path.clone(),
+                            append,
                             result: FilesListResult::Err(error),
                         });
                         String::new()
@@ -2232,11 +2344,14 @@ fn files_worker_loop(
                         waker.wake();
                         continue;
                     }
-                    let result = list_local_dir(&path).map(|entries| FilesListing {
-                        node_id: local_node_label(),
-                        health: None,
-                        health_error: None,
-                        entries,
+                    let result = list_local_dir_page(&path, sort_mode, offset, limit).map(|page| {
+                        FilesListing {
+                            node_id: local_node_label(),
+                            health: None,
+                            health_error: None,
+                            entries: page.entries,
+                            total_count: page.total_count,
+                        }
                     });
                     (path, result)
                 } else if let Some(error) = &open_error {
@@ -2262,17 +2377,21 @@ fn files_worker_loop(
                     match (&browser, &open_error) {
                         (Some(browser), _) => {
                             let path = browser.normalize(&requested_path);
-                            let result = browser.list_shallow(&path).map(|entries| FilesListing {
-                                node_id: browser.node_id().to_string(),
-                                health: None,
-                                health_error: None,
-                                entries,
-                            });
+                            let result = browser
+                                .list_shallow_page(&path, sort_mode.sifs_options(offset, limit))
+                                .map(|page| FilesListing {
+                                    node_id: browser.node_id().to_string(),
+                                    health: None,
+                                    health_error: None,
+                                    entries: page.entries,
+                                    total_count: page.total_count,
+                                });
                             let listed = result.is_ok();
                             let _ = result_tx.send(FilesWorkerResult::List {
                                 request_id,
                                 source,
                                 path,
+                                append,
                                 result: match result {
                                     Ok(listing) => FilesListResult::Ok(listing),
                                     Err(error) => FilesListResult::Err(error),
@@ -2302,6 +2421,7 @@ fn files_worker_loop(
                     request_id,
                     source,
                     path,
+                    append,
                     result: match result {
                         Ok(listing) => FilesListResult::Ok(listing),
                         Err(error) => FilesListResult::Err(error),
@@ -2854,7 +2974,12 @@ fn validated_local_relative_path(input: &str, label: &str) -> Result<PathBuf, St
     Ok(normalized)
 }
 
-fn list_local_dir(path: &str) -> Result<Vec<SifsEntry>, String> {
+fn list_local_dir_page(
+    path: &str,
+    sort_mode: FileSortMode,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<SifsEntryPage, String> {
     let read_dir = fs::read_dir(path).map_err(|error| format!("cannot list {path}: {error}"))?;
     let mut entries = Vec::new();
     for entry in read_dir {
@@ -2878,7 +3003,19 @@ fn list_local_dir(path: &str) -> Result<Vec<SifsEntry>, String> {
             size,
         });
     }
-    Ok(sort_file_entries(entries))
+    sort_file_entries_by(&mut entries, sort_mode);
+    let total_count = entries.len();
+    let offset = offset.min(total_count);
+    let entries = match limit {
+        Some(limit) => entries.into_iter().skip(offset).take(limit).collect(),
+        None => entries.into_iter().skip(offset).collect(),
+    };
+    Ok(SifsEntryPage {
+        entries,
+        total_count,
+        offset,
+        limit,
+    })
 }
 
 fn local_details(path: &str) -> Result<LocalObjectDetails, String> {
@@ -4732,41 +4869,8 @@ fn entry_row_meta(entry: &SifsEntry, files: &FilesState, active: bool) -> String
     entry_meta(entry)
 }
 
-fn entry_row_description(entry: &SifsEntry, files: &FilesState, active: bool) -> String {
-    let source = files.source;
-    let mut description = format!(
-        "{}, {} {}",
-        entry_kind_label(entry),
-        source.path_label(),
-        entry.path
-    );
-    if source == FilesSourceKind::Sifs && active {
-        description.push_str(". Placement ");
-        description.push_str(&entry_row_meta(entry, files, true));
-    }
-    if entry.is_dir {
-        description.push_str(". Activate opens the folder; Inspect selects it for management");
-    }
-    description
-}
-
-fn entry_kind_label(entry: &SifsEntry) -> &'static str {
-    if entry.is_dir {
-        "Folder"
-    } else if entry.is_link {
-        "Link"
-    } else {
-        "File"
-    }
-}
-
-fn sort_file_entries(mut entries: Vec<SifsEntry>) -> Vec<SifsEntry> {
-    entries.sort_by(|a, b| {
-        (b.is_dir as u8)
-            .cmp(&(a.is_dir as u8))
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    entries
+fn sort_file_entries_by(entries: &mut [SifsEntry], sort_mode: FileSortMode) {
+    entries.sort_by(|left, right| compare_file_entries(left, right, sort_mode));
 }
 
 fn entry_icon(entry: &SifsEntry) -> IconGlyph {
@@ -5371,41 +5475,6 @@ fn files_preview_signature(preview: Option<&FilesPreview>) -> String {
         .unwrap_or_default()
 }
 
-fn normalized_files_filter(filter: &str) -> String {
-    filter.trim().to_ascii_lowercase()
-}
-
-fn file_entry_matches_filter(entry: &SifsEntry, filter: &str) -> bool {
-    if filter.is_empty() {
-        return true;
-    }
-    entry.name.to_ascii_lowercase().contains(filter)
-        || entry.path.to_ascii_lowercase().contains(filter)
-        || entry_kind_label(entry)
-            .to_ascii_lowercase()
-            .contains(filter)
-        || human_size(entry.size).to_ascii_lowercase().contains(filter)
-}
-
-fn filtered_file_indices(entries: &[SifsEntry], filter: &str) -> Vec<usize> {
-    entries
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| file_entry_matches_filter(entry, filter).then_some(index))
-        .collect()
-}
-
-fn visible_file_indices(
-    entries: &[SifsEntry],
-    filter: &str,
-    sort_mode: FileSortMode,
-) -> Vec<usize> {
-    let mut indices = filtered_file_indices(entries, filter);
-    indices
-        .sort_by(|left, right| compare_file_entries(&entries[*left], &entries[*right], sort_mode));
-    indices
-}
-
 fn compare_file_entries(
     left: &SifsEntry,
     right: &SifsEntry,
@@ -5530,437 +5599,6 @@ fn unix_nanos_label(nanos: u64) -> String {
             .format(&Rfc3339)
             .unwrap_or_else(|_| format!("{nanos} ns since epoch")),
         Err(_) => format!("{nanos} ns since epoch"),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SifsEntryRowHit {
-    Row,
-    Select,
-    Inspect,
-    Copy,
-    Transfer,
-}
-
-const ROW_INLINE_ACTIONS: [SifsEntryRowHit; 4] = [
-    SifsEntryRowHit::Select,
-    SifsEntryRowHit::Inspect,
-    SifsEntryRowHit::Copy,
-    SifsEntryRowHit::Transfer,
-];
-
-struct SifsEntryRow {
-    shared: Shared,
-    index: usize,
-    entry: SifsEntry,
-    hovered: bool,
-    pressed: Option<SifsEntryRowHit>,
-}
-
-impl SifsEntryRow {
-    fn new(shared: Shared, index: usize, entry: SifsEntry) -> Self {
-        Self {
-            shared,
-            index,
-            entry,
-            hovered: false,
-            pressed: None,
-        }
-    }
-
-    fn active(&self) -> bool {
-        self.shared.files().selected == Some(self.index)
-    }
-
-    fn marked(&self) -> bool {
-        self.shared.files().entry_marked(self.index)
-    }
-
-    fn action_rect(&self, bounds: Rect, action: SifsEntryRowHit) -> Rect {
-        let Some(slot) = row_action_slot(action) else {
-            return Rect::ZERO;
-        };
-        let side = ROW_ACTION_SIDE.min(bounds.height()).max(0.0);
-        let step = side + ROW_ACTION_GAP;
-        Rect::new(
-            bounds.max_x() - side - 2.0 - slot as f32 * step,
-            bounds.y() + (bounds.height() - side) * 0.5,
-            side,
-            side,
-        )
-    }
-
-    fn action_enabled(&self, action: SifsEntryRowHit) -> bool {
-        let _ = action;
-        true
-    }
-
-    fn hit_at(&self, bounds: Rect, position: Point) -> Option<SifsEntryRowHit> {
-        if !bounds.contains(position) {
-            return None;
-        }
-        for action in ROW_INLINE_ACTIONS {
-            if !self.action_enabled(action) {
-                continue;
-            }
-            if self.action_rect(bounds, action).contains(position) {
-                return Some(action);
-            }
-        }
-        Some(SifsEntryRowHit::Row)
-    }
-
-    fn action_widget_id(parent: sui::WidgetId, action: SifsEntryRowHit) -> sui::WidgetId {
-        let salt = match action {
-            SifsEntryRowHit::Select => 8_309,
-            SifsEntryRowHit::Inspect => 8_317,
-            SifsEntryRowHit::Copy => 8_329,
-            SifsEntryRowHit::Transfer => 8_333,
-            SifsEntryRowHit::Row => 8_401,
-        };
-        sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(salt))
-    }
-}
-
-fn row_action_slot(action: SifsEntryRowHit) -> Option<usize> {
-    match action {
-        SifsEntryRowHit::Select => Some(0),
-        SifsEntryRowHit::Inspect => Some(1),
-        SifsEntryRowHit::Copy => Some(2),
-        SifsEntryRowHit::Transfer => Some(3),
-        SifsEntryRowHit::Row => None,
-    }
-}
-
-fn row_actions_width() -> f32 {
-    ROW_ACTION_SIDE * ROW_ACTION_COUNT + ROW_ACTION_GAP * (ROW_ACTION_COUNT - 1.0) + 8.0
-}
-
-fn row_action_visible(
-    entry: &SifsEntry,
-    action: SifsEntryRowHit,
-    hovered: bool,
-    active: bool,
-    marked: bool,
-    pressed: Option<SifsEntryRowHit>,
-) -> bool {
-    hovered
-        || active
-        || marked
-        || pressed.is_some()
-        || (entry.is_dir && action == SifsEntryRowHit::Inspect)
-        || (marked && action == SifsEntryRowHit::Select)
-}
-
-fn row_transfer_prompt_kind(source: FilesSourceKind) -> FileActionPromptKind {
-    match source {
-        FilesSourceKind::Sifs => FileActionPromptKind::CopyToLocal,
-        FilesSourceKind::Local => FileActionPromptKind::CopyToSifs,
-    }
-}
-
-fn row_transfer_glyph(source: FilesSourceKind) -> IconGlyph {
-    match source {
-        FilesSourceKind::Sifs => IconGlyph::Download,
-        FilesSourceKind::Local => IconGlyph::Storage,
-    }
-}
-
-fn row_transfer_label(source: FilesSourceKind, name: &str) -> String {
-    match source {
-        FilesSourceKind::Sifs => format!("Download {name}"),
-        FilesSourceKind::Local => format!("Copy to SIFS {name}"),
-    }
-}
-
-fn row_transfer_description(source: FilesSourceKind, path: &str) -> String {
-    match source {
-        FilesSourceKind::Sifs => format!("Download SIFS {path} to a local path"),
-        FilesSourceKind::Local => format!("Copy local {path} into SIFS"),
-    }
-}
-
-impl Widget for SifsEntryRow {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        match event {
-            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
-                let hovered = ctx.bounds().contains(pointer.position);
-                if self.hovered != hovered {
-                    self.hovered = hovered;
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                }
-            }
-            Event::Pointer(pointer)
-                if pointer.kind == PointerEventKind::Down
-                    && pointer.button == Some(PointerButton::Primary) =>
-            {
-                let Some(hit) = self.hit_at(ctx.bounds(), pointer.position) else {
-                    return;
-                };
-                self.pressed = Some(hit);
-                ctx.request_focus();
-                ctx.request_pointer_capture(pointer.pointer_id);
-                ctx.request_paint();
-                ctx.set_handled();
-            }
-            Event::Pointer(pointer)
-                if pointer.kind == PointerEventKind::Up
-                    && (pointer.button == Some(PointerButton::Primary)
-                        || self.pressed.is_some()) =>
-            {
-                let hit = self.hit_at(ctx.bounds(), pointer.position);
-                if let (Some(pressed), Some(hit)) = (self.pressed.take(), hit)
-                    && pressed == hit
-                {
-                    match hit {
-                        SifsEntryRowHit::Row => {
-                            self.shared.files_mut().activate_row(self.index);
-                        }
-                        SifsEntryRowHit::Select => {
-                            self.shared.files_mut().toggle_marked_entry(self.index);
-                        }
-                        SifsEntryRowHit::Inspect => {
-                            self.shared.files_mut().select_entry(self.index);
-                        }
-                        SifsEntryRowHit::Copy => {
-                            let mut files = self.shared.files_mut();
-                            files.select_entry(self.index);
-                            files.open_action_prompt(FileActionPromptKind::Copy);
-                            request_files_overlay_rebuild(ctx);
-                        }
-                        SifsEntryRowHit::Transfer => {
-                            let mut files = self.shared.files_mut();
-                            files.select_entry(self.index);
-                            let prompt_kind = row_transfer_prompt_kind(files.source);
-                            files.open_action_prompt(prompt_kind);
-                            request_files_overlay_rebuild(ctx);
-                        }
-                    }
-                    ctx.request_measure();
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                }
-                ctx.release_pointer_capture(pointer.pointer_id);
-                ctx.set_handled();
-            }
-            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Leave => {
-                if self.hovered {
-                    self.hovered = false;
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                }
-            }
-            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Cancel => {
-                if self.pressed.take().is_some() {
-                    ctx.release_pointer_capture(pointer.pointer_id);
-                    ctx.request_paint();
-                    ctx.set_handled();
-                }
-                if self.hovered {
-                    self.hovered = false;
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                }
-            }
-            Event::Keyboard(key)
-                if ctx.is_focused()
-                    && key.state == KeyState::Pressed
-                    && matches!(key.key.as_str(), "Enter" | " ") =>
-            {
-                self.shared.files_mut().activate_row(self.index);
-                ctx.request_measure();
-                ctx.request_paint();
-                ctx.request_semantics();
-                ctx.set_handled();
-            }
-            _ => {}
-        }
-    }
-
-    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        constraints.clamp(Size::new(
-            if constraints.max.width.is_finite() {
-                constraints.max.width
-            } else {
-                260.0
-            },
-            24.0,
-        ))
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        let theme = self.shared.theme();
-        let pal = palette(&self.shared);
-        let bounds = ctx.bounds();
-        let active = self.active();
-        let marked = self.marked();
-        let icon_color = if active { pal.accent } else { pal.text_faint };
-        let label_color = if active { pal.text } else { pal.text_muted };
-        let title_style = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, label_color);
-        let meta_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
-        let (source, meta_text) = {
-            let files = self.shared.files();
-            (files.source, entry_row_meta(&self.entry, &files, active))
-        };
-
-        let leading = Rect::new(bounds.x() + 2.0, bounds.y(), 20.0, bounds.height());
-        let icon_side = 15.0;
-        draw_glyph(
-            ctx,
-            entry_icon(&self.entry),
-            Rect::new(
-                leading.x() + 1.0,
-                leading.y() + (leading.height() - icon_side) * 0.5,
-                icon_side,
-                icon_side,
-            ),
-            icon_color,
-        );
-
-        for (action, glyph, color) in [
-            (
-                SifsEntryRowHit::Select,
-                IconGlyph::Check,
-                if marked { pal.accent } else { pal.text_muted },
-            ),
-            (
-                SifsEntryRowHit::Inspect,
-                IconGlyph::Search,
-                if active { pal.accent } else { pal.text_muted },
-            ),
-            (SifsEntryRowHit::Copy, IconGlyph::Restore, pal.text_muted),
-            (
-                SifsEntryRowHit::Transfer,
-                row_transfer_glyph(source),
-                pal.accent,
-            ),
-        ] {
-            if !self.action_enabled(action) {
-                continue;
-            }
-            let rect = self.action_rect(bounds, action);
-            if row_action_visible(
-                &self.entry,
-                action,
-                self.hovered,
-                active,
-                marked,
-                self.pressed,
-            ) {
-                let fill = if self.pressed == Some(action) {
-                    pal.selected
-                } else if action == SifsEntryRowHit::Select && marked {
-                    pal.selected
-                } else if active {
-                    pal.field
-                } else {
-                    pal.hover
-                };
-                widgets::fill_round_rect(ctx, rect, fill, 6.0);
-                draw_glyph(ctx, glyph, rect.inflate(-5.0, -5.0), color);
-            }
-        }
-
-        let actions_w = row_actions_width();
-        let meta_w = if source == FilesSourceKind::Sifs && active {
-            166.0_f32.min(bounds.width() * 0.34).max(86.0)
-        } else {
-            74.0_f32.min(bounds.width() * 0.36).max(0.0)
-        };
-        let meta_rect = Rect::new(
-            (bounds.max_x() - actions_w - meta_w).max(bounds.x()),
-            bounds.y(),
-            meta_w,
-            bounds.height(),
-        );
-        let meta_display = display_name_for_width(&meta_text, meta_rect.width(), 6.2);
-        widgets::draw_text_in(ctx, meta_rect, &meta_display, meta_style);
-
-        let title_x = leading.max_x() + 5.0;
-        let title_right = meta_rect.x() - 6.0;
-        let title_rect = Rect::new(
-            title_x,
-            bounds.y(),
-            (title_right - title_x).max(0.0),
-            bounds.height(),
-        );
-        let display_name = display_name_for_width(&self.entry.name, title_rect.width(), 7.1);
-        ctx.push_clip_rect(title_rect);
-        widgets::draw_text_in(ctx, title_rect, &display_name, title_style);
-        ctx.pop_clip();
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let row_id = ctx.widget_id();
-        let mut node = SemanticsNode::new(row_id, SemanticsRole::ListItem, ctx.bounds());
-        let (source, description, active, marked) = {
-            let files = self.shared.files();
-            (
-                files.source,
-                entry_row_description(&self.entry, &files, files.selected == Some(self.index)),
-                files.selected == Some(self.index),
-                files.entry_marked(self.index),
-            )
-        };
-        node.name = Some(self.entry.name.clone());
-        node.description = Some(description);
-        node.state.focused = ctx.is_focused();
-        node.state.hovered = self.hovered;
-        node.state.selected = active || marked;
-        node.actions = vec![SemanticsAction::Focus, SemanticsAction::Activate];
-        ctx.push(node);
-
-        for (action, name, description) in [
-            (
-                SifsEntryRowHit::Select,
-                if self.marked() {
-                    format!("Unmark {}", self.entry.name)
-                } else {
-                    format!("Mark {}", self.entry.name)
-                },
-                "Include this entry in batch actions".to_string(),
-            ),
-            (
-                SifsEntryRowHit::Inspect,
-                format!("Inspect {}", self.entry.name),
-                "Show SIFS placement and metadata".to_string(),
-            ),
-            (
-                SifsEntryRowHit::Copy,
-                format!("Copy {}", self.entry.name),
-                format!(
-                    "Copy {} to another {} path",
-                    self.entry.path,
-                    source.operation_scope()
-                ),
-            ),
-            (
-                SifsEntryRowHit::Transfer,
-                row_transfer_label(source, &self.entry.name),
-                row_transfer_description(source, &self.entry.path),
-            ),
-        ] {
-            if !self.action_enabled(action) {
-                continue;
-            }
-            let mut node = SemanticsNode::new(
-                Self::action_widget_id(row_id, action),
-                SemanticsRole::Button,
-                self.action_rect(ctx.bounds(), action),
-            );
-            node.parent = Some(row_id);
-            node.name = Some(name);
-            node.description = Some(description);
-            node.actions = vec![SemanticsAction::Activate];
-            node.state.hovered = self.hovered;
-            node.state.selected = self.active() || self.marked();
-            ctx.push(node);
-        }
-    }
-
-    fn accepts_focus(&self) -> bool {
-        true
     }
 }
 
@@ -6135,11 +5773,17 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 let s = s.clone();
                 move || {
                     let files = s.files();
-                    files.can_modify_current_location() && files.selected_entry().is_some()
+                    files.can_modify_current_location()
+                        && (files.marked_count() > 0 || files.selected_entry().is_some())
                 }
             })
             .on_press_with_ctx(move |ctx| {
-                s.files_mut().open_action_prompt(FileActionPromptKind::Copy);
+                let kind = if s.files().marked_count() > 0 {
+                    FileActionPromptKind::CopySelected
+                } else {
+                    FileActionPromptKind::Copy
+                };
+                s.files_mut().open_action_prompt(kind);
                 request_files_overlay_rebuild(ctx);
             })
     };
@@ -6153,11 +5797,17 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 let s = s.clone();
                 move || {
                     let files = s.files();
-                    files.can_modify_current_location() && files.selected_entry().is_some()
+                    files.can_modify_current_location()
+                        && (files.marked_count() > 0 || files.selected_entry().is_some())
                 }
             })
             .on_press_with_ctx(move |ctx| {
-                s.files_mut().open_action_prompt(FileActionPromptKind::Move);
+                let kind = if s.files().marked_count() > 0 {
+                    FileActionPromptKind::MoveSelected
+                } else {
+                    FileActionPromptKind::Move
+                };
+                s.files_mut().open_action_prompt(kind);
                 request_files_overlay_rebuild(ctx);
             })
     };
@@ -6232,12 +5882,17 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 let s = s.clone();
                 move || {
                     let files = s.files();
-                    files.can_modify_current_location() && files.selected_entry().is_some()
+                    files.can_modify_current_location()
+                        && (files.marked_count() > 0 || files.selected_entry().is_some())
                 }
             })
             .on_press_with_ctx(move |ctx| {
-                s.files_mut()
-                    .open_action_prompt(FileActionPromptKind::Delete);
+                let kind = if s.files().marked_count() > 0 {
+                    FileActionPromptKind::DeleteSelected
+                } else {
+                    FileActionPromptKind::Delete
+                };
+                s.files_mut().open_action_prompt(kind);
                 request_files_overlay_rebuild(ctx);
             })
     };
@@ -6321,9 +5976,8 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 // File listing — rebuilt on navigation by `RebuildOnChange`.
 // ---------------------------------------------------------------------------
 
-/// Build the file-list body for the *current* listing: an error/empty placeholder, or a `ListView`
-/// of the entries wrapped in a `ScrollView`. Directory rows navigate; the inline inspect action
-/// selects either files or directories for the SIFS inspector without changing the path.
+/// Build the file-list body for the current location: an error/empty placeholder, or a virtual
+/// table whose pinned header owns sorting and whose rows support select/open interactions.
 fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
     let (loading, error, is_empty, has_tasks): (bool, Option<String>, bool, bool) = {
         let files = shared.files();
@@ -6457,34 +6111,16 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
     }
 
     let scroll = files_list_body_rebuild(shared, reader, scroll_state);
-    let filter = SizedBox::new()
-        .height(LIST_FILTER_H)
-        .with_child(InsetX::new(
-            files_filter_bar(shared, reader),
-            CONTENT_PAD * 0.5,
-        ));
-    let header = SizedBox::new()
-        .height(LIST_HEADER_H)
-        .with_child(FilesListHeader::new(shared.clone()));
     if has_tasks {
-        let top_h = LIST_TASK_STRIP_H + LIST_FILTER_H + LIST_HEADER_H;
-        let top = Stack::vertical()
-            .alignment(Alignment::Stretch)
-            .with_child(
-                SizedBox::new()
-                    .height(LIST_TASK_STRIP_H)
-                    .with_child(FilesTaskStrip::new(shared.clone())),
-            )
-            .with_child(filter)
-            .with_child(header);
+        let top_h = LIST_TASK_STRIP_H;
+        let top = Stack::vertical().alignment(Alignment::Stretch).with_child(
+            SizedBox::new()
+                .height(LIST_TASK_STRIP_H)
+                .with_child(FilesTaskStrip::new(shared.clone())),
+        );
         WidgetPod::new(widgets::Dock::new(scroll).top(top_h, top))
     } else {
-        let top_h = LIST_FILTER_H + LIST_HEADER_H;
-        let top = Stack::vertical()
-            .alignment(Alignment::Stretch)
-            .with_child(filter)
-            .with_child(header);
-        WidgetPod::new(widgets::Dock::new(scroll).top(top_h, top))
+        WidgetPod::new(scroll)
     }
 }
 
@@ -6506,263 +6142,13 @@ where
     }
 }
 
-fn files_filter_input(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let s = shared.clone();
-    let value = shared.files().filter_query.clone();
-    sui::TextInput::new("files-list-filter")
-        .value(value)
-        .placeholder("Filter current folder")
-        .leading_icon(IconGlyph::Search)
-        .theme_when(clone_reader(reader))
-        .on_change(move |value| {
-            s.files_mut().set_filter_query(value);
-        })
-}
-
-fn files_sort_select(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let s = shared.clone();
-    sui::Select::new("files-sort")
-        .options(FileSortMode::options())
-        .placeholder("Sort")
-        .theme_when(clone_reader(reader))
-        .selected_when({
-            let s = s.clone();
-            move || {
-                let mode = s.files().sort_mode;
-                FileSortMode::ALL
-                    .iter()
-                    .position(|candidate| *candidate == mode)
-            }
-        })
-        .on_change(move |index, _label| {
-            if let Some(mode) = FileSortMode::ALL.get(index).copied() {
-                s.files_mut().set_sort_mode(mode);
-            }
-        })
-}
-
-fn files_mark_visible_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let s = shared.clone();
-    IconButton::new(IconGlyph::Check, "Mark visible entries")
-        .size(30.0)
-        .theme_when(clone_reader(reader))
-        .enabled_when({
-            let s = s.clone();
-            move || !s.files().loading && !s.files().entries.is_empty()
-        })
-        .on_press_with_ctx(move |ctx| {
-            s.files_mut().mark_visible_entries();
-            request_files_overlay_rebuild(ctx);
-        })
-}
-
-fn files_clear_marks_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let s = shared.clone();
-    IconButton::new(IconGlyph::Close, "Clear marked entries")
-        .size(30.0)
-        .theme_when(clone_reader(reader))
-        .enabled_when({
-            let s = s.clone();
-            move || s.files().marked_count() > 0
-        })
-        .on_press_with_ctx(move |ctx| {
-            s.files_mut().clear_marked_entries();
-            request_files_overlay_rebuild(ctx);
-        })
-}
-
-fn files_marked_summary_label(shared: &Shared) -> impl Widget + use<> {
-    let s = shared.clone();
-    sui::Label::dynamic("No marked entries", move || {
-        let count = s.files().marked_count();
-        if count == 0 {
-            "No marked entries".to_string()
-        } else {
-            marked_entries_label(count)
-        }
-    })
-    .semantic_name("Files marked entries")
-    .font_size(11.0)
-    .line_height(16.0)
-}
-
-fn files_marked_hint_label() -> impl Widget {
-    sui::Label::new("Mark rows to batch copy, transfer, move, or delete")
-        .semantic_name("Files marked entries")
-        .font_size(11.0)
-        .line_height(16.0)
-}
-
-fn files_copy_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let s = shared.clone();
-    sui::Button::new("Copy")
-        .icon(IconGlyph::Restore)
-        .min_width(76.0)
-        .min_height(28.0)
-        .theme_when(clone_reader(reader))
-        .enabled_when({
-            let s = s.clone();
-            move || {
-                let files = s.files();
-                files.can_modify_current_location() && files.marked_count() > 0
-            }
-        })
-        .on_press_with_ctx(move |ctx| {
-            s.files_mut()
-                .open_action_prompt(FileActionPromptKind::CopySelected);
-            request_files_overlay_rebuild(ctx);
-        })
-}
-
-fn files_transfer_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let s = shared.clone();
-    let (glyph, label, width) = match shared.files().source {
-        FilesSourceKind::Sifs => (IconGlyph::Download, "Download", 100.0),
-        FilesSourceKind::Local => (IconGlyph::Storage, "Copy to SIFS", 112.0),
-    };
-    sui::Button::new(label)
-        .icon(glyph)
-        .min_width(width)
-        .min_height(28.0)
-        .theme_when(clone_reader(reader))
-        .enabled_when({
-            let s = s.clone();
-            move || {
-                let files = s.files();
-                files.can_modify_current_location() && files.marked_count() > 0
-            }
-        })
-        .on_press_with_ctx(move |ctx| {
-            s.files_mut()
-                .open_action_prompt(FileActionPromptKind::TransferSelected);
-            request_files_overlay_rebuild(ctx);
-        })
-}
-
-fn files_move_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let s = shared.clone();
-    sui::Button::new("Move")
-        .icon(IconGlyph::ChevronRight)
-        .min_width(78.0)
-        .min_height(28.0)
-        .theme_when(clone_reader(reader))
-        .enabled_when({
-            let s = s.clone();
-            move || {
-                let files = s.files();
-                files.can_modify_current_location() && files.marked_count() > 0
-            }
-        })
-        .on_press_with_ctx(move |ctx| {
-            s.files_mut()
-                .open_action_prompt(FileActionPromptKind::MoveSelected);
-            request_files_overlay_rebuild(ctx);
-        })
-}
-
-fn files_delete_marked_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let s = shared.clone();
-    sui::Button::new("Delete")
-        .icon(IconGlyph::Trash)
-        .min_width(82.0)
-        .min_height(28.0)
-        .theme_when(clone_reader(reader))
-        .enabled_when({
-            let s = s.clone();
-            move || {
-                let files = s.files();
-                files.can_modify_current_location() && files.marked_count() > 0
-            }
-        })
-        .on_press_with_ctx(move |ctx| {
-            s.files_mut()
-                .open_action_prompt(FileActionPromptKind::DeleteSelected);
-            request_files_overlay_rebuild(ctx);
-        })
-}
-
-fn files_filter_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let filters = Stack::horizontal()
-        .spacing(8.0)
-        .alignment(Alignment::Center)
-        .with_child(
-            SizedBox::new()
-                .width(240.0)
-                .height(30.0)
-                .with_child(files_filter_input(shared, reader)),
-        )
-        .with_child(
-            SizedBox::new()
-                .width(150.0)
-                .height(30.0)
-                .with_child(files_sort_select(shared, reader)),
-        )
-        .with_child(files_mark_visible_button(shared, reader))
-        .with_child(files_clear_marks_button(shared, reader));
-
-    Stack::vertical()
-        .spacing(6.0)
-        .alignment(Alignment::Stretch)
-        .with_child(SizedBox::new().height(30.0).with_child(filters))
-        .with_child(
-            SizedBox::new()
-                .height(28.0)
-                .with_child(files_marked_actions_rebuild(shared, reader)),
-        )
-}
-
-fn files_marked_actions_rebuild(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || {
-                let files = s.files();
-                (
-                    files.marked_count(),
-                    files.source,
-                    files.can_modify_current_location(),
-                )
-            }
-        },
-        move |_key| files_marked_actions(&s, &r),
-    )
-}
-
-fn files_marked_actions(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    if shared.files().marked_count() == 0 {
-        return WidgetPod::new(
-            Stack::horizontal()
-                .spacing(8.0)
-                .alignment(Alignment::Center)
-                .with_child(files_marked_hint_label()),
-        );
-    }
-
-    WidgetPod::new(
-        Stack::horizontal()
-            .spacing(8.0)
-            .alignment(Alignment::Center)
-            .with_child(
-                SizedBox::new()
-                    .width(116.0)
-                    .height(28.0)
-                    .with_child(files_marked_summary_label(shared)),
-            )
-            .with_child(files_copy_marked_button(shared, reader))
-            .with_child(files_transfer_marked_button(shared, reader))
-            .with_child(files_move_marked_button(shared, reader))
-            .with_child(files_delete_marked_button(shared, reader)),
-    )
-}
-
-fn files_list_body_signature(shared: &Shared) -> (u64, String, FileSortMode) {
+fn files_list_body_signature(shared: &Shared) -> (u64, FileSortMode, usize, usize) {
     let files = shared.files();
     (
         files.list_revision,
-        files.filter_query.clone(),
         files.sort_mode,
+        files.entries.len(),
+        files.entries_total_count,
     )
 }
 
@@ -6779,96 +6165,221 @@ fn files_list_body_rebuild(
             let s = s.clone();
             move || files_list_body_signature(&s)
         },
-        move |_key| files_list_body(&s, &r, &ss),
+        move |_key| files_list_body_table(&s, &r, &ss),
     )
 }
 
-fn files_list_body(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
-    let (entries, filter_query, source, sort_mode) = {
+fn files_list_body_table(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_state: &ScrollState,
+) -> WidgetPod {
+    let _ = scroll_state;
+    let (entries, source, sort_mode, total_count) = {
         let files = shared.files();
         (
             files.entries.clone(),
-            files.filter_query.clone(),
             files.source,
             files.sort_mode,
+            files.entries_total_count,
         )
     };
-    let filter = normalized_files_filter(&filter_query);
-    let visible_indices = visible_file_indices(&entries, &filter, sort_mode);
-    if visible_indices.is_empty() {
+    if entries.is_empty() {
         return WidgetPod::new(
             centered_note(
                 shared,
-                "▤",
-                "No matching entries",
-                format!(
-                    "No {} entries match \"{}\".",
-                    source.label(),
-                    filter_query.trim()
-                ),
+                "â–¤",
+                "Empty directory",
+                format!("No {} entries to show.", source.label()),
             )
-            .glyph(IconGlyph::Search),
+            .glyph(IconGlyph::Folder),
         );
     }
 
-    // Build the row items: icon + name on the left, compact metadata and inspect action on the
-    // right. The child row handles pointer hit-testing while `ListView` keeps selection and scroll.
-    let items: Vec<ListItem> = visible_indices
-        .iter()
-        .filter_map(|index| {
-            let entry = entries.get(*index)?.clone();
-            Some(
-                ListItem::new(entry.path.clone()).with_child(SifsEntryRow::new(
-                    shared.clone(),
-                    *index,
-                    entry,
-                )),
-            )
-        })
-        .collect();
-
-    let list = {
+    let row_entries = entries.clone();
+    let paint_shared = shared.clone();
+    let name_entries = entries.clone();
+    let description_entries = entries.clone();
+    let table = {
         let s = shared.clone();
-        ListView::new("files-listing")
-            .items(items)
+        let cell_s = shared.clone();
+        let header_s = shared.clone();
+        let page_s = shared.clone();
+        let description_s = shared.clone();
+        VirtualTable::new("files-listing")
+            .columns([
+                VirtualTableColumn::new("").width(36.0),
+                VirtualTableColumn::new("Name")
+                    .min_width(180.0)
+                    .sort_direction(sort_mode.name_sort_direction()),
+                VirtualTableColumn::new("Kind / size")
+                    .width(150.0)
+                    .sort_direction(sort_mode.meta_sort_direction()),
+            ])
+            .row_count(entries.len())
             .row_height(ROW_H)
+            .header_height(LIST_HEADER_H)
             .theme_when(clone_reader(reader))
-            // Reflect the current file selection (the highlight is reactive — selecting a file does
-            // NOT rebuild the list, only repaints + updates the inspector).
             .selected_when({
                 let s = s.clone();
                 move || {
-                    let files = s.files();
-                    let filter = normalized_files_filter(&files.filter_query);
-                    visible_file_indices(&files.entries, &filter, files.sort_mode)
-                        .into_iter()
-                        .position(|entry_index| files.selected == Some(entry_index))
+                    s.files()
+                        .selected
+                        .filter(|index| *index < s.files().entries.len())
                 }
             })
-            .on_change(move |index, _label| {
-                // Fallback for keyboard-driven ListView activation when no row child receives focus:
-                // directory -> navigate, file -> select. Row children handle pointer activation.
-                let mut files = s.files_mut();
-                let filter = normalized_files_filter(&files.filter_query);
-                let visible_indices =
-                    visible_file_indices(&files.entries, &filter, files.sort_mode);
-                if let Some(entry_index) = visible_indices.get(index) {
-                    files.activate_row(*entry_index);
+            .row_name(move |index| {
+                name_entries
+                    .get(index)
+                    .map(|entry| entry.name.clone())
+                    .unwrap_or_default()
+            })
+            .row_description(move |index| {
+                let Some(entry) = description_entries.get(index) else {
+                    return String::new();
+                };
+                let files = description_s.files();
+                let kind = if entry.is_dir {
+                    "Folder"
+                } else if entry.is_link {
+                    "Link"
+                } else {
+                    "File"
+                };
+                let mut description =
+                    format!("{kind}, {} {}", files.source.path_label(), entry.path);
+                if entry.is_dir {
+                    description.push_str(". Single click selects; double click opens the folder");
+                }
+                if files.source == FilesSourceKind::Sifs && files.selected == Some(index) {
+                    description.push_str(". Placement ");
+                    description.push_str(&entry_row_meta(entry, &files, true));
+                }
+                description
+            })
+            .row_painter(move |ctx, row| {
+                paint_file_table_row(ctx, &paint_shared, &row_entries, row);
+            })
+            .on_cell_activate(move |row_index, column_index, activation| {
+                if column_index == 0 && activation == VirtualTableRowActivationKind::Single {
+                    cell_s.files_mut().toggle_marked_entry(row_index);
+                    true
+                } else {
+                    false
+                }
+            })
+            .on_row_activate(move |index, activation| {
+                s.files_mut().click_row(index, activation);
+            })
+            .on_header_activate(move |column| {
+                let sort_column = if column == 2 {
+                    FilesSortColumn::KindSize
+                } else {
+                    FilesSortColumn::Name
+                };
+                header_s.files_mut().toggle_sort_column(sort_column);
+            })
+            .on_near_end(move || {
+                if page_s.files().entries.len() < total_count {
+                    let waker = { page_s.borrow().waker.clone() };
+                    page_s.files_mut().request_more_entries(waker);
                 }
             })
     };
 
-    // Pad the list off the panel edges, then make it scrollable. `ScrollView` owns the scroll
-    // position (the `FilesState::scroll` field is now vestigial but kept for state compatibility).
-    let inset = InsetX::new(
-        Stack::vertical()
-            .alignment(Alignment::Stretch)
-            .with_child(SizedBox::new().height(CONTENT_PAD * 0.5))
-            .with_child(list)
-            .with_child(SizedBox::new().height(CONTENT_PAD * 0.5)),
-        CONTENT_PAD * 0.5,
+    WidgetPod::new(table)
+}
+
+fn paint_file_table_row(
+    ctx: &mut PaintCtx,
+    shared: &Shared,
+    entries: &[SifsEntry],
+    row: &VirtualTableRowContext<'_>,
+) {
+    let Some(entry) = entries.get(row.row_index) else {
+        return;
+    };
+    let theme = shared.theme();
+    let pal = palette(shared);
+    let files = shared.files();
+    let active = files.selected == Some(row.row_index);
+    let selected = files.entry_marked(row.row_index);
+    let label_color = if active { pal.text } else { pal.text_muted };
+    let icon_color = if active { pal.accent } else { pal.text_faint };
+    let title_style = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, label_color);
+    let meta_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
+
+    let select_cell = row.column_rects.first().copied().unwrap_or(row.row_rect);
+    let select_side = ROW_SELECT_SIDE.min(select_cell.height() - 6.0).max(0.0);
+    let select_rect = Rect::new(
+        select_cell.x() + ((select_cell.width() - select_side) * 0.5).max(0.0),
+        select_cell.y() + ((select_cell.height() - select_side) * 0.5).max(0.0),
+        select_side,
+        select_side,
     );
-    WidgetPod::new(ScrollView::vertical(inset).state(scroll_state.clone()))
+    let select_border = if selected { pal.accent } else { pal.border };
+    let select_fill = if selected {
+        pal.selected
+    } else {
+        Color::TRANSPARENT
+    };
+    widgets::round_panel(ctx, select_rect, select_fill, select_border, 5.0);
+    if selected || row.hovered {
+        draw_glyph(
+            ctx,
+            IconGlyph::Check,
+            select_rect.inflate(-5.0, -5.0),
+            if selected {
+                pal.accent
+            } else {
+                pal.text_faint.with_alpha(0.55)
+            },
+        );
+    }
+
+    if let Some(name_cell) = row.column_rects.get(1).copied() {
+        let thumbnail_rect = Rect::new(
+            name_cell.x() + 6.0,
+            name_cell.y() + ((name_cell.height() - ROW_THUMBNAIL_SIDE) * 0.5).max(0.0),
+            ROW_THUMBNAIL_SIDE,
+            ROW_THUMBNAIL_SIDE,
+        );
+        // This slot is intentionally isolated so image/SVG thumbnails can replace the glyph later.
+        draw_glyph(
+            ctx,
+            entry_icon(entry),
+            thumbnail_rect.inflate(-2.0, -2.0),
+            icon_color,
+        );
+
+        let title_x = thumbnail_rect.max_x() + 8.0;
+        let title_rect = Rect::new(
+            title_x,
+            name_cell.y(),
+            (name_cell.max_x() - title_x - 8.0).max(0.0),
+            name_cell.height(),
+        );
+        let display_name = display_name_for_width(&entry.name, title_rect.width(), 7.1);
+        ctx.push_clip_rect(title_rect);
+        widgets::draw_text_in(ctx, title_rect, &display_name, title_style);
+        ctx.pop_clip();
+    }
+
+    if let Some(meta_cell) = row.column_rects.get(2).copied() {
+        let meta_text = entry_row_meta(entry, &files, active);
+        let display = display_name_for_width(&meta_text, (meta_cell.width() - 12.0).max(0.0), 6.2);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(
+                meta_cell.x() + 8.0,
+                meta_cell.y(),
+                (meta_cell.width() - 16.0).max(0.0),
+                meta_cell.height(),
+            ),
+            &display,
+            meta_style,
+        );
+    }
 }
 
 /// A centered empty/error placeholder (mark, title, subtitle) themed off the chrome palette.
@@ -7070,14 +6581,14 @@ fn files_entry_count_status(files: &FilesState) -> String {
         "loading directory".to_string()
     } else if files.error.is_some() {
         "listing unavailable".to_string()
+    } else if files.entries_total_count > files.entries.len() {
+        format!(
+            "{}/{} entries loaded",
+            files.entries.len(),
+            files.entries_total_count
+        )
     } else {
-        let filter = normalized_files_filter(&files.filter_query);
-        if filter.is_empty() {
-            plural(files.entries.len(), "entry")
-        } else {
-            let shown = filtered_file_indices(&files.entries, &filter).len();
-            format!("{shown}/{} entries", files.entries.len())
-        }
+        plural(files.entries.len(), "entry")
     }
 }
 
@@ -7085,9 +6596,9 @@ fn files_selection_status(files: &FilesState) -> String {
     let marked = files.marked_count();
     if marked > 0 {
         return if marked == 1 {
-            "1 entry marked".to_string()
+            "1 entry selected".to_string()
         } else {
-            format!("{marked} entries marked")
+            format!("{marked} entries selected")
         };
     }
     files
@@ -7100,9 +6611,9 @@ fn files_status_bar_selection(files: &FilesState) -> String {
     let marked = files.marked_count();
     if marked > 0 {
         return if marked == 1 {
-            "1 marked".to_string()
+            "1 selected".to_string()
         } else {
-            format!("{marked} marked")
+            format!("{marked} selected")
         };
     }
     files
@@ -7521,91 +7032,9 @@ fn plural(count: usize, singular: &str) -> String {
 
 fn marked_entries_label(count: usize) -> String {
     if count == 1 {
-        "1 marked entry".to_string()
+        "1 selected entry".to_string()
     } else {
-        format!("{count} marked entries")
-    }
-}
-
-struct FilesListHeader {
-    shared: Shared,
-}
-
-impl FilesListHeader {
-    fn new(shared: Shared) -> Self {
-        Self { shared }
-    }
-}
-
-impl Widget for FilesListHeader {
-    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        constraints.clamp(Size::new(280.0, LIST_HEADER_H))
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        let theme = self.shared.theme();
-        let pal = palette(&self.shared);
-        let bounds = ctx.bounds();
-        let files = self.shared.files();
-
-        ctx.fill_rect(bounds, pal.sidebar);
-        widgets::hairline_bottom(ctx, bounds, pal.border);
-
-        let x = bounds.x() + CONTENT_PAD;
-        let y = bounds.y() + 8.0;
-        let content_w = (bounds.width() - CONTENT_PAD * 2.0).max(0.0);
-        let action_w = row_actions_width();
-        let meta_w = 88.0_f32.min(content_w * 0.28).max(0.0);
-        let action_x = bounds.max_x() - CONTENT_PAD - action_w;
-        let meta_x = (action_x - meta_w).max(x + 120.0);
-        let title_w = (meta_x - x - 12.0).max(0.0);
-
-        let label_style = pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x, y, title_w, 16.0),
-            "Name",
-            label_style.clone(),
-        );
-        let count_x = (x + 44.0).min(x + title_w);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(count_x, y, (title_w - 44.0).max(0.0), 16.0),
-            &files_entry_count_status(&files),
-            pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text_muted),
-        );
-
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(meta_x, y, meta_w, 16.0),
-            "Kind / size",
-            label_style.clone(),
-        );
-        if content_w > 520.0 {
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(action_x, y, action_w, 16.0),
-                "Actions",
-                label_style,
-            );
-        }
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let files = self.shared.files();
-        let summary = format!(
-            "{} list columns: Name, Kind / size, Actions. Path {}. {}.",
-            files.source.label(),
-            files.path,
-            files_entry_count_status(&files)
-        );
-        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::Text, ctx.bounds());
-        node.name = Some("Files list columns".to_string());
-        node.value = Some(SemanticsValue::Text(
-            "Name | Kind / size | Actions".to_string(),
-        ));
-        node.description = Some(summary);
-        ctx.push(node);
+        format!("{count} selected entries")
     }
 }
 
@@ -8363,8 +7792,8 @@ fn task_progress_fraction(task: &FilesTask) -> f32 {
 
 /// Renders the SIFS inspector for the *currently selected* entry, live-reading
 /// `shared.files()` in `paint`. Diffs a summary on each `RedrawRequested` to self-invalidate so a
-/// selection (which the `ListView` reports with only a repaint request) refreshes the inspector
-/// without rebuilding the list. Mirrors the Settings `StatusReflector` pattern.
+/// virtual-table selection refreshes the inspector without rebuilding the list. Mirrors the
+/// Settings `StatusReflector` pattern.
 ///
 /// Kept as a bespoke painter (rather than a `PanelSection`/`PropertyRow` tree) because its content
 /// is fully selection-driven and re-reads live: composing it from reactive `Label`s would still
@@ -10662,10 +10091,9 @@ fn inspector(shared: &Shared, scroll_state: &ScrollState) -> impl Widget + use<>
 
 /// Hosts a child [`WidgetPod`] that is *rebuilt from scratch* whenever a watched key changes.
 ///
-/// `sui-widgets` collection widgets (`ListView`, `Breadcrumb`, …) take a fixed item vector at build
-/// time — there is no reactive `items_when` builder that re-reads the items each frame. So when the
-/// underlying data set changes (here: the SIFS listing + breadcrumb segments change as the user
-/// navigates), we can't just bind a reader; we have to *rebuild* the subtree. This widget does that:
+/// Some composed widgets (`Breadcrumb`, the current virtual-table configuration, and similar
+/// fixed child trees) are cheaper to rebuild when their backing key changes than to make every
+/// child fully reactive. This widget owns that rebuild boundary:
 ///
 /// * It owns a `build: Fn(&K) -> WidgetPod` closure and a `key: Fn() -> K` reader.
 /// * On each `RedrawRequested` it reads the current key; if it differs from the last-built key it
@@ -11800,49 +11228,6 @@ mod tests {
     }
 
     #[test]
-    fn directory_inspect_action_is_visible_before_hover() {
-        let dir = SifsEntry {
-            name: "dir".to_string(),
-            path: "/dir".to_string(),
-            is_dir: true,
-            is_link: false,
-            size: None,
-        };
-        let file = SifsEntry {
-            name: "file.txt".to_string(),
-            path: "/file.txt".to_string(),
-            is_dir: false,
-            is_link: false,
-            size: Some(10),
-        };
-
-        assert!(
-            row_action_visible(&dir, SifsEntryRowHit::Inspect, false, false, false, None),
-            "directory rows should always expose the inspect/manage affordance"
-        );
-        assert!(
-            !row_action_visible(&file, SifsEntryRowHit::Inspect, false, false, false, None),
-            "file rows should keep secondary actions quiet until hover or selection"
-        );
-        assert!(row_action_visible(
-            &file,
-            SifsEntryRowHit::Inspect,
-            true,
-            false,
-            false,
-            None
-        ));
-        assert!(row_action_visible(
-            &file,
-            SifsEntryRowHit::Select,
-            false,
-            false,
-            true,
-            None
-        ));
-    }
-
-    #[test]
     fn selected_entry_tracks_selection() {
         let backend = Backend::local_fallback();
         let mut state = FilesState::new(&backend);
@@ -11998,17 +11383,15 @@ mod tests {
                 node.role == sui::SemanticsRole::ListItem
                     && node.name.as_deref() == Some("services")
                     && node.description.as_deref().is_some_and(|description| {
-                        description.contains(
-                            "Activate opens the folder; Inspect selects it for management",
-                        )
+                        description.contains("Single click selects; double click opens the folder")
                     })
             })
             .expect("directory row semantics should be present");
         assert!(
             row.description.as_deref().is_some_and(|description| {
-                description.contains("Activate opens the folder; Inspect selects it for management")
+                description.contains("Single click selects; double click opens the folder")
             }),
-            "directory row should explain the open versus inspect split"
+            "directory row should explain the select versus open split"
         );
 
         window
@@ -12843,9 +12226,17 @@ mod tests {
                 source,
                 path,
                 request_id,
+                sort_mode,
+                offset,
+                limit,
+                append,
             } => {
                 assert_eq!(source, FilesSourceKind::Sifs);
                 assert_eq!(path, "/cluster-tests");
+                assert_eq!(sort_mode, FileSortMode::NameAsc);
+                assert_eq!(offset, 0);
+                assert_eq!(limit, Some(FILES_LIST_PAGE_SIZE));
+                assert!(!append);
                 assert_eq!(shared.files().pending_request_id, Some(request_id));
             }
             FilesWorkerCommand::Operation { .. } => panic!("expected list command"),
@@ -13573,10 +12964,10 @@ mod tests {
         );
 
         state.marked_entries.insert(0);
-        assert_eq!(files_status_bar_selection(&state), "1 marked");
+        assert_eq!(files_status_bar_selection(&state), "1 selected");
         assert_eq!(
             files_status_summary(&state),
-            "Local SIFS | Path /cluster-tests | 1 entry | 1 entry marked | 1 task done"
+            "Local SIFS | Path /cluster-tests | 1 entry | 1 entry selected | 1 task done"
         );
 
         state.clustered = true;
@@ -13595,7 +12986,7 @@ mod tests {
         assert_eq!(files_source_status(&state), "SIFS degraded");
         assert_eq!(
             files_status_summary(&state),
-            "SIFS degraded | Path /cluster-tests | 1 entry | 1 entry marked | 1 task done"
+            "SIFS degraded | Path /cluster-tests | 1 entry | 1 entry selected | 1 task done"
         );
 
         state.sifs_health = None;
@@ -13603,7 +12994,7 @@ mod tests {
         assert_eq!(files_source_status(&state), "SIFS unknown");
         assert_eq!(
             files_status_summary(&state),
-            "SIFS unknown | Path /cluster-tests | 1 entry | 1 entry marked | 1 task done"
+            "SIFS unknown | Path /cluster-tests | 1 entry | 1 entry selected | 1 task done"
         );
     }
 
@@ -13824,10 +13215,12 @@ mod tests {
             request_id: 7,
             source: FilesSourceKind::Sifs,
             path: "/services".to_string(),
+            append: false,
             result: FilesListResult::Ok(FilesListing {
                 node_id: "node-a".to_string(),
                 health: None,
                 health_error: None,
+                total_count: 1,
                 entries: vec![SifsEntry {
                     name: "sinomo".to_string(),
                     path: "/services/sinomo".to_string(),
@@ -13883,6 +13276,7 @@ mod tests {
             request_id: 8,
             source: FilesSourceKind::Sifs,
             path: "/services".to_string(),
+            append: false,
             result: FilesListResult::Slow { elapsed_secs: 20 },
         });
 
@@ -13896,10 +13290,12 @@ mod tests {
             request_id: 8,
             source: FilesSourceKind::Sifs,
             path: "/services".to_string(),
+            append: false,
             result: FilesListResult::Ok(FilesListing {
                 node_id: "node-a".to_string(),
                 health: None,
                 health_error: None,
+                total_count: 1,
                 entries: vec![SifsEntry {
                     name: "sinomo".to_string(),
                     path: "/services/sinomo".to_string(),
@@ -13937,6 +13333,7 @@ mod tests {
             request_id: 9,
             source: FilesSourceKind::Sifs,
             path: "/".to_string(),
+            append: false,
             result: FilesListResult::Err("timed out".to_string()),
         });
 
@@ -14252,10 +13649,18 @@ mod tests {
                 request_id,
                 source,
                 path,
+                sort_mode,
+                offset,
+                limit,
+                append,
             } => {
                 assert_eq!(request_id, 0);
                 assert_eq!(source, FilesSourceKind::Sifs);
                 assert_eq!(path, "/services");
+                assert_eq!(sort_mode, FileSortMode::NameAsc);
+                assert_eq!(offset, 0);
+                assert_eq!(limit, Some(FILES_LIST_PAGE_SIZE));
+                assert!(!append);
             }
             FilesWorkerCommand::Details { .. } => panic!("expected list command"),
             FilesWorkerCommand::Preview { .. } => panic!("expected list command"),
@@ -14348,105 +13753,27 @@ mod tests {
     }
 
     #[test]
-    fn file_filter_matches_name_path_kind_and_size() {
-        let entry = SifsEntry {
-            name: "Artifact.bin".to_string(),
-            path: "/services/releases/Artifact.bin".to_string(),
-            is_dir: false,
-            is_link: false,
-            size: Some(1024),
-        };
-        let dir = SifsEntry {
-            name: "logs".to_string(),
-            path: "/services/logs".to_string(),
-            is_dir: true,
-            is_link: false,
-            size: None,
-        };
+    fn local_listing_page_sorts_and_paginates() {
+        let root = files_test_temp_dir("local-page");
+        fs::create_dir(root.join("folder")).expect("create folder");
+        fs::write(root.join("small.txt"), b"small").expect("write small");
+        fs::write(root.join("large.bin"), vec![0_u8; 4096]).expect("write large");
+        let root_label = root.to_string_lossy().into_owned();
 
-        assert!(file_entry_matches_filter(
-            &entry,
-            &normalized_files_filter("artifact")
-        ));
-        assert!(file_entry_matches_filter(
-            &entry,
-            &normalized_files_filter("releases")
-        ));
-        assert!(file_entry_matches_filter(
-            &entry,
-            &normalized_files_filter("1.0 kb")
-        ));
-        assert!(file_entry_matches_filter(
-            &dir,
-            &normalized_files_filter("folder")
-        ));
-        assert!(!file_entry_matches_filter(
-            &entry,
-            &normalized_files_filter("missing")
-        ));
+        let page =
+            list_local_dir_page(&root_label, FileSortMode::SizeDesc, 1, Some(1)).expect("page");
+
+        assert_eq!(page.total_count, 3);
+        assert_eq!(page.offset, 1);
+        assert_eq!(page.limit, Some(1));
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].name, "large.bin");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn visible_file_indices_sort_entries_without_losing_original_indices() {
-        let entries = vec![
-            SifsEntry {
-                name: "logs".to_string(),
-                path: "/services/logs".to_string(),
-                is_dir: true,
-                is_link: false,
-                size: None,
-            },
-            SifsEntry {
-                name: "small.txt".to_string(),
-                path: "/services/small.txt".to_string(),
-                is_dir: false,
-                is_link: false,
-                size: Some(5),
-            },
-            SifsEntry {
-                name: "large.bin".to_string(),
-                path: "/services/large.bin".to_string(),
-                is_dir: false,
-                is_link: false,
-                size: Some(4096),
-            },
-            SifsEntry {
-                name: "alias".to_string(),
-                path: "/services/alias".to_string(),
-                is_dir: false,
-                is_link: true,
-                size: None,
-            },
-        ];
-
-        assert_eq!(
-            visible_file_indices(&entries, "", FileSortMode::NameAsc),
-            vec![0, 3, 2, 1]
-        );
-        assert_eq!(
-            visible_file_indices(&entries, "", FileSortMode::NameDesc),
-            vec![0, 1, 2, 3]
-        );
-        assert_eq!(
-            visible_file_indices(&entries, "", FileSortMode::Kind),
-            vec![0, 3, 2, 1]
-        );
-        assert_eq!(
-            visible_file_indices(&entries, "", FileSortMode::SizeDesc),
-            vec![0, 2, 1, 3]
-        );
-        assert_eq!(
-            visible_file_indices(
-                &entries,
-                &normalized_files_filter("txt"),
-                FileSortMode::SizeDesc
-            ),
-            vec![1]
-        );
-    }
-
-    #[test]
-    fn marked_entries_filter_and_queue_batch_delete_tasks() {
+    fn selected_entries_queue_batch_delete_tasks() {
         let backend = Backend::local_fallback();
         let mut state = FilesState::new(&backend);
         state.loaded = true;
@@ -14476,13 +13803,6 @@ mod tests {
             },
         ];
 
-        state.mark_visible_entries();
-        assert_eq!(state.marked_count(), 3);
-        state.set_filter_query("artifact".to_string());
-        assert_eq!(state.marked_count(), 1);
-
-        state.clear_marked_entries();
-        state.set_filter_query(String::new());
         assert!(state.toggle_marked_entry(0));
         assert!(state.toggle_marked_entry(2));
         state.open_action_prompt(FileActionPromptKind::DeleteSelected);
@@ -14503,7 +13823,7 @@ mod tests {
                 .action_prompt
                 .as_ref()
                 .and_then(|prompt| prompt.error.as_deref()),
-            Some("type DELETE to remove 2 marked entries")
+            Some("type DELETE to remove 2 selected entries")
         );
 
         let (tx, rx) = mpsc::channel();
@@ -14643,60 +13963,6 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&state.local_path);
-    }
-
-    #[test]
-    fn setting_filter_clears_hidden_selection() {
-        let backend = Backend::local_fallback();
-        let mut state = FilesState::new(&backend);
-        state.loaded = true;
-        state.loading = false;
-        state.path = "/services".to_string();
-        state.entries = vec![
-            SifsEntry {
-                name: "logs".to_string(),
-                path: "/services/logs".to_string(),
-                is_dir: true,
-                is_link: false,
-                size: None,
-            },
-            SifsEntry {
-                name: "artifact.txt".to_string(),
-                path: "/services/artifact.txt".to_string(),
-                is_dir: false,
-                is_link: false,
-                size: Some(42),
-            },
-        ];
-        state.selected = Some(0);
-        state.selected_details = Some(SifsObjectDetails {
-            file_system_id: "sifs".to_string(),
-            object_id: "obj".to_string(),
-            path: "/services/logs".to_string(),
-            kind: "directory".to_string(),
-            version: "v1".to_string(),
-            content_hash: None,
-            size_bytes: None,
-            link_count: 1,
-            mode: 0o755,
-            uid: 0,
-            gid: 0,
-            accessed_at_unix_nanos: 0,
-            modified_at_unix_nanos: 0,
-            created_at_unix_nanos: 0,
-            changed_at_unix_nanos: 0,
-            policy: "replicated-eventual".to_string(),
-            current_locations: Vec::new(),
-            local_pins: Vec::new(),
-            metadata_shard: None,
-            health: None,
-        });
-
-        state.set_filter_query("artifact".to_string());
-
-        assert_eq!(state.selected, None);
-        assert!(state.selected_details.is_none());
-        assert_eq!(files_entry_count_status(&state), "1/2 entries");
     }
 
     #[test]
@@ -15122,7 +14388,7 @@ mod tests {
     }
 
     #[test]
-    fn files_list_header_exposes_column_context() -> sui::Result<()> {
+    fn files_table_exposes_column_context() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -15159,109 +14425,29 @@ mod tests {
         let window = app.main_window()?;
 
         let snapshot = window.snapshot()?;
-        let header = snapshot
+        let table = snapshot
             .accessibility
             .nodes
             .iter()
             .find(|node| {
-                node.role == sui::SemanticsRole::Text
-                    && node.name.as_deref() == Some("Files list columns")
+                node.role == sui::SemanticsRole::Table
+                    && node.name.as_deref() == Some("files-listing")
             })
-            .expect("files list header semantics");
+            .expect("files table semantics");
         assert_eq!(
-            header.value,
-            Some(sui::SemanticsValue::Text(
-                "Name | Kind / size | Actions".to_string(),
-            ))
+            table.value,
+            Some(sui::SemanticsValue::Text("2 rows".to_string()))
         );
         assert_eq!(
-            header.description.as_deref(),
-            Some("SIFS list columns: Name, Kind / size, Actions. Path /services. 2 entries.")
+            table.description.as_deref(),
+            Some("Columns: Name, Kind / size")
         );
 
         Ok(())
     }
 
     #[test]
-    fn filtered_file_rows_map_to_original_entries() -> sui::Result<()> {
-        let backend = Backend::local_fallback();
-        let shared = Shared::new(AppState::ready(backend));
-        {
-            let mut files = shared.files_mut();
-            files.loaded = true;
-            files.loading = false;
-            files.path = "/services".to_string();
-            files.entries = vec![
-                SifsEntry {
-                    name: "logs".to_string(),
-                    path: "/services/logs".to_string(),
-                    is_dir: true,
-                    is_link: false,
-                    size: None,
-                },
-                SifsEntry {
-                    name: "artifact.txt".to_string(),
-                    path: "/services/artifact.txt".to_string(),
-                    is_dir: false,
-                    is_link: false,
-                    size: Some(42),
-                },
-                SifsEntry {
-                    name: "notes.md".to_string(),
-                    path: "/services/notes.md".to_string(),
-                    is_dir: false,
-                    is_link: false,
-                    size: Some(5),
-                },
-            ];
-            files.filter_query = "artifact".to_string();
-        }
-
-        let runtime = sui::Application::new()
-            .window(
-                sui::WindowBuilder::new()
-                    .title("Files filtered rows")
-                    .root(view(shared.clone())),
-            )
-            .build()?;
-        let app = sui_testing::TestApp::from_runtime(runtime)?;
-        let window = app.main_window()?;
-        let snapshot = window.snapshot()?;
-
-        assert!(
-            snapshot.accessibility.nodes.iter().any(|node| {
-                node.role == sui::SemanticsRole::Text
-                    && node.name.as_deref() == Some("Files status")
-                    && node.value
-                        == Some(sui::SemanticsValue::Text(
-                            "Local SIFS | Path /services | 1/3 entries | no selection | idle"
-                                .to_string(),
-                        ))
-            }),
-            "status should show filtered and total entry counts"
-        );
-        assert!(
-            !snapshot
-                .accessibility
-                .nodes
-                .iter()
-                .any(|node| node.name.as_deref() == Some("logs")),
-            "non-matching entries should not be rendered"
-        );
-
-        window
-            .get_by_role(sui::SemanticsRole::ListItem)
-            .with_name("artifact.txt")
-            .with_description("File, SIFS path /services/artifact.txt")
-            .click()?;
-
-        assert_eq!(shared.files().selected, Some(1));
-
-        Ok(())
-    }
-
-    #[test]
-    fn rendered_sorted_file_rows_select_original_entry() -> sui::Result<()> {
+    fn rendered_file_rows_select_matching_entry() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -15285,7 +14471,6 @@ mod tests {
                     size: Some(4096),
                 },
             ];
-            files.sort_mode = FileSortMode::SizeDesc;
         }
 
         let runtime = sui::Application::new()
@@ -15298,18 +14483,9 @@ mod tests {
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
-        assert_eq!(
-            window
-                .get_by_role(sui::SemanticsRole::ComboBox)
-                .with_name("files-sort")
-                .count()?,
-            1
-        );
-
         window
             .get_by_role(sui::SemanticsRole::ListItem)
             .with_name("large.bin")
-            .with_description("File, SIFS path /services/large.bin")
             .click()?;
 
         assert_eq!(shared.files().selected, Some(1));
@@ -15395,7 +14571,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_inspect_button_selects_without_navigation() -> sui::Result<()> {
+    fn directory_row_single_click_selects_without_navigation() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -15425,8 +14601,8 @@ mod tests {
         let window = app.main_window()?;
 
         window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Inspect dir")
+            .get_by_role(sui::SemanticsRole::ListItem)
+            .with_name("dir")
             .click()?;
 
         let files = shared.files();
@@ -15585,7 +14761,7 @@ mod tests {
     }
 
     #[test]
-    fn row_action_buttons_expose_quick_copy_and_transfer_only() -> sui::Result<()> {
+    fn file_rows_do_not_expose_inline_copy_or_transfer_actions() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -15607,7 +14783,7 @@ mod tests {
             .window(
                 sui::WindowBuilder::new().title("Files row actions").root(
                     SizedBox::new()
-                        .width(520.0)
+                        .width(1180.0)
                         .height(720.0)
                         .with_child(view(shared.clone())),
                 ),
@@ -15616,46 +14792,10 @@ mod tests {
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Copy artifact.txt")
-            .click()?;
-        {
-            let files = shared.files();
-            let prompt = files.action_prompt.as_ref().expect("copy prompt");
-            assert_eq!(prompt.kind, FileActionPromptKind::Copy);
-            assert_eq!(prompt.target_path.as_deref(), Some("/artifact.txt"));
-            assert_eq!(prompt.input, "artifact copy.txt");
-            assert_eq!(files.selected, Some(0));
-        }
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Cancel")
-            .click()?;
-        assert!(shared.files().action_prompt.is_none());
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Download artifact.txt")
-            .click()?;
-        {
-            let files = shared.files();
-            let prompt = files.action_prompt.as_ref().expect("download prompt");
-            assert_eq!(prompt.kind, FileActionPromptKind::CopyToLocal);
-            assert_eq!(prompt.target_path.as_deref(), Some("/artifact.txt"));
-            assert!(prompt.input.ends_with("artifact.txt"));
-            assert_eq!(files.selected, Some(0));
-        }
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Cancel")
-            .click()?;
-        assert!(shared.files().action_prompt.is_none());
-
         let snapshot = window.snapshot()?;
         for hidden_name in [
+            "Copy artifact.txt",
+            "Download artifact.txt",
             "Move artifact.txt",
             "Rename artifact.txt",
             "Delete artifact.txt",
@@ -15665,15 +14805,29 @@ mod tests {
                     node.role == sui::SemanticsRole::Button
                         && node.name.as_deref() == Some(hidden_name)
                 }),
-                "{hidden_name} should stay in the labeled inspector actions, not the compact row"
+                "{hidden_name} should not be exposed as an inline row action"
             );
         }
+
+        window
+            .get_by_role(sui::SemanticsRole::ListItem)
+            .with_name("artifact.txt")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Copy to")
+            .click()?;
+        let files = shared.files();
+        let prompt = files.action_prompt.as_ref().expect("copy prompt");
+        assert_eq!(prompt.kind, FileActionPromptKind::Copy);
+        assert_eq!(prompt.target_path.as_deref(), Some("/artifact.txt"));
+        assert_eq!(files.selected, Some(0));
 
         Ok(())
     }
 
     #[test]
-    fn batch_mark_controls_open_delete_selected_prompt() -> sui::Result<()> {
+    fn selected_row_toolbar_actions_open_item_prompts() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -15703,7 +14857,7 @@ mod tests {
             .window(
                 sui::WindowBuilder::new().title("Files batch actions").root(
                     SizedBox::new()
-                        .width(620.0)
+                        .width(1180.0)
                         .height(720.0)
                         .with_child(view(shared.clone())),
                 ),
@@ -15712,186 +14866,87 @@ mod tests {
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
-        let initial_snapshot = window.snapshot()?;
-        assert!(
-            initial_snapshot.accessibility.nodes.iter().any(|node| {
-                node.role == sui::SemanticsRole::Text
-                    && node.name.as_deref() == Some("Files marked entries")
-                    && node.value
-                        == Some(sui::SemanticsValue::Text(
-                            "Mark rows to batch copy, transfer, move, or delete".to_string(),
-                        ))
-            }),
-            "the unmarked state should show a quiet batch-action hint"
-        );
-        for name in ["Copy", "Download", "Move", "Delete"] {
-            assert!(
-                !initial_snapshot.accessibility.nodes.iter().any(|node| {
-                    node.role == sui::SemanticsRole::Button && node.name.as_deref() == Some(name)
-                }),
-                "batch action {name} should stay hidden until entries are marked"
+        window
+            .get_by_role(sui::SemanticsRole::ListItem)
+            .with_name("artifact.txt")
+            .click()?;
+        assert_eq!(shared.files().selected, Some(0));
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Copy to")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("copy prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::Copy);
+            assert_eq!(
+                prompt.target_path.as_deref(),
+                Some("/services/artifact.txt")
+            );
+        }
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel")
+            .click()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Move to")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("move prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::Move);
+            assert_eq!(
+                prompt.target_path.as_deref(),
+                Some("/services/artifact.txt")
+            );
+            assert_eq!(prompt.input, "artifact.txt");
+        }
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel")
+            .click()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Rename")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("rename prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::Rename);
+            assert_eq!(
+                prompt.target_path.as_deref(),
+                Some("/services/artifact.txt")
+            );
+            assert_eq!(prompt.input, "artifact.txt");
+        }
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel")
+            .click()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Delete selected item")
+            .click()?;
+        {
+            let files = shared.files();
+            let prompt = files.action_prompt.as_ref().expect("delete prompt");
+            assert_eq!(prompt.kind, FileActionPromptKind::Delete);
+            assert_eq!(
+                prompt.target_path.as_deref(),
+                Some("/services/artifact.txt")
             );
         }
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Mark artifact.txt")
-            .click()?;
-        assert_eq!(shared.files().marked_count(), 1);
-        assert!(shared.files().entry_marked(0));
-
-        let snapshot = window.snapshot()?;
-        assert!(snapshot.accessibility.nodes.iter().any(|node| {
-            node.role == sui::SemanticsRole::Text
-                && node.name.as_deref() == Some("Files marked entries")
-                && node.value == Some(sui::SemanticsValue::Text("1 marked entry".to_string()))
-        }));
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Copy")
-            .click()?;
-        {
-            let files = shared.files();
-            let prompt = files.action_prompt.as_ref().expect("copy selected prompt");
-            assert_eq!(prompt.kind, FileActionPromptKind::CopySelected);
-            assert_eq!(prompt.targets.len(), 1);
-            assert_eq!(prompt.targets[0].path, "/services/artifact.txt");
-            assert_eq!(prompt.input, "/services");
-        }
-        window
-            .get_by_role(sui::SemanticsRole::Button)
             .with_name("Cancel")
             .click()?;
 
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Download")
-            .click()?;
-        {
-            let files = shared.files();
-            let prompt = files
-                .action_prompt
-                .as_ref()
-                .expect("transfer selected prompt");
-            assert_eq!(prompt.kind, FileActionPromptKind::TransferSelected);
-            assert_eq!(prompt.targets.len(), 1);
-            assert_eq!(prompt.targets[0].path, "/services/artifact.txt");
-            assert_eq!(prompt.input, files.local_path);
-        }
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Cancel")
-            .click()?;
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Move")
-            .click()?;
-        {
-            let files = shared.files();
-            let prompt = files.action_prompt.as_ref().expect("move selected prompt");
-            assert_eq!(prompt.kind, FileActionPromptKind::MoveSelected);
-            assert_eq!(prompt.targets.len(), 1);
-            assert_eq!(prompt.targets[0].path, "/services/artifact.txt");
-            assert_eq!(prompt.input, "/services");
-        }
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Cancel")
-            .click()?;
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Delete")
-            .click()?;
-        {
-            let files = shared.files();
-            let prompt = files
-                .action_prompt
-                .as_ref()
-                .expect("delete selected prompt");
-            assert_eq!(prompt.kind, FileActionPromptKind::DeleteSelected);
-            assert_eq!(prompt.targets.len(), 1);
-            assert_eq!(prompt.targets[0].path, "/services/artifact.txt");
-        }
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Cancel")
-            .click()?;
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Mark visible entries")
-            .click()?;
-        assert_eq!(shared.files().marked_count(), 2);
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Clear marked entries")
-            .click()?;
-        assert_eq!(shared.files().marked_count(), 0);
-
-        Ok(())
-    }
-
-    #[test]
-    fn local_row_action_exposes_copy_to_sifs_prompt() -> sui::Result<()> {
-        let backend = Backend::local_fallback();
-        let shared = Shared::new(AppState::ready(backend));
-        let root = files_test_temp_dir("row-copy-to-sifs");
-        let artifact = root.join("artifact.txt");
-        fs::write(&artifact, b"hello").expect("write local artifact");
-        let root_label = display_local_path(root.to_string_lossy().into_owned());
-        let artifact_label = display_local_path(artifact.to_string_lossy().into_owned());
-        {
-            let mut files = shared.files_mut();
-            files.source = FilesSourceKind::Local;
-            files.loaded = true;
-            files.loading = false;
-            files.path = root_label.clone();
-            files.local_path = root_label;
-            files.sifs_path = "/services".to_string();
-            files.entries = vec![SifsEntry {
-                name: "artifact.txt".to_string(),
-                path: artifact_label.clone(),
-                is_dir: false,
-                is_link: false,
-                size: Some(5),
-            }];
-            files.selected = None;
-        }
-
-        let runtime = sui::Application::new()
-            .window(
-                sui::WindowBuilder::new()
-                    .title("Files local row transfer")
-                    .root(
-                        SizedBox::new()
-                            .width(520.0)
-                            .height(720.0)
-                            .with_child(view(shared.clone())),
-                    ),
-            )
-            .build()?;
-        let app = sui_testing::TestApp::from_runtime(runtime)?;
-        let window = app.main_window()?;
-
-        window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Copy to SIFS artifact.txt")
-            .click()?;
-
-        {
-            let files = shared.files();
-            let prompt = files.action_prompt.as_ref().expect("copy to SIFS prompt");
-            assert_eq!(prompt.kind, FileActionPromptKind::CopyToSifs);
-            assert_eq!(prompt.target_path.as_deref(), Some(artifact_label.as_str()));
-            assert_eq!(prompt.input, "/services/artifact.txt");
-            assert_eq!(files.selected, Some(0));
-        }
-
-        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
@@ -16410,8 +15465,8 @@ mod tests {
         let window = app.main_window()?;
 
         window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Inspect dir")
+            .get_by_role(sui::SemanticsRole::ListItem)
+            .with_name("dir")
             .click()?;
         assert_eq!(shared.files().path, "/");
         assert!(

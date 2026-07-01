@@ -17047,7 +17047,21 @@ mod tests {
         ))))?;
         app.run_until_idle()?;
 
-        let pos = Point::new(724.0, 296.0);
+        let snapshot = window.snapshot()?;
+        let check_sifs = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("Check SIFS")
+                    && node.description.as_deref() == Some("Open SIFS browser")
+            })
+            .expect("Check SIFS recovery button");
+        let pos = Point::new(
+            check_sifs.bounds.x() + check_sifs.bounds.width() * 0.5,
+            check_sifs.bounds.y() + check_sifs.bounds.height() * 0.5,
+        );
         root.dispatch_event(Event::Pointer(PointerEvent::new(
             PointerEventKind::Move,
             pos,
