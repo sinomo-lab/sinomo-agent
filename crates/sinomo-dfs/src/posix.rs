@@ -6,7 +6,10 @@
 //! behavior over SIFS while the lower DFS layers handle placement, receipts,
 //! repair, and metadata journaling.
 
-use crate::namespace::{initial_version, metadata_path, next_version, object_id_for_path};
+use crate::namespace::{
+    initial_version, metadata_path, namespace_transaction_id_for_path, next_version,
+    object_id_for_path,
+};
 use crate::{
     DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest, DfsControlPlaneStore,
     DfsDirectoryPage, DfsDirectoryPageCursor, DfsError, DfsFileSystem, DfsMessageTransport,
@@ -1721,7 +1724,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             old_path_tombstone.link_target_object_id = None;
             old_path_tombstone.current_locations = vec![self.node_id.clone()];
             self.apply_namespace_transaction(DfsNamespaceTransaction {
-                transaction_id: namespace_transaction_id(
+                transaction_id: namespace_transaction_id_for_path(
                     "rename-cross-shard",
                     &moved_object.object_id,
                     &old_path,
@@ -1833,7 +1836,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         transaction_objects.push(object.clone());
         let visible_version = object_version_record(object, object.content_size_bytes);
         self.apply_namespace_transaction(DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id("adopt-cross-shard", &object.object_id, &path),
+            transaction_id: namespace_transaction_id_for_path(
+                "adopt-cross-shard",
+                &object.object_id,
+                &path,
+            ),
             file_system_id: object.file_system_id.clone(),
             objects: transaction_objects,
             versions: vec![visible_version],
@@ -1897,7 +1904,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.ensure_parent_directory(&path)?;
         self.apply_namespace_transaction(DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id(
+            transaction_id: namespace_transaction_id_for_path(
                 "adopt-hardlink-cross-shard",
                 &alias.object_id,
                 &path,
@@ -4998,7 +5005,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         transaction_objects.extend(moved_children);
         transaction_objects.extend(hardlink_target_updates);
         self.apply_namespace_transaction(DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id("rename", &source.object_id, &source.path),
+            transaction_id: namespace_transaction_id_for_path(
+                "rename",
+                &source.object_id,
+                &source.path,
+            ),
             file_system_id: source.file_system_id.clone(),
             objects: transaction_objects,
             versions: Vec::new(),
@@ -5902,7 +5913,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 promoted.changed_at_unix_nanos = now_unix_nanos();
                 promoted.version = next_version(&promoted.version);
                 self.apply_namespace_transaction(DfsNamespaceTransaction {
-                    transaction_id: namespace_transaction_id(
+                    transaction_id: namespace_transaction_id_for_path(
                         "clear-hardlink",
                         &promoted.object_id,
                         &promoted.path,
@@ -6264,7 +6275,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         transaction_objects.insert(0, old_path_tombstone);
         transaction_objects.insert(1, source.clone());
         self.apply_namespace_transaction(DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id("rename", &source.object_id, &source.path),
+            transaction_id: namespace_transaction_id_for_path(
+                "rename",
+                &source.object_id,
+                &source.path,
+            ),
             file_system_id: source.file_system_id.clone(),
             objects: transaction_objects,
             versions: Vec::new(),
@@ -6305,7 +6320,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut moved = object.clone();
         moved.path = target_path.to_string();
         self.apply_namespace_transaction(DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id("rename-child", &moved.object_id, &moved.path),
+            transaction_id: namespace_transaction_id_for_path(
+                "rename-child",
+                &moved.object_id,
+                &moved.path,
+            ),
             file_system_id: moved.file_system_id.clone(),
             objects: vec![moved],
             versions: Vec::new(),
@@ -6634,7 +6653,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object.version = next_version(&object.version);
 
         self.apply_namespace_transaction(DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id(
+            transaction_id: namespace_transaction_id_for_path(
                 "unlink-hardlink",
                 &object.object_id,
                 old_path,
@@ -6885,14 +6904,6 @@ fn validate_posix_symlink_target(target: &str) -> Result<()> {
         });
     }
     Ok(())
-}
-
-fn namespace_transaction_id(kind: &str, object_id: &DfsObjectId, path: &str) -> String {
-    format!(
-        "namespace_{}_{}",
-        kind,
-        blake3::hash(format!("{object_id}\0{path}").as_bytes()).to_hex()
-    )
 }
 
 fn namespace_job_id(

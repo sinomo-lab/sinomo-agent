@@ -80,6 +80,19 @@ pub struct DfsAntiEntropyIssue {
     pub repaired: bool,
 }
 
+pub(crate) fn record_anti_entropy_issue(
+    report: &mut DfsAntiEntropyReport,
+    max_issues: usize,
+    issue: DfsAntiEntropyIssue,
+) {
+    report.issue_count = report.issue_count.saturating_add(1);
+    if report.issues.len() < max_issues {
+        report.issues.push(issue);
+    } else {
+        report.max_issues_reached = true;
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsLifecycleMaintenanceOptions {
     #[serde(default)]

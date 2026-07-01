@@ -1,10 +1,20 @@
 use crate::{
-    ChunkedBlobAssembler, DFS_BLOB_CHUNK_BYTES, DfsError, DfsFileSystemId, DfsObjectId,
-    DfsObjectMetadata, DfsVersion,
+    ChunkedBlobAssembler, DfsError, DfsFileSystemId, DfsObjectId, DfsObjectMetadata,
+    DfsTransferProfile, DfsVersion,
 };
 use sinomo_node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+pub(crate) const DFS_BLOB_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const DFS_STAGE_CHUNK_WINDOW_SIZE: u32 = 4;
+pub(crate) const DFS_READ_CHUNK_WINDOW_SIZE: u32 = 4;
+pub(crate) const DFS_FETCH_CHUNK_WINDOW_SIZE: u32 = 4;
+pub(crate) const DFS_LAN_CHUNK_WINDOW_SIZE: u32 = 16;
+pub(crate) const DFS_LOCAL_CHUNK_WINDOW_SIZE: u32 = 16;
+pub(crate) const DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const DFS_REPAIR_RETRY_SUPPRESSED_TICK: u64 = u64::MAX;
+const DFS_REPAIR_RETRY_TICK_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub(crate) struct PendingNetworkedWrite {
@@ -25,6 +35,45 @@ pub(crate) struct PendingNetworkedWrite {
     pub(crate) fetch_next_chunk_indexes: BTreeMap<NodeId, u32>,
     pub(crate) fetch_window_end_chunk_indexes: BTreeMap<NodeId, u32>,
     pub(crate) fetch_failed_from: BTreeSet<NodeId>,
+}
+
+impl PendingNetworkedWrite {
+    pub(crate) fn new(
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        content_hash: String,
+        size_bytes: u64,
+    ) -> Self {
+        Self::with_patch(object_id, version, content_hash, size_bytes, None)
+    }
+
+    pub(crate) fn with_patch(
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        content_hash: String,
+        size_bytes: u64,
+        patch: Option<PendingNetworkedWritePatch>,
+    ) -> Self {
+        Self {
+            object_id,
+            version,
+            content_hash,
+            size_bytes,
+            patch,
+            stage_retries: BTreeMap::new(),
+            repair_retries: BTreeMap::new(),
+            stage_inflight_request_ids: BTreeMap::new(),
+            stage_next_chunk_indexes: BTreeMap::new(),
+            repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
+            fetch_inflight_from: BTreeSet::new(),
+            fetch_inflight_request_ids: BTreeMap::new(),
+            fetch_inflight_started_ticks: BTreeMap::new(),
+            fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
+            fetch_failed_from: BTreeSet::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +105,42 @@ pub(crate) struct RepairRetryState {
     pub(crate) attempts: u32,
     pub(crate) next_retry_tick: u64,
     pub(crate) inflight: bool,
+}
+
+pub(crate) fn repair_retry_delay_ticks(attempts: u32) -> u64 {
+    1_u64 << attempts.saturating_sub(1).min(6)
+}
+
+pub(crate) fn repair_retry_delay_nanos_for_ticks(ticks: u64) -> u64 {
+    let tick_nanos = u64::try_from(DFS_REPAIR_RETRY_TICK_DURATION.as_nanos()).unwrap_or(u64::MAX);
+    ticks.saturating_mul(tick_nanos)
+}
+
+pub(crate) fn repair_retry_state_is_suppressed(state: &RepairRetryState) -> bool {
+    state.next_retry_tick == DFS_REPAIR_RETRY_SUPPRESSED_TICK
+}
+
+pub(crate) fn wake_repair_retry_state(state: &mut RepairRetryState) {
+    if !repair_retry_state_is_suppressed(state) {
+        state.next_retry_tick = 0;
+    }
+}
+
+pub(crate) fn stage_inflight_retry_delay_ticks(attempts: u32) -> u64 {
+    repair_retry_delay_ticks(attempts).saturating_add(1)
+}
+
+pub(crate) fn fetch_inflight_timeout_ticks() -> u64 {
+    stage_inflight_retry_delay_ticks(2)
+}
+
+pub(crate) fn repair_transfer_inflight_timeout_ticks(total_size_bytes: u64) -> u64 {
+    let chunk_count = total_size_bytes
+        .div_ceil(DFS_BLOB_CHUNK_BYTES as u64)
+        .max(1);
+    let window_chunks = u64::from(DFS_STAGE_CHUNK_WINDOW_SIZE.max(1));
+    let repair_windows = chunk_count.div_ceil(window_chunks).max(1);
+    fetch_inflight_timeout_ticks().saturating_mul(repair_windows)
 }
 
 #[derive(Debug)]
@@ -482,6 +567,127 @@ pub(crate) fn blob_chunk_count_for_size(size_bytes: u64) -> Result<u32, DfsError
     let chunks = size_bytes.div_ceil(chunk_size);
     u32::try_from(chunks).map_err(|_| DfsError::Distributed {
         message: format!("DFS blob is too large to transfer in {DFS_BLOB_CHUNK_BYTES}-byte chunks"),
+    })
+}
+
+pub(crate) fn dfs_adaptive_chunk_window_size(
+    profile: DfsTransferProfile,
+    total_size_bytes: u64,
+    base_window_chunks: u32,
+) -> u32 {
+    let total_chunks = total_size_bytes
+        .div_ceil(DFS_BLOB_CHUNK_BYTES as u64)
+        .clamp(1, u64::from(u32::MAX)) as u32;
+    let profile_window = match profile {
+        DfsTransferProfile::Conservative => base_window_chunks,
+        DfsTransferProfile::Lan => base_window_chunks.max(DFS_LAN_CHUNK_WINDOW_SIZE),
+        DfsTransferProfile::Local => base_window_chunks.max(DFS_LOCAL_CHUNK_WINDOW_SIZE),
+    };
+    let budget_window = (DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES / DFS_BLOB_CHUNK_BYTES as u64)
+        .clamp(1, u64::from(u32::MAX)) as u32;
+    profile_window.min(budget_window).min(total_chunks).max(1)
+}
+
+pub(crate) fn blob_chunk_len(total_size_bytes: u64, chunk_index: u32) -> Result<usize, DfsError> {
+    let chunk_offset = u64::from(chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
+    let chunk_len = total_size_bytes
+        .saturating_sub(chunk_offset)
+        .min(DFS_BLOB_CHUNK_BYTES as u64);
+    usize::try_from(chunk_len).map_err(|_| DfsError::Distributed {
+        message: format!("DFS blob chunk is too large to fit in memory: {chunk_len} bytes"),
+    })
+}
+
+pub(crate) fn chunk_prefix_bytes(total_size_bytes: u64, chunk_count: u32) -> u64 {
+    total_size_bytes.min(u64::from(chunk_count).saturating_mul(DFS_BLOB_CHUNK_BYTES as u64))
+}
+
+pub(crate) fn pending_stage_transfer_size_bytes(
+    pending: &PendingNetworkedWrite,
+    replica_node_id: &NodeId,
+) -> u64 {
+    pending
+        .patch
+        .as_ref()
+        .filter(|patch| !patch.full_stage_fallback_nodes.contains(replica_node_id))
+        .map(|patch| patch.patch_size_bytes)
+        .unwrap_or(pending.size_bytes)
+}
+
+pub(crate) fn range_transfer_size_bytes(
+    object_total_size_bytes: u64,
+    requested_offset: u64,
+    requested_max_bytes: usize,
+) -> u64 {
+    let start = requested_offset.min(object_total_size_bytes);
+    let max_bytes = u64::try_from(requested_max_bytes).unwrap_or(u64::MAX);
+    object_total_size_bytes.saturating_sub(start).min(max_bytes)
+}
+
+pub(crate) fn dfs_byte_count_to_usize(label: &str, value: u64) -> Result<usize, DfsError> {
+    usize::try_from(value).map_err(|_| DfsError::Distributed {
+        message: format!("{label} byte count is too large for this platform: {value}"),
+    })
+}
+
+pub(crate) fn fetch_response_window_end(
+    start_chunk_index: u32,
+    total_chunks: u32,
+    max_chunks: u32,
+) -> u32 {
+    if max_chunks == 0 {
+        return total_chunks;
+    }
+    start_chunk_index
+        .saturating_add(max_chunks)
+        .min(total_chunks)
+}
+
+pub(crate) fn repair_replica_chunk_start_and_window(
+    requested_start_chunk_index: u32,
+    requested_max_chunks: u32,
+    total_chunks: u32,
+) -> (u32, u32) {
+    if requested_start_chunk_index >= total_chunks {
+        return (total_chunks, 1);
+    }
+    if requested_start_chunk_index
+        .checked_add(1)
+        .is_some_and(|next| next == total_chunks)
+    {
+        return (requested_start_chunk_index, 1);
+    }
+    (
+        requested_start_chunk_index,
+        requested_max_chunks
+            .max(1)
+            .min(total_chunks.saturating_sub(requested_start_chunk_index)),
+    )
+}
+
+pub(crate) fn read_response_window_range_len(
+    start_chunk_index: u32,
+    total_size_bytes: u64,
+    max_chunks: u32,
+) -> Result<usize, DfsError> {
+    let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
+    if start_chunk_index >= total_chunks {
+        return Err(DfsError::Distributed {
+            message: format!(
+                "DFS read chunk window starts outside object: start={}, total_chunks={total_chunks}",
+                start_chunk_index
+            ),
+        });
+    }
+    let end_chunk_index = fetch_response_window_end(start_chunk_index, total_chunks, max_chunks);
+    let start_offset = u64::from(start_chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
+    let end_offset = if end_chunk_index >= total_chunks {
+        total_size_bytes
+    } else {
+        u64::from(end_chunk_index) * DFS_BLOB_CHUNK_BYTES as u64
+    };
+    usize::try_from(end_offset.saturating_sub(start_offset)).map_err(|_| DfsError::Distributed {
+        message: format!("DFS read chunk window is too large: {start_offset}..{end_offset}"),
     })
 }
 

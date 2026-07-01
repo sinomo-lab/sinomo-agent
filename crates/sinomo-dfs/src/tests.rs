@@ -10286,7 +10286,7 @@ fn persisted_repair_attempts_prevent_duplicate_fetch_after_reopen() {
     );
     dfs.pending_writes.insert(
         intent_id.clone(),
-        pending_networked_write(
+        PendingNetworkedWrite::new(
             object_id.clone(),
             version_2,
             content_hash.clone(),
@@ -16144,7 +16144,7 @@ fn repair_attempt_restore_restarts_stale_partial_chunk_window() {
     .expect("visible repair metadata");
     dfs.pending_writes.insert(
         intent_id.clone(),
-        pending_networked_write(
+        PendingNetworkedWrite::new(
             object_id.clone(),
             version_2.clone(),
             manifest.content_hash.clone(),
@@ -16204,7 +16204,7 @@ fn completed_chunked_stage_and_repair_keep_probe_offset_until_response() {
     let repair_intent_id = "dfs_intent_completed_repair_probe";
     dfs.pending_writes.insert(
         repair_intent_id.to_string(),
-        pending_networked_write(
+        PendingNetworkedWrite::new(
             object_id.clone(),
             version.clone(),
             "blake3:completed-repair-probe".to_string(),
@@ -16234,7 +16234,7 @@ fn completed_chunked_stage_and_repair_keep_probe_offset_until_response() {
     let stage_intent_id = "dfs_intent_completed_stage_probe";
     dfs.pending_writes.insert(
         stage_intent_id.to_string(),
-        pending_networked_write(
+        PendingNetworkedWrite::new(
             object_id,
             version,
             "blake3:completed-stage-probe".to_string(),
@@ -16275,7 +16275,7 @@ fn partial_chunked_repair_preserves_resume_offset_without_backoff() {
     let intent_id = "dfs_intent_partial_repair_resume";
     dfs.pending_writes.insert(
         intent_id.to_string(),
-        pending_networked_write(
+        PendingNetworkedWrite::new(
             object_id,
             version,
             "blake3:partial-repair-resume".to_string(),
@@ -16330,7 +16330,7 @@ fn stale_chunked_repair_resume_restarts_from_zero_without_backoff() {
     let intent_id = "dfs_intent_stale_repair_resume";
     dfs.pending_writes.insert(
         intent_id.to_string(),
-        pending_networked_write(
+        PendingNetworkedWrite::new(
             object_id.clone(),
             version.clone(),
             content_hash.clone(),
@@ -16645,7 +16645,7 @@ fn stateless_repair_response_restores_pending_write_without_inflight_request() {
         .expect("intent");
     dfs.pending_writes.insert(
         intent.intent_id.clone(),
-        pending_networked_write(
+        PendingNetworkedWrite::new(
             object_id.clone(),
             version_2.clone(),
             manifest.content_hash.clone(),
@@ -18214,7 +18214,7 @@ fn completed_repair_transfer_retry_deadline_scales_with_payload_size() {
 
     dfs.pending_writes.insert(
         intent_id.to_string(),
-        pending_networked_write(
+        PendingNetworkedWrite::new(
             object_id,
             version,
             "blake3:repair-deadline".to_string(),

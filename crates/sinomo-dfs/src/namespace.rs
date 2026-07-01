@@ -1,9 +1,9 @@
 //! Distributed SIFS namespace bootstrap helpers.
 
 use crate::{
-    DfsFileSystem, DfsObjectKind, DfsObjectMetadata, DfsSubtreePolicy, sifs_file_system_id,
+    DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
+    DfsSubtreePolicy, DfsVersion, metadata_backend::DfsObjectVersionRecord, sifs_file_system_id,
 };
-use crate::{DfsObjectId, DfsVersion};
 use sinomo_core::DfsObjectPolicy;
 use sinomo_node::NodeId;
 
@@ -162,6 +162,79 @@ pub fn next_version(version: &DfsVersion) -> DfsVersion {
             .expect("valid incremented version");
     }
     DfsVersion::generate()
+}
+
+pub(crate) fn namespace_transaction_id_for_path(
+    kind: &str,
+    object_id: &DfsObjectId,
+    path: &str,
+) -> String {
+    format!(
+        "namespace_{}_{}",
+        kind,
+        blake3::hash(format!("{object_id}\0{path}").as_bytes()).to_hex()
+    )
+}
+
+pub(crate) fn namespace_transaction_id_for_object(
+    kind: &str,
+    object_id: &DfsObjectId,
+    version: &DfsVersion,
+) -> String {
+    format!(
+        "namespace_{}_{}",
+        kind,
+        blake3::hash(format!("{object_id}\0{version}").as_bytes()).to_hex()
+    )
+}
+
+pub(crate) fn namespace_transaction_id_for_batch(
+    kind: &str,
+    file_system_id: &DfsFileSystemId,
+    objects: &[DfsObjectMetadata],
+    versions: &[DfsObjectVersionRecord],
+) -> String {
+    let mut input = format!("{file_system_id}\0{}\0{}\0", objects.len(), versions.len());
+    for object in objects {
+        input.push_str(object.object_id.as_str());
+        input.push('\0');
+        input.push_str(object.version.as_str());
+        input.push('\0');
+        input.push_str(&object.path);
+        input.push('\0');
+        input.push_str(&format!("{:?}", object.kind));
+        input.push('\0');
+        input.push_str(object.content_hash.as_deref().unwrap_or(""));
+        input.push('\0');
+        input.push_str(
+            &object
+                .content_size_bytes
+                .map(|size| size.to_string())
+                .unwrap_or_default(),
+        );
+        input.push('\0');
+    }
+    for version in versions {
+        input.push_str(version.object_id.as_str());
+        input.push('\0');
+        input.push_str(version.version.as_str());
+        input.push('\0');
+        input.push_str(version.content_hash.as_deref().unwrap_or(""));
+        input.push('\0');
+        input.push_str(
+            &version
+                .size_bytes
+                .map(|size| size.to_string())
+                .unwrap_or_default(),
+        );
+        input.push('\0');
+        input.push_str(if version.visible { "visible" } else { "hidden" });
+        input.push('\0');
+    }
+    format!(
+        "namespace_{kind}_{}",
+        blake3::hash(input.as_bytes()).to_hex()
+    )
 }
 
 #[cfg(test)]

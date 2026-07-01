@@ -4743,7 +4743,7 @@ fn validate_extents_cover_size(
     Ok(())
 }
 
-fn content_hash(bytes: &[u8]) -> String {
+pub(crate) fn content_hash(bytes: &[u8]) -> String {
     format!("{HASH_PREFIX}{}", blake3::hash(bytes).to_hex())
 }
 

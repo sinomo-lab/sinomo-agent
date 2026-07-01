@@ -6,22 +6,26 @@ mod direct_read;
 pub mod discovery;
 pub mod distributed;
 mod error;
+mod intent;
 pub mod local_owned;
 mod local_state;
 mod maintenance;
 mod message_transport;
 pub mod metadata_backend;
+mod metadata_records;
 mod model;
 mod module_surface;
 pub mod namespace;
 pub mod operator;
 pub mod posix;
 pub mod protocol;
+mod repair;
 mod routes;
 mod service;
 mod smoke;
 mod transfer;
 
+pub(crate) use content_store::content_hash;
 pub use content_store::{
     BlobRangeReader, BlobReader, ChunkedBlobAssembler, ContentManifest, ContentStoreError,
     ContentStoreGcOptions, ContentStoreGcReport, ContentStoreQuota, ContentStoreQuotaResource,
@@ -67,6 +71,12 @@ pub(crate) use error::{
     distributed_write_rejection_current_primary, namespace_rejection_current_primary,
     routed_write_rejection_error,
 };
+pub(crate) use intent::{
+    conflict_id_for, distributed_error_creates_conflict, distributed_intent_from_record,
+    distributed_intent_matches_record, distributed_intent_matches_routed_write_command,
+    routed_write_command_content_hash, write_intent_record,
+    write_intent_record_matches_routed_write_command, write_intent_status_requires_hydrate_restore,
+};
 pub use local_owned::{
     DFS_EXPOSE_CONFIG_KEY, DfsExposeAddRequest, DfsExposeConfig, DfsExposeEntry, DfsExposeFileInfo,
     DfsExposeStore, DfsExposeStoreError, DfsExposedDirectory, LocalOwnedDfsError,
@@ -87,6 +97,7 @@ pub use local_state::{
     open_root_local_metadata_backend, remove_dfs_expose_entry, remove_local_dfs_pin,
     resolve_dfs_metadata_root, resolve_dfs_pin_root,
 };
+pub(crate) use maintenance::record_anti_entropy_issue;
 #[cfg(test)]
 pub(crate) use maintenance::write_legacy_dfs_metadata_replication_cursor;
 pub use maintenance::{
@@ -133,6 +144,11 @@ pub use metadata_backend::{
     DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentStatus,
     LocalShardedMetadataBackend, LocalSobjMetadataBackend, MetadataBackendError,
 };
+pub(crate) use metadata_records::{
+    dfs_now_unix_nanos, metadata_journal_batch_file_system_id, object_version_record,
+    put_visible_version_record_if_changed, read_conflicts_reason,
+    remote_read_rejection_prunes_location,
+};
 pub use model::{
     DfsFileSystem, DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics,
     DfsPolicyViolation, DfsReadOutcome, DfsServiceEvent, DfsSubtreePolicy, DfsWriteOutcome,
@@ -144,11 +160,13 @@ pub use module_surface::{
     SINOMO_DFS_MODULE_OWNER, SINOMO_DFS_NATIVE_REGISTRATION_KEY, dfs_module_capabilities,
     dfs_module_id, dfs_module_registration, dfs_module_surfaces, register_storage_paths,
 };
-use namespace::metadata_path;
 pub use namespace::{
     SIFS_NODES_PATH, SIFS_ROOT_PATH, SIFS_SERVICES_PATH, SIFS_SINOMO_PATH, SIFS_USERS_PATH,
     directory_object, distributed_sifs, distributed_sifs_bootstrap_objects,
     distributed_sifs_bootstrap_objects_for_nodes, sifs_node_files_path, sifs_node_path,
+};
+pub(crate) use namespace::{
+    metadata_path, namespace_transaction_id_for_batch, namespace_transaction_id_for_object,
 };
 pub use operator::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsAgentFileSystemSummary,
@@ -179,6 +197,10 @@ pub use protocol::{
     DfsRepairReplicaResponse, DfsRoutedMessage, DfsStageBlobChunkCommand, DfsStageBlobCommand,
     DfsStageBlobResponse, DfsStagePatchChunkCommand, DfsStagePatchCommand, DfsWriteCommand,
     DfsWriteResponse, DfsWriteResult,
+};
+pub(crate) use repair::{
+    repair_attempt_record_indicates_lost_authority, repair_rejection_indicates_lost_authority,
+    repair_rejection_indicates_stale_chunk_resume,
 };
 pub use routes::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_BULK_READ_RESPONSE_ROUTE, DFS_DATA_BULK_READ_ROUTE,
@@ -265,30 +287,32 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
-use transfer::RepairRetryState;
+#[cfg(test)]
 use transfer::{
-    InProgressBlobTransfer, InProgressFetchBlobTransfer, InProgressPatchTransfer,
-    InProgressReadMemoryTransfer, InProgressReadTransfer, PendingNetworkedRead,
-    PendingNetworkedWrite, PendingNetworkedWritePatch, blob_chunk_count, blob_chunk_count_for_size,
-    blob_transfer_key, chunk_hash, validate_chunk_bytes, validate_chunk_hash,
-    validate_chunked_transfer_shape,
+    DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES, DFS_LAN_CHUNK_WINDOW_SIZE, DFS_LOCAL_CHUNK_WINDOW_SIZE,
+    RepairRetryState,
+};
+use transfer::{
+    DFS_BLOB_CHUNK_BYTES, DFS_FETCH_CHUNK_WINDOW_SIZE, DFS_READ_CHUNK_WINDOW_SIZE,
+    DFS_REPAIR_RETRY_SUPPRESSED_TICK, DFS_STAGE_CHUNK_WINDOW_SIZE, InProgressBlobTransfer,
+    InProgressFetchBlobTransfer, InProgressPatchTransfer, InProgressReadMemoryTransfer,
+    InProgressReadTransfer, PendingNetworkedRead, PendingNetworkedWrite,
+    PendingNetworkedWritePatch, blob_chunk_count, blob_chunk_count_for_size, blob_chunk_len,
+    blob_transfer_key, chunk_hash, chunk_prefix_bytes, dfs_adaptive_chunk_window_size,
+    dfs_byte_count_to_usize, fetch_inflight_timeout_ticks, fetch_response_window_end,
+    pending_stage_transfer_size_bytes, range_transfer_size_bytes, read_response_window_range_len,
+    repair_replica_chunk_start_and_window, repair_retry_delay_nanos_for_ticks,
+    repair_retry_delay_ticks, repair_retry_state_is_suppressed,
+    repair_transfer_inflight_timeout_ticks, stage_inflight_retry_delay_ticks, validate_chunk_bytes,
+    validate_chunk_hash, validate_chunked_transfer_shape, wake_repair_retry_state,
 };
 
 pub const DEFAULT_DFS_NODE_ID: &str = "node_local";
 pub const SIFS_FILE_SYSTEM_ID: &str = "sifs";
 
 pub(crate) const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 1024 * 1024;
-const DFS_BLOB_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-const DFS_STAGE_CHUNK_WINDOW_SIZE: u32 = 4;
-const DFS_READ_CHUNK_WINDOW_SIZE: u32 = 4;
-const DFS_FETCH_CHUNK_WINDOW_SIZE: u32 = 4;
-const DFS_LAN_CHUNK_WINDOW_SIZE: u32 = 16;
-const DFS_LOCAL_CHUNK_WINDOW_SIZE: u32 = 16;
-const DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DFS_REMOTE_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DFS_CHUNK_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const DFS_REPAIR_RETRY_SUPPRESSED_TICK: u64 = u64::MAX;
-const DFS_REPAIR_RETRY_TICK_DURATION: Duration = Duration::from_secs(5);
 const DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE: usize = 4096;
 const DFS_METADATA_OBJECT_VERSION_PAGE_SIZE: usize = 1024;
 const DFS_METADATA_OBJECT_INTENT_PAGE_SIZE: usize = 1024;
@@ -297,24 +321,6 @@ const DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE: usize = 1024;
 const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 1024;
 #[cfg(test)]
 const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 2;
-
-fn dfs_adaptive_chunk_window_size(
-    profile: DfsTransferProfile,
-    total_size_bytes: u64,
-    base_window_chunks: u32,
-) -> u32 {
-    let total_chunks = total_size_bytes
-        .div_ceil(DFS_BLOB_CHUNK_BYTES as u64)
-        .clamp(1, u64::from(u32::MAX)) as u32;
-    let profile_window = match profile {
-        DfsTransferProfile::Conservative => base_window_chunks,
-        DfsTransferProfile::Lan => base_window_chunks.max(DFS_LAN_CHUNK_WINDOW_SIZE),
-        DfsTransferProfile::Local => base_window_chunks.max(DFS_LOCAL_CHUNK_WINDOW_SIZE),
-    };
-    let budget_window = (DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES / DFS_BLOB_CHUNK_BYTES as u64)
-        .clamp(1, u64::from(u32::MAX)) as u32;
-    profile_window.min(budget_window).min(total_chunks).max(1)
-}
 
 pub fn fallback_dfs_node_id() -> NodeId {
     NodeId::from_legacy_named(DEFAULT_DFS_NODE_ID).expect("valid fallback DFS node id")
@@ -8997,7 +9003,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .unwrap_or(0);
                 self.pending_writes.insert(
                     intent_record.intent_id.clone(),
-                    pending_networked_write(
+                    PendingNetworkedWrite::new(
                         intent_record.object_id.clone(),
                         intent_record.target_version.clone(),
                         content_hash,
@@ -9736,7 +9742,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .unwrap_or(0);
             self.pending_writes.insert(
                 intent_record.intent_id.clone(),
-                pending_networked_write(
+                PendingNetworkedWrite::new(
                     intent_record.object_id.clone(),
                     intent_record.target_version.clone(),
                     content_hash,
@@ -11516,7 +11522,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.put_metadata_intent(&intent, Some(&manifest.content_hash))?;
         self.pending_writes.insert(
             intent.intent_id.clone(),
-            pending_networked_write_with_patch(
+            PendingNetworkedWrite::with_patch(
                 request.object_id.clone(),
                 request.target_version.clone(),
                 manifest.content_hash.clone(),
@@ -11693,7 +11699,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.put_metadata_intent(&intent, Some(&manifest.content_hash))?;
         self.pending_writes.insert(
             intent.intent_id.clone(),
-            pending_networked_write_with_patch(
+            PendingNetworkedWrite::with_patch(
                 request.object_id.clone(),
                 request.target_version.clone(),
                 manifest.content_hash.clone(),
@@ -12164,7 +12170,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.put_metadata_intent(&intent, Some(&manifest.content_hash))?;
         self.pending_writes.insert(
             intent.intent_id.clone(),
-            pending_networked_write(
+            PendingNetworkedWrite::new(
                 request.object_id.clone(),
                 request.target_version.clone(),
                 manifest.content_hash.clone(),
@@ -12381,7 +12387,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let put_intent_elapsed = put_intent_started.elapsed();
         self.pending_writes.insert(
             intent.intent_id.clone(),
-            pending_networked_write(
+            PendingNetworkedWrite::new(
                 request.object_id.clone(),
                 request.target_version.clone(),
                 content_hash.clone(),
@@ -12719,7 +12725,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let create_intent_elapsed = create_intent_started.elapsed();
         self.pending_writes.insert(
             intent.intent_id.clone(),
-            pending_networked_write(
+            PendingNetworkedWrite::new(
                 request.object_id.clone(),
                 request.target_version.clone(),
                 manifest.content_hash.clone(),
@@ -23454,7 +23460,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .unwrap_or(0);
         self.pending_writes.insert(
             intent_id.to_string(),
-            pending_networked_write(
+            PendingNetworkedWrite::new(
                 record.object_id,
                 record.target_version,
                 content_hash,
@@ -25345,118 +25351,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 }
 
-fn blob_chunk_len(total_size_bytes: u64, chunk_index: u32) -> Result<usize, DfsError> {
-    let chunk_offset = u64::from(chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
-    let chunk_len = total_size_bytes
-        .saturating_sub(chunk_offset)
-        .min(DFS_BLOB_CHUNK_BYTES as u64);
-    usize::try_from(chunk_len).map_err(|_| DfsError::Distributed {
-        message: format!("DFS blob chunk is too large to fit in memory: {chunk_len} bytes"),
-    })
-}
-
-fn chunk_prefix_bytes(total_size_bytes: u64, chunk_count: u32) -> u64 {
-    total_size_bytes.min(u64::from(chunk_count).saturating_mul(DFS_BLOB_CHUNK_BYTES as u64))
-}
-
-fn pending_stage_transfer_size_bytes(
-    pending: &PendingNetworkedWrite,
-    replica_node_id: &NodeId,
-) -> u64 {
-    pending
-        .patch
-        .as_ref()
-        .filter(|patch| !patch.full_stage_fallback_nodes.contains(replica_node_id))
-        .map(|patch| patch.patch_size_bytes)
-        .unwrap_or(pending.size_bytes)
-}
-
-fn range_transfer_size_bytes(
-    object_total_size_bytes: u64,
-    requested_offset: u64,
-    requested_max_bytes: usize,
-) -> u64 {
-    let start = requested_offset.min(object_total_size_bytes);
-    let max_bytes = u64::try_from(requested_max_bytes).unwrap_or(u64::MAX);
-    object_total_size_bytes.saturating_sub(start).min(max_bytes)
-}
-
-fn dfs_byte_count_to_usize(label: &str, value: u64) -> Result<usize, DfsError> {
-    usize::try_from(value).map_err(|_| DfsError::Distributed {
-        message: format!("{label} byte count is too large for this platform: {value}"),
-    })
-}
-
-fn fetch_response_window_end(start_chunk_index: u32, total_chunks: u32, max_chunks: u32) -> u32 {
-    if max_chunks == 0 {
-        return total_chunks;
-    }
-    start_chunk_index
-        .saturating_add(max_chunks)
-        .min(total_chunks)
-}
-
-fn repair_replica_chunk_start_and_window(
-    requested_start_chunk_index: u32,
-    requested_max_chunks: u32,
-    total_chunks: u32,
-) -> (u32, u32) {
-    if requested_start_chunk_index >= total_chunks {
-        return (total_chunks, 1);
-    }
-    if requested_start_chunk_index
-        .checked_add(1)
-        .is_some_and(|next| next == total_chunks)
-    {
-        return (requested_start_chunk_index, 1);
-    }
-    (
-        requested_start_chunk_index,
-        requested_max_chunks
-            .max(1)
-            .min(total_chunks.saturating_sub(requested_start_chunk_index)),
-    )
-}
-
-fn read_response_window_range_len(
-    start_chunk_index: u32,
-    total_size_bytes: u64,
-    max_chunks: u32,
-) -> Result<usize, DfsError> {
-    let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
-    if start_chunk_index >= total_chunks {
-        return Err(DfsError::Distributed {
-            message: format!(
-                "DFS read chunk window starts outside object: start={}, total_chunks={total_chunks}",
-                start_chunk_index
-            ),
-        });
-    }
-    let end_chunk_index = fetch_response_window_end(start_chunk_index, total_chunks, max_chunks);
-    let start_offset = u64::from(start_chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
-    let end_offset = if end_chunk_index >= total_chunks {
-        total_size_bytes
-    } else {
-        u64::from(end_chunk_index) * DFS_BLOB_CHUNK_BYTES as u64
-    };
-    usize::try_from(end_offset.saturating_sub(start_offset)).map_err(|_| DfsError::Distributed {
-        message: format!("DFS read chunk window is too large: {start_offset}..{end_offset}"),
-    })
-}
-
-fn record_anti_entropy_issue(
-    report: &mut DfsAntiEntropyReport,
-    max_issues: usize,
-    issue: DfsAntiEntropyIssue,
-) {
-    report.issue_count = report.issue_count.saturating_add(1);
-    if report.issues.len() < max_issues {
-        report.issues.push(issue);
-    } else {
-        report.max_issues_reached = true;
-    }
-}
-
 fn read_small_blob_from_reader(
     content_hash: &str,
     total_size_bytes: u64,
@@ -25474,407 +25368,11 @@ fn read_small_blob_from_reader(
     Ok(bytes)
 }
 
-pub(crate) fn content_hash(bytes: &[u8]) -> String {
-    format!("blake3:{}", blake3::hash(bytes).to_hex())
-}
-
 fn object_content_identity(object: &DfsObjectMetadata) -> Option<ContentVersionIdentity> {
     Some(ContentVersionIdentity {
         content_hash: object.content_hash.clone()?,
         size_bytes: object.content_size_bytes?,
     })
-}
-
-fn routed_write_command_content_hash(command: &DfsDistributedWriteCommand) -> String {
-    command
-        .content_hash
-        .clone()
-        .unwrap_or_else(|| content_hash(&command.bytes))
-}
-
-fn distributed_intent_matches_routed_write_command(
-    intent: &DistributedWriteIntent,
-    requester_node_id: &NodeId,
-    command: &DfsDistributedWriteCommand,
-) -> bool {
-    intent.file_system_id == command.request.file_system_id
-        && intent.object_id == command.request.object_id
-        && intent.base_version == command.expected_base_version
-        && intent.target_version == command.request.target_version
-        && intent.requesting_node_id == *requester_node_id
-        && command.request.requesting_node_id == *requester_node_id
-        && matches!(
-            intent.state,
-            DfsWriteIntentState::AwaitingReceipts | DfsWriteIntentState::Committed
-        )
-}
-
-fn write_intent_record_matches_routed_write_command(
-    record: &DfsWriteIntentRecord,
-    requester_node_id: &NodeId,
-    command: &DfsDistributedWriteCommand,
-    expected_content_hash: &str,
-) -> bool {
-    record.file_system_id == command.request.file_system_id
-        && record.object_id == command.request.object_id
-        && record.base_version == command.expected_base_version
-        && record.target_version == command.request.target_version
-        && record.coordinator_node_id == *requester_node_id
-        && command.request.requesting_node_id == *requester_node_id
-        && record.content_hash.as_deref() == Some(expected_content_hash)
-        && matches!(
-            record.status,
-            DfsWriteIntentStatus::Staging
-                | DfsWriteIntentStatus::ReceiptsPending
-                | DfsWriteIntentStatus::Committed
-        )
-}
-
-fn metadata_journal_batch_file_system_id(
-    batch: &DfsMetadataJournalBatch,
-) -> Option<DfsFileSystemId> {
-    batch
-        .entries
-        .iter()
-        .find_map(|entry| match &entry.mutation {
-            DfsMetadataMutation::PutFileSystem { file_system_id, .. }
-            | DfsMetadataMutation::PutObject { file_system_id, .. }
-            | DfsMetadataMutation::PutVersion { file_system_id, .. }
-            | DfsMetadataMutation::PutReceipt { file_system_id, .. }
-            | DfsMetadataMutation::RemoveReceipt { file_system_id, .. }
-            | DfsMetadataMutation::PutIntent { file_system_id, .. }
-            | DfsMetadataMutation::CommitVisibleVersion { file_system_id, .. }
-            | DfsMetadataMutation::PutConflict { file_system_id, .. }
-            | DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. } => {
-                Some(file_system_id.clone())
-            }
-        })
-}
-
-fn read_conflicts_reason(conflicts: Vec<DfsConflictReadView>) -> String {
-    conflicts
-        .into_iter()
-        .map(|conflict| format!("{}: {}", conflict.conflict_id, conflict.reason))
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
-fn dfs_now_unix_nanos() -> u64 {
-    OffsetDateTime::now_utc()
-        .unix_timestamp_nanos()
-        .try_into()
-        .unwrap_or(1_000_000_000)
-}
-
-fn object_version_record(
-    object: &DfsObjectMetadata,
-    size_bytes: Option<u64>,
-) -> DfsObjectVersionRecord {
-    let mut locations = object.current_locations.clone();
-    normalize_current_locations(&mut locations);
-    DfsObjectVersionRecord {
-        file_system_id: object.file_system_id.clone(),
-        object_id: object.object_id.clone(),
-        version: object.version.clone(),
-        content_hash: object.content_hash.clone(),
-        size_bytes: size_bytes.or(object.content_size_bytes),
-        locations,
-        created_by_event_id: object.last_modified_by_event_id.clone(),
-        created_at: OffsetDateTime::now_utc(),
-        visible: true,
-    }
-}
-
-fn put_visible_version_record_if_changed(
-    backend: &mut dyn DfsMetadataBackend,
-    mut version_record: DfsObjectVersionRecord,
-) -> Result<(), DfsError> {
-    if let Some(existing) =
-        backend.get_version(&version_record.object_id, &version_record.version)?
-    {
-        version_record.created_at = existing.created_at;
-        if existing == version_record {
-            return Ok(());
-        }
-    }
-    backend.put_version(&version_record)?;
-    Ok(())
-}
-
-fn remote_read_rejection_prunes_location(reason: &str) -> bool {
-    reason.contains("is not a current location for DFS object")
-}
-
-fn pending_networked_write(
-    object_id: DfsObjectId,
-    version: DfsVersion,
-    content_hash: String,
-    size_bytes: u64,
-) -> PendingNetworkedWrite {
-    pending_networked_write_with_patch(object_id, version, content_hash, size_bytes, None)
-}
-
-fn pending_networked_write_with_patch(
-    object_id: DfsObjectId,
-    version: DfsVersion,
-    content_hash: String,
-    size_bytes: u64,
-    patch: Option<PendingNetworkedWritePatch>,
-) -> PendingNetworkedWrite {
-    PendingNetworkedWrite {
-        object_id,
-        version,
-        content_hash,
-        size_bytes,
-        patch,
-        stage_retries: BTreeMap::new(),
-        repair_retries: BTreeMap::new(),
-        stage_inflight_request_ids: BTreeMap::new(),
-        stage_next_chunk_indexes: BTreeMap::new(),
-        repair_inflight_request_ids: BTreeMap::new(),
-        repair_next_chunk_indexes: BTreeMap::new(),
-        fetch_inflight_from: BTreeSet::new(),
-        fetch_inflight_request_ids: BTreeMap::new(),
-        fetch_inflight_started_ticks: BTreeMap::new(),
-        fetch_next_chunk_indexes: BTreeMap::new(),
-        fetch_window_end_chunk_indexes: BTreeMap::new(),
-        fetch_failed_from: BTreeSet::new(),
-    }
-}
-
-fn write_intent_record(
-    intent: &DistributedWriteIntent,
-    content_hash: Option<&str>,
-    object_metadata: Option<DfsObjectMetadata>,
-) -> DfsWriteIntentRecord {
-    let now = OffsetDateTime::now_utc();
-    DfsWriteIntentRecord {
-        intent_id: intent.intent_id.clone(),
-        file_system_id: intent.file_system_id.clone(),
-        object_id: intent.object_id.clone(),
-        base_version: intent.base_version.clone(),
-        target_version: intent.target_version.clone(),
-        coordinator_node_id: intent.requesting_node_id.clone(),
-        owner_epoch: intent.owner_epoch,
-        desired_replica_node_ids: intent.desired_replica_nodes.clone(),
-        policy: intent.policy.clone(),
-        status: write_intent_status(&intent.state),
-        content_hash: content_hash.map(ToOwned::to_owned),
-        object_metadata,
-        created_at: now,
-        updated_at: Some(now),
-    }
-}
-
-fn write_intent_status(state: &DfsWriteIntentState) -> DfsWriteIntentStatus {
-    match state {
-        DfsWriteIntentState::AwaitingReceipts => DfsWriteIntentStatus::ReceiptsPending,
-        DfsWriteIntentState::Committed => DfsWriteIntentStatus::Committed,
-        DfsWriteIntentState::Rejected => DfsWriteIntentStatus::Rejected,
-        DfsWriteIntentState::Conflict => DfsWriteIntentStatus::Conflict,
-        DfsWriteIntentState::Aborted => DfsWriteIntentStatus::Aborted,
-    }
-}
-
-fn distributed_intent_from_record(record: &DfsWriteIntentRecord) -> DistributedWriteIntent {
-    DistributedWriteIntent {
-        intent_id: record.intent_id.clone(),
-        file_system_id: record.file_system_id.clone(),
-        object_id: record.object_id.clone(),
-        base_version: record.base_version.clone(),
-        target_version: record.target_version.clone(),
-        requesting_node_id: record.coordinator_node_id.clone(),
-        owner_epoch: record.owner_epoch,
-        desired_replica_nodes: record.desired_replica_node_ids.clone(),
-        policy: record.policy.clone(),
-        state: distributed_intent_state_from_status(&record.status),
-    }
-}
-
-fn distributed_intent_matches_record(
-    intent: &DistributedWriteIntent,
-    record: &DfsWriteIntentRecord,
-) -> bool {
-    intent.file_system_id == record.file_system_id
-        && intent.object_id == record.object_id
-        && intent.target_version == record.target_version
-}
-
-fn distributed_intent_state_from_status(status: &DfsWriteIntentStatus) -> DfsWriteIntentState {
-    match status {
-        DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending => {
-            DfsWriteIntentState::AwaitingReceipts
-        }
-        DfsWriteIntentStatus::Committed => DfsWriteIntentState::Committed,
-        DfsWriteIntentStatus::Rejected => DfsWriteIntentState::Rejected,
-        DfsWriteIntentStatus::Conflict => DfsWriteIntentState::Conflict,
-        DfsWriteIntentStatus::Aborted => DfsWriteIntentState::Aborted,
-    }
-}
-
-fn write_intent_status_requires_hydrate_restore(status: &DfsWriteIntentStatus) -> bool {
-    matches!(
-        status,
-        DfsWriteIntentStatus::Staging
-            | DfsWriteIntentStatus::ReceiptsPending
-            | DfsWriteIntentStatus::Committed
-    )
-}
-
-fn repair_retry_delay_ticks(attempts: u32) -> u64 {
-    1_u64 << attempts.saturating_sub(1).min(6)
-}
-
-fn repair_retry_delay_nanos_for_ticks(ticks: u64) -> u64 {
-    let tick_nanos = u64::try_from(DFS_REPAIR_RETRY_TICK_DURATION.as_nanos()).unwrap_or(u64::MAX);
-    ticks.saturating_mul(tick_nanos)
-}
-
-fn repair_retry_state_is_suppressed(state: &RepairRetryState) -> bool {
-    state.next_retry_tick == DFS_REPAIR_RETRY_SUPPRESSED_TICK
-}
-
-fn repair_attempt_record_indicates_lost_authority(record: &DfsRepairAttemptRecord) -> bool {
-    record
-        .last_error
-        .as_deref()
-        .is_some_and(repair_rejection_indicates_lost_authority)
-}
-
-fn wake_repair_retry_state(state: &mut RepairRetryState) {
-    if !repair_retry_state_is_suppressed(state) {
-        state.next_retry_tick = 0;
-    }
-}
-
-fn repair_rejection_indicates_lost_authority(reason: &str) -> bool {
-    reason.contains("source is not current metadata shard primary")
-        || reason.contains("source is not authorized to fetch DFS blob")
-}
-
-fn repair_rejection_indicates_stale_chunk_resume(reason: &str) -> bool {
-    reason.contains("repair replica chunk transfer")
-        && reason.contains("started at chunk")
-        && reason.contains("without earlier chunks")
-}
-
-fn stage_inflight_retry_delay_ticks(attempts: u32) -> u64 {
-    repair_retry_delay_ticks(attempts).saturating_add(1)
-}
-
-fn fetch_inflight_timeout_ticks() -> u64 {
-    stage_inflight_retry_delay_ticks(2)
-}
-
-fn repair_transfer_inflight_timeout_ticks(total_size_bytes: u64) -> u64 {
-    let chunk_count = total_size_bytes
-        .div_ceil(DFS_BLOB_CHUNK_BYTES as u64)
-        .max(1);
-    let window_chunks = u64::from(DFS_STAGE_CHUNK_WINDOW_SIZE.max(1));
-    let repair_windows = chunk_count.div_ceil(window_chunks).max(1);
-    fetch_inflight_timeout_ticks().saturating_mul(repair_windows)
-}
-
-fn namespace_transaction_id_for_object(
-    kind: &str,
-    object_id: &DfsObjectId,
-    version: &DfsVersion,
-) -> String {
-    format!(
-        "namespace_{}_{}",
-        kind,
-        blake3::hash(format!("{object_id}\0{version}").as_bytes()).to_hex()
-    )
-}
-
-fn namespace_transaction_id_for_batch(
-    kind: &str,
-    file_system_id: &DfsFileSystemId,
-    objects: &[DfsObjectMetadata],
-    versions: &[DfsObjectVersionRecord],
-) -> String {
-    let mut input = format!("{file_system_id}\0{}\0{}\0", objects.len(), versions.len());
-    for object in objects {
-        input.push_str(object.object_id.as_str());
-        input.push('\0');
-        input.push_str(object.version.as_str());
-        input.push('\0');
-        input.push_str(&object.path);
-        input.push('\0');
-        input.push_str(&format!("{:?}", object.kind));
-        input.push('\0');
-        input.push_str(object.content_hash.as_deref().unwrap_or(""));
-        input.push('\0');
-        input.push_str(
-            &object
-                .content_size_bytes
-                .map(|size| size.to_string())
-                .unwrap_or_default(),
-        );
-        input.push('\0');
-    }
-    for version in versions {
-        input.push_str(version.object_id.as_str());
-        input.push('\0');
-        input.push_str(version.version.as_str());
-        input.push('\0');
-        input.push_str(version.content_hash.as_deref().unwrap_or(""));
-        input.push('\0');
-        input.push_str(
-            &version
-                .size_bytes
-                .map(|size| size.to_string())
-                .unwrap_or_default(),
-        );
-        input.push('\0');
-        input.push_str(if version.visible { "visible" } else { "hidden" });
-        input.push('\0');
-    }
-    format!(
-        "namespace_{kind}_{}",
-        blake3::hash(input.as_bytes()).to_hex()
-    )
-}
-
-impl From<DfsConflictRecord> for DfsConflictReadView {
-    fn from(conflict: DfsConflictRecord) -> Self {
-        Self {
-            conflict_id: conflict.conflict_id,
-            base_version: conflict.base_version,
-            local_version: conflict.local_version,
-            remote_version: conflict.remote_version,
-            detected_by_node_id: conflict.detected_by_node_id,
-            reason: conflict.reason,
-            local_content_hash: conflict.local_content_hash,
-            remote_content_hash: conflict.remote_content_hash,
-            status: conflict.status,
-        }
-    }
-}
-
-fn distributed_error_creates_conflict(error: &DfsDistributedError) -> bool {
-    matches!(
-        error,
-        DfsDistributedError::BaseVersionConflict { .. }
-            | DfsDistributedError::DuplicateIntent { .. }
-            | DfsDistributedError::PendingIntentConflict { .. }
-    )
-}
-
-fn conflict_id_for(
-    object_id: &DfsObjectId,
-    local_version: &DfsVersion,
-    local_content_hash: Option<&str>,
-    detected_by_node_id: &NodeId,
-) -> String {
-    let hash_input = format!(
-        "{}\0{}\0{}\0{}",
-        object_id,
-        local_version,
-        local_content_hash.unwrap_or(""),
-        detected_by_node_id
-    );
-    format!("conflict_{}", blake3::hash(hash_input.as_bytes()).to_hex())
 }
 
 #[cfg(test)]
