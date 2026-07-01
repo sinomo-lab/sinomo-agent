@@ -1,8 +1,8 @@
 //! In-memory materialized metadata tables.
 //!
-//! Durable table IO lives in the backend for now; this module owns the table
-//! maps, secondary indexes, and rollback bookkeeping used while materializing
-//! journal entries.
+//! Durable table IO lives in `metadata_table_store`; this module owns the
+//! table maps, secondary indexes, and rollback bookkeeping used while
+//! materializing journal entries.
 
 use std::collections::BTreeMap;
 

@@ -86,6 +86,13 @@ fn write_intent_status(state: &DfsWriteIntentState) -> DfsWriteIntentStatus {
     }
 }
 
+pub(crate) fn write_intent_status_is_active(status: &DfsWriteIntentStatus) -> bool {
+    matches!(
+        status,
+        DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+    )
+}
+
 pub(crate) fn distributed_intent_from_record(
     record: &DfsWriteIntentRecord,
 ) -> DistributedWriteIntent {
