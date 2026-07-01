@@ -387,6 +387,7 @@ pub struct FilesState {
     pub selected: Option<usize>,
     pub selected_details: Option<SifsObjectDetails>,
     selected_local_details: Option<LocalObjectDetails>,
+    list_slow_after_secs: Option<u64>,
     pub details_loading: bool,
     pub details_error: Option<String>,
     sifs_health: Option<SifsHealthSummary>,
@@ -409,6 +410,7 @@ pub struct FilesState {
     worker_cancellations: Arc<Mutex<BTreeSet<u64>>>,
     next_request_id: u64,
     pending_request_id: Option<u64>,
+    completed_request_id: Option<u64>,
     pending_details_request_id: Option<u64>,
     pending_preview_request_id: Option<u64>,
 }
@@ -437,6 +439,7 @@ impl FilesState {
             selected: None,
             selected_details: None,
             selected_local_details: None,
+            list_slow_after_secs: None,
             details_loading: false,
             details_error: None,
             sifs_health: None,
@@ -459,6 +462,7 @@ impl FilesState {
             worker_cancellations: Arc::new(Mutex::new(BTreeSet::new())),
             next_request_id: 0,
             pending_request_id: None,
+            completed_request_id: None,
             pending_details_request_id: None,
             pending_preview_request_id: None,
         }
@@ -541,6 +545,8 @@ impl FilesState {
         self.selected = None;
         self.marked_entries.clear();
         self.clear_selected_details();
+        self.list_slow_after_secs = None;
+        self.completed_request_id = None;
         self.loading = false;
         let path = self.path.clone();
         let listing = match self.source {
@@ -596,6 +602,8 @@ impl FilesState {
         self.selected = None;
         self.marked_entries.clear();
         self.clear_selected_details();
+        self.list_slow_after_secs = None;
+        self.completed_request_id = None;
         self.loading = true;
         self.error = None;
         self.entries.clear();
@@ -607,6 +615,7 @@ impl FilesState {
         };
         if tx.send(command).is_err() {
             self.pending_request_id = None;
+            self.completed_request_id = None;
             self.loading = false;
             self.error = Some("SIFS browser worker stopped".to_string());
             self.list_revision = self.list_revision.wrapping_add(1);
@@ -624,11 +633,9 @@ impl FilesState {
                         request_id,
                         source,
                         path,
-                        result: Err(format!(
-                            "{} listing did not finish within {} seconds",
-                            source.label(),
-                            LOAD_TIMEOUT.as_secs()
-                        )),
+                        result: FilesListResult::Slow {
+                            elapsed_secs: LOAD_TIMEOUT.as_secs(),
+                        },
                     });
                     if let Some(waker) = waker {
                         waker.wake();
@@ -666,10 +673,12 @@ impl FilesState {
         self.node_id.clear();
         self.sifs_health = None;
         self.sifs_health_error = None;
+        self.list_slow_after_secs = None;
         self.inspector_details_open = false;
         self.loaded = self.source == FilesSourceKind::Local;
         self.loading = false;
         self.pending_request_id = None;
+        self.completed_request_id = None;
         self.pending_details_request_id = None;
         self.pending_preview_request_id = None;
         self.worker_tx = None;
@@ -730,6 +739,7 @@ impl FilesState {
                     if self.loading {
                         self.loading = false;
                         self.pending_request_id = None;
+                        self.completed_request_id = None;
                         self.error = Some("SIFS browser worker stopped".to_string());
                         self.list_revision = self.list_revision.wrapping_add(1);
                         changed = true;
@@ -776,12 +786,14 @@ impl FilesState {
                 if self.source != source {
                     return false;
                 }
-                self.pending_request_id = None;
-                self.loading = false;
-                self.path = path;
-                self.store_active_path();
                 match result {
-                    Ok(listing) => {
+                    FilesListResult::Ok(listing) => {
+                        self.pending_request_id = None;
+                        self.completed_request_id = Some(request_id);
+                        self.loading = false;
+                        self.list_slow_after_secs = None;
+                        self.path = path;
+                        self.store_active_path();
                         self.node_id = listing.node_id;
                         self.sifs_health = listing.health;
                         self.sifs_health_error = listing.health_error;
@@ -797,13 +809,41 @@ impl FilesState {
                             self.request_selected_details();
                         }
                     }
-                    Err(error) => {
+                    FilesListResult::Err(error) => {
+                        self.pending_request_id = None;
+                        self.completed_request_id = None;
+                        self.loading = false;
+                        self.list_slow_after_secs = None;
+                        self.path = path;
+                        self.store_active_path();
                         self.entries.clear();
                         self.sifs_health = None;
                         self.sifs_health_error = None;
                         self.error = Some(error);
                     }
+                    FilesListResult::Slow { elapsed_secs } => {
+                        self.list_slow_after_secs = Some(elapsed_secs);
+                    }
                 }
+                self.list_revision = self.list_revision.wrapping_add(1);
+                true
+            }
+            FilesWorkerResult::Health {
+                request_id,
+                source,
+                health,
+                health_error,
+            } => {
+                if self.source != source {
+                    return false;
+                }
+                if self.pending_request_id.is_some()
+                    || self.completed_request_id != Some(request_id)
+                {
+                    return false;
+                }
+                self.sifs_health = health;
+                self.sifs_health_error = health_error;
                 self.list_revision = self.list_revision.wrapping_add(1);
                 true
             }
@@ -950,6 +990,7 @@ impl FilesState {
             self.clear_selected_details();
             self.loading = false;
             self.pending_request_id = None;
+            self.completed_request_id = None;
             self.pending_details_request_id = None;
             self.pending_preview_request_id = None;
             self.list_revision = self.list_revision.wrapping_add(1);
@@ -2061,6 +2102,12 @@ struct FilesListing {
     entries: Vec<SifsEntry>,
 }
 
+enum FilesListResult {
+    Ok(FilesListing),
+    Err(String),
+    Slow { elapsed_secs: u64 },
+}
+
 fn sifs_health_probe(browser: &SifsBrowser) -> (Option<SifsHealthSummary>, Option<String>) {
     match browser.health_summary() {
         Ok(health) => (health, None),
@@ -2073,7 +2120,13 @@ enum FilesWorkerResult {
         request_id: u64,
         source: FilesSourceKind,
         path: String,
-        result: Result<FilesListing, String>,
+        result: FilesListResult,
+    },
+    Health {
+        request_id: u64,
+        source: FilesSourceKind,
+        health: Option<SifsHealthSummary>,
+        health_error: Option<String>,
     },
     Details {
         request_id: u64,
@@ -2170,7 +2223,7 @@ fn files_worker_loop(
                             request_id,
                             source,
                             path: path.clone(),
-                            result: Err(error),
+                            result: FilesListResult::Err(error),
                         });
                         String::new()
                     });
@@ -2208,16 +2261,34 @@ fn files_worker_loop(
                     match (&browser, &open_error) {
                         (Some(browser), _) => {
                             let path = browser.normalize(&requested_path);
-                            let result = browser.list_shallow(&path).map(|entries| {
+                            let result = browser.list_shallow(&path).map(|entries| FilesListing {
+                                node_id: browser.node_id().to_string(),
+                                health: None,
+                                health_error: None,
+                                entries,
+                            });
+                            let listed = result.is_ok();
+                            let _ = result_tx.send(FilesWorkerResult::List {
+                                request_id,
+                                source,
+                                path,
+                                result: match result {
+                                    Ok(listing) => FilesListResult::Ok(listing),
+                                    Err(error) => FilesListResult::Err(error),
+                                },
+                            });
+                            waker.wake();
+                            if listed {
                                 let (health, health_error) = sifs_health_probe(browser);
-                                FilesListing {
-                                    node_id: browser.node_id().to_string(),
+                                let _ = result_tx.send(FilesWorkerResult::Health {
+                                    request_id,
+                                    source,
                                     health,
                                     health_error,
-                                    entries,
-                                }
-                            });
-                            (path, result)
+                                });
+                                waker.wake();
+                            }
+                            continue;
                         }
                         (None, Some(error)) => (requested_path, Err(error.clone())),
                         (None, None) => (
@@ -2230,7 +2301,10 @@ fn files_worker_loop(
                     request_id,
                     source,
                     path,
-                    result,
+                    result: match result {
+                        Ok(listing) => FilesListResult::Ok(listing),
+                        Err(error) => FilesListResult::Err(error),
+                    },
                 });
             }
             FilesWorkerCommand::Details {
@@ -8315,7 +8389,11 @@ impl InspectorView {
             |end_y: f32| (end_y + INSPECTOR_BOTTOM_PAD).max(inspector_min_content_h(&files.tasks));
 
         if files.loading {
-            let rows = sifs_loading_rows(&files.path, files.inspector_details_open);
+            let rows = sifs_loading_rows(
+                &files.path,
+                files.inspector_details_open,
+                files.list_slow_after_secs,
+            );
             let panel_h = Self::state_panel_height(w, &rows);
             return finish(y + panel_h);
         }
@@ -8793,8 +8871,25 @@ fn inspector_actions(files: &FilesState, entry: &SifsEntry) -> Vec<InspectorActi
     actions
 }
 
-fn sifs_loading_rows(path: &str, details_open: bool) -> Vec<(&'static str, String)> {
-    let mut rows = vec![("Status", "Connecting to SIFS".to_string())];
+fn sifs_loading_rows(
+    path: &str,
+    details_open: bool,
+    slow_after_secs: Option<u64>,
+) -> Vec<(&'static str, String)> {
+    let mut rows = vec![(
+        "Status",
+        if slow_after_secs.is_some() {
+            "SIFS is still loading".to_string()
+        } else {
+            "Connecting to SIFS".to_string()
+        },
+    )];
+    if let Some(seconds) = slow_after_secs {
+        rows.push((
+            "Wait",
+            format!("Directory listing has been running for at least {seconds} seconds."),
+        ));
+    }
     if details_open {
         rows.push(("Path", path.to_string()));
         rows.push(("Authority", "SIFS through daemon".to_string()));
@@ -9208,7 +9303,7 @@ impl Widget for InspectorView {
 
         if files.loading {
             let details_open = files.inspector_details_open;
-            let rows = sifs_loading_rows(&files.path, details_open);
+            let rows = sifs_loading_rows(&files.path, details_open, files.list_slow_after_secs);
             self.state_panel(
                 ctx,
                 &theme,
@@ -12873,7 +12968,7 @@ mod tests {
 
     #[test]
     fn sifs_unavailable_rows_hide_diagnostics_until_expanded() {
-        let loading = sifs_loading_rows("/services", false);
+        let loading = sifs_loading_rows("/services", false, None);
         assert!(
             loading
                 .iter()
@@ -12883,6 +12978,15 @@ mod tests {
             !loading
                 .iter()
                 .any(|(_, value)| value.contains("file storage"))
+        );
+        let slow = sifs_loading_rows("/services", true, Some(20));
+        assert!(
+            slow.iter()
+                .any(|(label, value)| *label == "Status" && value == "SIFS is still loading")
+        );
+        assert!(
+            slow.iter()
+                .any(|(label, value)| *label == "Wait" && value.contains("20 seconds"))
         );
 
         let collapsed = sifs_unavailable_rows("device authorization was denied", false);
@@ -13670,7 +13774,7 @@ mod tests {
             request_id: 7,
             source: FilesSourceKind::Sifs,
             path: "/services".to_string(),
-            result: Ok(FilesListing {
+            result: FilesListResult::Ok(FilesListing {
                 node_id: "node-a".to_string(),
                 health: None,
                 health_error: None,
@@ -13691,6 +13795,78 @@ mod tests {
         assert_eq!(state.node_id, "node-a");
         assert_eq!(state.entries.len(), 1);
         assert_eq!(state.list_revision, 1);
+
+        let health_changed = state.apply_worker_result(FilesWorkerResult::Health {
+            request_id: 7,
+            source: FilesSourceKind::Sifs,
+            health: Some(degraded_sifs_health()),
+            health_error: None,
+        });
+
+        assert!(health_changed);
+        assert!(state.sifs_health.is_some());
+        assert_eq!(state.list_revision, 2);
+
+        state.pending_request_id = Some(8);
+        let stale_health_changed = state.apply_worker_result(FilesWorkerResult::Health {
+            request_id: 7,
+            source: FilesSourceKind::Sifs,
+            health: None,
+            health_error: Some("stale health".to_string()),
+        });
+
+        assert!(!stale_health_changed);
+        assert!(state.sifs_health.is_some());
+        assert_eq!(state.sifs_health_error, None);
+        assert_eq!(state.list_revision, 2);
+    }
+
+    #[test]
+    fn slow_listing_notice_keeps_request_alive_for_late_success() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.loading = true;
+        state.pending_request_id = Some(8);
+        state.path = "/".to_string();
+
+        let slow_changed = state.apply_worker_result(FilesWorkerResult::List {
+            request_id: 8,
+            source: FilesSourceKind::Sifs,
+            path: "/services".to_string(),
+            result: FilesListResult::Slow { elapsed_secs: 20 },
+        });
+
+        assert!(slow_changed);
+        assert!(state.loading);
+        assert_eq!(state.pending_request_id, Some(8));
+        assert_eq!(state.error, None);
+        assert_eq!(state.list_slow_after_secs, Some(20));
+
+        let success_changed = state.apply_worker_result(FilesWorkerResult::List {
+            request_id: 8,
+            source: FilesSourceKind::Sifs,
+            path: "/services".to_string(),
+            result: FilesListResult::Ok(FilesListing {
+                node_id: "node-a".to_string(),
+                health: None,
+                health_error: None,
+                entries: vec![SifsEntry {
+                    name: "sinomo".to_string(),
+                    path: "/services/sinomo".to_string(),
+                    is_dir: true,
+                    is_link: false,
+                    size: None,
+                }],
+            }),
+        });
+
+        assert!(success_changed);
+        assert!(!state.loading);
+        assert_eq!(state.pending_request_id, None);
+        assert_eq!(state.error, None);
+        assert_eq!(state.list_slow_after_secs, None);
+        assert_eq!(state.path, "/services");
+        assert_eq!(state.entries.len(), 1);
     }
 
     #[test]
@@ -13711,7 +13887,7 @@ mod tests {
             request_id: 9,
             source: FilesSourceKind::Sifs,
             path: "/".to_string(),
-            result: Err("timed out".to_string()),
+            result: FilesListResult::Err("timed out".to_string()),
         });
 
         assert!(changed);
