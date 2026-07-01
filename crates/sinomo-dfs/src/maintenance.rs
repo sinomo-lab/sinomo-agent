@@ -1,30 +1,191 @@
 //! DFS lifecycle maintenance, anti-entropy, and repair tick orchestration.
 //!
-//! This module owns the reusable maintenance surface. Cluster-specific service
-//! opening and transport wiring still live in the root module while the
-//! networked service is being split into smaller domains.
+//! This module owns both the reusable maintenance host surface and the
+//! cluster-aware entrypoints that open DFS services, bind transports, and run a
+//! maintenance tick against configured metadata shards.
 
 use serde::{Deserialize, Serialize};
 use sinomo_local::SinomoDataDir;
+use sinomo_network::ClusterPaths;
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
-    AsyncDfsMessageTransport, AsyncDfsMetadataJournalReplicationTransport, ContentStoreGcOptions,
+    AsyncDfsMessageTransport, AsyncDfsMetadataEndpointTransport,
+    AsyncDfsMetadataJournalReplicationTransport, AsyncDfsPeerTransport, ContentStoreGcOptions,
     ContentStoreGcReport, ContentStoreScrubReport, ContentStoreStagingGcOptions,
     ContentStoreStagingGcReport, ContentStoreVersionGcOptions, ContentStoreVersionGcReport,
-    DFS_CHUNK_TRANSFER_IDLE_TIMEOUT, DfsError, DfsFileSystemId, DfsMessageTransport,
-    DfsMetadataBackend, DfsMetadataJournalPublisherHost, DfsMetadataJournalReplicationOptions,
-    DfsMetadataJournalReplicationReport, DfsMetadataJournalReplicationTransport,
-    DfsMetadataShardConfig, DfsMetadataShardId, DfsNamespaceJobMaintenanceReport, DfsObjectId,
-    DfsObjectPageCursor, DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport,
-    DfsTransportIdentity, DfsVersion, DistributedRepairJob, NetworkedDfsService,
-    NetworkedDfsServiceEvent, dfs_metadata_replication_notice_lines,
-    dfs_metadata_replication_sent_count, dfs_now_unix_nanos, dfs_path_safe_segment,
+    DFS_CHUNK_TRANSFER_IDLE_TIMEOUT, DfsControlPlaneKvClient, DfsError, DfsFileSystemId,
+    DfsMessageSender, DfsMessageTransport, DfsMetadataBackend, DfsMetadataEndpointTransport,
+    DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
+    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    DfsMetadataJournalReplicationTransport, DfsMetadataShardConfig, DfsMetadataShardId,
+    DfsMetadataSnapshotInstallSender, DfsNamespaceJobMaintenanceReport, DfsObjectId,
+    DfsObjectPageCursor, DfsPeerTransport, DfsTombstoneCompactionOptions,
+    DfsTombstoneCompactionReport, DfsTransportIdentity, DfsVersion, DistributedRepairJob,
+    LocalDfsMetadataJournalPublisherHost, NetworkedDfsService, NetworkedDfsServiceEvent,
+    async_dfs_metadata_journal_batch_sender_from_peer_transport,
+    async_dfs_metadata_snapshot_install_sender_from_peer_transport, cluster_dfs_data_endpoints,
+    cluster_dfs_metadata_shards, dfs_message_sender_from_peer_transport,
+    dfs_metadata_journal_batch_sender_from_peer_transport, dfs_metadata_replication_notice_lines,
+    dfs_metadata_replication_sent_count, dfs_metadata_snapshot_install_sender_from_peer_transport,
+    dfs_now_unix_nanos, dfs_path_safe_segment, distributed_sifs,
+    open_cluster_dfs_service_with_message_sender, open_cluster_dfs_service_with_peer_transports,
     publish_dfs_metadata_journal_with_async_host, publish_dfs_metadata_journal_with_host,
+    refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport,
 };
+
+#[cfg(test)]
+pub(crate) fn run_cluster_dfs_maintenance_tick(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    message_sender: DfsMessageSender,
+    metadata_sender: DfsMetadataJournalBatchSender,
+    snapshot_sender: DfsMetadataSnapshotInstallSender,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsMaintenanceTickOptions,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
+    run_cluster_dfs_maintenance_tick_with_message_sender(
+        data_dir,
+        cluster_paths,
+        message_sender,
+        metadata_sender,
+        snapshot_sender,
+        control_plane,
+        options,
+    )
+}
+
+pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    message_sender: DfsMessageSender,
+    metadata_sender: DfsMetadataJournalBatchSender,
+    snapshot_sender: DfsMetadataSnapshotInstallSender,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsMaintenanceTickOptions,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    if !cluster_paths.state.exists() {
+        return Ok(None);
+    }
+
+    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+        .map_err(DfsError::from_network)?;
+    let local_node_id = state.local_node_id.clone();
+    let file_system = distributed_sifs(local_node_id.clone());
+    let metadata_shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
+    let endpoints = cluster_dfs_data_endpoints(cluster_paths, &state);
+    let mut service = open_cluster_dfs_service_with_message_sender(
+        data_dir,
+        cluster_paths,
+        local_node_id.clone(),
+        endpoints.clone(),
+        message_sender,
+        control_plane,
+    )?;
+    let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
+    let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
+    let mut metadata_transport =
+        DfsMetadataEndpointTransport::new(endpoints, metadata_sender, snapshot_sender);
+    run_dfs_maintenance_tick_with_host(
+        &mut service,
+        &mut maintenance_host,
+        file_system.file_system_id,
+        &local_node_id,
+        metadata_shards,
+        &mut metadata_publisher_host,
+        &mut metadata_transport,
+        options,
+    )
+    .map(Some)
+}
+
+pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
+    runtime: &tokio::runtime::Handle,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsMaintenanceTickOptions,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    if !cluster_paths.state.exists() {
+        return Ok(None);
+    }
+
+    refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport(
+        &cluster_paths,
+        sync_peer_transport.as_ref(),
+    )?;
+
+    let state = sinomo_network::read_cluster_state_without_kv_async(runtime, &cluster_paths)
+        .await
+        .map_err(DfsError::from_network)?;
+    let local_node_id = state.local_node_id.clone();
+    let file_system = distributed_sifs(local_node_id.clone());
+    let metadata_shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
+    let endpoints = cluster_dfs_data_endpoints(&cluster_paths, &state);
+    let mut service = open_cluster_dfs_service_with_peer_transports(
+        &data_dir,
+        &cluster_paths,
+        local_node_id.clone(),
+        endpoints.clone(),
+        sync_peer_transport,
+        Arc::clone(&peer_transport),
+        control_plane,
+    )?;
+    let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
+    let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
+    let mut metadata_transport = AsyncDfsMetadataEndpointTransport::new(
+        endpoints,
+        async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
+    );
+    run_dfs_maintenance_tick_with_async_host(
+        &mut service,
+        &mut maintenance_host,
+        &data_dir,
+        file_system.file_system_id,
+        &local_node_id,
+        metadata_shards,
+        &mut metadata_publisher_host,
+        &mut metadata_transport,
+        options,
+    )
+    .await
+    .map(Some)
+}
+
+pub fn run_cluster_dfs_maintenance_tick_with_peer_transport(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    peer_transport: Arc<dyn DfsPeerTransport>,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsMaintenanceTickOptions,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
+    run_cluster_dfs_maintenance_tick_with_message_sender(
+        data_dir,
+        cluster_paths,
+        dfs_message_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
+        control_plane,
+        options,
+    )
+}
 
 const DFS_ANTI_ENTROPY_DEFAULT_OBJECT_PAGE_SIZE: usize = 1024;
 const DFS_ANTI_ENTROPY_DEFAULT_ISSUE_LIMIT: usize = 1024;
