@@ -2,9 +2,9 @@
 //!
 //! This module owns the service-facing object read surface: local object
 //! publication, remote-read request scheduling, authoritative metadata
-//! resolution, local stream opening, and confirmed-read checks. Data-plane
-//! message handlers remain in the root service protocol until their send/receive
-//! paths are split together.
+//! resolution, local stream opening, and confirmed-read checks. Network read
+//! message handlers live in `service_read_transfer`, and pending-write fetch
+//! recovery lives in `service_fetch_transfer`.
 
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -409,17 +409,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(content_hash) = object.content_hash.as_deref() else {
             return Ok(object);
         };
-        let mut locations = object
-            .current_locations
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        for receipt in self.backend_receipts_for_version(&object.object_id, &object.version)? {
-            if receipt.content_hash.as_deref() == Some(content_hash) {
-                locations.insert(receipt.replica_node_id);
+        let mut locations = Vec::new();
+        for node_id in std::mem::take(&mut object.current_locations) {
+            if !locations.contains(&node_id) {
+                locations.push(node_id);
             }
         }
-        object.current_locations = locations.into_iter().collect();
+        for receipt in self.backend_receipts_for_version(&object.object_id, &object.version)? {
+            if receipt.content_hash.as_deref() == Some(content_hash)
+                && !locations.contains(&receipt.replica_node_id)
+            {
+                locations.push(receipt.replica_node_id);
+            }
+        }
+        object.current_locations = locations;
         Ok(object)
     }
 
@@ -1085,5 +1088,200 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }),
             other => Ok(other),
         }
+    }
+
+    pub(crate) fn pending_read_metadata_advanced(
+        &self,
+        pending: &PendingNetworkedRead,
+    ) -> Result<bool, DfsError> {
+        let object = self.current_read_object_metadata(&pending.object_id)?;
+        Ok(object.version != pending.version
+            || object.content_hash != pending.content_hash
+            || object.content_size_bytes != pending.content_size_bytes)
+    }
+
+    pub(crate) fn pending_read_source_still_current(
+        &self,
+        pending: &PendingNetworkedRead,
+        source_node_id: &NodeId,
+    ) -> Result<bool, DfsError> {
+        let object = self.current_read_object_metadata(&pending.object_id)?;
+        Ok(object.version == pending.version
+            && object.content_hash == pending.content_hash
+            && object.content_size_bytes == pending.content_size_bytes
+            && object.current_locations.contains(source_node_id))
+    }
+
+    pub(crate) fn clear_pending_remote_reads_for_object_version(
+        &mut self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        content_hash: &Option<String>,
+    ) {
+        let request_ids: Vec<String> = self
+            .pending_reads
+            .iter()
+            .filter(|(_, pending)| {
+                pending.object_id == *object_id
+                    && pending.version == *version
+                    && pending.content_hash == *content_hash
+            })
+            .map(|(request_id, _)| request_id.clone())
+            .collect();
+        for request_id in request_ids {
+            self.pending_reads.remove(&request_id);
+            self.incoming_read_transfers.remove(&request_id);
+            self.incoming_read_memory_transfers.remove(&request_id);
+        }
+    }
+
+    pub(crate) fn store_remote_read_data(
+        &mut self,
+        _source_node_id: &NodeId,
+        data: &DfsReadData,
+    ) -> Result<(), DfsError> {
+        let (expected_hash, size_bytes) = self.validate_remote_read_data(data)?;
+        self.store_command_bytes(&data.object_id, &data.version, &expected_hash, &data.bytes)?;
+        self.store_remote_read_manifest(data, size_bytes)
+    }
+
+    pub(crate) fn validate_remote_read_data(
+        &self,
+        data: &DfsReadData,
+    ) -> Result<(String, u64), DfsError> {
+        let object = self.current_read_object_metadata(&data.object_id)?;
+        self.validate_remote_read_data_against(
+            data,
+            &object.object_id,
+            &object.version,
+            object.content_hash.as_deref(),
+            object.content_size_bytes,
+            "object metadata",
+        )
+    }
+
+    pub(crate) fn validate_remote_read_data_for_pending(
+        &self,
+        pending: &PendingNetworkedRead,
+        data: &DfsReadData,
+    ) -> Result<(String, u64), DfsError> {
+        self.validate_remote_read_data_against(
+            data,
+            &pending.object_id,
+            &pending.version,
+            pending.content_hash.as_deref(),
+            pending.content_size_bytes,
+            "pending metadata",
+        )
+    }
+
+    fn validate_remote_read_data_against(
+        &self,
+        data: &DfsReadData,
+        expected_object_id: &DfsObjectId,
+        expected_version: &DfsVersion,
+        expected_content_hash: Option<&str>,
+        expected_size_bytes: Option<u64>,
+        size_context: &str,
+    ) -> Result<(String, u64), DfsError> {
+        if expected_object_id != &data.object_id {
+            return Err(DfsError::ContentHashMismatch {
+                expected: expected_object_id.to_string(),
+                actual: data.object_id.to_string(),
+            });
+        }
+        if expected_version != &data.version {
+            return Err(DfsError::ContentHashMismatch {
+                expected: expected_version.to_string(),
+                actual: data.version.to_string(),
+            });
+        }
+        let Some(expected_hash) = expected_content_hash else {
+            return Err(DfsError::ContentHashMismatch {
+                expected: "committed content hash".to_string(),
+                actual: data
+                    .content_hash
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string()),
+            });
+        };
+        if let Some(actual_hash) = data.content_hash.as_ref()
+            && actual_hash != expected_hash
+        {
+            return Err(DfsError::ContentHashMismatch {
+                expected: expected_hash.to_string(),
+                actual: actual_hash.clone(),
+            });
+        }
+        let actual_hash = content_hash(&data.bytes);
+        if actual_hash != expected_hash {
+            return Err(DfsError::ContentHashMismatch {
+                expected: expected_hash.to_string(),
+                actual: actual_hash,
+            });
+        }
+        let size_bytes = data.bytes.len() as u64;
+        if let Some(expected_size) = expected_size_bytes
+            && expected_size != size_bytes
+        {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "remote read size does not match {size_context}: expected {expected_size}, actual {size_bytes}"
+                ),
+            });
+        }
+        Ok((expected_hash.to_string(), size_bytes))
+    }
+
+    pub(crate) fn store_remote_read_manifest(
+        &mut self,
+        data: &DfsReadData,
+        size_bytes: u64,
+    ) -> Result<(), DfsError> {
+        let object = self.current_read_object_metadata(&data.object_id)?;
+        if object.version != data.version {
+            return Err(DfsError::ContentHashMismatch {
+                expected: object.version.to_string(),
+                actual: data.version.to_string(),
+            });
+        }
+        let Some(expected_hash) = object.content_hash.clone() else {
+            return Err(DfsError::ContentHashMismatch {
+                expected: "committed content hash".to_string(),
+                actual: data
+                    .content_hash
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string()),
+            });
+        };
+        if let Some(actual_hash) = data.content_hash.as_ref()
+            && actual_hash != &expected_hash
+        {
+            return Err(DfsError::ContentHashMismatch {
+                expected: expected_hash,
+                actual: actual_hash.clone(),
+            });
+        }
+        if let Some(expected_size) = object.content_size_bytes
+            && expected_size != size_bytes
+        {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "remote read size does not match object metadata: expected {expected_size}, actual {size_bytes}"
+                ),
+            });
+        }
+        let mut object = object;
+        object.content_size_bytes = Some(size_bytes);
+        if self.is_local_metadata_primary_for_object(&object)? {
+            self.put_object_version_size_in_metadata_backend(&object, Some(size_bytes))?;
+        }
+        self.metadata.add_object(object)?;
+        self.clear_transient_remote_read_location_prunes_for_object(
+            &data.object_id,
+            &data.version,
+            &data.content_hash,
+        );
+        Ok(())
     }
 }

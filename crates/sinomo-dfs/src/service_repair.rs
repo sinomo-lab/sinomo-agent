@@ -1,9 +1,10 @@
 //! Repair, stage, and pending-transfer lifecycle for the networked DFS service.
 //!
 //! This module owns retry scheduling, stale inflight cleanup, alternate-source
-//! fetch requests, and repair-attempt persistence. Inbound transfer validation
-//! stays in `service_transfer`, and outbound packet construction stays in
-//! `service_outbound`.
+//! fetch requests, inbound repair transfer handling, and repair-attempt
+//! persistence. Unrelated fetch/read byte assembly stays in
+//! `service_fetch_transfer` and `service_read_transfer`; outbound packet
+//! construction stays in `service_outbound`.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -11,10 +12,11 @@ use std::time::{Duration, Instant};
 use sinomo_node::NodeId;
 
 use crate::transfer::{
-    DFS_REPAIR_RETRY_SUPPRESSED_TICK, PendingNetworkedWrite, fetch_inflight_timeout_ticks,
+    DFS_BLOB_CHUNK_BYTES, DFS_REPAIR_RETRY_SUPPRESSED_TICK, InProgressBlobTransfer,
+    PendingNetworkedWrite, blob_transfer_key, fetch_inflight_timeout_ticks,
     repair_retry_delay_nanos_for_ticks, repair_retry_delay_ticks, repair_retry_state_is_suppressed,
-    repair_transfer_inflight_timeout_ticks, stage_inflight_retry_delay_ticks,
-    wake_repair_retry_state,
+    repair_transfer_inflight_timeout_ticks, stage_inflight_retry_delay_ticks, validate_chunk_bytes,
+    validate_chunk_hash, wake_repair_retry_state,
 };
 use crate::*;
 
@@ -22,6 +24,599 @@ pub(crate) const DFS_CHUNK_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs
 /// How long a primary keeps an unanswered routed-write response obligation
 /// before assuming the requester gave up.
 const DFS_REMOTE_WRITE_RESPONSE_TTL: Duration = Duration::from_secs(60);
+
+impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    pub(crate) fn handle_repair_replica(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsRepairReplicaCommand,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let result = match self
+            .ensure_replica_command_authorized_with_metadata(
+                &requester_node_id,
+                &command.intent_id,
+                &command.object_id,
+                command.object_metadata.as_ref(),
+                command.authority_shard.as_ref(),
+            )
+            .and_then(|()| self.ensure_replica_object_metadata(command.object_metadata.as_ref()))
+            .and_then(|()| {
+                self.ensure_replica_command_hash_matches_intent(
+                    &command.intent_id,
+                    &command.object_id,
+                    &command.content_hash,
+                )
+            })
+            .and_then(|()| {
+                self.ensure_no_conflicting_pending_replica_write(
+                    "repair",
+                    &requester_node_id,
+                    &command.intent_id,
+                    &command.object_id,
+                    &command.version,
+                    &command.content_hash,
+                )
+            })
+            .and_then(|()| {
+                self.ensure_command_base_matches_current(
+                    "repair",
+                    &command.object_id,
+                    command.expected_base_version.as_ref(),
+                    &command.version,
+                    &command.content_hash,
+                )
+            })
+            .and_then(|()| {
+                let local_node_id = self.node_id.clone();
+                self.ensure_metadata_receipt_accepts(
+                    &command.object_id,
+                    &command.version,
+                    &local_node_id,
+                    &command.content_hash,
+                )
+            })
+            .and_then(|()| {
+                self.store_command_bytes(
+                    &command.object_id,
+                    &command.version,
+                    &command.content_hash,
+                    &command.bytes,
+                )
+            }) {
+            Ok(()) => {
+                let local_node_id = self.node_id.clone();
+                match self.commit_replica_metadata_cache(
+                    &command.file_system_id,
+                    &command.object_id,
+                    &command.version,
+                    &local_node_id,
+                    &command.content_hash,
+                    command.object_metadata.as_ref(),
+                ) {
+                    Ok(()) => DfsBlobTransferResult::Committed {
+                        content_hash: command.content_hash.clone(),
+                    },
+                    Err(error) => DfsBlobTransferResult::Rejected {
+                        reason: error.to_string(),
+                    },
+                }
+            }
+            Err(error) => DfsBlobTransferResult::Rejected {
+                reason: error.to_string(),
+            },
+        };
+        self.send_repair_replica_response(
+            &requester_node_id,
+            command.request_id,
+            command.intent_id.clone(),
+            command.file_system_id,
+            command.object_id.clone(),
+            command.version.clone(),
+            result.clone(),
+        )?;
+        Ok(self.repair_replica_result_event(
+            command.intent_id,
+            command.object_id,
+            command.version,
+            result,
+        ))
+    }
+
+    fn ensure_repair_response_matches_pending(
+        &self,
+        response: &DfsRepairReplicaResponse,
+        content_hash: &str,
+    ) -> Result<(), DfsError> {
+        self.ensure_repair_response_request_matches_pending(response)?;
+        let pending = self
+            .pending_writes
+            .get(&response.intent_id)
+            .expect("pending write validated");
+        self.ensure_response_matches_pending_write(
+            "repair",
+            &response.intent_id,
+            &response.file_system_id,
+            &response.object_id,
+            &response.version,
+            &response.replica_node_id,
+            content_hash,
+            pending,
+        )
+    }
+
+    fn ensure_repair_response_request_matches_pending(
+        &self,
+        response: &DfsRepairReplicaResponse,
+    ) -> Result<(), DfsError> {
+        let Some(pending) = self.pending_writes.get(&response.intent_id) else {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "missing pending write for repair response: {}",
+                    response.intent_id
+                ),
+            });
+        };
+        let expected_request_id = pending
+            .repair_inflight_request_ids
+            .get(&response.replica_node_id);
+        if let Some(expected_request_id) = expected_request_id {
+            if expected_request_id != &response.request_id {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "unexpected DFS repair response request id for intent {} from {}: expected {}, actual {}",
+                        response.intent_id,
+                        response.replica_node_id,
+                        expected_request_id,
+                        response.request_id
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        if !pending.repair_inflight_request_ids.is_empty() {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "unexpected DFS repair response source for intent {}: {}",
+                    response.intent_id, response.replica_node_id
+                ),
+            });
+        }
+        if self.coordinator.repair_jobs().iter().any(|job| {
+            job.intent_id == response.intent_id
+                && job.missing_replica_node_id == response.replica_node_id
+        }) {
+            return Ok(());
+        }
+        Err(DfsError::Distributed {
+            message: format!(
+                "unexpected DFS repair response source for intent {}: {}",
+                response.intent_id, response.replica_node_id
+            ),
+        })
+    }
+
+    pub(crate) fn handle_repair_replica_chunk(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsRepairReplicaChunkCommand,
+    ) -> Result<Option<NetworkedDfsServiceEvent>, DfsError> {
+        if command.total_chunks == 0 {
+            let reason = format!(
+                "repair replica chunk transfer {} has no chunks",
+                command.intent_id
+            );
+            return self.reject_repair_replica_chunk(requester_node_id, command, reason);
+        }
+        if let Err(error) = validate_chunk_bytes(
+            "chunked DFS blob transfer",
+            command.total_size_bytes,
+            command.chunk_index,
+            command.total_chunks,
+            &command.bytes,
+        ) {
+            return self.reject_repair_replica_chunk(requester_node_id, command, error.to_string());
+        }
+        let transfer_key = blob_transfer_key(
+            "repair",
+            &requester_node_id,
+            &command.intent_id,
+            &command.request_id,
+        );
+        if let Err(error) = validate_chunk_hash(
+            "chunked DFS blob transfer",
+            command.chunk_index,
+            &command.bytes,
+            command.chunk_hash.as_deref(),
+        ) {
+            self.incoming_blob_transfers.remove(&transfer_key);
+            return self.reject_repair_replica_chunk(requester_node_id, command, error.to_string());
+        }
+        if !self.incoming_blob_transfers.contains_key(&transfer_key) {
+            if let Err(error) = self.ensure_replica_command_authorized_with_metadata(
+                &requester_node_id,
+                &command.intent_id,
+                &command.object_id,
+                command.object_metadata.as_ref(),
+                command.authority_shard.as_ref(),
+            ) {
+                return self.reject_repair_replica_chunk(
+                    requester_node_id,
+                    command,
+                    error.to_string(),
+                );
+            }
+            if let Err(error) = self
+                .ensure_replica_object_metadata(command.object_metadata.as_ref())
+                .and_then(|()| {
+                    self.ensure_replica_command_hash_matches_intent(
+                        &command.intent_id,
+                        &command.object_id,
+                        &command.content_hash,
+                    )
+                })
+                .and_then(|()| {
+                    self.ensure_no_conflicting_pending_replica_write(
+                        "repair",
+                        &requester_node_id,
+                        &command.intent_id,
+                        &command.object_id,
+                        &command.version,
+                        &command.content_hash,
+                    )
+                })
+                .and_then(|()| {
+                    self.ensure_command_base_matches_current(
+                        "repair",
+                        &command.object_id,
+                        command.expected_base_version.as_ref(),
+                        &command.version,
+                        &command.content_hash,
+                    )
+                })
+            {
+                return self.reject_repair_replica_chunk(
+                    requester_node_id,
+                    command,
+                    error.to_string(),
+                );
+            }
+            if self.local_object_version_manifest_matches(
+                &command.object_id,
+                &command.version,
+                &command.content_hash,
+                command.total_size_bytes,
+            ) {
+                let local_node_id = self.node_id.clone();
+                self.commit_replica_metadata_cache(
+                    &command.file_system_id,
+                    &command.object_id,
+                    &command.version,
+                    &local_node_id,
+                    &command.content_hash,
+                    command.object_metadata.as_ref(),
+                )?;
+                let result = DfsBlobTransferResult::Committed {
+                    content_hash: command.content_hash.clone(),
+                };
+                self.send_repair_replica_response(
+                    &requester_node_id,
+                    command.request_id,
+                    command.intent_id.clone(),
+                    command.file_system_id,
+                    command.object_id.clone(),
+                    command.version.clone(),
+                    result.clone(),
+                )?;
+                return Ok(Some(self.repair_replica_result_event(
+                    command.intent_id,
+                    command.object_id,
+                    command.version,
+                    result,
+                )));
+            }
+            if command.chunk_index != 0 {
+                let reason = format!(
+                    "repair replica chunk transfer {} started at chunk {} without earlier chunks",
+                    command.intent_id, command.chunk_index
+                );
+                return self.reject_repair_replica_chunk(requester_node_id, command, reason);
+            }
+            let assembler = match self.content.begin_chunked_object_version(
+                command.object_id.as_str(),
+                command.version.as_str(),
+                &command.content_hash,
+                command.total_size_bytes,
+                command.total_chunks,
+                DFS_BLOB_CHUNK_BYTES,
+            ) {
+                Ok(assembler) => assembler,
+                Err(error) => {
+                    return self.reject_repair_replica_chunk(
+                        requester_node_id,
+                        command,
+                        error.to_string(),
+                    );
+                }
+            };
+            let transfer = InProgressBlobTransfer::new(
+                command.request_id.clone(),
+                command.intent_id.clone(),
+                command.file_system_id.clone(),
+                command.object_id.clone(),
+                command.expected_base_version.clone(),
+                command.version.clone(),
+                command.content_hash.clone(),
+                command.object_metadata.clone(),
+                command.total_size_bytes,
+                command.total_chunks,
+                assembler,
+            )?;
+            self.incoming_blob_transfers
+                .insert(transfer_key.clone(), transfer);
+        }
+        let transfer = self
+            .incoming_blob_transfers
+            .get_mut(&transfer_key)
+            .expect("transfer inserted");
+        if transfer.file_system_id != command.file_system_id
+            || transfer.object_id != command.object_id
+            || transfer.expected_base_version != command.expected_base_version
+            || transfer.version != command.version
+            || transfer.content_hash != command.content_hash
+        {
+            self.incoming_blob_transfers.remove(&transfer_key);
+            let reason = format!(
+                "conflicting repair replica chunk metadata for {}",
+                command.intent_id
+            );
+            return self.reject_repair_replica_chunk(requester_node_id, command, reason);
+        }
+        let transfer_complete = match transfer.insert_chunk(
+            command.chunk_index,
+            command.total_chunks,
+            command.bytes.clone(),
+        ) {
+            Ok(true) => true,
+            Ok(false) => return Ok(None),
+            Err(error) => {
+                self.incoming_blob_transfers.remove(&transfer_key);
+                return self.reject_repair_replica_chunk(
+                    requester_node_id,
+                    command,
+                    error.to_string(),
+                );
+            }
+        };
+        if !transfer_complete {
+            return Ok(None);
+        }
+        let transfer = self
+            .incoming_blob_transfers
+            .remove(&transfer_key)
+            .expect("completed transfer");
+        let manifest = match self
+            .content
+            .commit_chunked_object_version(transfer.chunks.assembler)
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                return self.reject_repair_replica_chunk(
+                    requester_node_id,
+                    command,
+                    error.to_string(),
+                );
+            }
+        };
+        let local_node_id = self.node_id.clone();
+        self.commit_replica_metadata_cache(
+            &transfer.file_system_id,
+            &transfer.object_id,
+            &transfer.version,
+            &local_node_id,
+            &manifest.content_hash,
+            transfer.object_metadata.as_ref(),
+        )?;
+        let result = DfsBlobTransferResult::Committed {
+            content_hash: manifest.content_hash.clone(),
+        };
+        self.send_repair_replica_response(
+            &requester_node_id,
+            transfer.request_id,
+            transfer.intent_id.clone(),
+            transfer.file_system_id,
+            transfer.object_id.clone(),
+            transfer.version.clone(),
+            result.clone(),
+        )?;
+        Ok(Some(self.repair_replica_result_event(
+            transfer.intent_id,
+            transfer.object_id,
+            transfer.version,
+            result,
+        )))
+    }
+
+    fn reject_repair_replica_chunk(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsRepairReplicaChunkCommand,
+        reason: String,
+    ) -> Result<Option<NetworkedDfsServiceEvent>, DfsError> {
+        let transfer_key = blob_transfer_key(
+            "repair",
+            &requester_node_id,
+            &command.intent_id,
+            &command.request_id,
+        );
+        self.incoming_blob_transfers.remove(&transfer_key);
+        let result = DfsBlobTransferResult::Rejected { reason };
+        self.send_repair_replica_response(
+            &requester_node_id,
+            command.request_id,
+            command.intent_id.clone(),
+            command.file_system_id,
+            command.object_id.clone(),
+            command.version.clone(),
+            result.clone(),
+        )?;
+        Ok(Some(self.repair_replica_result_event(
+            command.intent_id,
+            command.object_id,
+            command.version,
+            result,
+        )))
+    }
+
+    pub(crate) fn handle_repair_replica_response(
+        &mut self,
+        frame_source_node_id: NodeId,
+        response: DfsRepairReplicaResponse,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        if frame_source_node_id != response.replica_node_id {
+            let reason = format!(
+                "DFS repair response source mismatch: frame source {}, payload replica {}",
+                frame_source_node_id, response.replica_node_id
+            );
+            return Ok(NetworkedDfsServiceEvent::RepairRejected {
+                intent_id: response.intent_id,
+                object_id: response.object_id,
+                replica_node_id: frame_source_node_id,
+                reason,
+            });
+        }
+        self.restore_pending_write_for_intent_if_missing(&response.intent_id, &response.object_id)?;
+        match response.result {
+            DfsBlobTransferResult::Committed { ref content_hash }
+            | DfsBlobTransferResult::Durable { ref content_hash } => {
+                if let Err(error) =
+                    self.ensure_repair_response_matches_pending(&response, content_hash)
+                {
+                    return Ok(NetworkedDfsServiceEvent::RepairRejected {
+                        intent_id: response.intent_id,
+                        object_id: response.object_id,
+                        replica_node_id: response.replica_node_id,
+                        reason: error.to_string(),
+                    });
+                }
+                self.put_metadata_receipt(
+                    &response.file_system_id,
+                    &response.object_id,
+                    &response.version,
+                    &response.replica_node_id,
+                    content_hash,
+                )?;
+                self.coordinator.record_durable_receipt(
+                    &response.intent_id,
+                    response.replica_node_id.clone(),
+                )?;
+                self.mark_repaired_location(
+                    &response.object_id,
+                    &response.version,
+                    &response.replica_node_id,
+                    content_hash,
+                )?;
+                self.record_repair_metadata_settle(&response.intent_id, &response.replica_node_id);
+                self.cleanup_committed_pending_write_if_repaired(&response.intent_id);
+                Ok(NetworkedDfsServiceEvent::ReplicaRepaired {
+                    intent_id: response.intent_id,
+                    object_id: response.object_id,
+                    version: response.version,
+                    replica_node_id: response.replica_node_id,
+                    content_hash: content_hash.clone(),
+                })
+            }
+            DfsBlobTransferResult::Rejected { ref reason } => {
+                match self.ensure_repair_response_request_matches_pending(&response) {
+                    Ok(()) => {
+                        if repair_rejection_indicates_lost_authority(reason) {
+                            self.suppress_repair_retries_for_lost_authority(
+                                &response.intent_id,
+                                Some(&response.replica_node_id),
+                                false,
+                            );
+                        } else if repair_rejection_indicates_stale_chunk_resume(reason) {
+                            self.record_repair_resume_reset(
+                                &response.intent_id,
+                                &response.replica_node_id,
+                            );
+                        } else {
+                            self.record_repair_retry_scheduled(
+                                &response.intent_id,
+                                &response.replica_node_id,
+                            );
+                        }
+                        Ok(NetworkedDfsServiceEvent::RepairRejected {
+                            intent_id: response.intent_id,
+                            object_id: response.object_id,
+                            replica_node_id: response.replica_node_id,
+                            reason: reason.clone(),
+                        })
+                    }
+                    Err(error) => Ok(NetworkedDfsServiceEvent::RepairRejected {
+                        intent_id: response.intent_id,
+                        object_id: response.object_id,
+                        replica_node_id: response.replica_node_id,
+                        reason: error.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+
+    fn send_repair_replica_response(
+        &mut self,
+        requester_node_id: &NodeId,
+        request_id: String,
+        intent_id: String,
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        result: DfsBlobTransferResult,
+    ) -> Result<(), DfsError> {
+        self.send_dfs_message_if_routable(
+            requester_node_id,
+            DfsNetworkMessage::RepairReplicaResponse(DfsRepairReplicaResponse {
+                request_id,
+                intent_id,
+                file_system_id,
+                object_id,
+                version,
+                replica_node_id: self.node_id.clone(),
+                result,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn repair_replica_result_event(
+        &self,
+        intent_id: String,
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        result: DfsBlobTransferResult,
+    ) -> NetworkedDfsServiceEvent {
+        match result {
+            DfsBlobTransferResult::Committed { content_hash }
+            | DfsBlobTransferResult::Durable { content_hash } => {
+                NetworkedDfsServiceEvent::ReplicaRepaired {
+                    intent_id,
+                    object_id,
+                    version,
+                    replica_node_id: self.node_id.clone(),
+                    content_hash,
+                }
+            }
+            DfsBlobTransferResult::Rejected { reason } => {
+                NetworkedDfsServiceEvent::RepairRejected {
+                    intent_id,
+                    object_id,
+                    replica_node_id: self.node_id.clone(),
+                    reason,
+                }
+            }
+        }
+    }
+}
 
 impl<T> NetworkedDfsService<T>
 where

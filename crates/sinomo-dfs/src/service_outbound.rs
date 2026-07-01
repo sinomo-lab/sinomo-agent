@@ -1,8 +1,8 @@
 //! Outbound DFS data-plane message sending helpers.
 //!
-//! Inbound transfer validation lives in `service_transfer`; this module owns
-//! the companion helpers that package local content into stage, repair, fetch,
-//! and best-effort routed messages.
+//! Inbound transfer validation lives in the focused transfer modules; this
+//! module owns the companion helpers that package local content into stage,
+//! repair, fetch, and best-effort routed messages.
 
 use std::io::Read;
 

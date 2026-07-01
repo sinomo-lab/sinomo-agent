@@ -2,8 +2,8 @@
 //!
 //! This module owns async transport polling, bounded quiescence waits,
 //! and deferred routed-write response flushing. Synchronous protocol
-//! message handlers stay in `service_protocol` and transfer assembly stays
-//! in `service_transfer` / `service_outbound`.
+//! message handlers stay in `service_protocol`; transfer assembly is split
+//! across the focused transfer modules and `service_outbound`.
 
 use crate::*;
 
