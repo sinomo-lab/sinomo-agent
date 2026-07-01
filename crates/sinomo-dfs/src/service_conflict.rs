@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use sinomo_node::NodeId;
 use time::OffsetDateTime;
 
+use crate::metadata_pages::collect_metadata_pages;
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -221,27 +222,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         object_id: &DfsObjectId,
     ) -> Result<(), DfsError> {
-        if self.metadata_backend.is_none() {
+        let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(());
-        }
-        let mut cursor = None;
-        loop {
-            let page = self
-                .metadata_backend
-                .as_ref()
-                .expect("metadata backend checked above")
-                .conflicts_for_object_page(
-                    object_id,
-                    cursor.as_ref(),
-                    DFS_CONFLICT_SCAN_PAGE_SIZE,
-                )?;
-            for conflict in page.conflicts {
-                self.metadata.add_conflict(conflict);
-            }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            cursor = Some(next_cursor);
+        };
+        let conflicts = collect_metadata_pages(|cursor| {
+            let page = backend.conflicts_for_object_page(
+                object_id,
+                cursor,
+                DFS_CONFLICT_SCAN_PAGE_SIZE,
+            )?;
+            Ok((page.conflicts, page.next_cursor))
+        })?;
+        for conflict in conflicts {
+            self.metadata.add_conflict(conflict);
         }
         Ok(())
     }
@@ -263,22 +256,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(conflicts.into_values().collect());
         };
-        let mut cursor = None;
-        loop {
+        let backend_conflicts = collect_metadata_pages(|cursor| {
             let page = backend.conflicts_for_object_page(
                 object_id,
-                cursor.as_ref(),
+                cursor,
                 DFS_CONFLICT_SCAN_PAGE_SIZE,
             )?;
-            for conflict in page.conflicts {
-                if include_backend_conflict(&conflict) {
-                    conflicts.insert(conflict.conflict_id.clone(), conflict);
-                }
+            Ok((page.conflicts, page.next_cursor))
+        })?;
+        for conflict in backend_conflicts {
+            if include_backend_conflict(&conflict) {
+                conflicts.insert(conflict.conflict_id.clone(), conflict);
             }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            cursor = Some(next_cursor);
         }
         Ok(conflicts.into_values().collect())
     }

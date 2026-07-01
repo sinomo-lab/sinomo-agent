@@ -70,6 +70,42 @@ pub(crate) fn collect_filtered_metadata_pages<T, U, C>(
     Ok(records)
 }
 
+/// Build one bounded cursor page by walking a source page API and accepting
+/// only records that map to an output cursor.
+///
+/// The helper stops after collecting one more accepted record than the caller
+/// requested, then delegates to [`finish_cursor_page`] so next-cursor semantics
+/// stay consistent across metadata default methods.
+pub(crate) fn collect_filtered_cursor_page<T, U, SourceCursor, OutputCursor: Clone>(
+    after: Option<SourceCursor>,
+    max_entries: usize,
+    mut fetch_page: impl FnMut(Option<&SourceCursor>) -> Result<(Vec<T>, Option<SourceCursor>)>,
+    mut filter_map_record: impl FnMut(T) -> Result<Option<(U, OutputCursor)>>,
+) -> Result<(Vec<U>, Option<OutputCursor>)> {
+    if max_entries == 0 {
+        return Ok((Vec::new(), None));
+    }
+    let mut source_cursor = after;
+    let mut entries = Vec::new();
+    loop {
+        let (page_records, next_source_cursor) = fetch_page(source_cursor.as_ref())?;
+        for record in page_records {
+            let Some(entry) = filter_map_record(record)? else {
+                continue;
+            };
+            entries.push(entry);
+            if entries.len() > max_entries {
+                return Ok(finish_cursor_page(entries, max_entries));
+            }
+        }
+        let Some(next_source_cursor) = next_source_cursor else {
+            break;
+        };
+        source_cursor = Some(next_source_cursor);
+    }
+    Ok(finish_cursor_page(entries, max_entries))
+}
+
 /// Walk a cursor-paged metadata API until it returns no next cursor.
 ///
 /// The closure receives the current cursor and returns the next cursor after
@@ -948,6 +984,26 @@ mod tests {
         .expect("collect filtered pages");
 
         assert_eq!(records, vec![10, 30, 50]);
+    }
+
+    #[test]
+    fn collect_filtered_cursor_page_uses_last_included_cursor_when_more_exists() {
+        let (records, next_cursor) = collect_filtered_cursor_page(
+            None,
+            2,
+            |cursor: Option<&usize>| {
+                Ok(match cursor.copied().unwrap_or(0) {
+                    0 => (vec![1, 2, 3], Some(3)),
+                    3 => (vec![4, 5], None),
+                    other => panic!("unexpected cursor {other}"),
+                })
+            },
+            |record| Ok((record % 2 == 1).then_some((record * 10, record))),
+        )
+        .expect("collect filtered cursor page");
+
+        assert_eq!(records, vec![10, 30]);
+        assert_eq!(next_cursor, Some(3));
     }
 
     #[test]

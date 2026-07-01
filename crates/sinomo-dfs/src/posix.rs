@@ -6,6 +6,8 @@
 //! behavior over SIFS while the lower DFS layers handle placement, receipts,
 //! repair, and metadata journaling.
 
+use crate::metadata_pages::walk_metadata_pages;
+use crate::metadata_shard_migration::collect_object_metadata_family;
 use crate::namespace::{
     initial_version, metadata_path, namespace_transaction_id_for_path, next_version,
     object_id_for_path,
@@ -1243,11 +1245,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return busy();
         }
         if let Some(backend) = self.metadata_backend.as_ref() {
-            let mut cursor = None;
-            loop {
+            let mut has_blocking_intent = false;
+            walk_metadata_pages(|cursor| {
                 let page = backend.intents_for_object_page(
                     &object.object_id,
-                    cursor.as_ref(),
+                    cursor,
                     POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
                 )?;
                 if page.intents.iter().any(|intent| {
@@ -1255,12 +1257,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         || (matches!(intent.status, DfsWriteIntentStatus::ReceiptsPending)
                             && intent.target_version != object.version)
                 }) {
-                    return busy();
+                    has_blocking_intent = true;
+                    return Ok(None);
                 }
-                let Some(next_cursor) = page.next_cursor else {
-                    break;
-                };
-                cursor = Some(next_cursor);
+                Ok(page.next_cursor)
+            })?;
+            if has_blocking_intent {
+                return busy();
             }
         }
         Ok(())
@@ -1619,71 +1622,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
         };
-        let mut versions = Vec::new();
-        let mut version_cursor = None;
-        loop {
-            let page = backend.versions_for_object_page(
-                object_id,
-                version_cursor.as_ref(),
-                POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
-            )?;
-            versions.extend(page.versions);
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            version_cursor = Some(next_cursor);
-        }
-        // Bound the shipped history to the most recent records; the current
-        // visible version is always the newest. Older history remains in the
-        // source shard until lifecycle GC collects it.
-        versions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
-        versions.truncate(CROSS_SHARD_MOVE_VERSION_HISTORY_LIMIT);
-        let mut receipts = Vec::new();
-        for version in &versions {
-            let mut receipt_cursor = None;
-            loop {
-                let page = backend.receipts_for_version_page(
-                    object_id,
-                    &version.version,
-                    receipt_cursor.as_ref(),
-                    POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
-                )?;
-                receipts.extend(page.receipts);
-                let Some(next_cursor) = page.next_cursor else {
-                    break;
-                };
-                receipt_cursor = Some(next_cursor);
-            }
-        }
-        let mut intents = Vec::new();
-        let mut intent_cursor = None;
-        loop {
-            let page = backend.intents_for_object_page(
-                object_id,
-                intent_cursor.as_ref(),
-                POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
-            )?;
-            intents.extend(page.intents);
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            intent_cursor = Some(next_cursor);
-        }
-        let mut conflicts = Vec::new();
-        let mut conflict_cursor = None;
-        loop {
-            let page = backend.conflicts_for_object_page(
-                object_id,
-                conflict_cursor.as_ref(),
-                POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
-            )?;
-            conflicts.extend(page.conflicts);
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            conflict_cursor = Some(next_cursor);
-        }
-        Ok((versions, receipts, intents, conflicts))
+        let family = collect_object_metadata_family(
+            backend.as_ref(),
+            object_id,
+            POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
+            Some(CROSS_SHARD_MOVE_VERSION_HISTORY_LIMIT),
+        )?;
+        Ok((
+            family.versions,
+            family.receipts,
+            family.intents,
+            family.conflicts,
+        ))
     }
 
     /// The source-side half of a cross-shard move, applied after the

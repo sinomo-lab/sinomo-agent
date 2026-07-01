@@ -6,12 +6,17 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use sinomo_node::NodeId;
 use time::OffsetDateTime;
 
+use crate::metadata_pages::collect_metadata_pages;
+use crate::metadata_receipt::receipt_for_replica_from_backend;
 use crate::{
-    DfsControlPlaneStore, DfsError, DfsFileSystem, DfsFileSystemConfig, DfsFileSystemId,
-    DfsMessageTransport, DfsNamespaceTransaction, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
-    DfsObjectVersionRecord, NetworkedDfsService, dfs_perf_trace, metadata_path,
+    DFS_METADATA_OBJECT_INTENT_PAGE_SIZE, DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
+    DfsControlPlaneStore, DfsDistributedError, DfsError, DfsFileSystem, DfsFileSystemConfig,
+    DfsFileSystemId, DfsMessageTransport, DfsNamespaceTransaction, DfsObjectId, DfsObjectKind,
+    DfsObjectMetadata, DfsObjectVersionRecord, DfsReplicaReceiptRecord, DfsVersion,
+    DfsWriteIntentRecord, NetworkedDfsService, dfs_perf_trace, metadata_path,
     namespace_transaction_id_for_batch, normalize_current_locations, object_version_record,
     path_index_key,
 };
@@ -183,6 +188,107 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn remove_transient_object_metadata(&mut self, object_id: &DfsObjectId) {
         self.metadata.remove_object(object_id);
+    }
+
+    // Shared metadata-backend read helpers for service paths that need durable
+    // receipts or intents while preserving the service's no-backend fallback.
+    pub(crate) fn backend_receipts_for_version(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+    ) -> Result<Vec<DfsReplicaReceiptRecord>, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let receipts = collect_metadata_pages(|cursor| {
+            let page = backend.receipts_for_version_page(
+                object_id,
+                version,
+                cursor,
+                DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
+            )?;
+            Ok((page.receipts, page.next_cursor))
+        })?;
+        Ok(receipts)
+    }
+
+    pub(crate) fn backend_intent_ids_for_version(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+    ) -> Result<Vec<String>, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let intents = collect_metadata_pages(|cursor| {
+            let page = backend.intents_for_object_version_page(
+                object_id,
+                version,
+                cursor,
+                DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
+            )?;
+            Ok((page.intents, page.next_cursor))
+        })?;
+        Ok(intents.into_iter().map(|intent| intent.intent_id).collect())
+    }
+
+    pub(crate) fn backend_receipt_for_replica(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsReplicaReceiptRecord>, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(None);
+        };
+        Ok(receipt_for_replica_from_backend(
+            backend.as_ref(),
+            object_id,
+            version,
+            replica_node_id,
+            DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
+        )?)
+    }
+
+    pub(crate) fn restore_backend_durable_receipt(
+        &mut self,
+        intent_id: &str,
+        replica_node_id: NodeId,
+        allow_unknown_intent: bool,
+    ) -> Result<(), DfsError> {
+        match self
+            .coordinator
+            .restore_durable_receipt(intent_id, replica_node_id)
+        {
+            Ok(()) => Ok(()),
+            Err(DfsDistributedError::UnknownIntent { .. }) if allow_unknown_intent => Ok(()),
+            Err(
+                DfsDistributedError::UnexpectedReplica { .. }
+                | DfsDistributedError::IntentClosed { .. },
+            ) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) fn restore_backend_receipt_pages_for_intent(
+        &mut self,
+        intent_record: &DfsWriteIntentRecord,
+    ) -> Result<(), DfsError> {
+        for receipt in self
+            .backend_receipts_for_version(&intent_record.object_id, &intent_record.target_version)?
+        {
+            if let Some(expected_hash) = intent_record.content_hash.as_deref()
+                && receipt.content_hash.as_deref() != Some(expected_hash)
+            {
+                continue;
+            }
+            self.restore_backend_durable_receipt(
+                &intent_record.intent_id,
+                receipt.replica_node_id,
+                false,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn apply_namespace_transaction(

@@ -1,5 +1,6 @@
 //! Operator and agent-facing DFS inspection surfaces.
 
+use crate::metadata_pages::{collect_metadata_pages, walk_metadata_pages};
 use crate::{
     DfsConflictPageCursor, DfsConflictRecord, DfsConflictStatus, DfsFileSystem, DfsMetadataBackend,
     DfsMetadataShardStatus, DfsObjectMetadata, DfsObjectPageCursor, DfsObjectVersionRecord,
@@ -692,21 +693,17 @@ impl<'a> DfsOperatorInspector<'a> {
             None => self.backend.list_file_systems()?,
         };
         for file_system in filesystems {
-            let mut cursor = None;
-            loop {
+            walk_metadata_pages(|cursor| {
                 let page = self.backend.objects_for_file_system_page(
                     &file_system.file_system_id,
-                    cursor.as_ref(),
+                    cursor,
                     OPERATOR_OBJECT_SCAN_PAGE_SIZE,
                 )?;
                 for object in page.objects {
                     visit(object)?;
                 }
-                let Some(next_cursor) = page.next_cursor else {
-                    break;
-                };
-                cursor = Some(next_cursor);
-            }
+                Ok(page.next_cursor)
+            })?;
         }
         Ok(())
     }
@@ -831,11 +828,10 @@ impl<'a> DfsOperatorInspector<'a> {
 
         let receipt_nodes_by_hash = current_version_receipt_nodes_by_hash(self.backend, object)?;
         let mut candidates = BTreeMap::<(DfsVersion, NodeId, String), DfsOperatorRepairView>::new();
-        let mut intent_cursor = None;
-        loop {
+        walk_metadata_pages(|intent_cursor| {
             let page = self.backend.intents_for_object_page(
                 &object.object_id,
-                intent_cursor.as_ref(),
+                intent_cursor,
                 OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
             )?;
             for intent in page.intents {
@@ -869,11 +865,8 @@ impl<'a> DfsOperatorInspector<'a> {
                     }
                 }
             }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            intent_cursor = Some(next_cursor);
-        }
+            Ok(page.next_cursor)
+        })?;
         let has_remaining = candidates.len() > limit;
         output.extend(candidates.into_values().take(limit));
         Ok(has_remaining)
@@ -1232,21 +1225,14 @@ fn versions_for_object_from_backend(
     backend: &dyn DfsMetadataBackend,
     object_id: &DfsObjectId,
 ) -> Result<Vec<DfsObjectVersionRecord>, MetadataBackendError> {
-    let mut versions = Vec::new();
-    let mut cursor = None;
-    loop {
+    collect_metadata_pages(|cursor| {
         let page = backend.versions_for_object_page(
             object_id,
-            cursor.as_ref(),
+            cursor,
             OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
         )?;
-        versions.extend(page.versions);
-        let Some(next_cursor) = page.next_cursor else {
-            break;
-        };
-        cursor = Some(next_cursor);
-    }
-    Ok(versions)
+        Ok((page.versions, page.next_cursor))
+    })
 }
 
 fn receipts_for_version_from_backend(
@@ -1254,64 +1240,43 @@ fn receipts_for_version_from_backend(
     object_id: &DfsObjectId,
     version: &DfsVersion,
 ) -> Result<Vec<DfsReplicaReceiptRecord>, MetadataBackendError> {
-    let mut receipts = Vec::new();
-    let mut cursor = None;
-    loop {
+    collect_metadata_pages(|cursor| {
         let page = backend.receipts_for_version_page(
             object_id,
             version,
-            cursor.as_ref(),
+            cursor,
             OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
         )?;
-        receipts.extend(page.receipts);
-        let Some(next_cursor) = page.next_cursor else {
-            break;
-        };
-        cursor = Some(next_cursor);
-    }
-    Ok(receipts)
+        Ok((page.receipts, page.next_cursor))
+    })
 }
 
 fn intents_for_object_from_backend(
     backend: &dyn DfsMetadataBackend,
     object_id: &DfsObjectId,
 ) -> Result<Vec<DfsWriteIntentRecord>, MetadataBackendError> {
-    let mut intents = Vec::new();
-    let mut cursor = None;
-    loop {
+    collect_metadata_pages(|cursor| {
         let page = backend.intents_for_object_page(
             object_id,
-            cursor.as_ref(),
+            cursor,
             OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
         )?;
-        intents.extend(page.intents);
-        let Some(next_cursor) = page.next_cursor else {
-            break;
-        };
-        cursor = Some(next_cursor);
-    }
-    Ok(intents)
+        Ok((page.intents, page.next_cursor))
+    })
 }
 
 fn conflicts_for_object_from_backend(
     backend: &dyn DfsMetadataBackend,
     object_id: &DfsObjectId,
 ) -> Result<Vec<DfsConflictRecord>, MetadataBackendError> {
-    let mut conflicts = Vec::new();
-    let mut cursor = None;
-    loop {
+    collect_metadata_pages(|cursor| {
         let page = backend.conflicts_for_object_page(
             object_id,
-            cursor.as_ref(),
+            cursor,
             OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
         )?;
-        conflicts.extend(page.conflicts);
-        let Some(next_cursor) = page.next_cursor else {
-            break;
-        };
-        cursor = Some(next_cursor);
-    }
-    Ok(conflicts)
+        Ok((page.conflicts, page.next_cursor))
+    })
 }
 
 fn repairs_for_object_from_backend(
@@ -1346,11 +1311,11 @@ fn object_has_open_conflict(
     backend: &dyn DfsMetadataBackend,
     object_id: &DfsObjectId,
 ) -> Result<bool, MetadataBackendError> {
-    let mut cursor = None;
-    loop {
+    let mut has_open_conflict = false;
+    walk_metadata_pages(|cursor| {
         let page = backend.conflicts_for_object_page(
             object_id,
-            cursor.as_ref(),
+            cursor,
             OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
         )?;
         if page
@@ -1358,13 +1323,12 @@ fn object_has_open_conflict(
             .iter()
             .any(|conflict| conflict.status == DfsConflictStatus::Open)
         {
-            return Ok(true);
+            has_open_conflict = true;
+            return Ok(None);
         }
-        let Some(next_cursor) = page.next_cursor else {
-            return Ok(false);
-        };
-        cursor = Some(next_cursor);
-    }
+        Ok(page.next_cursor)
+    })?;
+    Ok(has_open_conflict)
 }
 
 fn current_version_receipt_nodes_by_hash(
@@ -1372,12 +1336,11 @@ fn current_version_receipt_nodes_by_hash(
     object: &DfsObjectMetadata,
 ) -> Result<BTreeMap<Option<String>, BTreeSet<NodeId>>, MetadataBackendError> {
     let mut nodes_by_hash = BTreeMap::<Option<String>, BTreeSet<NodeId>>::new();
-    let mut cursor = None;
-    loop {
+    walk_metadata_pages(|cursor| {
         let page = backend.receipts_for_version_page(
             &object.object_id,
             &object.version,
-            cursor.as_ref(),
+            cursor,
             OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
         )?;
         for receipt in page.receipts {
@@ -1386,11 +1349,8 @@ fn current_version_receipt_nodes_by_hash(
                 .or_default()
                 .insert(receipt.replica_node_id);
         }
-        let Some(next_cursor) = page.next_cursor else {
-            break;
-        };
-        cursor = Some(next_cursor);
-    }
+        Ok(page.next_cursor)
+    })?;
     Ok(nodes_by_hash)
 }
 

@@ -23,6 +23,14 @@ pub(crate) struct DfsObjectShardMigrationBundle {
     pub(crate) conflicts: Vec<DfsConflictRecord>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DfsObjectMetadataFamily {
+    pub(crate) versions: Vec<DfsObjectVersionRecord>,
+    pub(crate) receipts: Vec<DfsReplicaReceiptRecord>,
+    pub(crate) intents: Vec<DfsWriteIntentRecord>,
+    pub(crate) conflicts: Vec<DfsConflictRecord>,
+}
+
 pub(crate) fn collect_object_shard_migration_bundle<B: DfsMetadataBackend + ?Sized>(
     source: &B,
     object_id: &DfsObjectId,
@@ -34,10 +42,37 @@ pub(crate) fn collect_object_shard_migration_bundle<B: DfsMetadataBackend + ?Siz
             .ok_or_else(|| MetadataBackendError::UnknownObject {
                 object_id: object_id.clone(),
             })?;
+    let family = collect_object_metadata_family(source, object_id, page_size, None)?;
+    Ok(DfsObjectShardMigrationBundle {
+        object,
+        versions: family.versions,
+        receipts: family.receipts,
+        intents: family.intents,
+        conflicts: family.conflicts,
+    })
+}
+
+/// Collect the durable metadata records attached to one object.
+///
+/// When `version_history_limit` is set, only the newest version records are
+/// retained and receipts are collected for that bounded version set. Intents
+/// and conflicts remain unbounded because they carry recovery state independent
+/// of visible version history.
+pub(crate) fn collect_object_metadata_family<B: DfsMetadataBackend + ?Sized>(
+    source: &B,
+    object_id: &DfsObjectId,
+    page_size: usize,
+    version_history_limit: Option<usize>,
+) -> Result<DfsObjectMetadataFamily> {
     let versions = collect_metadata_pages(|cursor| {
         let page = source.versions_for_object_page(object_id, cursor, page_size)?;
         Ok((page.versions, page.next_cursor))
     })?;
+    let mut versions = versions;
+    if let Some(limit) = version_history_limit {
+        versions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        versions.truncate(limit);
+    }
     let mut receipts = Vec::new();
     for version in &versions {
         receipts.extend(collect_metadata_pages(|cursor| {
@@ -54,8 +89,7 @@ pub(crate) fn collect_object_shard_migration_bundle<B: DfsMetadataBackend + ?Siz
         let page = source.conflicts_for_object_page(object_id, cursor, page_size)?;
         Ok((page.conflicts, page.next_cursor))
     })?;
-    Ok(DfsObjectShardMigrationBundle {
-        object,
+    Ok(DfsObjectMetadataFamily {
         versions,
         receipts,
         intents,

@@ -16,7 +16,7 @@ use crate::metadata_keys::{
 };
 use crate::metadata_limits::OBJECT_LOCAL_METADATA_PAGE_SIZE;
 use crate::metadata_pages::{
-    collect_filtered_metadata_pages, collect_metadata_pages, finish_cursor_page,
+    collect_filtered_cursor_page, collect_filtered_metadata_pages, collect_metadata_pages,
     walk_metadata_pages,
 };
 use crate::metadata_records::*;
@@ -178,41 +178,39 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         after: Option<&DfsDirectoryPageCursor>,
         max_entries: usize,
     ) -> Result<DfsDirectoryPage> {
-        if max_entries == 0 {
-            return Ok(DfsDirectoryPage {
-                objects: Vec::new(),
-                next_cursor: None,
-            });
-        }
         let directory_path = normalize_posix_path(directory_path);
         let prefix = if directory_path == "/" {
             "/".to_string()
         } else {
             format!("{}/", directory_path.trim_end_matches('/'))
         };
-        let mut object_cursor = after.map(|cursor| DfsObjectPageCursor {
+        let object_cursor = after.map(|cursor| DfsObjectPageCursor {
             path: cursor.path.clone(),
             object_id: cursor.object_id.clone(),
             shard_id: cursor.shard_id.clone(),
         });
-        let mut entries = Vec::new();
-        'pages: loop {
-            let page = self.objects_for_file_system_page(
-                file_system_id,
-                object_cursor.as_ref(),
-                OBJECT_LOCAL_METADATA_PAGE_SIZE,
-            )?;
-            for object in page.objects {
+        let (objects, next_cursor) = collect_filtered_cursor_page(
+            object_cursor,
+            max_entries,
+            |cursor| {
+                let page = self.objects_for_file_system_page(
+                    file_system_id,
+                    cursor,
+                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
+                )?;
+                Ok((page.objects, page.next_cursor))
+            },
+            |object| {
                 let object_path = normalize_posix_path(&object.path);
                 if object.kind == DfsObjectKind::Tombstone
                     || object_path == directory_path
                     || !object_path.starts_with(&prefix)
                 {
-                    continue;
+                    return Ok(None);
                 }
                 let rest = object_path.trim_start_matches(&prefix);
                 if rest.is_empty() || rest.contains('/') {
-                    continue;
+                    return Ok(None);
                 }
                 let object_cursor = self.object_page_cursor_for_object(&object)?;
                 let cursor = DfsDirectoryPageCursor {
@@ -221,17 +219,9 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                     dentry: None,
                     shard_id: object_cursor.shard_id,
                 };
-                entries.push((object, cursor));
-                if entries.len() > max_entries {
-                    break 'pages;
-                }
-            }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            object_cursor = Some(next_cursor);
-        }
-        let (objects, next_cursor) = finish_cursor_page(entries, max_entries);
+                Ok(Some((object, cursor)))
+            },
+        )?;
         Ok(DfsDirectoryPage {
             objects,
             next_cursor,
@@ -270,36 +260,25 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         after: Option<&DfsObjectPageCursor>,
         max_entries: usize,
     ) -> Result<DfsObjectPage> {
-        if max_entries == 0 {
-            return Ok(DfsObjectPage {
-                objects: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        let mut object_cursor = after.cloned();
-        let mut entries = Vec::new();
-        'pages: loop {
-            let page = self.objects_for_file_system_page(
-                file_system_id,
-                object_cursor.as_ref(),
-                OBJECT_LOCAL_METADATA_PAGE_SIZE,
-            )?;
-            for object in page.objects {
+        let (hardlinks, next_cursor) = collect_filtered_cursor_page(
+            after.cloned(),
+            max_entries,
+            |cursor| {
+                let page = self.objects_for_file_system_page(
+                    file_system_id,
+                    cursor,
+                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
+                )?;
+                Ok((page.objects, page.next_cursor))
+            },
+            |object| {
                 if !object_is_hardlink_to_target(&object, file_system_id, target_object_id) {
-                    continue;
+                    return Ok(None);
                 }
                 let cursor = self.object_page_cursor_for_object(&object)?;
-                entries.push((object, cursor));
-                if entries.len() > max_entries {
-                    break 'pages;
-                }
-            }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            object_cursor = Some(next_cursor);
-        }
-        let (hardlinks, next_cursor) = finish_cursor_page(entries, max_entries);
+                Ok(Some((object, cursor)))
+            },
+        )?;
         Ok(DfsObjectPage {
             objects: hardlinks,
             next_cursor,
@@ -543,36 +522,25 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         after: Option<&DfsWriteIntentPageCursor>,
         max_entries: usize,
     ) -> Result<DfsWriteIntentPage> {
-        if max_entries == 0 {
-            return Ok(DfsWriteIntentPage {
-                intents: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        let mut entries = Vec::new();
-        let mut cursor = after.cloned();
-        'pages: loop {
-            let page = self.intents_for_object_page(
-                object_id,
-                cursor.as_ref(),
-                OBJECT_LOCAL_METADATA_PAGE_SIZE,
-            )?;
-            for intent in page.intents {
+        let (intents, next_cursor) = collect_filtered_cursor_page(
+            after.cloned(),
+            max_entries,
+            |cursor| {
+                let page = self.intents_for_object_page(
+                    object_id,
+                    cursor,
+                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
+                )?;
+                Ok((page.intents, page.next_cursor))
+            },
+            |intent| {
                 if intent.target_version != *target_version {
-                    continue;
+                    return Ok(None);
                 }
                 let cursor = write_intent_page_cursor(&intent);
-                entries.push((intent, cursor));
-                if entries.len() > max_entries {
-                    break 'pages;
-                }
-            }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            cursor = Some(next_cursor);
-        }
-        let (intents, next_cursor) = finish_cursor_page(entries, max_entries);
+                Ok(Some((intent, cursor)))
+            },
+        )?;
         Ok(DfsWriteIntentPage {
             intents,
             next_cursor,

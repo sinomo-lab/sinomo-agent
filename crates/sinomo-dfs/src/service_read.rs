@@ -406,9 +406,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         mut object: DfsObjectMetadata,
     ) -> Result<DfsObjectMetadata, DfsError> {
-        let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(object);
-        };
         let Some(content_hash) = object.content_hash.as_deref() else {
             return Ok(object);
         };
@@ -417,23 +414,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let mut cursor = None;
-        loop {
-            let page = backend.receipts_for_version_page(
-                &object.object_id,
-                &object.version,
-                cursor.as_ref(),
-                DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
-            )?;
-            for receipt in page.receipts {
-                if receipt.content_hash.as_deref() == Some(content_hash) {
-                    locations.insert(receipt.replica_node_id);
-                }
+        for receipt in self.backend_receipts_for_version(&object.object_id, &object.version)? {
+            if receipt.content_hash.as_deref() == Some(content_hash) {
+                locations.insert(receipt.replica_node_id);
             }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            cursor = Some(next_cursor);
         }
         object.current_locations = locations.into_iter().collect();
         Ok(object)

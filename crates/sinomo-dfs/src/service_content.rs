@@ -7,6 +7,7 @@
 
 use std::io::Read;
 
+use crate::metadata_pages::walk_metadata_pages;
 use crate::transfer::PendingNetworkedWrite;
 use crate::*;
 
@@ -231,12 +232,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(backend) = self.metadata_backend.as_ref()
             && let Some(expected_hash) = object.content_hash.as_ref()
         {
-            let mut version_cursor = None;
             let mut matching_size_bytes = None;
-            loop {
+            walk_metadata_pages(|cursor| {
                 let page = backend.versions_for_object_page(
                     &object.object_id,
-                    version_cursor.as_ref(),
+                    cursor,
                     DFS_METADATA_OBJECT_VERSION_PAGE_SIZE,
                 )?;
                 for version in page.versions {
@@ -244,11 +244,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         matching_size_bytes = Some(version.size_bytes);
                     }
                 }
-                let Some(next_cursor) = page.next_cursor else {
-                    break;
-                };
-                version_cursor = Some(next_cursor);
-            }
+                Ok(page.next_cursor)
+            })?;
             if let Some(size_bytes) = matching_size_bytes {
                 return Ok(size_bytes);
             }

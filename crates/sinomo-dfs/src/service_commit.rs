@@ -15,6 +15,7 @@ use sinomo_events::EventId;
 use sinomo_node::NodeId;
 use time::OffsetDateTime;
 
+use crate::metadata_pages::walk_metadata_pages;
 use crate::transfer::PendingNetworkedWrite;
 use crate::*;
 
@@ -268,17 +269,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(());
         };
-        let mut intent_cursor = None;
-        loop {
-            let page = backend
-                .intents_for_object_page(
-                    object_id,
-                    intent_cursor.as_ref(),
-                    DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
-                )
-                .map_err(|error| DfsDistributedError::InvalidPolicy {
-                    reason: error.to_string(),
-                })?;
+        let mut pending_intent = None;
+        walk_metadata_pages(|cursor| {
+            let page = backend.intents_for_object_page(
+                object_id,
+                cursor,
+                DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
+            )?;
             for intent in page.intents {
                 if excluding_intent_id == Some(intent.intent_id.as_str()) {
                     continue;
@@ -287,18 +284,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     intent.status,
                     DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
                 ) {
-                    return Err(DfsDistributedError::PendingIntentConflict {
-                        object_id: object_id.clone(),
-                        pending_intent_id: intent.intent_id.clone(),
-                        pending_target_version: intent.target_version.clone(),
-                        requested_target_version: target_version.clone(),
-                    });
+                    pending_intent = Some(intent);
+                    return Ok(None);
                 }
             }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            intent_cursor = Some(next_cursor);
+            Ok(page.next_cursor)
+        })
+        .map_err(|error| DfsDistributedError::InvalidPolicy {
+            reason: error.to_string(),
+        })?;
+        if let Some(intent) = pending_intent {
+            return Err(DfsDistributedError::PendingIntentConflict {
+                object_id: object_id.clone(),
+                pending_intent_id: intent.intent_id,
+                pending_target_version: intent.target_version,
+                requested_target_version: target_version.clone(),
+            });
         }
         Ok(())
     }
@@ -359,39 +360,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self.coordinator.intent(intent_id).is_none() {
             self.coordinator
                 .restore_intent(distributed_intent_from_record(&record))?;
-            if let Some(backend) = self.metadata_backend.as_ref() {
-                let mut receipt_cursor = None;
-                loop {
-                    let page = backend.receipts_for_version_page(
-                        &record.object_id,
-                        &record.target_version,
-                        receipt_cursor.as_ref(),
-                        DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
-                    )?;
-                    for receipt in page.receipts {
-                        if let Some(expected_hash) = record.content_hash.as_deref()
-                            && receipt.content_hash.as_deref() != Some(expected_hash)
-                        {
-                            continue;
-                        }
-                        match self
-                            .coordinator
-                            .restore_durable_receipt(intent_id, receipt.replica_node_id)
-                        {
-                            Ok(()) => {}
-                            Err(
-                                DfsDistributedError::UnexpectedReplica { .. }
-                                | DfsDistributedError::IntentClosed { .. },
-                            ) => continue,
-                            Err(error) => return Err(error.into()),
-                        }
-                    }
-                    let Some(next_cursor) = page.next_cursor else {
-                        break;
-                    };
-                    receipt_cursor = Some(next_cursor);
-                }
-            }
+            self.restore_backend_receipt_pages_for_intent(&record)?;
         }
         let intent =
             self.coordinator
@@ -584,31 +553,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .cloned()
             .collect();
 
-        if let Some(backend) = self.metadata_backend.as_ref() {
+        if self.metadata_backend.is_some() {
             confirmed_locations.clear();
-            let mut receipt_cursor = None;
-            loop {
-                let page = backend.receipts_for_version_page(
-                    &object.object_id,
-                    &object.version,
-                    receipt_cursor.as_ref(),
-                    DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
-                )?;
-                for receipt in page.receipts {
-                    if !required_replica_node_ids.contains(&receipt.replica_node_id) {
+            for receipt in self.backend_receipts_for_version(&object.object_id, &object.version)? {
+                if !required_replica_node_ids.contains(&receipt.replica_node_id) {
+                    continue;
+                }
+                if let Some(expected_hash) = object.content_hash.as_deref() {
+                    if receipt.content_hash.as_deref() != Some(expected_hash) {
                         continue;
                     }
-                    if let Some(expected_hash) = object.content_hash.as_deref() {
-                        if receipt.content_hash.as_deref() != Some(expected_hash) {
-                            continue;
-                        }
-                    }
-                    confirmed_locations.insert(receipt.replica_node_id);
                 }
-                let Some(next_cursor) = page.next_cursor else {
-                    break;
-                };
-                receipt_cursor = Some(next_cursor);
+                confirmed_locations.insert(receipt.replica_node_id);
             }
         }
 
@@ -655,36 +611,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<bool, DfsError> {
         self.ensure_metadata_receipt_accepts(object_id, version, replica_node_id, content_hash)?;
         let object = self.current_read_object_metadata(object_id).ok();
+        let existing_matching_receipt = self
+            .backend_receipt_for_replica(object_id, version, replica_node_id)?
+            .is_some_and(|receipt| receipt.content_hash.as_deref() == Some(content_hash));
         let inserted = {
             let Some(backend) = self.metadata_backend.as_mut() else {
                 return Ok(false);
             };
-            let mut existing_matching_receipt = false;
-            let mut receipt_cursor = None;
-            loop {
-                let page = backend.receipts_for_version_page(
-                    object_id,
-                    version,
-                    receipt_cursor.as_ref(),
-                    DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
-                )?;
-                for receipt in page.receipts {
-                    if receipt.replica_node_id != *replica_node_id {
-                        continue;
-                    }
-                    if receipt.content_hash.as_deref() == Some(content_hash) {
-                        existing_matching_receipt = true;
-                    }
-                    break;
-                }
-                if existing_matching_receipt {
-                    break;
-                }
-                let Some(next_cursor) = page.next_cursor else {
-                    break;
-                };
-                receipt_cursor = Some(next_cursor);
-            }
             if existing_matching_receipt {
                 false
             } else {
@@ -718,37 +651,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replica_node_id: &NodeId,
         content_hash: &str,
     ) -> Result<(), DfsError> {
-        let Some(backend) = self.metadata_backend.as_ref() else {
+        let Some(receipt) =
+            self.backend_receipt_for_replica(object_id, version, replica_node_id)?
+        else {
             return Ok(());
         };
-        let mut receipt_cursor = None;
-        loop {
-            let page = backend.receipts_for_version_page(
-                object_id,
-                version,
-                receipt_cursor.as_ref(),
-                DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
-            )?;
-            for receipt in page.receipts {
-                if receipt.replica_node_id != *replica_node_id {
-                    continue;
-                }
-                if receipt.content_hash.as_deref() == Some(content_hash) {
-                    return Ok(());
-                }
-                return Err(DfsError::Distributed {
-                    message: format!(
-                        "conflicting DFS replica receipt for {object_id} {version} from {replica_node_id}: existing {:?}, new {content_hash}",
-                        receipt.content_hash
-                    ),
-                });
-            }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            receipt_cursor = Some(next_cursor);
+        if receipt.content_hash.as_deref() == Some(content_hash) {
+            return Ok(());
         }
-        Ok(())
+        Err(DfsError::Distributed {
+            message: format!(
+                "conflicting DFS replica receipt for {object_id} {version} from {replica_node_id}: existing {:?}, new {content_hash}",
+                receipt.content_hash
+            ),
+        })
     }
 
     pub(crate) fn put_metadata_intent(

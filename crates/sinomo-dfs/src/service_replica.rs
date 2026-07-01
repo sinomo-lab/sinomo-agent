@@ -380,32 +380,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         if !intent.desired_replica_node_ids.contains(&self.node_id) {
-            let mut has_receipt = false;
-            let mut receipt_cursor = None;
-            loop {
-                let Some(backend) = self.metadata_backend.as_ref() else {
-                    break;
-                };
-                let page = backend.receipts_for_version_page(
-                    object_id,
-                    &intent.target_version,
-                    receipt_cursor.as_ref(),
-                    DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
-                )?;
-                if page
-                    .receipts
-                    .into_iter()
-                    .any(|receipt| receipt.replica_node_id == self.node_id)
-                {
-                    has_receipt = true;
-                    break;
-                }
-                let Some(next_cursor) = page.next_cursor else {
-                    break;
-                };
-                receipt_cursor = Some(next_cursor);
-            }
-            if !has_receipt {
+            if self
+                .backend_receipt_for_replica(object_id, &intent.target_version, &self.node_id)?
+                .is_none()
+            {
                 return Err(DfsError::UnauthorizedReplicaCommand {
                     source_node_id: requester_node_id.clone(),
                     reason: format!(
