@@ -48,11 +48,11 @@ enum PosixBulkReadPlan {
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    pub fn posix_read_file(&self, path: &str) -> Result<Vec<u8>> {
-        let path = self.resolve_existing_posix_path(path, true)?;
-        let object = self
-            .lookup_sifs_path(&path)?
-            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+    fn posix_file_content_object(
+        &self,
+        path: String,
+        object: DfsObjectMetadata,
+    ) -> Result<(String, DfsObjectMetadata)> {
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
         }
@@ -60,6 +60,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }
+        Ok((path, object))
+    }
+
+    fn local_posix_file_content_object(
+        &self,
+        path: &str,
+        follow_final: bool,
+    ) -> Result<(String, DfsObjectMetadata)> {
+        let path = self.resolve_existing_posix_path(path, follow_final)?;
+        let object = self
+            .lookup_sifs_path(&path)?
+            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        self.posix_file_content_object(path, object)
+    }
+
+    fn distributed_posix_file_content_object(
+        &mut self,
+        path: &str,
+        follow_final: bool,
+    ) -> Result<(String, DfsObjectMetadata)> {
+        let (path, object) = self.lookup_sifs_path_distributed_synced(path, follow_final)?;
+        let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        self.posix_file_content_object(path, object)
+    }
+
+    pub fn posix_read_file(&self, path: &str) -> Result<Vec<u8>> {
+        let (path, object) = self.local_posix_file_content_object(path, true)?;
         match self.read_object_metadata_local_content_with_state(&object, false)? {
             NetworkedDfsReadOutcome::Found {
                 data: DfsReadData { bytes, .. },
@@ -80,17 +107,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<Vec<u8>> {
-        let path = self.resolve_existing_posix_path(path, true)?;
-        let object = self
-            .lookup_sifs_path(&path)?
-            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-        if object.kind == DfsObjectKind::Tombstone {
-            return Err(DfsPosixError::NotFound { path });
-        }
-        let object = self.resolve_hardlink_target(&object)?;
-        if object.kind == DfsObjectKind::Directory {
-            return Err(DfsPosixError::IsDirectory { path });
-        }
+        let (path, object) = self.local_posix_file_content_object(path, true)?;
         match self.read_object_metadata_local_range_with_state(&object, offset, max_bytes, false)? {
             NetworkedDfsRangeReadOutcome::Found {
                 data: DfsReadRangeData { bytes, .. },
@@ -106,17 +123,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_open_file_stream(&self, path: &str) -> Result<DfsPosixFileReadStream> {
-        let path = self.resolve_existing_posix_path(path, true)?;
-        let object = self
-            .lookup_sifs_path(&path)?
-            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-        if object.kind == DfsObjectKind::Tombstone {
-            return Err(DfsPosixError::NotFound { path });
-        }
-        let object = self.resolve_hardlink_target(&object)?;
-        if object.kind == DfsObjectKind::Directory {
-            return Err(DfsPosixError::IsDirectory { path });
-        }
+        let (path, object) = self.local_posix_file_content_object(path, true)?;
         match self.open_local_object_metadata_stream_with_state(&object)? {
             NetworkedDfsReadStreamOutcome::Found(stream) => Ok(DfsPosixFileReadStream {
                 object_id: stream.data.object_id,
@@ -139,17 +146,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<DfsPosixFileRangeReadStream> {
-        let path = self.resolve_existing_posix_path(path, true)?;
-        let object = self
-            .lookup_sifs_path(&path)?
-            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-        if object.kind == DfsObjectKind::Tombstone {
-            return Err(DfsPosixError::NotFound { path });
-        }
-        let object = self.resolve_hardlink_target(&object)?;
-        if object.kind == DfsObjectKind::Directory {
-            return Err(DfsPosixError::IsDirectory { path });
-        }
+        let (path, object) = self.local_posix_file_content_object(path, true)?;
         match self
             .open_local_object_metadata_range_stream_with_state(&object, offset, max_bytes, 0)?
         {
@@ -173,16 +170,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_read_file_distributed(&mut self, path: &str) -> Result<Vec<u8>> {
         let trace_started = Instant::now();
         let lookup_started = Instant::now();
-        let (path, object) = self.lookup_sifs_path_distributed_synced(path, true)?;
+        let (path, object) = self.distributed_posix_file_content_object(path, true)?;
         let lookup_elapsed_ms = lookup_started.elapsed().as_millis();
-        let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-        if object.kind == DfsObjectKind::Tombstone {
-            return Err(DfsPosixError::NotFound { path });
-        }
-        let object = self.resolve_hardlink_target(&object)?;
-        if object.kind == DfsObjectKind::Directory {
-            return Err(DfsPosixError::IsDirectory { path });
-        }
         let fetch_started = Instant::now();
         let outcome = self.read_object_metadata_or_fetch_remote_without_cache(&object)?;
         let fetch_elapsed_ms = fetch_started.elapsed().as_millis();
@@ -338,15 +327,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         input_path: &str,
         index: usize,
     ) -> Result<PosixBulkReadPlan> {
-        let (path, object) = self.lookup_sifs_path_distributed_synced(input_path, true)?;
-        let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-        if object.kind == DfsObjectKind::Tombstone {
-            return Err(DfsPosixError::NotFound { path });
-        }
-        let object = self.resolve_hardlink_target(&object)?;
-        if object.kind == DfsObjectKind::Directory {
-            return Err(DfsPosixError::IsDirectory { path });
-        }
+        let (path, object) = self.distributed_posix_file_content_object(input_path, true)?;
         match self.read_object_metadata_local_if_current_location(&object)? {
             NetworkedDfsReadOutcome::Found {
                 data: DfsReadData { bytes, .. },
@@ -524,15 +505,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_read_file_update_access(&mut self, path: &str) -> Result<Vec<u8>> {
-        let (path, object) = self.lookup_sifs_path_distributed_synced(path, true)?;
-        let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-        if object.kind == DfsObjectKind::Tombstone {
-            return Err(DfsPosixError::NotFound { path });
-        }
-        let object = self.resolve_hardlink_target(&object)?;
-        if object.kind == DfsObjectKind::Directory {
-            return Err(DfsPosixError::IsDirectory { path });
-        }
+        let (path, object) = self.distributed_posix_file_content_object(path, true)?;
         match self.read_object_metadata_or_fetch_remote_without_cache(&object)? {
             NetworkedDfsReadOutcome::Found {
                 data: DfsReadData { bytes, .. },
@@ -541,10 +514,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let mut object = self
                     .object_by_id(&object.object_id)?
                     .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-                object = self.resolve_hardlink_target(&object)?;
-                if object.kind == DfsObjectKind::Directory {
-                    return Err(DfsPosixError::IsDirectory { path });
-                }
+                (_, object) = self.posix_file_content_object(path.clone(), object)?;
                 // Only the metadata authority may journal the atime update;
                 // appending it on a replica would fork the replica's journal
                 // from the shard primary's stream (noatime-style degradation
@@ -779,17 +749,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         follow_final: bool,
     ) -> Result<Vec<NodeId>> {
-        let path = self.resolve_existing_posix_path(path, follow_final)?;
-        let object = self
-            .lookup_sifs_path(&path)?
-            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-        if object.kind == DfsObjectKind::Tombstone {
-            return Err(DfsPosixError::NotFound { path });
-        }
-        let object = self.resolve_hardlink_target(&object)?;
-        if object.kind == DfsObjectKind::Directory {
-            return Err(DfsPosixError::IsDirectory { path });
-        }
+        let (path, object) = self.local_posix_file_content_object(path, follow_final)?;
         match self.read_object_metadata_local_content_with_state(&object, false)? {
             NetworkedDfsReadOutcome::Found { .. } => Ok(Vec::new()),
             NetworkedDfsReadOutcome::PendingReplication { .. } => self
