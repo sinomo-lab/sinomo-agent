@@ -46,10 +46,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sui::{
     Alignment, ArrangeCtx, Color, Constraints, DefaultTheme, Event, EventCtx, Flex, FlexItem,
     FontWeight, IconButton, IconGlyph, Insets, KeyState, Label, ListItem, ListView, MeasureCtx,
-    PaintCtx, Point, PointerButton, PointerEventKind, Rect, ScrollDelta, ScrollState, ScrollView,
-    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator, Size, SizedBox, Stack,
-    StackHostOptions, Surface, SurfaceBorder, SurfaceRole, TextArea, TextInput, Widget, WidgetPod,
-    WidgetPodMutVisitor, WidgetPodVisitor, draw_glyph,
+    PaintCtx, Point, PointerButton, PointerEventKind, Rect, ScrollBar, ScrollDelta, ScrollState,
+    ScrollView, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator, Size,
+    SizedBox, Stack, StackHostOptions, Surface, SurfaceBorder, SurfaceRole, TextArea, TextInput,
+    Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, draw_glyph,
 };
 
 use sinomo_agent::{
@@ -78,7 +78,6 @@ const WIDE_THRESHOLD: f32 = 620.0;
 const SIDEBAR_W: f32 = 250.0;
 const MEDIA_CALL_H: f32 = 156.0;
 const MEDIA_CALL_COMPACT_H: f32 = 46.0;
-const COMPOSER_H: f32 = 260.0;
 const PAD: f32 = 16.0;
 const SIDEBAR_ROW_H: f32 = 36.0;
 const SIDEBAR_ROW_EDIT_W: f32 = 26.0;
@@ -99,6 +98,9 @@ const COMPOSER_DEFAULT_ACTION_W: f32 = SEND_BUTTON_SIZE * 2.0 + 6.0;
 const COMPOSER_REUSE_ACTION_W: f32 = 166.0;
 const COMPOSER_TEXT_SIZE: f32 = 13.5;
 const COMPOSER_LINE_HEIGHT: f32 = 19.0;
+const COMPOSER_INPUT_MIN_LINES: usize = 2;
+const COMPOSER_INPUT_MAX_H: f32 = 400.0;
+const COMPOSER_INPUT_PAD_Y: f32 = 18.0;
 const SESSION_LIST_UI_TIMEOUT: Duration = Duration::from_secs(8);
 const TRANSCRIPT_LOAD_UI_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -4994,6 +4996,7 @@ fn context_overview_summary(chat: &ChatState) -> String {
     }
 }
 
+#[cfg(test)]
 fn runtime_overview_title(chat: &ChatState) -> String {
     if let Some(provider) = chat.current_provider() {
         let model = chat.current_model();
@@ -10221,7 +10224,16 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 }
 
 fn model_button_label(chat: &ChatState) -> String {
-    runtime_overview_title(chat)
+    let model = chat.current_model();
+    if !model.is_empty() {
+        return compact_line(&model, 26);
+    }
+
+    if let Some(provider) = chat.current_provider() {
+        return format!("{} model", compact_line(&provider.name, 18));
+    }
+
+    "Model".to_string()
 }
 
 fn attachment_button_label(chat: &ChatState) -> String {
@@ -10578,10 +10590,10 @@ fn composer_attachments_inline_for_width(chat: &ChatState, width: f32) -> bool {
     if !(1..=2).contains(&count) {
         return false;
     }
-    let required = 188.0
+    let required = 132.0
         + composer_attachment_inline_width(count)
-        + 98.0
-        + 78.0
+        + 82.0
+        + 64.0
         + 96.0
         + CONTROL_ROW_GAP * 4.0;
     width >= required
@@ -10835,6 +10847,10 @@ fn composer_actions(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     }
 }
 
+fn composer_input_min_height() -> f32 {
+    COMPOSER_LINE_HEIGHT * COMPOSER_INPUT_MIN_LINES as f32 + COMPOSER_INPUT_PAD_Y
+}
+
 fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let input = {
         let s = shared.clone();
@@ -10848,6 +10864,7 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         let mut input = TextArea::new("chat-input")
             .value(draft)
             .placeholder(placeholder)
+            .min_height(composer_input_min_height())
             .padding(Insets {
                 left: 12.0,
                 top: 8.0,
@@ -10871,7 +10888,20 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         } else {
             input = input.read_only();
         }
-        input
+        let scroll_state = ScrollState::new();
+        ComposerInputScroll::new(
+            WidgetPod::new(
+                ScrollView::vertical(input)
+                    .name("chat-input-scroll")
+                    .state(scroll_state.clone()),
+            ),
+            WidgetPod::new(
+                ScrollBar::vertical(scroll_state)
+                    .name("chat-input-scrollbar")
+                    .width(8.0)
+                    .theme(reader()),
+            ),
+        )
     };
 
     let action = {
@@ -10900,15 +10930,7 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     WidgetPod::new(row)
 }
 
-fn composer_layout_signature(shared: &Shared) -> Option<ComposerPopup> {
-    shared.chat().composer_popup()
-}
-
-fn composer_body(
-    shared: &Shared,
-    reader: &ThemeReader,
-    active_popup: Option<ComposerPopup>,
-) -> WidgetPod {
+fn composer_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     // The input row is rebuilt when the streaming flag flips (Send <-> Interrupt), when provider
     // availability changes (editable composer <-> setup-required read-only state), and when a
     // programmatic quick action replaces the draft. Normal typing does not bump the revision, so the
@@ -10944,61 +10966,22 @@ fn composer_body(
         )
     };
 
-    let popup_h = if active_popup.is_some() {
-        COMPOSER_POPUP_H + COMPOSER_SECTION_GAP
-    } else {
-        0.0
-    };
-    let input_h =
-        (COMPOSER_H - (COMPOSER_PAD_Y * 2.0) - popup_h - CONTROL_ROW_H - COMPOSER_SECTION_GAP)
-            .max(48.0);
-    let mut body = Stack::vertical()
-        .spacing(0.0)
-        .alignment(Alignment::Stretch)
-        .with_child(SizedBox::new().height(COMPOSER_PAD_Y));
-    if active_popup.is_some() {
-        body = body
-            .with_child(
-                SizedBox::new()
-                    .height(COMPOSER_POPUP_H)
-                    .with_child(InsetX::new(composer_popup_host(shared, reader), PAD)),
-            )
-            .with_child(SizedBox::new().height(COMPOSER_SECTION_GAP));
-    }
-    body = body
-        .with_child(
-            SizedBox::new()
-                .height(CONTROL_ROW_H)
-                .with_child(InsetX::new(controls_host, PAD)),
-        )
-        .with_child(SizedBox::new().height(COMPOSER_SECTION_GAP))
-        .with_child(
-            SizedBox::new()
-                .height(input_h)
-                .with_child(InsetX::new(input_host, PAD)),
-        )
-        .with_child(SizedBox::new().height(COMPOSER_PAD_Y));
+    let body = ComposerPanel::new(
+        shared.clone(),
+        WidgetPod::new(composer_popup_host(shared, reader)),
+        WidgetPod::new(controls_host),
+        WidgetPod::new(input_host),
+    );
 
-    WidgetPod::new(
-        Surface::new(SurfaceRole::Titlebar, body)
-            .border(SurfaceBorder::Top)
-            .fill()
-            .theme_when(clone_reader(reader)),
-    )
+    Surface::new(SurfaceRole::Titlebar, body)
+        .border(SurfaceBorder::Top)
+        .fill_width()
+        .theme_when(clone_reader(reader))
 }
 
-/// The full composer: a titlebar-surfaced panel with the selector row above the input row. Wrapped
-/// so the selector row rebuilds when the option lists change. A fixed `COMPOSER_H` tall.
+/// The full composer: a bottom-anchored panel with popups opening above the controls.
 fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || composer_layout_signature(&s)
-        },
-        move |show_scenario_actions| composer_body(&s, &r, *show_scenario_actions),
-    )
+    composer_body(shared, reader)
 }
 
 // ---------------------------------------------------------------------------
@@ -11037,7 +11020,88 @@ fn main_column(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             },
         )
     };
-    widgets::Dock::new(transcript).bottom(COMPOSER_H, composer(shared, reader))
+    MeasuredBottomDock::new(
+        WidgetPod::new(transcript),
+        WidgetPod::new(composer(shared, reader)),
+    )
+}
+
+struct MeasuredBottomDock {
+    body: WidgetPod,
+    bottom: WidgetPod,
+}
+
+impl MeasuredBottomDock {
+    fn new(body: WidgetPod, bottom: WidgetPod) -> Self {
+        Self { body, bottom }
+    }
+}
+
+impl Widget for MeasuredBottomDock {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let width = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            constraints.min.width.max(640.0)
+        };
+        let height = if constraints.max.height.is_finite() {
+            constraints.max.height
+        } else {
+            constraints.min.height.max(640.0)
+        };
+        let bottom_size = self.bottom.measure(
+            ctx,
+            Constraints::new(Size::new(width, 0.0), Size::new(width, height)),
+        );
+        let bottom_h = bottom_size.height.min(height).max(0.0);
+        let body_h = (height - bottom_h).max(0.0);
+        self.body
+            .measure(ctx, Constraints::tight(Size::new(width, body_h)));
+        constraints.clamp(Size::new(width, body_h + bottom_h))
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let bottom_h = self
+            .bottom
+            .measured_size()
+            .height
+            .min(bounds.height())
+            .max(0.0);
+        let body_h = (bounds.height() - bottom_h).max(0.0);
+        self.body.arrange(
+            ctx,
+            Rect::new(bounds.x(), bounds.y(), bounds.width(), body_h),
+        );
+        self.bottom.arrange(
+            ctx,
+            Rect::new(
+                bounds.x(),
+                bounds.max_y() - bottom_h,
+                bounds.width(),
+                bottom_h,
+            ),
+        );
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.body.paint(ctx);
+        self.bottom.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.body.semantics(ctx);
+        self.bottom.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.body);
+        visitor.visit(&self.bottom);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.body);
+        visitor.visit(&mut self.bottom);
+    }
 }
 
 fn chat_work_area(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -11448,6 +11512,228 @@ impl<K: PartialEq + Clone + 'static> Widget for RebuildOnChange<K> {
     }
 }
 
+struct ComposerPanel {
+    shared: Shared,
+    popup: WidgetPod,
+    controls: WidgetPod,
+    input: WidgetPod,
+}
+
+impl ComposerPanel {
+    fn new(shared: Shared, popup: WidgetPod, controls: WidgetPod, input: WidgetPod) -> Self {
+        Self {
+            shared,
+            popup,
+            controls,
+            input,
+        }
+    }
+
+    fn popup_visible(&self) -> bool {
+        self.shared.chat().composer_popup().is_some()
+    }
+
+    fn popup_block_h(&self) -> f32 {
+        if self.popup_visible() {
+            COMPOSER_POPUP_H + COMPOSER_SECTION_GAP
+        } else {
+            0.0
+        }
+    }
+
+    fn content_rect(bounds: Rect, y: f32, height: f32) -> Rect {
+        Rect::new(
+            bounds.x() + PAD,
+            y,
+            (bounds.width() - PAD * 2.0).max(0.0),
+            height.max(0.0),
+        )
+    }
+}
+
+impl Widget for ComposerPanel {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let width = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            constraints.min.width.max(420.0)
+        };
+        let max_height = if constraints.max.height.is_finite() {
+            constraints.max.height
+        } else {
+            f32::INFINITY
+        };
+        let content_w = (width - PAD * 2.0).max(0.0);
+        let popup_block_h = self.popup_block_h();
+        let fixed_h = COMPOSER_PAD_Y * 2.0 + popup_block_h + CONTROL_ROW_H + COMPOSER_SECTION_GAP;
+        let input_max_h = if max_height.is_finite() {
+            (max_height - fixed_h).max(0.0)
+        } else {
+            COMPOSER_INPUT_MAX_H
+        };
+
+        if self.popup_visible() {
+            self.popup.measure(
+                ctx,
+                Constraints::tight(Size::new(content_w, COMPOSER_POPUP_H)),
+            );
+        } else {
+            self.popup
+                .measure(ctx, Constraints::tight(Size::new(content_w, 0.0)));
+        }
+        self.controls
+            .measure(ctx, Constraints::tight(Size::new(content_w, CONTROL_ROW_H)));
+
+        let natural_input = self.input.measure(
+            ctx,
+            Constraints::new(
+                Size::new(content_w, 0.0),
+                Size::new(content_w, f32::INFINITY),
+            ),
+        );
+        let input_h = natural_input
+            .height
+            .max(composer_input_min_height())
+            .min(COMPOSER_INPUT_MAX_H)
+            .min(input_max_h);
+        self.input
+            .measure(ctx, Constraints::tight(Size::new(content_w, input_h)));
+
+        constraints.clamp(Size::new(width, fixed_h + input_h))
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let input_h = self
+            .input
+            .measured_size()
+            .height
+            .min(bounds.height())
+            .max(0.0);
+        let input_y = bounds.max_y() - COMPOSER_PAD_Y - input_h;
+        let controls_y = input_y - COMPOSER_SECTION_GAP - CONTROL_ROW_H;
+        let popup_y = controls_y - COMPOSER_SECTION_GAP - COMPOSER_POPUP_H;
+
+        if self.popup_visible() {
+            self.popup
+                .arrange(ctx, Self::content_rect(bounds, popup_y, COMPOSER_POPUP_H));
+        } else {
+            self.popup
+                .arrange(ctx, Self::content_rect(bounds, controls_y, 0.0));
+        }
+        self.controls
+            .arrange(ctx, Self::content_rect(bounds, controls_y, CONTROL_ROW_H));
+        self.input
+            .arrange(ctx, Self::content_rect(bounds, input_y, input_h));
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        if self.popup_visible() {
+            self.popup.paint(ctx);
+        }
+        self.controls.paint(ctx);
+        self.input.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        if self.popup_visible() {
+            self.popup.semantics(ctx);
+        }
+        self.controls.semantics(ctx);
+        self.input.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.popup);
+        visitor.visit(&self.controls);
+        visitor.visit(&self.input);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.popup);
+        visitor.visit(&mut self.controls);
+        visitor.visit(&mut self.input);
+    }
+}
+
+struct ComposerInputScroll {
+    scroll: WidgetPod,
+    bar: WidgetPod,
+}
+
+impl ComposerInputScroll {
+    const BAR_W: f32 = 8.0;
+
+    fn new(scroll: WidgetPod, bar: WidgetPod) -> Self {
+        Self { scroll, bar }
+    }
+}
+
+impl Widget for ComposerInputScroll {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let width = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            constraints.min.width.max(320.0)
+        };
+        if !constraints.max.height.is_finite() {
+            let natural = self.scroll.measure(
+                ctx,
+                Constraints::new(Size::new(width, 0.0), Size::new(width, f32::INFINITY)),
+            );
+            let height = natural
+                .height
+                .max(composer_input_min_height())
+                .max(constraints.min.height);
+            self.bar.measure(
+                ctx,
+                Constraints::tight(Size::new(Self::BAR_W.min(width), height)),
+            );
+            return constraints.clamp(Size::new(width, height));
+        }
+        let height = if constraints.max.height.is_finite() {
+            constraints.max.height
+        } else {
+            constraints.min.height.max(composer_input_min_height())
+        };
+        let size = constraints.clamp(Size::new(width, height));
+        self.scroll.measure(ctx, Constraints::tight(size));
+        self.bar.measure(
+            ctx,
+            Constraints::tight(Size::new(Self::BAR_W.min(size.width), size.height)),
+        );
+        size
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.scroll.arrange(ctx, bounds);
+        let bar_w = Self::BAR_W.min(bounds.width()).max(0.0);
+        self.bar.arrange(
+            ctx,
+            Rect::new(bounds.max_x() - bar_w, bounds.y(), bar_w, bounds.height()),
+        );
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.scroll.paint(ctx);
+        self.bar.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.scroll.semantics(ctx);
+        self.bar.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.scroll);
+        visitor.visit(&self.bar);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.scroll);
+        visitor.visit(&mut self.bar);
+    }
+}
+
 struct ResponsiveComposerControlRow {
     shared: Shared,
     reader: ThemeReader,
@@ -11569,11 +11855,11 @@ impl ComposerControlStrip {
         let total = total.max(0.0);
         let compact = total < 640.0;
         let mut gap = if compact { 6.0 } else { CONTROL_ROW_GAP };
-        let mut model = if compact { 160.0 } else { 188.0 };
+        let mut model = if compact { 112.0 } else { 132.0 };
         let mut attachments = self.attachment_width;
-        let mut activity = if compact { 88.0 } else { 98.0 };
-        let mut call = if compact { 70.0 } else { 78.0 };
-        let preferred_context = if compact { 72.0 } else { 96.0 };
+        let mut activity = if compact { 72.0 } else { 82.0 };
+        let mut call = if compact { 56.0 } else { 64.0 };
+        let preferred_context = if compact { 72.0 } else { 104.0 };
         let attachment_floor = if self.inline_attachments {
             CONTROL_ROW_H
         } else {
@@ -11584,10 +11870,10 @@ impl ComposerControlStrip {
         let mut context = (total - fixed).max(0.0);
         if context < preferred_context {
             let mut deficit = preferred_context - context;
-            Self::shrink_width(&mut model, 136.0, &mut deficit);
+            Self::shrink_width(&mut model, 92.0, &mut deficit);
             Self::shrink_width(&mut attachments, attachment_floor, &mut deficit);
-            Self::shrink_width(&mut activity, 76.0, &mut deficit);
-            Self::shrink_width(&mut call, 60.0, &mut deficit);
+            Self::shrink_width(&mut activity, 54.0, &mut deficit);
+            Self::shrink_width(&mut call, 46.0, &mut deficit);
             let mut gap_total = gap * 4.0;
             Self::shrink_width(&mut gap_total, 16.0, &mut deficit);
             gap = gap_total / 4.0;
@@ -11597,9 +11883,9 @@ impl ComposerControlStrip {
         let mut overflow =
             (model + context + attachments + activity + call + gap * 4.0 - total).max(0.0);
         Self::shrink_width(&mut context, 0.0, &mut overflow);
-        Self::shrink_width(&mut model, 96.0, &mut overflow);
+        Self::shrink_width(&mut model, 76.0, &mut overflow);
         Self::shrink_width(&mut attachments, 42.0, &mut overflow);
-        Self::shrink_width(&mut activity, 52.0, &mut overflow);
+        Self::shrink_width(&mut activity, 44.0, &mut overflow);
         Self::shrink_width(&mut call, 42.0, &mut overflow);
         let mut gap_total = gap * 4.0;
         Self::shrink_width(&mut gap_total, 0.0, &mut overflow);
@@ -11754,6 +12040,27 @@ impl Widget for ComposerInputRow {
         } else {
             constraints.min.width.max(320.0)
         };
+        if !constraints.max.height.is_finite() {
+            let provisional_h = constraints.min.height.max(self.action_side);
+            let bounds = Rect::new(0.0, 0.0, width, provisional_h);
+            let (input, action) = self.layout_rects(bounds);
+            let input_size = self.input.measure(
+                ctx,
+                Constraints::new(
+                    Size::new(input.width(), 0.0),
+                    Size::new(input.width(), f32::INFINITY),
+                ),
+            );
+            self.action.measure(
+                ctx,
+                Constraints::tight(Size::new(action.width(), self.action_side)),
+            );
+            let height = input_size
+                .height
+                .max(self.action_side)
+                .max(constraints.min.height);
+            return constraints.clamp(Size::new(width, height));
+        }
         let height = if constraints.max.height.is_finite() {
             constraints.max.height
         } else {
@@ -14019,14 +14326,48 @@ mod tests {
             );
         }
 
+        let button_y = |name: &str| -> sui::Result<f32> {
+            let snapshot = window.snapshot()?;
+            let node = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == SemanticsRole::Button && node.name.as_deref() == Some(name)
+                })
+                .expect("button semantics");
+            Ok(node.bounds.y())
+        };
+        let model_button_y = button_y("gpt-5")?;
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("OpenAI / gpt-5")
+            .with_name("gpt-5")
             .click()?;
         assert_eq!(
             window.get_by_text("Model selector").count()?,
             1,
             "model button should open the model selector popup"
+        );
+        let popup_title_bounds = {
+            let snapshot = window.snapshot()?;
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == SemanticsRole::Text
+                        && node.name.as_deref() == Some("Model selector")
+                })
+                .expect("model popup title semantics")
+                .bounds
+        };
+        assert!(
+            popup_title_bounds.y() < model_button_y,
+            "model selector popup should open above the control row"
+        );
+        assert!(
+            (button_y("gpt-5")? - model_button_y).abs() < 0.5,
+            "opening the model popup should not move the control row"
         );
 
         window
@@ -14042,6 +14383,97 @@ mod tests {
             1,
             "context bar should open context details"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_composer_input_autogrows_and_caps_with_scrollbar() -> sui::Result<()> {
+        let short_shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut chat = short_shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+        }
+        let short_runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Composer short input")
+                    .root(view(short_shared.clone())),
+            )
+            .build()?;
+        let short_app = sui_testing::TestApp::from_runtime(short_runtime)?;
+        let short_window = short_app.main_window()?;
+        let short_snapshot = short_window.snapshot()?;
+        let short_input = short_snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::ScrollView
+                    && node.name.as_deref() == Some("chat-input-scroll")
+            })
+            .expect("short input scroll semantics");
+        assert!(
+            (54.0..=64.0).contains(&short_input.bounds.height()),
+            "empty composer should default to about two text lines: {:?}",
+            short_input.bounds
+        );
+
+        let long_shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut chat = long_shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+            let long_draft = (0..48)
+                .map(|index| format!("line {index:02} with enough text to wrap naturally"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            chat.set_draft(long_draft);
+        }
+        let long_runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Composer long input")
+                    .root(view(long_shared.clone())),
+            )
+            .build()?;
+        let long_app = sui_testing::TestApp::from_runtime(long_runtime)?;
+        let long_window = long_app.main_window()?;
+        let long_snapshot = long_window.snapshot()?;
+        let long_input = long_snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::ScrollView
+                    && node.name.as_deref() == Some("chat-input-scroll")
+            })
+            .expect("long input scroll semantics");
+        assert!(
+            (COMPOSER_INPUT_MAX_H - 1.0..=COMPOSER_INPUT_MAX_H + 1.0)
+                .contains(&long_input.bounds.height()),
+            "long composer should cap at {COMPOSER_INPUT_MAX_H}px: {:?}",
+            long_input.bounds
+        );
+        let scrollbar = long_snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Slider
+                    && node.name.as_deref() == Some("chat-input-scrollbar")
+            })
+            .expect("input scrollbar semantics");
+        match &scrollbar.value {
+            Some(sui::SemanticsValue::Range { max, .. }) => {
+                assert!(
+                    *max > 0.0,
+                    "capped composer input should expose a scrollable overflow range"
+                );
+            }
+            other => panic!("input scrollbar should expose range semantics, got {other:?}"),
+        }
 
         Ok(())
     }
