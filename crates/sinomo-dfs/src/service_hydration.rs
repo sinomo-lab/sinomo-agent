@@ -10,6 +10,8 @@ use sinomo_core::DfsWriteReceipt;
 use sinomo_events::EventId;
 use time::OffsetDateTime;
 
+use crate::metadata_pages::{collect_metadata_pages, walk_metadata_pages};
+use crate::metadata_receipt::receipt_for_replica_from_backend;
 use crate::transfer::PendingNetworkedWrite;
 use crate::*;
 
@@ -20,10 +22,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(());
         };
         let mut locks = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = backend
-                .list_namespace_jobs_page(cursor.as_ref(), DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE)?;
+        walk_metadata_pages(|cursor| {
+            let page =
+                backend.list_namespace_jobs_page(cursor, DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE)?;
             for job in page.jobs {
                 if job.status == DfsNamespaceJobStatus::Running
                     && matches!(
@@ -36,11 +37,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     locks.push((job.file_system_id.clone(), job.root_path.clone()));
                 }
             }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            cursor = Some(next_cursor);
-        }
+            Ok(page.next_cursor)
+        })?;
         for (file_system_id, path) in locks {
             self.lock_cross_shard_namespace_path(&file_system_id, &path);
         }
@@ -293,47 +291,83 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    fn backend_receipts_for_version(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+    ) -> Result<Vec<DfsReplicaReceiptRecord>, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let receipts = collect_metadata_pages(|cursor| {
+            let page = backend.receipts_for_version_page(
+                object_id,
+                version,
+                cursor,
+                DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
+            )?;
+            Ok((page.receipts, page.next_cursor))
+        })?;
+        Ok(receipts)
+    }
+
+    fn backend_intent_ids_for_version(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+    ) -> Result<Vec<String>, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let intents = collect_metadata_pages(|cursor| {
+            let page = backend.intents_for_object_version_page(
+                object_id,
+                version,
+                cursor,
+                DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
+            )?;
+            Ok((page.intents, page.next_cursor))
+        })?;
+        Ok(intents.into_iter().map(|intent| intent.intent_id).collect())
+    }
+
+    fn restore_backend_durable_receipt(
+        &mut self,
+        intent_id: &str,
+        replica_node_id: NodeId,
+        allow_unknown_intent: bool,
+    ) -> Result<(), DfsError> {
+        match self
+            .coordinator
+            .restore_durable_receipt(intent_id, replica_node_id)
+        {
+            Ok(()) => Ok(()),
+            Err(DfsDistributedError::UnknownIntent { .. }) if allow_unknown_intent => Ok(()),
+            Err(
+                DfsDistributedError::UnexpectedReplica { .. }
+                | DfsDistributedError::IntentClosed { .. },
+            ) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub(crate) fn restore_backend_receipt_pages_for_intent(
         &mut self,
         intent_record: &DfsWriteIntentRecord,
     ) -> Result<(), DfsError> {
-        if self.metadata_backend.is_none() {
-            return Ok(());
-        }
-        let mut receipt_cursor = None;
-        loop {
-            let receipt_page = self
-                .metadata_backend
-                .as_ref()
-                .expect("metadata backend checked above")
-                .receipts_for_version_page(
-                    &intent_record.object_id,
-                    &intent_record.target_version,
-                    receipt_cursor.as_ref(),
-                    DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
-                )?;
-            for receipt in receipt_page.receipts {
-                if let Some(expected_hash) = intent_record.content_hash.as_deref()
-                    && receipt.content_hash.as_deref() != Some(expected_hash)
-                {
-                    continue;
-                }
-                match self
-                    .coordinator
-                    .restore_durable_receipt(&intent_record.intent_id, receipt.replica_node_id)
-                {
-                    Ok(()) => {}
-                    Err(
-                        DfsDistributedError::UnexpectedReplica { .. }
-                        | DfsDistributedError::IntentClosed { .. },
-                    ) => continue,
-                    Err(error) => return Err(error.into()),
-                }
+        for receipt in self
+            .backend_receipts_for_version(&intent_record.object_id, &intent_record.target_version)?
+        {
+            if let Some(expected_hash) = intent_record.content_hash.as_deref()
+                && receipt.content_hash.as_deref() != Some(expected_hash)
+            {
+                continue;
             }
-            let Some(next_cursor) = receipt_page.next_cursor else {
-                break;
-            };
-            receipt_cursor = Some(next_cursor);
+            self.restore_backend_durable_receipt(
+                &intent_record.intent_id,
+                receipt.replica_node_id,
+                false,
+            )?;
         }
         Ok(())
     }
@@ -423,37 +457,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
 
         let mut existing_receipts = BTreeSet::new();
-        if let Some(backend) = self.metadata_backend.as_ref() {
-            let mut receipt_cursor = None;
-            loop {
-                let page = backend.receipts_for_version_page(
-                    &object.object_id,
-                    &object.version,
-                    receipt_cursor.as_ref(),
-                    DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
-                )?;
-                for receipt in page.receipts {
-                    if receipt.content_hash.as_deref() != Some(content_hash) {
-                        continue;
-                    }
-                    existing_receipts.insert(receipt.replica_node_id.clone());
-                    match self
-                        .coordinator
-                        .restore_durable_receipt(&intent_record.intent_id, receipt.replica_node_id)
-                    {
-                        Ok(()) => {}
-                        Err(
-                            DfsDistributedError::UnexpectedReplica { .. }
-                            | DfsDistributedError::IntentClosed { .. },
-                        ) => {}
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-                let Some(next_cursor) = page.next_cursor else {
-                    break;
-                };
-                receipt_cursor = Some(next_cursor);
+        for receipt in self.backend_receipts_for_version(&object.object_id, &object.version)? {
+            if receipt.content_hash.as_deref() != Some(content_hash) {
+                continue;
             }
+            existing_receipts.insert(receipt.replica_node_id.clone());
+            self.restore_backend_durable_receipt(
+                &intent_record.intent_id,
+                receipt.replica_node_id,
+                false,
+            )?;
         }
 
         let owner_node_id = object.owner_node_id.clone();
@@ -485,17 +498,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 existing_receipts.insert(replica_node_id.clone());
             }
             if existing_receipts.contains(&replica_node_id) {
-                match self
-                    .coordinator
-                    .restore_durable_receipt(&intent_record.intent_id, replica_node_id)
-                {
-                    Ok(()) => {}
-                    Err(
-                        DfsDistributedError::UnexpectedReplica { .. }
-                        | DfsDistributedError::IntentClosed { .. },
-                    ) => {}
-                    Err(error) => return Err(error.into()),
-                }
+                self.restore_backend_durable_receipt(
+                    &intent_record.intent_id,
+                    replica_node_id,
+                    false,
+                )?;
             }
         }
         Ok(())
@@ -789,24 +796,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(None);
         };
-        let mut cursor = None;
-        loop {
-            let page = backend.receipts_for_version_page(
-                object_id,
-                version,
-                cursor.as_ref(),
-                DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
-            )?;
-            for receipt in page.receipts {
-                if receipt.replica_node_id == *replica_node_id {
-                    return Ok(Some(receipt));
-                }
-            }
-            let Some(next_cursor) = page.next_cursor else {
-                return Ok(None);
-            };
-            cursor = Some(next_cursor);
-        }
+        Ok(receipt_for_replica_from_backend(
+            backend.as_ref(),
+            object_id,
+            version,
+            replica_node_id,
+            DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
+        )?)
     }
 
     fn restore_backend_receipts_for_visible_version(
@@ -814,32 +810,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object_id: &DfsObjectId,
         version: &DfsVersion,
     ) -> Result<(), DfsError> {
-        if self.metadata_backend.is_none() {
-            return Ok(());
-        }
-        let mut cursor = None;
-        loop {
-            let page = self
-                .metadata_backend
-                .as_ref()
-                .expect("metadata backend checked above")
-                .receipts_for_version_page(
-                    object_id,
-                    version,
-                    cursor.as_ref(),
-                    DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
-                )?;
-            for receipt in page.receipts {
-                self.apply_metadata_receipt_to_service_state(
-                    object_id,
-                    version,
-                    &receipt.replica_node_id,
-                )?;
-            }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            cursor = Some(next_cursor);
+        for receipt in self.backend_receipts_for_version(object_id, version)? {
+            self.apply_metadata_receipt_to_service_state(
+                object_id,
+                version,
+                &receipt.replica_node_id,
+            )?;
         }
         Ok(())
     }
@@ -1044,36 +1020,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         version: &DfsVersion,
         replica_node_id: &NodeId,
     ) -> Result<(), DfsError> {
-        let mut intent_ids = Vec::new();
-        if let Some(backend) = self.metadata_backend.as_ref() {
-            let mut intent_cursor = None;
-            loop {
-                let page = backend.intents_for_object_version_page(
-                    object_id,
-                    version,
-                    intent_cursor.as_ref(),
-                    DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
-                )?;
-                intent_ids.extend(page.intents.into_iter().map(|intent| intent.intent_id));
-                let Some(next_cursor) = page.next_cursor else {
-                    break;
-                };
-                intent_cursor = Some(next_cursor);
-            }
-        }
+        let intent_ids = self.backend_intent_ids_for_version(object_id, version)?;
         for intent_id in intent_ids {
-            match self
-                .coordinator
-                .restore_durable_receipt(&intent_id, replica_node_id.clone())
-            {
-                Ok(()) => {}
-                Err(
-                    DfsDistributedError::UnknownIntent { .. }
-                    | DfsDistributedError::UnexpectedReplica { .. }
-                    | DfsDistributedError::IntentClosed { .. },
-                ) => {}
-                Err(error) => return Err(error.into()),
-            }
+            self.restore_backend_durable_receipt(&intent_id, replica_node_id.clone(), true)?;
         }
         Ok(())
     }

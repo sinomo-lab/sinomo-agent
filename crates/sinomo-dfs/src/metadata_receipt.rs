@@ -4,6 +4,7 @@ use sinomo_node::NodeId;
 
 use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_error::Result;
+use crate::metadata_pages::walk_metadata_pages;
 use crate::metadata_records::DfsReplicaReceiptRecord;
 use crate::{DfsObjectId, DfsVersion};
 
@@ -14,22 +15,20 @@ pub(crate) fn receipt_for_replica_from_backend<B: DfsMetadataBackend + ?Sized>(
     replica_node_id: &NodeId,
     page_size: usize,
 ) -> Result<Option<DfsReplicaReceiptRecord>> {
-    let mut cursor = None;
-    loop {
-        let page =
-            backend.receipts_for_version_page(object_id, version, cursor.as_ref(), page_size)?;
+    let mut found = None;
+    walk_metadata_pages(|cursor| {
+        let page = backend.receipts_for_version_page(object_id, version, cursor, page_size)?;
         if let Some(receipt) = page
             .receipts
             .into_iter()
             .find(|receipt| &receipt.replica_node_id == replica_node_id)
         {
-            return Ok(Some(receipt));
-        }
-        let Some(next_cursor) = page.next_cursor else {
+            found = Some(receipt);
             return Ok(None);
-        };
-        cursor = Some(next_cursor);
-    }
+        }
+        Ok(page.next_cursor)
+    })?;
+    Ok(found)
 }
 
 pub(crate) fn replay_receipt_matches_existing(

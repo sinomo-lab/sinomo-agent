@@ -15,7 +15,10 @@ use crate::metadata_keys::{
     normalize_posix_path, posix_path_is_at_or_under_prefix, write_intent_page_cursor,
 };
 use crate::metadata_limits::OBJECT_LOCAL_METADATA_PAGE_SIZE;
-use crate::metadata_pages::{finish_cursor_page, walk_metadata_pages};
+use crate::metadata_pages::{
+    collect_filtered_metadata_pages, collect_metadata_pages, finish_cursor_page,
+    walk_metadata_pages,
+};
 use crate::metadata_records::*;
 use crate::metadata_summary::count_pending_repairs_for_object;
 use crate::{
@@ -82,17 +85,14 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<Vec<DfsObjectMetadata>> {
-        let mut objects = Vec::new();
-        walk_metadata_pages(|cursor| {
+        collect_metadata_pages(|cursor| {
             let page = self.objects_for_file_system_page(
                 file_system_id,
                 cursor,
                 OBJECT_LOCAL_METADATA_PAGE_SIZE,
             )?;
-            objects.extend(page.objects);
-            Ok(page.next_cursor)
-        })?;
-        Ok(objects)
+            Ok((page.objects, page.next_cursor))
+        })
     }
 
     /// Return one cursor-bounded page of objects for a filesystem.
@@ -141,28 +141,27 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         } else {
             format!("{}/", directory_path.trim_end_matches('/'))
         };
-        let mut children = Vec::new();
-        walk_metadata_pages(|cursor| {
-            let page = self.objects_for_file_system_page(
-                file_system_id,
-                cursor,
-                OBJECT_LOCAL_METADATA_PAGE_SIZE,
-            )?;
-            for object in page.objects {
+        let mut children = collect_filtered_metadata_pages(
+            |cursor| {
+                let page = self.objects_for_file_system_page(
+                    file_system_id,
+                    cursor,
+                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
+                )?;
+                Ok((page.objects, page.next_cursor))
+            },
+            |object| {
                 let object_path = normalize_posix_path(&object.path);
                 if object.kind == DfsObjectKind::Tombstone
                     || object_path == directory_path
                     || !object_path.starts_with(&prefix)
                 {
-                    continue;
+                    return None;
                 }
                 let rest = object_path.trim_start_matches(&prefix);
-                if !rest.is_empty() && !rest.contains('/') {
-                    children.push(object);
-                }
-            }
-            Ok(page.next_cursor)
-        })?;
+                (!rest.is_empty() && !rest.contains('/')).then_some(object)
+            },
+        )?;
         children.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
@@ -245,20 +244,20 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         file_system_id: &DfsFileSystemId,
         target_object_id: &DfsObjectId,
     ) -> Result<Vec<DfsObjectMetadata>> {
-        let mut hardlinks = Vec::new();
-        walk_metadata_pages(|cursor| {
-            let page = self.objects_for_file_system_page(
-                file_system_id,
-                cursor,
-                OBJECT_LOCAL_METADATA_PAGE_SIZE,
-            )?;
-            for object in page.objects {
-                if object_is_hardlink_to_target(&object, file_system_id, target_object_id) {
-                    hardlinks.push(object);
-                }
-            }
-            Ok(page.next_cursor)
-        })?;
+        let mut hardlinks = collect_filtered_metadata_pages(
+            |cursor| {
+                let page = self.objects_for_file_system_page(
+                    file_system_id,
+                    cursor,
+                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
+                )?;
+                Ok((page.objects, page.next_cursor))
+            },
+            |object| {
+                object_is_hardlink_to_target(&object, file_system_id, target_object_id)
+                    .then_some(object)
+            },
+        )?;
         sort_hardlinks_by_path(&mut hardlinks);
         Ok(hardlinks)
     }
@@ -418,14 +417,11 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
 
     /// Compatibility helper that drains all versions for one object.
     fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>> {
-        let mut versions = Vec::new();
-        walk_metadata_pages(|cursor| {
+        collect_metadata_pages(|cursor| {
             let page =
                 self.versions_for_object_page(object_id, cursor, OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
-            versions.extend(page.versions);
-            Ok(page.next_cursor)
-        })?;
-        Ok(versions)
+            Ok((page.versions, page.next_cursor))
+        })
     }
 
     /// Return one cursor-bounded page of versions for one object.
@@ -465,18 +461,15 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         object_id: &DfsObjectId,
         version: &DfsVersion,
     ) -> Result<Vec<DfsReplicaReceiptRecord>> {
-        let mut receipts = Vec::new();
-        walk_metadata_pages(|cursor| {
+        collect_metadata_pages(|cursor| {
             let page = self.receipts_for_version_page(
                 object_id,
                 version,
                 cursor,
                 OBJECT_LOCAL_METADATA_PAGE_SIZE,
             )?;
-            receipts.extend(page.receipts);
-            Ok(page.next_cursor)
-        })?;
-        Ok(receipts)
+            Ok((page.receipts, page.next_cursor))
+        })
     }
 
     /// Return one cursor-bounded page of receipts for one object version.
@@ -526,14 +519,11 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
 
     /// Compatibility helper that drains all intents for one object.
     fn intents_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsWriteIntentRecord>> {
-        let mut intents = Vec::new();
-        walk_metadata_pages(|cursor| {
+        collect_metadata_pages(|cursor| {
             let page =
                 self.intents_for_object_page(object_id, cursor, OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
-            intents.extend(page.intents);
-            Ok(page.next_cursor)
-        })?;
-        Ok(intents)
+            Ok((page.intents, page.next_cursor))
+        })
     }
 
     /// Return one cursor-bounded page of intents for one object.
@@ -619,46 +609,34 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// Compatibility helper for callers that still need a full materialized
     /// list. Implementations should expose the paged scan APIs as primitives.
     fn all_versions(&self) -> Result<Vec<DfsObjectVersionRecord>> {
-        let mut versions = Vec::new();
-        walk_metadata_pages(|cursor| {
+        collect_metadata_pages(|cursor| {
             let page = self.version_records_page(cursor, OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
-            versions.extend(page.versions);
-            Ok(page.next_cursor)
-        })?;
-        Ok(versions)
+            Ok((page.versions, page.next_cursor))
+        })
     }
     /// Compatibility helper for callers that still need a full materialized
     /// list. Implementations should expose the paged scan APIs as primitives.
     fn all_receipts(&self) -> Result<Vec<DfsReplicaReceiptRecord>> {
-        let mut receipts = Vec::new();
-        walk_metadata_pages(|cursor| {
+        collect_metadata_pages(|cursor| {
             let page = self.receipt_records_page(cursor, OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
-            receipts.extend(page.receipts);
-            Ok(page.next_cursor)
-        })?;
-        Ok(receipts)
+            Ok((page.receipts, page.next_cursor))
+        })
     }
     /// Compatibility helper for callers that still need a full materialized
     /// list. Implementations should expose the paged scan APIs as primitives.
     fn all_intents(&self) -> Result<Vec<DfsWriteIntentRecord>> {
-        let mut intents = Vec::new();
-        walk_metadata_pages(|cursor| {
+        collect_metadata_pages(|cursor| {
             let page = self.write_intents_page(cursor, OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
-            intents.extend(page.intents);
-            Ok(page.next_cursor)
-        })?;
-        Ok(intents)
+            Ok((page.intents, page.next_cursor))
+        })
     }
     /// Compatibility helper for callers that still need a full materialized
     /// list. Implementations should expose the paged scan APIs as primitives.
     fn all_conflicts(&self) -> Result<Vec<DfsConflictRecord>> {
-        let mut conflicts = Vec::new();
-        walk_metadata_pages(|cursor| {
+        collect_metadata_pages(|cursor| {
             let page = self.conflict_records_page(cursor, OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
-            conflicts.extend(page.conflicts);
-            Ok(page.next_cursor)
-        })?;
-        Ok(conflicts)
+            Ok((page.conflicts, page.next_cursor))
+        })
     }
 
     /// Add one object's versions, receipts, intents, conflicts, and repair
@@ -908,13 +886,10 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
 
     /// Compatibility helper that drains all namespace jobs.
     fn list_namespace_jobs(&self) -> Result<Vec<DfsNamespaceJobRecord>> {
-        let mut jobs = Vec::new();
-        walk_metadata_pages(|cursor| {
+        collect_metadata_pages(|cursor| {
             let page = self.list_namespace_jobs_page(cursor, OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
-            jobs.extend(page.jobs);
-            Ok(page.next_cursor)
-        })?;
-        Ok(jobs)
+            Ok((page.jobs, page.next_cursor))
+        })
     }
 
     /// Return one cursor-bounded page of namespace jobs.
@@ -943,14 +918,11 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
 
     /// Compatibility helper that drains all conflicts for one object.
     fn conflicts_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsConflictRecord>> {
-        let mut conflicts = Vec::new();
-        walk_metadata_pages(|cursor| {
+        collect_metadata_pages(|cursor| {
             let page =
                 self.conflicts_for_object_page(object_id, cursor, OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
-            conflicts.extend(page.conflicts);
-            Ok(page.next_cursor)
-        })?;
-        Ok(conflicts)
+            Ok((page.conflicts, page.next_cursor))
+        })
     }
 
     /// Return one cursor-bounded page of conflicts for one object.

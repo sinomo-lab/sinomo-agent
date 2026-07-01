@@ -52,6 +52,24 @@ pub(crate) fn collect_metadata_pages<T, C>(
     Ok(records)
 }
 
+/// Drain a paged metadata API while keeping only mapped records.
+///
+/// This is for compatibility helpers that still return a materialized vector
+/// but need to filter each page while walking it. Prefer direct paged APIs for
+/// service paths that can stay bounded end-to-end.
+pub(crate) fn collect_filtered_metadata_pages<T, U, C>(
+    mut fetch_page: impl FnMut(Option<&C>) -> Result<(Vec<T>, Option<C>)>,
+    mut filter_map_record: impl FnMut(T) -> Option<U>,
+) -> Result<Vec<U>> {
+    let mut records = Vec::new();
+    walk_metadata_pages(|cursor| {
+        let (page_records, next_cursor) = fetch_page(cursor)?;
+        records.extend(page_records.into_iter().filter_map(&mut filter_map_record));
+        Ok(next_cursor)
+    })?;
+    Ok(records)
+}
+
 /// Walk a cursor-paged metadata API until it returns no next cursor.
 ///
 /// The closure receives the current cursor and returns the next cursor after
@@ -898,6 +916,51 @@ mod tests {
             created_at,
             updated_at: Some(created_at),
         }
+    }
+
+    #[test]
+    fn collect_metadata_pages_drains_until_cursor_exhausted() {
+        let records = collect_metadata_pages(|cursor: Option<&usize>| {
+            Ok(match cursor.copied().unwrap_or(0) {
+                0 => (vec![1, 2], Some(2)),
+                2 => (vec![3, 4], Some(4)),
+                4 => (vec![5], None),
+                other => panic!("unexpected cursor {other}"),
+            })
+        })
+        .expect("collect pages");
+
+        assert_eq!(records, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn collect_filtered_metadata_pages_filters_each_page() {
+        let records = collect_filtered_metadata_pages(
+            |cursor: Option<&usize>| {
+                Ok(match cursor.copied().unwrap_or(0) {
+                    0 => (vec![1, 2, 3], Some(3)),
+                    3 => (vec![4, 5], None),
+                    other => panic!("unexpected cursor {other}"),
+                })
+            },
+            |record| (record % 2 == 1).then_some(record * 10),
+        )
+        .expect("collect filtered pages");
+
+        assert_eq!(records, vec![10, 30, 50]);
+    }
+
+    #[test]
+    fn walk_metadata_pages_allows_early_stop() {
+        let mut seen = Vec::new();
+        walk_metadata_pages(|cursor: Option<&usize>| {
+            let value = cursor.copied().unwrap_or(0);
+            seen.push(value);
+            Ok((value < 2).then_some(value + 1))
+        })
+        .expect("walk pages");
+
+        assert_eq!(seen, vec![0, 1, 2]);
     }
 
     #[test]

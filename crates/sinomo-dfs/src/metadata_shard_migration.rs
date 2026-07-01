@@ -6,6 +6,7 @@
 
 use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_error::{MetadataBackendError, Result};
+use crate::metadata_pages::collect_metadata_pages;
 use crate::metadata_receipt::receipt_for_replica_from_backend;
 use crate::metadata_records::{
     DfsConflictRecord, DfsMetadataShardId, DfsObjectVersionRecord, DfsReplicaReceiptRecord,
@@ -33,55 +34,26 @@ pub(crate) fn collect_object_shard_migration_bundle<B: DfsMetadataBackend + ?Siz
             .ok_or_else(|| MetadataBackendError::UnknownObject {
                 object_id: object_id.clone(),
             })?;
-    let mut versions = Vec::new();
-    let mut version_cursor = None;
-    loop {
-        let page =
-            source.versions_for_object_page(object_id, version_cursor.as_ref(), page_size)?;
-        versions.extend(page.versions);
-        let Some(next_cursor) = page.next_cursor else {
-            break;
-        };
-        version_cursor = Some(next_cursor);
-    }
+    let versions = collect_metadata_pages(|cursor| {
+        let page = source.versions_for_object_page(object_id, cursor, page_size)?;
+        Ok((page.versions, page.next_cursor))
+    })?;
     let mut receipts = Vec::new();
     for version in &versions {
-        let mut receipt_cursor = None;
-        loop {
-            let page = source.receipts_for_version_page(
-                object_id,
-                &version.version,
-                receipt_cursor.as_ref(),
-                page_size,
-            )?;
-            receipts.extend(page.receipts);
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            receipt_cursor = Some(next_cursor);
-        }
+        receipts.extend(collect_metadata_pages(|cursor| {
+            let page =
+                source.receipts_for_version_page(object_id, &version.version, cursor, page_size)?;
+            Ok((page.receipts, page.next_cursor))
+        })?);
     }
-    let mut intents = Vec::new();
-    let mut intent_cursor = None;
-    loop {
-        let page = source.intents_for_object_page(object_id, intent_cursor.as_ref(), page_size)?;
-        intents.extend(page.intents);
-        let Some(next_cursor) = page.next_cursor else {
-            break;
-        };
-        intent_cursor = Some(next_cursor);
-    }
-    let mut conflicts = Vec::new();
-    let mut conflict_cursor = None;
-    loop {
-        let page =
-            source.conflicts_for_object_page(object_id, conflict_cursor.as_ref(), page_size)?;
-        conflicts.extend(page.conflicts);
-        let Some(next_cursor) = page.next_cursor else {
-            break;
-        };
-        conflict_cursor = Some(next_cursor);
-    }
+    let intents = collect_metadata_pages(|cursor| {
+        let page = source.intents_for_object_page(object_id, cursor, page_size)?;
+        Ok((page.intents, page.next_cursor))
+    })?;
+    let conflicts = collect_metadata_pages(|cursor| {
+        let page = source.conflicts_for_object_page(object_id, cursor, page_size)?;
+        Ok((page.conflicts, page.next_cursor))
+    })?;
     Ok(DfsObjectShardMigrationBundle {
         object,
         versions,
