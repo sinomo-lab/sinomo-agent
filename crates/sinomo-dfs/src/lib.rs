@@ -6,10 +6,12 @@ pub mod discovery;
 pub mod distributed;
 pub mod local_owned;
 pub mod metadata_backend;
+mod module_surface;
 pub mod namespace;
 pub mod operator;
 pub mod posix;
 pub mod protocol;
+mod routes;
 mod service;
 mod transfer;
 
@@ -59,6 +61,11 @@ pub use metadata_backend::{
     DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentStatus,
     LocalShardedMetadataBackend, LocalSobjMetadataBackend, MetadataBackendError,
 };
+pub use module_surface::{
+    DFS_POLICY_VIOLATION_EVENT_KIND, DFS_PROTOCOL, SINOMO_DFS_MODULE_LEGACY_ID,
+    SINOMO_DFS_MODULE_OWNER, SINOMO_DFS_NATIVE_REGISTRATION_KEY, dfs_module_capabilities,
+    dfs_module_id, dfs_module_registration, dfs_module_surfaces, register_storage_paths,
+};
 use namespace::metadata_path;
 pub use namespace::{
     SIFS_NODES_PATH, SIFS_ROOT_PATH, SIFS_SERVICES_PATH, SIFS_SINOMO_PATH, SIFS_USERS_PATH,
@@ -95,6 +102,37 @@ pub use protocol::{
     DfsStageBlobResponse, DfsStagePatchChunkCommand, DfsStagePatchCommand, DfsWriteCommand,
     DfsWriteResponse, DfsWriteResult,
 };
+pub use routes::{
+    DFS_CONTROL_PLANE_ROUTES, DFS_DATA_BULK_READ_RESPONSE_ROUTE, DFS_DATA_BULK_READ_ROUTE,
+    DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE, DFS_DATA_COMMIT_VERSION_ROUTE,
+    DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE, DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
+    DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE, DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
+    DFS_DATA_FETCH_BLOB_ROUTE, DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
+    DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE, DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE,
+    DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
+    DFS_DATA_NAMESPACE_ROUTE, DFS_DATA_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES,
+    DFS_DATA_READ_RESPONSE_CHUNK_ROUTE, DFS_DATA_READ_RESPONSE_ROUTE, DFS_DATA_READ_ROUTE,
+    DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE, DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
+    DFS_DATA_REPAIR_REPLICA_ROUTE, DFS_DATA_STAGE_BLOB_CHUNK_ROUTE,
+    DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE, DFS_DATA_STAGE_BLOB_ROUTE,
+    DFS_DATA_STAGE_PATCH_CHUNK_ROUTE, DFS_DATA_STAGE_PATCH_ROUTE, DFS_DATA_WRITE_RESPONSE_ROUTE,
+    DFS_DATA_WRITE_ROUTE, DFS_DIRECT_READ_ROUTE, DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE,
+    DFS_MESSAGE_DATA_PLANE_ROUTES, DFS_METADATA_JOURNAL_BATCH_ROUTE,
+    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY, DFS_SMOKE_ROUTE,
+    DFS_STATUS_ROUTE, decode_dfs_inspection_rpc_response, decode_dfs_message_rpc_request,
+    decode_dfs_message_rpc_response, decode_dfs_metadata_journal_batch_rpc_response,
+    decode_dfs_metadata_snapshot_install_rpc_response, decode_dfs_smoke_rpc_response,
+    decode_dfs_status_rpc_response, dfs_inspection_rpc_request,
+    dfs_message_allows_write_repair_progress, dfs_message_is_read_only_request,
+    dfs_message_requires_fresh_metadata, dfs_message_rpc_request,
+    dfs_metadata_journal_batch_rpc_request, dfs_metadata_snapshot_install_rpc_request,
+    dfs_route_is_message_data_plane, dfs_routed_message_rpc_request, dfs_smoke_rpc_request,
+    dfs_status_rpc_request,
+};
+pub(crate) use routes::{
+    build_dfs_routed_message, dfs_network_message_allows_write_repair_progress,
+    dfs_routed_message_from_object_rpc_request,
+};
 
 pub type DfsFileSystemId = sinomo_core::Id;
 pub type DfsNodeId = NodeId;
@@ -122,11 +160,10 @@ pub use service::{
     DfsService, register_data_plane_services, register_services,
 };
 use sinomo_core::{
-    CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
-    ClusterMemberRecord, ClusterMemberRole, ClusterTransportKind, Confidence, DfsObjectPolicy,
-    DfsWriteReceipt, DfsWriteRequest, EventEnvelope, EventKind, FileSystemAccess, LatencyClass,
-    ModuleCapabilities, ModuleResourceLimits, NetworkAccess, PrivacyClass, RoutingMetadata,
-    RoutingScope, Salience, Source, TrustRing,
+    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
+    ClusterMemberRole, ClusterTransportKind, Confidence, DfsObjectPolicy, DfsWriteReceipt,
+    DfsWriteRequest, EventEnvelope, EventKind, LatencyClass, PrivacyClass, RoutingMetadata,
+    RoutingScope, Salience, Source,
 };
 use sinomo_events::EventId;
 use sinomo_kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
@@ -353,382 +390,8 @@ impl AsyncDfsMessageTransport for sinomo_network::AsyncInProcessTransport {
     }
 }
 
-pub const DFS_PROTOCOL: &str = "sinomo.dfs.v1";
-pub const SINOMO_DFS_MODULE_LEGACY_ID: &str = "module.dfs";
-pub const SINOMO_DFS_MODULE_OWNER: &str = "sinomo-dfs";
-pub const SINOMO_DFS_NATIVE_REGISTRATION_KEY: &str = "sinomo-dfs";
-pub const DFS_RPC_CATEGORY: &str = "dfs";
-pub const DFS_STATUS_ROUTE: &str = "/dfs/status";
-pub const DFS_INSPECTION_ROUTE: &str = "/dfs/inspection";
-pub const DFS_SMOKE_ROUTE: &str = "/dfs/smoke";
-pub const DFS_EXPOSE_CONFIG_ROUTE: &str = "/dfs/expose/config";
-pub const DFS_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/metadata/journal-batch";
-pub const DFS_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/metadata/snapshot-install";
-pub const DFS_DIRECT_READ_ROUTE: &str = "/dfs/object/read";
-pub const DFS_DATA_READ_ROUTE: &str = "/dfs/data/read";
-pub const DFS_DATA_READ_RESPONSE_ROUTE: &str = "/dfs/data/read/response";
-pub const DFS_DATA_READ_RESPONSE_CHUNK_ROUTE: &str = "/dfs/data/read/response-chunk";
-pub const DFS_DATA_BULK_READ_ROUTE: &str = "/dfs/data/bulk-read";
-pub const DFS_DATA_BULK_READ_RESPONSE_ROUTE: &str = "/dfs/data/bulk-read/response";
-pub const DFS_DATA_WRITE_ROUTE: &str = "/dfs/data/write";
-pub const DFS_DATA_WRITE_RESPONSE_ROUTE: &str = "/dfs/data/write/response";
-pub const DFS_DATA_DISTRIBUTED_WRITE_ROUTE: &str = "/dfs/data/distributed-write";
-pub const DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE: &str = "/dfs/data/distributed-write/response";
-pub const DFS_DATA_NAMESPACE_ROUTE: &str = "/dfs/data/namespace";
-pub const DFS_DATA_NAMESPACE_RESPONSE_ROUTE: &str = "/dfs/data/namespace/response";
-pub const DFS_DATA_STAGE_BLOB_ROUTE: &str = "/dfs/data/stage-blob";
-pub const DFS_DATA_STAGE_BLOB_CHUNK_ROUTE: &str = "/dfs/data/stage-blob/chunk";
-pub const DFS_DATA_STAGE_PATCH_ROUTE: &str = "/dfs/data/stage-patch";
-pub const DFS_DATA_STAGE_PATCH_CHUNK_ROUTE: &str = "/dfs/data/stage-patch/chunk";
-pub const DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE: &str = "/dfs/data/stage-blob/response";
-pub const DFS_DATA_COMMIT_VERSION_ROUTE: &str = "/dfs/data/commit-version";
-pub const DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE: &str = "/dfs/data/commit-version/response";
-pub const DFS_DATA_REPAIR_REPLICA_ROUTE: &str = "/dfs/data/repair-replica";
-pub const DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE: &str = "/dfs/data/repair-replica/chunk";
-pub const DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE: &str = "/dfs/data/repair-replica/response";
-pub const DFS_DATA_FETCH_BLOB_ROUTE: &str = "/dfs/data/fetch-blob";
-pub const DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE: &str = "/dfs/data/fetch-blob/response";
-pub const DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE: &str = "/dfs/data/fetch-blob/response-chunk";
-pub const DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/data/metadata/journal-batch";
-pub const DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE: &str =
-    "/dfs/data/metadata/journal-batch/response";
-pub const DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/data/metadata/snapshot-install";
-pub const DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE: &str =
-    "/dfs/data/metadata/snapshot-install/response";
-pub const DFS_POLICY_VIOLATION_EVENT_KIND: &str = "dfs.policy.violation";
-pub const DFS_MESSAGE_DATA_PLANE_ROUTES: &[&str] = &[
-    DFS_DATA_READ_ROUTE,
-    DFS_DATA_READ_RESPONSE_ROUTE,
-    DFS_DATA_READ_RESPONSE_CHUNK_ROUTE,
-    DFS_DATA_BULK_READ_ROUTE,
-    DFS_DATA_BULK_READ_RESPONSE_ROUTE,
-    DFS_DATA_WRITE_ROUTE,
-    DFS_DATA_WRITE_RESPONSE_ROUTE,
-    DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
-    DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
-    DFS_DATA_NAMESPACE_ROUTE,
-    DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
-    DFS_DATA_STAGE_BLOB_ROUTE,
-    DFS_DATA_STAGE_BLOB_CHUNK_ROUTE,
-    DFS_DATA_STAGE_PATCH_ROUTE,
-    DFS_DATA_STAGE_PATCH_CHUNK_ROUTE,
-    DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
-    DFS_DATA_COMMIT_VERSION_ROUTE,
-    DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
-    DFS_DATA_FETCH_BLOB_ROUTE,
-    DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
-    DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE,
-    DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
-    DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
-    DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
-    DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE,
-];
-pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = &[
-    DFS_STATUS_ROUTE,
-    DFS_EXPOSE_CONFIG_ROUTE,
-    DFS_INSPECTION_ROUTE,
-    DFS_METADATA_JOURNAL_BATCH_ROUTE,
-    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-];
-/// Canonical DFS data-plane object-RPC routes.
-pub const DFS_DATA_PLANE_ROUTES: &[&str] = &[
-    DFS_SMOKE_ROUTE,
-    DFS_DIRECT_READ_ROUTE,
-    DFS_DATA_READ_ROUTE,
-    DFS_DATA_READ_RESPONSE_ROUTE,
-    DFS_DATA_READ_RESPONSE_CHUNK_ROUTE,
-    DFS_DATA_BULK_READ_ROUTE,
-    DFS_DATA_BULK_READ_RESPONSE_ROUTE,
-    DFS_DATA_WRITE_ROUTE,
-    DFS_DATA_WRITE_RESPONSE_ROUTE,
-    DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
-    DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
-    DFS_DATA_NAMESPACE_ROUTE,
-    DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
-    DFS_DATA_STAGE_BLOB_ROUTE,
-    DFS_DATA_STAGE_BLOB_CHUNK_ROUTE,
-    DFS_DATA_STAGE_PATCH_ROUTE,
-    DFS_DATA_STAGE_PATCH_CHUNK_ROUTE,
-    DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
-    DFS_DATA_COMMIT_VERSION_ROUTE,
-    DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
-    DFS_DATA_FETCH_BLOB_ROUTE,
-    DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
-    DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE,
-    DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
-    DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
-    DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
-    DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE,
-];
-/// Routes registered by the DFS data-plane service.
-pub const DFS_DATA_PLANE_SERVICE_ROUTES: &[&str] = DFS_DATA_PLANE_ROUTES;
-pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
-    DFS_STATUS_ROUTE,
-    DFS_EXPOSE_CONFIG_ROUTE,
-    DFS_INSPECTION_ROUTE,
-    DFS_METADATA_JOURNAL_BATCH_ROUTE,
-    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-    DFS_SMOKE_ROUTE,
-    DFS_DIRECT_READ_ROUTE,
-    DFS_DATA_READ_ROUTE,
-    DFS_DATA_READ_RESPONSE_ROUTE,
-    DFS_DATA_READ_RESPONSE_CHUNK_ROUTE,
-    DFS_DATA_BULK_READ_ROUTE,
-    DFS_DATA_BULK_READ_RESPONSE_ROUTE,
-    DFS_DATA_WRITE_ROUTE,
-    DFS_DATA_WRITE_RESPONSE_ROUTE,
-    DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
-    DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
-    DFS_DATA_NAMESPACE_ROUTE,
-    DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
-    DFS_DATA_STAGE_BLOB_ROUTE,
-    DFS_DATA_STAGE_BLOB_CHUNK_ROUTE,
-    DFS_DATA_STAGE_PATCH_ROUTE,
-    DFS_DATA_STAGE_PATCH_CHUNK_ROUTE,
-    DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
-    DFS_DATA_COMMIT_VERSION_ROUTE,
-    DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE,
-    DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
-    DFS_DATA_FETCH_BLOB_ROUTE,
-    DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
-    DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE,
-    DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
-    DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
-    DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
-    DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE,
-];
 pub const DEFAULT_DFS_NODE_ID: &str = "node_local";
 pub const SIFS_FILE_SYSTEM_ID: &str = "sifs";
-
-fn build_dfs_routed_message(
-    source_node_id: &NodeId,
-    target_node_id: &NodeId,
-    frame_id: u64,
-    message_id: u64,
-    message: DfsNetworkMessage,
-) -> DfsRoutedMessage {
-    DfsRoutedMessage {
-        source_node_id: source_node_id.clone(),
-        target_node_id: target_node_id.clone(),
-        frame_id,
-        message_id,
-        message,
-    }
-}
-
-fn dfs_message_command_from_routed_message(message: DfsRoutedMessage) -> DfsMessageCommand {
-    DfsMessageCommand {
-        request_id: format!("dfs-message-{}-{}", message.frame_id, message.message_id),
-        routed_message: message,
-    }
-}
-
-fn dfs_routed_message_from_object_rpc_request(
-    request: &ObjectRpcRequest,
-) -> Result<DfsRoutedMessage, NetworkError> {
-    Ok(decode_dfs_message_rpc_request(request)?.routed_message)
-}
-
-fn decode_dfs_message_rpc_request(
-    request: &ObjectRpcRequest,
-) -> Result<DfsMessageCommand, NetworkError> {
-    if !dfs_route_is_message_data_plane(&request.route) {
-        return Err(NetworkError::Serialization {
-            detail: format!(
-                "DFS message RPC requires a typed DFS data-plane route, got {}",
-                request.route
-            ),
-        });
-    }
-    let command: DfsMessageCommand = request.decode_body()?;
-    let expected_route = dfs_message_route_for_network_message(&command.routed_message.message);
-    if request.route != expected_route {
-        return Err(NetworkError::Serialization {
-            detail: format!(
-                "DFS data-plane route {} does not match message route {}",
-                request.route, expected_route
-            ),
-        });
-    }
-    Ok(command)
-}
-
-pub fn dfs_route_is_message_data_plane(route: &str) -> bool {
-    DFS_MESSAGE_DATA_PLANE_ROUTES.contains(&route)
-}
-
-fn dfs_message_route(command: &DfsMessageCommand) -> &'static str {
-    dfs_message_route_for_network_message(&command.routed_message.message)
-}
-
-fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'static str {
-    match message {
-        DfsNetworkMessage::ReadRequest(_) => DFS_DATA_READ_ROUTE,
-        DfsNetworkMessage::ReadResponse(_) => DFS_DATA_READ_RESPONSE_ROUTE,
-        DfsNetworkMessage::ReadResponseChunk(_) => DFS_DATA_READ_RESPONSE_CHUNK_ROUTE,
-        DfsNetworkMessage::BulkReadRequest(_) => DFS_DATA_BULK_READ_ROUTE,
-        DfsNetworkMessage::BulkReadResponse(_) => DFS_DATA_BULK_READ_RESPONSE_ROUTE,
-        DfsNetworkMessage::WriteRequest(_) => DFS_DATA_WRITE_ROUTE,
-        DfsNetworkMessage::WriteResponse(_) => DFS_DATA_WRITE_RESPONSE_ROUTE,
-        DfsNetworkMessage::DistributedWriteRequest(_) => DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
-        DfsNetworkMessage::DistributedWriteResponse(_) => DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
-        DfsNetworkMessage::NamespaceRequest(_) => DFS_DATA_NAMESPACE_ROUTE,
-        DfsNetworkMessage::NamespaceResponse(_) => DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
-        DfsNetworkMessage::StageBlob(_) => DFS_DATA_STAGE_BLOB_ROUTE,
-        DfsNetworkMessage::StageBlobChunk(_) => DFS_DATA_STAGE_BLOB_CHUNK_ROUTE,
-        DfsNetworkMessage::StagePatch(_) => DFS_DATA_STAGE_PATCH_ROUTE,
-        DfsNetworkMessage::StagePatchChunk(_) => DFS_DATA_STAGE_PATCH_CHUNK_ROUTE,
-        DfsNetworkMessage::StageBlobResponse(_) => DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
-        DfsNetworkMessage::CommitVersion(_) => DFS_DATA_COMMIT_VERSION_ROUTE,
-        DfsNetworkMessage::CommitVersionResponse(_) => DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
-        DfsNetworkMessage::RepairReplica(_) => DFS_DATA_REPAIR_REPLICA_ROUTE,
-        DfsNetworkMessage::RepairReplicaChunk(_) => DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE,
-        DfsNetworkMessage::RepairReplicaResponse(_) => DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
-        DfsNetworkMessage::FetchBlob(_) => DFS_DATA_FETCH_BLOB_ROUTE,
-        DfsNetworkMessage::FetchBlobResponse(_) => DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
-        DfsNetworkMessage::FetchBlobResponseChunk(_) => DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE,
-        DfsNetworkMessage::MetadataJournalBatch(_) => DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
-        DfsNetworkMessage::MetadataJournalBatchResponse(_) => {
-            DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE
-        }
-        DfsNetworkMessage::MetadataSnapshotInstall(_) => DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
-        DfsNetworkMessage::MetadataSnapshotInstallResponse(_) => {
-            DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE
-        }
-    }
-}
-
-fn dfs_network_message_is_read_only_request(message: &DfsNetworkMessage) -> bool {
-    matches!(
-        message,
-        DfsNetworkMessage::ReadRequest(_) | DfsNetworkMessage::BulkReadRequest(_)
-    )
-}
-
-pub fn dfs_message_is_read_only_request(command: &DfsMessageCommand) -> bool {
-    dfs_network_message_is_read_only_request(&command.routed_message.message)
-}
-
-fn dfs_network_message_requires_fresh_metadata(message: &DfsNetworkMessage) -> bool {
-    matches!(
-        message,
-        DfsNetworkMessage::ReadRequest(_)
-            | DfsNetworkMessage::BulkReadRequest(_)
-            | DfsNetworkMessage::NamespaceRequest(_)
-    )
-}
-
-pub fn dfs_message_requires_fresh_metadata(command: &DfsMessageCommand) -> bool {
-    dfs_network_message_requires_fresh_metadata(&command.routed_message.message)
-}
-
-fn dfs_network_message_allows_write_repair_progress(message: &DfsNetworkMessage) -> bool {
-    match message {
-        DfsNetworkMessage::DistributedWriteRequest(command) => command.foreground_replica_repair,
-        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
-            operation: DfsNamespaceOperation::SyncPath { .. },
-            ..
-        }) => true,
-        _ => false,
-    }
-}
-
-pub fn dfs_message_allows_write_repair_progress(command: &DfsMessageCommand) -> bool {
-    dfs_network_message_allows_write_repair_progress(&command.routed_message.message)
-}
-
-pub fn dfs_status_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
-    ObjectRpcRequest::encode_body(DFS_STATUS_ROUTE, DFS_RPC_CATEGORY, &())
-}
-
-pub fn decode_dfs_status_rpc_response(
-    response: &ObjectRpcResponse,
-) -> Result<DfsOperatorStatus, NetworkError> {
-    response.decode_body()
-}
-
-pub fn dfs_inspection_rpc_request(
-    request: &DaemonDfsInspectionRequest,
-) -> Result<ObjectRpcRequest, NetworkError> {
-    ObjectRpcRequest::encode_body(DFS_INSPECTION_ROUTE, DFS_RPC_CATEGORY, request)
-}
-
-pub fn decode_dfs_inspection_rpc_response(
-    response: &ObjectRpcResponse,
-) -> Result<DaemonDfsInspectionResponse, NetworkError> {
-    response.decode_body()
-}
-
-pub fn dfs_smoke_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
-    ObjectRpcRequest::encode_body(DFS_SMOKE_ROUTE, DFS_RPC_CATEGORY, &())
-}
-
-pub fn decode_dfs_smoke_rpc_response(
-    response: &ObjectRpcResponse,
-) -> Result<DfsSmokeReport, NetworkError> {
-    response.decode_body()
-}
-
-pub fn dfs_metadata_journal_batch_rpc_request(
-    command: &DfsMetadataJournalBatchCommand,
-) -> Result<ObjectRpcRequest, NetworkError> {
-    ObjectRpcRequest::encode_body(DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_RPC_CATEGORY, command)
-}
-
-pub fn decode_dfs_metadata_journal_batch_rpc_response(
-    response: &ObjectRpcResponse,
-) -> Result<DfsMetadataJournalBatchResponse, NetworkError> {
-    response.decode_body()
-}
-
-pub fn dfs_metadata_snapshot_install_rpc_request(
-    command: &DfsMetadataSnapshotInstallCommand,
-) -> Result<ObjectRpcRequest, NetworkError> {
-    ObjectRpcRequest::encode_body(
-        DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-        DFS_RPC_CATEGORY,
-        command,
-    )
-}
-
-pub fn decode_dfs_metadata_snapshot_install_rpc_response(
-    response: &ObjectRpcResponse,
-) -> Result<DfsMetadataSnapshotInstallResponse, NetworkError> {
-    response.decode_body()
-}
-
-pub fn dfs_routed_message_rpc_request(
-    message: &DfsRoutedMessage,
-) -> Result<ObjectRpcRequest, NetworkError> {
-    dfs_message_rpc_request(&dfs_message_command_from_routed_message(message.clone()))
-}
-
-pub fn dfs_message_rpc_request(
-    command: &DfsMessageCommand,
-) -> Result<ObjectRpcRequest, NetworkError> {
-    let mut request =
-        ObjectRpcRequest::encode_body(dfs_message_route(command), DFS_RPC_CATEGORY, command)?;
-    request.ensure_trace_context();
-    sinomo_network::set_object_rpc_request_stream_mode(
-        &mut request,
-        sinomo_network::ObjectRpcRequestStreamMode::ReuseDaemonStream,
-    );
-    Ok(request)
-}
-
-pub fn decode_dfs_message_rpc_response(
-    response: &ObjectRpcResponse,
-) -> Result<DfsMessageResponse, NetworkError> {
-    response.decode_body()
-}
 
 const DFS_DIRECT_READ_STATUS_METADATA_KEY: &str = "sinomo.dfs.direct-read.status";
 const DFS_DIRECT_READ_STATUS_FOUND: &str = "found";
@@ -1189,290 +852,6 @@ fn dfs_adaptive_chunk_window_size(
     let budget_window = (DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES / DFS_BLOB_CHUNK_BYTES as u64)
         .clamp(1, u64::from(u32::MAX)) as u32;
     profile_window.min(budget_window).min(total_chunks).max(1)
-}
-
-pub fn register_storage_paths(
-    layout: &mut sinomo_storage::StorageLayout,
-) -> Result<(), sinomo_storage::StorageContractError> {
-    use sinomo_storage::StorageRing;
-
-    for (relative_path, reason) in [
-        ("dfs/content/blobs", "content-addressed DFS blob bytes"),
-        (
-            "dfs/content/blob-packs",
-            "packed small DFS blob segment files and index records",
-        ),
-        (
-            "dfs/content/objects",
-            "dynamic DFS object manifests stored as sinomo-object files",
-        ),
-        (
-            "dfs/content/stats.sobj",
-            "durable approximate DFS content-store counters",
-        ),
-        (
-            "dfs/content/stats.lock",
-            "advisory lock for DFS content-store counter updates",
-        ),
-        ("dfs/content/staging", "temporary DFS staging bytes"),
-        (
-            "dfs/metadata/records",
-            "dynamic DFS metadata records stored as sinomo-object files",
-        ),
-        (
-            "dfs/metadata/journal",
-            "dynamic DFS metadata journal entries stored as sinomo-object files",
-        ),
-        (
-            "dfs/metadata/root",
-            "default DFS root metadata shard with object records and journal entries",
-        ),
-        (
-            "dfs/metadata/shard-index",
-            "dynamic DFS object-to-metadata-shard index records",
-        ),
-        (
-            "dfs/metadata-replication-cursors",
-            "durable per-replica DFS metadata journal replication cursors",
-        ),
-        (
-            "dfs/maintenance",
-            "durable DFS maintenance cursors, retry ledgers, and suppression records",
-        ),
-        (
-            "dfs/metadata",
-            "dynamic DFS metadata shard directories with object records and journal entries",
-        ),
-        (
-            "dfs/imports",
-            "quarantined DFS metadata imported from migrated source clusters",
-        ),
-        (
-            "dfs/operator",
-            "dynamic DFS operator intent records stored as sinomo-object files",
-        ),
-        (
-            "dfs/pins",
-            "dynamic DFS pin records stored as sinomo-object files",
-        ),
-        ("files", "local-owned user files exposed into DFS"),
-    ] {
-        layout.register_escape_path("sinomo-dfs", StorageRing::R1, relative_path, reason)?;
-    }
-    Ok(())
-}
-
-pub fn dfs_module_id() -> sinomo_module::ModuleId {
-    sinomo_module::ModuleId::from_legacy_named(SINOMO_DFS_MODULE_LEGACY_ID)
-        .expect("valid DFS module id")
-}
-
-pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
-    use sinomo_module::{ModuleObjectRpcRoute, ModuleRouteAuth, ModuleSurfaces};
-
-    let mut surfaces = ModuleSurfaces::default()
-        .with_object_rpc_route(ModuleObjectRpcRoute::new(
-            DFS_STATUS_ROUTE,
-            DFS_RPC_CATEGORY,
-            "dfs.status.read",
-            ModuleRouteAuth::LocalOrClusterMember,
-        ))
-        .with_object_rpc_route(ModuleObjectRpcRoute::new(
-            DFS_EXPOSE_CONFIG_ROUTE,
-            DFS_RPC_CATEGORY,
-            "dfs.expose.configure",
-            ModuleRouteAuth::LocalCommand,
-        ))
-        .with_object_rpc_route(ModuleObjectRpcRoute::new(
-            DFS_INSPECTION_ROUTE,
-            DFS_RPC_CATEGORY,
-            "dfs.inspection.read",
-            ModuleRouteAuth::LocalOrClusterMember,
-        ))
-        .with_object_rpc_route(ModuleObjectRpcRoute::new(
-            DFS_METADATA_JOURNAL_BATCH_ROUTE,
-            DFS_RPC_CATEGORY,
-            "dfs.metadata.replicate",
-            ModuleRouteAuth::LocalOrClusterMember,
-        ))
-        .with_object_rpc_route(ModuleObjectRpcRoute::new(
-            DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-            DFS_RPC_CATEGORY,
-            "dfs.metadata.repair",
-            ModuleRouteAuth::LocalOrClusterMember,
-        ))
-        .with_object_rpc_route(ModuleObjectRpcRoute::new(
-            DFS_SMOKE_ROUTE,
-            DFS_RPC_CATEGORY,
-            "dfs.smoke.run",
-            ModuleRouteAuth::LocalCommand,
-        ))
-        .with_object_rpc_route(ModuleObjectRpcRoute::new(
-            DFS_DIRECT_READ_ROUTE,
-            DFS_RPC_CATEGORY,
-            "dfs.object.transfer",
-            ModuleRouteAuth::LocalOrClusterMember,
-        ))
-        .with_event_kind_name(DFS_POLICY_VIOLATION_EVENT_KIND)
-        .with_storage_owner(SINOMO_DFS_MODULE_OWNER);
-    for route in DFS_MESSAGE_DATA_PLANE_ROUTES.iter().copied() {
-        surfaces = surfaces.with_object_rpc_route(ModuleObjectRpcRoute::new(
-            route,
-            DFS_RPC_CATEGORY,
-            "dfs.object.transfer",
-            ModuleRouteAuth::LocalOrClusterMember,
-        ));
-    }
-    surfaces.capabilities = dfs_module_capabilities();
-    surfaces
-}
-
-pub fn dfs_module_registration() -> sinomo_module::ModuleRegistration {
-    let mut registration = sinomo_module::ModuleRegistration::native_rust(
-        dfs_module_id(),
-        env!("CARGO_PKG_VERSION"),
-        SINOMO_DFS_MODULE_OWNER,
-        env!("CARGO_PKG_NAME"),
-        DFS_PROTOCOL,
-        TrustRing::R1TrustedRuntime,
-        SINOMO_DFS_NATIVE_REGISTRATION_KEY,
-    );
-    registration.manifest.capabilities = dfs_module_capabilities();
-    registration.manifest.limits = ModuleResourceLimits {
-        network: NetworkAccess::Allowlisted,
-        filesystem: FileSystemAccess::Scoped,
-        ..ModuleResourceLimits::default()
-    };
-    registration.surfaces = dfs_module_surfaces();
-    registration
-}
-
-pub fn dfs_module_capabilities() -> ModuleCapabilities {
-    ModuleCapabilities {
-        imports: vec![
-            dfs_capability("storage.local.read"),
-            dfs_capability("storage.local.write"),
-            dfs_capability("network.object_rpc"),
-            dfs_capability("cluster.kv.read"),
-        ],
-        exports: vec![
-            dfs_capability("dfs.status.read"),
-            dfs_capability("dfs.inspection.read"),
-            dfs_capability("dfs.expose.configure"),
-            dfs_capability("dfs.metadata.replicate"),
-            dfs_capability("dfs.metadata.repair"),
-            dfs_capability("dfs.smoke.run"),
-            dfs_capability("dfs.object.transfer"),
-            dfs_capability("sifs.path.access"),
-        ],
-    }
-}
-
-fn dfs_capability(name: &str) -> CapabilityName {
-    CapabilityName::new(name).expect("valid DFS module capability")
-}
-
-#[cfg(test)]
-mod module_registration_tests {
-    use super::*;
-    use sinomo_core::ModuleKind;
-    use sinomo_module::{ModuleBackendRegistration, NativeRustBackendRegistration};
-    use sinomo_storage::StorageLayout;
-
-    #[test]
-    fn dfs_registers_as_r1_native_rust_module() {
-        let registration = dfs_module_registration();
-
-        assert_eq!(registration.module_id(), &dfs_module_id());
-        assert_eq!(registration.manifest.kind, ModuleKind::NativeRust);
-        assert_eq!(
-            registration.manifest.target_ring,
-            TrustRing::R1TrustedRuntime
-        );
-        assert_eq!(registration.manifest.api_version, DFS_PROTOCOL);
-        assert!(
-            registration
-                .manifest
-                .capabilities
-                .exports
-                .iter()
-                .any(|capability| capability.as_str() == "dfs.metadata.replicate")
-        );
-        assert_eq!(
-            registration.backend,
-            ModuleBackendRegistration::NativeRust {
-                registration: NativeRustBackendRegistration::new(
-                    SINOMO_DFS_NATIVE_REGISTRATION_KEY,
-                    SINOMO_DFS_MODULE_OWNER
-                )
-            }
-        );
-        assert_eq!(
-            registration.surfaces.storage_owners,
-            vec![SINOMO_DFS_MODULE_OWNER.to_string()]
-        );
-        assert!(
-            registration
-                .surfaces
-                .event_kinds
-                .iter()
-                .any(|event_kind| event_kind.as_str() == DFS_POLICY_VIOLATION_EVENT_KIND)
-        );
-        assert!(
-            registration
-                .surfaces
-                .capabilities
-                .exports
-                .iter()
-                .any(|capability| capability.as_str() == "dfs.object.transfer")
-        );
-        assert_eq!(
-            registration.surfaces.object_rpc_routes.len(),
-            DFS_OBJECT_RPC_ROUTES.len()
-        );
-        assert!(
-            registration
-                .surfaces
-                .object_rpc_routes
-                .iter()
-                .all(|route| route.route != "/dfs/message")
-        );
-        assert!(
-            registration
-                .surfaces
-                .object_rpc_routes
-                .iter()
-                .any(|route| route.route == DFS_DATA_READ_ROUTE
-                    && route.operation == "dfs.object.transfer")
-        );
-        assert!(
-            registration
-                .surfaces
-                .object_rpc_routes
-                .iter()
-                .all(|route| route.route != "/dfs/protocol/frame")
-        );
-    }
-
-    #[test]
-    fn dfs_storage_contract_covers_dynamic_metadata_shards() {
-        let mut layout = StorageLayout::new();
-        register_storage_paths(&mut layout).expect("register DFS storage paths");
-
-        for path in [
-            "dfs/content/blob-packs/index.sobj",
-            "dfs/content/blob-packs/segments/0000000000000000.pack",
-            "dfs/content/stats.sobj",
-            "dfs/metadata/services/records/tables/materialized.slog",
-            "dfs/metadata/users/journal/segments/00000000000000000001.slog",
-            "dfs/metadata/custom-shard/records/objects/example.sobj",
-        ] {
-            assert!(
-                layout.owner_for(path).is_some(),
-                "storage contract should cover {path}"
-            );
-        }
-    }
 }
 
 pub fn fallback_dfs_node_id() -> NodeId {
