@@ -29,6 +29,8 @@ pub mod protocol;
 mod repair;
 mod routes;
 mod service;
+mod service_conflict;
+mod service_content;
 mod service_core;
 mod service_hydration;
 mod service_maintenance;
@@ -345,6 +347,7 @@ pub use routes::{
 pub(crate) use routes::{
     build_dfs_routed_message, dfs_network_message_allows_write_repair_progress,
 };
+pub(crate) use service_content::object_content_identity;
 
 pub type DfsFileSystemId = sinomo_core::Id;
 pub type DfsNodeId = NodeId;
@@ -1788,159 +1791,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.remove_pending_write_state(intent_id);
     }
 
-    pub fn conflicts_for_object(
-        &self,
-        object_id: &DfsObjectId,
-    ) -> Result<Vec<DfsConflictRecord>, DfsError> {
-        let mut conflicts: BTreeMap<String, DfsConflictRecord> = self
-            .metadata
-            .conflicts_for_object(object_id)
-            .into_iter()
-            .map(|conflict| (conflict.conflict_id.clone(), conflict))
-            .collect();
-        self.merge_backend_conflict_pages(object_id, &mut conflicts, |_| true)?;
-        Ok(conflicts.into_values().collect())
-    }
-
-    pub fn open_conflicts_for_object(
-        &self,
-        object_id: &DfsObjectId,
-    ) -> Result<Vec<DfsConflictRecord>, DfsError> {
-        let mut conflicts: BTreeMap<String, DfsConflictRecord> = self
-            .metadata
-            .open_conflicts_for_object(object_id)
-            .into_iter()
-            .map(|conflict| (conflict.conflict_id.clone(), conflict))
-            .collect();
-        self.merge_backend_conflict_pages(object_id, &mut conflicts, |conflict| {
-            conflict.status == DfsConflictStatus::Open
-        })?;
-        Ok(conflicts.into_values().collect())
-    }
-
-    pub fn update_conflict_status(
-        &mut self,
-        object_id: &DfsObjectId,
-        conflict_id: &str,
-        status: DfsConflictStatus,
-    ) -> Result<Option<DfsConflictRecord>, DfsError> {
-        let updated = if let Some(backend) = self.metadata_backend.as_mut() {
-            backend.update_conflict_status(object_id, conflict_id, status.clone())?
-        } else {
-            self.metadata
-                .conflicts_for_object(object_id)
-                .into_iter()
-                .find(|conflict| conflict.conflict_id == conflict_id)
-                .map(|mut conflict| {
-                    conflict.status = status;
-                    conflict
-                })
-        };
-        if let Some(conflict) = updated.clone() {
-            self.metadata.add_conflict(conflict);
-        }
-        Ok(updated)
-    }
-
-    pub fn reconcile_local_manifests(
-        &mut self,
-        object_id: &DfsObjectId,
-    ) -> Result<DfsReconnectReconciliation, DfsError> {
-        let object = self.current_read_object_metadata(object_id)?;
-        let manifests = self
-            .content
-            .manifests_for_object(object.object_id.as_str())?;
-        let mut refreshed_receipts = 0;
-        let mut conflicts = Vec::new();
-        let mut has_current_manifest = false;
-
-        for manifest in manifests {
-            let manifest_version = DfsVersion::deserialize_migrating_legacy(
-                manifest.version.clone(),
-            )
-            .map_err(|error| DfsError::ContentStore {
-                message: error.to_string(),
-            })?;
-            if manifest_version == object.version {
-                if object
-                    .content_hash
-                    .as_ref()
-                    .is_some_and(|hash| hash == &manifest.content_hash)
-                {
-                    if self
-                        .content
-                        .has_blob(&manifest.content_hash)
-                        .unwrap_or(false)
-                    {
-                        has_current_manifest = true;
-                        let local_node_id = self.node_id.clone();
-                        let receipt_inserted = self.put_metadata_receipt(
-                            &object.file_system_id,
-                            &object.object_id,
-                            &object.version,
-                            &local_node_id,
-                            &manifest.content_hash,
-                        )?;
-                        self.mark_repaired_location(
-                            &object.object_id,
-                            &object.version,
-                            &local_node_id,
-                            &manifest.content_hash,
-                        )?;
-                        if receipt_inserted {
-                            refreshed_receipts += 1;
-                        }
-                    }
-                } else {
-                    conflicts.push(self.create_write_conflict(
-                        &object,
-                        Some(object.version.clone()),
-                        manifest_version,
-                        self.node_id.clone(),
-                        Some(manifest.content_hash),
-                        "local current-version manifest hash diverged during reconnect".to_string(),
-                        None,
-                    )?);
-                }
-            } else if !self.local_manifest_is_known_historical_version(
-                &object.object_id,
-                &manifest_version,
-                &manifest.content_hash,
-            )? {
-                conflicts.push(self.create_write_conflict(
-                    &object,
-                    Some(object.version.clone()),
-                    manifest_version,
-                    self.node_id.clone(),
-                    Some(manifest.content_hash),
-                    "local non-visible manifest diverged during reconnect".to_string(),
-                    None,
-                )?);
-            }
-        }
-
-        Ok(DfsReconnectReconciliation {
-            object_id: object.object_id.clone(),
-            refreshed_receipts,
-            conflicts,
-            missing_current: object.content_hash.is_some() && !has_current_manifest,
-        })
-    }
-
-    fn local_manifest_is_known_historical_version(
-        &self,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-        content_hash: &str,
-    ) -> Result<bool, DfsError> {
-        let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(false);
-        };
-        Ok(backend
-            .get_version(object_id, version)?
-            .is_some_and(|record| record.content_hash.as_deref() == Some(content_hash)))
-    }
-
     pub fn handoff_object_owner(
         &mut self,
         object_id: &DfsObjectId,
@@ -2056,142 +1906,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         Ok(())
-    }
-
-    fn create_write_conflict(
-        &mut self,
-        object: &DfsObjectMetadata,
-        base_version: Option<DfsVersion>,
-        local_version: DfsVersion,
-        detected_by_node_id: NodeId,
-        local_content_hash: Option<String>,
-        reason: String,
-        created_by_intent_id: Option<String>,
-    ) -> Result<DfsConflictRecord, DfsError> {
-        let conflict_id = conflict_id_for(
-            &object.object_id,
-            &local_version,
-            local_content_hash.as_deref(),
-            &detected_by_node_id,
-        );
-        if let Some(existing) =
-            self.get_conflict_from_memory_or_backend(&object.object_id, &conflict_id)?
-        {
-            return Ok(existing);
-        }
-        let conflict = DfsConflictRecord {
-            conflict_id,
-            file_system_id: object.file_system_id.clone(),
-            object_id: object.object_id.clone(),
-            path: object.path.clone(),
-            base_version,
-            local_version,
-            remote_version: object.version.clone(),
-            detected_by_node_id,
-            reason,
-            local_content_hash,
-            remote_content_hash: object.content_hash.clone(),
-            created_by_intent_id,
-            strategy: Some("branch".to_string()),
-            status: DfsConflictStatus::Open,
-            detected_at: OffsetDateTime::now_utc(),
-        };
-        self.put_conflict_record(&conflict)?;
-        Ok(conflict)
-    }
-
-    fn put_conflict_record(&mut self, conflict: &DfsConflictRecord) -> Result<(), DfsError> {
-        if let Some(backend) = self.metadata_backend.as_mut() {
-            if backend
-                .get_conflict(&conflict.object_id, &conflict.conflict_id)?
-                .as_ref()
-                == Some(conflict)
-            {
-                self.metadata.add_conflict(conflict.clone());
-                return Ok(());
-            }
-            backend.put_conflict(conflict)?;
-        }
-        self.metadata.add_conflict(conflict.clone());
-        Ok(())
-    }
-
-    fn add_backend_conflict_pages_to_memory(
-        &mut self,
-        object_id: &DfsObjectId,
-    ) -> Result<(), DfsError> {
-        if self.metadata_backend.is_none() {
-            return Ok(());
-        }
-        let mut cursor = None;
-        loop {
-            let page = self
-                .metadata_backend
-                .as_ref()
-                .expect("metadata backend checked above")
-                .conflicts_for_object_page(
-                    object_id,
-                    cursor.as_ref(),
-                    DFS_CONFLICT_SCAN_PAGE_SIZE,
-                )?;
-            for conflict in page.conflicts {
-                self.metadata.add_conflict(conflict);
-            }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            cursor = Some(next_cursor);
-        }
-        Ok(())
-    }
-
-    fn merge_backend_conflict_pages<F>(
-        &self,
-        object_id: &DfsObjectId,
-        conflicts: &mut BTreeMap<String, DfsConflictRecord>,
-        mut include_conflict: F,
-    ) -> Result<(), DfsError>
-    where
-        F: FnMut(&DfsConflictRecord) -> bool,
-    {
-        let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(());
-        };
-        let mut cursor = None;
-        loop {
-            let page = backend.conflicts_for_object_page(
-                object_id,
-                cursor.as_ref(),
-                DFS_CONFLICT_SCAN_PAGE_SIZE,
-            )?;
-            for conflict in page.conflicts {
-                if include_conflict(&conflict) {
-                    conflicts.insert(conflict.conflict_id.clone(), conflict);
-                }
-            }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            cursor = Some(next_cursor);
-        }
-        Ok(())
-    }
-
-    fn get_conflict_from_memory_or_backend(
-        &self,
-        object_id: &DfsObjectId,
-        conflict_id: &str,
-    ) -> Result<Option<DfsConflictRecord>, DfsError> {
-        if let Some(backend) = self.metadata_backend.as_ref()
-            && let Some(conflict) = backend.get_conflict(object_id, conflict_id)?
-        {
-            return Ok(Some(conflict));
-        }
-        Ok(self
-            .metadata
-            .conflicts_for_object(object_id)
-            .into_iter()
-            .find(|conflict| conflict.conflict_id == conflict_id))
     }
 
     fn retry_pending_stages(&mut self) -> Result<(), DfsError> {
@@ -2439,161 +2153,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object_metadata,
         )?;
         Ok(Some(outcome))
-    }
-
-    fn open_pending_write_blob_stream(
-        &self,
-        pending: &PendingNetworkedWrite,
-    ) -> Result<ObjectVersionReader, DfsError> {
-        if let Ok((manifest, reader)) = self
-            .content
-            .open_object_version_stream(pending.object_id.as_str(), pending.version.as_str())
-        {
-            if manifest.content_hash == pending.content_hash
-                && (pending.size_bytes == 0 || manifest.size_bytes == pending.size_bytes)
-            {
-                return Ok(reader);
-            }
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "pending write manifest mismatch for {} {}: expected hash {} size {}, actual hash {} size {}",
-                    pending.object_id,
-                    pending.version,
-                    pending.content_hash,
-                    pending.size_bytes,
-                    manifest.content_hash,
-                    manifest.size_bytes
-                ),
-            });
-        }
-
-        let reader = self.content.open_blob_stream(&pending.content_hash)?;
-        if pending.size_bytes != 0 && reader.size_bytes() != pending.size_bytes {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "pending write blob size mismatch for {} {}: expected {}, actual {}",
-                    pending.object_id,
-                    pending.version,
-                    pending.size_bytes,
-                    reader.size_bytes()
-                ),
-            });
-        }
-        Ok(ObjectVersionReader::from_blob(reader))
-    }
-
-    fn open_content_hash_stream(
-        &self,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-        content_hash: &str,
-        expected_size_bytes: Option<u64>,
-    ) -> Result<(u64, ObjectVersionReader), DfsError> {
-        if let Ok((manifest, reader)) = self
-            .content
-            .open_object_version_stream(object_id.as_str(), version.as_str())
-        {
-            if manifest.content_hash != content_hash {
-                return Err(DfsError::ContentHashMismatch {
-                    expected: content_hash.to_string(),
-                    actual: manifest.content_hash,
-                });
-            }
-            if let Some(expected_size_bytes) = expected_size_bytes
-                && manifest.size_bytes != expected_size_bytes
-            {
-                return Err(DfsError::Distributed {
-                    message: format!(
-                        "object version size mismatch for {object_id} {version}: expected {expected_size_bytes}, actual {}",
-                        manifest.size_bytes
-                    ),
-                });
-            }
-            return Ok((manifest.size_bytes, reader));
-        }
-
-        let reader = self.content.open_blob_stream(content_hash)?;
-        if let Some(expected_size_bytes) = expected_size_bytes
-            && reader.size_bytes() != expected_size_bytes
-        {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "content blob size mismatch for {object_id} {version}: expected {expected_size_bytes}, actual {}",
-                    reader.size_bytes()
-                ),
-            });
-        }
-        let size_bytes = reader.size_bytes();
-        Ok((size_bytes, ObjectVersionReader::from_blob(reader)))
-    }
-
-    pub fn read_object_version_content(
-        &self,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-        content_hash: &str,
-        expected_size_bytes: Option<u64>,
-    ) -> Result<Vec<u8>, DfsError> {
-        let (size_bytes, mut reader) =
-            self.open_content_hash_stream(object_id, version, content_hash, expected_size_bytes)?;
-        let mut bytes = Vec::with_capacity(usize::try_from(size_bytes).unwrap_or(0));
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|source| DfsError::ContentStore {
-                message: format!("cannot read DFS object {object_id} version {version}: {source}"),
-            })?;
-        Ok(bytes)
-    }
-
-    fn open_content_hash_range_stream(
-        &self,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-        content_hash: &str,
-        expected_size_bytes: Option<u64>,
-        offset: u64,
-        max_bytes: usize,
-    ) -> Result<ObjectVersionReader, DfsError> {
-        if let Ok((manifest, reader)) = self.content.open_object_version_range_stream(
-            object_id.as_str(),
-            version.as_str(),
-            offset,
-            max_bytes,
-        ) {
-            if manifest.content_hash != content_hash {
-                return Err(DfsError::ContentHashMismatch {
-                    expected: content_hash.to_string(),
-                    actual: manifest.content_hash,
-                });
-            }
-            if let Some(expected_size_bytes) = expected_size_bytes
-                && manifest.size_bytes != expected_size_bytes
-            {
-                return Err(DfsError::Distributed {
-                    message: format!(
-                        "object version range size mismatch for {object_id} {version}: expected {expected_size_bytes}, actual {}",
-                        manifest.size_bytes
-                    ),
-                });
-            }
-            return Ok(reader);
-        }
-
-        let reader = self
-            .content
-            .open_blob_range_stream(content_hash, offset, max_bytes)?;
-        if let Some(expected_size_bytes) = expected_size_bytes {
-            let range_start = reader.offset();
-            let range_end = range_start.saturating_add(reader.remaining_bytes());
-            if range_start > expected_size_bytes || range_end > expected_size_bytes {
-                return Err(DfsError::Distributed {
-                    message: format!(
-                        "content blob range for {object_id} {version} exceeds expected size {expected_size_bytes}: {range_start}..{range_end}"
-                    ),
-                });
-            }
-        }
-        Ok(ObjectVersionReader::from_blob_range(reader))
     }
 
     fn request_stage_blob_from_alternate(
@@ -4393,66 +3952,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    pub(crate) fn object_content_size_hint(
-        &self,
-        object: &DfsObjectMetadata,
-    ) -> Result<Option<u64>, DfsError> {
-        if !matches!(object.kind, DfsObjectKind::File | DfsObjectKind::Symlink) {
-            return Ok(None);
-        }
-        if let Ok(manifest) = self
-            .content
-            .read_manifest(object.object_id.as_str(), object.version.as_str())
-        {
-            return Ok(Some(manifest.size_bytes));
-        }
-        if object.content_size_bytes.is_some() {
-            return Ok(object.content_size_bytes);
-        }
-        if let Some(backend) = self.metadata_backend.as_ref()
-            && let Some(version) = backend.get_version(&object.object_id, &object.version)?
-            && version.size_bytes.is_some()
-        {
-            return Ok(version.size_bytes);
-        }
-        if let Some(expected_hash) = object.content_hash.as_ref()
-            && let Some(manifest) = self
-                .content
-                .manifests_for_object(object.object_id.as_str())?
-                .into_iter()
-                .rev()
-                .find(|manifest| &manifest.content_hash == expected_hash)
-        {
-            return Ok(Some(manifest.size_bytes));
-        }
-        if let Some(backend) = self.metadata_backend.as_ref() {
-            if let Some(expected_hash) = object.content_hash.as_ref() {
-                let mut version_cursor = None;
-                let mut matching_size_bytes = None;
-                loop {
-                    let page = backend.versions_for_object_page(
-                        &object.object_id,
-                        version_cursor.as_ref(),
-                        DFS_METADATA_OBJECT_VERSION_PAGE_SIZE,
-                    )?;
-                    for version in page.versions {
-                        if version.content_hash.as_ref() == Some(expected_hash) {
-                            matching_size_bytes = Some(version.size_bytes);
-                        }
-                    }
-                    let Some(next_cursor) = page.next_cursor else {
-                        break;
-                    };
-                    version_cursor = Some(next_cursor);
-                }
-                if let Some(size_bytes) = matching_size_bytes {
-                    return Ok(size_bytes);
-                }
-            }
-        }
-        Ok(None)
-    }
-
     fn commit_visible_version_in_metadata_backend(
         &mut self,
         intent: &DistributedWriteIntent,
@@ -4677,59 +4176,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         Ok(())
-    }
-
-    fn local_object_version_manifest_matches(
-        &self,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-        expected_hash: &str,
-        expected_size_bytes: u64,
-    ) -> bool {
-        if self
-            .content
-            .read_manifest(object_id.as_str(), version.as_str())
-            .is_ok_and(|manifest| {
-                manifest.content_hash == expected_hash
-                    && manifest.size_bytes == expected_size_bytes
-                    && self
-                        .content
-                        .manifest_content_available(&manifest)
-                        .unwrap_or(false)
-            })
-        {
-            return true;
-        }
-        self.content
-            .open_blob_stream(expected_hash)
-            .is_ok_and(|reader| reader.size_bytes() == expected_size_bytes)
-    }
-
-    fn local_object_version_manifest_size_if_matches(
-        &self,
-        object_id: &DfsObjectId,
-        version: &DfsVersion,
-        expected_hash: &str,
-    ) -> Option<u64> {
-        if let Some(size_bytes) = self
-            .content
-            .read_manifest(object_id.as_str(), version.as_str())
-            .ok()
-            .filter(|manifest| {
-                manifest.content_hash == expected_hash
-                    && self
-                        .content
-                        .manifest_content_available(manifest)
-                        .unwrap_or(false)
-            })
-            .map(|manifest| manifest.size_bytes)
-        {
-            return Some(size_bytes);
-        }
-        self.content
-            .open_blob_stream(expected_hash)
-            .ok()
-            .map(|reader| reader.size_bytes())
     }
 
     fn ensure_replica_object_metadata(
@@ -5408,34 +4854,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
-    fn read_patch_blob_range(
-        &self,
-        patch_hash: &str,
-        offset: u64,
-        len: u64,
-    ) -> Result<Vec<u8>, DfsError> {
-        let len = usize::try_from(len).map_err(|_| DfsError::Distributed {
-            message: format!("DFS patch range is too large to fit in memory: {len} bytes"),
-        })?;
-        let mut reader = self
-            .content
-            .open_blob_range_stream(patch_hash, offset, len)
-            .map_err(|source| DfsError::ContentStore {
-                message: format!(
-                    "failed to open DFS patch blob {patch_hash} at {offset}+{len}: {source}"
-                ),
-            })?;
-        let mut bytes = vec![0_u8; len];
-        reader
-            .read_exact(&mut bytes)
-            .map_err(|source| DfsError::ContentStore {
-                message: format!(
-                    "failed to read DFS patch blob {patch_hash} at {offset}+{len}: {source}"
-                ),
-            })?;
-        Ok(bytes)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn send_stage_blob_window_if_routable(
         &mut self,
@@ -5827,13 +5245,6 @@ fn read_small_blob_from_reader(
             message: format!("failed to read inline blob {content_hash}: {source}"),
         })?;
     Ok(bytes)
-}
-
-fn object_content_identity(object: &DfsObjectMetadata) -> Option<ContentVersionIdentity> {
-    Some(ContentVersionIdentity {
-        content_hash: object.content_hash.clone()?,
-        size_bytes: object.content_size_bytes?,
-    })
 }
 
 #[cfg(test)]
