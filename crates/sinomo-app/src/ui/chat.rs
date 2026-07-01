@@ -1096,30 +1096,9 @@ impl ChatState {
         let spawn_result = thread::Builder::new()
             .name("sinomo-app-chat-list".to_string())
             .spawn(move || {
-                let (indexed_chat_sessions, _) =
-                    list_index_chat_conversations_with_error(&data_dir, sifs_daemon.as_ref());
-                let mut last_partial_sessions = Vec::new();
-                if !indexed_chat_sessions.is_empty()
-                    && tx
-                        .send(SessionListWorkerResult {
-                            sessions: indexed_chat_sessions.clone(),
-                            error: None,
-                            complete: false,
-                        })
-                        .is_ok()
-                {
-                    last_partial_sessions = indexed_chat_sessions.clone();
-                    if let Some(waker) = worker_waker.as_ref() {
-                        waker.wake();
-                    }
-                }
-
-                let (mut chat_sessions, chat_error) =
+                let (chat_sessions, chat_error) =
                     list_chat_conversations_with_error(&data_dir, sifs_daemon.as_ref());
-                if chat_sessions.is_empty() && !indexed_chat_sessions.is_empty() {
-                    chat_sessions = indexed_chat_sessions;
-                }
-                if chat_sessions != last_partial_sessions
+                if !chat_sessions.is_empty()
                     && tx
                         .send(SessionListWorkerResult {
                             sessions: chat_sessions.clone(),
@@ -3951,19 +3930,6 @@ fn list_conversations_with_error(
         .filter(|_| conversations.is_empty())
         .or_else(|| channel_error.filter(|_| conversations.is_empty()));
     (conversations, error)
-}
-
-fn list_index_chat_conversations_with_error(
-    data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
-) -> (Vec<SessionRef>, Option<String>) {
-    let Some(_) = sifs_daemon else {
-        return (Vec::new(), None);
-    };
-    match sessions::list_index_with_report_via_daemon(data_dir, sifs_daemon) {
-        Ok(metas) => (chat_metas_to_session_refs(metas), None),
-        Err(_) => (Vec::new(), None),
-    }
 }
 
 fn list_chat_conversations_with_error(

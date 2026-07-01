@@ -38,8 +38,8 @@ use sui::{
     DefaultTheme, Event, EventCtx, Flex, FlexItem, FontWeight, IconButton, IconGlyph, KeyState,
     ListItem, ListView, MeasureCtx, PaintCtx, Point, PointerButton, PointerEventKind, Rect,
     ScrollState, ScrollView, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole,
-    SemanticsValue, Separator, Size, SizedBox, Stack, StackHostOptions, Widget, WidgetPod,
-    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, draw_glyph,
+    SemanticsValue, Separator, Size, SizedBox, Stack, StackHostOptions, Tooltip, TooltipPlacement,
+    Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, draw_glyph,
 };
 
 use sinomo_cli::app_api::{
@@ -63,9 +63,10 @@ const ROW_ACTION_SIDE: f32 = 24.0;
 const ROW_ACTION_GAP: f32 = 4.0;
 const ROW_ACTION_COUNT: f32 = 4.0;
 const CONTENT_PAD: f32 = 16.0;
-const HEADER_H: f32 = 78.0;
-const HEADER_COMMAND_GAP: f32 = 8.0;
-const HEADER_ROW_GAP: f32 = 6.0;
+const HEADER_H: f32 = 48.0;
+const HEADER_CONTROL_H: f32 = 30.0;
+const HEADER_COMMAND_GAP: f32 = 6.0;
+const HEADER_PAD_Y: f32 = 9.0;
 const FILES_STATUS_H: f32 = 38.0;
 const LIST_HEADER_H: f32 = 36.0;
 const LIST_FILTER_H: f32 = 72.0;
@@ -4451,6 +4452,15 @@ fn secondary_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + '
     }
 }
 
+fn toolbar_tooltip<W>(text: impl Into<String>, child: W, reader: &ThemeReader) -> Tooltip
+where
+    W: Widget + 'static,
+{
+    Tooltip::new(text, child)
+        .placement(TooltipPlacement::Below)
+        .theme(reader())
+}
+
 fn human_size(size: Option<u64>) -> String {
     match size {
         None => "—".to_string(),
@@ -6086,9 +6096,8 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 
     let new_file = {
         let s = shared.clone();
-        sui::Button::new("New file")
-            .icon(IconGlyph::File)
-            .min_width(96.0)
+        IconButton::new(IconGlyph::File, "New file")
+            .size(HEADER_CONTROL_H)
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
@@ -6103,9 +6112,8 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 
     let new_folder = {
         let s = shared.clone();
-        sui::Button::new("New folder")
-            .icon(IconGlyph::Folder)
-            .min_width(112.0)
+        IconButton::new(IconGlyph::Folder, "New folder")
+            .size(HEADER_CONTROL_H)
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
@@ -6234,37 +6242,83 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             })
     };
 
-    let navigation_row = Flex::horizontal()
+    let toolbar_row = Flex::horizontal()
         .main_gap(HEADER_COMMAND_GAP)
         .align_items(Alignment::Center)
-        .with_item(back, FlexItem::new().no_shrink())
-        .with_item(forward, FlexItem::new().no_shrink())
-        .with_item(up, FlexItem::new().no_shrink())
         .with_item(
-            SizedBox::new().width(118.0).height(30.0).with_child(source),
-            FlexItem::fixed(118.0),
+            toolbar_tooltip("Back", back, reader),
+            FlexItem::new().no_shrink(),
         )
-        .with_item(breadcrumb, FlexItem::fill().min_width(180.0))
-        .with_item(refresh, FlexItem::new().no_shrink())
-        .with_item(go_to, FlexItem::new().no_shrink());
-
-    let command_row = Flex::horizontal()
-        .main_gap(HEADER_COMMAND_GAP)
-        .align_items(Alignment::Center)
-        .with_item(new_file, FlexItem::new().no_shrink())
-        .with_item(new_folder, FlexItem::new().no_shrink())
-        .with_item(copy, FlexItem::new().no_shrink())
-        .with_item(move_to, FlexItem::new().no_shrink())
-        .with_item(refresh_placement, FlexItem::new().no_shrink())
-        .with_item(repair_replicas, FlexItem::new().no_shrink())
-        .with_item(rename, FlexItem::new().no_shrink())
-        .with_item(delete, FlexItem::new().no_shrink());
+        .with_item(
+            toolbar_tooltip("Forward", forward, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("Up", up, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            SizedBox::new()
+                .width(108.0)
+                .height(HEADER_CONTROL_H)
+                .with_child(source),
+            FlexItem::fixed(108.0),
+        )
+        .with_item(breadcrumb, FlexItem::fill())
+        .with_item(
+            toolbar_tooltip(
+                format!("Refresh {}", shared.files().source.label()),
+                refresh,
+                reader,
+            ),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("Go to path", go_to, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("New file", new_file, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("New folder", new_folder, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("Copy to", copy, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("Move to", move_to, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("Refresh placement", refresh_placement, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("Repair replicas", repair_replicas, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("Rename", rename, reader),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            toolbar_tooltip("Delete selected item", delete, reader),
+            FlexItem::new().no_shrink(),
+        );
 
     Stack::vertical()
-        .spacing(HEADER_ROW_GAP)
         .alignment(Alignment::Stretch)
-        .with_child(SizedBox::new().height(30.0).with_child(navigation_row))
-        .with_child(SizedBox::new().height(30.0).with_child(command_row))
+        .with_child(SizedBox::new().height(HEADER_PAD_Y))
+        .with_child(
+            SizedBox::new()
+                .height(HEADER_CONTROL_H)
+                .with_child(toolbar_row),
+        )
+        .with_child(SizedBox::new().height(HEADER_PAD_Y))
 }
 
 // ---------------------------------------------------------------------------

@@ -3111,13 +3111,7 @@ impl SifsBrowser {
                 .iter()
                 .map(|path| (path.clone(), backend.read_file(path)))
                 .collect()),
-            SifsBrowserBackend::Remote(remote) => match remote.read_files(paths) {
-                Ok(files) => Ok(files),
-                Err(_) => Ok(paths
-                    .iter()
-                    .map(|path| (path.clone(), remote.read_file(path)))
-                    .collect()),
-            },
+            SifsBrowserBackend::Remote(remote) => remote.read_files(paths),
         }
     }
 
@@ -4356,6 +4350,25 @@ mod tests {
                 .read_file("/services/sinomo-agent/channel-index.json")
                 .is_err(),
             "channel summaries should not create a shared mutable index cache"
+        );
+    }
+
+    #[test]
+    fn sifs_channel_summaries_skip_channel_dirs_without_snapshots() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-missing-snapshot");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        SifsBrowser::open(&data_dir)
+            .expect("open SIFS")
+            .create_dir_all(&SifsAgentChannelStore::channel_dir(&channel_id))
+            .expect("create partial channel dir");
+
+        let summaries = store.list_channel_summaries().expect("list summaries");
+
+        assert!(
+            summaries.is_empty(),
+            "partial channel directories without snapshots should be ignored"
         );
     }
 

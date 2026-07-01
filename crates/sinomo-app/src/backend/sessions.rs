@@ -14,7 +14,6 @@ use sinomo_cli::app_api::{SifsBrowser, SifsEntry};
 use sinomo_runtime::local::SinomoDataDir;
 
 pub const SIFS_SESSIONS_ROOT: &str = "/services/sinomo-app/chat/sessions";
-const SIFS_SESSIONS_INDEX: &str = "/services/sinomo-app-chat-sessions-index.json";
 const SIFS_SESSION_FILE_PREFIX: &str = "/services/sinomo-app-chat-session-";
 const SIFS_SESSION_FILE_NAME_PREFIX: &str = "sinomo-app-chat-session-";
 const SIFS_SESSION_FILE_SUFFIX: &str = ".json";
@@ -103,12 +102,6 @@ pub struct StoredTranscript {
 struct StoredSessionRecord {
     meta: SessionMeta,
     transcript: StoredTranscript,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct StoredSessionIndex {
-    #[serde(default)]
-    sessions: Vec<SessionMeta>,
 }
 
 /// Persist a chat's metadata + transcript.
@@ -304,18 +297,6 @@ pub fn list_with_report_via_daemon(
     Ok(metas)
 }
 
-pub fn list_index_with_report_via_daemon(
-    data_dir: &SinomoDataDir,
-    daemon: Option<&SifsDaemonAccess>,
-) -> Result<Vec<SessionMeta>, String> {
-    let daemon =
-        daemon.ok_or_else(|| "chat persistence requires a daemon connection".to_string())?;
-    let browser = open_sifs_browser(data_dir, Some(daemon))?;
-    let mut metas = list_sifs_index(&browser)?;
-    metas.retain(|meta| meta.deleted_unix.is_none());
-    Ok(metas)
-}
-
 /// Load a chat's transcript on demand.
 pub fn load_transcript(data_dir: &SinomoDataDir, id: &str) -> Option<StoredTranscript> {
     load_transcript_using(data_dir, None, id)
@@ -372,27 +353,6 @@ fn save_sifs_with_browser(
         &sifs_session_file(id)?,
         &serde_json::to_vec(&record).map_err(|error| error.to_string())?,
     )?;
-    // The flat per-session record is the authoritative SIFS object; the index only accelerates
-    // sidebar listing and can be rebuilt from records when it is stale or conflicted.
-    if let Err(error) = update_sifs_index(browser, meta) {
-        tracing::warn!(
-            session_id = %meta.id,
-            %error,
-            "chat session index update failed after the SIFS record was saved"
-        );
-    }
-    Ok(())
-}
-
-fn update_sifs_index(browser: &SifsBrowser, meta: &SessionMeta) -> Result<(), String> {
-    let mut metas = read_sifs_index(browser).unwrap_or_default().sessions;
-    merge_session_meta(&mut metas, meta.clone());
-    metas.sort_by_key(|existing| std::cmp::Reverse(existing.updated_unix));
-    let index = StoredSessionIndex { sessions: metas };
-    browser.write_file(
-        SIFS_SESSIONS_INDEX,
-        &serde_json::to_vec(&index).map_err(|error| error.to_string())?,
-    )?;
     Ok(())
 }
 
@@ -401,7 +361,7 @@ fn list_sifs(
     daemon: Option<&SifsDaemonAccess>,
 ) -> Result<Vec<SessionMeta>, String> {
     let browser = open_sifs_browser(data_dir, daemon)?;
-    let mut metas = list_sifs_index(&browser).unwrap_or_default();
+    let mut metas = Vec::new();
     for meta in list_flat_sifs_records(&browser)
         .into_iter()
         .chain(list_legacy_sifs(&browser))
@@ -409,12 +369,6 @@ fn list_sifs(
         merge_session_meta(&mut metas, meta);
     }
     metas.retain(|meta| meta.deleted_unix.is_none());
-    Ok(metas)
-}
-
-fn list_sifs_index(browser: &SifsBrowser) -> Result<Vec<SessionMeta>, String> {
-    let mut metas = read_sifs_index(browser)?.sessions;
-    metas.sort_by_key(|meta| std::cmp::Reverse(meta.updated_unix));
     Ok(metas)
 }
 
@@ -532,11 +486,6 @@ fn load_sifs_record_from_browser(browser: &SifsBrowser, id: &str) -> Option<Stor
     load_legacy_sifs_record(browser, id)
 }
 
-fn read_sifs_index(browser: &SifsBrowser) -> Result<StoredSessionIndex, String> {
-    let bytes = browser.read_file(SIFS_SESSIONS_INDEX)?;
-    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
-}
-
 fn load_flat_sifs_record(browser: &SifsBrowser, id: &str) -> Option<StoredSessionRecord> {
     let file_path = sifs_session_file(id).ok()?;
     let bytes = browser.read_file(&file_path).ok()?;
@@ -625,92 +574,6 @@ mod tests {
     }
 
     #[test]
-    fn sifs_listing_recovers_index_only_session_records() {
-        let root = temp_data_dir("sifs-index-listing");
-        let data_dir = SinomoDataDir::new(&root);
-        let id = "01hxy6qa9k0t9vr4g9n8d3q5e0";
-        let meta = SessionMeta {
-            id: id.to_string(),
-            title: "indexed record".to_string(),
-            updated_unix: 84,
-            message_count: 2,
-            title_source: Some("user".to_string()),
-            deleted_unix: None,
-        };
-        let browser = SifsBrowser::open(&data_dir).expect("open sifs");
-        browser
-            .write_file(
-                SIFS_SESSIONS_INDEX,
-                &serde_json::to_vec(&StoredSessionIndex {
-                    sessions: vec![meta.clone()],
-                })
-                .expect("index json"),
-            )
-            .expect("write session index");
-
-        let listed = list(&data_dir);
-        assert!(
-            listed
-                .iter()
-                .any(|session| session.id == meta.id && session.title == meta.title),
-            "index-only session records from older builds should remain visible"
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn sifs_listing_index_tombstone_hides_older_flat_record() {
-        let root = temp_data_dir("sifs-index-tombstone");
-        let data_dir = SinomoDataDir::new(&root);
-        let id = "01hxy6qa9k0t9vr4g9n8d3q5e1";
-        let flat_meta = SessionMeta {
-            id: id.to_string(),
-            title: "older flat record".to_string(),
-            updated_unix: 10,
-            message_count: 1,
-            title_source: Some("auto".to_string()),
-            deleted_unix: None,
-        };
-        let tombstone = SessionMeta {
-            id: id.to_string(),
-            title: "Deleted chat".to_string(),
-            updated_unix: 20,
-            message_count: 0,
-            title_source: None,
-            deleted_unix: Some(20),
-        };
-        let browser = SifsBrowser::open(&data_dir).expect("open sifs");
-        browser
-            .write_file(
-                &sifs_session_file(id).expect("session path"),
-                &serde_json::to_vec(&StoredSessionRecord {
-                    meta: flat_meta,
-                    transcript: StoredTranscript::default(),
-                })
-                .expect("record json"),
-            )
-            .expect("write flat record");
-        browser
-            .write_file(
-                SIFS_SESSIONS_INDEX,
-                &serde_json::to_vec(&StoredSessionIndex {
-                    sessions: vec![tombstone],
-                })
-                .expect("index json"),
-            )
-            .expect("write session index");
-
-        let listed = list(&data_dir);
-        assert!(
-            listed.iter().all(|session| session.id != id),
-            "newer index tombstones should prevent older flat records from reappearing"
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn sifs_listing_recovers_flat_session_records_without_index() {
         let root = temp_data_dir("sifs-flat-listing");
         let data_dir = SinomoDataDir::new(&root);
@@ -749,22 +612,27 @@ mod tests {
     }
 
     #[test]
-    fn save_updates_sifs_index_for_fast_sidebar_listing() {
-        let root = temp_data_dir("sifs-index-save");
+    fn save_does_not_create_legacy_sifs_index() {
+        let root = temp_data_dir("sifs-no-index-save");
         let data_dir = SinomoDataDir::new(&root);
         let id = "01hxy6qa9k0t9vr4g9n8d3q5f0";
         let messages = vec![StoredMessage::new("user", "hello", "user", "message")];
 
-        save(&data_dir, id, "indexed after save", &messages).expect("save");
+        save(&data_dir, id, "saved without index", &messages).expect("save");
 
         let browser = SifsBrowser::open(&data_dir).expect("open sifs");
-        let index = read_sifs_index(&browser).expect("session index");
-        let meta = index
-            .sessions
+        assert!(
+            browser
+                .read_file("/services/sinomo-app-chat-sessions-index.json")
+                .is_err(),
+            "saving chats should not recreate the obsolete sidebar index"
+        );
+        let listed = list(&data_dir);
+        let meta = listed
             .iter()
             .find(|session| session.id == id)
-            .expect("saved session indexed");
-        assert_eq!(meta.title, "indexed after save");
+            .expect("saved session listed");
+        assert_eq!(meta.title, "saved without index");
         assert_eq!(meta.message_count, 1);
         assert!(meta.deleted_unix.is_none());
 
@@ -772,14 +640,14 @@ mod tests {
     }
 
     #[test]
-    fn save_succeeds_when_sidebar_index_update_fails() {
-        let root = temp_data_dir("sifs-index-unavailable");
+    fn save_succeeds_when_legacy_index_path_is_unavailable() {
+        let root = temp_data_dir("sifs-legacy-index-unavailable");
         let data_dir = SinomoDataDir::new(&root);
         let id = "01hxy6qa9k0t9vr4g9n8d3q5f2";
         let messages = vec![StoredMessage::new("user", "hello", "user", "message")];
         let browser = SifsBrowser::open(&data_dir).expect("open sifs");
         browser
-            .create_dir_all(SIFS_SESSIONS_INDEX)
+            .create_dir_all("/services/sinomo-app-chat-sessions-index.json")
             .expect("occupy index path");
 
         save(&data_dir, id, "saved without index", &messages)
@@ -798,39 +666,27 @@ mod tests {
     }
 
     #[test]
-    fn rename_and_delete_update_sifs_index() {
-        let root = temp_data_dir("sifs-index-edit");
+    fn rename_and_delete_update_flat_sifs_record() {
+        let root = temp_data_dir("sifs-flat-edit");
         let data_dir = SinomoDataDir::new(&root);
         let id = "01hxy6qa9k0t9vr4g9n8d3q5f1";
         let messages = vec![StoredMessage::new("user", "hello", "user", "message")];
 
         save(&data_dir, id, "original", &messages).expect("save");
-        rename(&data_dir, id, "Renamed in index").expect("rename");
+        rename(&data_dir, id, "Renamed chat").expect("rename");
 
-        let browser = SifsBrowser::open(&data_dir).expect("open sifs");
-        let index = read_sifs_index(&browser).expect("session index");
-        let meta = index
-            .sessions
-            .iter()
-            .find(|session| session.id == id)
-            .expect("renamed session indexed");
-        assert_eq!(meta.title, "Renamed in index");
-        assert_eq!(meta.title_source.as_deref(), Some("user"));
-        assert!(meta.deleted_unix.is_none());
+        let record = load_sifs_record(&data_dir, id).expect("renamed session saved");
+        assert_eq!(record.meta.title, "Renamed chat");
+        assert_eq!(record.meta.title_source.as_deref(), Some("user"));
+        assert!(record.meta.deleted_unix.is_none());
 
         delete(&data_dir, id).expect("delete");
 
-        let browser = SifsBrowser::open(&data_dir).expect("reopen sifs");
-        let index = read_sifs_index(&browser).expect("session index");
-        let meta = index
-            .sessions
-            .iter()
-            .find(|session| session.id == id)
-            .expect("deleted session tombstone indexed");
-        assert!(meta.deleted_unix.is_some());
+        let tombstone = load_sifs_record(&data_dir, id).expect("deleted session tombstone saved");
+        assert!(tombstone.meta.deleted_unix.is_some());
         assert!(
             list(&data_dir).iter().all(|session| session.id != id),
-            "indexed tombstone should hide deleted sessions from the sidebar list"
+            "flat tombstone should hide deleted sessions from the sidebar list"
         );
 
         let _ = fs::remove_dir_all(root);

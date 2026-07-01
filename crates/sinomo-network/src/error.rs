@@ -144,6 +144,8 @@ pub enum NetworkError {
     },
     #[error("network serialization error: {detail}")]
     Serialization { detail: String },
+    #[error("object RPC error at {route}: {detail}")]
+    ObjectRpc { route: String, detail: String },
     #[error("cluster JSON error at {path}: {detail}")]
     Json { path: String, detail: String },
     #[error("cluster storage I/O error at {path}: {detail}")]

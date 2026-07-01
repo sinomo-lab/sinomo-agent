@@ -307,6 +307,10 @@ impl From<network::NetworkError> for CliError {
             network::NetworkError::StorageIo { path, detail } => Self::Io { path, detail },
             network::NetworkError::ClusterReadOnly { detail } => Self::ClusterReadOnly { detail },
             network::NetworkError::Kv(error) => Self::Kv(error),
+            network::NetworkError::ObjectRpc { route, detail } => Self::Network {
+                address: route,
+                detail,
+            },
             network::NetworkError::Io { operation, detail } => Self::Network {
                 address: operation,
                 detail,
