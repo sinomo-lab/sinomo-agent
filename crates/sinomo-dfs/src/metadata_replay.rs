@@ -137,6 +137,18 @@ pub(crate) fn hydrate_journal_entry_payload<B: DfsMetadataBackend + ?Sized>(
     Ok(entry)
 }
 
+pub(crate) fn hydrate_journal_entry_payloads<B: DfsMetadataBackend + ?Sized>(
+    backend: &B,
+    tables: &DfsMetadataTables,
+    entries: Vec<DfsMetadataJournalEntry>,
+    receipt_page_size: usize,
+) -> Result<Vec<DfsMetadataJournalEntry>> {
+    entries
+        .into_iter()
+        .map(|entry| hydrate_journal_entry_payload(backend, tables, entry, receipt_page_size))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

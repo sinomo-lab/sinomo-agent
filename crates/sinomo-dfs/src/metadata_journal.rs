@@ -17,7 +17,7 @@ use crate::metadata_io::{
     remove_file_if_exists, sync_dir, write_sobj_atomic,
 };
 use crate::metadata_records::{
-    DfsMetadataJournalBatch, DfsMetadataJournalEntry, DfsMetadataShardId,
+    DfsMetadataJournalBatch, DfsMetadataJournalEntry, DfsMetadataMutation, DfsMetadataShardId,
 };
 
 pub(crate) const JOURNAL_SEGMENT_ENTRY_LIMIT: u64 = 8192;
@@ -267,6 +267,146 @@ pub(crate) fn append_segmented_journal_entries(
         "metadata-journal-segment"
     );
     Ok(())
+}
+
+pub(crate) fn write_local_journal_entry(
+    root: &Path,
+    shard_id: &DfsMetadataShardId,
+    next_sequence: &mut u64,
+    mutation: DfsMetadataMutation,
+) -> Result<DfsMetadataJournalEntry> {
+    let sequence = (*next_sequence).max(current_next_journal_sequence(root)?);
+    let entry = DfsMetadataJournalEntry {
+        shard_id: shard_id.clone(),
+        sequence,
+        created_at: time::OffsetDateTime::now_utc(),
+        mutation,
+    };
+    append_segmented_journal_entry(root, &entry)?;
+    *next_sequence = sequence.saturating_add(1);
+    Ok(entry)
+}
+
+pub(crate) fn write_local_journal_entries(
+    root: &Path,
+    shard_id: &DfsMetadataShardId,
+    next_sequence: &mut u64,
+    mutations: Vec<DfsMetadataMutation>,
+) -> Result<Vec<DfsMetadataJournalEntry>> {
+    if mutations.is_empty() {
+        return Ok(Vec::new());
+    }
+    let trace_started = Instant::now();
+    let sequence_started = Instant::now();
+    let mut candidate_sequence = (*next_sequence).max(current_next_journal_sequence(root)?);
+    let sequence_ms = sequence_started.elapsed().as_millis();
+    let build_started = Instant::now();
+    let mut entries = Vec::with_capacity(mutations.len());
+    for mutation in mutations {
+        entries.push(DfsMetadataJournalEntry {
+            shard_id: shard_id.clone(),
+            sequence: candidate_sequence,
+            created_at: time::OffsetDateTime::now_utc(),
+            mutation,
+        });
+        candidate_sequence = candidate_sequence.saturating_add(1);
+    }
+    let build_ms = build_started.elapsed().as_millis();
+
+    let mut chunk_start = 0usize;
+    let mut chunk_count = 0usize;
+    let mut append_ms = 0u128;
+    while chunk_start < entries.len() {
+        let segment_id = journal_segment_id(entries[chunk_start].sequence);
+        let mut chunk_end = chunk_start + 1;
+        while chunk_end < entries.len()
+            && journal_segment_id(entries[chunk_end].sequence) == segment_id
+        {
+            chunk_end += 1;
+        }
+        let chunk = entries[chunk_start..chunk_end].iter().collect::<Vec<_>>();
+        let append_started = Instant::now();
+        append_segmented_journal_entries(root, &chunk)?;
+        append_ms = append_ms.saturating_add(append_started.elapsed().as_millis());
+        *next_sequence = entries[chunk_end - 1].sequence.saturating_add(1);
+        chunk_count += 1;
+        chunk_start = chunk_end;
+    }
+    tracing::trace!(
+        target: "sinomo.dfs.perf",
+        shard = %shard_id.0,
+        entries = entries.len(),
+        chunks = chunk_count,
+        sequence_ms,
+        build_ms,
+        append_ms,
+        head_ms = 0,
+        total_ms = trace_started.elapsed().as_millis(),
+        "metadata-journal-entries"
+    );
+    Ok(entries)
+}
+
+pub(crate) fn persist_replayed_journal_entry(
+    root: &Path,
+    entry: &DfsMetadataJournalEntry,
+) -> Result<Option<u64>> {
+    if let Some(existing) = segmented_journal_entry_at_sequence(root, entry.sequence)? {
+        if existing == *entry {
+            return Ok(Some(entry.sequence));
+        }
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata journal sequence {} already exists with a different entry while replaying shard {}",
+            entry.sequence, entry.shard_id.0
+        )));
+    }
+    append_segmented_journal_entry(root, entry)?;
+    Ok(Some(entry.sequence))
+}
+
+pub(crate) fn persist_replayed_journal_entries(
+    root: &Path,
+    entries: &[&DfsMetadataJournalEntry],
+) -> Result<Option<u64>> {
+    let mut entries_by_segment = BTreeMap::<u64, Vec<&DfsMetadataJournalEntry>>::new();
+    let mut max_sequence = 0u64;
+    for entry in entries {
+        entries_by_segment
+            .entry(journal_segment_id(entry.sequence))
+            .or_default()
+            .push(*entry);
+        max_sequence = max_sequence.max(entry.sequence);
+    }
+    for (segment_id, entries) in entries_by_segment.iter_mut() {
+        entries.sort_by_key(|entry| entry.sequence);
+        let path = root
+            .join("journal")
+            .join("segments")
+            .join(format!("{segment_id:020}.slog"));
+        let existing = if path.exists() {
+            read_segmented_journal_file_since_limited(&path, 0, usize::MAX)?
+                .into_iter()
+                .map(|entry| (entry.sequence, entry))
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            BTreeMap::new()
+        };
+        let mut missing = Vec::new();
+        for entry in entries.iter().copied() {
+            if let Some(existing) = existing.get(&entry.sequence) {
+                if existing == entry {
+                    continue;
+                }
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata journal sequence {} already exists with a different entry while replaying shard {}",
+                    entry.sequence, entry.shard_id.0
+                )));
+            }
+            missing.push(entry);
+        }
+        append_segmented_journal_entries(root, &missing)?;
+    }
+    Ok((max_sequence > 0).then_some(max_sequence))
 }
 
 pub(crate) fn journal_entries_since_limited(
