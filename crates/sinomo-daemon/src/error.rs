@@ -70,6 +70,10 @@ impl From<sinomo_network::NetworkError> for DaemonError {
             }
             sinomo_network::NetworkError::Json { path, detail } => Self::Json { path, detail },
             sinomo_network::NetworkError::StorageIo { path, detail } => Self::Io { path, detail },
+            sinomo_network::NetworkError::ObjectRpc { route, detail } => Self::Network {
+                address: route,
+                detail,
+            },
             sinomo_network::NetworkError::Io { operation, detail } => Self::Network {
                 address: operation,
                 detail,

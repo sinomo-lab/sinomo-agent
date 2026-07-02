@@ -2931,6 +2931,23 @@ fn object_rpc_error_detail_maps_auth_denial() {
 }
 
 #[test]
+fn object_rpc_error_detail_maps_service_error_with_route_context() {
+    let response = ObjectRpcResponse::encode_error(
+        "/daemon/dfs/browser/read-file",
+        "not found: /services/example.json",
+    )
+    .expect("rpc error");
+
+    match response.error_detail().expect_err("rpc error detail") {
+        NetworkError::ObjectRpc { route, detail } => {
+            assert_eq!(route, "/daemon/dfs/browser/read-file");
+            assert_eq!(detail, "not found: /services/example.json");
+        }
+        error => panic!("unexpected error: {error}"),
+    }
+}
+
+#[test]
 fn iroh_daemon_proxy_error_route_hint_falls_back_for_unreadable_payload() {
     assert_eq!(
         crate::roaming::iroh_proxy_route_hint(b"not-a-control-frame"),

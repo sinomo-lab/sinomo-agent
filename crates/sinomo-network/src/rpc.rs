@@ -407,7 +407,10 @@ impl ObjectRpcResponse {
             ) {
                 return Err(NetworkError::AuthDenied);
             }
-            return Err(NetworkError::Serialization { detail });
+            return Err(NetworkError::ObjectRpc {
+                route: self.route.clone(),
+                detail,
+            });
         }
         Ok(())
     }

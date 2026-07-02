@@ -2840,6 +2840,48 @@ pub struct SifsEntry {
     pub size: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SifsListSortKey {
+    #[default]
+    Name,
+    Kind,
+    Size,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SifsListSortDirection {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SifsListOptions {
+    pub sort_key: SifsListSortKey,
+    pub sort_direction: SifsListSortDirection,
+    pub offset: usize,
+    pub limit: Option<usize>,
+}
+
+impl Default for SifsListOptions {
+    fn default() -> Self {
+        Self {
+            sort_key: SifsListSortKey::Name,
+            sort_direction: SifsListSortDirection::Ascending,
+            offset: 0,
+            limit: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SifsEntryPage {
+    pub entries: Vec<SifsEntry>,
+    pub total_count: usize,
+    pub offset: usize,
+    pub limit: Option<usize>,
+}
+
 /// SIFS metadata for a selected object.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SifsObjectDetails {
@@ -3064,6 +3106,24 @@ impl SifsBrowser {
         Ok(sort_sifs_entries(entries))
     }
 
+    pub fn list_shallow_page(
+        &self,
+        path: &str,
+        options: SifsListOptions,
+    ) -> Result<SifsEntryPage, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => {
+                let entries = backend
+                    .list_dir_shallow(path)?
+                    .into_iter()
+                    .map(sifs_entry_from_file_manager)
+                    .collect::<Vec<_>>();
+                Ok(page_sifs_entries(entries, options))
+            }
+            SifsBrowserBackend::Remote(remote) => remote.list_page(path, true, false, options),
+        }
+    }
+
     pub fn stat(&self, path: &str) -> Result<SifsObjectDetails, String> {
         match &self.backend {
             SifsBrowserBackend::Local(backend) => backend.dfs_stat(path).map(|stat| {
@@ -3111,13 +3171,7 @@ impl SifsBrowser {
                 .iter()
                 .map(|path| (path.clone(), backend.read_file(path)))
                 .collect()),
-            SifsBrowserBackend::Remote(remote) => match remote.read_files(paths) {
-                Ok(files) => Ok(files),
-                Err(_) => Ok(paths
-                    .iter()
-                    .map(|path| (path.clone(), remote.read_file(path)))
-                    .collect()),
-            },
+            SifsBrowserBackend::Remote(remote) => remote.read_files(paths),
         }
     }
 
@@ -3279,6 +3333,10 @@ impl RemoteSifsBrowser {
                 path: path.to_string(),
                 shallow,
                 missing_is_empty,
+                sort_key: sinomo_runtime::daemon::DaemonDfsBrowserSortKey::Name,
+                sort_direction: sinomo_runtime::daemon::DaemonDfsBrowserSortDirection::Ascending,
+                offset: 0,
+                limit: None,
             },
         )?;
         Ok(response
@@ -3286,6 +3344,37 @@ impl RemoteSifsBrowser {
             .into_iter()
             .map(sifs_entry_from_rpc)
             .collect())
+    }
+
+    fn list_page(
+        &self,
+        path: &str,
+        shallow: bool,
+        missing_is_empty: bool,
+        options: SifsListOptions,
+    ) -> Result<SifsEntryPage, String> {
+        let response: sinomo_runtime::daemon::DaemonDfsBrowserListResponse = self.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_LIST_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserListRequest {
+                path: path.to_string(),
+                shallow,
+                missing_is_empty,
+                sort_key: daemon_sort_key_from_sifs(options.sort_key),
+                sort_direction: daemon_sort_direction_from_sifs(options.sort_direction),
+                offset: options.offset,
+                limit: options.limit,
+            },
+        )?;
+        Ok(SifsEntryPage {
+            entries: response
+                .entries
+                .into_iter()
+                .map(sifs_entry_from_rpc)
+                .collect(),
+            total_count: response.total_count,
+            offset: response.offset,
+            limit: response.limit,
+        })
     }
 
     fn stat(&self, path: &str) -> Result<SifsObjectDetails, String> {
@@ -3709,12 +3798,96 @@ fn sifs_agent_state_label(state: &sinomo_runtime::dfs::DfsAgentObjectState) -> &
 }
 
 fn sort_sifs_entries(mut entries: Vec<SifsEntry>) -> Vec<SifsEntry> {
-    entries.sort_by(|a, b| {
-        (b.is_dir as u8)
-            .cmp(&(a.is_dir as u8))
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    sort_sifs_entries_with(
+        &mut entries,
+        SifsListSortKey::Name,
+        SifsListSortDirection::Ascending,
+    );
     entries
+}
+
+fn page_sifs_entries(mut entries: Vec<SifsEntry>, options: SifsListOptions) -> SifsEntryPage {
+    sort_sifs_entries_with(&mut entries, options.sort_key, options.sort_direction);
+    let total_count = entries.len();
+    let offset = options.offset.min(total_count);
+    let entries = match options.limit {
+        Some(limit) => entries.into_iter().skip(offset).take(limit).collect(),
+        None => entries.into_iter().skip(offset).collect(),
+    };
+    SifsEntryPage {
+        entries,
+        total_count,
+        offset,
+        limit: options.limit,
+    }
+}
+
+fn sort_sifs_entries_with(
+    entries: &mut [SifsEntry],
+    sort_key: SifsListSortKey,
+    sort_direction: SifsListSortDirection,
+) {
+    entries.sort_by(|left, right| {
+        let directory_order = sifs_entry_kind_rank(left).cmp(&sifs_entry_kind_rank(right));
+        if directory_order != std::cmp::Ordering::Equal {
+            return directory_order;
+        }
+        let ordering = match sort_key {
+            SifsListSortKey::Name => compare_sifs_entry_names(left, right),
+            SifsListSortKey::Kind => sifs_entry_kind_rank(left)
+                .cmp(&sifs_entry_kind_rank(right))
+                .then_with(|| compare_sifs_entry_names(left, right)),
+            SifsListSortKey::Size => left
+                .size
+                .unwrap_or(0)
+                .cmp(&right.size.unwrap_or(0))
+                .then_with(|| compare_sifs_entry_names(left, right)),
+        };
+        match sort_direction {
+            SifsListSortDirection::Ascending => ordering,
+            SifsListSortDirection::Descending => ordering.reverse(),
+        }
+    });
+}
+
+fn sifs_entry_kind_rank(entry: &SifsEntry) -> u8 {
+    if entry.is_dir {
+        0
+    } else if entry.is_link {
+        1
+    } else {
+        2
+    }
+}
+
+fn compare_sifs_entry_names(left: &SifsEntry, right: &SifsEntry) -> std::cmp::Ordering {
+    left.name
+        .to_ascii_lowercase()
+        .cmp(&right.name.to_ascii_lowercase())
+        .then_with(|| left.name.cmp(&right.name))
+}
+
+fn daemon_sort_key_from_sifs(
+    sort_key: SifsListSortKey,
+) -> sinomo_runtime::daemon::DaemonDfsBrowserSortKey {
+    match sort_key {
+        SifsListSortKey::Name => sinomo_runtime::daemon::DaemonDfsBrowserSortKey::Name,
+        SifsListSortKey::Kind => sinomo_runtime::daemon::DaemonDfsBrowserSortKey::Kind,
+        SifsListSortKey::Size => sinomo_runtime::daemon::DaemonDfsBrowserSortKey::Size,
+    }
+}
+
+fn daemon_sort_direction_from_sifs(
+    direction: SifsListSortDirection,
+) -> sinomo_runtime::daemon::DaemonDfsBrowserSortDirection {
+    match direction {
+        SifsListSortDirection::Ascending => {
+            sinomo_runtime::daemon::DaemonDfsBrowserSortDirection::Ascending
+        }
+        SifsListSortDirection::Descending => {
+            sinomo_runtime::daemon::DaemonDfsBrowserSortDirection::Descending
+        }
+    }
 }
 
 fn sifs_error_is_not_found(error: &str) -> bool {
@@ -4356,6 +4529,25 @@ mod tests {
                 .read_file("/services/sinomo-agent/channel-index.json")
                 .is_err(),
             "channel summaries should not create a shared mutable index cache"
+        );
+    }
+
+    #[test]
+    fn sifs_channel_summaries_skip_channel_dirs_without_snapshots() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-missing-snapshot");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        SifsBrowser::open(&data_dir)
+            .expect("open SIFS")
+            .create_dir_all(&SifsAgentChannelStore::channel_dir(&channel_id))
+            .expect("create partial channel dir");
+
+        let summaries = store.list_channel_summaries().expect("list summaries");
+
+        assert!(
+            summaries.is_empty(),
+            "partial channel directories without snapshots should be ignored"
         );
     }
 

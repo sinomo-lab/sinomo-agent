@@ -107,18 +107,56 @@ pub struct DaemonDfsBrowserHealthSummary {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonDfsBrowserSortKey {
+    Name,
+    Kind,
+    Size,
+}
+
+impl Default for DaemonDfsBrowserSortKey {
+    fn default() -> Self {
+        Self::Name
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonDfsBrowserSortDirection {
+    Ascending,
+    Descending,
+}
+
+impl Default for DaemonDfsBrowserSortDirection {
+    fn default() -> Self {
+        Self::Ascending
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserListRequest {
     pub path: String,
     #[serde(default)]
     pub shallow: bool,
     #[serde(default)]
     pub missing_is_empty: bool,
+    #[serde(default)]
+    pub sort_key: DaemonDfsBrowserSortKey,
+    #[serde(default)]
+    pub sort_direction: DaemonDfsBrowserSortDirection,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserListResponse {
     pub node_id: String,
     pub entries: Vec<DaemonDfsBrowserEntry>,
+    pub total_count: usize,
+    pub offset: usize,
+    pub limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
