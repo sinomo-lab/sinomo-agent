@@ -72,6 +72,13 @@ pub const NETWORK_MODULES_RPC_ROUTE_POLICIES: &[NetworkModuleRoutePolicy] = &[
     network_modules_admin_policy(NETWORK_MODULES_SET_ENABLED_ROUTE),
 ];
 
+/// Looks up the auth policy for a network-module control route.
+pub fn network_modules_rpc_route_policy(route: &str) -> Option<&'static NetworkModuleRoutePolicy> {
+    NETWORK_MODULES_RPC_ROUTE_POLICIES
+        .iter()
+        .find(|policy| policy.route == route)
+}
+
 /// Boxed future returned by network-module dial operations. `'static` so the
 /// host can spawn or hold the dial without borrowing the module call site.
 pub type NetworkFuture<T> = Pin<Box<dyn Future<Output = Result<T, NetworkError>> + Send + 'static>>;

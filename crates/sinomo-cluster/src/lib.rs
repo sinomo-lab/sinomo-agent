@@ -268,8 +268,6 @@ pub(crate) mod prelude {
     pub(crate) use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
     pub(crate) use std::path::PathBuf;
     pub(crate) use std::sync::{Arc, Mutex};
-    #[cfg(feature = "iroh-transport")]
-    pub(crate) use std::thread;
     pub(crate) use std::time::Duration;
     #[allow(unused_imports)]
     pub(crate) use thiserror::Error;

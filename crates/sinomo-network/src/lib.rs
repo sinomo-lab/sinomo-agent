@@ -159,7 +159,8 @@ pub use network_module::{
     NETWORK_MODULES_SET_ENABLED_ROUTE, NetworkFuture, NetworkModule, NetworkModuleContext,
     NetworkModuleDescriptor, NetworkModuleListResponse, NetworkModuleRegistry,
     NetworkModuleRoutePolicy, NetworkModuleSetEnabledRequest, NetworkModuleSetEnabledResponse,
-    NetworkModuleStatus, network_module_registry, set_network_module_registry,
+    NetworkModuleStatus, network_module_registry, network_modules_rpc_route_policy,
+    set_network_module_registry,
 };
 pub use network_module_abi::FfiNetworkModule;
 pub use object::try_clone_id;

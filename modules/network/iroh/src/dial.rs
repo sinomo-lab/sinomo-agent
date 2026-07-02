@@ -377,3 +377,79 @@ pub(crate) fn iroh_endpoint_addr_from_record(
     }
     Ok(addr)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_core::network::ObjectRpcRequest;
+
+    #[test]
+    fn response_retry_is_limited_to_idempotent_routes() {
+        let retry_safe = ObjectRpcRequest::encode_body("/test/retry-safe", "test", &())
+            .expect("retry-safe request")
+            .with_response_retry_safe();
+        assert!(iroh_daemon_control_request_allows_response_retry(
+            &retry_safe
+        ));
+
+        let range = ObjectRpcRequest::encode_body("/cluster/kv/range-prefix", "cluster.kv", &())
+            .expect("range request");
+        assert!(iroh_daemon_control_request_allows_response_retry(&range));
+
+        for route in ["/test/mutate", "/test/finalize", "/test/build"] {
+            let request = ObjectRpcRequest::encode_body(route, "test", &()).expect("rpc request");
+            assert!(
+                !iroh_daemon_control_request_allows_response_retry(&request),
+                "{route} should not be retried after the remote may have accepted the request"
+            );
+        }
+    }
+
+    #[test]
+    fn response_retry_classifier_matches_remote_close_only() {
+        assert!(iroh_daemon_response_error_is_retryable(&NetworkError::Io {
+            operation: "read iroh daemon response".to_string(),
+            detail: "peer closed before object frame length (4 bytes expected)".to_string(),
+        }));
+        assert!(iroh_daemon_response_error_is_retryable(&NetworkError::Io {
+            operation: "read iroh daemon response".to_string(),
+            detail: "peer closed during object frame body: read 3 of 8 bytes".to_string(),
+        }));
+        assert!(!iroh_daemon_response_error_is_retryable(
+            &NetworkError::Io {
+                operation: "read iroh daemon response".to_string(),
+                detail: "timed out after 1000ms".to_string(),
+            }
+        ));
+        assert!(!iroh_daemon_response_error_is_retryable(
+            &NetworkError::Io {
+                operation: "connect iroh endpoint".to_string(),
+                detail: "peer closed before object frame length (4 bytes expected)".to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn rpc_retry_delay_is_bounded_by_attempts_and_deadline() {
+        assert_eq!(
+            iroh_daemon_rpc_retry_delay_with_budget(1, Some(Duration::from_secs(5))),
+            Some(Duration::from_millis(40))
+        );
+        assert_eq!(
+            iroh_daemon_rpc_retry_delay_with_budget(2, Some(Duration::from_secs(5))),
+            Some(Duration::from_millis(80))
+        );
+        assert_eq!(
+            iroh_daemon_rpc_retry_delay_with_budget(1, Some(Duration::from_millis(10))),
+            Some(Duration::from_millis(9))
+        );
+        assert_eq!(
+            iroh_daemon_rpc_retry_delay_with_budget(3, Some(Duration::from_secs(5))),
+            None
+        );
+        assert_eq!(
+            iroh_daemon_rpc_retry_delay_with_budget(1, Some(Duration::from_millis(5))),
+            None
+        );
+    }
+}

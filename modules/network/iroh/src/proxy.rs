@@ -20,9 +20,13 @@ use sinomo_core::network::{
     read_optional_object_file, write_object_file_create_new_serialized,
 };
 use sinomo_core::node::{ClusterId, NodeId};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 pub const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";
@@ -112,6 +116,33 @@ fn storage_io(path: &std::path::Path, detail: impl std::fmt::Display) -> Network
     }
 }
 
+#[cfg(test)]
+static IROH_SECRET_KEY_CREATE_NEW_ATTEMPTS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn record_iroh_secret_key_create_new_attempt_for_test(path: &PathBuf) {
+    if let Ok(mut attempts) = IROH_SECRET_KEY_CREATE_NEW_ATTEMPTS_FOR_TEST.lock() {
+        *attempts.entry(path.clone()).or_default() += 1;
+    }
+}
+
+#[cfg(test)]
+fn reset_iroh_secret_key_create_new_attempts_for_test(path: &PathBuf) {
+    if let Ok(mut attempts) = IROH_SECRET_KEY_CREATE_NEW_ATTEMPTS_FOR_TEST.lock() {
+        attempts.remove(path);
+    }
+}
+
+#[cfg(test)]
+fn iroh_secret_key_create_new_attempts_for_test(path: &PathBuf) -> u64 {
+    IROH_SECRET_KEY_CREATE_NEW_ATTEMPTS_FOR_TEST
+        .lock()
+        .ok()
+        .and_then(|attempts| attempts.get(path).copied())
+        .unwrap_or(0)
+}
+
 fn iroh_secret_key_lock_retry_delay(attempts: u32) -> Duration {
     let shift = attempts.min(5);
     IROH_SECRET_KEY_LOCK_RETRY_INITIAL
@@ -124,8 +155,11 @@ fn file_lock_is_busy(source: &std::io::Error) -> bool {
         || matches!(source.raw_os_error(), Some(32 | 33))
 }
 
-fn lock_iroh_secret_key(paths: &ClusterPaths, node_id: &NodeId) -> Result<fs::File, NetworkError> {
-    let wait = IROH_SECRET_KEY_LOCK_WAIT;
+fn lock_iroh_secret_key_with_wait(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    wait: Duration,
+) -> Result<fs::File, NetworkError> {
     let lock_path = iroh_endpoint_key_lock_path(paths, node_id);
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent).map_err(|source| storage_io(parent, source))?;
@@ -159,6 +193,10 @@ fn lock_iroh_secret_key(paths: &ClusterPaths, node_id: &NodeId) -> Result<fs::Fi
     }
 }
 
+fn lock_iroh_secret_key(paths: &ClusterPaths, node_id: &NodeId) -> Result<fs::File, NetworkError> {
+    lock_iroh_secret_key_with_wait(paths, node_id, IROH_SECRET_KEY_LOCK_WAIT)
+}
+
 /// Loads the node's iroh secret key, creating (and persisting) one when
 /// absent. A file lock serializes concurrent creators; losers re-read the
 /// winner's key.
@@ -178,6 +216,8 @@ pub(crate) fn load_or_create_iroh_secret_key(
         fs::create_dir_all(parent).map_err(|source| storage_io(parent, source))?;
     }
     let key = iroh::SecretKey::generate();
+    #[cfg(test)]
+    record_iroh_secret_key_create_new_attempt_for_test(&key_path);
     if write_object_file_create_new_serialized(&key_path, &key)? {
         Ok(key)
     } else {
@@ -881,4 +921,397 @@ async fn run_iroh_daemon_proxy(
     endpoint.close().await;
     abort_and_drain_iroh_daemon_proxy_tasks(&mut connection_tasks, "connection").await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_core::local::SinomoDataDir;
+    use sinomo_core::network::{ObjectFrameIoOptions, ObjectRpcRequest, read_object_frame_async};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn default_iroh_relay_urls_match_iroh_n0_preset_hosts() {
+        for relay_url in sinomo_iroh_relay_url_strings_from_env(None) {
+            let host = relay_url
+                .strip_prefix("https://")
+                .and_then(|rest| rest.split('/').next())
+                .expect("https relay host");
+            assert!(
+                host.ends_with(".relay.n0.iroh-canary.iroh.link."),
+                "default relay should follow the Iroh N0 preset relay map: {relay_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn sinomo_default_iroh_relays_use_stable_network_hosts() {
+        let urls = sinomo_iroh_relay_url_strings_from_env(None);
+
+        assert_eq!(
+            urls,
+            vec![
+                "https://use1-1.relay.n0.iroh-canary.iroh.link./".to_string(),
+                "https://usw1-1.relay.n0.iroh-canary.iroh.link./".to_string(),
+                "https://euc1-1.relay.n0.iroh-canary.iroh.link./".to_string(),
+                "https://aps1-1.relay.n0.iroh-canary.iroh.link./".to_string(),
+            ]
+        );
+        assert!(urls.iter().all(|url| url.contains("iroh-canary")));
+    }
+
+    #[test]
+    fn sinomo_iroh_relay_env_ignores_empty_entries() {
+        let urls = sinomo_iroh_relay_url_strings_from_env(Some(
+            " https://relay-a.example./, ,https://relay-b.example./ ".to_string(),
+        ));
+
+        assert_eq!(
+            urls,
+            vec![
+                "https://relay-a.example./".to_string(),
+                "https://relay-b.example./".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn iroh_daemon_proxy_restart_backoff_grows_and_caps() {
+        assert_eq!(
+            iroh_daemon_proxy_restart_backoff(0),
+            IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN
+        );
+        assert_eq!(
+            iroh_daemon_proxy_restart_backoff(1),
+            IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN
+        );
+        assert_eq!(
+            iroh_daemon_proxy_restart_backoff(2),
+            IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN * 2
+        );
+        assert_eq!(
+            iroh_daemon_proxy_restart_backoff(32),
+            IROH_DAEMON_PROXY_RESTART_BACKOFF_MAX
+        );
+    }
+
+    #[test]
+    fn iroh_daemon_proxy_restart_delay_adds_bounded_node_jitter() {
+        let node_a = NodeId::from_legacy_named("node_iroh_restart_jitter_a").expect("node a");
+        let node_b = NodeId::from_legacy_named("node_iroh_restart_jitter_b").expect("node b");
+        let failures = 3;
+        let base = iroh_daemon_proxy_restart_backoff(failures);
+        let jitter_max = IROH_DAEMON_PROXY_RESTART_JITTER_MAX
+            .min(Duration::from_millis((base.as_millis() / 10) as u64));
+
+        let delay_a = iroh_daemon_proxy_restart_delay(failures, &node_a);
+        let delay_b = iroh_daemon_proxy_restart_delay(failures, &node_b);
+
+        assert_eq!(
+            delay_a,
+            iroh_daemon_proxy_restart_delay(failures, &node_a),
+            "restart jitter must be deterministic for a given node and failure count"
+        );
+        assert!(
+            delay_a >= base && delay_a <= base + jitter_max,
+            "restart delay should stay inside the bounded jitter window"
+        );
+        assert!(
+            delay_b >= base && delay_b <= base + jitter_max,
+            "restart delay should stay inside the bounded jitter window"
+        );
+        assert_ne!(
+            delay_a, delay_b,
+            "different nodes should not reconnect in lockstep after proxy failures"
+        );
+    }
+
+    #[test]
+    fn iroh_daemon_proxy_admission_limit_releases_permits() {
+        assert!(IROH_DAEMON_PROXY_MAX_CONNECTIONS >= 2);
+        assert!(IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS >= IROH_DAEMON_PROXY_MAX_CONNECTIONS);
+        let estimated_proxy_fd_budget = IROH_DAEMON_PROXY_MAX_CONNECTIONS
+            + IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS.saturating_mul(2)
+            + 64;
+        assert!(
+            estimated_proxy_fd_budget <= 512,
+            "proxy admission should leave room under a 1024 open-file soft limit"
+        );
+        assert!(
+            IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES
+                >= IROH_DAEMON_COMMAND_MAX_BYTES.saturating_add(12)
+        );
+        let limiter = Arc::new(tokio::sync::Semaphore::new(2));
+        let first = try_acquire_iroh_proxy_permit(&limiter, 2, "test").expect("first permit");
+        let second = try_acquire_iroh_proxy_permit(&limiter, 2, "test").expect("second permit");
+
+        assert!(
+            try_acquire_iroh_proxy_permit(&limiter, 2, "test").is_none(),
+            "admission should reject work once all permits are active"
+        );
+
+        drop(first);
+        let replacement =
+            try_acquire_iroh_proxy_permit(&limiter, 2, "test").expect("replacement permit");
+        drop(second);
+        drop(replacement);
+
+        assert_eq!(limiter.available_permits(), 2);
+    }
+
+    #[test]
+    fn iroh_daemon_proxy_error_frame_preserves_rpc_route_and_budget() {
+        let request =
+            ObjectRpcRequest::encode_body("/test/proxy-error", "test", &()).expect("rpc request");
+        let payload = encode_object_frame_to_vec(&request).expect("control frame");
+
+        let route = iroh_proxy_route_hint(&payload);
+        assert_eq!(route, "/test/proxy-error");
+
+        let budget = IrohProxyByteBudget::new(4096);
+        let (frame, permit) =
+            encode_iroh_proxy_error_response_frame(&budget, route, "daemon forward failed")
+                .expect("error response frame");
+        assert_eq!(budget.in_flight_bytes(), frame.len());
+
+        let response: ObjectRpcResponse =
+            decode_single_object_frame_from_slice(&frame, IROH_DAEMON_COMMAND_MAX_BYTES)
+                .expect("decode rpc response");
+        assert_eq!(response.route, "/test/proxy-error");
+        let error = response.error_detail().expect_err("rpc error detail");
+        assert!(error.to_string().contains("daemon forward failed"));
+
+        drop(permit);
+        assert_eq!(budget.in_flight_bytes(), 0);
+    }
+
+    #[test]
+    fn iroh_daemon_proxy_error_route_hint_falls_back_for_unreadable_payload() {
+        assert_eq!(
+            iroh_proxy_route_hint(b"not-a-control-frame"),
+            IROH_DAEMON_PROXY_ERROR_ROUTE
+        );
+    }
+
+    #[test]
+    fn iroh_daemon_proxy_peer_closed_accept_is_not_error_noise() {
+        let closed = NetworkError::Io {
+            operation: "accept iroh daemon command stream".to_string(),
+            detail: "closed by peer: done (code 0)".to_string(),
+        };
+        assert!(iroh_proxy_command_stream_accept_error_is_peer_close(
+            &closed
+        ));
+
+        let timed_out = NetworkError::Io {
+            operation: "accept iroh daemon command stream".to_string(),
+            detail: "timed out".to_string(),
+        };
+        assert!(iroh_proxy_command_stream_accept_error_is_peer_close(
+            &timed_out
+        ));
+
+        let unrelated = NetworkError::Io {
+            operation: "accept iroh daemon command stream".to_string(),
+            detail: "permission denied".to_string(),
+        };
+        assert!(!iroh_proxy_command_stream_accept_error_is_peer_close(
+            &unrelated
+        ));
+    }
+
+    #[tokio::test]
+    async fn iroh_daemon_proxy_command_accept_times_out_idle_connections() {
+        let started = Instant::now();
+        let accepted = accept_iroh_proxy_command_stream_with_idle_timeout(
+            std::future::pending::<Result<(), std::io::Error>>(),
+            Duration::from_millis(5),
+        )
+        .await
+        .expect("idle accept timeout");
+
+        assert_eq!(accepted, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "idle proxy command accept should be bounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn iroh_daemon_proxy_command_accept_returns_stream_before_idle_timeout() {
+        let accepted = accept_iroh_proxy_command_stream_with_idle_timeout(
+            async { Ok::<_, std::io::Error>(42_u8) },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("accepted command stream");
+
+        assert_eq!(accepted, Some(42));
+    }
+
+    #[test]
+    fn iroh_secret_key_creation_is_atomic_under_concurrency() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-secret-concurrent");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        let node_id = NodeId::from_legacy_named("node_iroh_secret_concurrent").expect("node");
+        let key_path = iroh_endpoint_key_path(&paths, &node_id);
+        reset_iroh_secret_key_create_new_attempts_for_test(&key_path);
+        let threads = 8;
+        let barrier = Arc::new(Barrier::new(threads));
+        let handles = (0..threads)
+            .map(|_| {
+                let paths = paths.clone();
+                let node_id = node_id.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    load_or_create_iroh_secret_key(&paths, &node_id)
+                        .expect("load or create iroh secret")
+                        .public()
+                        .to_string()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut public_keys = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("iroh secret worker"))
+            .collect::<Vec<_>>();
+        public_keys.sort();
+        public_keys.dedup();
+        assert_eq!(
+            public_keys.len(),
+            1,
+            "concurrent Iroh secret initialization must converge on one persisted endpoint identity"
+        );
+        let persisted_public_key = load_or_create_iroh_secret_key(&paths, &node_id)
+            .expect("load persisted iroh secret")
+            .public()
+            .to_string();
+        assert_eq!(persisted_public_key, public_keys[0]);
+        assert_eq!(
+            iroh_secret_key_create_new_attempts_for_test(&key_path),
+            1,
+            "concurrent Iroh secret initialization should serialize creation so only one temporary key is written"
+        );
+        let key_lock_path = iroh_endpoint_key_lock_path(&paths, &node_id);
+        std::fs::remove_file(&key_lock_path).expect("remove creation lock");
+        let steady_state_public_key = load_or_create_iroh_secret_key(&paths, &node_id)
+            .expect("load existing iroh secret")
+            .public()
+            .to_string();
+        assert_eq!(steady_state_public_key, public_keys[0]);
+        assert!(
+            !key_lock_path.exists(),
+            "steady-state Iroh secret loads should read the existing key without creating a lock file"
+        );
+    }
+
+    #[test]
+    fn iroh_secret_key_lock_wait_is_bounded() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-secret-lock-timeout");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        let node_id = NodeId::from_legacy_named("node_iroh_secret_lock_timeout").expect("node");
+        std::fs::create_dir_all(&paths.iroh).expect("iroh dir");
+        let key_lock_path = iroh_endpoint_key_lock_path(&paths, &node_id);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = thread::spawn({
+            let key_lock_path = key_lock_path.clone();
+            move || {
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .open(&key_lock_path)
+                    .expect("open lock");
+                file.lock_exclusive().expect("hold lock");
+                held_tx.send(()).expect("notify lock held");
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        held_rx.recv().expect("wait for lock holder");
+
+        let started = Instant::now();
+        let error = lock_iroh_secret_key_with_wait(&paths, &node_id, Duration::from_millis(20))
+            .expect_err("busy Iroh secret lock should time out");
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "Iroh secret lock timeout should be bounded, elapsed {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(error, NetworkError::StorageIo { ref detail, .. } if detail.contains("timed out waiting for Iroh secret key lock")),
+            "unexpected lock error: {error}"
+        );
+
+        holder.join().expect("join lock holder");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn iroh_daemon_proxy_round_trips_rpc_request() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind daemon fixture");
+        let daemon_address = listener
+            .local_addr()
+            .expect("daemon fixture address")
+            .to_string();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept daemon fixture");
+            let request: sinomo_core::network::DaemonControlRequest = read_object_frame_async(
+                &mut stream,
+                IROH_DAEMON_COMMAND_MAX_BYTES,
+                ObjectFrameIoOptions::none(),
+            )
+            .await
+            .expect("read daemon fixture request");
+            assert_eq!(request.route, "/test/ping");
+            let rpc_response = ObjectRpcResponse::encode_body("/test/ping", &"PONG".to_string())
+                .expect("rpc response");
+            let frame = encode_object_frame_to_vec(&rpc_response).expect("response frame");
+            stream
+                .write_all(&frame)
+                .await
+                .expect("write daemon fixture response");
+        });
+
+        let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-proxy");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("cluster paths");
+        let proxy = start_iroh_daemon_proxy(
+            tokio::runtime::Handle::current(),
+            IrohProxyConfig {
+                paths,
+                cluster_id: ClusterId::from_legacy_named("cluster_iroh_proxy").expect("cluster"),
+                node_id: NodeId::from_legacy_named("node_iroh_proxy").expect("node"),
+                daemon_forward_address: daemon_address,
+            },
+        )
+        .await
+        .expect("start iroh proxy");
+
+        let request =
+            ObjectRpcRequest::encode_body("/test/ping", "test", &()).expect("rpc request");
+        let request_frame = encode_object_frame_to_vec(&request).expect("request frame");
+        let response_frame = crate::dial::dial_iroh_daemon_control_frame_async(
+            &proxy.record().endpoint().address,
+            &request_frame,
+            DaemonRpcTimeouts::connect_only(Duration::from_secs(5)),
+        )
+        .await
+        .expect("send iroh daemon rpc");
+        let response: ObjectRpcResponse =
+            decode_single_object_frame_from_slice(&response_frame, IROH_DAEMON_COMMAND_MAX_BYTES)
+                .expect("decode response frame");
+
+        assert_eq!(response.decode_body::<String>().expect("decode"), "PONG");
+        proxy.shutdown().await;
+        fixture.await.expect("daemon fixture");
+    }
 }

@@ -241,6 +241,12 @@ pub fn authorize_authenticated_daemon_command(
         }
         return Err(DaemonError::AuthDenied);
     }
+    if let Some(policy) = sinomo_core::network::network_modules_rpc_route_policy(route) {
+        if daemon_signer_authorizes_network_module_route(&authenticated.signer, policy.auth) {
+            return Ok(());
+        }
+        return Err(DaemonError::AuthDenied);
+    }
     let allowed = match route {
         route if route == crate::DAEMON_STATUS_ROUTE => true,
         route if route == crate::DAEMON_SHUTDOWN_ROUTE => {
@@ -437,6 +443,25 @@ fn daemon_signer_authorizes_cluster_kv_route(
                 DaemonSignerAuthority::Local | DaemonSignerAuthority::Voter
             )
         }
+    }
+}
+
+fn daemon_signer_authorizes_network_module_route(
+    signer: &DaemonSignerAuthority,
+    auth: sinomo_core::network::NetworkModuleRouteAuth,
+) -> bool {
+    match auth {
+        sinomo_core::network::NetworkModuleRouteAuth::LocalCommand => {
+            signer.can_run_local_command()
+        }
+        sinomo_core::network::NetworkModuleRouteAuth::LocalOrClusterMember
+        | sinomo_core::network::NetworkModuleRouteAuth::ClusterMember => matches!(
+            signer,
+            DaemonSignerAuthority::Local
+                | DaemonSignerAuthority::Voter
+                | DaemonSignerAuthority::Member
+        ),
+        sinomo_core::network::NetworkModuleRouteAuth::Admin => signer.can_run_admin_command(),
     }
 }
 
@@ -1112,6 +1137,28 @@ mod tests {
             let authenticated =
                 authenticated_command(sinomo_observe::OBSERVE_CONTROL_ROUTE.to_string(), signer);
             assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+        }
+    }
+
+    #[test]
+    fn network_module_control_routes_authorize_admin_signers() {
+        for route in [
+            sinomo_core::network::NETWORK_MODULES_LIST_ROUTE,
+            sinomo_core::network::NETWORK_MODULES_SET_ENABLED_ROUTE,
+        ] {
+            for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
+                let authenticated = authenticated_command(route.to_string(), signer);
+                authorize_authenticated_daemon_command(&authenticated)
+                    .expect("network-module control routes require admin signers");
+            }
+            for signer in [
+                DaemonSignerAuthority::Member,
+                DaemonSignerAuthority::JoinCandidate,
+                DaemonSignerAuthority::StatusProbe,
+            ] {
+                let authenticated = authenticated_command(route.to_string(), signer);
+                assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+            }
         }
     }
 

@@ -8085,6 +8085,7 @@ dependencies = [
  "iroh",
  "sinomo-core",
  "sinomo-module-api",
+ "sinomo-testdir",
  "tokio",
  "tracing",
 ]
