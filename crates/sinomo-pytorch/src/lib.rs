@@ -1146,6 +1146,39 @@ mod tests {
     use super::*;
     use sinomo_lm::{LanguageModelResponseFormat, LanguageModelRole};
 
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let mut body_start = None;
+        let mut content_length = 0_usize;
+        loop {
+            let size = stream.read(&mut buffer).expect("read");
+            assert!(size > 0, "connection closed before full request");
+            bytes.extend_from_slice(&buffer[..size]);
+            if body_start.is_none()
+                && let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+            {
+                let header = String::from_utf8_lossy(&bytes[..header_end + 4]);
+                content_length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                body_start = Some(header_end + 4);
+            }
+            if let Some(body_start) = body_start
+                && bytes.len() >= body_start.saturating_add(content_length)
+            {
+                break;
+            }
+        }
+        String::from_utf8(bytes).expect("request utf8")
+    }
+
     #[test]
     fn default_bridge_script_points_inside_crate() {
         let path = default_bridge_script();
@@ -1216,9 +1249,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            let mut buffer = [0_u8; 4096];
-            let size = stream.read(&mut buffer).expect("read");
-            let request = String::from_utf8_lossy(&buffer[..size]);
+            let request = read_http_request(&mut stream);
             assert!(request.starts_with("POST /complete HTTP/1.1"));
             let body = serde_json::to_string(&PytorchResponse {
                 content: "ok".to_string(),
@@ -1273,9 +1304,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            let mut buffer = [0_u8; 4096];
-            let size = stream.read(&mut buffer).expect("read");
-            let request = String::from_utf8_lossy(&buffer[..size]);
+            let request = read_http_request(&mut stream);
             assert!(request.starts_with("POST /complete HTTP/1.1"));
             assert!(request.contains("\"stream\":true") || request.contains("\"stream\": true"));
             let response =
@@ -1347,9 +1376,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            let mut buffer = [0_u8; 4096];
-            let size = stream.read(&mut buffer).expect("read");
-            let request = String::from_utf8_lossy(&buffer[..size]);
+            let request = read_http_request(&mut stream);
             assert!(request.contains("Authorization: Bearer test-token\r\n"));
             let body = serde_json::to_string(&PytorchRuntimeStatus {
                 model: MINICPM_DEFAULT_MODEL.to_string(),

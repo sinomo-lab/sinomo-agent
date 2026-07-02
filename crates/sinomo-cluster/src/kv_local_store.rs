@@ -394,16 +394,6 @@ pub fn read_cluster_kv_prefix_entries_limited_by_payload_bytes(
     .map_err(kv_err)
 }
 
-pub(crate) fn read_cluster_kv_cached_snapshot(
-    paths: &ClusterPaths,
-) -> Result<Arc<KvSnapshot>, NetworkError> {
-    #[cfg(test)]
-    record_cluster_kv_cached_snapshot_read_for_test(paths);
-    cluster_kv_local_cache(paths)
-        .cached_snapshot_arc()
-        .map_err(kv_err)
-}
-
 pub(crate) fn read_cluster_kv_cached_snapshot_if_present(
     paths: &ClusterPaths,
 ) -> Result<Option<Arc<KvSnapshot>>, NetworkError> {

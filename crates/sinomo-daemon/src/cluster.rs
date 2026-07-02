@@ -6548,7 +6548,7 @@ mod tests {
         status: ClusterNodeStatusRecord,
     ) -> Result<KvSnapshot, sinomo_core::network::NetworkError> {
         let state = sinomo_core::cluster::read_cluster_state_without_kv(paths)?;
-        append_cluster_raft_command(
+        let snapshot = append_cluster_raft_command(
             paths,
             &state.local_node_id,
             KvCommand::Txn(KvTxn {
@@ -6563,7 +6563,10 @@ mod tests {
                 ],
                 failure: Vec::new(),
             }),
-        )
+        )?;
+        sinomo_core::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &snapshot)
+            .map_err(sinomo_core::network::NetworkError::directory)?;
+        Ok(snapshot)
     }
 
     #[test]
@@ -6626,6 +6629,7 @@ mod tests {
     }
 
     fn unique_cluster_test_root(name: &str) -> sinomo_testdir::TestDir {
+        ensure_cluster_directory_installed();
         sinomo_testdir::TestDir::new(name)
     }
 

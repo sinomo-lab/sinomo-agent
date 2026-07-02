@@ -25,9 +25,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sinomo_agent::{
     Agent, AgentConfig, AgentContextAttachment, AgentContextBudget, AgentItem, AgentLoopInput,
     AgentModelEvent, AgentOp, AgentRole, AgentSession, AgentSessionRuntime, AgentStoragePaths,
-    AgentToolPairIntegrity, AgentToolRegistry, AgentToolSurface, FileAgentTraceStore,
-    InteractionModel, InteractionSession, InteractionSurface, InteractionSurfaceKind,
-    LocalWorkspaceAgentConfig, default_coding_agent_tools, user_interaction_input_event,
+    AgentToolKind, AgentToolPairIntegrity, AgentToolRegistry, AgentToolSpec, AgentToolSurface,
+    FileAgentTraceStore, InteractionModel, InteractionSession, InteractionSurface,
+    InteractionSurfaceKind, LocalWorkspaceAgentConfig, default_coding_agent_tools,
+    user_interaction_input_event,
 };
 use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
@@ -4530,6 +4531,13 @@ where
                 None,
             ))
             .with_max_model_repair_attempts(2);
+        if !config
+            .visible_toolsets
+            .iter()
+            .any(|toolset| toolset == "coding_advanced")
+        {
+            config.visible_toolsets.push("coding_advanced".to_string());
+        }
         if let Some(max_steps) = self.max_steps {
             config = config.with_max_steps(max_steps);
         }
@@ -4554,7 +4562,7 @@ where
             latest_event,
             async_update: None,
             context_attachments: vec![evolution_agent_context_attachment(packet, bundle)],
-            tool_specs: default_coding_agent_tools(),
+            tool_specs: evolution_agent_mutation_tools(),
         };
         let runtime = AgentSessionRuntime::new(
             agent,
@@ -4843,6 +4851,17 @@ fn non_empty_string(value: String) -> Option<String> {
     } else {
         Some(value)
     }
+}
+
+fn evolution_agent_mutation_tools() -> Vec<AgentToolSpec> {
+    let mut tools = default_coding_agent_tools();
+    tools.push(AgentToolSpec::new(
+        AgentToolKind::ApplyPatch,
+        "apply_patch",
+        "Edit workspace files with a scoped provider-specific patch.",
+        true,
+    ));
+    tools
 }
 
 pub fn render_agent_mutation_prompt(

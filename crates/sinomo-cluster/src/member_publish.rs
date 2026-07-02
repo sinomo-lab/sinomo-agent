@@ -5,7 +5,7 @@ use crate::keyspace::{
 use crate::kv_local_store::kv_err;
 use crate::kv_local_store::{
     imported_snapshot_advances_local_kv, local_cluster_kv_snapshot_revision,
-    read_cluster_kv_cached_snapshot, read_cluster_kv_current_snapshot,
+    read_cluster_kv_current_or_cached_snapshot_arc_if_present, read_cluster_kv_current_snapshot,
     read_cluster_kv_current_snapshot_arc, write_imported_cluster_kv_snapshot_if_changed,
 };
 use crate::local_state_store::read_cluster_state;
@@ -97,7 +97,9 @@ pub fn cluster_member_publish_matches_kv(
     paths: &ClusterPaths,
     members: &[ClusterMemberRecord],
 ) -> Result<bool, NetworkError> {
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    let Some(snapshot) = read_cluster_kv_current_or_cached_snapshot_arc_if_present(paths)? else {
+        return Ok(false);
+    };
     for member in members {
         let mut member = cluster_member_publish_record_for_snapshot(Some(&snapshot), member);
         cleanup_member_iroh_endpoints(&mut member);
@@ -302,6 +304,9 @@ pub fn publish_local_members_to_quorum_if_needed_with_host(
         return Ok(None);
     }
     let already_published = cluster_member_publish_matches_kv(paths, &members).unwrap_or(false);
+    if already_published && !options.force_kv_snapshot_sync {
+        return Ok(None);
+    }
     if sinomo_kv::cluster_kv_raft_local_is_voter(state)
         && host.cluster_has_local_quorum(paths, state)
     {
@@ -343,6 +348,9 @@ pub async fn publish_local_members_to_quorum_if_needed_async_with_host(
             operation: "cluster local member publish match".to_string(),
             detail: format!("member publish match task failed: {source}"),
         })?;
+    if already_published && !options.force_kv_snapshot_sync {
+        return Ok(None);
+    }
     if sinomo_kv::cluster_kv_raft_local_is_voter(state)
         && host.cluster_has_local_quorum_async(paths, state).await?
     {

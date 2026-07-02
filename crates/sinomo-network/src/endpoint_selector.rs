@@ -752,7 +752,6 @@ fn try_cluster_live_voter_command_targets_impl(
     let node_statuses = cluster_directory_for(paths)
         .node_statuses()
         .unwrap_or_default();
-    let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
     let mut targets = Vec::new();
     for endpoint in try_cluster_raft_command_targets_impl(paths, state)? {
         if !state.node_is_raft_voter(&endpoint.node_id) {
@@ -761,7 +760,6 @@ fn try_cluster_live_voter_command_targets_impl(
         if node_statuses
             .get(&endpoint.node_id)
             .is_some_and(|status| status.availability == ClusterNodeAvailability::Offline)
-            && graph.unavailability_rank(&endpoint) > 0
         {
             continue;
         }

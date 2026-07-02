@@ -10917,12 +10917,13 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
 
     let host_identity =
         super::load_or_create_main_node_identity(&host_root).expect("host identity");
+    let host_state = read_cluster_state(&host_paths).expect("host state");
     let peer_main_identity =
         super::load_or_create_main_node_identity(&peer_root).expect("peer identity");
     let peer_shadow_identity =
         sinomo_runtime::node::load_or_create_shadow_node_identity(&peer_root)
             .expect("peer shadow identity");
-    let peer_pending = sinomo_runtime::cluster::prepare_pending_cluster_join_state(
+    let mut peer_pending = sinomo_runtime::cluster::prepare_pending_cluster_join_state(
         cluster_id.clone(),
         "sync cluster".to_string(),
         NodeId::from_legacy_named("node_peer").expect("node"),
@@ -10931,10 +10932,16 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         peer_shadow_identity.public_key,
         time::OffsetDateTime::now_utc(),
     );
+    let host_member = host_state
+        .members
+        .iter()
+        .find(|member| member.node_id == host_state.local_node_id)
+        .cloned()
+        .expect("host member");
+    peer_pending.members.push(host_member);
     sinomo_runtime::cluster::write_cluster_state(&peer_paths, &peer_pending)
         .expect("peer pending state");
 
-    let host_state = read_cluster_state(&host_paths).expect("host state");
     let peer_state = read_cluster_state(&peer_paths).expect("peer state");
     let host_auth = authenticated_test_command(
         sinomo_runtime::kv::CLUSTER_RAFT_APPEND_ROUTE,
