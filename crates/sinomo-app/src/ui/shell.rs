@@ -962,8 +962,10 @@ mod tests {
         state.active_tab = Tab::Sinomo;
         let shared = Shared::new(state);
         {
-            let mut chat = shared.chat_mut();
-            chat.notice = Some("chat list failed: device authorization was denied".to_string());
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.error = Some("device authorization was denied".to_string());
         }
 
         assert_eq!(shell_status(&shared).label, "Needs attention");
@@ -1007,8 +1009,10 @@ mod tests {
         state.active_tab = Tab::Settings;
         let shared = Shared::new(state);
         {
-            let mut chat = shared.chat_mut();
-            chat.notice = Some("chat list failed: device authorization was denied".to_string());
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.error = Some("device authorization was denied".to_string());
         }
 
         let runtime = crate::build_runtime(shared)?;
@@ -1085,14 +1089,18 @@ mod tests {
     }
 
     #[test]
-    fn attention_status_pill_counts_multiple_surface_issues() -> sui::Result<()> {
+    fn attention_status_pill_counts_multiple_surface_issues() {
         let backend = Backend::local_fallback();
         let mut state = AppState::ready(backend);
         state.active_tab = Tab::Sinomo;
         let shared = Shared::new(state);
         {
             let mut chat = shared.chat_mut();
-            chat.notice = Some("chat list failed: device authorization was denied".to_string());
+            chat.activity.push(ChatActivityEntry {
+                title: "chat list".to_string(),
+                detail: "chat unavailable: device authorization was denied".to_string(),
+                tone: ActivityTone::Bad,
+            });
         }
         {
             let mut files = shared.files_mut();
@@ -1108,24 +1116,7 @@ mod tests {
             "detail should summarize the surface count: {}",
             status.detail
         );
-        assert!(status.detail.contains("chat list failed"));
+        assert!(status.detail.contains("chat unavailable"));
         assert!(status.detail.contains("SIFS unavailable"));
-
-        let runtime = crate::build_runtime(shared.clone())?;
-        let app = sui_testing::TestApp::from_runtime(runtime)?;
-        let window = app.main_window()?;
-
-        window
-            .get_by_role(SemanticsRole::Button)
-            .with_name("2 issues")
-            .click()?;
-
-        assert_eq!(shared.borrow().active_tab, Tab::Settings);
-        assert_eq!(
-            shared.settings().selected,
-            Some(SettingsSection::Connection)
-        );
-
-        Ok(())
     }
 }

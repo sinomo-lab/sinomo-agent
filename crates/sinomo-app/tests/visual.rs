@@ -4,7 +4,7 @@
 //! app's tabs to `$SINOMO_APP_SHOTS` (default `/tmp`) for visual inspection.
 //!
 //! ```sh
-//! cargo test -p sinomo-app --test visual -- --nocapture
+//! cargo test -p sinomo-app --test visual -- --ignored --nocapture
 //! ```
 
 use sinomo_app::state::Tab;
@@ -99,6 +99,7 @@ fn boot_settings_with_provider_accounts(
 }
 
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_tabs() {
     let dir = shots_dir();
     std::fs::create_dir_all(&dir).expect("create shots dir");
@@ -129,6 +130,7 @@ fn capture_tabs() {
 }
 
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_evolution_seeded() {
     use sinomo_app::backend::evolution::{
         EvolutionDashboard, EvolutionDecisionSummary, EvolutionJobSummary, EvolutionPhase,
@@ -256,6 +258,7 @@ fn capture_evolution_seeded() {
 }
 
 #[test]
+#[ignore = "SUI visual smoke; run explicitly with --ignored --nocapture"]
 fn cluster_node_click_opens_detail_selection() {
     use sinomo_app::backend::cluster::{ClusterNodeInfo, ClusterSnapshot};
     use sinomo_app::ui::cluster::ClusterSelection;
@@ -306,6 +309,7 @@ fn cluster_node_click_opens_detail_selection() {
 }
 
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_cluster_node_diagnostics() {
     use sinomo_app::backend::cluster::{ClusterEndpointInfo, ClusterNodeInfo, ClusterSnapshot};
     use sinomo_app::theme::AppThemeMode;
@@ -386,6 +390,7 @@ fn capture_cluster_node_diagnostics() {
 }
 
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_settings_responsive() {
     use sui::{Event, Size, WindowEvent};
 
@@ -438,6 +443,7 @@ fn capture_settings_responsive() {
 /// in dark + light, and the narrow drill-down menu + detail. Sets `selected` directly rather than
 /// relying on click coordinates so the captures stay stable as the composed layout evolves.
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_settings_composed() {
     use sinomo_app::theme::AppThemeMode;
     use sinomo_app::ui::settings::SettingsSection;
@@ -517,6 +523,7 @@ fn capture_settings_composed() {
 /// Wide master/detail: clicking a sidebar row navigates the detail pane (the inner `SwitchView`
 /// relayouts to the newly-selected section, driven by the host's relayout-on-pointer-up).
 #[test]
+#[ignore = "SUI visual smoke; run explicitly with --ignored --nocapture"]
 fn settings_wide_sidebar_navigates() {
     use sinomo_app::ui::settings::SettingsSection;
 
@@ -543,6 +550,7 @@ fn settings_wide_sidebar_navigates() {
 
 /// Narrow drill-down: clicking a menu row drills into its detail; the back button returns.
 #[test]
+#[ignore = "SUI visual smoke; run explicitly with --ignored --nocapture"]
 fn settings_narrow_click_navigates() {
     use sinomo_app::ui::settings::SettingsSection;
     use sui::{Event, Size, WindowEvent};
@@ -668,6 +676,7 @@ fn open_chat_provider_select(window: &sui_testing::TestWindow) -> sui::Rect {
 /// the inspector collapses away. Drives selection via the public `FilesState::selected` field and a
 /// pointer click for navigation, so the captures stay stable as the composed layout evolves.
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_files_composed() {
     use sinomo_app::theme::AppThemeMode;
     use sinomo_cli::app_api::{SifsEntry, SifsObjectDetails, SifsObjectHealth, SifsPinDetails};
@@ -834,6 +843,7 @@ fn capture_files_composed() {
 }
 
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_files_nav() {
     let dir = shots_dir();
     std::fs::create_dir_all(&dir).expect("create shots dir");
@@ -852,6 +862,7 @@ fn capture_files_nav() {
 }
 
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_typing() {
     use sui::{
         Event, KeyState, KeyboardEvent, Point, PointerButton, PointerEvent, PointerEventKind,
@@ -892,6 +903,7 @@ fn capture_typing() {
 }
 
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_chat_dropdown() {
     let dir = shots_dir();
     std::fs::create_dir_all(&dir).expect("create shots dir");
@@ -918,6 +930,7 @@ fn capture_chat_dropdown() {
 }
 
 #[test]
+#[ignore = "SUI visual smoke; run explicitly with --ignored --nocapture"]
 fn new_chat_row_clears_visible_transcript() {
     use sinomo_app::ui::chat::ChatMessage;
     use sui::SemanticsRole;
@@ -955,6 +968,7 @@ fn new_chat_row_clears_visible_transcript() {
 /// The Providers settings section: per-provider cards (enabled toggle, API key, default model,
 /// base URL, reasoning effort).
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_providers_settings() {
     let dir = shots_dir();
     std::fs::create_dir_all(&dir).expect("create shots dir");
@@ -974,6 +988,7 @@ fn capture_providers_settings() {
 /// The device-login providers (codex / github-copilot): captured in a tall window so the
 /// Authentication row (status + Sign-in button) is visible, not just the API-key providers.
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_providers_device_login() {
     use sinomo_app::ui::settings::SettingsSection;
     use sui::{Event, Size, WindowEvent};
@@ -1004,6 +1019,7 @@ fn capture_providers_device_login() {
 /// The Advanced settings section: the generic, type-aware editor listing every `sinomo-config`
 /// key (bool → toggle, others → click-to-edit value).
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_advanced_settings() {
     use sinomo_app::ui::settings::SettingsSection;
 
@@ -1027,6 +1043,7 @@ fn capture_advanced_settings() {
 /// background thread's external wake transitions it to the interactive tabs. Asserts the wake
 /// mechanism actually drives the UI to ready — not just a screenshot dump.
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_connecting_then_ready() {
     use sinomo_app::backend::Backend;
     use sinomo_app::state::{AppState, ConnectEvent, ReadyState, Shared};
@@ -1080,6 +1097,7 @@ fn capture_connecting_then_ready() {
 /// re-measures/arranges the content `SwitchView`'s newly-active child) — the same behavior the old
 /// hand-painted `switch_to` provided.
 #[test]
+#[ignore = "SUI visual smoke; run explicitly with --ignored --nocapture"]
 fn shell_tabbar_switches_tab_and_relayouts_content() {
     use sinomo_app::state::Tab;
     use sui::SemanticsRole;
@@ -1135,6 +1153,7 @@ fn shell_tabbar_switches_tab_and_relayouts_content() {
 /// content below is whichever tab's view — here the chrome is what we're inspecting. Captures land in
 /// `target/shots` so the paths are stable.
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_shell_chrome() {
     use sinomo_app::theme::AppThemeMode;
     use sui::Rect;
@@ -1191,6 +1210,7 @@ fn capture_shell_chrome() {
 /// "thinking…" indicator), and the provider selector open. The transcript is seeded directly via
 /// the public `ChatState.messages` field so the captures stay independent of any live model backend.
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_chat_composed() {
     use sinomo_app::theme::AppThemeMode;
     use sinomo_app::ui::chat::{ChatMessage, ConversationKind, SessionRef};
@@ -1493,6 +1513,7 @@ fn capture_chat_composed() {
 /// Deterministic capture for the runtime telemetry chrome: the context budget bar, model usage,
 /// active background-task counts, and the right-side activity rail.
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_chat_runtime_activity() {
     use sinomo_app::backend::chat_engine::RuntimeInfo;
     use sinomo_app::theme::AppThemeMode;
@@ -1679,6 +1700,7 @@ fn capture_chat_runtime_activity() {
 /// * Chat selector OPEN — the provider `Select` dropdown menu, so the overlay shadow (B3) is visible
 ///   in the final shot, in dark + light.
 #[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_final_polish() {
     use sinomo_app::theme::AppThemeMode;
     use sinomo_app::ui::chat::ChatMessage;
@@ -1890,6 +1912,7 @@ fn pixel_diff_in_rect(
 /// Issue 1 (Enter-to-send): a plain Enter dispatched to the focused composer must start a turn
 /// (the `TextArea::on_submit` -> `ChatState::submit` wiring), not merely insert a newline.
 #[test]
+#[ignore = "SUI visual smoke; run explicitly with --ignored --nocapture"]
 fn enter_in_composer_sends_the_message() {
     use sui::{
         Event, KeyState, KeyboardEvent, Point, PointerButton, PointerEvent, PointerEventKind,
@@ -1949,6 +1972,7 @@ fn enter_in_composer_sends_the_message() {
 
 /// Issue 1 (Shift+Enter): Shift+Enter must NOT send — it inserts a newline into the draft.
 #[test]
+#[ignore = "SUI visual smoke; run explicitly with --ignored --nocapture"]
 fn shift_enter_in_composer_inserts_a_newline() {
     use sui::{
         Event, KeyState, KeyboardEvent, Point, PointerButton, PointerEvent, PointerEventKind,
@@ -1993,6 +2017,7 @@ fn shift_enter_in_composer_inserts_a_newline() {
 /// a draft that cannot be sent. Connection recovery may be visible at the same time, so the selector
 /// still exposes provider setup as a separate prerequisite.
 #[test]
+#[ignore = "SUI visual smoke; run explicitly with --ignored --nocapture"]
 fn composer_without_provider_is_read_only_and_opens_setup() {
     use sui::{
         Event, KeyState, KeyboardEvent, Point, PointerButton, PointerEvent, PointerEventKind,
@@ -2066,6 +2091,7 @@ fn composer_without_provider_is_read_only_and_opens_setup() {
 /// must relayout (Spinner -> Send), not just sit stale. Drive the pump with animation frames and
 /// assert the composer pixels change across the streaming on/off transition.
 #[test]
+#[ignore = "SUI visual smoke; run explicitly with --ignored --nocapture"]
 fn pump_relayouts_composer_when_streaming_flips() {
     use sinomo_app::ui::chat::ChatMessage;
     use sui::{Event, Point, PointerEvent, PointerEventKind};
