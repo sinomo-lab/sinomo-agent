@@ -150,6 +150,9 @@ impl LocalStagedSandboxCommandRunner {
         let (manifest, layout) = store.load(sandbox_id)?;
         let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
         let before = sandbox_fs.snapshot()?;
+        if process_plan_needs_sequential_piped_input_accounting(plan, toolchain, &manifest)? {
+            return Ok(None);
+        }
         let toolchain_artifacts = load_local_toolchain_artifacts(toolchain_store, toolchain)?;
         let toolchain_commands = load_local_toolchain_commands(toolchain_store, toolchain)?;
         let mut artifact_preopens =
@@ -423,6 +426,31 @@ impl LocalStagedSandboxCommandRunner {
             step_outcomes,
         }))
     }
+}
+
+fn process_plan_needs_sequential_piped_input_accounting(
+    plan: &SandboxProcessPlan,
+    toolchain: &SandboxToolchainManifest,
+    manifest: &SandboxInstanceManifest,
+) -> Result<bool, SandboxCommandExecutionError> {
+    for steps in plan.steps.windows(2) {
+        let [producer, receiver] = steps else {
+            continue;
+        };
+        if !producer.pipe_stdout_to_next {
+            continue;
+        }
+        let producer_command = toolchain.command(&producer.command_name)?;
+        let receiver_command = toolchain.command(&receiver.command_name)?;
+        let producer_limits =
+            effective_sandbox_command_limits(&manifest.limits, &producer_command.default_limits);
+        let receiver_limits =
+            effective_sandbox_command_limits(&manifest.limits, &receiver_command.default_limits);
+        if producer_limits.max_output_bytes > receiver_limits.max_input_bytes {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(feature = "wasix-runtime")]

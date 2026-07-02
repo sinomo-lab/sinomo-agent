@@ -853,7 +853,7 @@ fn local_staged_runner_process_plan_step_overrides_cwd_and_env() {
         .put_command_module(
             &mut toolchain,
             "readcwd",
-            wasi_read_path_to_stdout_module(3, "cwd.txt", 8).as_bytes(),
+            wasix_read_absolute_file_to_stdout_module("/tmp/cwd.txt", 8).as_bytes(),
             SandboxResourceLimits::default(),
         )
         .expect("put readcwd");
@@ -1465,7 +1465,7 @@ fn local_staged_toolchain_command_stages_support_artifacts_read_only() {
         .put_command_module(
             &mut toolchain,
             "echo",
-            wasi_read_path_from_any_preopen_to_stdout_module("pkg/data.txt", 7, 3, 16).as_bytes(),
+            wasix_read_absolute_file_to_stdout_module("/share/pkg/data.txt", 7).as_bytes(),
             SandboxResourceLimits::default(),
         )
         .expect("put command");
@@ -1473,7 +1473,7 @@ fn local_staged_toolchain_command_stages_support_artifacts_read_only() {
         .put_command_module(
             &mut toolchain,
             "readlib",
-            wasi_read_path_from_any_preopen_to_stdout_module("site.py", 8, 3, 16).as_bytes(),
+            wasix_read_absolute_file_to_stdout_module("/Lib/site.py", 8).as_bytes(),
             SandboxResourceLimits::default(),
         )
         .expect("put readlib command");

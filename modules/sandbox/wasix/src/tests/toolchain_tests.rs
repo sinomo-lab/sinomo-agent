@@ -284,32 +284,50 @@ fn sandbox_mvp_command_list_tracks_busybox_subset_and_known_gaps() {
     );
     let wasix_process_capabilities =
         sandbox_runtime_process_capabilities_for_abi(&SandboxWasiAbi::Wasix);
-    assert_eq!(wasix_process_capabilities.len(), 2);
+    assert_eq!(wasix_process_capabilities.len(), 4);
+    assert!(
+        wasix_process_capabilities.iter().any(|capability| {
+            capability.capability == SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY
+                && capability.supported
+                && capability.detail.contains("pinned toolchain")
+        }),
+        "wasix should report child-process support through the staged toolchain path"
+    );
     assert!(
         wasix_process_capabilities.iter().any(|capability| {
             capability.capability == SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY
                 && capability.supported
-                && capability.detail.contains("pinned /bin")
+                && capability.detail.contains("sandbox-mounted paths")
         }),
-        "wasix should still report the bounded pinned subprocess bridge separately"
+        "wasix should report sandbox-local child exec support separately"
     );
     assert!(
         wasix_process_capabilities.iter().any(|capability| {
-            capability.capability == "child-process-exec"
-                && !capability.supported
-                && capability.detail.contains("lacks POSIX fork")
+            capability.capability == SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY
+                && capability.supported
+                && capability.detail.contains("asyncify")
         }),
-        "wasix should still be honest about lacking POSIX child-process parity"
+        "wasix should report asyncified fork support separately"
     );
     let wasix_budget_capabilities =
         sandbox_runtime_budget_capabilities_for_abi(&SandboxWasiAbi::Wasix);
-    assert_eq!(wasix_budget_capabilities.len(), 5);
-    assert!(
-        wasix_budget_capabilities
-            .iter()
-            .all(|capability| capability.supported),
-        "wasix runner should report timeout, cancellation, input, memory, and output-limit enforcement"
-    );
+    assert_eq!(wasix_budget_capabilities.len(), 9);
+    for capability in [
+        "task-limit",
+        "output-limit",
+        "input-limit",
+        "memory-limit",
+        "instruction-budget",
+        "process-tree-timeout",
+        "process-tree-cancellation",
+    ] {
+        assert!(
+            wasix_budget_capabilities
+                .iter()
+                .any(|reported| reported.capability == capability && reported.supported),
+            "wasix runner should report {capability} enforcement"
+        );
+    }
     assert!(
         wasix_budget_capabilities
             .iter()

@@ -231,13 +231,13 @@ fn sandbox_policy_denies_unsupported_runtime_command_capability_even_when_allowe
 
     let error = policy
         .validate_command(&command, &SandboxWasiAbi::Wasix)
-        .expect_err("unsupported runtime capability denied");
+        .expect_err("WASIX child exec without an explicit mode is denied");
 
-    assert_eq!(error.code, "command-capability-unsupported");
+    assert_eq!(error.code, "command-capability-missing");
     assert!(
         error
             .detail
-            .contains("WASIX sandbox runtime does not support")
+            .contains(SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY)
     );
 }
 
@@ -443,8 +443,7 @@ fn sandbox_policy_denies_wasix_child_process_capability_without_runtime_feature(
 }
 
 #[test]
-fn sandbox_policy_denies_process_substrate_commands_without_support_even_without_declared_capability()
- {
+fn sandbox_policy_denies_process_substrate_commands_without_declared_capability() {
     let toolchain_id =
         SandboxToolchainId::from_legacy_named("toolchain_busybox").expect("toolchain");
 
@@ -466,7 +465,7 @@ fn sandbox_policy_denies_process_substrate_commands_without_support_even_without
             .validate_command(&command, &SandboxWasiAbi::Wasix)
             .expect_err("process substrate command denied");
 
-        assert_eq!(error.code, "command-capability-unsupported");
+        assert_eq!(error.code, "command-capability-missing");
         assert!(error.detail.contains("child-process execution substrate"));
     }
 }

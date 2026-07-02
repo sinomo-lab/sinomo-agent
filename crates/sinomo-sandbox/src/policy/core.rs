@@ -344,6 +344,17 @@ impl SandboxPolicy {
                 ),
             ));
         }
+        if sandbox_command_requires_child_process_substrate(&command.name)
+            && !command_declares_child_process_capability(command)
+        {
+            return Err(SandboxPolicyDenial::new(
+                "command-capability-missing",
+                format!(
+                    "command {} requires a child-process execution substrate; the command manifest must explicitly declare a child-process capability or WASIX child-exec mode",
+                    command.name
+                ),
+            ));
+        }
         for capability in &command.required_capabilities {
             if !sandbox_runtime_supports_command_capability_for_abi(capability, target_abi) {
                 return Err(SandboxPolicyDenial::new(
@@ -647,6 +658,15 @@ impl SandboxPolicy {
         }
         Ok(parts)
     }
+}
+
+fn command_declares_child_process_capability(command: &SandboxToolchainCommand) -> bool {
+    command.required_capabilities.iter().any(|capability| {
+        capability == SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY
+            || capability == SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY
+            || capability == SANDBOX_PINNED_CHILD_EXEC_CONTAINMENT_CAPABILITY
+            || capability == SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
