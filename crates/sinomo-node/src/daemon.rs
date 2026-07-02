@@ -1,10 +1,10 @@
 use crate::NodeId;
-use sinomo_core::{
+use sinomo_base::{
     CapabilityName, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState,
     ClusterTransportKind, Id,
 };
 
-pub const DAEMON_MAIN_RUN_CAPABILITY: &str = "daemon.main.run";
+pub use sinomo_base::DAEMON_MAIN_RUN_CAPABILITY;
 pub const DAEMON_SHADOW_SUPERVISE_CAPABILITY: &str = "daemon.shadow.supervise";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";

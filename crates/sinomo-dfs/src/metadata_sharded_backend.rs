@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::control_plane::{DfsMetadataShardConfig, select_metadata_shard_config_for_path};
 use crate::metadata_api::DfsMetadataBackend;

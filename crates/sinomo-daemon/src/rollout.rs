@@ -612,9 +612,9 @@ pub fn run_shadow_daemon_supervision_loop(
     let bind_address = format!("{}:{}", options.host, options.port);
     let daemon_runtime = crate::build_daemon_async_runtime("shadow-daemon")?;
     let daemon_runtime_handle = daemon_runtime.handle().clone();
-    let listener = daemon_runtime.block_on(sinomo_network::AsyncDaemonControlListener::bind(
-        &bind_address,
-    ))?;
+    let listener = daemon_runtime.block_on(
+        sinomo_core::network::AsyncDaemonControlListener::bind(&bind_address),
+    )?;
     let mut shadow_runtime_tasks = Vec::new();
     let (control_shutdown_tx, control_shutdown_rx) = tokio::sync::watch::channel(false);
     let control_shutdown_signal = control_shutdown_tx.clone();

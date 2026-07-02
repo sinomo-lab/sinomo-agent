@@ -9,10 +9,17 @@ license.workspace = true
 include = ["**/*.rs", "Cargo.toml"]
 
 [package.metadata.sinomo]
-ring = "r1"
+ring = "r0"
 
 [features]
+# Exposes crate internals for sibling-crate integration tests.
+test-support = ["dep:sinomo-kv"]
 default = []
+# TODO(stage-C-followup): remove this feature (and the `iroh` dep) once the
+# daemon's built-in iroh proxy loop, sinomo-cli's direct-dial tests, and the
+# sinomo-cluster proxy tests are migrated to the modules/network/iroh dylib.
+# The extraction landed in stage C; registry-aware dispatch already prefers a
+# registered module over this built-in path.
 iroh-transport = ["dep:iroh"]
 
 [dependencies]
@@ -33,9 +40,9 @@ local-ip-address.workspace = true
 tokio.workspace = true
 tower-layer = "0.3"
 tower-service = "0.3"
-sinomo-core = { path = "../sinomo-core" }
+sinomo-base = { path = "../sinomo-base" }
 sinomo-events = { path = "../sinomo-events" }
-sinomo-kv = { path = "../sinomo-kv" }
+sinomo-kv = { path = "../sinomo-kv", optional = true }
 sinomo-local = { path = "../sinomo-local" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }

@@ -13,7 +13,7 @@ use crate::{
     DfsMetadataShardId, DfsNamespaceJobKind, DfsNamespaceOperation, DfsNamespaceResult,
     DfsObjectKind, DfsObjectMetadata, NetworkedDfsService, sifs_file_system_id,
 };
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 use std::time::{Duration, Instant};
 
 const POSIX_SIFS_METADATA_SHARD_CACHE_TTL: Duration = Duration::from_secs(1);

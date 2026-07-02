@@ -1,7 +1,7 @@
 //! Event validation, append, and replay backbone.
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{
+use sinomo_base::{
     Confidence, EventEnvelope, EventKind, EvidenceRef, Id, LatencyClass, PrivacyClass,
     RoutingMetadata, RoutingScope, Salience, Source,
 };
@@ -13,9 +13,9 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
 
-pub type EventId = sinomo_core::Id;
-pub type SessionId = sinomo_core::Id;
-pub type EntityId = sinomo_core::Id;
+pub type EventId = sinomo_base::Id;
+pub type SessionId = sinomo_base::Id;
+pub type EntityId = sinomo_base::Id;
 pub type InteractiveEnvironmentId = Id;
 pub type InteractiveTrajectoryId = Id;
 pub type InteractiveActionId = Id;
@@ -217,8 +217,8 @@ pub fn interactive_state_event(
         .map(|artifact| EvidenceRef {
             uri: artifact.uri.clone(),
             kind: match artifact.kind {
-                InteractiveArtifactKind::Screenshot => sinomo_core::EvidenceKind::Screen,
-                _ => sinomo_core::EvidenceKind::Artifact,
+                InteractiveArtifactKind::Screenshot => sinomo_base::EvidenceKind::Screen,
+                _ => sinomo_base::EvidenceKind::Artifact,
             },
             content_hash: Some(artifact.content_hash.clone()),
         })
@@ -785,7 +785,7 @@ pub fn kind_has_prefix(kind: &EventKind, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::{
+    use sinomo_base::{
         Confidence, EventEnvelope, EventKind, EventLinks, EventSpan, LatencyClass, PrivacyClass,
         RoutingMetadata, RoutingScope, Salience, Source,
     };

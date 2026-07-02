@@ -88,7 +88,7 @@ fn command_record_events_append_from_local_sandbox_logs() {
     let mut sandbox_fs = LocalSandboxFileSystem::new(layout);
     let record = completed_command_record("sandbox_command_events_local");
     persist_command_outputs(&mut sandbox_fs, &record, b"hello\n", b"warn\n").expect("persist");
-    let mut event_store = sinomo_events::InMemoryEventStore::new();
+    let mut event_store = sinomo_core::events::InMemoryEventStore::new();
     let node_id = NodeId::from_legacy_named("node_sandbox_events").expect("node");
 
     let receipts =
@@ -97,7 +97,7 @@ fn command_record_events_append_from_local_sandbox_logs() {
 
     assert_eq!(receipts.len(), 4);
     let events = event_store
-        .replay(sinomo_events::ReplayQuery::by_kind_prefix(
+        .replay(sinomo_core::events::ReplayQuery::by_kind_prefix(
             "sandbox.command",
         ))
         .expect("replay");
@@ -166,7 +166,7 @@ fn failed_command_record_events_append_raw_output_before_status() {
         error: Some("command exited with status 1".to_string()),
     };
     persist_command_outputs(&mut sandbox_fs, &record, b"", b"failed\n").expect("persist");
-    let mut event_store = sinomo_events::InMemoryEventStore::new();
+    let mut event_store = sinomo_core::events::InMemoryEventStore::new();
     let node_id = NodeId::from_legacy_named("node_sandbox_failed_events").expect("node");
 
     let receipts =
@@ -175,7 +175,7 @@ fn failed_command_record_events_append_raw_output_before_status() {
 
     assert_eq!(receipts.len(), 3);
     let events = event_store
-        .replay(sinomo_events::ReplayQuery::by_kind_prefix(
+        .replay(sinomo_core::events::ReplayQuery::by_kind_prefix(
             "sandbox.command",
         ))
         .expect("replay");
@@ -226,7 +226,7 @@ fn command_record_events_append_from_sifs_sandbox_logs() {
     let mut sandbox_fs = SifsSandboxFileSystem::new(store.into_inner(), &manifest);
     let record = completed_command_record("sandbox_sifs_command_events");
     persist_command_outputs(&mut sandbox_fs, &record, b"hello\n", b"").expect("persist");
-    let mut event_store = sinomo_events::InMemoryEventStore::new();
+    let mut event_store = sinomo_core::events::InMemoryEventStore::new();
 
     let receipts =
         append_sandbox_command_record_events(&mut sandbox_fs, node_id.clone(), &mut event_store)
@@ -234,7 +234,7 @@ fn command_record_events_append_from_sifs_sandbox_logs() {
 
     assert_eq!(receipts.len(), 3);
     let events = event_store
-        .replay(sinomo_events::ReplayQuery::by_kind_prefix(
+        .replay(sinomo_core::events::ReplayQuery::by_kind_prefix(
             "sandbox.command",
         ))
         .expect("replay");
@@ -313,7 +313,7 @@ fn command_record_events_fetch_remote_sifs_log_content() {
     .with_metadata_backend(reader_backend)
     .expect("reader metadata backend");
     let mut reader_fs = SifsSandboxFileSystem::new(reader_dfs, &manifest);
-    let mut event_store = sinomo_events::InMemoryEventStore::new();
+    let mut event_store = sinomo_core::events::InMemoryEventStore::new();
 
     let owner_worker = {
         let owner_dfs = Arc::clone(&owner_dfs);
@@ -354,7 +354,7 @@ fn command_record_events_fetch_remote_sifs_log_content() {
     assert_eq!(owner_worker.join().expect("owner worker"), 2);
     assert_eq!(receipts.len(), 3);
     let events = event_store
-        .replay(sinomo_events::ReplayQuery::by_kind_prefix(
+        .replay(sinomo_core::events::ReplayQuery::by_kind_prefix(
             "sandbox.command",
         ))
         .expect("replay");

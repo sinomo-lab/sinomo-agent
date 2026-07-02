@@ -1,0 +1,32 @@
+[package]
+name = "sinomo-network-iroh-module"
+version.workspace = true
+description = "Trusted native-dylib iroh roaming transport module for the Sinomo network layer"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[package.metadata.sinomo.native-dylib]
+module-id = "module.network-iroh"
+interface-version = "sinomo.network-iroh.v1"
+cache-key = "module/network/iroh"
+source = "rollout:modules/network/iroh"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+
+[dependencies]
+fs2.workspace = true
+iroh = "0.98.2"
+sinomo-core = { path = "../../../crates/sinomo-core" }
+sinomo-module-api = { path = "../../../crates/sinomo-module-api" }
+tokio.workspace = true
+tracing.workspace = true

@@ -1,28 +1,32 @@
-//! Explicit R0/R1 runtime boundary facade.
+//! Explicit R1 runtime boundary facade.
 //!
 //! R2 service crates should treat this crate as the public foundation surface
-//! for trusted runtime contracts. The facade intentionally aggregates only R0
-//! and R1 crates; it must never depend on R2 service or application crates.
+//! for trusted runtime contracts. The facade aggregates the R0 boundary
+//! (`sinomo-core`) plus the R1 crates; it must never depend on R2 service or
+//! application crates, and it reaches R0 exclusively through `sinomo-core`.
 //!
 //! The crate does not add behavior. It makes the trust-ring cut visible in the
 //! Cargo graph and gives architecture tests one concrete boundary to enforce.
 
-/// R0 continuity-root contracts.
+/// R0 cluster foundation, re-exported from the `sinomo-core` boundary facade.
 ///
 /// These are the smallest durable contracts that must remain understandable
-/// across standby handoff, rollback, recovery, and high-level automation.
+/// across standby handoff, rollback, recovery, and high-level automation: the
+/// minimal set of crates that defines the cluster.
 pub mod r0 {
     pub use sinomo_core as core;
     pub use sinomo_core::*;
-    pub use sinomo_object as object;
+    pub use sinomo_core::{
+        base, cluster, events, kv, local, network, node, object, service, storage,
+    };
 }
 
 /// R1 trusted-runtime services and contracts.
 ///
-/// R1 owns the local runtime substrate: events, nodes, DFS metadata, module
-/// loading, policy, registry, rollout, sandboxing, supervision, local paths,
-/// and command evaluation. R2 services may build on these crates, but R1 crates
-/// must not depend back on R2 service crates.
+/// R1 owns the local runtime substrate above the cluster foundation: DFS
+/// metadata, module loading, policy, registry, rollout, sandboxing,
+/// supervision, and command evaluation. R2 services may build on these crates,
+/// but R1 crates must not depend back on R2 service crates.
 pub mod r1 {
     pub use sinomo_cli_registry as cli_registry;
     pub use sinomo_config as config;
@@ -31,14 +35,14 @@ pub mod r1 {
     pub use sinomo_dfs as dfs;
     pub use sinomo_dfs_cloud_files_api as dfs_cloud_files_api;
     pub use sinomo_eval as eval;
-    pub use sinomo_events as events;
-    pub use sinomo_kv as kv;
-    pub use sinomo_local as local;
     pub use sinomo_module as module;
     pub use sinomo_module_api as module_api;
-    pub use sinomo_network as network;
-    pub use sinomo_network_module as network_module;
-    pub use sinomo_node as node;
+    pub mod network_module {
+        pub use sinomo_daemon::registry::{
+            network_module_capabilities, network_module_id, network_module_registration,
+            network_module_surfaces,
+        };
+    }
     pub use sinomo_observe as observe;
     pub use sinomo_policy as policy;
     pub use sinomo_registry as registry;
@@ -51,266 +55,37 @@ pub mod r1 {
     pub use sinomo_sandbox_wasix_api as sandbox_wasix_api;
     #[cfg(feature = "sandbox")]
     pub use sinomo_sandbox_wasix_host as sandbox_wasix_host;
-    pub use sinomo_service as service;
     pub use sinomo_supervision as supervision;
     pub use sinomo_test as test;
 
+    pub use sinomo_core::{cluster, events, kv, local, network, node, service};
+
     pub mod storage {
-        pub use sinomo_storage::*;
-
-        pub fn sinomo_data_dir_layout() -> Result<StorageLayout, StorageContractError> {
-            let mut layout = StorageLayout::new();
-            sinomo_network::register_storage_paths(&mut layout)?;
-            sinomo_kv::register_storage_paths(&mut layout)?;
-            sinomo_daemon::register_storage_paths(&mut layout)?;
-            sinomo_config::register_storage_paths(&mut layout)?;
-            sinomo_module::register_storage_paths(&mut layout)?;
-            sinomo_registry::register_storage_paths(&mut layout)?;
-            sinomo_node::register_storage_paths(&mut layout)?;
-            super::modules::register_internal_module_storage_paths(&mut layout)?;
-            sinomo_sandbox::register_storage_paths(&mut layout)?;
-            sinomo_local::register_storage_paths(&mut layout)?;
-            sinomo_events::register_storage_paths(&mut layout)?;
-            Ok(layout)
-        }
-
-        pub fn storage_registry() -> Result<StorageRegistry, StorageContractError> {
-            sinomo_data_dir_layout().map(StorageRegistry::from_layout)
-        }
-
-        pub fn verify_sinomo_data_dir(
-            data_dir: impl AsRef<std::path::Path>,
-        ) -> Result<StorageVerificationReport, StorageContractError> {
-            sinomo_data_dir_layout()?.verify_data_dir(data_dir)
-        }
-
-        pub fn ensure_sinomo_data_dir_is_registered(
-            data_dir: impl AsRef<std::path::Path>,
-        ) -> Result<(), StorageContractError> {
-            let report = verify_sinomo_data_dir(data_dir)?;
-            if report.is_complete() {
-                Ok(())
-            } else {
-                Err(StorageContractError::UnregisteredPaths {
-                    paths: report.unregistered,
-                })
-            }
-        }
+        pub use sinomo_core::storage::*;
+        pub use sinomo_daemon::registry::{
+            ensure_sinomo_data_dir_is_registered, sinomo_data_dir_layout, storage_registry,
+            verify_sinomo_data_dir,
+        };
     }
 
     pub mod modules {
-        pub use sinomo_module::{
+        pub use sinomo_daemon::registry::{
+            InternalModuleTable, MODULE_REGISTRY_SNAPSHOT_VERSION_OBSERVABILITY_KEY,
             ModuleRegistration, ModuleRegistry, ModuleRegistryError, ModuleRegistrySnapshot,
-            ModuleRegistrySnapshotStore,
+            ModuleRegistrySnapshotStore, NativeRustModuleBinding,
+            install_module_registry_snapshot_routes, internal_module_registry,
+            internal_module_table, internal_native_rust_module_bindings,
+            module_object_rpc_route_descriptor_to_network,
+            module_registration_object_rpc_route_descriptors,
+            module_registry_object_rpc_route_descriptors,
+            module_registry_snapshot_object_rpc_route_descriptors,
+            native_rust_binding_for_registration, native_rust_module_binding,
+            register_internal_module_storage_paths,
         };
-        use std::collections::BTreeSet;
-        use std::future::Future;
-        use std::sync::Arc;
-
-        pub struct NativeRustModuleBinding {
-            pub registration_key: &'static str,
-            pub register_services: Option<
-                fn(
-                    sinomo_service::ServiceRegistryBuilder,
-                ) -> sinomo_service::ServiceRegistryBuilder,
-            >,
-            pub register_storage_paths: Option<
-                fn(
-                    &mut sinomo_storage::StorageLayout,
-                ) -> Result<(), sinomo_storage::StorageContractError>,
-            >,
-        }
-
-        pub struct InternalModuleTable {
-            pub registry: ModuleRegistry,
-            pub native_rust_bindings: &'static [NativeRustModuleBinding],
-        }
-
-        const INTERNAL_NATIVE_RUST_MODULE_BINDINGS: &[NativeRustModuleBinding] = &[
-            NativeRustModuleBinding {
-                registration_key: sinomo_dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY,
-                register_services: Some(sinomo_dfs::register_services),
-                register_storage_paths: Some(sinomo_dfs::register_storage_paths),
-            },
-            NativeRustModuleBinding {
-                registration_key: sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY,
-                register_services: Some(sinomo_rollout::register_services),
-                register_storage_paths: Some(sinomo_rollout::register_storage_paths),
-            },
-            NativeRustModuleBinding {
-                registration_key: sinomo_network::SINOMO_NETWORK_NATIVE_REGISTRATION_KEY,
-                register_services: None,
-                register_storage_paths: None,
-            },
-            NativeRustModuleBinding {
-                registration_key: sinomo_observe::SINOMO_OBSERVE_NATIVE_REGISTRATION_KEY,
-                register_services: Some(sinomo_observe::register_services),
-                register_storage_paths: Some(sinomo_observe::register_storage_paths),
-            },
-        ];
-
-        pub fn internal_module_table() -> Result<InternalModuleTable, ModuleRegistryError> {
-            let registry = internal_module_registry()?;
-            Ok(InternalModuleTable {
-                registry,
-                native_rust_bindings: internal_native_rust_module_bindings(),
-            })
-        }
-
-        pub fn internal_module_registry() -> Result<ModuleRegistry, ModuleRegistryError> {
-            let registry = sinomo_module::ModuleRegistry::builder()
-                .register(sinomo_dfs::dfs_module_registration())?
-                .register(sinomo_network_module::network_module_registration())?
-                .register(sinomo_rollout::rollout_module_registration())?
-                .register(sinomo_observe::observe_module_registration())?
-                .try_build()?;
-            Ok(registry)
-        }
-
-        pub fn module_object_rpc_route_descriptor_to_network(
-            descriptor: &sinomo_module::ModuleObjectRpcRouteDescriptor,
-        ) -> sinomo_network::ObjectRouteDescriptor {
-            let mut route = sinomo_network::ObjectRouteDescriptor::new(
-                descriptor.route.clone(),
-                descriptor.category.clone(),
-                format!(
-                    "module object RPC operation {}",
-                    descriptor.operation.as_str()
-                ),
-                "sinomo_network::ObjectRpcRequest",
-                "sinomo_network::ObjectRpcResponse",
-            )
-            .with_auth_scope(descriptor.auth_scope.clone())
-            .observable("module.operation", descriptor.operation.as_str());
-            for capability in &descriptor.required_capabilities {
-                route = route.require_capability(capability.as_str());
-            }
-            route
-        }
-
-        pub fn module_registration_object_rpc_route_descriptors(
-            registration: &ModuleRegistration,
-        ) -> Result<Vec<sinomo_network::ObjectRouteDescriptor>, sinomo_module::ModuleSurfaceError>
-        {
-            Ok(registration
-                .surfaces
-                .object_rpc_route_descriptors()?
-                .iter()
-                .map(module_object_rpc_route_descriptor_to_network)
-                .collect::<Vec<_>>())
-        }
-
-        pub fn module_registry_object_rpc_route_descriptors(
-            registry: &ModuleRegistry,
-        ) -> Result<Vec<sinomo_network::ObjectRouteDescriptor>, sinomo_module::ModuleSurfaceError>
-        {
-            let mut seen_routes = BTreeSet::new();
-            let mut descriptors = Vec::new();
-            for registration in registry.registrations() {
-                for descriptor in module_registration_object_rpc_route_descriptors(registration)? {
-                    if !seen_routes.insert(descriptor.route.clone()) {
-                        return Err(sinomo_module::ModuleSurfaceError::DuplicateObjectRpcRoute {
-                            route: descriptor.route,
-                        });
-                    }
-                    descriptors.push(descriptor);
-                }
-            }
-            Ok(descriptors)
-        }
-
-        pub fn module_registry_snapshot_object_rpc_route_descriptors(
-            snapshot: &ModuleRegistrySnapshot,
-        ) -> Result<Vec<sinomo_network::ObjectRouteDescriptor>, sinomo_module::ModuleSurfaceError>
-        {
-            module_registry_object_rpc_route_descriptors(snapshot.registry())
-        }
-
-        pub const MODULE_REGISTRY_SNAPSHOT_VERSION_OBSERVABILITY_KEY: &str =
-            "module.registry.snapshot_version";
-
-        pub fn install_module_registry_snapshot_routes<F, Fut>(
-            router: &sinomo_network::ObjectRpcRouter,
-            snapshot: &ModuleRegistrySnapshot,
-            handler: F,
-        ) -> Result<Arc<sinomo_network::ObjectRpcRouteRegistry>, sinomo_network::NetworkError>
-        where
-            F: Fn(sinomo_network::ObjectRpcRequest) -> Fut + Clone + Send + Sync + 'static,
-            Fut: Future<
-                    Output = Result<
-                        sinomo_network::ObjectRpcResponse,
-                        sinomo_network::NetworkError,
-                    >,
-                > + Send
-                + 'static,
-        {
-            let snapshot_version = snapshot.version().to_string();
-            let descriptors = module_registry_snapshot_object_rpc_route_descriptors(snapshot)
-                .map_err(module_surface_error_to_network_error)?
-                .into_iter()
-                .map(|descriptor| {
-                    descriptor.observable(
-                        MODULE_REGISTRY_SNAPSHOT_VERSION_OBSERVABILITY_KEY,
-                        snapshot_version.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            router.replace_route_set(
-                |descriptor| {
-                    descriptor
-                        .observability
-                        .contains_key(MODULE_REGISTRY_SNAPSHOT_VERSION_OBSERVABILITY_KEY)
-                },
-                descriptors,
-                handler,
-            )
-        }
-
-        fn module_surface_error_to_network_error(
-            error: sinomo_module::ModuleSurfaceError,
-        ) -> sinomo_network::NetworkError {
-            sinomo_network::NetworkError::Serialization {
-                detail: error.to_string(),
-            }
-        }
-
-        pub fn internal_native_rust_module_bindings() -> &'static [NativeRustModuleBinding] {
-            INTERNAL_NATIVE_RUST_MODULE_BINDINGS
-        }
-
-        pub fn native_rust_module_binding(
-            registration_key: &str,
-        ) -> Option<&'static NativeRustModuleBinding> {
-            internal_native_rust_module_bindings()
-                .iter()
-                .find(|binding| binding.registration_key == registration_key)
-        }
-
-        pub fn native_rust_binding_for_registration(
-            registration: &ModuleRegistration,
-        ) -> Option<&'static NativeRustModuleBinding> {
-            let sinomo_module::ModuleBackendRegistration::NativeRust {
-                registration: native_registration,
-            } = &registration.backend
-            else {
-                return None;
-            };
-            native_rust_module_binding(&native_registration.registration_key)
-        }
-
-        pub fn register_internal_module_storage_paths(
-            layout: &mut sinomo_storage::StorageLayout,
-        ) -> Result<(), sinomo_storage::StorageContractError> {
-            for binding in internal_native_rust_module_bindings() {
-                if let Some(register_storage_paths) = binding.register_storage_paths {
-                    register_storage_paths(layout)?;
-                }
-            }
-            Ok(())
-        }
     }
 }
 
+pub use r0::cluster;
 pub use r0::{core, object};
 #[cfg(feature = "sandbox")]
 pub use r1::sandbox_wasix_host;
@@ -338,7 +113,7 @@ mod tests {
         else {
             panic!("expected cluster state contract");
         };
-        assert_eq!(cluster_state.module, "sinomo-network");
+        assert_eq!(cluster_state.module, "sinomo-cluster");
 
         let Some(StoragePathOwner::Escape(kv_raft_node)) =
             layout.owner_for("cluster/kv-raft/01kr3d54d45zkm0p0xgps8k7mt/wal.sobjlog")
@@ -643,7 +418,7 @@ mod tests {
                 .iter()
                 .any(|route| route.route == observe::OBSERVE_EVENTS_ROUTE
                     && route.category == observe::OBSERVE_RPC_CATEGORY
-                    && route.auth == module::ModuleRouteAuth::LocalCommand)
+                    && route.auth == module::ModuleRouteAuth::LocalOrClusterMember)
         );
     }
 

@@ -1027,8 +1027,8 @@ pub(super) fn sandbox_command_record_status_for_execution_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_core::network::InProcessNetwork;
     use sinomo_dfs::{DfsMetadataShardId, LocalContentStore, LocalSobjMetadataBackend};
-    use sinomo_network::InProcessNetwork;
 
     fn unique_test_dir(name: &str) -> sinomo_testdir::TestDir {
         sinomo_testdir::TestDir::new(name)

@@ -1,0 +1,20 @@
+[package]
+name = "sinomo-base"
+version.workspace = true
+description = "Sinomo base contracts: IDs, event envelope, domain types, scalars"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r0"
+
+[dependencies]
+serde.workspace = true
+serde_bytes.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+ulid.workspace = true

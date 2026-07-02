@@ -4,66 +4,59 @@ use super::{
     AgentSessionMessageOptions, AgentSessionProgressOptions, AgentSessionResumeOptions,
     AgentSessionTerminalResultsOptions, AgentValidateOptions, BUILTIN_TOP_LEVEL_USAGE_COMMANDS,
     CliClusterMemberMutationHost, CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand,
-    ClusterInitOptions, ClusterInviteOptions, ClusterJoinOptions, ClusterJoinRegistrationRequest,
-    ClusterMigrateCommand, ClusterMigrationPlanOptions, ClusterPaths, ClusterRemoveOptions,
-    ClusterRenameOptions, ClusterRoleOptions, ClusterRolloutBuildRequest,
-    ClusterStateAuthorityOptions, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
-    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DebugCliCommand, DfsCliCommand,
-    DfsCommonOptions, DfsConflictResolveOptions, DfsConflictSaveVersionOptions,
-    DfsConflictUseVersionOptions, DfsConflictVersionsOptions, DfsExposeCliCommand,
-    DfsFilterOptions, DfsMetadataShardTransferPrimaryOptions, DfsMountOptions, DfsPinCliCommand,
-    InstallLayout, InstallOptions, InteractionModel, InteractionRuntime, InteractionSession,
-    InteractionSurface, InteractionSurfaceKind, ModelOptionValueUpdate, ModelOptionsCliCommand,
-    ModelOptionsSetOptions, ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions,
-    ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName,
-    RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation,
+    ClusterInitOptions, ClusterInviteOptions, ClusterJoinOptions, ClusterMigrateCommand,
+    ClusterMigrationPlanOptions, ClusterPaths, ClusterRemoveOptions, ClusterRenameOptions,
+    ClusterRoleOptions, ClusterRolloutBuildRequest, ClusterStateAuthorityOptions, DaemonCliCommand,
+    DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
+    DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsConflictResolveOptions,
+    DfsConflictSaveVersionOptions, DfsConflictUseVersionOptions, DfsConflictVersionsOptions,
+    DfsExposeCliCommand, DfsFilterOptions, DfsMetadataShardTransferPrimaryOptions, DfsMountOptions,
+    DfsPinCliCommand, InstallLayout, InstallOptions, InteractionModel, InteractionRuntime,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, ModelOptionValueUpdate,
+    ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget, ModelRuntimeCliCommand,
+    ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions,
+    ProviderName, RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation,
     RolloutModuleNativeDylibOptions, RolloutOptions, RolloutProgressExpectation,
     RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
-    TestCliCommand, UninstallOptions, apply_cluster_node_role, apply_cluster_raft_role,
-    authenticate_daemon_control_request, build_cluster_raft_append_request_from_next_index,
-    cli_command_is_help, cli_command_requires_cluster_state,
-    cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
-    cluster_doctor_findings, cluster_has_local_quorum, cluster_init_with_paths,
+    TestCliCommand, UninstallOptions, authenticate_daemon_control_request,
+    build_cluster_raft_append_request_from_next_index, cli_command_is_help,
+    cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
+    cli_invocation_force_local_mode, cluster_has_local_quorum, cluster_init_with_paths,
     cluster_invite_with_paths, cluster_join_with_paths, cluster_kv_state_authority_id,
-    cluster_leave_with_paths, cluster_migration_plan_with_paths,
-    cluster_node_status_from_daemon_status, cluster_peer_members, cluster_state_sync_txn,
-    compact_default_invite_introducers, daemon_advertised_endpoints_for_state,
-    daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
-    data_dir_storage_contract_findings, decode_cluster_join_invite, default_dfs_file_system_id,
-    encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
-    format_rollout_progress_line, handle_daemon_cluster_join_request,
-    handle_daemon_cluster_kv_txn_request, handle_daemon_rollout_build_request,
-    install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
-    invite_communication_channels, invite_introducer_endpoint,
-    invite_introducer_endpoint_from_state, load_tui_model_runtime_config,
-    main_agent_config_tool_registry, main_agent_handler_for_tui_with_data_dir,
-    main_agent_tool_registry_for_workspace, managed_source_status, model_config_uses_cluster,
-    models_default_with_data_dir, normalize_model_provider,
-    open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
-    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-    parse_dfs_command, parse_install_options, parse_model_default_options,
+    cluster_leave, cluster_leave_with_paths, cluster_migration_plan_with_paths,
+    cluster_node_status_from_daemon_status, cluster_peer_members, cluster_rename,
+    daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_http_fetch,
+    daemon_package_version, data_dir_storage_contract_findings, default_dfs_file_system_id,
+    ensure_rollout_layout, expire_cluster_network_records_in_kv, format_rollout_progress_line,
+    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_txn_request,
+    handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
+    load_tui_model_runtime_config, main_agent_config_tool_registry,
+    main_agent_handler_for_tui_with_data_dir, main_agent_tool_registry_for_workspace,
+    managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
+    normalize_model_provider, open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command,
+    parse_cli_invocation, parse_cluster_command, parse_cluster_join_invite_argument,
+    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
     parse_provider_command, parse_rollout_command, parse_slash_command, parse_test_command,
-    parse_uninstall_options, parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
-    read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
-    read_cluster_state, require_cluster_runtime_quorum_with_paths_and_daemon,
-    rollout_advance_with_data_dir, rollout_cluster_targets, rollout_cluster_targets_from_state,
-    rollout_pending_error_grace, rollout_progress_bar, rollout_status_matches_expectation,
+    parse_uninstall_options, parse_usage_options, read_cluster_rollout_status,
+    require_cluster_runtime_quorum_with_paths_and_daemon, rollout_advance_with_data_dir,
+    rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_pending_error_grace,
+    rollout_progress_bar, rollout_status_matches_expectation,
     rollout_target_endpoint_for_main_with_connectivity, rollout_telemetry_gates_set_with_data_dir,
     rollout_terminal_response, run_tui_with_handler_io, run_tui_with_handler_io_and_daemon,
-    send_cluster_join_registration_over_iroh, shadow_daemon_node_id, sign_cluster_join_invite,
+    send_cluster_join_registration_over_iroh, shadow_daemon_node_id,
     sign_daemon_rpc_request_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
     test_command_requires_cluster_state, tui_default_daemon_status, uninstall_with_layout,
     with_cli_force_local_mode, write_daemon_status, write_imported_cluster_kv_snapshot,
     write_model_runtime_config_for_node, write_rollout_status,
 };
-#[cfg(feature = "sandbox")]
 use super::{
     daemon_handle_daemon_sandbox_http_fetch_to_file, daemon_handle_daemon_sandbox_import_busybox,
     daemon_handle_daemon_sandbox_read, daemon_handle_daemon_sandbox_toolchain_add_artifact,
     daemon_handle_daemon_sandbox_toolchain_add_command,
     daemon_handle_daemon_sandbox_toolchain_import_package, daemon_handle_daemon_sandbox_write,
 };
+use crate::commands::{read_cluster_kv_snapshot, read_cluster_state};
 use base64::Engine;
 use sinomo_agent::{AgentRuntimeControlHost, AgentSessionResumeRequest, AgentSessionSteerRequest};
 use sinomo_lm::{
@@ -73,6 +66,18 @@ use sinomo_lm::{
 use sinomo_runtime::cli_registry::{
     CliCommandContext, CliCommandError, CliCommandHandler, CliCommandHelp, CliCommandMetadata,
     CliCommandPolicy, CliParseError, RegisteredCliCommand,
+};
+#[cfg(feature = "sandbox")]
+#[allow(unused_imports)]
+use sinomo_runtime::cluster;
+use sinomo_runtime::cluster::ClusterKvPathsExt;
+use sinomo_runtime::cluster::{
+    ClusterJoinRegistrationRequest, apply_cluster_node_role, apply_cluster_raft_role,
+    cluster_doctor_findings, cluster_state_sync_txn, compact_default_invite_introducers,
+    decode_cluster_join_invite, encode_cluster_join_invite, invite_channels_for_join_registration,
+    invite_communication_channels, invite_introducer_endpoint,
+    invite_introducer_endpoint_from_state, push_unique_introducer, read_cluster_members_from_kv,
+    read_cluster_node_statuses_from_kv, sign_cluster_join_invite,
 };
 use sinomo_runtime::core::{
     CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
@@ -131,7 +136,7 @@ fn append_cluster_raft_command(
             command,
             sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
-        .map_err(Into::into)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
 }
 
 fn cluster_network_info_key(node_id: &NodeId) -> String {
@@ -190,12 +195,12 @@ fn append_cluster_raft_command_with_response(
             command,
             sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
-        .map_err(Into::into)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
 }
 
 struct CliLocalMemberPublishHost;
 
-impl network::ClusterLocalMemberPublishHost for CliLocalMemberPublishHost {
+impl cluster::ClusterLocalMemberPublishHost for CliLocalMemberPublishHost {
     fn cluster_has_local_quorum(
         &mut self,
         _paths: &ClusterPaths,
@@ -216,9 +221,9 @@ impl network::ClusterLocalMemberPublishHost for CliLocalMemberPublishHost {
     fn send_cluster_member_publish(
         &mut self,
         _endpoint: &ClusterEndpointRecord,
-        _request: &network::ClusterMemberPublishRequest,
+        _request: &cluster::ClusterMemberPublishRequest,
         _timeout: Duration,
-    ) -> Result<network::ClusterMemberPublishResponse, network::NetworkError> {
+    ) -> Result<cluster::ClusterMemberPublishResponse, network::NetworkError> {
         panic!("local quorum host should not forward member publish requests")
     }
 }
@@ -436,8 +441,8 @@ fn authenticated_test_command(
 
 fn authenticated_cluster_peer(
     authenticated: &super::AuthenticatedDaemonCommand,
-) -> sinomo_runtime::network::ClusterAuthenticatedPeer {
-    sinomo_runtime::network::ClusterAuthenticatedPeer {
+) -> sinomo_runtime::cluster::ClusterAuthenticatedPeer {
+    sinomo_runtime::cluster::ClusterAuthenticatedPeer {
         node_id: authenticated.signer_node_id.clone(),
         public_key: authenticated.signer_public_key.clone(),
     }
@@ -448,7 +453,8 @@ fn handle_cluster_raft_append_rpc(
     request: sinomo_runtime::kv::ClusterRaftAppendRequest,
     authenticated: &super::AuthenticatedDaemonCommand,
 ) -> Result<sinomo_runtime::kv::ClusterRaftAppendResponse, network::NetworkError> {
-    let payload = sinomo_runtime::kv::cluster_raft_append_rpc_payload(&request)?;
+    let payload = sinomo_runtime::kv::cluster_raft_append_rpc_payload(&request)
+        .map_err(sinomo_runtime::network::NetworkError::directory)?;
     let rpc =
         network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -459,7 +465,7 @@ fn handle_cluster_raft_append_rpc(
             detail: error.to_string(),
         })?;
     let peer = authenticated_cluster_peer(authenticated);
-    let response = runtime.block_on(network::handle_cluster_kv_consensus_rpc_request_async(
+    let response = runtime.block_on(cluster::handle_cluster_kv_consensus_rpc_request_async(
         runtime.handle(),
         paths,
         rpc,
@@ -468,7 +474,7 @@ fn handle_cluster_raft_append_rpc(
     runtime.shutdown_timeout(Duration::from_millis(250));
     response.error_detail()?;
     sinomo_runtime::kv::decode_cluster_raft_append_rpc_response_body(&response.body)
-        .map_err(Into::into)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
 }
 
 fn handle_cluster_raft_vote_rpc(
@@ -476,7 +482,8 @@ fn handle_cluster_raft_vote_rpc(
     request: sinomo_runtime::kv::ClusterRaftVoteRequest,
     authenticated: &super::AuthenticatedDaemonCommand,
 ) -> Result<sinomo_runtime::kv::ClusterRaftVoteResponse, network::NetworkError> {
-    let payload = sinomo_runtime::kv::cluster_raft_vote_rpc_payload(&request)?;
+    let payload = sinomo_runtime::kv::cluster_raft_vote_rpc_payload(&request)
+        .map_err(sinomo_runtime::network::NetworkError::directory)?;
     let rpc =
         network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -487,7 +494,7 @@ fn handle_cluster_raft_vote_rpc(
             detail: error.to_string(),
         })?;
     let peer = authenticated_cluster_peer(authenticated);
-    let response = runtime.block_on(network::handle_cluster_kv_consensus_rpc_request_async(
+    let response = runtime.block_on(cluster::handle_cluster_kv_consensus_rpc_request_async(
         runtime.handle(),
         paths,
         rpc,
@@ -496,7 +503,7 @@ fn handle_cluster_raft_vote_rpc(
     runtime.shutdown_timeout(Duration::from_millis(250));
     response.error_detail()?;
     sinomo_runtime::kv::decode_cluster_raft_vote_rpc_response_body(&response.body)
-        .map_err(Into::into)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
 }
 
 #[test]
@@ -6381,7 +6388,7 @@ fn cluster_network_expiration_keeps_local_owned_records() {
         "local-public-key",
         now,
     );
-    sinomo_runtime::network::write_cluster_state(&paths, &state).expect("cluster state");
+    sinomo_runtime::cluster::write_cluster_state(&paths, &state).expect("cluster state");
 
     let mut store = InProcessKvStore::new();
     for node_id in [&node_id, &shadow_daemon_node_id(&node_id)] {
@@ -6451,7 +6458,7 @@ fn imported_daemon_snapshot_defers_volatile_only_materialized_refresh() {
     let baseline = InProcessKvStore::new().snapshot().expect("snapshot");
     sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &baseline)
         .expect("write baseline snapshot");
-    let before_metadata = std::fs::metadata(&paths.kv_snapshot).expect("snapshot metadata");
+    let before_metadata = std::fs::metadata(&paths.kv_paths().snapshot).expect("snapshot metadata");
     let before_modified = before_metadata.modified().expect("snapshot mtime");
 
     let cluster_id =
@@ -6479,7 +6486,7 @@ fn imported_daemon_snapshot_defers_volatile_only_materialized_refresh() {
 
     write_imported_cluster_kv_snapshot(&paths, &imported).expect("import daemon snapshot");
 
-    let after_metadata = std::fs::metadata(&paths.kv_snapshot).expect("snapshot metadata");
+    let after_metadata = std::fs::metadata(&paths.kv_paths().snapshot).expect("snapshot metadata");
     assert_eq!(
         before_metadata.len(),
         after_metadata.len(),
@@ -6553,7 +6560,7 @@ fn stable_connectivity_sync_does_not_rewrite_source_prefix() {
     )
     .expect("cluster kv snapshot");
 
-    sinomo_runtime::network::sync_cluster_connectivity_records_to_kv(
+    sinomo_runtime::cluster::sync_cluster_connectivity_records_to_kv(
         &paths,
         &source_node_id,
         vec![incoming],
@@ -6680,6 +6687,7 @@ fn cluster_doctor_reports_duplicate_iroh_endpoint_public_keys() {
 
 #[test]
 fn cluster_peer_members_preserves_pending_local_member() {
+    crate::ensure_cluster_directory_installed();
     let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-peers-offline-introducer");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -6709,9 +6717,10 @@ fn cluster_peer_members_preserves_pending_local_member() {
         "existing-public-key",
         OffsetDateTime::now_utc(),
     ));
-    sinomo_runtime::network::write_cluster_state(&paths, &state).expect("write joined state");
-    super::network::sync_cluster_state_to_local_kv_unchecked(&paths, &state).expect("sync kv");
-    std::fs::write(&paths.kv_snapshot, "{\"revision\":1}trailing").expect("corrupt kv");
+    sinomo_runtime::cluster::write_cluster_state(&paths, &state).expect("write joined state");
+    sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+        .expect("sync kv");
+    std::fs::write(&paths.kv_paths().snapshot, "{\"revision\":1}trailing").expect("corrupt kv");
 
     let members = cluster_peer_members(&paths).expect("peer members");
 
@@ -7369,9 +7378,9 @@ fn dfs_operator_inspection_uses_configured_metadata_shards() {
         "pk-local",
         now,
     );
-    sinomo_runtime::network::write_cluster_state(&cluster_paths, &state)
+    sinomo_runtime::cluster::write_cluster_state(&cluster_paths, &state)
         .expect("write cluster state");
-    super::network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+    sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
         .expect("sync cluster state");
 
     let file_system = distributed_sifs(node_id.clone());
@@ -7489,6 +7498,7 @@ fn cluster_parser_accepts_init_and_join_options() {
             cluster_id: None,
             node_id: None,
             name: "laptop".to_string(),
+            name_explicit: true,
         })
     );
     assert_eq!(
@@ -7831,6 +7841,39 @@ fn cluster_hostname_targets_use_node_status_hostname() {
 }
 
 #[test]
+fn cluster_mutations_surface_daemon_required_error_without_daemon() {
+    // Forced-local mode short-circuits daemon discovery, exercising the
+    // daemon-first gate the same way an unreachable daemon does.
+    let error = with_cli_force_local_mode(true, || {
+        cluster_rename(ClusterRenameOptions {
+            node_id: NodeId::from_legacy_named("node_daemon_required_rename").expect("node"),
+            name: "renamed".to_string(),
+        })
+    })
+    .expect_err("cluster rename must require a reachable daemon");
+    match error {
+        CliError::DaemonNotRunning { detail } => {
+            assert!(
+                detail.contains("sinomo daemon start"),
+                "daemon-required guidance should mention `sinomo daemon start`: {detail}"
+            );
+            assert!(
+                detail.contains("cluster rename"),
+                "daemon-required guidance should name the command: {detail}"
+            );
+        }
+        other => panic!("expected CliError::DaemonNotRunning, got {other:?}"),
+    }
+
+    let error = with_cli_force_local_mode(true, cluster_leave)
+        .expect_err("cluster leave must require a reachable daemon");
+    assert!(
+        matches!(error, CliError::DaemonNotRunning { .. }),
+        "cluster leave without a daemon should surface the daemon-required error: {error:?}"
+    );
+}
+
+#[test]
 fn cluster_node_rename_updates_local_state_and_kv() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-rename");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
@@ -7846,7 +7889,7 @@ fn cluster_node_rename_updates_local_state_and_kv() {
     .expect("cluster init");
     let state = read_cluster_state(&paths).expect("cluster state");
 
-    let update = network::update_cluster_node_name_with_host(
+    let update = cluster::update_cluster_node_name_with_host(
         &paths,
         state,
         node_id.clone(),
@@ -8006,7 +8049,7 @@ fn cluster_migration_plan_rejects_single_node_mode_with_remote_peers() {
         OffsetDateTime::now_utc(),
     );
     state.members.push(remote);
-    network::write_cluster_state(&source_paths, &state).expect("write state");
+    cluster::write_cluster_state(&source_paths, &state).expect("write state");
     sync_cluster_state_to_kv(&source_paths, &state).expect("sync remote peer");
 
     let error = cluster_migration_plan_with_paths(
@@ -8080,6 +8123,7 @@ fn cluster_join_on_initialized_node_rolls_back_when_target_join_fails() {
             cluster_id: None,
             node_id: None,
             name: "joiner".to_string(),
+            name_explicit: true,
         },
         &source_paths,
     )
@@ -8127,6 +8171,7 @@ fn cluster_join_on_initialized_node_rolls_back_when_target_join_fails() {
 
 #[test]
 fn cluster_state_sync_rejects_unsafe_voter_reconfiguration() {
+    crate::ensure_cluster_directory_installed();
     let root = sinomo_testdir::TestDir::new("sinomo-cli-unsafe-voter-config");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
@@ -8147,13 +8192,16 @@ fn cluster_state_sync_rejects_unsafe_voter_reconfiguration() {
     removed_voter_state.members.clear();
     let removed_error =
         sync_cluster_state_to_kv(&paths, &removed_voter_state).expect_err("reject voter removal");
-    match removed_error {
-        CliError::Kv(sinomo_runtime::kv::KvError::InvalidRaftConfigTransition { detail }) => {
-            assert!(detail.contains("overlapping old/new quorum"));
-            assert!(detail.contains("refusing to remove"));
-        }
-        other => panic!("unexpected voter removal error: {other:?}"),
-    }
+    // The refactor's cluster boundary converts KV errors into detail strings
+    // (docs/plans/r0-r1-crate-boundary-refactor.md, provider-trait section);
+    // the rejection semantics are asserted through the carried detail.
+    let removed_detail = removed_error.to_string();
+    assert!(
+        removed_detail.contains("invalid raft config transition"),
+        "unexpected voter removal error: {removed_detail}"
+    );
+    assert!(removed_detail.contains("overlapping old/new quorum"));
+    assert!(removed_detail.contains("refusing to remove"));
 
     let mut direct_voter_state = state.clone();
     let peer_id = NodeId::from_legacy_named("node_direct_voter").expect("peer");
@@ -8174,13 +8222,13 @@ fn cluster_state_sync_rejects_unsafe_voter_reconfiguration() {
     direct_voter_state.members.push(direct_voter);
     let added_error =
         sync_cluster_state_to_kv(&paths, &direct_voter_state).expect_err("reject direct voter add");
-    match added_error {
-        CliError::Kv(sinomo_runtime::kv::KvError::InvalidRaftConfigTransition { detail }) => {
-            assert!(detail.contains("must already be a committed learner or non-voting member"));
-            assert!(detail.contains(peer_id.as_str()));
-        }
-        other => panic!("unexpected direct voter add error: {other:?}"),
-    }
+    let added_detail = added_error.to_string();
+    assert!(
+        added_detail.contains("invalid raft config transition"),
+        "unexpected direct voter add error: {added_detail}"
+    );
+    assert!(added_detail.contains("must already be a committed learner or non-voting member"));
+    assert!(added_detail.contains(peer_id.as_str()));
 }
 
 #[test]
@@ -8214,9 +8262,9 @@ fn cluster_remove_deletes_non_voter_members_from_state_and_kv() {
         OffsetDateTime::now_utc(),
     ));
     sync_cluster_state_to_kv(&paths, &state).expect("sync state");
-    network::write_cluster_state(&paths, &state).expect("write state");
+    cluster::write_cluster_state(&paths, &state).expect("write state");
 
-    let removal = network::remove_cluster_members_with_host(
+    let removal = cluster::remove_cluster_members_with_host(
         &paths,
         read_cluster_state(&paths).expect("state before remove"),
         vec![learner_id.clone(), non_voter_id.clone()],
@@ -8263,7 +8311,7 @@ fn local_voter_republishes_local_members_missing_from_kv() {
     )
     .expect("cluster init");
     let local_state =
-        super::network::read_cluster_state_without_kv(&paths).expect("state without kv");
+        sinomo_runtime::cluster::read_cluster_state_without_kv(&paths).expect("state without kv");
 
     append_cluster_raft_command_with_response(
         &paths,
@@ -8287,10 +8335,10 @@ fn local_voter_republishes_local_members_missing_from_kv() {
             .iter()
             .any(|member| member.node_id == local_state.local_node_id)
     );
-    network::publish_local_members_to_quorum_if_needed_with_host(
+    cluster::publish_local_members_to_quorum_if_needed_with_host(
         &paths,
         &merged_state,
-        network::ClusterLocalMemberPublishOptions {
+        cluster::ClusterLocalMemberPublishOptions {
             member_publish_timeout: Duration::from_secs(1),
             force_kv_snapshot_sync: false,
         },
@@ -8763,6 +8811,7 @@ fn cluster_join_without_reachable_introducer_leaves_no_local_state() {
             cluster_id: Some(ClusterId::from_legacy_named("cluster_joined").expect("cluster")),
             node_id: Some(NodeId::from_legacy_named("node_joiner").expect("node")),
             name: "joiner".to_string(),
+            name_explicit: true,
         },
         &paths,
     )
@@ -8788,7 +8837,7 @@ fn cluster_join_removes_stale_pending_state_on_failure() {
     let main_identity = super::load_or_create_main_node_identity(&root).expect("main identity");
     let shadow_identity =
         sinomo_runtime::node::load_or_create_shadow_node_identity(&root).expect("shadow identity");
-    let pending = super::network::prepare_pending_cluster_join_state(
+    let pending = sinomo_runtime::cluster::prepare_pending_cluster_join_state(
         ClusterId::from_legacy_named("cluster_stale_pending").expect("cluster"),
         "stale pending".to_string(),
         NodeId::from_legacy_named("node_stale_pending").expect("node"),
@@ -8797,7 +8846,7 @@ fn cluster_join_removes_stale_pending_state_on_failure() {
         shadow_identity.public_key,
         OffsetDateTime::now_utc(),
     );
-    super::network::write_cluster_state(&paths, &pending).expect("write pending state");
+    sinomo_runtime::cluster::write_cluster_state(&paths, &pending).expect("write pending state");
 
     let error = cluster_join_with_paths(
         ClusterJoinOptions {
@@ -8805,6 +8854,7 @@ fn cluster_join_removes_stale_pending_state_on_failure() {
             cluster_id: Some(ClusterId::from_legacy_named("cluster_joined").expect("cluster")),
             node_id: None,
             name: "joiner".to_string(),
+            name_explicit: true,
         },
         &paths,
     )
@@ -8881,7 +8931,7 @@ fn cluster_invite_generates_portable_join_payload() {
     );
     assert!(parsed.introducers.is_empty());
     let persisted_invite =
-        super::network::read_cluster_invitation_from_kv(&paths, &parsed.invite_id)
+        sinomo_runtime::cluster::read_cluster_invitation_from_kv(&paths, &parsed.invite_id)
             .expect("published invite");
     assert_eq!(persisted_invite, rendered.invite);
     assert_eq!(parsed.invite_id, persisted_invite.invite_id);
@@ -9071,6 +9121,7 @@ fn cluster_join_uses_structured_invite_cluster_identity() {
             cluster_id: Some(ClusterId::from_legacy_named("cluster_remote").expect("cluster")),
             node_id: Some(NodeId::from_legacy_named("node_remote").expect("node")),
             name: "remote".to_string(),
+            name_explicit: true,
         },
         &join_paths,
     )
@@ -9118,7 +9169,7 @@ fn introducer_records_joined_members_and_returns_peer_view() {
         super::load_or_create_main_node_identity(&host_root).expect("host identity");
     offline_invite.signature =
         sign_cluster_join_invite(&offline_invite, &host_identity).expect("resign invite");
-    super::network::sync_cluster_invitation_to_kv(&host_paths, &offline_invite)
+    sinomo_runtime::cluster::sync_cluster_invitation_to_kv(&host_paths, &offline_invite)
         .expect("active offline invite kv");
     let remote_node = NodeId::from_legacy_named("node_remote").expect("node");
     let remote_main_identity =
@@ -9126,7 +9177,7 @@ fn introducer_records_joined_members_and_returns_peer_view() {
     let remote_shadow_identity =
         sinomo_runtime::node::load_or_create_shadow_node_identity(&join_root)
             .expect("remote shadow identity");
-    let remote_state = super::network::prepare_pending_cluster_join_state(
+    let remote_state = sinomo_runtime::cluster::prepare_pending_cluster_join_state(
         ClusterId::from_legacy_named("cluster_register").expect("cluster"),
         "remote".to_string(),
         remote_node.clone(),
@@ -10440,8 +10491,8 @@ fn daemon_cluster_kv_txn_does_not_ack_without_append_quorum() {
     peer.allowed_capabilities = peer.capabilities.clone();
     peer.endpoints = vec![daemon_lan_endpoint(&peer_node_id, peer_address, 0)];
     state.members.push(peer);
-    sinomo_runtime::network::write_cluster_state(&paths, &state).expect("write cluster state");
-    super::network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+    sinomo_runtime::cluster::write_cluster_state(&paths, &state).expect("write cluster state");
+    sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
         .expect("sync state to kv");
 
     let txn = KvTxn {
@@ -10468,6 +10519,7 @@ fn daemon_cluster_kv_txn_does_not_ack_without_append_quorum() {
 
 #[test]
 fn daemon_cluster_kv_is_read_only_without_cluster_state() {
+    crate::ensure_cluster_directory_installed();
     let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-kv-no-cluster");
     let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
     let txn = KvTxn {
@@ -10531,7 +10583,7 @@ fn network_raft_handlers_reject_mismatched_authenticated_peer() {
     )
     .expect("cluster init");
     let state = read_cluster_state(&paths).expect("cluster state");
-    super::network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+    sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
         .expect("sync state to kv");
     let bad_auth = authenticated_test_command(
         sinomo_runtime::kv::CLUSTER_RAFT_APPEND_ROUTE,
@@ -10633,7 +10685,7 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
     )
     .expect("cluster init");
     let state = read_cluster_state(&paths).expect("cluster state");
-    super::network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+    sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
         .expect("sync state to kv");
     let stale_snapshot = read_cluster_kv_snapshot(&paths).expect("stale snapshot");
     append_cluster_raft_command_with_response(
@@ -10870,7 +10922,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     let peer_shadow_identity =
         sinomo_runtime::node::load_or_create_shadow_node_identity(&peer_root)
             .expect("peer shadow identity");
-    let peer_pending = super::network::prepare_pending_cluster_join_state(
+    let peer_pending = sinomo_runtime::cluster::prepare_pending_cluster_join_state(
         cluster_id.clone(),
         "sync cluster".to_string(),
         NodeId::from_legacy_named("node_peer").expect("node"),
@@ -10879,7 +10931,8 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         peer_shadow_identity.public_key,
         time::OffsetDateTime::now_utc(),
     );
-    super::network::write_cluster_state(&peer_paths, &peer_pending).expect("peer pending state");
+    sinomo_runtime::cluster::write_cluster_state(&peer_paths, &peer_pending)
+        .expect("peer pending state");
 
     let host_state = read_cluster_state(&host_paths).expect("host state");
     let peer_state = read_cluster_state(&peer_paths).expect("peer state");
@@ -10889,7 +10942,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         host_state.local_node_id.as_str(),
         host_identity.public_key.clone(),
     );
-    super::network::sync_cluster_state_to_local_kv_unchecked(&host_paths, &host_state)
+    sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&host_paths, &host_state)
         .expect("host kv");
     let request = build_cluster_raft_append_request_from_next_index(&host_paths, &host_state, 1)
         .expect("raft append");
@@ -11487,6 +11540,7 @@ fn rollout_cluster_targets_deduplicate_explicit_targets() {
 
 #[test]
 fn rollout_cluster_targets_include_shadow_only_repair_route() {
+    crate::ensure_cluster_directory_installed();
     let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-shadow-only-repair");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -11715,6 +11769,7 @@ fn rollout_cluster_target_prefers_direct_shadow_endpoint_before_iroh() {
 
 #[test]
 fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
+    crate::ensure_cluster_directory_installed();
     let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-connectivity-order");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -11747,8 +11802,9 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
     );
     remote.endpoints = vec![lan_endpoint.clone(), iroh_endpoint.clone()];
     state.members.push(remote);
-    sinomo_runtime::network::write_cluster_state(&paths, &state).expect("write state");
-    super::network::sync_cluster_state_to_local_kv_unchecked(&paths, &state).expect("sync state");
+    sinomo_runtime::cluster::write_cluster_state(&paths, &state).expect("write state");
+    sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+        .expect("sync state");
 
     let now = OffsetDateTime::now_utc();
     let records = [
@@ -11784,7 +11840,7 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
         )
     })
     .collect::<Vec<_>>();
-    sinomo_runtime::network::sync_cluster_connectivity_records_to_kv(
+    sinomo_runtime::cluster::sync_cluster_connectivity_records_to_kv(
         &paths,
         &local_node_id,
         records,
@@ -12036,6 +12092,7 @@ fn rollout_target_prefers_healthy_main_tcp_over_shadow_iroh_backup() {
 
 #[test]
 fn rollout_endpoint_candidates_include_kv_only_endpoint_records() {
+    crate::ensure_cluster_directory_installed();
     let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-kv-endpoint-candidates");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);

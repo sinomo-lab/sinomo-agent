@@ -306,7 +306,10 @@ impl From<network::NetworkError> for CliError {
             network::NetworkError::Json { path, detail } => Self::Json { path, detail },
             network::NetworkError::StorageIo { path, detail } => Self::Io { path, detail },
             network::NetworkError::ClusterReadOnly { detail } => Self::ClusterReadOnly { detail },
-            network::NetworkError::Kv(error) => Self::Kv(error),
+            network::NetworkError::Directory { detail } => Self::Network {
+                address: "cluster-directory".to_string(),
+                detail,
+            },
             network::NetworkError::ObjectRpc { route, detail } => Self::Network {
                 address: route,
                 detail,

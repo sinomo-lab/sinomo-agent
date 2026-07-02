@@ -31,6 +31,6 @@ pub fn set_io_observer(observer: Option<Arc<dyn IoObserver>>) -> Option<Arc<dyn 
     std::mem::replace(&mut *guard, observer)
 }
 
-pub(crate) fn io_observer() -> Option<Arc<dyn IoObserver>> {
+pub fn io_observer() -> Option<Arc<dyn IoObserver>> {
     IO_OBSERVER.lock().ok().and_then(|guard| guard.clone())
 }

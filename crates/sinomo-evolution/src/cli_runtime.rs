@@ -1,6 +1,9 @@
 use super::*;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+#[allow(unused_imports)]
+use sinomo_runtime::cluster;
+use sinomo_runtime::cluster::ClusterKvPathsExt;
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::env;
@@ -699,7 +702,7 @@ pub fn registry_trust_uses_cluster(data_dir: &SinomoDataDir) -> bool {
     if cli_force_local_mode() {
         return false;
     }
-    network::read_cluster_state(&ClusterPaths::new(data_dir)).is_ok()
+    cluster::read_cluster_state(&ClusterPaths::new(data_dir)).is_ok()
 }
 
 pub fn read_trusted_signers_for_node(
@@ -765,11 +768,11 @@ fn registry_trusted_signer_cluster_entries(
 ) -> Result<Vec<KvEntry>, CliError> {
     let paths = ClusterPaths::new(data_dir);
     let snapshot = registry_trust_cluster_snapshot(&paths)?;
-    let store =
-        InProcessKvStore::restore(snapshot).map_err(sinomo_runtime::network::NetworkError::from)?;
+    let store = InProcessKvStore::restore(snapshot)
+        .map_err(sinomo_runtime::network::NetworkError::directory)?;
     store
         .range_prefix(sinomo_runtime::registry::CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX)
-        .map_err(sinomo_runtime::network::NetworkError::from)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
         .map_err(Into::into)
 }
 
@@ -784,7 +787,7 @@ fn registry_trust_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, C
     #[cfg(test)]
     {
         return sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
-            .map_err(network::NetworkError::from)
+            .map_err(network::NetworkError::directory)
             .map_err(Into::into);
     }
     #[cfg(not(test))]
@@ -798,7 +801,7 @@ fn registry_trust_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, C
 #[cfg(test)]
 fn commit_registry_trust_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Result<(), CliError> {
     let paths = ClusterPaths::new(data_dir);
-    let state = network::read_cluster_state_without_kv(&paths).map_err(|error| match error {
+    let state = cluster::read_cluster_state_without_kv(&paths).map_err(|error| match error {
         network::NetworkError::ClusterOrphan => {
             CliError::Network(network::NetworkError::ClusterReadOnly {
                 detail: "local node has no cluster state".to_string(),
@@ -813,7 +816,7 @@ fn commit_registry_trust_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Re
             sinomo_runtime::kv::KvCommand::Txn(txn),
             sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
-        .map_err(network::NetworkError::from)?;
+        .map_err(network::NetworkError::directory)?;
     Ok(())
 }
 
@@ -828,7 +831,7 @@ fn commit_registry_trust_cluster_txn(
         });
     };
     let payload = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(&txn)
-        .map_err(network::NetworkError::from)?;
+        .map_err(network::NetworkError::directory)?;
     let request =
         network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response = sinomo_runtime::daemon::send_daemon_rpc(
@@ -838,7 +841,7 @@ fn commit_registry_trust_cluster_txn(
     )?;
     response.error_detail().map_err(CliError::from)?;
     let _: KvTxnResponse = sinomo_runtime::kv::decode_cluster_kv_txn_rpc_body(&response.body)
-        .map_err(network::NetworkError::from)?;
+        .map_err(network::NetworkError::directory)?;
     Ok(())
 }
 
@@ -893,7 +896,7 @@ fn model_config_uses_cluster(data_dir: &SinomoDataDir) -> bool {
     if cli_force_local_mode() {
         return false;
     }
-    network::read_cluster_state(&ClusterPaths::new(data_dir)).is_ok()
+    cluster::read_cluster_state(&ClusterPaths::new(data_dir)).is_ok()
 }
 
 fn load_model_config_for_node(
@@ -903,7 +906,7 @@ fn load_model_config_for_node(
         let paths = ClusterPaths::new(data_dir);
         let snapshot = model_config_cluster_snapshot(&paths)?;
         let config = model_config_from_cluster_kv_snapshot(&snapshot)?.unwrap_or_default();
-        return Ok((config, paths.kv_snapshot));
+        return Ok((config, paths.kv_paths().snapshot));
     }
     let store = model_config_store()?;
     let config = store.get_typed(data_dir, None, LM_PROVIDER_CONFIG_KEY)?;
@@ -921,7 +924,7 @@ fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, Cli
     #[cfg(test)]
     {
         return sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
-            .map_err(network::NetworkError::from)
+            .map_err(network::NetworkError::directory)
             .map_err(Into::into);
     }
     #[cfg(not(test))]

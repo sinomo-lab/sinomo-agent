@@ -4,7 +4,7 @@ use metrics::{
     SharedString, Unit,
 };
 use serde::{Deserialize, Serialize};
-use sinomo_local::SinomoDataDir;
+use sinomo_core::local::SinomoDataDir;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use time::OffsetDateTime;

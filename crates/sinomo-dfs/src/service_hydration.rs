@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use sinomo_core::DfsWriteReceipt;
-use sinomo_events::EventId;
+use sinomo_core::events::EventId;
 use time::OffsetDateTime;
 
 use crate::metadata_pages::{try_walk_metadata_pages, walk_metadata_pages};

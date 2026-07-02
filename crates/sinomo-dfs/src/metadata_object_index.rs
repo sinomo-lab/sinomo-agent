@@ -267,7 +267,7 @@ mod tests {
     use super::*;
     use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
     use sinomo_core::DfsObjectPolicy;
-    use sinomo_node::NodeId;
+    use sinomo_core::node::NodeId;
 
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("valid node id")

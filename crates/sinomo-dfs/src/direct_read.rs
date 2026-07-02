@@ -6,8 +6,8 @@
 
 use std::io::Read;
 
-use sinomo_local::SinomoDataDir;
-use sinomo_network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse};
 
 use crate::DfsError;
 use crate::content_store::{BlobReader, LocalContentStore};
@@ -44,16 +44,17 @@ pub fn dfs_direct_read_rpc_request(
 ) -> Result<ObjectRpcRequest, NetworkError> {
     let mut rpc_request =
         ObjectRpcRequest::encode_body(DFS_DIRECT_READ_ROUTE, DFS_RPC_CATEGORY, request)?;
-    sinomo_network::set_object_rpc_request_stream_mode(
+    sinomo_core::network::set_object_rpc_request_stream_mode(
         &mut rpc_request,
-        sinomo_network::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+        sinomo_core::network::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
     );
     Ok(rpc_request)
 }
 
 pub fn dfs_direct_read_rpc_request_accepts_streamed_response(request: &ObjectRpcRequest) -> bool {
     request.route == DFS_DIRECT_READ_ROUTE
-        && sinomo_network::object_rpc_request_stream_mode(request).expects_raw_streamed_response()
+        && sinomo_core::network::object_rpc_request_stream_mode(request)
+            .expects_raw_streamed_response()
 }
 
 #[cfg(test)]
@@ -228,9 +229,9 @@ fn serve_dfs_direct_read_stream_request(
         DFS_DIRECT_READ_CONTENT_SIZE_METADATA_KEY.to_string(),
         request.content_size_bytes.to_string(),
     );
-    sinomo_network::set_object_rpc_response_stream_mode(
+    sinomo_core::network::set_object_rpc_response_stream_mode(
         &mut response,
-        sinomo_network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
+        sinomo_core::network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
     );
     Ok(DfsDirectReadStreamResponse {
         response,

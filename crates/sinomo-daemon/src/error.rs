@@ -26,9 +26,9 @@ pub enum DaemonError {
     ClusterReadOnly { detail: String },
 }
 
-impl From<sinomo_service::ServiceError> for DaemonError {
-    fn from(error: sinomo_service::ServiceError) -> Self {
-        use sinomo_service::ServiceError;
+impl From<sinomo_core::service::ServiceError> for DaemonError {
+    fn from(error: sinomo_core::service::ServiceError) -> Self {
+        use sinomo_core::service::ServiceError;
         match error {
             ServiceError::Network(source) => source.into(),
             ServiceError::Kv(source) => source.into(),
@@ -43,38 +43,44 @@ impl From<sinomo_service::ServiceError> for DaemonError {
     }
 }
 
-impl From<sinomo_node::NodeIdentityError> for DaemonError {
-    fn from(error: sinomo_node::NodeIdentityError) -> Self {
+impl From<sinomo_core::node::NodeIdentityError> for DaemonError {
+    fn from(error: sinomo_core::node::NodeIdentityError) -> Self {
         match error {
-            sinomo_node::NodeIdentityError::Parse { detail } => Self::Parse { detail },
-            sinomo_node::NodeIdentityError::Io { path, detail } => Self::Io { path, detail },
-            sinomo_node::NodeIdentityError::Json { path, detail } => Self::Json { path, detail },
-            sinomo_node::NodeIdentityError::Object { path, detail } => Self::Parse {
+            sinomo_core::node::NodeIdentityError::Parse { detail } => Self::Parse { detail },
+            sinomo_core::node::NodeIdentityError::Io { path, detail } => Self::Io { path, detail },
+            sinomo_core::node::NodeIdentityError::Json { path, detail } => {
+                Self::Json { path, detail }
+            }
+            sinomo_core::node::NodeIdentityError::Object { path, detail } => Self::Parse {
                 detail: format!("node identity object error at {path}: {detail}"),
             },
         }
     }
 }
 
-impl From<sinomo_network::NetworkError> for DaemonError {
-    fn from(error: sinomo_network::NetworkError) -> Self {
+impl From<sinomo_core::network::NetworkError> for DaemonError {
+    fn from(error: sinomo_core::network::NetworkError) -> Self {
         match error {
-            sinomo_network::NetworkError::AuthDenied => Self::AuthDenied,
-            sinomo_network::NetworkError::AuthExpired => Self::AuthExpired,
-            sinomo_network::NetworkError::ClusterOrphan => Self::ClusterOrphan,
-            sinomo_network::NetworkError::ClusterReadOnly { detail } => {
+            sinomo_core::network::NetworkError::AuthDenied => Self::AuthDenied,
+            sinomo_core::network::NetworkError::AuthExpired => Self::AuthExpired,
+            sinomo_core::network::NetworkError::ClusterOrphan => Self::ClusterOrphan,
+            sinomo_core::network::NetworkError::ClusterReadOnly { detail } => {
                 Self::ClusterReadOnly { detail }
             }
-            sinomo_network::NetworkError::InvalidClusterCommand { detail } => {
+            sinomo_core::network::NetworkError::InvalidClusterCommand { detail } => {
                 Self::Parse { detail }
             }
-            sinomo_network::NetworkError::Json { path, detail } => Self::Json { path, detail },
-            sinomo_network::NetworkError::StorageIo { path, detail } => Self::Io { path, detail },
-            sinomo_network::NetworkError::ObjectRpc { route, detail } => Self::Network {
+            sinomo_core::network::NetworkError::Json { path, detail } => {
+                Self::Json { path, detail }
+            }
+            sinomo_core::network::NetworkError::StorageIo { path, detail } => {
+                Self::Io { path, detail }
+            }
+            sinomo_core::network::NetworkError::ObjectRpc { route, detail } => Self::Network {
                 address: route,
                 detail,
             },
-            sinomo_network::NetworkError::Io { operation, detail } => Self::Network {
+            sinomo_core::network::NetworkError::Io { operation, detail } => Self::Network {
                 address: operation,
                 detail,
             },
@@ -85,16 +91,16 @@ impl From<sinomo_network::NetworkError> for DaemonError {
     }
 }
 
-impl From<sinomo_kv::KvError> for DaemonError {
-    fn from(error: sinomo_kv::KvError) -> Self {
+impl From<sinomo_core::kv::KvError> for DaemonError {
+    fn from(error: sinomo_core::kv::KvError) -> Self {
         Self::Parse {
             detail: error.to_string(),
         }
     }
 }
 
-impl From<sinomo_local::LocalDataError> for DaemonError {
-    fn from(error: sinomo_local::LocalDataError) -> Self {
+impl From<sinomo_core::local::LocalDataError> for DaemonError {
+    fn from(error: sinomo_core::local::LocalDataError) -> Self {
         Self::Io {
             path: "sinomo data directory".to_string(),
             detail: error.to_string(),
@@ -218,8 +224,8 @@ impl From<sinomo_sandbox::SandboxRecordedHttpFetchError> for DaemonError {
     }
 }
 
-impl From<sinomo_events::EventStoreError> for DaemonError {
-    fn from(error: sinomo_events::EventStoreError) -> Self {
+impl From<sinomo_core::events::EventStoreError> for DaemonError {
+    fn from(error: sinomo_core::events::EventStoreError) -> Self {
         Self::Io {
             path: "events/event-log.jsonl".to_string(),
             detail: error.to_string(),

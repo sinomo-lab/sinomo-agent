@@ -3,8 +3,8 @@
 mod native;
 
 use serde::{Deserialize, Serialize};
+use sinomo_core::node::NodeId;
 use sinomo_core::{CapabilityName, DeviceCapability};
-use sinomo_node::NodeId;
 
 pub use native::*;
 

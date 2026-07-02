@@ -207,7 +207,7 @@ mod tests {
     };
     use crate::{DfsFileSystemId, DfsObjectKind, DfsVersion};
     use sinomo_core::DfsObjectPolicy;
-    use sinomo_node::NodeId;
+    use sinomo_core::node::NodeId;
     use std::time::Duration;
     use time::OffsetDateTime;
 

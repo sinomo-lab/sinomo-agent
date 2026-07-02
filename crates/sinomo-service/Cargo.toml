@@ -9,17 +9,20 @@ license.workspace = true
 include = ["**/*.rs", "Cargo.toml"]
 
 [package.metadata.sinomo]
-ring = "r1"
+ring = "r0"
 
 [dependencies]
 arc-swap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
-sinomo-core = { path = "../sinomo-core" }
+sinomo-base = { path = "../sinomo-base" }
 sinomo-kv = { path = "../sinomo-kv" }
 sinomo-local = { path = "../sinomo-local" }
 sinomo-network = { path = "../sinomo-network" }
+sinomo-node = { path = "../sinomo-node" }
 
 [dev-dependencies]
 serde.workspace = true

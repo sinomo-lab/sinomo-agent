@@ -1,6 +1,6 @@
 use crate::error::NetworkError;
 use crate::object::SinomoObjectCodec;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::peer::EventFrame;
 use crate::peer::PeerEndpointCandidate;
 use crate::prelude::*;
@@ -11,9 +11,9 @@ use std::time::Instant;
 
 const DEFAULT_LAN_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(60);
 const PUBLIC_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(300);
-pub(crate) const PUBLIC_IP_DISCOVERY_EMPTY_CACHE_TTL: Duration = Duration::from_secs(30);
-pub(crate) const PUBLIC_IP_DISCOVERY_DEFERRED_CACHE_TTL: Duration = Duration::from_secs(30);
-pub(crate) const MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES: usize = 8;
+pub const PUBLIC_IP_DISCOVERY_EMPTY_CACHE_TTL: Duration = Duration::from_secs(30);
+pub const PUBLIC_IP_DISCOVERY_DEFERRED_CACHE_TTL: Duration = Duration::from_secs(30);
+pub const MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES: usize = 8;
 pub(crate) const MAX_PUBLIC_IP_DISCOVERY_RESPONSE_BYTES: u64 = 16 * 1024;
 const PUBLIC_IP_DISCOVERY_IO_TIMEOUT: Duration = Duration::from_millis(750);
 static DEFAULT_LAN_IP_DISCOVERY_CACHE: LazyLock<Mutex<Option<LocalIpDiscoveryCacheEntry>>> =
@@ -80,13 +80,13 @@ impl PublicIpDiscoveryCache {
         self.entries.insert(key, entry);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn clear(&mut self) {
         self.entries.clear();
         self.expiry_index.clear();
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn age_for_test(&mut self, age: Duration) {
         for entry in self.entries.values_mut() {
             if let Some(checked_at) = entry.checked_at.checked_sub(age) {
@@ -164,7 +164,7 @@ impl PublicIpDiscoveryCache {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn rebuild_expiry_index(&mut self) {
         self.expiry_index.clear();
         let entries = self
@@ -179,20 +179,20 @@ impl PublicIpDiscoveryCache {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PublicIpDiscoveryResult {
+pub enum PublicIpDiscoveryResult {
     Complete(Vec<IpAddr>),
     Deferred(Vec<IpAddr>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct LanQuicEndpointConfig {
     pub bind_address: String,
     pub alpn: String,
     pub max_frame_bytes: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Default for LanQuicEndpointConfig {
     fn default() -> Self {
         Self {
@@ -204,12 +204,12 @@ impl Default for LanQuicEndpointConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[cfg(test)]
-pub(crate) struct LanQuicEventFrameCodec {
+#[cfg(any(test, feature = "test-support"))]
+pub struct LanQuicEventFrameCodec {
     pub max_frame_bytes: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Default for LanQuicEventFrameCodec {
     fn default() -> Self {
         Self {
@@ -218,9 +218,9 @@ impl Default for LanQuicEventFrameCodec {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl LanQuicEventFrameCodec {
-    pub(crate) fn encode(&self, frame: &EventFrame) -> Result<Vec<u8>, NetworkError> {
+    pub fn encode(&self, frame: &EventFrame) -> Result<Vec<u8>, NetworkError> {
         let bytes = SinomoObjectCodec::default().encode(frame)?;
         if bytes.len() > self.max_frame_bytes {
             return Err(NetworkError::FrameTooLarge {
@@ -231,7 +231,7 @@ impl LanQuicEventFrameCodec {
         Ok(bytes)
     }
 
-    pub(crate) fn decode(&self, bytes: &[u8]) -> Result<EventFrame, NetworkError> {
+    pub fn decode(&self, bytes: &[u8]) -> Result<EventFrame, NetworkError> {
         if bytes.len() > self.max_frame_bytes {
             return Err(NetworkError::FrameTooLarge {
                 actual_bytes: bytes.len(),
@@ -251,7 +251,7 @@ pub async fn discover_default_lan_ip_candidates_async() -> Vec<IpAddr> {
         .await
 }
 
-pub(crate) fn cached_default_lan_ip_candidates_with(
+pub fn cached_default_lan_ip_candidates_with(
     discover: impl FnOnce() -> Vec<IpAddr>,
 ) -> Vec<IpAddr> {
     let now = Instant::now();
@@ -271,7 +271,7 @@ pub(crate) fn cached_default_lan_ip_candidates_with(
     candidates
 }
 
-pub(crate) async fn cached_default_lan_ip_candidates_with_async<F, Fut>(discover: F) -> Vec<IpAddr>
+pub async fn cached_default_lan_ip_candidates_with_async<F, Fut>(discover: F) -> Vec<IpAddr>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Vec<IpAddr>>,
@@ -325,8 +325,8 @@ async fn discover_default_lan_ip_candidates_uncached_async() -> Vec<IpAddr> {
     candidates
 }
 
-#[cfg(test)]
-pub(crate) fn clear_default_lan_ip_discovery_cache() {
+#[cfg(any(test, feature = "test-support"))]
+pub fn clear_default_lan_ip_discovery_cache() {
     if let Ok(mut cache) = DEFAULT_LAN_IP_DISCOVERY_CACHE.lock() {
         *cache = None;
     }
@@ -372,15 +372,15 @@ pub(crate) async fn discover_default_public_ip_candidates_for_local_ips_async(
     .await
 }
 
-#[cfg(test)]
-pub(crate) fn cached_default_public_ip_candidates_for_local_ips_with(
+#[cfg(any(test, feature = "test-support"))]
+pub fn cached_default_public_ip_candidates_for_local_ips_with(
     local_ips: impl IntoIterator<Item = IpAddr>,
     discover: impl FnOnce() -> PublicIpDiscoveryResult,
 ) -> Vec<IpAddr> {
     cached_default_public_ip_candidates_for_key_with(local_network_cache_key(local_ips), discover)
 }
 
-pub(crate) async fn cached_default_public_ip_candidates_for_local_ips_with_async<F, Fut>(
+pub async fn cached_default_public_ip_candidates_for_local_ips_with_async<F, Fut>(
     local_ips: impl IntoIterator<Item = IpAddr>,
     discover: F,
 ) -> Vec<IpAddr>
@@ -395,7 +395,7 @@ where
     .await
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn cached_default_public_ip_candidates_for_key_with(
     cache_key: Vec<IpAddr>,
     discover: impl FnOnce() -> PublicIpDiscoveryResult,
@@ -475,15 +475,15 @@ pub(crate) fn local_network_cache_key(local_ips: impl IntoIterator<Item = IpAddr
     key
 }
 
-#[cfg(test)]
-pub(crate) fn clear_public_ip_discovery_cache() {
+#[cfg(any(test, feature = "test-support"))]
+pub fn clear_public_ip_discovery_cache() {
     if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
         cache.clear();
     }
 }
 
-#[cfg(test)]
-pub(crate) fn age_public_ip_discovery_cache_for_test(age: Duration) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn age_public_ip_discovery_cache_for_test(age: Duration) {
     if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
         cache.age_for_test(age);
     }
@@ -522,7 +522,7 @@ pub(crate) async fn discover_public_ip_candidates_from_hosts_with_status_async(
     PublicIpDiscoveryResult::Complete(candidates)
 }
 
-pub(crate) async fn fetch_public_ip_candidates_from_service_async(
+pub async fn fetch_public_ip_candidates_from_service_async(
     host: &str,
     path: &str,
     address: SocketAddr,
@@ -590,7 +590,7 @@ fn public_ip_discovery_http_request(host: &str, path: &str) -> String {
     )
 }
 
-pub(crate) fn parse_public_ip_discovery_response(response: &str) -> Vec<IpAddr> {
+pub fn parse_public_ip_discovery_response(response: &str) -> Vec<IpAddr> {
     let mut candidates = Vec::new();
     let body = response.rsplit("\r\n\r\n").next().unwrap_or(response);
     for token in body
@@ -700,7 +700,7 @@ pub fn is_invitable_ip(ip: IpAddr) -> bool {
     !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
 }
 
-pub(crate) fn is_advertisable_interface_ip(ip: IpAddr) -> bool {
+pub fn is_advertisable_interface_ip(ip: IpAddr) -> bool {
     if !is_invitable_ip(ip) {
         return false;
     }
@@ -793,8 +793,8 @@ impl MdnsDiscoveryCache {
             .collect()
     }
 
-    #[cfg(test)]
-    pub(crate) fn index_record_counts_for_test(&self) -> (usize, usize) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn index_record_counts_for_test(&self) -> (usize, usize) {
         (
             self.node_index.values().map(BTreeSet::len).sum(),
             self.cluster_index.values().map(BTreeSet::len).sum(),
@@ -908,8 +908,8 @@ pub const SINOMO_LAN_DISCOVERY_PROTOCOL: &str = "sinomo.lan-discovery.v1";
 pub const SINOMO_LAN_DISCOVERY_MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 255, 77, 77);
 pub const SINOMO_LAN_DISCOVERY_PORT: u16 = 21_359;
 pub const SINOMO_LAN_DISCOVERY_TTL_TICKS: u64 = 10;
-pub(crate) const MAX_SINOMO_LAN_DISCOVERY_TTL_TICKS: u64 = SINOMO_LAN_DISCOVERY_TTL_TICKS * 3;
-pub(crate) const MAX_MDNS_DISCOVERY_RECORDS: usize = 4096;
+pub const MAX_SINOMO_LAN_DISCOVERY_TTL_TICKS: u64 = SINOMO_LAN_DISCOVERY_TTL_TICKS * 3;
+pub const MAX_MDNS_DISCOVERY_RECORDS: usize = 4096;
 pub(crate) const MAX_MDNS_DISCOVERY_DRAIN_DATAGRAMS: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1118,7 +1118,7 @@ impl AsyncMdnsDiscoverySocket {
     }
 }
 
-pub(crate) fn decode_lan_discovery_datagram(bytes: &[u8]) -> Option<MdnsDiscoveryAdvertisement> {
+pub fn decode_lan_discovery_datagram(bytes: &[u8]) -> Option<MdnsDiscoveryAdvertisement> {
     let advertisement: MdnsDiscoveryAdvertisement =
         SinomoObjectCodec::default().decode(bytes).ok()?;
     (advertisement.protocol == SINOMO_LAN_DISCOVERY_PROTOCOL).then_some(advertisement)
@@ -1174,4 +1174,12 @@ impl MdnsDiscoveryRecord {
                 .saturating_add(clamped_lan_discovery_ttl_ticks(ttl_ticks)),
         }
     }
+}
+
+/// Whether a connect address targets the local loopback interface.
+pub fn is_loopback_connect_address(address: &str) -> bool {
+    address.starts_with("127.")
+        || address.starts_with("localhost:")
+        || address.starts_with("[::1]:")
+        || address.starts_with("::1:")
 }

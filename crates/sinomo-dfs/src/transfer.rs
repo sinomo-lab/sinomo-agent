@@ -2,7 +2,7 @@ use crate::{
     ChunkedBlobAssembler, DfsError, DfsFileSystemId, DfsObjectId, DfsObjectMetadata,
     DfsTransferProfile, DfsVersion,
 };
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 

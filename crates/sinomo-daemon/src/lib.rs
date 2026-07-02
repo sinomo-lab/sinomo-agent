@@ -1,3 +1,4 @@
+mod api;
 mod auth;
 mod client;
 mod cluster;
@@ -9,6 +10,7 @@ mod install;
 mod observe;
 mod paths;
 mod process;
+pub mod registry;
 mod rollout;
 mod service_adapter;
 mod status;
@@ -384,7 +386,9 @@ pub struct DaemonClusterMaintenanceRefreshResponse;
 #[derive(Clone)]
 pub struct DaemonServiceRegistryHook {
     register: std::sync::Arc<
-        dyn Fn(sinomo_service::ServiceRegistryBuilder) -> sinomo_service::ServiceRegistryBuilder
+        dyn Fn(
+                sinomo_core::service::ServiceRegistryBuilder,
+            ) -> sinomo_core::service::ServiceRegistryBuilder
             + Send
             + Sync,
     >,
@@ -403,8 +407,8 @@ pub struct DaemonServiceRegistryHook {
 impl DaemonServiceRegistryHook {
     pub fn new(
         register: impl Fn(
-            sinomo_service::ServiceRegistryBuilder,
-        ) -> sinomo_service::ServiceRegistryBuilder
+            sinomo_core::service::ServiceRegistryBuilder,
+        ) -> sinomo_core::service::ServiceRegistryBuilder
         + Send
         + Sync
         + 'static,
@@ -449,8 +453,8 @@ impl DaemonServiceRegistryHook {
 
     pub fn register(
         &self,
-        builder: sinomo_service::ServiceRegistryBuilder,
-    ) -> sinomo_service::ServiceRegistryBuilder {
+        builder: sinomo_core::service::ServiceRegistryBuilder,
+    ) -> sinomo_core::service::ServiceRegistryBuilder {
         (self.register)(builder)
     }
 
@@ -461,6 +465,7 @@ impl DaemonServiceRegistryHook {
     }
 }
 
+pub use api::{DAEMON_API_DEFAULT_TIMEOUT, DAEMON_API_PROBE_TIMEOUT, DaemonApiClient};
 pub use auth::{
     AuthenticatedDaemonCommand, DaemonSignerAuthority, SignedDaemonCommand,
     authenticate_daemon_control_request, authorize_authenticated_daemon_command,
@@ -572,9 +577,9 @@ pub(crate) use status::{
 };
 
 pub fn register_storage_paths(
-    layout: &mut sinomo_storage::StorageLayout,
-) -> Result<(), sinomo_storage::StorageContractError> {
-    use sinomo_storage::{ObjectSchema, STORAGE_CONTRACT_OBJECT_VERSION, StorageRing};
+    layout: &mut sinomo_core::storage::StorageLayout,
+) -> Result<(), sinomo_core::storage::StorageContractError> {
+    use sinomo_core::storage::{ObjectSchema, STORAGE_CONTRACT_OBJECT_VERSION, StorageRing};
 
     for relative_path in ["daemon/status.sobj", "shadow-daemon/status.sobj"] {
         layout.register_sinomo_object(

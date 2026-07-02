@@ -135,6 +135,27 @@ restart. Correctness must come from routing and state transitions, not from an
 assumption that `dlclose` or the platform equivalent always fully reclaims the
 module.
 
+### Network Modules
+
+Network transport modules are native dynamic libraries with an additional,
+narrower contract. Besides the generic loader handshake, they implement the
+`sinomo-network` network-module vtable (descriptor, start/stop,
+request/response dial, advertised endpoints) and declare their transports
+through the module surface data, so the daemon loads them from
+content-addressed artifacts like any other native-dylib module and then
+registers them into the runtime network-module registry. Iroh is the first
+module of this kind; serial and LoRa transports are planned. The transport
+contract is described in [network-architecture.md](network-architecture.md).
+
+They use the same node-local loader states as other native-dylib modules:
+stable, previous, shadow, candidate, and rolled-back versions with
+content-hash verification before load. One lifecycle nuance is load-bearing:
+network modules support runtime enable/disable, and disable stops the module
+and removes its transports from dial dispatch, but it never unloads the
+library. The host keeps the library handle alive for the life of the process
+so no dial path can race a dangling vtable pointer; process restart remains
+the reclamation path, consistent with the general unload contract.
+
 ### Declarative
 
 Declarative modules have no executable code. They are structured data consumed
@@ -439,8 +460,8 @@ policy decision, and rollback plan.
 
 The crate boundary follows the trust-ring architecture:
 
-- `sinomo-core` owns foundational module manifest vocabulary that must be
-  visible below higher-level services.
+- `sinomo-base` owns foundational module manifest vocabulary that must be
+  visible below higher-level services; the `sinomo-core` facade re-exports it.
 - `sinomo-module` owns low-level module glue: backend-neutral catalog
   registration, loader activation state, routing and invocation primitives,
   native dynamic-library host loading, unload records, raw replay contracts,
@@ -448,8 +469,15 @@ The crate boundary follows the trust-ring architecture:
   must not own policy decisions, rollout admission, rollout transition state,
   or self-evolution scoring.
 - `sinomo-module-api` owns the stable native dynamic-library ABI surface,
-  including generic descriptor fields for self-described object-RPC routes and
-  embedded declarative resources.
+  including generic descriptor fields for self-described object-RPC routes,
+  embedded declarative resources, and declared network transports.
+- `sinomo-network` owns the network-module registry, descriptors, and the
+  network-module dylib vtable that transport modules implement.
+- `sinomo-daemon` owns the runtime registry that assembles the module table:
+  internal native-rust registrations and bindings, dylib loader adaptation,
+  module-to-route conversion, and the composed storage layout.
+  `sinomo-runtime` re-exports that machinery as
+  `sinomo_runtime::{modules, storage}` without adding behavior.
 - `sinomo-policy` owns policy decisions and policy vocabulary interpretation.
 - `sinomo-registry` owns immutable artifact, capsule, provenance, evidence, and
   signer records.
@@ -466,6 +494,7 @@ The crate boundary follows the trust-ring architecture:
   and host-service binding helpers. Generic infrastructure crates own framing,
   dispatch, storage verification, and daemon event-loop mechanics.
 
+R1 crates cross into the cluster foundation through the `sinomo-core` facade.
 R2 and application crates cross into these foundations through
 `sinomo-runtime`. R0/R1 crates must not depend on R2 or application crates.
 

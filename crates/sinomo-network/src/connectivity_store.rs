@@ -1,11 +1,8 @@
 use crate::connectivity::{
-    ClusterConnectivityRecord, ClusterConnectivityState,
+    ClusterConnectivityRecord, ClusterConnectivityState, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
     cluster_connectivity_record_for_hard_failure,
     cluster_connectivity_record_for_identity_mismatch,
-    cluster_connectivity_record_for_probe_outcome,
-};
-use crate::connectivity_publish::{
-    MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, cluster_connectivity_stable_eq,
+    cluster_connectivity_record_for_probe_outcome, cluster_connectivity_stable_eq,
     cluster_network_record_live, validate_cluster_connectivity_records_for_source,
 };
 use crate::error::NetworkError;
@@ -29,7 +26,7 @@ static LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATIONS: LazyLock<Mutex<HashMap<Pa
 static LOCAL_CLUSTER_CONNECTIVITY_RECORDS: LazyLock<
     Mutex<HashMap<PathBuf, LocalClusterConnectivityRecordCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static LOCAL_CLUSTER_CONNECTIVITY_PRUNE_PASSES_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -40,7 +37,7 @@ struct LocalClusterConnectivityRecordCacheEntry {
     last_used: u64,
 }
 
-pub(crate) fn local_cluster_connectivity_content_generation(paths: &ClusterPaths) -> u64 {
+pub fn local_cluster_connectivity_content_generation(paths: &ClusterPaths) -> u64 {
     LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATIONS
         .lock()
         .ok()
@@ -123,8 +120,8 @@ pub fn read_local_cluster_connectivity_records_for_source(
 
 pub fn record_local_cluster_endpoint_command_connectivity(
     paths: &ClusterPaths,
-    state: &sinomo_core::ClusterBootstrapState,
-    endpoint: &sinomo_core::ClusterEndpointRecord,
+    state: &sinomo_base::ClusterBootstrapState,
+    endpoint: &sinomo_base::ClusterEndpointRecord,
     connectivity_state: ClusterConnectivityState,
     latency_ms: Option<u64>,
     allow_failure_grace: bool,
@@ -174,7 +171,7 @@ pub fn record_local_cluster_endpoint_command_connectivity(
     Ok(record)
 }
 
-pub(crate) fn write_local_cluster_connectivity_records(
+pub fn write_local_cluster_connectivity_records(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
@@ -182,7 +179,7 @@ pub(crate) fn write_local_cluster_connectivity_records(
     write_local_cluster_connectivity_records_inner(paths, source_node_id, records, false)
 }
 
-pub(crate) fn write_local_cluster_connectivity_record_set(
+pub fn write_local_cluster_connectivity_record_set(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
@@ -190,7 +187,7 @@ pub(crate) fn write_local_cluster_connectivity_record_set(
     write_local_cluster_connectivity_records_inner(paths, source_node_id, records, true)
 }
 
-pub(crate) async fn write_local_cluster_connectivity_record_set_async(
+pub async fn write_local_cluster_connectivity_record_set_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     source_node_id: &NodeId,
@@ -245,7 +242,7 @@ fn earliest_cluster_connectivity_expiry(
     records.iter().map(|record| record.expires_at).min()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_local_cluster_connectivity_prune_pass_for_test(path: &PathBuf) {
     if let Ok(mut passes) = LOCAL_CLUSTER_CONNECTIVITY_PRUNE_PASSES_FOR_TEST.lock() {
         *passes.entry(path.clone()).or_default() += 1;
@@ -263,7 +260,7 @@ fn prune_expired_local_cluster_connectivity_cache_entry(
     {
         return;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     record_local_cluster_connectivity_prune_pass_for_test(_path);
     entry
         .records
@@ -469,25 +466,23 @@ pub(crate) fn sort_cluster_connectivity_records(records: &mut [ClusterConnectivi
     });
 }
 
-#[cfg(test)]
-pub(crate) fn local_cluster_connectivity_record_cache_contains_for_test(
-    paths: &ClusterPaths,
-) -> bool {
+#[cfg(any(test, feature = "test-support"))]
+pub fn local_cluster_connectivity_record_cache_contains_for_test(paths: &ClusterPaths) -> bool {
     LOCAL_CLUSTER_CONNECTIVITY_RECORDS
         .lock()
         .map(|cache| cache.contains_key(&paths.root))
         .unwrap_or(false)
 }
 
-#[cfg(test)]
-pub(crate) fn reset_local_cluster_connectivity_prune_passes_for_test(paths: &ClusterPaths) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_local_cluster_connectivity_prune_passes_for_test(paths: &ClusterPaths) {
     if let Ok(mut passes) = LOCAL_CLUSTER_CONNECTIVITY_PRUNE_PASSES_FOR_TEST.lock() {
         passes.remove(&paths.root);
     }
 }
 
-#[cfg(test)]
-pub(crate) fn local_cluster_connectivity_prune_passes_for_test(paths: &ClusterPaths) -> u64 {
+#[cfg(any(test, feature = "test-support"))]
+pub fn local_cluster_connectivity_prune_passes_for_test(paths: &ClusterPaths) -> u64 {
     LOCAL_CLUSTER_CONNECTIVITY_PRUNE_PASSES_FOR_TEST
         .lock()
         .ok()
@@ -495,13 +490,13 @@ pub(crate) fn local_cluster_connectivity_prune_passes_for_test(paths: &ClusterPa
         .unwrap_or(0)
 }
 
-#[cfg(test)]
-pub(crate) fn local_cluster_connectivity_record_cache_capacity_for_test() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+pub fn local_cluster_connectivity_record_cache_capacity_for_test() -> usize {
     MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES
 }
 
-#[cfg(test)]
-pub(crate) fn remove_local_cluster_connectivity_record_cache_entries_under_root_for_test(
+#[cfg(any(test, feature = "test-support"))]
+pub fn remove_local_cluster_connectivity_record_cache_entries_under_root_for_test(
     root: &std::path::Path,
 ) {
     if let Ok(mut cache) = LOCAL_CLUSTER_CONNECTIVITY_RECORDS.lock() {

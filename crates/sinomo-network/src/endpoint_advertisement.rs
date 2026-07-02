@@ -3,7 +3,7 @@ use crate::lan::{
     discover_default_public_ip_candidates_for_local_ips_async, format_ip_port, is_invitable_ip,
     is_private_or_link_local_ip, local_network_cache_key,
 };
-use sinomo_core::{
+use sinomo_base::{
     ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterTransportKind,
 };
 use sinomo_node::{NodeId, daemon_lan_endpoint_id, daemon_loopback_endpoint_id};
@@ -15,9 +15,8 @@ use std::time::{Duration, Instant};
 
 pub(crate) const PUBLIC_ENDPOINT_REACHABILITY_POSITIVE_CACHE_TTL: Duration =
     Duration::from_secs(60);
-pub(crate) const PUBLIC_ENDPOINT_REACHABILITY_NEGATIVE_CACHE_TTL: Duration =
-    Duration::from_secs(10);
-pub(crate) const MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES: usize = 128;
+pub const PUBLIC_ENDPOINT_REACHABILITY_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(10);
+pub const MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES: usize = 128;
 
 /// How long to wait when probing this node's own public endpoint for reachability.
 const PUBLIC_ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
@@ -86,7 +85,7 @@ impl PublicEndpointReachabilityCache {
         self.entries.insert(key, entry);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn clear(&mut self) {
         self.entries.clear();
         self.expiry_index.clear();
@@ -195,7 +194,7 @@ pub fn daemon_advertised_endpoints_from_static_addresses(
 /// NAT hairpin). Only a verified public endpoint should be advertised; an unverified one (a
 /// NAT'd node with no forward) would publish an unreachable address that every peer then
 /// wastes connection attempts on. Manual endpoint configuration is future work.
-pub(crate) async fn public_endpoint_is_reachable_for_local_ips_async(
+pub async fn public_endpoint_is_reachable_for_local_ips_async(
     ip: IpAddr,
     port: u16,
     local_ips: impl IntoIterator<Item = IpAddr>,
@@ -219,8 +218,8 @@ pub(crate) async fn public_endpoint_is_reachable_for_local_ips_async(
     .await
 }
 
-#[cfg(test)]
-pub(crate) fn public_endpoint_is_reachable_with_probe(
+#[cfg(any(test, feature = "test-support"))]
+pub fn public_endpoint_is_reachable_with_probe(
     ip: IpAddr,
     port: u16,
     probe: impl FnOnce(SocketAddr) -> bool,
@@ -228,8 +227,8 @@ pub(crate) fn public_endpoint_is_reachable_with_probe(
     public_endpoint_is_reachable_with_probe_at(ip, port, Instant::now(), probe)
 }
 
-#[cfg(test)]
-pub(crate) fn public_endpoint_is_reachable_with_probe_at(
+#[cfg(any(test, feature = "test-support"))]
+pub fn public_endpoint_is_reachable_with_probe_at(
     ip: IpAddr,
     port: u16,
     now: Instant,
@@ -279,8 +278,8 @@ where
     reachable
 }
 
-#[cfg(test)]
-pub(crate) fn public_endpoint_is_reachable_for_local_ips_with_probe_at(
+#[cfg(any(test, feature = "test-support"))]
+pub fn public_endpoint_is_reachable_for_local_ips_with_probe_at(
     ip: IpAddr,
     port: u16,
     now: Instant,
@@ -311,8 +310,8 @@ pub(crate) fn public_endpoint_is_reachable_for_local_ips_with_probe_at(
     reachable
 }
 
-#[cfg(test)]
-pub(crate) fn clear_public_endpoint_reachability_cache() {
+#[cfg(any(test, feature = "test-support"))]
+pub fn clear_public_endpoint_reachability_cache() {
     if let Ok(mut cache) = PUBLIC_ENDPOINT_REACHABILITY_CACHE.lock() {
         cache.clear();
     }

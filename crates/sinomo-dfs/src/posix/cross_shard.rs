@@ -26,7 +26,7 @@ use crate::{
     DfsReplicaReceiptRecord, DfsWriteIntentState, DfsWriteIntentStatus, NetworkedDfsService,
     object_version_record, sifs_file_system_id,
 };
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Coordinates a rename whose destination lives in a metadata shard owned

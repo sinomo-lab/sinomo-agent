@@ -5,8 +5,8 @@ use crate::{
     DfsVersion, DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
 };
 use serde::{Deserialize, Serialize};
+use sinomo_core::node::NodeId;
 use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
-use sinomo_node::NodeId;
 
 fn is_zero_u32(value: &u32) -> bool {
     *value == 0

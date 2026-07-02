@@ -18,6 +18,13 @@
 //! Routes that need consensus call [`ServiceContext::require_cluster`] and degrade to
 //! [`ServiceError::NotClustered`] in local-only mode.
 
+pub mod discovery;
+pub use discovery::{
+    CLUSTER_SERVICES_KV_PREFIX, ServiceInstanceRecord, ServiceTargetSelector,
+    TargetSelectionPolicy, cluster_service_instance_key, cluster_service_prefix,
+    discover_service_instances, publish_local_service_instances,
+    service_instance_records_from_registry, service_instances_from_entries,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;

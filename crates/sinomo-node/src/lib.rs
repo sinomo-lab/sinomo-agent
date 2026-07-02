@@ -8,10 +8,10 @@ pub use daemon::*;
 pub use identity::*;
 pub use membership::*;
 
-pub type NodeId = sinomo_core::Id;
+pub type NodeId = sinomo_base::Id;
 
 use serde::{Deserialize, Serialize};
-use sinomo_core::{CapabilityName, ModelCapability, NodeCapability, ScalarError, TrustDomain};
+use sinomo_base::{CapabilityName, ModelCapability, NodeCapability, ScalarError, TrustDomain};
 
 pub fn register_storage_paths(
     layout: &mut sinomo_storage::StorageLayout,
@@ -167,7 +167,7 @@ pub enum NodeAvailability {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::{
+    use sinomo_base::{
         ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
         ClusterEndpointSource, ClusterMemberRecord, ClusterMemberState, ClusterNodeAvailability,
         ClusterNodeStatusRecord, ClusterTransportKind, Id, NodeCapability,
@@ -218,7 +218,7 @@ mod tests {
         assert_eq!(shadow_node, shadow_daemon_node_id(&main_node));
         assert_eq!(shadow_node.as_str().len(), 26);
         assert!(
-            main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter)
+            main_daemon_capabilities(&sinomo_base::ClusterMemberRole::Voter)
                 .iter()
                 .any(|capability| capability.as_str() == "cluster.kv.vote")
         );

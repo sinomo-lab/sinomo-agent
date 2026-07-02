@@ -154,12 +154,20 @@ pub enum NetworkError {
     Io { operation: String, detail: String },
     #[error(transparent)]
     EventStore(#[from] EventStoreError),
-    #[error(transparent)]
-    Kv(#[from] KvError),
+    #[error("cluster directory error: {detail}")]
+    Directory { detail: String },
 }
 
 impl NetworkError {
-    pub(crate) fn object(error: sinomo_object::Error) -> Self {
+    /// Wraps a cluster-state/store error (KV, directory backends) for
+    /// transport through the networking error type.
+    pub fn directory(detail: impl std::fmt::Display) -> Self {
+        Self::Directory {
+            detail: detail.to_string(),
+        }
+    }
+
+    pub fn object(error: sinomo_object::Error) -> Self {
         match error {
             sinomo_object::Error::ResourceExhausted {
                 context,

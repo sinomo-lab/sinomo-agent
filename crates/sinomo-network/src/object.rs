@@ -2,9 +2,9 @@ use crate::error::NetworkError;
 use crate::io_observer;
 use sinomo_object::{BorrowedDocumentBuilder, LengthMode, serde_ext};
 use std::collections::HashMap;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::io::{Read, Write};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::net::TcpStream;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -120,7 +120,7 @@ pub(crate) struct ObjectFrameByteBudget {
 #[derive(Clone, Copy, Debug)]
 enum ObjectFrameByteBudgetLimit {
     AvailableMemory,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     Fixed(usize),
 }
 
@@ -143,7 +143,7 @@ impl ObjectFrameByteBudget {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn fixed(max_bytes: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(ObjectFrameByteBudgetState::default())),
@@ -161,7 +161,7 @@ impl ObjectFrameByteBudget {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let available_memory_bytes = match self.limit {
             ObjectFrameByteBudgetLimit::AvailableMemory => current_available_memory_bytes(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             ObjectFrameByteBudgetLimit::Fixed(max_bytes) => {
                 Some(max_bytes.saturating_sub(state.in_flight_bytes))
             }
@@ -193,7 +193,7 @@ impl ObjectFrameByteBudget {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn in_flight_bytes(&self) -> usize {
         self.inner
             .lock()
@@ -341,19 +341,19 @@ fn configure_daemon_control_tcp_stream(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
-pub(crate) struct DaemonControlStream {
+pub struct DaemonControlStream {
     stream: TcpStream,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl DaemonControlStream {
-    pub(crate) fn new(stream: TcpStream) -> Self {
+    pub fn new(stream: TcpStream) -> Self {
         Self { stream }
     }
 
-    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), NetworkError> {
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), NetworkError> {
         self.stream
             .set_read_timeout(timeout)
             .map_err(|source| NetworkError::Io {
@@ -362,7 +362,7 @@ impl DaemonControlStream {
             })
     }
 
-    pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), NetworkError> {
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), NetworkError> {
         self.stream
             .set_write_timeout(timeout)
             .map_err(|source| NetworkError::Io {
@@ -932,7 +932,7 @@ pub(crate) fn object_rpc_response_has_streamed_daemon_body(
         .is_some_and(|value| value == DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn daemon_control_request_expects_raw_rpc_response(request: &DaemonControlRequest) -> bool {
     object_rpc_request_expects_raw_daemon_response(request)
 }
@@ -974,14 +974,14 @@ fn map_daemon_control_frame_error(error: NetworkError, operation: String) -> Net
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Read for DaemonControlStream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         self.stream.read(buffer)
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Write for DaemonControlStream {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         self.stream.write(buffer)
@@ -1075,7 +1075,7 @@ pub(crate) fn object_frame_len_prefix(len: usize) -> Result<ObjectFrameLenPrefix
     Ok(prefix)
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 pub(crate) fn object_frame_total_bytes(
     prefix_bytes: usize,
     body_bytes: usize,
@@ -1088,7 +1088,9 @@ pub(crate) fn object_frame_total_bytes(
         })
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+// Unconditional since stage C: registry-aware network-module dispatch frames
+// typed requests before handing them to a module, and dylib network modules
+// reuse this codec through the sinomo-core facade.
 pub fn encode_object_frame_to_vec<T>(value: &T) -> Result<Vec<u8>, NetworkError>
 where
     T: serde::Serialize + ?Sized,
@@ -1121,7 +1123,7 @@ where
     Ok(frame)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn encode_borrowed_object_frame_to_vec(
     document: &BorrowedDocumentBuilder<'_>,
 ) -> Result<Vec<u8>, NetworkError> {
@@ -1151,7 +1153,7 @@ pub fn encode_borrowed_object_frame_to_vec(
     Ok(frame)
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+// Unconditional since stage C: see encode_object_frame_to_vec.
 pub fn decode_single_object_frame_from_slice<T>(
     frame: &[u8],
     max_bytes: usize,
@@ -1253,7 +1255,7 @@ pub(crate) fn network_allocation_error(operation: &str, requested_bytes: usize) 
     }
 }
 
-pub(crate) fn try_reserve_vec<T>(
+pub fn try_reserve_vec<T>(
     vec: &mut Vec<T>,
     additional: usize,
     operation: &str,
@@ -1275,7 +1277,7 @@ pub(crate) fn try_reserve_vec<T>(
         .map_err(|_| network_allocation_error(operation, requested_bytes))
 }
 
-pub(crate) fn try_zeroed_vec(len: usize, operation: &str) -> Result<Vec<u8>, NetworkError> {
+pub fn try_zeroed_vec(len: usize, operation: &str) -> Result<Vec<u8>, NetworkError> {
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(len)
@@ -1304,21 +1306,18 @@ pub(crate) fn try_clone_string(value: &str, operation: &str) -> Result<String, N
     Ok(cloned)
 }
 
-pub(crate) fn try_clone_id(
-    id: &sinomo_core::Id,
+pub fn try_clone_id(
+    id: &sinomo_base::Id,
     operation: &str,
-) -> Result<sinomo_core::Id, NetworkError> {
+) -> Result<sinomo_base::Id, NetworkError> {
     let value = try_clone_string(id.as_str(), operation)?;
-    sinomo_core::Id::new(value).map_err(|error| NetworkError::Serialization {
+    sinomo_base::Id::new(value).map_err(|error| NetworkError::Serialization {
         detail: error.to_string(),
     })
 }
 
-#[cfg(test)]
-pub(crate) fn write_object_frame_blocking<W, T>(
-    writer: &mut W,
-    value: &T,
-) -> Result<(), NetworkError>
+#[cfg(any(test, feature = "test-support"))]
+pub fn write_object_frame_blocking<W, T>(writer: &mut W, value: &T) -> Result<(), NetworkError>
 where
     W: Write,
     T: serde::Serialize + ?Sized,
@@ -1338,11 +1337,8 @@ where
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn read_object_frame_blocking<R, T>(
-    reader: &mut R,
-    max_bytes: usize,
-) -> Result<T, NetworkError>
+#[cfg(any(test, feature = "test-support"))]
+pub fn read_object_frame_blocking<R, T>(reader: &mut R, max_bytes: usize) -> Result<T, NetworkError>
 where
     R: Read,
     T: serde::de::DeserializeOwned,
@@ -1350,7 +1346,7 @@ where
     read_object_frame_blocking_with_budget(reader, max_bytes, object_frame_byte_budget())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn read_object_frame_blocking_with_budget<R, T>(
     reader: &mut R,
     max_bytes: usize,
@@ -1370,7 +1366,7 @@ where
     SinomoObjectCodec::network_frame().decode(&bytes)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn read_object_frame_len_blocking<R: Read>(
     reader: &mut R,
     max_bytes: usize,
@@ -1394,7 +1390,7 @@ fn read_object_frame_len_blocking<R: Read>(
     Ok((len, if extended { 12 } else { 4 }))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn read_exact_blocking_frame<R: Read>(
     reader: &mut R,
     buf: &mut [u8],

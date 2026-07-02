@@ -5,7 +5,7 @@
 //! repairs after a replica or routed-response mirror falls behind. The
 //! background publish planner remains in `metadata_replication`.
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::*;
 

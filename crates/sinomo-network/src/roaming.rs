@@ -1,6 +1,19 @@
+//! Roaming transport support: the transport-neutral iroh pieces this crate
+//! keeps (the `IrohEndpointRecord` data type, `iroh://` parse/format, stable
+//! endpoint ids, record file I/O) plus registry-aware daemon RPC dispatch.
+//!
+//! TODO(stage-C-followup): the `iroh-transport`-gated implementation below
+//! (endpoint builder, secret keys, proxy supervisor, dial client) was
+//! extracted to `modules/network/iroh` in stage C of
+//! docs/plans/r0-r1-crate-boundary-refactor.md. It stays here behind the
+//! feature until the daemon's built-in proxy loop and the cli/cluster
+//! direct-dial tests migrate to the dylib module; registry-aware dispatch
+//! already prefers a registered module over these paths.
+
 use crate::ClusterPaths;
+#[allow(unused_imports)]
 use crate::error::NetworkError;
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 use crate::io_observer;
 use crate::object::DaemonRpcTimeouts;
 use crate::object_file_store::{read_object_file, write_object_file};
@@ -8,13 +21,15 @@ use crate::object_file_store::{read_object_file, write_object_file};
 use crate::object_file_store::{
     read_optional_object_file, write_object_file_create_new_serialized,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::peer::{EndpointCandidateStatus, PeerEndpointCandidate};
 use crate::prelude::*;
 #[cfg(feature = "iroh-transport")]
 use fs2::FileExt;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use sinomo_kv::KvEntry;
+#[cfg(any(test, feature = "test-support"))]
+use sinomo_kv::{KvOp, LeaseId};
 #[cfg(feature = "iroh-transport")]
 use std::fs;
 
@@ -23,21 +38,21 @@ const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";
 pub const IROH_DAEMON_COMMAND_MAX_BYTES: usize = crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES;
 #[cfg(feature = "iroh-transport")]
 const IROH_DAEMON_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 const SINOMO_IROH_RELAY_URLS_ENV: &str = "SINOMO_IROH_RELAY_URLS";
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN: Duration = Duration::from_secs(5);
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const IROH_DAEMON_PROXY_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(300);
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const IROH_DAEMON_PROXY_RESTART_JITTER_MAX: Duration = Duration::from_secs(30);
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub const IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN: Duration = Duration::from_secs(5);
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub const IROH_DAEMON_PROXY_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(300);
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub const IROH_DAEMON_PROXY_RESTART_JITTER_MAX: Duration = Duration::from_secs(30);
 #[cfg(feature = "iroh-transport")]
 const IROH_DAEMON_PROXY_STABLE_RUNTIME: Duration = Duration::from_secs(60);
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 const IROH_DAEMON_RPC_MAX_ATTEMPTS: usize = 3;
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 const IROH_DAEMON_RPC_RETRY_INITIAL: Duration = Duration::from_millis(40);
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 const IROH_DAEMON_RPC_RETRY_MAX: Duration = Duration::from_millis(250);
 #[cfg(feature = "iroh-transport")]
 const IROH_SECRET_KEY_LOCK_WAIT: Duration = Duration::from_secs(2);
@@ -45,20 +60,20 @@ const IROH_SECRET_KEY_LOCK_WAIT: Duration = Duration::from_secs(2);
 const IROH_SECRET_KEY_LOCK_RETRY_INITIAL: Duration = Duration::from_millis(2);
 #[cfg(feature = "iroh-transport")]
 const IROH_SECRET_KEY_LOCK_RETRY_MAX: Duration = Duration::from_millis(40);
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const IROH_DAEMON_PROXY_ERROR_ROUTE: &str = "/iroh-daemon-proxy/error";
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const IROH_DAEMON_PROXY_MAX_CONNECTIONS: usize = 64;
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS: usize = 128;
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES: usize =
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub const IROH_DAEMON_PROXY_ERROR_ROUTE: &str = "/iroh-daemon-proxy/error";
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub const IROH_DAEMON_PROXY_MAX_CONNECTIONS: usize = 64;
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub const IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS: usize = 128;
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub const IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES: usize =
     IROH_DAEMON_COMMAND_MAX_BYTES.saturating_add(12);
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub const IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub const IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
     "https://use1-1.relay.n0.iroh-canary.iroh.link./",
     "https://usw1-1.relay.n0.iroh-canary.iroh.link./",
@@ -66,9 +81,9 @@ const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
     "https://aps1-1.relay.n0.iroh-canary.iroh.link./",
 ];
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub(crate) struct WebRtcSignalingEnvelope {
+pub struct WebRtcSignalingEnvelope {
     pub cluster_id: ClusterId,
     pub exchange_id: String,
     pub source_node_id: NodeId,
@@ -78,7 +93,7 @@ pub(crate) struct WebRtcSignalingEnvelope {
     pub message: WebRtcSignalMessage,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl WebRtcSignalingEnvelope {
     pub fn offer(
         cluster_id: ClusterId,
@@ -119,19 +134,19 @@ impl WebRtcSignalingEnvelope {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum WebRtcSignalMessage {
+pub enum WebRtcSignalMessage {
     Offer { sdp: String },
     Answer { sdp: String },
     IceCandidate(IceCandidateRecord),
     EndOfCandidates,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub(crate) struct IceCandidateRecord {
+pub struct IceCandidateRecord {
     pub cluster_id: ClusterId,
     pub exchange_id: String,
     pub node_id: NodeId,
@@ -143,7 +158,7 @@ pub(crate) struct IceCandidateRecord {
     pub expires_after_tick: u64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl IceCandidateRecord {
     pub fn endpoint(&self) -> ClusterEndpointRecord {
         let (transport, privacy, source_priority) = match self.candidate_type {
@@ -181,20 +196,20 @@ impl IceCandidateRecord {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum IceCandidateType {
+pub enum IceCandidateType {
     Host,
     ServerReflexive,
     PeerReflexive,
     Relay,
 }
 
-#[cfg(test)]
-pub(crate) struct WebRtcKvExchange;
+#[cfg(any(test, feature = "test-support"))]
+pub struct WebRtcKvExchange;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl WebRtcKvExchange {
     pub fn signal_key(cluster_id: &ClusterId, exchange_id: &str, sequence: u64) -> String {
         format!("/webrtc/signals/{cluster_id}/{exchange_id}/{sequence:020}")
@@ -217,6 +232,7 @@ impl WebRtcKvExchange {
         format!("/webrtc/candidates/{cluster_id}/{exchange_id}/")
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn put_signal(
         envelope: WebRtcSignalingEnvelope,
         lease_id: Option<LeaseId>,
@@ -226,9 +242,10 @@ impl WebRtcKvExchange {
             &envelope.exchange_id,
             envelope.sequence,
         );
-        KvOp::put_serde(key, &envelope, lease_id).map_err(Into::into)
+        KvOp::put_serde(key, &envelope, lease_id).map_err(NetworkError::directory)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn put_candidate(
         candidate: IceCandidateRecord,
         lease_id: Option<LeaseId>,
@@ -239,15 +256,17 @@ impl WebRtcKvExchange {
             &candidate.node_id,
             &candidate.candidate_id,
         );
-        KvOp::put_serde(key, &candidate, lease_id).map_err(Into::into)
+        KvOp::put_serde(key, &candidate, lease_id).map_err(NetworkError::directory)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn signal_from_entry(entry: &KvEntry) -> Result<WebRtcSignalingEnvelope, NetworkError> {
-        entry.decode().map_err(Into::into)
+        entry.decode().map_err(NetworkError::directory)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn candidate_from_entry(entry: &KvEntry) -> Result<IceCandidateRecord, NetworkError> {
-        entry.decode().map_err(Into::into)
+        entry.decode().map_err(NetworkError::directory)
     }
 }
 
@@ -376,10 +395,7 @@ impl Drop for IrohDaemonProxyHandle {
     }
 }
 
-pub(crate) fn stable_iroh_endpoint_id(
-    node_id: &NodeId,
-    endpoint_public_key: &str,
-) -> ClusterEndpointId {
+pub fn stable_iroh_endpoint_id(node_id: &NodeId, endpoint_public_key: &str) -> ClusterEndpointId {
     ClusterEndpointId::derived(
         "sinomo.iroh.endpoint",
         format!("{}\0{endpoint_public_key}", node_id.as_str()),
@@ -394,13 +410,13 @@ pub enum IrohRelayMode {
     Custom { relay_url: String },
 }
 
-#[cfg(test)]
-pub(crate) fn default_sinomo_iroh_relay_urls() -> Vec<String> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn default_sinomo_iroh_relay_urls() -> Vec<String> {
     sinomo_iroh_relay_url_strings_from_env(std::env::var(SINOMO_IROH_RELAY_URLS_ENV).ok())
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) fn sinomo_iroh_relay_url_strings_from_env(value: Option<String>) -> Vec<String> {
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub fn sinomo_iroh_relay_url_strings_from_env(value: Option<String>) -> Vec<String> {
     let Some(value) = value else {
         return SINOMO_DEFAULT_IROH_RELAY_URLS
             .iter()
@@ -450,10 +466,10 @@ fn sinomo_iroh_endpoint_builder() -> Result<iroh::endpoint::Builder, NetworkErro
     Ok(iroh::Endpoint::builder(iroh::endpoint::presets::N0).relay_mode(sinomo_iroh_relay_mode()?))
 }
 
-#[cfg(test)]
-pub(crate) struct IrohKvExchange;
+#[cfg(any(test, feature = "test-support"))]
+pub struct IrohKvExchange;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl IrohKvExchange {
     pub fn endpoint_key(cluster_id: &ClusterId, node_id: &NodeId) -> String {
         format!("/iroh/endpoints/{cluster_id}/{node_id}")
@@ -463,16 +479,18 @@ impl IrohKvExchange {
         format!("/iroh/endpoints/{cluster_id}/")
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn put_endpoint(
         endpoint: IrohEndpointRecord,
         lease_id: Option<LeaseId>,
     ) -> Result<KvOp, NetworkError> {
         let key = Self::endpoint_key(&endpoint.cluster_id, &endpoint.node_id);
-        KvOp::put_serde(key, &endpoint, lease_id).map_err(Into::into)
+        KvOp::put_serde(key, &endpoint, lease_id).map_err(NetworkError::directory)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn endpoint_from_entry(entry: &KvEntry) -> Result<IrohEndpointRecord, NetworkError> {
-        entry.decode().map_err(Into::into)
+        entry.decode().map_err(NetworkError::directory)
     }
 }
 
@@ -645,7 +663,7 @@ pub(crate) fn read_iroh_endpoint_record(
     read_object_file(&path)
 }
 
-pub(crate) async fn read_iroh_endpoint_record_async(
+pub async fn read_iroh_endpoint_record_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     node_id: &NodeId,
@@ -665,8 +683,8 @@ pub(crate) fn write_iroh_endpoint_record(
     write_object_file(&iroh_endpoint_record_path(paths, &record.node_id), record)
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) async fn write_iroh_endpoint_record_async(
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub async fn write_iroh_endpoint_record_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     record: &IrohEndpointRecord,
@@ -679,8 +697,8 @@ pub(crate) async fn write_iroh_endpoint_record_async(
     .await
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) fn try_acquire_iroh_proxy_permit(
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub fn try_acquire_iroh_proxy_permit(
     limiter: &Arc<tokio::sync::Semaphore>,
     limit: usize,
     scope: &str,
@@ -694,8 +712,8 @@ pub(crate) fn try_acquire_iroh_proxy_permit(
     }
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) fn iroh_proxy_route_hint(payload: &[u8]) -> String {
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub fn iroh_proxy_route_hint(payload: &[u8]) -> String {
     let Ok(request) = crate::decode_single_object_frame_from_slice::<crate::DaemonControlRequest>(
         payload,
         IROH_DAEMON_COMMAND_MAX_BYTES,
@@ -705,19 +723,16 @@ pub(crate) fn iroh_proxy_route_hint(payload: &[u8]) -> String {
     request.route
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) fn iroh_daemon_proxy_restart_backoff(consecutive_failures: u32) -> Duration {
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub fn iroh_daemon_proxy_restart_backoff(consecutive_failures: u32) -> Duration {
     let shift = consecutive_failures.saturating_sub(1).min(8);
     IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN
         .saturating_mul(2_u32.saturating_pow(shift))
         .min(IROH_DAEMON_PROXY_RESTART_BACKOFF_MAX)
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) fn iroh_daemon_proxy_restart_delay(
-    consecutive_failures: u32,
-    node_id: &NodeId,
-) -> Duration {
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub fn iroh_daemon_proxy_restart_delay(consecutive_failures: u32, node_id: &NodeId) -> Duration {
     let base = iroh_daemon_proxy_restart_backoff(consecutive_failures);
     let jitter_window_ms = ((base.as_millis() / 10) as u64)
         .min(IROH_DAEMON_PROXY_RESTART_JITTER_MAX.as_millis() as u64);
@@ -735,36 +750,36 @@ pub(crate) fn iroh_daemon_proxy_restart_delay(
     base + Duration::from_millis(hash % (jitter_window_ms + 1))
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 #[derive(Clone, Debug)]
-pub(crate) struct IrohProxyByteBudget {
+pub struct IrohProxyByteBudget {
     inner: Arc<Mutex<IrohProxyByteBudgetState>>,
     max_bytes: usize,
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 #[derive(Debug, Default)]
 struct IrohProxyByteBudgetState {
     in_flight_bytes: usize,
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 #[derive(Debug)]
-pub(crate) struct IrohProxyByteBudgetPermit {
+pub struct IrohProxyByteBudgetPermit {
     budget: IrohProxyByteBudget,
     bytes: usize,
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 impl IrohProxyByteBudget {
-    pub(crate) fn new(max_bytes: usize) -> Self {
+    pub fn new(max_bytes: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(IrohProxyByteBudgetState::default())),
             max_bytes,
         }
     }
 
-    pub(crate) fn try_acquire(
+    pub fn try_acquire(
         &self,
         frame_bytes: usize,
     ) -> Result<IrohProxyByteBudgetPermit, NetworkError> {
@@ -796,8 +811,8 @@ impl IrohProxyByteBudget {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn in_flight_bytes(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn in_flight_bytes(&self) -> usize {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -805,7 +820,7 @@ impl IrohProxyByteBudget {
     }
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 impl Drop for IrohProxyByteBudgetPermit {
     fn drop(&mut self) {
         let mut state = self
@@ -817,7 +832,7 @@ impl Drop for IrohProxyByteBudgetPermit {
     }
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 fn reserve_iroh_proxy_frame(
     len_prefix: Vec<u8>,
     body_bytes: usize,
@@ -836,8 +851,8 @@ fn reserve_iroh_proxy_frame(
     Ok((frame, permit))
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) fn encode_iroh_proxy_error_response_frame(
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub fn encode_iroh_proxy_error_response_frame(
     budget: &IrohProxyByteBudget,
     route: impl Into<String>,
     detail: impl Into<String>,
@@ -848,8 +863,8 @@ pub(crate) fn encode_iroh_proxy_error_response_frame(
     Ok((frame, permit))
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) async fn write_iroh_proxy_frame_async_with_idle_timeout<W>(
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub async fn write_iroh_proxy_frame_async_with_idle_timeout<W>(
     writer: &mut W,
     frame: &[u8],
     scope: &str,
@@ -888,8 +903,8 @@ where
     .await
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) async fn read_iroh_proxy_frame_async<R>(
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub async fn read_iroh_proxy_frame_async<R>(
     reader: &mut R,
     budget: &IrohProxyByteBudget,
     scope: &str,
@@ -950,8 +965,8 @@ where
     Ok((frame, permit))
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) async fn read_iroh_proxy_frame_async_with_idle_timeout<R>(
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub async fn read_iroh_proxy_frame_async_with_idle_timeout<R>(
     reader: &mut R,
     budget: &IrohProxyByteBudget,
     scope: &str,
@@ -1016,7 +1031,7 @@ where
     Ok((frame, permit))
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 async fn read_exact_iroh_proxy_frame_async<R>(
     reader: &mut R,
     buf: &mut [u8],
@@ -1051,7 +1066,7 @@ where
     Ok(())
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 async fn read_exact_iroh_proxy_frame_async_with_idle_timeout<R>(
     reader: &mut R,
     buf: &mut [u8],
@@ -1096,7 +1111,7 @@ where
     Ok(())
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 fn iroh_proxy_frame_eof_detail(part: &str, read: usize, expected: usize) -> String {
     if read == 0 {
         format!("peer closed before object frame {part} ({expected} bytes expected)")
@@ -1548,8 +1563,8 @@ async fn abort_and_drain_iroh_daemon_proxy_tasks(
     }
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) async fn accept_iroh_proxy_command_stream_with_idle_timeout<F, T, E>(
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub async fn accept_iroh_proxy_command_stream_with_idle_timeout<F, T, E>(
     accept: F,
     timeout: Duration,
 ) -> Result<Option<T>, NetworkError>
@@ -1567,8 +1582,8 @@ where
     }
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) fn iroh_proxy_command_stream_accept_error_is_peer_close(error: &NetworkError) -> bool {
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub fn iroh_proxy_command_stream_accept_error_is_peer_close(error: &NetworkError) -> bool {
     let NetworkError::Io { operation, detail } = error else {
         return false;
     };
@@ -1603,8 +1618,8 @@ pub fn iroh_endpoint_record_from_addr(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn iroh_endpoint_record_from_cluster_endpoint(
+#[cfg(any(test, feature = "test-support"))]
+pub fn iroh_endpoint_record_from_cluster_endpoint(
     endpoint: &ClusterEndpointRecord,
     cluster_id: &ClusterId,
 ) -> Result<IrohEndpointRecord, NetworkError> {
@@ -1617,8 +1632,11 @@ pub(crate) fn iroh_endpoint_record_from_cluster_endpoint(
     iroh_endpoint_record_from_address(&endpoint.address, cluster_id, &endpoint.node_id)
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) fn iroh_endpoint_record_from_address(
+/// Parses an `iroh://<public-key>?direct=...&relay=...` address into an
+/// [`IrohEndpointRecord`]. Unconditionally public since stage C: the
+/// `iroh://` parse/format contract stays in this crate while dylib network
+/// modules reuse it through the sinomo-core facade.
+pub fn iroh_endpoint_record_from_address(
     address: &str,
     cluster_id: &ClusterId,
     node_id: &NodeId,
@@ -1942,23 +1960,24 @@ fn iroh_daemon_control_attempt_should_retry(
     }
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) fn iroh_daemon_control_request_allows_response_retry(
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub fn iroh_daemon_control_request_allows_response_retry(
     request: &crate::DaemonControlRequest,
 ) -> bool {
     if request.is_response_retry_safe() {
         return true;
     }
+    // Read-only cluster KV routes are retry-safe over the proxy. Route names
+    // are string contracts owned by sinomo-kv; spelled out here so the
+    // networking library does not link the KV crate for an allowlist.
     matches!(
         request.route.as_str(),
-        crate::CLUSTER_HEALTH_ROUTE
-            | sinomo_kv::CLUSTER_KV_RANGE_PREFIX_ROUTE
-            | sinomo_kv::CLUSTER_KV_SNAPSHOT_ROUTE
+        crate::CLUSTER_HEALTH_ROUTE | "/cluster/kv/range-prefix" | "/cluster/kv/snapshot"
     )
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) fn iroh_daemon_response_error_is_retryable(error: &NetworkError) -> bool {
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub fn iroh_daemon_response_error_is_retryable(error: &NetworkError) -> bool {
     matches!(
         error,
         NetworkError::Io { operation, detail }
@@ -1968,12 +1987,12 @@ pub(crate) fn iroh_daemon_response_error_is_retryable(error: &NetworkError) -> b
     )
 }
 
-#[cfg(test)]
-pub(crate) fn iroh_daemon_rpc_retry_delay(attempt: usize, remaining: Duration) -> Option<Duration> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn iroh_daemon_rpc_retry_delay(attempt: usize, remaining: Duration) -> Option<Duration> {
     iroh_daemon_rpc_retry_delay_with_budget(attempt, Some(remaining))
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 pub(crate) fn iroh_daemon_rpc_retry_delay_with_budget(
     attempt: usize,
     remaining: Option<Duration>,
@@ -2024,8 +2043,8 @@ where
     })
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) async fn write_iroh_daemon_control_request_bytes_with_idle_timeout<W>(
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub async fn write_iroh_daemon_control_request_bytes_with_idle_timeout<W>(
     writer: &mut W,
     bytes: &[u8],
     idle_timeout: Duration,
@@ -2082,8 +2101,8 @@ where
     }
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) async fn read_iroh_daemon_control_response_async<R>(
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
+pub async fn read_iroh_daemon_control_response_async<R>(
     reader: &mut R,
     timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::DaemonControlResponse, NetworkError>
@@ -2102,15 +2121,15 @@ where
     }
 }
 
-#[cfg(test)]
-pub(crate) fn decode_iroh_daemon_control_response_bytes(
+#[cfg(any(test, feature = "test-support"))]
+pub fn decode_iroh_daemon_control_response_bytes(
     response: &[u8],
 ) -> Result<crate::DaemonControlResponse, NetworkError> {
     crate::decode_single_object_frame_from_slice(response, IROH_DAEMON_COMMAND_MAX_BYTES)
         .map_err(iroh_daemon_response_frame_error)
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
 fn iroh_daemon_response_frame_error(error: NetworkError) -> NetworkError {
     match error {
         NetworkError::Io { detail, .. } => NetworkError::Io {
@@ -2207,7 +2226,7 @@ fn iroh_endpoint_addr_from_record(
     Ok(addr)
 }
 
-pub(crate) async fn send_daemon_rpc_to_cluster_endpoint_async(
+pub async fn send_daemon_rpc_to_cluster_endpoint_async(
     endpoint: &ClusterEndpointRecord,
     auth: Option<&[u8]>,
     request: &crate::ObjectRpcRequest,
@@ -2246,16 +2265,81 @@ async fn send_daemon_control_request_to_cluster_endpoint_async(
 ) -> Result<crate::DaemonControlResponse, NetworkError> {
     match endpoint.transport {
         ClusterTransportKind::Iroh => {
+            // Registry-aware dispatch (stage C): a runtime-registered enabled
+            // network module claiming the Iroh transport takes precedence
+            // over the built-in feature-gated iroh dial path.
+            if let Some(module) = crate::network_module::registered_network_module_for_transport(
+                &ClusterTransportKind::Iroh,
+            ) {
+                return dial_daemon_control_request_via_network_module(
+                    module.as_ref(),
+                    endpoint,
+                    request,
+                    timeouts,
+                )
+                .await;
+            }
             send_iroh_daemon_control_request_to_address_async(&endpoint.address, request, timeouts)
                 .await
         }
         ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
             send_daemon_control_request_to_address_async(&endpoint.address, request, timeouts).await
         }
-        _ => Err(NetworkError::Io {
-            operation: format!("send daemon rpc to {}", endpoint.address),
-            detail: format!("unsupported daemon rpc transport {:?}", endpoint.transport),
-        }),
+        ref transport => {
+            // Transports without a built-in path dial through a registered
+            // module when one claims them; otherwise keep the historical
+            // unsupported-transport error.
+            if let Some(module) =
+                crate::network_module::registered_network_module_for_transport(transport)
+            {
+                return dial_daemon_control_request_via_network_module(
+                    module.as_ref(),
+                    endpoint,
+                    request,
+                    timeouts,
+                )
+                .await;
+            }
+            Err(NetworkError::Io {
+                operation: format!("send daemon rpc to {}", endpoint.address),
+                detail: format!("unsupported daemon rpc transport {:?}", endpoint.transport),
+            })
+        }
+    }
+}
+
+/// Dials one daemon control request through a runtime network module: the
+/// typed request is framed, the module returns the raw response frame, and
+/// the frame is decoded back into the typed response.
+async fn dial_daemon_control_request_via_network_module(
+    module: &dyn crate::network_module::NetworkModule,
+    endpoint: &ClusterEndpointRecord,
+    request: &crate::DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+) -> Result<crate::DaemonControlResponse, NetworkError> {
+    let frame = crate::object::encode_object_frame_to_vec(request)?;
+    let response = module.dial_rpc(endpoint, &frame, timeouts).await?;
+    crate::object::decode_single_object_frame_from_slice(&response, IROH_DAEMON_COMMAND_MAX_BYTES)
+}
+
+/// Synthesizes the endpoint record handed to a network module when dispatch
+/// starts from a bare address string (scheme sniff) instead of a cluster
+/// endpoint record. Mirrors the placeholder identities the built-in iroh
+/// address dial has always used.
+fn cluster_endpoint_record_for_module_address_dial(
+    address: &str,
+    transport: ClusterTransportKind,
+) -> ClusterEndpointRecord {
+    ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::derived("sinomo.network-module.dial", address),
+        node_id: NodeId::from_legacy_named("node_network_module_dial_placeholder")
+            .expect("static node id"),
+        transport,
+        address: address.to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::InternetDirect,
+        priority: 0,
+        last_observed_latency_ms: None,
     }
 }
 
@@ -2274,11 +2358,30 @@ async fn send_daemon_control_rpc_request_raw_response_to_cluster_endpoint_async(
             )
             .await
         }
-        ClusterTransportKind::Iroh => Err(NetworkError::Io {
-            operation: format!("send streamed daemon rpc to {}", endpoint.address),
-            detail: "streamed raw RPC responses are not supported over iroh proxy transport"
-                .to_string(),
-        }),
+        ClusterTransportKind::Iroh => {
+            // Registry-aware dispatch (stage C): raw/streamed responses only
+            // route through a module that declares `supports_raw_response`
+            // (the iroh module does not — its proxy re-frames responses).
+            if let Some(module) = crate::network_module::registered_network_module_for_transport(
+                &ClusterTransportKind::Iroh,
+            ) && module.descriptor().supports_raw_response
+            {
+                // DaemonControlResponse == ObjectRpcResponse, so the module
+                // frame decode is identical to the non-raw path.
+                return dial_daemon_control_request_via_network_module(
+                    module.as_ref(),
+                    endpoint,
+                    request,
+                    timeouts,
+                )
+                .await;
+            }
+            Err(NetworkError::Io {
+                operation: format!("send streamed daemon rpc to {}", endpoint.address),
+                detail: "streamed raw RPC responses are not supported over iroh proxy transport"
+                    .to_string(),
+            })
+        }
         _ => Err(NetworkError::Io {
             operation: format!("send streamed daemon rpc to {}", endpoint.address),
             detail: format!("unsupported daemon rpc transport {:?}", endpoint.transport),
@@ -2292,6 +2395,25 @@ async fn send_daemon_control_request_to_address_async(
     timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::DaemonControlResponse, NetworkError> {
     if daemon_rpc_address_uses_iroh(address) {
+        // Registry-aware dispatch (stage C): `iroh://` strings can ride on
+        // LanTcp-tagged endpoint records, so this scheme sniff — not only the
+        // transport-kind arm above — must consult the registry before the
+        // built-in feature-gated iroh path.
+        if let Some(module) =
+            crate::network_module::registered_network_module_for_address_scheme("iroh")
+        {
+            let endpoint = cluster_endpoint_record_for_module_address_dial(
+                address,
+                ClusterTransportKind::Iroh,
+            );
+            return dial_daemon_control_request_via_network_module(
+                module.as_ref(),
+                &endpoint,
+                request,
+                timeouts,
+            )
+            .await;
+        }
         send_iroh_daemon_control_request_to_address_async(address, request, timeouts).await
     } else {
         crate::send_daemon_control_request_async(
@@ -2313,8 +2435,8 @@ fn daemon_control_timeout_detail(timeout: Duration) -> String {
     format!("timed out after {}ms", timeout.as_millis())
 }
 
-#[cfg(test)]
-pub(crate) fn configure_daemon_control_stream_idle_timeout(
+#[cfg(any(test, feature = "test-support"))]
+pub fn configure_daemon_control_stream_idle_timeout(
     stream: &std::net::TcpStream,
     address: &str,
     timeout: Duration,
@@ -2421,22 +2543,22 @@ async fn forward_daemon_control_payload_async(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub(crate) struct ClusterAuthMaterial {
+pub struct ClusterAuthMaterial {
     pub cluster_id: ClusterId,
     pub node_id: NodeId,
     pub node_public_key: String,
     pub certificate: ClusterCertificate,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ClusterAuthVerifier {
+pub struct ClusterAuthVerifier {
     members: BTreeMap<NodeId, ClusterMemberRecord>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl ClusterAuthVerifier {
     pub fn new(members: impl IntoIterator<Item = ClusterMemberRecord>) -> Self {
         Self {
@@ -2523,9 +2645,9 @@ impl ClusterAuthVerifier {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub(crate) struct AuthenticatedClusterSession {
+pub struct AuthenticatedClusterSession {
     pub cluster_id: ClusterId,
     pub local_node_id: NodeId,
     pub remote_node_id: NodeId,
@@ -2533,11 +2655,11 @@ pub(crate) struct AuthenticatedClusterSession {
     pub established_at: OffsetDateTime,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Default)]
-pub(crate) struct LanConnectionPlanner;
+pub struct LanConnectionPlanner;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl LanConnectionPlanner {
     pub fn select_direct_candidate<'a>(
         candidates: &'a [PeerEndpointCandidate],
@@ -2564,20 +2686,20 @@ impl LanConnectionPlanner {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub(crate) enum RoamingPathSelection {
+pub enum RoamingPathSelection {
     Direct(PeerEndpointCandidate),
     Iroh(PeerEndpointCandidate),
     WebRtc(PeerEndpointCandidate),
     Relay(PeerEndpointCandidate),
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Default)]
-pub(crate) struct RoamingConnectionPlanner;
+pub struct RoamingConnectionPlanner;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl RoamingConnectionPlanner {
     pub fn select_path(candidates: &[PeerEndpointCandidate]) -> Option<RoamingPathSelection> {
         if let Some(candidate) = LanConnectionPlanner::select_direct_candidate(candidates) {

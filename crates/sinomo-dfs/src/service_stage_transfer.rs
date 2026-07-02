@@ -5,7 +5,7 @@
 //! paths, stage chunk assembly, and the shared response shape while
 //! repair/fetch/read transfer assembly lives in their dedicated service modules.
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::transfer::{
     DFS_BLOB_CHUNK_BYTES, InProgressBlobTransfer, InProgressPatchTransfer, blob_transfer_key,

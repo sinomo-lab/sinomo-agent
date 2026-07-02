@@ -1,14 +1,14 @@
 //! Local command and replay evaluation skeleton.
 
 use serde::{Deserialize, Serialize};
+use sinomo_core::events::{EventId, ReplayQuery};
+use sinomo_core::node::NodeId;
 use sinomo_core::{
     Confidence, EvaluationGate, EvaluationGateResult, EvaluationMetric, EvaluationOutcome,
     EvaluationScorecard, EventEnvelope, EventKind, Id, LatencyClass, MetricValue, PrivacyClass,
     RoutingMetadata, RoutingScope, Salience, Source,
 };
-use sinomo_events::{EventId, ReplayQuery};
 use sinomo_module::{ArtifactId, ModuleReplayReport};
-use sinomo_node::NodeId;
 use sinomo_rollout::ScorecardId;
 use std::{
     collections::BTreeMap,
@@ -963,7 +963,7 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_events::SessionId;
+    use sinomo_core::events::SessionId;
     use std::env;
 
     #[test]

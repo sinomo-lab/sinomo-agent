@@ -3,10 +3,10 @@
 //! This module keeps the crate-root service loop from also owning endpoint
 //! selection and local service assembly.
 
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::{ClusterPaths, ObjectRpcRequest};
+use sinomo_core::node::NodeId;
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord};
-use sinomo_local::SinomoDataDir;
-use sinomo_network::{ClusterPaths, ObjectRpcRequest};
-use sinomo_node::NodeId;
 use std::sync::Arc;
 
 use crate::{
@@ -19,8 +19,8 @@ pub fn cluster_dfs_data_endpoints(
     cluster_paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
-    sinomo_network::ClusterEndpointSelector::new(cluster_paths, state)
-        .select(sinomo_network::ClusterEndpointSelectionPurpose::DfsData)
+    sinomo_core::network::ClusterEndpointSelector::new(cluster_paths, state)
+        .select(sinomo_core::network::ClusterEndpointSelectionPurpose::DfsData)
 }
 
 pub(crate) fn open_cluster_dfs_service_with_message_sender(
@@ -76,7 +76,7 @@ pub(crate) fn open_cluster_dfs_service_with_peer_transports(
 }
 
 pub(crate) fn object_rpc_request_from_kv_payload(
-    payload: sinomo_kv::ClusterKvRpcPayload,
+    payload: sinomo_core::kv::ClusterKvRpcPayload,
 ) -> ObjectRpcRequest {
     ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
 }

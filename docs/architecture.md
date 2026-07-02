@@ -83,9 +83,9 @@ The default `sinomo` command is daemon-first. When the local main daemon is runn
 
 Node operation is cluster-based. A machine that starts alone is represented as a single-node cluster, and adoption into another cluster is handled as cluster migration. `sinomo cluster migrate plan <invite>` validates the source cluster and target invite without mutating local state. `sinomo cluster join <invite>` on an initialized solo node uses the single-node migration path: it writes a migration record, quarantines old cluster state/KV/Raft storage under `$SINOMO_DATA_DIR/cluster/migrations/<migration_id>/source/`, moves existing DFS metadata under the import namespace `/sinomo/imports/<source_cluster_id>/...`, and records the target-cluster join with the preserved local node identity. Target cluster KV wins after the join; source cluster KV is kept as evidence/import source only, cluster-level config is skipped, and only node-local `/config/nodes/<source_node_id>/...` config may be reapplied to target KV as normal KV operations. Shared DFS data import is a separate policy-governed operation. `sinomo cluster leave` is the reverse lifecycle edge for an installed node: it leaves the current cluster by quarantining old cluster state/KV/Raft/watch storage under `$SINOMO_DATA_DIR/cluster/migrations/<leave_id>/leave-source/`, then creates a fresh single-node cluster with the preserved local node identity. The left cluster's KV remains archived evidence and is not imported into the new single-node cluster.
 
-User-facing node operations are cluster-centered and daemon-owned. Local degraded-mode helpers remain internal fallback plumbing for commands that can read local state when the daemon or quorum is unavailable.
+User-facing node operations are cluster-centered and daemon-owned. Normal cluster operations — `cluster init`, `join`, `invite`, `rename`, `role`, `remove`, and `leave` — reach the daemon through one typed daemon API client shared by the CLI and the app, backed by the `/cluster/control/{init,join,invite,rename,role,remove,leave}` object-RPC routes that `sinomo-cluster` registers; they require a running daemon. Documented debug/repair commands stay direct against local state: `cluster doctor`, `cluster connectivity`, `cluster repair-members`, `cluster cleanup-legacy-shadow-members`, `cluster state-authority-role`, `cluster migrate` planning, the `debug *` commands, and local daemon/install/rollout lifecycle. Local degraded-mode helpers remain internal fallback plumbing for commands that can read local state when the daemon or quorum is unavailable.
 
-The daemon hosts an internal cluster KV service adapter. The service is not exposed as a public API; Sinomo components use binary object RPC routes to read snapshots, submit KV transactions, range over prefixes, and create/drain local prefix watches. `sinomo-kv` owns KV storage semantics, Raft participant state, leader/election state, term/vote/log/snapshot behavior, and durable KV files under `$SINOMO_DATA_DIR/cluster/kv-raft/<node_id>/` plus the materialized snapshot at `$SINOMO_DATA_DIR/cluster/kv-snapshot.sobj`. `sinomo-network` owns the cluster network and routing layer: routes, endpoint selection, connectivity graph interpretation, relay decisions, and peer transport selection. The coupling between them is intentionally narrow: KV replication and KV RPC traffic are transmitted over network-selected routes, and network routing reads the connectivity graph persisted in KV through a small query surface. Connectivity records are network-domain facts stored in KV; KV stores and serves them, but network interprets them for routing. Neither crate should absorb the other's domain rules. The daemon supplies host-local authentication, process identity, and peer transport callbacks for those crates. Cluster init, daemon registration, and join registration store cluster identity, Raft role config, member records, endpoint records, capability policy, invitations, and rollout desired/node state under the `/cluster/...` keyspace, so cluster status and peer views can report the KV-backed view rather than only local state. Cluster maintenance sends Raft append heartbeats from the current leader, asks authorized voters for votes when the leader is unreachable, persists a new leader only after quorum, clears local leadership when quorum is lost, and fans out committed watch events with signed daemon messages. Daemons also publish runtime heartbeats under `/cluster/node-status/<node_id>`. Those records include online observation time, daemon version, platform, PID, control address, executable path, and rollout state summary.
+The daemon hosts an internal cluster KV service adapter. The service is not exposed as a public API; Sinomo components use binary object RPC routes to read snapshots, submit KV transactions, range over prefixes, and create/drain local prefix watches. `sinomo-kv` owns KV storage semantics, Raft participant state, leader/election state, term/vote/log/snapshot behavior, and durable KV files under `$SINOMO_DATA_DIR/cluster/kv-raft/<node_id>/` plus the materialized snapshot at `$SINOMO_DATA_DIR/cluster/kv-snapshot.sobj`. `sinomo-network` owns the cluster network and routing layer: routes, endpoint selection, connectivity graph interpretation, relay decisions, and peer transport selection. The two crates do not know each other: `sinomo-network` has no dependency on `sinomo-kv`, and `sinomo-kv` has no dependency on `sinomo-network` (the workspace boundary test enforces both directions). `sinomo-cluster` is the bridge. It owns the transport-coupled control plane — membership, invites, joins, member/state/connectivity/status publishing, and the KV/Raft replication drivers that move consensus traffic over network-selected routes — and it implements the network crate's `ClusterDirectory` provider by reading cluster KV (`install_kv_cluster_directory()`), so routing and endpoint selection read cluster state (members, endpoints, node statuses, connectivity records) only through that registered directory. Connectivity records remain network-domain facts stored in KV: `sinomo-cluster` publishes and serves them, and `sinomo-network` interprets them for routing. No crate absorbs another's domain rules. The daemon supplies host-local authentication, process identity, and peer transport callbacks for those crates. Cluster init, daemon registration, and join registration store cluster identity, Raft role config, member records, endpoint records, capability policy, invitations, and rollout desired/node state under the `/cluster/...` keyspace, so cluster status and peer views can report the KV-backed view rather than only local state. Cluster maintenance sends Raft append heartbeats from the current leader, asks authorized voters for votes when the leader is unreachable, persists a new leader only after quorum, clears local leadership when quorum is lost, and fans out committed watch events with signed daemon messages. Daemons also publish runtime heartbeats under `/cluster/node-status/<node_id>`. Those records include online observation time, daemon version, platform, PID, control address, executable path, and rollout state summary.
 
 `sinomo cluster health` reads the KV-backed member and node-status records, then probes reachable daemon endpoints for a fresh live view. The report shows each cluster member with online/offline/unknown health, version, platform, PID, address, last-seen time, and rollout status. Shadow reachability is represented through the main member's alternate daemon endpoints rather than a separate member row. `sinomo cluster status` includes online/offline counts from the same health rows. A node is treated as offline when it has a probeable endpoint but its last online heartbeat is stale; nodes without a usable endpoint remain unknown rather than falsely offline.
 
@@ -365,19 +365,20 @@ The system should separate immutable foundation code from evolvable modules.
 
 R0 should remain tiny and continuity-focused. R1 should be boring in behavior but mutable in deployment: it must be designed for autonomous replacement through redundant supervisors, shadow instances, atomic desired-state changes, and fast rollback.
 
-The crate graph now makes this trust-ring cut explicit. Each workspace crate declares `[package.metadata.sinomo] ring = "..."` in its `Cargo.toml`, and `sinomo-runtime` is the R0/R1 boundary facade. R0/R1 crates must not depend on R2 services or application crates. R2 services and application crates must cross the foundation boundary through the `sinomo-runtime` facade instead of depending directly on R0/R1 crates.
+The crate graph now makes this trust-ring cut explicit. Each workspace crate declares `[package.metadata.sinomo] ring = "..."` in its `Cargo.toml`, and two facade crates pin the cut: `sinomo-core` is the R0 boundary facade (it aggregates the minimal set of crates that defines the cluster and adds no behavior) and `sinomo-runtime` is the R1 boundary facade (pure re-exports over `sinomo-core` plus the R1 crates). R0 crates depend only on R0 crates. R1 crates cross the R0 boundary through `sinomo-core`, R2 services and application crates cross the foundation boundary through `sinomo-runtime`, and R0/R1 crates must not depend on R2 services or application crates. `crates/sinomo-core/tests/workspace_ring_boundaries.rs` enforces these rules, including the decoupling rule inside R0: `sinomo-network` must not depend on `sinomo-kv` or `sinomo-cluster`, `sinomo-kv` must not depend on `sinomo-network` or `sinomo-cluster`, and `sinomo-cluster` is the only bridge between them.
 
 Self-evolution is intentionally above this foundation. `sinomo-evolution` is an R2 service that owns evolution jobs, mutation packets, candidate bundles, approval records, and campaign state. R0/R1 crates expose generic primitives such as events, artifacts, scorecards, registry evidence, rollout plans, sandbox workloads, and module loader state; they do not know whether those primitives were produced by self-evolution, an operator, or another delivery system.
 
-Initial crate ownership:
+Current crate ownership:
 
 | Group | Crates |
 |---|---|
-| R0 | `sinomo-core` |
-| R1 | `sinomo-api`, `sinomo-device`, `sinomo-dfs`, `sinomo-eval`, `sinomo-events`, `sinomo-kv`, `sinomo-local`, `sinomo-module`, `sinomo-module-api`, `sinomo-network`, `sinomo-network-module`, `sinomo-node`, `sinomo-policy`, `sinomo-registry`, `sinomo-rollout`, `sinomo-sandbox`, `sinomo-supervision` |
-| R0/R1 boundary | `sinomo-runtime` |
-| R2 | `sinomo-actions`, `sinomo-agent`, `sinomo-audio`, `sinomo-deliberation`, `sinomo-evolution`, `sinomo-fusion`, `sinomo-gateway`, `sinomo-lm`, `sinomo-memory`, `sinomo-video`, `sinomo-voice` |
-| Application/tooling | `sinomo`, `sinomo-app`, `sinomo-cli` |
+| R0 | `sinomo-base`, `sinomo-object`, `sinomo-storage`, `sinomo-local`, `sinomo-node`, `sinomo-events`, `sinomo-network`, `sinomo-kv`, `sinomo-cluster`, `sinomo-service` |
+| R0 boundary | `sinomo-core` |
+| R1 | `sinomo-daemon`, `sinomo-dfs`, `sinomo-dfs-cloud-files-api`, `sinomo-module`, `sinomo-module-api`, `sinomo-registry`, `sinomo-rollout`, `sinomo-policy`, `sinomo-eval`, `sinomo-config`, `sinomo-observe`, `sinomo-device`, `sinomo-supervision`, `sinomo-cli-registry`, `sinomo-test`, the `sinomo-sandbox*` crates, and the native module packages under `modules/` |
+| R1 boundary | `sinomo-runtime` |
+| R2 | `sinomo-actions`, `sinomo-agent`, `sinomo-audio`, `sinomo-deliberation`, `sinomo-evolution`, `sinomo-fusion`, `sinomo-gateway`, `sinomo-lm`, `sinomo-memory`, `sinomo-models`, `sinomo-pytorch`, `sinomo-video`, `sinomo-voice` |
+| Application/tooling | `sinomo`, `sinomo-app`, `sinomo-cli`, `sinomo-dfs-fuse`, `sinomo-testdir` |
 
 ### Evolution Delivery Model
 
@@ -423,7 +424,7 @@ The manifest is part of the artifact. A candidate cannot grant itself new powers
 The foundation plane must provide these R1 contracts:
 
 - Stable trust ring metadata on modules, jobs, policies, and artifacts.
-- Module manifest and artifact identity types in `sinomo-core`.
+- Module manifest and artifact identity types in `sinomo-base`, re-exported at the `sinomo-core` root.
 - An explicit `sinomo-runtime` facade that aggregates only R0/R1 crates and gives R2 services a stable foundation import boundary.
 - Workspace architecture tests that reject missing ring metadata, R0/R1 dependencies on R2/application crates, and direct R2/application dependencies on R0/R1 crates outside `sinomo-runtime`.
 - A policy decision boundary that candidate code cannot bypass.
@@ -479,7 +480,7 @@ Responsibilities:
 - Capability discovery.
 - Trust, authentication, and node-local sandbox policy boundaries.
 
-Primary crates: `sinomo-node`, `sinomo-device`, `sinomo-network`, `sinomo-dfs`.
+Primary crates: `sinomo-node`, `sinomo-device`, `sinomo-network`, `sinomo-cluster`, `sinomo-service`, `sinomo-dfs`.
 
 ### Ingestion Plane
 
@@ -523,7 +524,7 @@ Responsibilities:
 - Merge state updates from participating nodes.
 - Preserve local-first operation when other nodes are unavailable.
 
-Primary crates: `sinomo-events`, `sinomo-memory`, `sinomo-core`.
+Primary crates: `sinomo-events`, `sinomo-memory`, `sinomo-base`.
 
 ### Agent Control Plane
 
@@ -567,7 +568,7 @@ Responsibilities:
 - Long-running generation jobs.
 - Artifact delivery and progress events.
 
-Primary crates: `sinomo-actions`, `sinomo-voice`, `sinomo-api`.
+Primary crates: `sinomo-actions`, `sinomo-voice`.
 
 ## Workspace Crate Layout
 
@@ -584,41 +585,72 @@ sinomo-agent/
     proposal.md
     research_notes/
   crates/
-    sinomo-core/          # Shared IDs, event schema, domain types, errors
+    # R0 cluster foundation
+    sinomo-base/          # Shared IDs, event envelope, domain types, scalars
+    sinomo-object/        # Sinomo Object (SOBJ) wire codec
+    sinomo-storage/       # Storage layout and durable object schema contracts
+    sinomo-local/         # Local data-directory layout
     sinomo-node/          # Node identity, local runtime metadata, capability model
+    sinomo-events/        # Event persistence, replay, entity/world-state reducers
+    sinomo-network/       # Pure networking library: object RPC, routing, transports, network modules
+    sinomo-kv/            # Cluster KV storage and Raft consensus core (transport-free)
+    sinomo-cluster/       # Cluster control plane: membership, invites, joins, replication drivers
+    sinomo-service/       # Service registration, discovery, routing target selection
+    sinomo-core/          # R0 boundary facade aggregating the cluster foundation crates
+    # R1 trusted runtime
+    sinomo-daemon/        # Local daemon: runtime registry, cluster operator, control routes
     sinomo-device/        # Device registry, source/action target metadata
-    sinomo-network/       # Peer discovery, transport, authentication, routing
-    sinomo-network-module/ # Module-surface adapter for network-owned inspection tools and skills
     sinomo-dfs/           # Local-first distributed workspace filesystem
+    sinomo-dfs-cloud-files-api/ # Stable Cloud Files DFS module ABI
     sinomo-policy/        # Trusted policy decision contracts and verifier
     sinomo-registry/      # Module artifact registry and provenance metadata
     sinomo-module/        # Module lifecycle, registry, routing, native loading, and node-local loader state
     sinomo-module-api/    # Stable native dynamic-library module ABI
-    sinomo-sandbox/       # Sandboxed candidate execution and test jobs
+    sinomo-sandbox/       # Sandbox contracts and sandboxed candidate execution
+    sinomo-sandbox-simple/ # Minimal sandbox backend
+    sinomo-sandbox-wasix-api/ # Stable WASIX sandbox module ABI
+    sinomo-sandbox-wasix-host/ # WASIX sandbox host loader
     sinomo-eval/          # Evaluation definitions, replay suites, and scorecards
-    sinomo-evolution/     # Evolution job orchestration
     sinomo-rollout/       # Progressive rollout and rollback controller
+    sinomo-config/        # Local and replicated configuration
+    sinomo-observe/       # Operational events, logs, and cluster observation
+    sinomo-supervision/   # Supervision and incident contracts
+    sinomo-cli-registry/  # CLI command registry contracts
+    sinomo-test/          # Shared test harness utilities
+    sinomo-runtime/       # R1 boundary facade over sinomo-core plus the R1 crates
+    # R2 trusted services
     sinomo-gateway/       # Ingress adapters and session wiring
     sinomo-audio/         # Audio orchestration and audio event production
     sinomo-video/         # Video/screen orchestration and visual event production
     sinomo-fusion/        # Cross-modal alignment on a shared timeline
-    sinomo-events/        # Event persistence, replay, entity/world-state reducers
     sinomo-memory/        # Hot/warm/cold/procedural memory and retrieval policy
     sinomo-agent/         # Interactive controller and dialogue/task loop
     sinomo-deliberation/  # Long-running planning, reflection, and generation jobs
     sinomo-actions/       # Tool, automation, notification, and environment actions
     sinomo-voice/         # TTS orchestration and duplex audio output control
-    sinomo-api/           # Operator/debug/admin HTTP and WebSocket API
-    sinomo-app/           # Local deployment binary that wires services together
+    sinomo-lm/            # Language-model provider clients
+    sinomo-models/        # Model catalog and provider configuration
+    sinomo-pytorch/       # PyTorch-backed inference workers
+    sinomo-evolution/     # Evolution job orchestration
+    # Application / tooling
+    sinomo/               # CLI binary entry point (wraps sinomo_cli::run)
+    sinomo-cli/           # CLI surface: commands and TUI
+    sinomo-app/           # Graphical app
+    sinomo-dfs-fuse/      # FUSE mount for DFS
+    sinomo-testdir/       # Test data-directory tooling
   modules/
+    benchmark/sinomo-benchmarks/ # Benchmark harness package (not a default build member)
+    dfs/cloud-files/      # Windows Cloud Files DFS integration native-dylib module
     remote/management/    # Self-contained trusted native-dylib shell, filesystem, and system-info module
+    sandbox/wasix/        # WASIX sandbox runtime native-dylib module
+    network/iroh/         # Iroh roaming transport native-dylib module (lands in stage C of the crate-boundary refactor)
 ```
 
 ## Crate Responsibilities
 
-### `sinomo-core`
+### `sinomo-base`
 
-Shared domain contracts used by all other crates.
+Shared domain contracts used by all other crates. It sits at the bottom of the R0 ring; crates outside R0 consume it through the `sinomo-core` facade, which re-exports the base contracts at its root.
 
 Early types:
 
@@ -660,6 +692,17 @@ Early types:
 
 This crate should avoid service-specific dependencies. It owns stable schemas, IDs, serialization, error types, and shared time/source abstractions.
 
+### `sinomo-core`
+
+The R0 boundary facade: the minimal set of crates that defines the cluster.
+
+Responsibilities:
+
+- Aggregate exactly the R0 crates and add no behavior of its own.
+- Re-export the `sinomo-base` contracts at the crate root so `sinomo_core::...` paths keep working.
+- Expose the other R0 crates as modules: `sinomo_core::{object, storage, local, node, events, cluster, network, kv, service}`.
+- Give R1 crates one stable import surface so the trust-ring cut stays visible in the Cargo graph.
+
 ### `sinomo-node`
 
 Node identity and runtime metadata.
@@ -686,18 +729,55 @@ Responsibilities:
 
 ### `sinomo-network`
 
-Peer discovery, transport, and cross-node routing.
+Pure networking library: object RPC, packet routing, transports, and the network-module system. Like a web framework, it owns the request/response mechanism while domain crates register their routes into it and own the business logic behind them.
 
-See [Sinomo Network](network-architecture.md) for the communication boundary and wire-format rules.
+See [Sinomo Network](network-architecture.md) for the communication boundary, wire-format rules, routing algorithm, and the network-module system.
 
 Responsibilities:
 
-- Discover known or nearby nodes.
-- Authenticate node-to-node communication.
-- Route events, commands, and state updates.
-- Support local network operation first.
-- Own the Sinomo Object wire codec for cluster communication.
-- Provide message and streaming abstractions over direct peer links, home-node sync APIs, or additional protocols.
+- Own the object RPC router, route registry, middleware, and service catalogs for cluster communication.
+- Implement the canonical packet routing algorithm: endpoint selection, connectivity-graph interpretation, relay decisions, retries.
+- Provide peer transports (loopback, LAN TCP, roaming) and LAN discovery.
+- Sign and verify daemon control transport (`sinomo.daemon-auth.v1`).
+- Own the Sinomo Object wire codec dependency for cluster framing.
+- Host the runtime network-module registry so transports can be added, enabled, and disabled as modules, including non-TCP/IP transports.
+- Read cluster state (members, endpoints, node statuses, connectivity records) only through the `ClusterDirectory` provider registered by `sinomo-cluster`; the crate has no dependency on `sinomo-kv` or `sinomo-cluster`.
+
+### `sinomo-kv`
+
+Cluster KV storage and Raft consensus core. Transport-free: it never opens a socket and has no dependency on `sinomo-network` or `sinomo-cluster`.
+
+Responsibilities:
+
+- Own KV storage semantics: models, WAL, snapshots, revisions, transactions, leases, and prefix watches.
+- Own Raft participant state: term/vote/log/snapshot behavior and the election/replication state machines.
+- Own durable KV files under `$SINOMO_DATA_DIR/cluster/kv-raft/<node_id>/` and the materialized snapshot at `$SINOMO_DATA_DIR/cluster/kv-snapshot.sobj`.
+- Define the `ClusterKvRaft*Host` traits that transport owners implement; hosts build their own error type through the traits' associated `kv_error` constructor rather than a `From<KvError>` bound.
+
+### `sinomo-cluster`
+
+Cluster control plane: the only bridge between `sinomo-kv` and `sinomo-network`.
+
+Responsibilities:
+
+- Own membership, invites, join registration, and member mutation drivers.
+- Publish member, state, connectivity, network-info, and node-status records to cluster KV.
+- Own the KV/Raft replication, election, quorum, and committed-watch fanout drivers that move consensus traffic over network-selected routes.
+- Own cluster health rows and doctor findings.
+- Own cluster bootstrap-state I/O for `$SINOMO_DATA_DIR/cluster/state.sobj`.
+- Implement the network crate's `ClusterDirectory` provider on top of cluster KV (`install_kv_cluster_directory()`), so routing and endpoint selection see cluster state without a network-to-KV dependency.
+- Register the `/cluster/control/{init,join,invite,rename,role,remove,leave}` object-RPC routes for daemon-mediated cluster operations.
+
+### `sinomo-service`
+
+Service registration, discovery, and generic routing target selection.
+
+Responsibilities:
+
+- Own `Service` and `ServiceRegistry`: per-service object-RPC route ownership with a host-agnostic async dispatch seam that works in-process or behind the daemon.
+- Publish one `ServiceInstanceRecord` per locally registered service under `/cluster/services/<service>/<node_id>`; the daemon refreshes the records on its maintenance tick.
+- Discover service instances by reading that prefix from a cluster-KV snapshot or `ClusterAccess`.
+- Select routing targets with `ServiceTargetSelector` and the `LocalFirst`/`LowestCost`/`RoundRobin`/`All` policies, consulting the network layer's `ClusterDirectory` for reachability instead of owning routing rules.
 
 ### `sinomo-dfs`
 
@@ -934,17 +1014,6 @@ Responsibilities:
 - Barge-in handling.
 - Output state events for trigger policy.
 
-### `sinomo-api`
-
-Operator and integration API.
-
-Responsibilities:
-
-- HTTP/WebSocket control endpoints.
-- Debug and replay views.
-- Health checks.
-- Configuration and supervision interfaces.
-
 ### `sinomo-app`
 
 Local deployment binary.
@@ -1020,7 +1089,7 @@ Initial event families:
 - `eval.*`
 - `rollout.*`
 
-The event envelope should live in `sinomo-core`; persistence, replay, and reducers should live in `sinomo-events`.
+The event envelope lives in `sinomo-base` (re-exported at the `sinomo-core` root); persistence, replay, and reducers live in `sinomo-events`.
 
 Distributed event fields:
 

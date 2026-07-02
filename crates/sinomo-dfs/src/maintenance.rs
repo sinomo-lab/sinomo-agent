@@ -5,10 +5,10 @@
 //! maintenance tick against configured metadata shards.
 
 use serde::{Deserialize, Serialize};
-use sinomo_local::SinomoDataDir;
-use sinomo_network::ClusterPaths;
-use sinomo_node::NodeId;
-use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::ClusterPaths;
+use sinomo_core::node::NodeId;
+use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,7 +77,7 @@ pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(
         return Ok(None);
     }
 
-    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(DfsError::from_network)?;
     let local_node_id = state.local_node_id.clone();
     let file_system = distributed_sifs(local_node_id.clone());
@@ -131,7 +131,7 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
         sync_peer_transport.as_ref(),
     )?;
 
-    let state = sinomo_network::read_cluster_state_without_kv_async(runtime, &cluster_paths)
+    let state = sinomo_core::cluster::read_cluster_state_without_kv_async(runtime, &cluster_paths)
         .await
         .map_err(DfsError::from_network)?;
     let local_node_id = state.local_node_id.clone();

@@ -6,6 +6,7 @@
 //! never depends on `tui` internals.
 
 use serde::{Deserialize, Serialize};
+use sinomo_runtime::cluster;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -30,9 +31,10 @@ use sinomo_lm::{
     AnthropicConfig, CLAUDE_DEFAULT_MODEL, ClaudeCodeConfig, CodexCliConfig, GeminiConfig,
     GitHubCopilotConfig, OpenAiConfig, PROVIDER_DEFAULT_MODEL, ProviderReasoningEffort,
 };
+use sinomo_runtime::cluster::ClusterHealthRow;
 use sinomo_runtime::events::{InMemoryEventStore, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::{self, ClusterHealthRow, ClusterPaths, ObjectRpcRequest};
+use sinomo_runtime::network::{self, ClusterPaths, ObjectRpcRequest};
 use sinomo_runtime::node::NodeId;
 use std::collections::BTreeSet;
 use time::format_description::well_known::Rfc3339;
@@ -2702,7 +2704,7 @@ pub fn cluster_status(data_dir: &SinomoDataDir) -> AppClusterStatus {
 pub fn cluster_health_rows(data_dir: &SinomoDataDir) -> Result<Vec<ClusterHealthRow>, CliError> {
     let paths = ClusterPaths::new(data_dir);
     let state = read_cli_cluster_state(&paths)?;
-    network::cluster_health_rows_with_probe(
+    cluster::cluster_health_rows_with_probe(
         &paths,
         &state,
         &crate::CliClusterStatusProbe { paths: &paths },
@@ -2781,6 +2783,7 @@ pub fn join_cluster(
             } else {
                 name.trim().to_string()
             },
+            name_explicit: true,
         },
         &paths,
     )?;

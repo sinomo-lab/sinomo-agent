@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::metadata_error::Result;
 use crate::metadata_io::{read_dir, read_sobj_optional, write_sobj_atomic};

@@ -14,6 +14,10 @@ pub(crate) use crate::runtime::{
 pub(crate) use crate::store::*;
 pub(crate) use crate::toolchain::*;
 pub(crate) use serde::{Deserialize, Serialize};
+pub(crate) use sinomo_core::events::{AppendReceipt, EventId, EventStore, EventStoreError};
+pub(crate) use sinomo_core::kv::{KvEntry, KvSnapshot, KvTxn, decode_kv_value};
+pub(crate) use sinomo_core::node::NodeId;
+pub(crate) use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 pub(crate) use sinomo_core::{
     Confidence, EventEnvelope, EventKind, Id, LatencyClass, ModuleResourceLimits, PrivacyClass,
     RoutingMetadata, RoutingScope, Salience, Source,
@@ -22,11 +26,7 @@ pub(crate) use sinomo_dfs::{
     DfsMessageTransport, DfsObjectId, DfsObjectKind, DfsPosixError, DfsWriteOptions,
     NetworkedDfsService,
 };
-pub(crate) use sinomo_events::{AppendReceipt, EventId, EventStore, EventStoreError};
-pub(crate) use sinomo_kv::{KvEntry, KvSnapshot, KvTxn, decode_kv_value};
 pub(crate) use sinomo_module::ArtifactId;
-pub(crate) use sinomo_node::NodeId;
-pub(crate) use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 pub(crate) use std::collections::{BTreeMap, BTreeSet};
 pub(crate) use std::fmt;
 pub(crate) use std::fs;

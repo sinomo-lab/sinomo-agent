@@ -1,3 +1,7 @@
+use sinomo_core::events::EventId;
+use sinomo_core::kv::InProcessKvStore;
+use sinomo_core::network::InProcessNetwork;
+use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
 use sinomo_dfs::{
     DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, DfsBlobTransferResult, DfsCommitVersionCommand,
@@ -15,10 +19,6 @@ use sinomo_dfs::{
     NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
     SharedDfsControlPlaneKvClient, file_system_config_key, sifs_node_files_path,
 };
-use sinomo_events::EventId;
-use sinomo_kv::InProcessKvStore;
-use sinomo_network::InProcessNetwork;
-use sinomo_node::NodeId;
 use std::fs;
 use std::io::{Read, Result as IoResult};
 use std::path::{Path, PathBuf};

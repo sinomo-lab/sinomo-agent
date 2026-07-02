@@ -266,9 +266,9 @@ fn rollout_capability(name: &str) -> sinomo_core::CapabilityName {
 }
 
 pub fn register_storage_paths(
-    layout: &mut sinomo_storage::StorageLayout,
-) -> Result<(), sinomo_storage::StorageContractError> {
-    use sinomo_storage::{ObjectSchema, STORAGE_CONTRACT_OBJECT_VERSION, StorageRing};
+    layout: &mut sinomo_core::storage::StorageLayout,
+) -> Result<(), sinomo_core::storage::StorageContractError> {
+    use sinomo_core::storage::{ObjectSchema, STORAGE_CONTRACT_OBJECT_VERSION, StorageRing};
 
     layout.register_sinomo_object(
         "sinomo-rollout",

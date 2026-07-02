@@ -7,10 +7,10 @@ fn main() {
     let cluster_root = std::env::args()
         .nth(1)
         .expect("usage: dump_shard_view <cluster-dir>");
-    let kv_paths = sinomo_kv::ClusterKvPaths::new(&cluster_root);
+    let kv_paths = sinomo_core::kv::ClusterKvPaths::new(&cluster_root);
     let prefix = format!("{}/", metadata_shards_prefix(&sifs_file_system_id()));
-    let entries =
-        sinomo_kv::read_cluster_kv_prefix_entries(&kv_paths, &prefix).expect("read kv prefix");
+    let entries = sinomo_core::kv::read_cluster_kv_prefix_entries(&kv_paths, &prefix)
+        .expect("read kv prefix");
     if entries.is_empty() {
         println!("no shard configs under {prefix}");
     }

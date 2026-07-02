@@ -3,7 +3,7 @@
 //! These helpers keep legacy local-node and default SIFS identifiers in one
 //! place while callers migrate toward explicit cluster-provided identities.
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::DfsFileSystemId;
 

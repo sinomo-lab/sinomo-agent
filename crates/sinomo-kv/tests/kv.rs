@@ -187,7 +187,7 @@ mod tests {
     fn cluster_raft_rpc_payloads_encode_kv_owned_bodies() {
         let node_id = NodeId::from_legacy_named("node_kv_raft_rpc_payloads").expect("node");
         let state = ClusterBootstrapState::initialized_locally(
-            sinomo_core::Id::from_legacy_named("cluster_kv_raft_rpc_payloads").expect("cluster"),
+            sinomo_base::Id::from_legacy_named("cluster_kv_raft_rpc_payloads").expect("cluster"),
             "kv raft rpc payloads",
             node_id.clone(),
             "node",
@@ -301,7 +301,7 @@ mod tests {
             ClusterKvRouteAuth::LocalOrRaftVoter
         );
 
-        let dispatched_append = handle_cluster_raft_rpc_payload::<_, _, KvError>(
+        let dispatched_append = handle_cluster_raft_rpc_payload::<_, _, KvError, _>(
             append_payload.route,
             &append_payload.body,
             |request| {
@@ -311,6 +311,7 @@ mod tests {
             |_| -> Result<ClusterRaftVoteResponse, KvError> {
                 panic!("append route must not call vote handler")
             },
+            |error| error,
         )
         .expect("dispatch append")
         .expect("append route");
@@ -321,7 +322,7 @@ mod tests {
             append_response
         );
 
-        let dispatched_vote = handle_cluster_raft_rpc_payload::<_, _, KvError>(
+        let dispatched_vote = handle_cluster_raft_rpc_payload::<_, _, KvError, _>(
             vote_payload.route,
             &vote_payload.body,
             |_| -> Result<ClusterRaftAppendResponse, KvError> {
@@ -331,6 +332,7 @@ mod tests {
                 assert_eq!(request, vote_request);
                 Ok(vote_response.clone())
             },
+            |error| error,
         )
         .expect("dispatch vote")
         .expect("vote route");
@@ -341,7 +343,7 @@ mod tests {
             vote_response
         );
 
-        let unknown = handle_cluster_raft_rpc_payload::<_, _, KvError>(
+        let unknown = handle_cluster_raft_rpc_payload::<_, _, KvError, _>(
             "/cluster/raft/unknown",
             &[],
             |_| -> Result<ClusterRaftAppendResponse, KvError> {
@@ -350,6 +352,7 @@ mod tests {
             |_| -> Result<ClusterRaftVoteResponse, KvError> {
                 panic!("unknown route must not call vote handler")
             },
+            |error| error,
         )
         .expect("unknown route");
         assert!(unknown.is_none());
@@ -365,6 +368,10 @@ mod tests {
 
     impl ClusterKvLocalReadWatchHost for FixedLocalReadWatchHost {
         type Error = KvError;
+
+        fn kv_error(error: KvError) -> Self::Error {
+            error
+        }
 
         fn range_prefix(&mut self, prefix: &str) -> Result<Vec<KvEntry>, Self::Error> {
             self.seen_range_prefix = Some(prefix.to_string());
@@ -5761,7 +5768,7 @@ mod tests {
             now,
         );
         let main_capability =
-            sinomo_core::CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY.to_string())
+            sinomo_base::CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY.to_string())
                 .expect("main daemon capability");
         state.members[0].role = ClusterMemberRole::Voter;
         state.members[0].state = ClusterMemberState::Voter;
@@ -5791,6 +5798,10 @@ mod tests {
 
     impl ClusterKvRaftCommandStorage for QuorumCommitTestHost {
         type Error = QuorumCommitTestError;
+
+        fn kv_error(error: KvError) -> Self::Error {
+            QuorumCommitTestError::from(error)
+        }
 
         fn append_cluster_raft_command_uncommitted_or_no_effect(
             &mut self,
@@ -5900,6 +5911,10 @@ mod tests {
 
     impl ClusterKvRaftQuorumCommitAsyncHost for QuorumCommitTestHost {
         type Error = QuorumCommitTestError;
+
+        fn kv_error(error: KvError) -> Self::Error {
+            QuorumCommitTestError::from(error)
+        }
         type Target = NodeId;
 
         fn append_cluster_raft_command_uncommitted_or_no_effect_async<'a>(
@@ -6006,6 +6021,10 @@ mod tests {
     impl ClusterKvTxnQuorumHost for TxnQuorumDriverTestHost {
         type Error = QuorumCommitTestError;
 
+        fn kv_error(error: KvError) -> Self::Error {
+            QuorumCommitTestError::from(error)
+        }
+
         fn local_is_raft_leader(
             &mut self,
             _state: &ClusterBootstrapState,
@@ -6076,6 +6095,10 @@ mod tests {
 
     impl ClusterKvRaftCommandStorage for RacingCommitTestHost {
         type Error = QuorumCommitTestError;
+
+        fn kv_error(error: KvError) -> Self::Error {
+            QuorumCommitTestError::from(error)
+        }
 
         fn lock_cluster_raft_commit_sequence(&mut self) -> Result<Option<File>, Self::Error> {
             lock_cluster_kv_commit_sequence(&self.kv_paths, CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT)
@@ -6338,6 +6361,10 @@ mod tests {
 
     impl ClusterKvRaftAppendReplicationHost for AppendReplicationTestHost {
         type Error = QuorumCommitTestError;
+
+        fn kv_error(error: KvError) -> Self::Error {
+            QuorumCommitTestError::from(error)
+        }
         type Target = NodeId;
 
         fn last_local_raft_log_index(
@@ -6828,6 +6855,10 @@ mod tests {
 
         impl ClusterKvRaftLeaderElectionHost for RecordingElectionHost {
             type Error = KvError;
+
+            fn kv_error(error: KvError) -> Self::Error {
+                error
+            }
 
             fn local_vote_metadata(
                 &mut self,

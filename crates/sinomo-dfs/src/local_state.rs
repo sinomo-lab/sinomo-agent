@@ -4,11 +4,13 @@
 //! store wrappers, metadata backend openers, and operator inspection entry
 //! points. The networked service loop remains in the root module for now.
 
+#[allow(unused_imports)]
+use sinomo_core::cluster::ClusterKvPathsExt;
 use std::path::{Path, PathBuf};
 
-use sinomo_local::{LocalDataError, SinomoDataDir};
-use sinomo_network::ClusterPaths;
-use sinomo_node::NodeId;
+use sinomo_core::local::{LocalDataError, SinomoDataDir};
+use sinomo_core::network::ClusterPaths;
+use sinomo_core::node::NodeId;
 
 use crate::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsConflictRecord, DfsError,
@@ -127,7 +129,7 @@ pub fn ensure_default_cluster_aware_dfs_expose_config(
     cluster_paths: &ClusterPaths,
 ) -> Result<DfsExposeConfig, DfsExposeStoreError> {
     let node_id = if cluster_paths.state.exists() {
-        sinomo_network::read_cluster_state_without_kv(cluster_paths)
+        sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
             .map(|state| state.local_node_id)
             .unwrap_or_else(|_| fallback_dfs_node_id())
     } else {
@@ -275,7 +277,7 @@ pub fn cluster_dfs_metadata_shards(
     cluster_paths: &ClusterPaths,
     file_system_id: &DfsFileSystemId,
 ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
-    let mut shards = sinomo_kv::read_cluster_kv_prefix_entries(
+    let mut shards = sinomo_core::kv::read_cluster_kv_prefix_entries(
         &cluster_paths.kv_paths(),
         &format!("{}/", metadata_shards_prefix(file_system_id)),
     )
@@ -294,7 +296,7 @@ pub fn inspect_cluster_aware_dfs_status(
     let metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
     let mut status = DfsOperatorInspector::new(metadata.as_ref()).status()?;
     attach_cluster_aware_dfs_maintenance_observations(&mut status, data_dir)?;
-    if let Ok(state) = sinomo_network::read_cluster_state_without_kv(cluster_paths) {
+    if let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths) {
         for shard in &mut status.metadata_shards {
             if shard.primary_node_id.as_ref() == Some(&state.local_node_id) {
                 shard.replay_cursors.clear();

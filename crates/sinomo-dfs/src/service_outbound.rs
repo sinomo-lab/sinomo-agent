@@ -6,8 +6,8 @@
 
 use std::io::Read;
 
-use sinomo_network::NetworkError;
-use sinomo_node::NodeId;
+use sinomo_core::network::NetworkError;
+use sinomo_core::node::NodeId;
 
 #[cfg(test)]
 use crate::transfer::blob_chunk_count;

@@ -31,22 +31,13 @@ serde_json.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-dfs = { path = "../sinomo-dfs" }
-sinomo-events = { path = "../sinomo-events" }
-sinomo-kv = { path = "../sinomo-kv" }
-sinomo-local = { path = "../sinomo-local" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-module-api = { path = "../sinomo-module-api" }
-sinomo-network = { path = "../sinomo-network" }
-sinomo-network-module = { path = "../sinomo-network-module" }
-sinomo-node = { path = "../sinomo-node" }
-sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 sinomo-observe = { path = "../sinomo-observe" }
 sinomo-registry = { path = "../sinomo-registry" }
 sinomo-rollout = { path = "../sinomo-rollout" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }
 sinomo-sandbox-wasix-host = { path = "../sinomo-sandbox-wasix-host", optional = true }
-sinomo-service = { path = "../sinomo-service" }
-sinomo-storage = { path = "../sinomo-storage" }
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true

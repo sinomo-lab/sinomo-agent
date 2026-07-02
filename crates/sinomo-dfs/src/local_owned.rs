@@ -7,9 +7,9 @@
 use crate::DfsFileSystemId;
 use crate::{SIFS_FILE_SYSTEM_ID, namespace::sifs_node_files_path};
 use serde::{Deserialize, Serialize};
-use sinomo_node::NodeId;
-use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
-use sinomo_storage::durable_file;
+use sinomo_core::node::NodeId;
+use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
+use sinomo_core::storage::durable_file;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};

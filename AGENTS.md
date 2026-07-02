@@ -35,25 +35,28 @@ Every crate declares its ring in `Cargo.toml`:
 
 ```toml
 [package.metadata.sinomo]
-ring = "r0" | "r1" | "r0-r1-boundary" | "r2" | "application"
+ring = "r0" | "r0-boundary" | "r1" | "r1-boundary" | "r2" | "application"
 ```
 
 The ring tag is enforced by `crates/sinomo-core/tests/workspace_ring_boundaries.rs`. Rules:
 
-1. R0/R1 crates must not depend on R2 or application crates.
-2. R2 and application crates must **not** depend on R0/R1 crates directly — they go through `sinomo-runtime`, the only crate tagged `r0-r1-boundary`.
-3. `sinomo-runtime` aggregates exclusively R0/R1 crates and re-exports them as `r0::*`/`r1::*` modules. Adding a new R0/R1 crate means wiring it into `crates/sinomo-runtime/src/lib.rs` and `Cargo.toml`.
-4. Every crate must declare a ring or the test fails.
+1. **R0** is the minimal set of crates that defines the cluster. R0 crates depend only on R0 crates.
+2. `sinomo-core` is the only `r0-boundary` crate: the R0 facade. It aggregates exactly the R0 set and re-exports it (`sinomo_core::{network, kv, cluster, node, service, object, storage, local, events}` plus the base contracts at the root).
+3. R1 crates cross the R0 boundary through `sinomo-core` (direct R0 deps are still tolerated until the `FACADE_MIGRATION_COMPLETE` flag in the boundary test flips; new code should use `sinomo_core::...` paths). ABI crates (`sinomo-module-api`, `sinomo-sandbox-wasix-api`, `sinomo-dfs-cloud-files-api`) may depend directly on `sinomo-object`.
+4. `sinomo-runtime` is the only `r1-boundary` crate: the R1 facade. It aggregates `sinomo-core` + the R1 crates and adds no behavior (the module/storage registry machinery lives in `sinomo_daemon::registry` and is re-exported as `sinomo_runtime::{modules, storage}`).
+5. R2 and application crates must not depend on `r0*`/`r1*` crates directly — they go through `sinomo-runtime`.
+6. `sinomo-network` must not depend on `sinomo-kv` or `sinomo-cluster`, and `sinomo-kv` must not depend on `sinomo-network` or `sinomo-cluster`. `sinomo-cluster` is the only bridge: it implements the network crate's `ClusterDirectory` provider by reading cluster KV. Dev-dependencies are exempt from every ring rule; an optional dependency is exempt only when all of its enabling features are the dev-only `test-support` feature or it is on the reviewed allowlist in the boundary test (`OPTIONAL_PRODUCTION_DEPENDENCY_ALLOWLIST`) — other optional deps are checked like plain ones.
 
 Current ring assignments:
 
-- **R0**: `sinomo-core` (event envelope, IDs, domain types, scalars — no service deps).
-- **R1**: `sinomo-api`, `sinomo-device`, `sinomo-dfs`, `sinomo-eval`, `sinomo-events`, `sinomo-local`, `sinomo-module`, `sinomo-network`, `sinomo-node`, `sinomo-policy`, `sinomo-registry`, `sinomo-rollout`, `sinomo-sandbox`, `sinomo-supervision`, `sinomo-sync`.
-- **R0/R1 boundary**: `sinomo-runtime`.
-- **R2 services**: `sinomo-actions`, `sinomo-agent`, `sinomo-audio`, `sinomo-deliberation`, `sinomo-evolution`, `sinomo-fusion`, `sinomo-gateway`, `sinomo-lm`, `sinomo-memory`, `sinomo-trigger`, `sinomo-video`, `sinomo-voice`.
-- **Application**: `sinomo`, `sinomo-app`, `sinomo-cli`.
+- **R0**: `sinomo-base` (IDs, event envelope, domain types, scalars), `sinomo-object` (SOBJ wire codec), `sinomo-storage`, `sinomo-local`, `sinomo-node`, `sinomo-events`, `sinomo-network` (pure networking library: object RPC, routing, transports, network modules), `sinomo-kv` (storage + Raft consensus core, transport-free), `sinomo-cluster` (cluster control plane: membership, invites, joins, KV/Raft replication drivers, state publishing, KV-backed cluster directory), `sinomo-service` (service registration, discovery, routing target selection).
+- **R0 boundary**: `sinomo-core`.
+- **R1**: `sinomo-daemon`, `sinomo-dfs`, `sinomo-dfs-cloud-files-api`, `sinomo-module`, `sinomo-module-api`, `sinomo-registry`, `sinomo-rollout`, `sinomo-policy`, `sinomo-eval`, `sinomo-config`, `sinomo-observe`, `sinomo-device`, `sinomo-supervision`, `sinomo-cli-registry`, `sinomo-test`, the `sinomo-sandbox*` crates, and the native module packages under `modules/`.
+- **R1 boundary**: `sinomo-runtime`.
+- **R2 services**: `sinomo-actions`, `sinomo-agent`, `sinomo-audio`, `sinomo-deliberation`, `sinomo-evolution`, `sinomo-fusion`, `sinomo-gateway`, `sinomo-lm`, `sinomo-memory`, `sinomo-models`, `sinomo-pytorch`, `sinomo-video`, `sinomo-voice`.
+- **Application**: `sinomo`, `sinomo-app`, `sinomo-cli`, `sinomo-dfs-fuse`, `sinomo-testdir`.
 
-When adding imports in an R2/application crate, prefer `use sinomo_runtime::core::...` / `use sinomo_runtime::events::...` over importing `sinomo_core` / `sinomo_events` directly — the latter compiles today but will break the boundary tests once that crate is moved into the facade.
+When adding imports in an R2/application crate, use `sinomo_runtime::...`; in an R1 crate, prefer `sinomo_core::...` over direct R0 crate imports. The refactor that produced this layout is documented in `docs/plans/r0-r1-crate-boundary-refactor.md`.
 
 ## Binary surface
 

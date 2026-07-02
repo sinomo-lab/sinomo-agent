@@ -21,8 +21,8 @@ use crate::{
     NetworkedDfsReadStreamOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
     sifs_file_system_id,
 };
-use sinomo_events::EventId;
-use sinomo_node::NodeId;
+use sinomo_core::events::EventId;
+use sinomo_core::node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 

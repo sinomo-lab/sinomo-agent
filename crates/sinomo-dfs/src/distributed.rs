@@ -2,7 +2,7 @@
 
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use serde::{Deserialize, Serialize};
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 

@@ -9,7 +9,7 @@
 use std::time::Instant;
 
 use sinomo_core::DfsWriteRequest;
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::metadata_pages::walk_metadata_pages;
 use crate::*;

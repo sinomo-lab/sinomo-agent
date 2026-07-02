@@ -180,7 +180,7 @@ mod tests {
     use crate::metadata_records::{DfsInodeRecord, DfsObjectVersionRecord};
     use crate::{DfsFileSystemId, DfsVersion};
     use sinomo_core::DfsObjectPolicy;
-    use sinomo_node::NodeId;
+    use sinomo_core::node::NodeId;
     use time::OffsetDateTime;
 
     fn node(value: &str) -> NodeId {

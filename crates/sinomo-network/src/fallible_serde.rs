@@ -23,21 +23,21 @@ where
     })
 }
 
-pub(crate) fn serialize_bytes<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+pub fn serialize_bytes<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: ser::Serializer,
 {
     serializer.serialize_bytes(bytes)
 }
 
-pub(crate) fn deserialize_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+pub fn deserialize_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
 where
     D: de::Deserializer<'de>,
 {
     deserialize_bytes_with_operation(deserializer, "network bytes")
 }
 
-pub(crate) fn deserialize_bytes_with_operation<'de, D>(
+pub fn deserialize_bytes_with_operation<'de, D>(
     deserializer: D,
     operation: &'static str,
 ) -> Result<Vec<u8>, D::Error>
@@ -47,7 +47,7 @@ where
     deserializer.deserialize_byte_buf(BytesVisitor { operation })
 }
 
-pub(crate) fn serialize_optional_bytes<S>(
+pub fn serialize_optional_bytes<S>(
     bytes: &Option<Vec<u8>>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
@@ -79,7 +79,7 @@ where
     deserializer.deserialize_option(OptionalBytesVisitor { operation })
 }
 
-pub(crate) fn deserialize_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+pub fn deserialize_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: de::Deserializer<'de>,
     T: Deserialize<'de>,

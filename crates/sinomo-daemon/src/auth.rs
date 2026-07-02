@@ -5,22 +5,26 @@ use ring::signature::{ED25519, UnparsedPublicKey};
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_SEARCH_ROUTE, CONFIG_SET_ROUTE,
 };
-use sinomo_core::{ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState};
-use sinomo_kv::{ClusterKvRouteAuth, cluster_kv_rpc_route_policy};
-use sinomo_local::SinomoDataDir;
-use sinomo_network::{
+#[allow(unused_imports)]
+use sinomo_core::cluster::ClusterKvPathsExt;
+use sinomo_core::cluster::{
     ClusterControlPlaneTimeouts, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
-    ClusterPaths,
 };
+use sinomo_core::kv::{ClusterKvRouteAuth, cluster_kv_rpc_route_policy};
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::ClusterPaths;
 #[cfg(test)]
-use sinomo_node::load_or_create_main_node_identity;
-use sinomo_node::{ClusterInviteId, NodeIdentity, NodeIdentityPaths, load_or_create_node_identity};
+use sinomo_core::node::load_or_create_main_node_identity;
+use sinomo_core::node::{
+    ClusterInviteId, NodeIdentity, NodeIdentityPaths, load_or_create_node_identity,
+};
+use sinomo_core::storage::durable_file::file_ino;
+use sinomo_core::{ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState};
 use sinomo_rollout::{
     ROLLOUT_BINARY_ROUTE, ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE, ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
     ROLLOUT_BUILD_ROUTE, ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_DIAGNOSTICS_ROUTE,
     ROLLOUT_FINALIZE_SHADOW_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
 };
-use sinomo_storage::durable_file::file_ino;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,13 +33,13 @@ use std::time::{Duration, Instant, SystemTime};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-pub const DAEMON_AUTH_PROTOCOL: &str = sinomo_network::DAEMON_AUTH_PROTOCOL;
+pub const DAEMON_AUTH_PROTOCOL: &str = sinomo_core::network::DAEMON_AUTH_PROTOCOL;
 pub const DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 pub const DAEMON_AUTH_NONCE_RETENTION_SECONDS: i64 = DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS * 2;
 const DAEMON_AUTH_NONCE_PRUNE_INTERVAL_SECONDS: i64 = 1;
 const DAEMON_AUTH_NONCE_PRUNE_MAX_ENTRIES: usize = 8_192;
 const DAEMON_AUTH_VERIFIER_CONTEXT_MAX_AGE: Duration = Duration::from_secs(1);
-pub use sinomo_network::SignedDaemonCommand;
+pub use sinomo_core::network::SignedDaemonCommand;
 /// In-memory replay-protection nonce sets, keyed by daemon data root. Replacing the
 /// previous per-RPC `auth-nonces.sobjlog` append (a disk read + write on *every*
 /// authenticated request, including idle cluster heartbeats) keeps idle disk I/O at
@@ -117,9 +121,9 @@ impl DaemonSignerAuthority {
 }
 
 pub fn sign_daemon_rpc_request_for_local_node(
-    request: &sinomo_network::ObjectRpcRequest,
+    request: &sinomo_core::network::ObjectRpcRequest,
 ) -> Result<Vec<u8>, DaemonError> {
-    sinomo_network::sign_daemon_rpc_request_for_local_node(request).map_err(DaemonError::from)
+    sinomo_core::network::sign_daemon_rpc_request_for_local_node(request).map_err(DaemonError::from)
 }
 
 pub fn sign_daemon_rpc_request_digest_for_local_node(
@@ -127,50 +131,55 @@ pub fn sign_daemon_rpc_request_digest_for_local_node(
     category: &str,
     rpc_body_sha256: Vec<u8>,
 ) -> Result<Vec<u8>, DaemonError> {
-    sinomo_network::sign_daemon_rpc_request_digest_for_local_node(route, category, rpc_body_sha256)
-        .map_err(DaemonError::from)
+    sinomo_core::network::sign_daemon_rpc_request_digest_for_local_node(
+        route,
+        category,
+        rpc_body_sha256,
+    )
+    .map_err(DaemonError::from)
 }
 
 pub fn sign_daemon_rpc_request_from_data_dir(
     data_dir: &SinomoDataDir,
-    request: &sinomo_network::ObjectRpcRequest,
+    request: &sinomo_core::network::ObjectRpcRequest,
 ) -> Result<Vec<u8>, DaemonError> {
-    sinomo_network::sign_daemon_rpc_request_from_data_dir(data_dir, request)
+    sinomo_core::network::sign_daemon_rpc_request_from_data_dir(data_dir, request)
         .map_err(DaemonError::from)
 }
 
-pub fn daemon_rpc_body_sha256(request: &sinomo_network::ObjectRpcRequest) -> Vec<u8> {
-    sinomo_network::daemon_rpc_body_sha256(request)
+pub fn daemon_rpc_body_sha256(request: &sinomo_core::network::ObjectRpcRequest) -> Vec<u8> {
+    sinomo_core::network::daemon_rpc_body_sha256(request)
 }
 
 pub fn authenticate_daemon_control_request(
     paths: &DaemonPaths,
-    request: &sinomo_network::DaemonControlRequest,
+    request: &sinomo_core::network::DaemonControlRequest,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
     authenticate_daemon_control_request_inner(paths, request, true)
 }
 
 pub(crate) fn authenticate_daemon_control_request_without_nonce(
     paths: &DaemonPaths,
-    request: &sinomo_network::DaemonControlRequest,
+    request: &sinomo_core::network::DaemonControlRequest,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
     authenticate_daemon_control_request_inner(paths, request, false)
 }
 
 fn authenticate_daemon_control_request_inner(
     paths: &DaemonPaths,
-    request: &sinomo_network::DaemonControlRequest,
+    request: &sinomo_core::network::DaemonControlRequest,
     remember_nonce: bool,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
     let auth = request.auth.as_deref().ok_or(DaemonError::AuthDenied)?;
     let envelope: SignedDaemonCommand =
-        sinomo_network::SinomoObjectCodec::default().decode(auth)?;
+        sinomo_core::network::SinomoObjectCodec::default().decode(auth)?;
     verify_daemon_rpc_body_binding(&envelope, request)?;
     let signer = verify_signed_daemon_command(paths, &envelope, request)?;
     if remember_nonce {
         remember_daemon_auth_nonce(paths, &envelope)?;
     }
-    let signer_public_key = sinomo_network::daemon_auth_encode_public_key(&envelope.public_key);
+    let signer_public_key =
+        sinomo_core::network::daemon_auth_encode_public_key(&envelope.public_key);
     let authenticated = AuthenticatedDaemonCommand {
         route: request.route.clone(),
         signer,
@@ -183,7 +192,7 @@ fn authenticate_daemon_control_request_inner(
 
 fn verify_daemon_rpc_body_binding(
     envelope: &SignedDaemonCommand,
-    request: &sinomo_network::ObjectRpcRequest,
+    request: &sinomo_core::network::ObjectRpcRequest,
 ) -> Result<(), DaemonError> {
     let Some(expected) = envelope.rpc_body_sha256.as_deref() else {
         return Err(DaemonError::AuthDenied);
@@ -207,7 +216,7 @@ pub fn create_cluster_invite_challenge_proof(
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
     let identity_paths = NodeIdentityPaths::new(data_dir);
     let identity = load_existing_node_identity(&identity_paths.main)?;
-    sinomo_network::create_cluster_invite_challenge_proof(
+    sinomo_core::cluster::create_cluster_invite_challenge_proof(
         &cluster_paths,
         &identity,
         request,
@@ -221,6 +230,12 @@ pub fn authorize_authenticated_daemon_command(
 ) -> Result<(), DaemonError> {
     let route = authenticated.route.as_str();
     if let Some(policy) = cluster_kv_rpc_route_policy(route) {
+        if daemon_signer_authorizes_cluster_kv_route(&authenticated.signer, policy.auth) {
+            return Ok(());
+        }
+        return Err(DaemonError::AuthDenied);
+    }
+    if let Some(policy) = sinomo_core::cluster::cluster_control_rpc_route_policy(route) {
         if daemon_signer_authorizes_cluster_kv_route(&authenticated.signer, policy.auth) {
             return Ok(());
         }
@@ -335,7 +350,7 @@ pub fn authorize_authenticated_daemon_command(
             )
         }
         route if is_local_sandbox_rpc_route(route) => authenticated.signer.can_run_local_command(),
-        route if route == sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE => {
+        route if route == sinomo_core::network::CLUSTER_JOIN_CHALLENGE_ROUTE => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -343,7 +358,7 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        route if route == sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE => {
+        route if route == sinomo_core::network::CLUSTER_JOIN_REGISTER_ROUTE => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -353,8 +368,8 @@ pub fn authorize_authenticated_daemon_command(
             )
         }
         route
-            if route == sinomo_network::CLUSTER_INVITE_PUBLISH_ROUTE
-                || route == sinomo_network::CLUSTER_MEMBER_PUBLISH_ROUTE =>
+            if route == sinomo_core::network::CLUSTER_INVITE_PUBLISH_ROUTE
+                || route == sinomo_core::network::CLUSTER_MEMBER_PUBLISH_ROUTE =>
         {
             matches!(
                 authenticated.signer,
@@ -364,8 +379,8 @@ pub fn authorize_authenticated_daemon_command(
             )
         }
         route
-            if route == sinomo_network::CLUSTER_HEALTH_ROUTE
-                || route == sinomo_network::CLUSTER_NETWORK_PING_ROUTE =>
+            if route == sinomo_core::network::CLUSTER_HEALTH_ROUTE
+                || route == sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE =>
         {
             matches!(
                 authenticated.signer,
@@ -383,7 +398,7 @@ pub fn authorize_authenticated_daemon_command(
         {
             authenticated.signer.can_run_admin_command()
         }
-        route if route == sinomo_network::CLUSTER_RELAY_ROUTE => {
+        route if route == sinomo_core::network::CLUSTER_RELAY_ROUTE => {
             // A relay envelope is forwarded on behalf of another node by any authenticated
             // cluster member (e.g. a bridge learner relaying a joiner's challenge toward a
             // voter). The wrapped inner request carries its own signature/invite-proof and is
@@ -464,7 +479,7 @@ fn is_local_sandbox_rpc_route(route: &str) -> bool {
 fn verify_signed_daemon_command(
     paths: &DaemonPaths,
     envelope: &SignedDaemonCommand,
-    request: &sinomo_network::ObjectRpcRequest,
+    request: &sinomo_core::network::ObjectRpcRequest,
 ) -> Result<DaemonSignerAuthority, DaemonError> {
     if envelope.protocol != DAEMON_AUTH_PROTOCOL {
         return Err(DaemonError::AuthDenied);
@@ -479,7 +494,7 @@ fn verify_signed_daemon_command(
     if envelope.nonce.trim().is_empty() || request.route.trim().is_empty() {
         return Err(DaemonError::AuthDenied);
     }
-    let signing_payload = sinomo_network::daemon_auth_signing_payload(
+    let signing_payload = sinomo_core::network::daemon_auth_signing_payload(
         &envelope.node_id,
         &envelope.public_key,
         &envelope.timestamp,
@@ -497,9 +512,10 @@ fn verify_signed_daemon_command(
 fn authorize_daemon_signer(
     paths: &DaemonPaths,
     envelope: &SignedDaemonCommand,
-    request: &sinomo_network::ObjectRpcRequest,
+    request: &sinomo_core::network::ObjectRpcRequest,
 ) -> Result<DaemonSignerAuthority, DaemonError> {
-    let envelope_public_key = sinomo_network::daemon_auth_encode_public_key(&envelope.public_key);
+    let envelope_public_key =
+        sinomo_core::network::daemon_auth_encode_public_key(&envelope.public_key);
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
@@ -524,7 +540,7 @@ fn authorize_daemon_signer(
         return Ok(authority.clone());
     }
 
-    if request.route == sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE {
+    if request.route == sinomo_core::network::CLUSTER_JOIN_REGISTER_ROUTE {
         authorize_cluster_join_rpc_signer(paths, Some(request), &envelope_public_key)?;
         return Ok(DaemonSignerAuthority::JoinCandidate);
     }
@@ -603,16 +619,16 @@ fn replace_cached_daemon_auth_verifier_context(
 fn refresh_daemon_auth_membership_snapshot(data_dir: &Path) -> Result<(), DaemonError> {
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
     let options =
         ClusterControlPlaneTimeouts::default_daemon_transport().kv_snapshot_refresh_options();
-    sinomo_network::refresh_current_cluster_kv_store_with_local_storage_and_transport(
+    sinomo_core::cluster::refresh_current_cluster_kv_store_with_local_storage_and_transport(
         &cluster_paths,
         &state,
         options,
         |endpoint, timeout| {
             crate::client::fetch_cluster_kv_snapshot_from_endpoint(endpoint, timeout).map_err(
-                |error| sinomo_network::NetworkError::Io {
+                |error| sinomo_core::network::NetworkError::Io {
                     operation: "cluster auth membership refresh".to_string(),
                     detail: error.to_string(),
                 },
@@ -689,7 +705,7 @@ fn load_daemon_auth_verifier_context(
     let mut members_by_node_and_key = BTreeMap::new();
     let mut members_by_key = BTreeMap::new();
     if cluster_paths.state.exists() {
-        let state = sinomo_network::read_cluster_state(&cluster_paths)?;
+        let state = sinomo_core::cluster::read_cluster_state(&cluster_paths)?;
         for member in state
             .members
             .iter()
@@ -725,7 +741,7 @@ fn daemon_auth_verifier_context_mark(
         main_identity: daemon_auth_file_mark(&identity_paths.main)?,
         shadow_identity: daemon_auth_file_mark(&identity_paths.shadow)?,
         cluster_state: daemon_auth_file_mark(&cluster_paths.state)?,
-        kv_snapshot: daemon_auth_file_mark(&cluster_paths.kv_snapshot)?,
+        kv_snapshot: daemon_auth_file_mark(&cluster_paths.kv_paths().snapshot)?,
     })
 }
 
@@ -763,27 +779,27 @@ fn signer_authority_for_member(member: &ClusterMemberRecord) -> DaemonSignerAuth
 
 fn authorize_cluster_join_rpc_signer(
     paths: &DaemonPaths,
-    rpc_request: Option<&sinomo_network::ObjectRpcRequest>,
+    rpc_request: Option<&sinomo_core::network::ObjectRpcRequest>,
     public_key: &str,
 ) -> Result<(), DaemonError> {
     let request = rpc_request.ok_or(DaemonError::AuthDenied)?;
-    if request.route != sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE {
+    if request.route != sinomo_core::network::CLUSTER_JOIN_REGISTER_ROUTE {
         return Err(DaemonError::AuthDenied);
     }
-    let request: sinomo_network::ClusterJoinRegistrationRequest = request.decode_body()?;
+    let request: sinomo_core::cluster::ClusterJoinRegistrationRequest = request.decode_body()?;
     authorize_cluster_join_request_signer(paths, &request, public_key)
 }
 
 pub(crate) fn is_cluster_join_register_control_request(
-    request: &sinomo_network::DaemonControlRequest,
+    request: &sinomo_core::network::DaemonControlRequest,
 ) -> bool {
-    request.route == sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE
-        && request.category == sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
+    request.route == sinomo_core::network::CLUSTER_JOIN_REGISTER_ROUTE
+        && request.category == sinomo_core::network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
 }
 
 fn authorize_cluster_join_request_signer(
     paths: &DaemonPaths,
-    request: &sinomo_network::ClusterJoinRegistrationRequest,
+    request: &sinomo_core::cluster::ClusterJoinRegistrationRequest,
     public_key: &str,
 ) -> Result<(), DaemonError> {
     let requested_member = request
@@ -796,7 +812,7 @@ fn authorize_cluster_join_request_signer(
         detail: "daemon paths have no data directory parent".to_string(),
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    let state = sinomo_network::read_cluster_state(&cluster_paths)?;
+    let state = sinomo_core::cluster::read_cluster_state(&cluster_paths)?;
 
     let persisted_invite = read_active_cluster_invite(&cluster_paths, &request.invite.invite_id)?;
     if !persisted_invite
@@ -835,11 +851,12 @@ fn read_active_cluster_invite(
     cluster_paths: &ClusterPaths,
     invite_id: &ClusterInviteId,
 ) -> Result<ClusterJoinInvite, DaemonError> {
-    sinomo_network::read_cluster_invitation_from_kv(cluster_paths, invite_id).map_err(Into::into)
+    sinomo_core::cluster::read_cluster_invitation_from_kv(cluster_paths, invite_id)
+        .map_err(Into::into)
 }
 
 fn verify_cluster_join_invite_signature(invite: &ClusterJoinInvite) -> Result<(), DaemonError> {
-    sinomo_network::verify_cluster_join_invite_signature(invite).map_err(Into::into)
+    sinomo_core::cluster::verify_cluster_join_invite_signature(invite).map_err(Into::into)
 }
 
 fn load_existing_node_identity(path: &Path) -> Result<NodeIdentity, DaemonError> {
@@ -892,7 +909,7 @@ fn remember_daemon_auth_nonce(
 
 #[cfg(test)]
 fn daemon_auth_decode_public_key(public_key: &str) -> Result<Vec<u8>, DaemonError> {
-    sinomo_network::daemon_auth_decode_public_key(public_key).map_err(DaemonError::from)
+    sinomo_core::network::daemon_auth_decode_public_key(public_key).map_err(DaemonError::from)
 }
 
 fn daemon_auth_nonce_key(envelope: &SignedDaemonCommand) -> Vec<u8> {
@@ -906,7 +923,7 @@ fn daemon_auth_nonce_key(envelope: &SignedDaemonCommand) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_kv::{
+    use sinomo_core::kv::{
         CLUSTER_KV_TXN_ROUTE, CLUSTER_KV_WATCH_CANCEL_ROUTE, CLUSTER_KV_WATCH_DRAIN_ROUTE,
         CLUSTER_KV_WATCH_EVENTS_ROUTE, CLUSTER_KV_WATCH_PREFIX_ROUTE,
     };
@@ -957,7 +974,7 @@ mod tests {
     fn signed_daemon_rpc_auth_uses_binary_body_hash_and_signature() {
         let data_root = unique_auth_test_root("sinomo-daemon-auth-binary");
         let data_dir = SinomoDataDir::new(&data_root);
-        let request = sinomo_network::ObjectRpcRequest::encode_body(
+        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
             crate::DAEMON_STATUS_ROUTE,
             crate::DAEMON_RPC_CATEGORY,
             &(),
@@ -966,7 +983,7 @@ mod tests {
 
         let auth_bytes =
             sign_daemon_rpc_request_from_data_dir(&data_dir, &request).expect("sign rpc auth");
-        let auth: SignedDaemonCommand = sinomo_network::SinomoObjectCodec::default()
+        let auth: SignedDaemonCommand = sinomo_core::network::SinomoObjectCodec::default()
             .decode(&auth_bytes)
             .expect("decode signed auth");
         let expected_hash = daemon_rpc_body_sha256(&request);
@@ -1037,8 +1054,8 @@ mod tests {
     #[test]
     fn cluster_health_authorizes_cluster_members_for_routed_inspection() {
         for route in [
-            sinomo_network::CLUSTER_HEALTH_ROUTE,
-            sinomo_network::CLUSTER_NETWORK_PING_ROUTE,
+            sinomo_core::network::CLUSTER_HEALTH_ROUTE,
+            sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE,
         ] {
             for signer in [
                 DaemonSignerAuthority::Local,
@@ -1108,7 +1125,7 @@ mod tests {
             .expect("unknown signed probes may read daemon status");
 
         let cluster_health = authenticated_command(
-            sinomo_network::CLUSTER_HEALTH_ROUTE.to_string(),
+            sinomo_core::network::CLUSTER_HEALTH_ROUTE.to_string(),
             DaemonSignerAuthority::StatusProbe,
         );
         assert!(authorize_authenticated_daemon_command(&cluster_health).is_err());
@@ -1150,7 +1167,7 @@ mod tests {
         let peer_public_key =
             daemon_auth_decode_public_key(&peer_identity.public_key).expect("peer public key");
         let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_daemon_auth_same_key_drift")
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_auth_same_key_drift")
                 .expect("cluster id");
         let local_node = sinomo_core::Id::from_legacy_named("node_daemon_auth_same_key_local")
             .expect("local node");
@@ -1184,15 +1201,16 @@ mod tests {
             rpc_body_sha256: None,
             signature: Vec::new(),
         };
-        let request = sinomo_network::ObjectRpcRequest::encode_body(
-            sinomo_network::CLUSTER_HEALTH_ROUTE,
-            sinomo_network::CLUSTER_HEALTH_RPC_CATEGORY,
+        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
+            sinomo_core::network::CLUSTER_HEALTH_ROUTE,
+            sinomo_core::network::CLUSTER_HEALTH_RPC_CATEGORY,
             &(),
         )
         .expect("health rpc request");
 
         state.members.push(peer.clone());
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write pending state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write pending state");
         assert!(matches!(
             authorize_daemon_signer(&daemon_paths, &envelope, &request),
             Err(DaemonError::AuthDenied)
@@ -1200,7 +1218,8 @@ mod tests {
 
         peer.state = ClusterMemberState::Learner;
         *state.members.last_mut().expect("peer member") = peer;
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write accepted state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write accepted state");
         assert_eq!(
             authorize_daemon_signer(&daemon_paths, &envelope, &request)
                 .expect("authorize accepted same-key member"),

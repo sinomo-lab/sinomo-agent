@@ -173,6 +173,13 @@ pub struct NativeModuleSurfaces {
     pub capability_imports: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capability_exports: Vec<String>,
+    /// Cluster transport kinds this dylib serves as a runtime network module
+    /// (e.g. `"iroh"`). Non-empty surfaces tell the host to resolve the
+    /// dylib's network-module entry symbol in addition to the standard module
+    /// entry points. Name-keyed SOBJ default keeps older descriptors
+    /// compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network_transports: Vec<String>,
 }
 
 impl NativeModuleSurfaces {
@@ -182,6 +189,7 @@ impl NativeModuleSurfaces {
             && self.storage_owners.is_empty()
             && self.capability_imports.is_empty()
             && self.capability_exports.is_empty()
+            && self.network_transports.is_empty()
     }
 }
 

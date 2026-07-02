@@ -5,8 +5,8 @@ use super::{
 use crate::content_store::fs_ops::{create_dir_all, file_len_if_exists, sync_dir};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
-use sinomo_storage::durable_file;
+use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
+use sinomo_core::storage::durable_file;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Seek, SeekFrom, Write};

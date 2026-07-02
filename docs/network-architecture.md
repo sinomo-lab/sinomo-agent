@@ -1,6 +1,6 @@
 # Sinomo Network
 
-`sinomo-network` is the cluster communication boundary. Crates above it should model requests, responses, events, and stream metadata as normal serde-compatible Rust types. The network crate is responsible for turning those types into the cluster wire representation, choosing the peer transport, and eventually routing through intermediate nodes when the target is not directly reachable.
+`sinomo-network` is the cluster communication boundary and a pure networking library. Crates above it should model requests, responses, events, and stream metadata as normal serde-compatible Rust types. The network crate is responsible for turning those types into the cluster wire representation, choosing the peer transport, and eventually routing through intermediate nodes when the target is not directly reachable. Like a web framework, it owns the mechanism — router, middleware, transports, packet delivery — while domain crates own the routes and business logic they register into it.
 
 ## Wire Format
 
@@ -234,8 +234,34 @@ fn deliver_local(packet: Packet) -> Result<Response, DeliveryError> {
 
 This algorithm intentionally removes protocol-specific route selection. Higher layers define the target and payload. `sinomo-network` decides how to deliver the packet, learns from success and failure, and retries through the same graph until the packet is delivered or the deadline, TTL, or cluster connectivity makes delivery impossible.
 
+## Library Boundary
+
+`sinomo-network` is mechanism, not policy. It stays a pure networking library with no dependency on `sinomo-kv` or `sinomo-cluster`; the workspace boundary test (`crates/sinomo-core/tests/workspace_ring_boundaries.rs`) enforces the cut in both directions, so KV and network never know each other and `sinomo-cluster` is the only bridge.
+
+Inside the crate: the object RPC router, route registry, middleware, and service catalogs; the canonical packet routing algorithm; endpoint records and endpoint selection; connectivity-graph interpretation; peer transports (loopback, LAN TCP, roaming) and LAN discovery; the signed daemon transport (`sinomo.daemon-auth.v1`); and the network-module registry and ABI.
+
+Registered into the crate: everything else. Domain crates declare object-RPC routes through their module surfaces and the daemon installs them into the router; `sinomo-cluster` registers the `/cluster/control/*` routes and the cluster directory provider; KV replication, membership, DFS, rollout, daemon control, and agent protocols define payload routes and target nodes and let the network crate deliver them; network modules register additional transports.
+
+### Cluster Directory
+
+Staying network code must not read cluster KV directly. Everything routing needs from cluster state arrives through the `ClusterDirectory` provider trait defined in this crate: authorized member records, endpoint records, node statuses, connectivity records published by peers, and a monotonic `DirectoryVersion` stamp used to invalidate routing caches. `sinomo-cluster` implements the trait on top of cluster KV — the version stamp is the local KV snapshot revision — and registers it process-wide with `install_kv_cluster_directory()` at daemon startup. Without a registered provider, as in tests and pre-cluster paths, routing sees an empty directory and works purely from bootstrap state and local observations.
+
+## Network Modules
+
+Transports are modules. `sinomo-network` defines a `NetworkModule` trait (descriptor, start/stop, request/response dial, advertised local endpoints) and a `NetworkModuleRegistry` that dispatches a dial to the module owning the endpoint's transport kind and address scheme — dispatch is scheme-aware, not only kind-aware, because `iroh://` addresses can ride on endpoints tagged with other transport kinds. Loopback and LAN TCP ship as built-in modules; their pooled and streamed raw paths stay internal to the built-in implementation, and descriptor capability flags such as raw-response support let dispatch keep raw or streamed requests off modules that cannot serve them. `ClusterEndpointSelector` takes the registry's dialable-transport snapshot and filters or deprioritizes endpoints whose transport has no enabled dialer, so candidates for an absent module do not burn per-endpoint timeout budgets.
+
+Modules can be enabled and disabled at runtime through `NetworkModuleRegistry::set_enabled`. The daemon persists the flag in module loader state and exposes `/network/modules` (list) and `/network/modules/set-enabled`. Disabling a module stops it and removes its transports from dispatch, but never unloads the library: the registry holds the module handle for the life of the process so no vtable pointer can dangle while foreign code may still be referenced.
+
+Dynamic modules are native dylibs speaking a pinned `repr(C)` ABI in `network_module_abi`: a versioned `SinomoNetworkModuleVtableV1` (descriptor, start, stop, blocking `dial_rpc`, `local_endpoints`, `free_buffer`, `destroy`) created through the `sinomo_network_module_create_v1` entry symbol, with an ABI version constant checked at load. Byte slice/buffer structs and status codes mirror `sinomo-module-api`; descriptors and endpoint lists cross the boundary as SOBJ payloads. The host-side adapter in `sinomo-daemon::registry` wraps the vtable in the safe `NetworkModule` trait, wraps the blocking dial in `spawn_blocking`, and keeps the loaded library alive for the registry's lifetime. Module packages declare their transports through the `sinomo-module-api` surfaces (`network_transports`), and `sinomo-module` loads them with its raw-entry native-library loader.
+
+The system is not TCP/IP-only: address schemes and dial semantics are module-defined, so serial and LoRa transports are planned as modules. Iroh is the first extracted module: `modules/network/iroh` (native dylib, ring r1, not a default build member) receives the iroh endpoint builder, relay config, secret-key handling, proxy supervisor, and dial client, while `sinomo-network` keeps `IrohEndpointRecord` — the `iroh://` parse/format, stable id, and on-disk record under `ClusterPaths::iroh` are the pinned cross-ring contract — plus endpoint dedup/cleanup and selector ranking. The extraction removes the `iroh` dependency and the `iroh-transport` feature from `sinomo-network` and `sinomo-core`.
+
+The module registry, the dylib ABI, and the iroh extraction land in stage C of [the crate-boundary refactor plan](plans/r0-r1-crate-boundary-refactor.md); until then iroh ships compiled into `sinomo-network` behind the optional `iroh-transport` feature.
+
 ## Ownership
 
 Cluster communication should flow through `sinomo-network` abstractions. Durable cluster storage may still use its own stable storage representation, but live peer discovery, peer routing, object RPC routes, and stream traffic should not reach around the network crate to open ad hoc sockets or choose a wire format in higher-level crates.
+
+The inverse also holds: `sinomo-network` does not own business routing. Route catalogs belong to the domain crates and modules that implement the behavior, cluster state belongs to `sinomo-cluster` and `sinomo-kv` and reaches routing only through the `ClusterDirectory` seam, and the network crate never decides whether a request is a KV, DFS, cluster-control, or service operation.
 
 Cluster daemon endpoint selection also belongs to `sinomo-network`. CLI and daemon code may sign or authorize commands, but choosing loopback, LAN TCP, Iroh, WebRTC, relay, direct delivery, or multi-hop relay should happen through the canonical routing algorithm rather than inside higher-level command handlers. Older purpose-specific selectors remain only as crate-local compatibility shims while call sites migrate toward target-node packet delivery.

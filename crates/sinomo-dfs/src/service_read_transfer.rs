@@ -7,7 +7,7 @@
 use std::io::Read;
 use std::time::Instant;
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::transfer::{
     DFS_BLOB_CHUNK_BYTES, InProgressReadMemoryTransfer, InProgressReadTransfer,

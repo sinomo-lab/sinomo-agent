@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 use time::OffsetDateTime;
 
 use crate::*;

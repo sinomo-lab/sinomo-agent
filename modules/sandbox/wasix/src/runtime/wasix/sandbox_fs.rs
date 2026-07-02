@@ -1252,9 +1252,9 @@ mod tests {
         LocalSandboxFileSystem, LocalSandboxInstanceLayout, SandboxId, SandboxInstanceManifest,
         SandboxMount, SandboxToolchainId, SifsSandboxFileSystem, SifsSandboxInstanceStore,
     };
+    use sinomo_core::network::InProcessNetwork;
+    use sinomo_core::node::NodeId;
     use sinomo_dfs::{DfsWriteOptions, LocalContentStore, NetworkedDfsService};
-    use sinomo_network::InProcessNetwork;
-    use sinomo_node::NodeId;
     use time::OffsetDateTime;
 
     fn test_layout() -> (sinomo_testdir::TestDir, LocalSandboxInstanceLayout) {
@@ -1270,8 +1270,8 @@ mod tests {
         name: &str,
     ) -> (
         sinomo_testdir::TestDir,
-        Arc<Mutex<SifsSandboxFileSystem<sinomo_network::InProcessTransport>>>,
-        WasixSandboxFileSystem<SifsSandboxFileSystem<sinomo_network::InProcessTransport>>,
+        Arc<Mutex<SifsSandboxFileSystem<sinomo_core::network::InProcessTransport>>>,
+        WasixSandboxFileSystem<SifsSandboxFileSystem<sinomo_core::network::InProcessTransport>>,
     ) {
         sifs_wasix_fs_with_mode(name, crate::SandboxMountMode::ReadWrite)
     }
@@ -1281,8 +1281,8 @@ mod tests {
         mode: crate::SandboxMountMode,
     ) -> (
         sinomo_testdir::TestDir,
-        Arc<Mutex<SifsSandboxFileSystem<sinomo_network::InProcessTransport>>>,
-        WasixSandboxFileSystem<SifsSandboxFileSystem<sinomo_network::InProcessTransport>>,
+        Arc<Mutex<SifsSandboxFileSystem<sinomo_core::network::InProcessTransport>>>,
+        WasixSandboxFileSystem<SifsSandboxFileSystem<sinomo_core::network::InProcessTransport>>,
     ) {
         let root = sinomo_testdir::TestDir::new(name);
         let network = InProcessNetwork::new();

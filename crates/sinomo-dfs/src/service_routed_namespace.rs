@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::*;
 use crate::{posix_model, posix_path};

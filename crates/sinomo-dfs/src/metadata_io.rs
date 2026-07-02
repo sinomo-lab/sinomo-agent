@@ -5,8 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Serialize, de::DeserializeOwned};
-use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
-use sinomo_storage::durable_file;
+use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
+use sinomo_core::storage::durable_file;
 
 use crate::metadata_error::{MetadataBackendError, Result};
 

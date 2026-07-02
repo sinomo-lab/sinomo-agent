@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
-use sinomo_storage::durable_file;
+use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
+use sinomo_core::storage::durable_file;
 
 use crate::metadata_cursor;
 use crate::metadata_error::{MetadataBackendError, Result};

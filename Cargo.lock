@@ -7661,6 +7661,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-base"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "ulid",
+]
+
+[[package]]
 name = "sinomo-benchmarks"
 version = "0.1.0"
 dependencies = [
@@ -7707,16 +7719,43 @@ name = "sinomo-cli-registry"
 version = "0.1.0"
 
 [[package]]
+name = "sinomo-cluster"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "base64 0.22.1",
+ "blake3",
+ "fs2",
+ "metrics",
+ "ring",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sinomo-base",
+ "sinomo-cluster",
+ "sinomo-events",
+ "sinomo-kv",
+ "sinomo-local",
+ "sinomo-network",
+ "sinomo-node",
+ "sinomo-object",
+ "sinomo-storage",
+ "sinomo-testdir",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
 name = "sinomo-config"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "sinomo-kv",
- "sinomo-local",
- "sinomo-network",
- "sinomo-service",
- "sinomo-storage",
+ "sinomo-core",
  "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
@@ -7727,12 +7766,16 @@ dependencies = [
 name = "sinomo-core"
 version = "0.1.0"
 dependencies = [
- "serde",
- "serde_bytes",
- "serde_json",
- "thiserror 2.0.18",
- "time",
- "ulid",
+ "sinomo-base",
+ "sinomo-cluster",
+ "sinomo-events",
+ "sinomo-kv",
+ "sinomo-local",
+ "sinomo-network",
+ "sinomo-node",
+ "sinomo-object",
+ "sinomo-service",
+ "sinomo-storage",
 ]
 
 [[package]]
@@ -7752,22 +7795,13 @@ dependencies = [
  "sinomo-config",
  "sinomo-core",
  "sinomo-dfs",
- "sinomo-events",
- "sinomo-kv",
- "sinomo-local",
  "sinomo-module",
  "sinomo-module-api",
- "sinomo-network",
- "sinomo-network-module",
- "sinomo-node",
- "sinomo-object",
  "sinomo-observe",
  "sinomo-registry",
  "sinomo-rollout",
  "sinomo-sandbox",
  "sinomo-sandbox-wasix-host",
- "sinomo-service",
- "sinomo-storage",
  "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
@@ -7798,7 +7832,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
- "sinomo-node",
  "thiserror 2.0.18",
  "v4l",
 ]
@@ -7814,15 +7847,7 @@ dependencies = [
  "serde_json",
  "sinomo-config",
  "sinomo-core",
- "sinomo-events",
- "sinomo-kv",
- "sinomo-local",
  "sinomo-module",
- "sinomo-network",
- "sinomo-node",
- "sinomo-object",
- "sinomo-service",
- "sinomo-storage",
  "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
@@ -7864,9 +7889,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
- "sinomo-events",
  "sinomo-module",
- "sinomo-node",
  "sinomo-rollout",
  "sinomo-testdir",
  "thiserror 2.0.18",
@@ -7880,7 +7903,7 @@ dependencies = [
  "blake3",
  "serde",
  "serde_json",
- "sinomo-core",
+ "sinomo-base",
  "sinomo-node",
  "sinomo-storage",
  "sinomo-testdir",
@@ -7931,7 +7954,7 @@ dependencies = [
  "fs2",
  "serde",
  "serde_bytes",
- "sinomo-core",
+ "sinomo-base",
  "sinomo-node",
  "sinomo-object",
  "sinomo-storage",
@@ -8007,12 +8030,7 @@ dependencies = [
  "sinomo-cli-registry",
  "sinomo-config",
  "sinomo-core",
- "sinomo-events",
- "sinomo-local",
  "sinomo-module-api",
- "sinomo-node",
- "sinomo-object",
- "sinomo-storage",
  "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
@@ -8043,7 +8061,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
- "sinomo-core",
+ "sinomo-base",
  "sinomo-events",
  "sinomo-kv",
  "sinomo-local",
@@ -8060,12 +8078,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "sinomo-network-module"
+name = "sinomo-network-iroh-module"
 version = "0.1.0"
 dependencies = [
+ "fs2",
+ "iroh",
  "sinomo-core",
- "sinomo-module",
- "sinomo-network",
+ "sinomo-module-api",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -8076,7 +8097,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
- "sinomo-core",
+ "sinomo-base",
  "sinomo-object",
  "sinomo-storage",
  "sinomo-testdir",
@@ -8102,11 +8123,7 @@ dependencies = [
  "serde_json",
  "sinomo-cli-registry",
  "sinomo-core",
- "sinomo-local",
  "sinomo-module",
- "sinomo-network",
- "sinomo-service",
- "sinomo-storage",
  "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
@@ -8145,10 +8162,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
- "sinomo-kv",
  "sinomo-module",
  "sinomo-node",
- "sinomo-storage",
  "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
@@ -8174,17 +8189,9 @@ dependencies = [
  "sinomo-config",
  "sinomo-core",
  "sinomo-dfs-cloud-files-api",
- "sinomo-events",
- "sinomo-kv",
- "sinomo-local",
  "sinomo-module",
- "sinomo-network",
- "sinomo-node",
- "sinomo-object",
  "sinomo-registry",
  "sinomo-sandbox-wasix-api",
- "sinomo-service",
- "sinomo-storage",
  "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
@@ -8204,15 +8211,8 @@ dependencies = [
  "sinomo-dfs",
  "sinomo-dfs-cloud-files-api",
  "sinomo-eval",
- "sinomo-events",
- "sinomo-kv",
- "sinomo-local",
  "sinomo-module",
  "sinomo-module-api",
- "sinomo-network",
- "sinomo-network-module",
- "sinomo-node",
- "sinomo-object",
  "sinomo-observe",
  "sinomo-policy",
  "sinomo-registry",
@@ -8221,8 +8221,6 @@ dependencies = [
  "sinomo-sandbox-simple",
  "sinomo-sandbox-wasix-api",
  "sinomo-sandbox-wasix-host",
- "sinomo-service",
- "sinomo-storage",
  "sinomo-supervision",
  "sinomo-test",
 ]
@@ -8239,16 +8237,8 @@ dependencies = [
  "sinomo-config",
  "sinomo-core",
  "sinomo-dfs",
- "sinomo-events",
- "sinomo-kv",
- "sinomo-local",
  "sinomo-module",
- "sinomo-network",
- "sinomo-node",
- "sinomo-object",
  "sinomo-registry",
- "sinomo-service",
- "sinomo-storage",
  "sinomo-testdir",
  "tar",
  "thiserror 2.0.18",
@@ -8261,7 +8251,7 @@ name = "sinomo-sandbox-simple"
 version = "0.1.0"
 dependencies = [
  "libc",
- "sinomo-node",
+ "sinomo-core",
  "sinomo-sandbox",
  "sinomo-testdir",
  "time",
@@ -8284,11 +8274,10 @@ dependencies = [
 name = "sinomo-sandbox-wasix-host"
 version = "0.1.0"
 dependencies = [
+ "sinomo-core",
  "sinomo-dfs",
  "sinomo-module",
  "sinomo-module-api",
- "sinomo-network",
- "sinomo-node",
  "sinomo-sandbox",
  "sinomo-sandbox-wasix-api",
  "thiserror 2.0.18",
@@ -8306,15 +8295,9 @@ dependencies = [
  "serde_json",
  "sinomo-core",
  "sinomo-dfs",
- "sinomo-events",
- "sinomo-kv",
  "sinomo-module",
- "sinomo-network",
- "sinomo-node",
- "sinomo-object",
  "sinomo-sandbox",
  "sinomo-sandbox-wasix-api",
- "sinomo-storage",
  "sinomo-testdir",
  "tar",
  "thiserror 2.0.18",
@@ -8339,12 +8322,14 @@ dependencies = [
  "arc-swap",
  "serde",
  "serde_json",
- "sinomo-core",
+ "sinomo-base",
  "sinomo-kv",
  "sinomo-local",
  "sinomo-network",
+ "sinomo-node",
  "sinomo-testdir",
  "thiserror 2.0.18",
+ "time",
  "tokio",
 ]
 
@@ -8367,8 +8352,6 @@ dependencies = [
  "serde_json",
  "sinomo-core",
  "sinomo-device",
- "sinomo-events",
- "sinomo-node",
  "time",
 ]
 
@@ -8378,7 +8361,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "sinomo-kv",
+ "sinomo-core",
  "thiserror 2.0.18",
 ]
 

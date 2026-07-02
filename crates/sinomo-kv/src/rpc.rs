@@ -287,30 +287,31 @@ pub fn decode_cluster_raft_vote_rpc_response_body(
     decode_cluster_kv_rpc_body(body)
 }
 
-pub fn handle_cluster_raft_rpc_payload<A, V, E>(
+pub fn handle_cluster_raft_rpc_payload<A, V, E, C>(
     route: &str,
     body: &[u8],
     append_handler: A,
     vote_handler: V,
+    kv_error: C,
 ) -> Result<Option<ClusterKvRpcPayload>, E>
 where
     A: FnOnce(ClusterRaftAppendRequest) -> Result<ClusterRaftAppendResponse, E>,
     V: FnOnce(ClusterRaftVoteRequest) -> Result<ClusterRaftVoteResponse, E>,
-    E: From<KvError>,
+    C: Fn(KvError) -> E,
 {
     match route {
         CLUSTER_RAFT_APPEND_ROUTE => {
-            let request = decode_cluster_raft_append_rpc_request_body(body).map_err(E::from)?;
+            let request = decode_cluster_raft_append_rpc_request_body(body).map_err(&kv_error)?;
             let response = append_handler(request)?;
             Ok(Some(
-                cluster_raft_append_response_rpc_payload(&response).map_err(E::from)?,
+                cluster_raft_append_response_rpc_payload(&response).map_err(&kv_error)?,
             ))
         }
         CLUSTER_RAFT_VOTE_ROUTE => {
-            let request = decode_cluster_raft_vote_rpc_request_body(body).map_err(E::from)?;
+            let request = decode_cluster_raft_vote_rpc_request_body(body).map_err(&kv_error)?;
             let response = vote_handler(request)?;
             Ok(Some(
-                cluster_raft_vote_response_rpc_payload(&response).map_err(E::from)?,
+                cluster_raft_vote_response_rpc_payload(&response).map_err(&kv_error)?,
             ))
         }
         _ => Ok(None),
@@ -318,7 +319,12 @@ where
 }
 
 pub trait ClusterKvLocalReadWatchHost {
-    type Error: From<KvError>;
+    type Error;
+
+    /// Wraps a KV store error in the host's error type. Replaces the old
+    /// `From<KvError>` bound so host error types in other crates do not need
+    /// orphan-rule-breaking `From` impls.
+    fn kv_error(error: KvError) -> Self::Error;
 
     fn range_prefix(&mut self, prefix: &str) -> Result<Vec<KvEntry>, Self::Error>;
 
@@ -348,42 +354,42 @@ where
 {
     let payload = match route {
         CLUSTER_KV_RANGE_PREFIX_ROUTE => {
-            let prefix: String = decode_cluster_kv_rpc_body(body).map_err(H::Error::from)?;
+            let prefix: String = decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?;
             let result = host.range_prefix(&prefix)?;
             ClusterKvRpcPayload {
                 route: CLUSTER_KV_RANGE_PREFIX_ROUTE,
                 category: CLUSTER_KV_RPC_CATEGORY,
-                body: encode_cluster_kv_rpc_body(&result).map_err(H::Error::from)?,
+                body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
             }
         }
         CLUSTER_KV_WATCH_PREFIX_ROUTE => {
             let request: ClusterKvWatchPrefixRequest =
-                decode_cluster_kv_rpc_body(body).map_err(H::Error::from)?;
+                decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?;
             let result = host.create_watch(request)?;
             ClusterKvRpcPayload {
                 route: CLUSTER_KV_WATCH_PREFIX_ROUTE,
                 category: CLUSTER_KV_RPC_CATEGORY,
-                body: encode_cluster_kv_rpc_body(&result).map_err(H::Error::from)?,
+                body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
             }
         }
         CLUSTER_KV_WATCH_DRAIN_ROUTE => {
             let request: ClusterKvWatchDrainRequest =
-                decode_cluster_kv_rpc_body(body).map_err(H::Error::from)?;
+                decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?;
             let result = host.drain_watch(request)?;
             ClusterKvRpcPayload {
                 route: CLUSTER_KV_WATCH_DRAIN_ROUTE,
                 category: CLUSTER_KV_RPC_CATEGORY,
-                body: encode_cluster_kv_rpc_body(&result).map_err(H::Error::from)?,
+                body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
             }
         }
         CLUSTER_KV_WATCH_CANCEL_ROUTE => {
             let request: ClusterKvWatchCancelRequest =
-                decode_cluster_kv_rpc_body(body).map_err(H::Error::from)?;
+                decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?;
             let result = host.cancel_watch(request)?;
             ClusterKvRpcPayload {
                 route: CLUSTER_KV_WATCH_CANCEL_ROUTE,
                 category: CLUSTER_KV_RPC_CATEGORY,
-                body: encode_cluster_kv_rpc_body(&result).map_err(H::Error::from)?,
+                body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
             }
         }
         _ => return Ok(None),

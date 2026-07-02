@@ -2,8 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use sinomo_network::NetworkError;
-use sinomo_node::NodeId;
+use sinomo_core::network::NetworkError;
+use sinomo_core::node::NodeId;
 
 use crate::transfer::{
     DFS_FETCH_CHUNK_WINDOW_SIZE, DFS_READ_CHUNK_WINDOW_SIZE, DFS_STAGE_CHUNK_WINDOW_SIZE,

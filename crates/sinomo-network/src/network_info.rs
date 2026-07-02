@@ -1,7 +1,17 @@
+use crate::maintenance::CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS;
 use crate::prelude::*;
 use sinomo_node::cluster_endpoint_list_stable_eq;
 
 pub const CLUSTER_NETWORK_INFO_TTL_SECONDS: i64 = 3600;
+
+/// Whether a network-domain record should be republished because it is close
+/// enough to expiry that a stable record still needs a TTL refresh.
+pub fn cluster_network_record_should_refresh(
+    expires_at: OffsetDateTime,
+    now: OffsetDateTime,
+) -> bool {
+    expires_at <= now + time::Duration::seconds(CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterNetworkInfoRecord {
@@ -88,13 +98,10 @@ pub fn cluster_network_info_publish_record_matches(
     now: OffsetDateTime,
 ) -> bool {
     cluster_network_info_stable_eq(known, info)
-        && !crate::connectivity_publish::cluster_network_record_should_refresh(
-            known.expires_at,
-            now,
-        )
+        && !cluster_network_record_should_refresh(known.expires_at, now)
 }
 
-pub(crate) fn cluster_network_info_stable_eq(
+pub fn cluster_network_info_stable_eq(
     left: &ClusterNetworkInfoRecord,
     right: &ClusterNetworkInfoRecord,
 ) -> bool {

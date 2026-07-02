@@ -11,9 +11,9 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::time::Instant;
 
+use sinomo_core::events::EventId;
+use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
-use sinomo_events::EventId;
-use sinomo_node::NodeId;
 
 use crate::transfer::{PendingNetworkedWrite, PendingNetworkedWritePatch};
 use crate::*;

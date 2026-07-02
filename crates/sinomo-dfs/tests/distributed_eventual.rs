@@ -1,9 +1,9 @@
 use sinomo_core::DfsObjectPolicy;
+use sinomo_core::node::NodeId;
 use sinomo_dfs::{
     DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsReplicationPolicy,
     DfsVersion, DfsWriteIntentState, DistributedEventualCoordinator, LocalContentStore,
 };
-use sinomo_node::NodeId;
 use std::fs;
 use std::path::Path;
 

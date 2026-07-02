@@ -1,6 +1,9 @@
 use super::*;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
+#[allow(unused_imports)]
+use sinomo_runtime::cluster;
+use sinomo_runtime::cluster::ClusterKvPathsExt;
 
 const DFS_CLUSTER_STATUS_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -2208,7 +2211,7 @@ impl CliDfsControlPlaneKvClient {
 
     fn kv_error(&self, source: impl std::fmt::Display) -> KvError {
         KvError::Io {
-            path: self.cluster_paths.kv_snapshot.display().to_string(),
+            path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
             detail: source.to_string(),
         }
     }
@@ -2241,7 +2244,7 @@ impl sinomo_runtime::dfs::DfsControlPlaneKvClient for CliDfsControlPlaneKvClient
     }
 
     fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-        let mut state = network::read_cluster_state(&self.cluster_paths)
+        let mut state = cluster::read_cluster_state(&self.cluster_paths)
             .map_err(|source| self.kv_error(source))?;
         let result =
             cli_commit_cluster_kv_txn_with_quorum_response(&self.cluster_paths, &mut state, txn)
@@ -2261,7 +2264,7 @@ fn run_local_dfs_smoke(
     let cluster_paths = ClusterPaths::new(data_dir);
     let options = DaemonRunOptions::default();
     let local_endpoint = format!("loopback://{}:{}", options.host, options.port);
-    let control_plane = cluster_paths.kv_snapshot.exists().then(|| {
+    let control_plane = cluster_paths.kv_paths().snapshot.exists().then(|| {
         Box::new(CliDfsControlPlaneKvClient::new(&cluster_paths))
             as Box<dyn sinomo_runtime::dfs::DfsControlPlaneKvClient>
     });

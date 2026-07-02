@@ -1503,7 +1503,7 @@ fn explicit_rollout_targets(addresses: Vec<String>) -> Vec<RolloutTarget> {
 
 fn explicit_rollout_target(address: String) -> RolloutTarget {
     if address.starts_with("iroh://") {
-        RolloutTarget::explicit_endpoint(network::invite_introducer_endpoint(
+        RolloutTarget::explicit_endpoint(cluster::invite_introducer_endpoint(
             &NodeId::from_legacy_named("node_rollout_explicit_target")
                 .expect("static rollout target node id"),
             address,
@@ -2286,3 +2286,4 @@ pub(crate) fn wait_for_local_shadow_rollout_completion(
     )
     .map_err(Into::into)
 }
+use sinomo_runtime::cluster;

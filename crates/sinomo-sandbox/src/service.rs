@@ -21,9 +21,9 @@ use crate::{
     SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE, SANDBOX_UPDATE_ROUTE, SANDBOX_WRITE_ROUTE,
     SandboxBackend, SandboxBackendError, SandboxCancellationToken, SandboxRunCancelResponse,
 };
-use sinomo_network::{ObjectRpcCancelRequest, ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_core::network::{ObjectRpcCancelRequest, ObjectRpcRequest, ObjectRpcResponse};
 
-use sinomo_service::{
+use sinomo_core::service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
     ServiceRegistryBuilder, ServiceRoute,
 };
@@ -358,9 +358,9 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use sinomo_local::SinomoDataDir;
+    use sinomo_core::local::SinomoDataDir;
 
-    use sinomo_service::{ResponseSink, ServiceRegistry, ServiceSigner};
+    use sinomo_core::service::{ResponseSink, ServiceRegistry, ServiceSigner};
 
     #[derive(Clone, Default)]
     struct CollectingSink {

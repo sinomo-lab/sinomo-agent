@@ -1,4 +1,4 @@
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 use time::OffsetDateTime;
 
 use crate::{

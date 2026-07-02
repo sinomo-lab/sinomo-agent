@@ -5,7 +5,7 @@
 //! checks here prevents the transfer protocol handlers from growing separate
 //! versions of the same replica write invariants.
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::service_content::object_content_identity;
 use crate::transfer::PendingNetworkedWrite;

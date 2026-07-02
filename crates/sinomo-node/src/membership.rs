@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sinomo_core::{
+use sinomo_base::{
     CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
     ClusterEndpointSource, ClusterMemberRecord, ClusterMemberState, ClusterNodeStatusRecord,
     ClusterTransportKind, Id,

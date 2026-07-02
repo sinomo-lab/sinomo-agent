@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use sinomo_core::ClusterEndpointRecord;
 #[cfg(test)]
-use sinomo_local::SinomoDataDir;
+use sinomo_core::local::SinomoDataDir;
 #[cfg(test)]
-use sinomo_network::ClusterPaths;
-use sinomo_network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse, SinomoObjectCodec};
-use sinomo_node::NodeId;
+use sinomo_core::network::ClusterPaths;
+use sinomo_core::network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse, SinomoObjectCodec};
+use sinomo_core::node::NodeId;
 
 use crate::{
     AsyncDfsMessageTransport, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES, DfsDirectReadRequest,
@@ -452,7 +452,7 @@ impl DfsEndpointTransport {
         self.endpoints_by_node_id
             .get(target_node_id)
             .map(|endpoints| {
-                sinomo_network::ClusterEndpointSelector::transfer_profile_for_endpoints(
+                sinomo_core::network::ClusterEndpointSelector::transfer_profile_for_endpoints(
                     endpoints.iter(),
                 )
                 .into()
@@ -1317,7 +1317,7 @@ pub(crate) fn process_cluster_dfs_message_command(
     if !cluster_paths.state.exists() {
         return Ok(None);
     };
-    let local_node_id = (sinomo_network::read_cluster_state_without_kv(cluster_paths)
+    let local_node_id = (sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(DfsError::from_network)?)
     .local_node_id;
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;

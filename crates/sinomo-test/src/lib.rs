@@ -231,7 +231,7 @@ pub struct SinomoTestContext {
     parameters: BTreeMap<String, String>,
     live: bool,
     require_cluster: bool,
-    cluster_snapshot: Option<sinomo_kv::KvSnapshot>,
+    cluster_snapshot: Option<sinomo_core::kv::KvSnapshot>,
     cluster_config_source: Option<PathBuf>,
     diagnostics: serde_json::Map<String, serde_json::Value>,
 }
@@ -276,7 +276,7 @@ impl SinomoTestContext {
 
     pub fn with_cluster_snapshot(
         mut self,
-        snapshot: sinomo_kv::KvSnapshot,
+        snapshot: sinomo_core::kv::KvSnapshot,
         source: impl Into<PathBuf>,
     ) -> Self {
         self.cluster_snapshot = Some(snapshot);
@@ -308,7 +308,7 @@ impl SinomoTestContext {
         self.require_cluster
     }
 
-    pub fn cluster_snapshot(&self) -> Option<&sinomo_kv::KvSnapshot> {
+    pub fn cluster_snapshot(&self) -> Option<&sinomo_core::kv::KvSnapshot> {
         self.cluster_snapshot.as_ref()
     }
 

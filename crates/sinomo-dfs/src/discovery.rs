@@ -6,8 +6,8 @@
 
 use crate::control_plane::DfsControlPlaneStore;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sinomo_kv::{KvEntry, KvError, encode_kv_value};
-use sinomo_node::NodeId;
+use sinomo_core::kv::{KvEntry, KvError, encode_kv_value};
+use sinomo_core::node::NodeId;
 use time::OffsetDateTime;
 
 const DFS_KV_PREFIX: &str = "/dfs";
@@ -157,7 +157,11 @@ impl<'a> DfsControlPlaneStore<'a> {
         self.kv.get(key)
     }
 
-    fn kv_put(&mut self, key: String, value: Vec<u8>) -> Result<sinomo_kv::KvRevision, KvError> {
+    fn kv_put(
+        &mut self,
+        key: String,
+        value: Vec<u8>,
+    ) -> Result<sinomo_core::kv::KvRevision, KvError> {
         self.kv.put(key, value)
     }
 

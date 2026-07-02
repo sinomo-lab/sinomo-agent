@@ -3,6 +3,8 @@
 //! These tests exercise write coordination, metadata commit ordering, hydration,
 //! concurrent writers, partial failures, and repair convergence.
 
+use sinomo_core::network::{InProcessNetwork, InProcessTransport};
+use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_dfs::{
     DfsFileSystem, DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsObjectKind,
@@ -10,8 +12,6 @@ use sinomo_dfs::{
     LocalSobjMetadataBackend, NetworkedDfsReadOutcome, NetworkedDfsService,
     NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
 };
-use sinomo_network::{InProcessNetwork, InProcessTransport};
-use sinomo_node::NodeId;
 use std::fs;
 use std::path::Path;
 

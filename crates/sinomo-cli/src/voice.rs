@@ -1,4 +1,5 @@
 use super::*;
+use sinomo_runtime::cluster;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -391,7 +392,7 @@ fn run_voice_devices() -> Result<(), CliError> {
 
 fn voice_local_node_id(data_dir: &SinomoDataDir) -> NodeId {
     let paths = ClusterPaths::new(data_dir);
-    network::read_cluster_state(&paths)
+    cluster::read_cluster_state(&paths)
         .map(|state| state.local_node_id)
         .unwrap_or_else(|_| NodeId::from_legacy_named("node_cli").expect("valid node id"))
 }

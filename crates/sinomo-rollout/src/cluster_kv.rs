@@ -1,3 +1,7 @@
+#[allow(unused_imports)]
+use sinomo_core::cluster::ClusterKvPathsExt;
+use sinomo_core::kv::{KvCommand, KvOp, KvSnapshot};
+use sinomo_core::network::{ClusterPaths, NetworkError};
 use sinomo_core::{
     ClusterModuleRolloutDesiredRecord, ClusterModuleRolloutReconciliationRecord,
     ClusterModuleRolloutStatusRecord, ClusterRolloutDesiredRecord, Id as NodeId,
@@ -6,8 +10,6 @@ use sinomo_core::{
     cluster_module_rollout_reconcile_key, cluster_module_rollout_reconcile_prefix,
     cluster_rollout_desired_key,
 };
-use sinomo_kv::{KvCommand, KvOp, KvSnapshot};
-use sinomo_network::{ClusterPaths, NetworkError};
 
 pub fn read_cluster_rollout_desired_from_kv(
     paths: &ClusterPaths,
@@ -17,7 +19,7 @@ pub fn read_cluster_rollout_desired_from_kv(
         .get(&cluster_rollout_desired_key())
         .map(|entry| entry.decode())
         .transpose()
-        .map_err(Into::into)
+        .map_err(sinomo_core::network::NetworkError::directory)
 }
 
 pub fn sync_cluster_rollout_desired_to_kv(
@@ -34,11 +36,18 @@ pub fn read_cluster_module_rollout_statuses_from_kv(
         return Ok(Vec::new());
     };
     let mut statuses: Vec<ClusterModuleRolloutStatusRecord> = Vec::new();
-    for entry in snapshot.range_prefix_limited(
-        &cluster_module_rollout_node_prefix(),
-        sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
-    )? {
-        statuses.push(entry.decode()?);
+    for entry in snapshot
+        .range_prefix_limited(
+            &cluster_module_rollout_node_prefix(),
+            sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+        )
+        .map_err(sinomo_core::network::NetworkError::directory)?
+    {
+        statuses.push(
+            entry
+                .decode()
+                .map_err(sinomo_core::network::NetworkError::directory)?,
+        );
     }
     statuses.sort_by(|left, right| {
         left.node_id
@@ -67,11 +76,18 @@ pub fn read_cluster_module_rollout_desired_from_kv(
         return Ok(Vec::new());
     };
     let mut desired: Vec<ClusterModuleRolloutDesiredRecord> = Vec::new();
-    for entry in snapshot.range_prefix_limited(
-        &cluster_module_rollout_desired_prefix(),
-        sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
-    )? {
-        desired.push(entry.decode()?);
+    for entry in snapshot
+        .range_prefix_limited(
+            &cluster_module_rollout_desired_prefix(),
+            sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+        )
+        .map_err(sinomo_core::network::NetworkError::directory)?
+    {
+        desired.push(
+            entry
+                .decode()
+                .map_err(sinomo_core::network::NetworkError::directory)?,
+        );
     }
     desired.sort_by(|left, right| {
         left.rollout_plan
@@ -107,11 +123,18 @@ pub fn read_cluster_module_rollout_reconciliations_from_kv(
         return Ok(Vec::new());
     };
     let mut reconciliations: Vec<ClusterModuleRolloutReconciliationRecord> = Vec::new();
-    for entry in snapshot.range_prefix_limited(
-        &cluster_module_rollout_reconcile_prefix(),
-        sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
-    )? {
-        reconciliations.push(entry.decode()?);
+    for entry in snapshot
+        .range_prefix_limited(
+            &cluster_module_rollout_reconcile_prefix(),
+            sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+        )
+        .map_err(sinomo_core::network::NetworkError::directory)?
+    {
+        reconciliations.push(
+            entry
+                .decode()
+                .map_err(sinomo_core::network::NetworkError::directory)?,
+        );
     }
     reconciliations.sort_by(|left, right| {
         left.node_id
@@ -138,9 +161,12 @@ pub fn sync_cluster_module_rollout_reconciliation_to_kv(
 }
 
 fn read_current_cluster_kv_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, NetworkError> {
-    let state = sinomo_network::read_cluster_state_without_kv(paths)?;
-    sinomo_kv::read_cluster_kv_current_snapshot_for_node(&paths.kv_paths(), state.local_node_id)
-        .map_err(Into::into)
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(paths)?;
+    sinomo_core::kv::read_cluster_kv_current_snapshot_for_node(
+        &paths.kv_paths(),
+        state.local_node_id,
+    )
+    .map_err(sinomo_core::network::NetworkError::directory)
 }
 
 fn read_cached_cluster_kv_snapshot_if_present(
@@ -151,7 +177,7 @@ fn read_cached_cluster_kv_snapshot_if_present(
         .local_cache()
         .cached_snapshot_arc_if_present()
         .map(|snapshot| snapshot.map(|snapshot| (*snapshot).clone()))
-        .map_err(Into::into)
+        .map_err(sinomo_core::network::NetworkError::directory)
 }
 
 fn put_cluster_kv_value<T: serde::Serialize + ?Sized>(
@@ -159,8 +185,9 @@ fn put_cluster_kv_value<T: serde::Serialize + ?Sized>(
     key: String,
     value: &T,
 ) -> Result<KvSnapshot, NetworkError> {
-    let state = sinomo_network::read_cluster_state_without_kv(paths)?;
-    let op = KvOp::put_serde(key, value, None)?;
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(paths)?;
+    let op =
+        KvOp::put_serde(key, value, None).map_err(sinomo_core::network::NetworkError::directory)?;
     append_cluster_kv_command(paths, &state.local_node_id, KvCommand::Op(op))
 }
 
@@ -172,14 +199,14 @@ fn append_cluster_kv_command(
     paths
         .kv_paths()
         .append_kv_command_and_publish(node_id, command, |_| false)
-        .map_err(Into::into)
+        .map_err(sinomo_core::network::NetworkError::directory)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_core::local::SinomoDataDir;
     use sinomo_core::{RollbackPolicy, RolloutPlan, RolloutStrategy, TrustRing};
-    use sinomo_local::SinomoDataDir;
     use time::OffsetDateTime;
 
     #[test]
@@ -202,8 +229,8 @@ mod tests {
             "public-key",
             now,
         );
-        sinomo_network::write_cluster_state(&paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+        sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state");
 
         let desired = ClusterRolloutDesiredRecord {

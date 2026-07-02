@@ -13,6 +13,9 @@ use crate::{
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+#[allow(unused_imports)]
+use sinomo_runtime::cluster;
+use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::config::{
     ConfigClusterMode, ConfigDefinition, ConfigError, ConfigRegistry, ConfigRegistryBuilder,
     ConfigStore, ConfigValueType, ConfigWriteTarget,
@@ -2552,7 +2555,7 @@ fn open_evolution_sifs_service(
         })?;
     let cluster_paths = ClusterPaths::new(data_dir);
     let (local_node_id, endpoints) = if cluster_paths.state.exists() {
-        let state = network::read_cluster_state_without_kv(&cluster_paths).map_err(|source| {
+        let state = cluster::read_cluster_state_without_kv(&cluster_paths).map_err(|source| {
             EvolutionPersistenceError::Sifs {
                 path: cluster_paths.state.display().to_string(),
                 detail: source.to_string(),

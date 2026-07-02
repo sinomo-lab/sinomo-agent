@@ -12,6 +12,53 @@ pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
 pub const CLUSTER_CONNECTIVITY_TTL_SECONDS: i64 = 900;
 pub const CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS: i64 = 7200;
 const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
+/// Maximum connectivity records a single source node may publish. Must stay
+/// equal to `sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES` (the KV-sync code
+/// asserts this at compile time) so a full source record set survives a
+/// prefix read.
+pub const MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS: usize = 4096;
+
+/// Whether a network-domain record (connectivity/network-info) is still live
+/// at `now` per its `expires_at` stamp.
+pub fn cluster_network_record_live(expires_at: OffsetDateTime, now: OffsetDateTime) -> bool {
+    expires_at > now
+}
+
+pub fn cluster_connectivity_stable_eq(
+    left: &ClusterConnectivityRecord,
+    right: &ClusterConnectivityRecord,
+) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.source_node_id == right.source_node_id
+        && left.target_node_id == right.target_node_id
+        && left.endpoint_id == right.endpoint_id
+        && left.transport == right.transport
+        && left.address == right.address
+        && left.state == right.state
+        && left.failure_reason == right.failure_reason
+}
+
+pub fn validate_cluster_connectivity_records_for_source(
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+) -> Result<(), NetworkError> {
+    if records.len() > MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS {
+        return Err(NetworkError::ClusterConnectivityRecordLimit {
+            source_node_id: source_node_id.clone(),
+            observed_records: records.len(),
+            max_records: MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
+        });
+    }
+    for record in records {
+        if record.source_node_id != *source_node_id {
+            return Err(NetworkError::ClusterConnectivitySourceMismatch {
+                expected_source_node_id: source_node_id.clone(),
+                record_source_node_id: record.source_node_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -241,6 +288,20 @@ pub trait ClusterConnectivityRecordQuery {
     ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError>;
 }
 
+/// Default [`ClusterConnectivityRecordQuery`]: serves connectivity records
+/// from the registered cluster directory provider.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DirectoryConnectivityRecordQuery;
+
+impl ClusterConnectivityRecordQuery for DirectoryConnectivityRecordQuery {
+    fn read_kv_connectivity_records(
+        &self,
+        paths: &ClusterPaths,
+    ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
+        crate::directory::cluster_directory_for(paths).connectivity_records()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterConnectivityProbeState {
     pub record: ClusterConnectivityRecord,
@@ -268,9 +329,9 @@ pub enum ClusterConnectivityProbeObservation {
 }
 
 fn try_clone_connectivity_id(
-    id: &sinomo_core::Id,
+    id: &sinomo_base::Id,
     operation: &str,
-) -> Result<sinomo_core::Id, NetworkError> {
+) -> Result<sinomo_base::Id, NetworkError> {
     crate::object::try_clone_id(id, operation)
 }
 
@@ -606,7 +667,7 @@ pub fn cluster_connectivity_record_for_probe_observation(
     }
 }
 
-pub(crate) fn cluster_connectivity_record_for_probe_outcome(
+pub fn cluster_connectivity_record_for_probe_outcome(
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
     previous: Option<&ClusterConnectivityRecord>,
@@ -670,7 +731,7 @@ pub(crate) fn cluster_connectivity_record_for_probe_outcome(
     )
 }
 
-pub(crate) fn cluster_connectivity_record_for_startup_probe_failure(
+pub fn cluster_connectivity_record_for_startup_probe_failure(
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
     previous: Option<&ClusterConnectivityRecord>,
@@ -691,7 +752,7 @@ pub(crate) fn cluster_connectivity_record_for_startup_probe_failure(
     record
 }
 
-pub(crate) fn cluster_connectivity_record_for_identity_mismatch(
+pub fn cluster_connectivity_record_for_identity_mismatch(
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
     timestamp: &str,
@@ -712,7 +773,7 @@ pub(crate) fn cluster_connectivity_record_for_identity_mismatch(
     record
 }
 
-pub(crate) fn cluster_connectivity_record_for_hard_failure(
+pub fn cluster_connectivity_record_for_hard_failure(
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
     previous: Option<&ClusterConnectivityRecord>,
@@ -876,8 +937,8 @@ pub fn cluster_connectivity_failure_reason_is_identity_mismatch(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn cluster_connectivity_probe_key(
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_connectivity_probe_key(
     source_node_id: &NodeId,
     endpoint: &ClusterEndpointRecord,
 ) -> String {
@@ -1109,7 +1170,7 @@ impl ClusterConnectivityGraph {
             .unwrap_or_default()
     }
 
-    pub(crate) fn healthy_target_refs<'a>(
+    pub fn healthy_target_refs<'a>(
         &'a self,
         source: &NodeId,
     ) -> impl Iterator<Item = &'a NodeId> + 'a {

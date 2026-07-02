@@ -9,10 +9,10 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sinomo_kv::{KvEntry, KvOp, KvTxn};
-use sinomo_local::SinomoDataDir;
-use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse};
-use sinomo_service::{
+use sinomo_core::kv::{KvEntry, KvOp, KvTxn};
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::{ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_core::service::{
     ClusterAccess, Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
     ServiceRegistryBuilder, ServiceRoute,
 };
@@ -611,11 +611,11 @@ pub fn register_services(
 }
 
 pub fn register_storage_paths(
-    layout: &mut sinomo_storage::StorageLayout,
-) -> Result<(), sinomo_storage::StorageContractError> {
+    layout: &mut sinomo_core::storage::StorageLayout,
+) -> Result<(), sinomo_core::storage::StorageContractError> {
     layout.register_escape_path(
         "sinomo-config",
-        sinomo_storage::StorageRing::R1,
+        sinomo_core::storage::StorageRing::R1,
         "configs",
         "human-readable shared local configuration documents managed by sinomo-config",
     )
@@ -1126,7 +1126,7 @@ pub enum ConfigError {
     #[error("config serialization error at {path}: {detail}")]
     Serde { path: String, detail: String },
     #[error(transparent)]
-    Kv(#[from] sinomo_kv::KvError),
+    Kv(#[from] sinomo_core::kv::KvError),
     #[error(transparent)]
     Service(#[from] ServiceError),
     #[error("config client/transport error: {detail}")]
@@ -1145,8 +1145,8 @@ impl From<ConfigError> for ServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_kv::{KvEntry, KvRevision, KvVersion};
-    use sinomo_service::ResponseSink;
+    use sinomo_core::kv::{KvEntry, KvRevision, KvVersion};
+    use sinomo_core::service::ResponseSink;
     use std::sync::Mutex;
 
     fn bool_definition() -> ConfigDefinition {
@@ -1248,8 +1248,9 @@ mod tests {
             txn: KvTxn,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = Result<sinomo_kv::KvTxnResponse, ServiceError>>
-                    + Send
+                dyn std::future::Future<
+                        Output = Result<sinomo_core::kv::KvTxnResponse, ServiceError>,
+                    > + Send
                     + 'a,
             >,
         > {
@@ -1260,7 +1261,7 @@ mod tests {
                         entries.insert(key, value);
                     }
                 }
-                Ok(sinomo_kv::KvTxnResponse {
+                Ok(sinomo_core::kv::KvTxnResponse {
                     succeeded: true,
                     revision: KvRevision(1),
                     responses: Vec::new(),
@@ -1322,11 +1323,11 @@ mod tests {
         let ctx = ServiceContext {
             data_dir: Arc::new(SinomoDataDir::new(&root)),
             cluster: None,
-            signer: sinomo_service::ServiceSigner::Local,
+            signer: sinomo_core::service::ServiceSigner::Local,
             sink: Box::new(sink),
         };
         let registry =
-            register_services(sinomo_service::ServiceRegistry::builder(), registry()).build();
+            register_services(sinomo_core::service::ServiceRegistry::builder(), registry()).build();
         let request = ObjectRpcRequest::encode_body(
             CONFIG_SEARCH_ROUTE,
             CONFIG_RPC_CATEGORY,

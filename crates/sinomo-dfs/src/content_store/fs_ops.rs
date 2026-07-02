@@ -1,5 +1,5 @@
 use super::{ContentStoreError, Result};
-use sinomo_storage::durable_file;
+use sinomo_core::storage::durable_file;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};

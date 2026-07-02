@@ -10,7 +10,7 @@ use crate::metadata_records::{
     DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentScanCursor,
 };
 use crate::{DfsFileSystemId, DfsObjectId, DfsObjectMetadata, DfsVersion};
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 const DIRFRAG_BUCKET_COUNT: u64 = 256;
 

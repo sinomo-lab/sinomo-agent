@@ -76,6 +76,15 @@ use sinomo_pytorch::{
 use sinomo_runtime::cli_registry::{
     CliCommandContext, CliCommandRegistry, CliParseError, RegisteredCliCommand,
 };
+use sinomo_runtime::cluster;
+#[cfg(test)]
+use sinomo_runtime::cluster::ClusterJoinRegistrationRequest;
+#[cfg(test)]
+use sinomo_runtime::cluster::ClusterJoinRegistrationResponse;
+use sinomo_runtime::cluster::cluster_doctor_findings;
+use sinomo_runtime::cluster::{ClusterDoctorFinding, ClusterHealthRow};
+#[cfg(test)]
+use sinomo_runtime::cluster::{ClusterInviteChallengeProof, ClusterInviteChallengeRequest};
 use sinomo_runtime::core::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterJoinInvite, ClusterMemberRecord,
     ClusterMemberRole, ClusterMemberState, ClusterMigrationMode, ClusterMigrationPhase,
@@ -90,8 +99,8 @@ use sinomo_runtime::daemon::{
     daemon_package_version, sign_daemon_rpc_request_from_data_dir, write_daemon_status,
 };
 use sinomo_runtime::daemon::{
-    DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus, DaemonPaths,
-    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DaemonStopBeforeInstallStart,
+    DaemonApiClient, DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus,
+    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DaemonStopBeforeInstallStart,
     DaemonStopBeforeInstallStatus, DaemonStopIfRunningStatus, IdleStatsSnapshot, InstallLayout,
     InstalledDaemonInstallPlanRequest, InstalledDaemonStartStatus, ManagedSourceRepoInstallStatus,
     SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
@@ -192,14 +201,7 @@ use sinomo_runtime::events::{EventStore, InMemoryEventStore};
 use sinomo_runtime::kv::{InProcessKvStore, KvError, KvOp, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::module::ModuleReplayReport;
-#[cfg(test)]
-use sinomo_runtime::network::ClusterJoinRegistrationRequest;
-#[cfg(test)]
-use sinomo_runtime::network::ClusterJoinRegistrationResponse;
-use sinomo_runtime::network::{self, ClusterPaths, cluster_doctor_findings};
-use sinomo_runtime::network::{ClusterDoctorFinding, ClusterHealthRow};
-#[cfg(test)]
-use sinomo_runtime::network::{ClusterInviteChallengeProof, ClusterInviteChallengeRequest};
+use sinomo_runtime::network::{self, ClusterPaths};
 #[cfg(test)]
 use sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE;
 use sinomo_runtime::node::{
@@ -277,7 +279,7 @@ pub(crate) use voice::*;
 
 struct CliClusterStateAuthorityReachabilityHost;
 
-impl network::ClusterStateAuthorityReachabilityHost for CliClusterStateAuthorityReachabilityHost {
+impl cluster::ClusterStateAuthorityReachabilityHost for CliClusterStateAuthorityReachabilityHost {
     fn probe_cluster_state_authority(
         &mut self,
         endpoint: &ClusterEndpointRecord,
@@ -288,8 +290,8 @@ impl network::ClusterStateAuthorityReachabilityHost for CliClusterStateAuthority
 }
 
 fn cli_cluster_state_authority_reachability_options()
--> network::ClusterStateAuthorityReachabilityOptions {
-    network::ClusterStateAuthorityReachabilityOptions {
+-> cluster::ClusterStateAuthorityReachabilityOptions {
+    cluster::ClusterStateAuthorityReachabilityOptions {
         timeout: Duration::from_secs(5),
         tcp_command_timeout: Duration::from_secs(5),
         iroh_command_timeout: Duration::from_secs(3),
@@ -300,7 +302,7 @@ fn cli_cluster_state_authority_reachability_options()
 }
 
 fn cluster_has_local_quorum(paths: &ClusterPaths, state: &ClusterBootstrapState) -> bool {
-    network::cluster_has_local_quorum_with_host(
+    cluster::cluster_has_local_quorum_with_host(
         paths,
         state,
         cli_cluster_state_authority_reachability_options(),
@@ -312,7 +314,7 @@ fn cluster_reachable_state_authority_count(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> usize {
-    network::cluster_reachable_state_authority_count_with_host(
+    cluster::cluster_reachable_state_authority_count_with_host(
         paths,
         state,
         cli_cluster_state_authority_reachability_options(),
@@ -324,7 +326,7 @@ struct CliClusterStatusProbe<'a> {
     paths: &'a ClusterPaths,
 }
 
-impl network::ClusterStatusProbe for CliClusterStatusProbe<'_> {
+impl cluster::ClusterStatusProbe for CliClusterStatusProbe<'_> {
     fn probe_member_status(
         &self,
         state: &ClusterBootstrapState,
@@ -446,7 +448,7 @@ fn cli_probe_member_status_via_shadow_endpoint(
     endpoint: &ClusterEndpointRecord,
     trace: bool,
 ) -> Option<ClusterNodeStatusRecord> {
-    let request = network::cluster_local_health_rpc_request().ok()?;
+    let request = cluster::cluster_local_health_rpc_request().ok()?;
     let response = match daemon_send_daemon_rpc_to_endpoint(
         endpoint,
         &request,
@@ -463,7 +465,7 @@ fn cli_probe_member_status_via_shadow_endpoint(
             return None;
         }
     };
-    let rows = match network::decode_cluster_health_rpc_response(&response) {
+    let rows = match cluster::decode_cluster_health_rpc_response(&response) {
         Ok(rows) => rows,
         Err(error) => {
             if trace {
@@ -540,7 +542,7 @@ fn cli_fetch_local_cluster_health_rows_from_member(
         .into_iter()
         .filter(|endpoint| endpoint.node_id == member.node_id)
     {
-        let Ok(request) = network::cluster_local_health_rpc_request() else {
+        let Ok(request) = cluster::cluster_local_health_rpc_request() else {
             return None;
         };
         let Ok(response) = daemon_send_daemon_rpc_to_endpoint(
@@ -550,21 +552,12 @@ fn cli_fetch_local_cluster_health_rows_from_member(
         ) else {
             continue;
         };
-        let Ok(rows) = network::decode_cluster_health_rpc_response(&response) else {
+        let Ok(rows) = cluster::decode_cluster_health_rpc_response(&response) else {
             continue;
         };
         return Some(rows);
     }
     None
-}
-
-fn cli_fetch_cluster_health_rows(
-    address: &str,
-    timeout: Duration,
-) -> Result<Vec<ClusterHealthRow>, CliError> {
-    let request = network::cluster_health_rpc_request()?;
-    let response = daemon_send_daemon_rpc(address, &request, timeout)?;
-    network::decode_cluster_health_rpc_response(&response).map_err(Into::into)
 }
 
 mod commands;
@@ -1347,7 +1340,7 @@ fn observe_cli_rpc(
 fn observe_cli_cluster_targets() -> Result<Vec<String>, String> {
     let data_dir = SinomoDataDir::from_env_or_home().map_err(|source| source.to_string())?;
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let state = network::read_cluster_state_without_kv(&cluster_paths)
+    let state = cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(|source| source.to_string())?;
     let mut targets = BTreeSet::from([state.local_node_id.to_string()]);
     targets.extend(
@@ -3313,6 +3306,14 @@ pub(crate) fn is_help_args(args: &[String]) -> bool {
     matches!(args, [arg] if matches!(arg.as_str(), "help" | "--help" | "-h"))
 }
 
+/// Installs the KV-backed cluster directory provider once per CLI process so
+/// direct/debug commands and local fallback reads see cluster state through
+/// the routing layer's provider seam (the daemon does the same at startup).
+pub(crate) fn ensure_cluster_directory_installed() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| sinomo_runtime::cluster::install_kv_cluster_directory());
+}
+
 pub fn run(args: Vec<String>) -> Result<(), CliError> {
     run_parsed_cli_invocation(parse_cli_invocation(&args)?)
 }
@@ -3322,6 +3323,7 @@ fn run_cli_command(args: &[String]) -> Result<(), CliError> {
 }
 
 fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> {
+    ensure_cluster_directory_installed();
     let command = invocation.command;
     let command_is_help = cli_command_is_help(&command);
     let daemon = if invocation.options.force_local
@@ -3401,7 +3403,7 @@ const CLUSTER_HEALTH_CLI_MAX_ENDPOINTS_PER_MEMBER: usize = 2;
 const CLUSTER_HEALTH_PEER_ROWS_TIMEOUT: Duration = Duration::from_secs(8);
 const DAEMON_AGENT_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
-const SINOMO_JOIN_URI_PREFIX: &str = network::SINOMO_JOIN_URI_PREFIX;
+const SINOMO_JOIN_URI_PREFIX: &str = cluster::SINOMO_JOIN_URI_PREFIX;
 const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
 const INSTALL_DEFAULT_HOST: &str = "0.0.0.0";
 
@@ -3436,5 +3438,6 @@ fn decode_cluster_kv_snapshot_rpc_response(
     response: &network::ObjectRpcResponse,
 ) -> Result<KvSnapshot, network::NetworkError> {
     response.error_detail()?;
-    sinomo_runtime::kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
+    sinomo_runtime::kv::decode_cluster_kv_snapshot_rpc_body(&response.body)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
 }

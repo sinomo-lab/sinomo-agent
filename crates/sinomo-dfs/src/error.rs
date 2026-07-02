@@ -2,8 +2,8 @@ use crate::{
     ContentStoreError, DfsDistributedError, DfsFileSystemId, DfsObjectId, MetadataBackendError,
 };
 use sinomo_core::DfsObjectPolicy;
-use sinomo_kv::KvError;
-use sinomo_node::NodeId;
+use sinomo_core::kv::KvError;
+use sinomo_core::node::NodeId;
 use thiserror::Error;
 
 /// Error type shared by DFS metadata, content, routing, and service code.
@@ -58,7 +58,7 @@ pub enum DfsError {
 }
 
 impl DfsError {
-    pub(crate) fn from_network(error: sinomo_network::NetworkError) -> Self {
+    pub(crate) fn from_network(error: sinomo_core::network::NetworkError) -> Self {
         Self::Network {
             message: error.to_string(),
         }

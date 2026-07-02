@@ -4,6 +4,12 @@ use crate::{
     send_dfs_object_rpc_to_target_on_runtime,
 };
 use sinomo_core::ClusterEndpointRecord;
+#[allow(unused_imports)]
+use sinomo_core::cluster::ClusterKvPathsExt;
+use sinomo_core::kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::ClusterPaths;
+use sinomo_core::node::NodeId;
 #[cfg(test)]
 use sinomo_dfs::DfsFileSystemConfig;
 #[cfg(test)]
@@ -25,10 +31,6 @@ use sinomo_dfs::{
     DfsMetadataPublishScheduleOptions, DfsObjectRpcSendOptions, DfsPeerTransport,
     DfsPeerTransportError, NetworkedDfsService,
 };
-use sinomo_kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
-use sinomo_local::SinomoDataDir;
-use sinomo_network::ClusterPaths;
-use sinomo_node::NodeId;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
@@ -61,7 +63,7 @@ struct DaemonDfsMessageCommandProcessResult {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DaemonDfsMessageServiceSignature {
-    local_node_id: sinomo_node::NodeId,
+    local_node_id: sinomo_core::node::NodeId,
     kv_snapshot_available: bool,
 }
 
@@ -136,7 +138,7 @@ impl DaemonDfsControlPlaneKvClient {
 
     fn daemon_error(&self, source: DaemonError) -> KvError {
         KvError::Io {
-            path: self.cluster_paths.kv_snapshot.display().to_string(),
+            path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
             detail: source.to_string(),
         }
     }
@@ -144,11 +146,11 @@ impl DaemonDfsControlPlaneKvClient {
 
 impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-        sinomo_kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
+        sinomo_core::kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
     }
 
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-        sinomo_kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
+        sinomo_core::kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
     }
 
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
@@ -180,9 +182,9 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
         &'a self,
         key: &'a str,
     ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Option<KvEntry>> {
-        Box::pin(
-            async move { sinomo_kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key) },
-        )
+        Box::pin(async move {
+            sinomo_core::kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
+        })
     }
 
     fn range_prefix_async<'a>(
@@ -190,7 +192,7 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
         prefix: &'a str,
     ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Vec<KvEntry>> {
         Box::pin(async move {
-            sinomo_kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
+            sinomo_core::kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
         })
     }
 
@@ -294,7 +296,7 @@ fn daemon_dfs_control_plane_client_on_runtime(
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Option<Box<dyn sinomo_dfs::DfsControlPlaneKvClient>> {
     let runtime = runtime?;
-    cluster_paths.kv_snapshot.exists().then(|| {
+    cluster_paths.kv_paths().snapshot.exists().then(|| {
         Box::new(DaemonDfsControlPlaneKvClient::new_on_runtime(
             cluster_paths,
             runtime,
@@ -303,7 +305,7 @@ fn daemon_dfs_control_plane_client_on_runtime(
 }
 
 pub(crate) fn daemon_dfs_endpoint_transport(
-    local_node_id: sinomo_node::NodeId,
+    local_node_id: sinomo_core::node::NodeId,
     endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
 ) -> DfsEndpointTransport {
     let peer_transport = Arc::new(DaemonDfsUnavailablePeerTransport);
@@ -319,7 +321,7 @@ pub(crate) fn daemon_dfs_endpoint_transport(
 }
 
 pub(crate) fn daemon_dfs_endpoint_transport_on_runtime(
-    local_node_id: sinomo_node::NodeId,
+    local_node_id: sinomo_core::node::NodeId,
     endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
     runtime: &tokio::runtime::Handle,
 ) -> DfsEndpointTransport {
@@ -357,9 +359,9 @@ impl DfsPeerTransport for DaemonDfsUnavailablePeerTransport {
     fn call_object_rpc(
         &self,
         _target_node_id: &NodeId,
-        _request: &sinomo_network::ObjectRpcRequest,
+        _request: &sinomo_core::network::ObjectRpcRequest,
         _options: DfsObjectRpcSendOptions,
-    ) -> Result<sinomo_network::ObjectRpcResponse, DfsPeerTransportError> {
+    ) -> Result<sinomo_core::network::ObjectRpcResponse, DfsPeerTransportError> {
         Err(daemon_dfs_unavailable_peer_transport_error())
     }
 }
@@ -368,11 +370,11 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsUnavailablePeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
         _target_node_id: &'a NodeId,
-        _request: &'a sinomo_network::ObjectRpcRequest,
+        _request: &'a sinomo_core::network::ObjectRpcRequest,
         _options: DfsObjectRpcSendOptions,
     ) -> sinomo_dfs::DfsPeerTransportFuture<
         'a,
-        Result<sinomo_network::ObjectRpcResponse, DfsPeerTransportError>,
+        Result<sinomo_core::network::ObjectRpcResponse, DfsPeerTransportError>,
     > {
         Box::pin(async { Err(daemon_dfs_unavailable_peer_transport_error()) })
     }
@@ -382,9 +384,9 @@ impl DfsPeerTransport for DaemonDfsBlockingPeerTransport {
     fn call_object_rpc(
         &self,
         target_node_id: &NodeId,
-        request: &sinomo_network::ObjectRpcRequest,
+        request: &sinomo_core::network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
-    ) -> Result<sinomo_network::ObjectRpcResponse, DfsPeerTransportError> {
+    ) -> Result<sinomo_core::network::ObjectRpcResponse, DfsPeerTransportError> {
         send_dfs_object_rpc_to_target_on_runtime(
             target_node_id,
             request,
@@ -400,11 +402,11 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsAsyncPeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
         target_node_id: &'a NodeId,
-        request: &'a sinomo_network::ObjectRpcRequest,
+        request: &'a sinomo_core::network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> sinomo_dfs::DfsPeerTransportFuture<
         'a,
-        Result<sinomo_network::ObjectRpcResponse, DfsPeerTransportError>,
+        Result<sinomo_core::network::ObjectRpcResponse, DfsPeerTransportError>,
     > {
         let runtime = self.runtime.clone();
         Box::pin(async move {
@@ -512,7 +514,7 @@ fn daemon_dfs_cache_lock_error() -> sinomo_dfs::DfsError {
     }
 }
 
-fn daemon_dfs_network_error(source: sinomo_network::NetworkError) -> sinomo_dfs::DfsError {
+fn daemon_dfs_network_error(source: sinomo_core::network::NetworkError) -> sinomo_dfs::DfsError {
     sinomo_dfs::DfsError::Network {
         message: source.to_string(),
     }
@@ -528,13 +530,13 @@ fn read_daemon_dfs_message_route_snapshot(
     if !cluster_paths.state.exists() {
         return Ok(None);
     }
-    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(daemon_dfs_network_error)?;
     let endpoints = sinomo_dfs::cluster_dfs_data_endpoints(cluster_paths, &state);
     Ok(Some(DaemonDfsMessageRouteSnapshot {
         signature: DaemonDfsMessageServiceSignature {
             local_node_id: state.local_node_id,
-            kv_snapshot_available: cluster_paths.kv_snapshot.exists(),
+            kv_snapshot_available: cluster_paths.kv_paths().snapshot.exists(),
         },
         endpoints,
     }))
@@ -599,7 +601,7 @@ fn drain_daemon_dfs_message_lane_deferred_work(
 fn open_daemon_dfs_message_service_lane(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
-    local_node_id: &sinomo_node::NodeId,
+    local_node_id: &sinomo_core::node::NodeId,
     endpoints: Vec<ClusterEndpointRecord>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<Arc<Mutex<DaemonDfsMessageServiceLane>>, sinomo_dfs::DfsError> {
@@ -1051,6 +1053,7 @@ fn daemon_data_dir(paths: &DaemonPaths) -> Result<&std::path::Path, DaemonError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_core::node::NodeId;
     use sinomo_core::{
         ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterTransportKind,
         DfsObjectPolicy,
@@ -1061,7 +1064,6 @@ mod tests {
         DfsObjectKind, DfsObjectMetadata, DfsRoutedMessage, DfsStageBlobCommand, DfsVersion,
         DfsWriteOptions,
     };
-    use sinomo_node::NodeId;
     use std::collections::BTreeMap;
     use std::fs;
     use std::sync::{Arc, Mutex};
@@ -1104,16 +1106,16 @@ mod tests {
     fn append_cluster_raft_command(
         paths: &ClusterPaths,
         node_id: &NodeId,
-        command: sinomo_kv::KvCommand,
-    ) -> Result<sinomo_kv::KvSnapshot, sinomo_network::NetworkError> {
+        command: sinomo_core::kv::KvCommand,
+    ) -> Result<sinomo_core::kv::KvSnapshot, sinomo_core::network::NetworkError> {
         paths
             .kv_paths()
             .append_kv_command_and_publish(
                 node_id,
                 command,
-                sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
+                sinomo_core::kv::cluster_kv_key_can_defer_materialized_snapshot,
             )
-            .map_err(Into::into)
+            .map_err(sinomo_core::network::NetworkError::directory)
     }
 
     fn daemon_test_runtime(name: &str) -> tokio::runtime::Runtime {
@@ -1304,7 +1306,7 @@ mod tests {
         let primary = NodeId::from_legacy_named("node_daemon_dfs_meta_primary").expect("primary");
         let stale = NodeId::from_legacy_named("node_daemon_dfs_meta_stale").expect("stale");
         let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            sinomo_node::ClusterId::from_legacy_named("cluster_daemon_dfs_meta_reject")
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_dfs_meta_reject")
                 .expect("cluster"),
             "daemon dfs metadata reject",
             local.clone(),
@@ -1312,7 +1314,8 @@ mod tests {
             "pk-local",
             OffsetDateTime::now_utc(),
         );
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
         let file_system = distributed_sifs(primary.clone());
         let shard = DfsMetadataShardConfig {
             file_system_id: file_system.file_system_id.clone(),
@@ -1326,8 +1329,8 @@ mod tests {
         append_cluster_raft_command(
             &cluster_paths,
             &local,
-            sinomo_kv::KvCommand::Op(
-                sinomo_kv::KvOp::put_serde(
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
                     metadata_shard_key(&file_system.file_system_id, "root"),
                     &shard,
                     None,
@@ -1431,8 +1434,9 @@ mod tests {
         data_dir.ensure_root_layout().expect("root layout");
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
-        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_dfs_namespace_jobs")
-            .expect("cluster");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_namespace_jobs")
+                .expect("cluster");
         let node_id = NodeId::from_legacy_named("node_daemon_dfs_namespace_jobs").expect("node");
         let state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id,
@@ -1442,8 +1446,8 @@ mod tests {
             "pk-local",
             now,
         );
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("sync raft");
 
         let old_dir = "/services/sandbox/instances/daemon_namespace_job/work/old";
@@ -1549,8 +1553,9 @@ mod tests {
         data_dir.ensure_root_layout().expect("root layout");
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
-        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_dfs_anti_entropy_tick")
-            .expect("cluster");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_anti_entropy_tick")
+                .expect("cluster");
         let node_id = NodeId::from_legacy_named("node_daemon_dfs_anti_entropy_tick").expect("node");
         let state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id,
@@ -1560,8 +1565,8 @@ mod tests {
             "pk-local",
             now,
         );
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("sync raft");
 
         let file_system = sinomo_dfs::default_cluster_sifs(&state);
@@ -1658,8 +1663,9 @@ mod tests {
         data_dir.ensure_root_layout().expect("root layout");
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
-        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_dfs_status_sharded")
-            .expect("cluster");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_status_sharded")
+                .expect("cluster");
         let node_id = NodeId::from_legacy_named("node_daemon_dfs_status_sharded").expect("node");
         let state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id,
@@ -1669,8 +1675,8 @@ mod tests {
             "pk-local",
             now,
         );
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("sync raft");
         let remote_node_id =
             NodeId::from_legacy_named("node_daemon_dfs_status_sharded_remote").expect("remote");
@@ -1698,16 +1704,16 @@ mod tests {
         append_cluster_raft_command(
             &cluster_paths,
             &node_id,
-            sinomo_kv::KvCommand::Txn(sinomo_kv::KvTxn {
+            sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
                 compares: Vec::new(),
                 success: vec![
-                    sinomo_kv::KvOp::put_serde(
+                    sinomo_core::kv::KvOp::put_serde(
                         metadata_shard_key(&file_system.file_system_id, "root"),
                         &root_shard,
                         None,
                     )
                     .expect("root shard op"),
-                    sinomo_kv::KvOp::put_serde(
+                    sinomo_core::kv::KvOp::put_serde(
                         metadata_shard_key(&file_system.file_system_id, "services"),
                         &services_shard,
                         None,
@@ -1800,7 +1806,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_status_replica_lag")
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_status_replica_lag")
                 .expect("cluster");
         let local = NodeId::from_legacy_named("node_dfs_status_replica_local").expect("local");
         let primary =
@@ -1813,8 +1819,8 @@ mod tests {
             "pk-local",
             now,
         );
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("sync raft");
         let file_system = distributed_sifs(local.clone());
         let shard = DfsMetadataShardConfig {
@@ -1829,8 +1835,8 @@ mod tests {
         append_cluster_raft_command(
             &cluster_paths,
             &local,
-            sinomo_kv::KvCommand::Op(
-                sinomo_kv::KvOp::put_serde(
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
                     metadata_shard_key(&file_system.file_system_id, "root"),
                     &shard,
                     None,
@@ -1862,7 +1868,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_cursor")
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_cursor")
                 .expect("cluster");
         let local =
             NodeId::from_legacy_named("node_dfs_metadata_publish_local").expect("local node");
@@ -1884,10 +1890,11 @@ mod tests {
             now,
         );
         remote_member.capabilities =
-            sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
         remote_member.endpoints = vec![test_endpoint(&remote, "192.0.2.21:21353")];
         state.members.push(remote_member);
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
 
         let file_system = distributed_sifs(local.clone());
         let shard_id = DfsMetadataShardId::new("root");
@@ -1903,8 +1910,8 @@ mod tests {
         append_cluster_raft_command(
             &cluster_paths,
             &local,
-            sinomo_kv::KvCommand::Op(
-                sinomo_kv::KvOp::put_serde(
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
                     metadata_shard_key(&file_system.file_system_id, "root"),
                     &shard,
                     None,
@@ -2019,7 +2026,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_all")
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_all")
                 .expect("cluster");
         let local =
             NodeId::from_legacy_named("node_dfs_metadata_publish_all_local").expect("local node");
@@ -2041,10 +2048,11 @@ mod tests {
             now,
         );
         remote_member.capabilities =
-            sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
         remote_member.endpoints = vec![test_endpoint(&remote, "192.0.2.22:21353")];
         state.members.push(remote_member);
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
 
         let file_system = distributed_sifs(local.clone());
         for shard_name in ["root", "services"] {
@@ -2066,8 +2074,8 @@ mod tests {
             append_cluster_raft_command(
                 &cluster_paths,
                 &local,
-                sinomo_kv::KvCommand::Op(
-                    sinomo_kv::KvOp::put_serde(
+                sinomo_core::kv::KvCommand::Op(
+                    sinomo_core::kv::KvOp::put_serde(
                         metadata_shard_key(&file_system.file_system_id, shard_name),
                         &shard,
                         None,
@@ -2153,7 +2161,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_drain")
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_drain")
                 .expect("cluster");
         let local =
             NodeId::from_legacy_named("node_dfs_metadata_publish_drain_local").expect("local node");
@@ -2175,10 +2183,11 @@ mod tests {
             now,
         );
         remote_member.capabilities =
-            sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
         remote_member.endpoints = vec![test_endpoint(&remote, "192.0.2.23:21353")];
         state.members.push(remote_member);
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
 
         let file_system = distributed_sifs(local.clone());
         let shard_id = DfsMetadataShardId::new("root");
@@ -2194,8 +2203,8 @@ mod tests {
         append_cluster_raft_command(
             &cluster_paths,
             &local,
-            sinomo_kv::KvCommand::Op(
-                sinomo_kv::KvOp::put_serde(
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
                     metadata_shard_key(&file_system.file_system_id, "root"),
                     &shard,
                     None,
@@ -2306,7 +2315,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_bad_ack")
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_bad_ack")
                 .expect("cluster");
         let local =
             NodeId::from_legacy_named("node_dfs_metadata_publish_bad_ack_local").expect("local");
@@ -2328,10 +2337,11 @@ mod tests {
             now,
         );
         remote_member.capabilities =
-            sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
         remote_member.endpoints = vec![test_endpoint(&remote, "192.0.2.24:21353")];
         state.members.push(remote_member);
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
 
         let file_system = distributed_sifs(local.clone());
         let shard_id = DfsMetadataShardId::new("root");
@@ -2347,8 +2357,8 @@ mod tests {
         append_cluster_raft_command(
             &cluster_paths,
             &local,
-            sinomo_kv::KvCommand::Op(
-                sinomo_kv::KvOp::put_serde(
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
                     metadata_shard_key(&file_system.file_system_id, "root"),
                     &shard,
                     None,
@@ -2407,9 +2417,10 @@ mod tests {
         data_dir.ensure_root_layout().expect("root layout");
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
-        let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_rejected")
-                .expect("cluster");
+        let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(
+            "cluster_dfs_metadata_publish_rejected",
+        )
+        .expect("cluster");
         let local =
             NodeId::from_legacy_named("node_dfs_metadata_publish_rejected_local").expect("local");
         let remote =
@@ -2430,10 +2441,11 @@ mod tests {
             now,
         );
         remote_member.capabilities =
-            sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
         remote_member.endpoints = vec![test_endpoint(&remote, "192.0.2.25:21353")];
         state.members.push(remote_member);
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
 
         let file_system = distributed_sifs(local.clone());
         let shard_id = DfsMetadataShardId::new("root");
@@ -2449,8 +2461,8 @@ mod tests {
         append_cluster_raft_command(
             &cluster_paths,
             &local,
-            sinomo_kv::KvCommand::Op(
-                sinomo_kv::KvOp::put_serde(
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
                     metadata_shard_key(&file_system.file_system_id, "root"),
                     &shard,
                     None,
@@ -2521,7 +2533,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_metadata_snapshot_repair")
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_metadata_snapshot_repair")
                 .expect("cluster");
         let local =
             NodeId::from_legacy_named("node_dfs_metadata_snapshot_repair_local").expect("local");
@@ -2543,10 +2555,11 @@ mod tests {
             now,
         );
         remote_member.capabilities =
-            sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
         remote_member.endpoints = vec![test_endpoint(&remote, "192.0.2.26:21353")];
         state.members.push(remote_member);
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
 
         let file_system = distributed_sifs(local.clone());
         let shard_id = DfsMetadataShardId::new("root");
@@ -2562,8 +2575,8 @@ mod tests {
         append_cluster_raft_command(
             &cluster_paths,
             &local,
-            sinomo_kv::KvCommand::Op(
-                sinomo_kv::KvOp::put_serde(
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
                     metadata_shard_key(&file_system.file_system_id, "root"),
                     &shard,
                     None,
@@ -2652,7 +2665,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_bounds")
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_bounds")
                 .expect("cluster");
         let local =
             NodeId::from_legacy_named("node_dfs_metadata_publish_bounds_local").expect("local");
@@ -2674,13 +2687,13 @@ mod tests {
             now,
         );
         remote_member.capabilities =
-            sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
         let lan_primary = test_endpoint(&remote, "10.0.0.10:21353");
         let lan_secondary = test_endpoint(&remote, "10.0.0.11:21353");
         let mut public = test_endpoint(&remote, "203.0.113.10:21353");
         public.privacy = ClusterEndpointPrivacy::InternetDirect;
         let iroh = ClusterEndpointRecord {
-            endpoint_id: sinomo_network::ClusterEndpointId::derived(
+            endpoint_id: sinomo_core::network::ClusterEndpointId::derived(
                 "sinomo.test.endpoint.iroh",
                 remote.as_str(),
             ),
@@ -2700,7 +2713,8 @@ mod tests {
             lan_primary.clone(),
         ];
         state.members.push(remote_member);
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
 
         let file_system = distributed_sifs(local.clone());
         let shard_id = DfsMetadataShardId::new("root");
@@ -2716,8 +2730,8 @@ mod tests {
         append_cluster_raft_command(
             &cluster_paths,
             &local,
-            sinomo_kv::KvCommand::Op(
-                sinomo_kv::KvOp::put_serde(
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
                     metadata_shard_key(&file_system.file_system_id, "root"),
                     &shard,
                     None,
@@ -2786,16 +2800,16 @@ mod tests {
         append_cluster_raft_command(
             &cluster_paths,
             &replica,
-            sinomo_kv::KvCommand::Txn(sinomo_kv::KvTxn {
+            sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
                 compares: Vec::new(),
                 success: vec![
-                    sinomo_kv::KvOp::put_serde(
+                    sinomo_core::kv::KvOp::put_serde(
                         file_system_config_key(&file_system_id),
                         &DfsFileSystemConfig::from(&file_system),
                         None,
                     )
                     .expect("filesystem config op"),
-                    sinomo_kv::KvOp::put_serde(
+                    sinomo_core::kv::KvOp::put_serde(
                         metadata_shard_key(&file_system_id, "root"),
                         &shard,
                         None,
@@ -3030,8 +3044,9 @@ mod tests {
     #[test]
     fn dfs_service_members_include_authorized_voters_and_learners_only() {
         let now = OffsetDateTime::now_utc();
-        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_dfs_service_members")
-            .expect("cluster");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_service_members")
+                .expect("cluster");
         let local = NodeId::from_legacy_named("node_dfs_service_local").expect("local");
         let voter = NodeId::from_legacy_named("node_dfs_service_voter").expect("voter");
         let learner = NodeId::from_legacy_named("node_dfs_service_learner").expect("learner");
@@ -3133,7 +3148,8 @@ mod tests {
                 "node_dfs_default_root_remote_b",
             ],
         );
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
         let file_system = sinomo_dfs::default_cluster_sifs(&state);
         let expected_primary = sinomo_dfs::stable_dfs_service_node_ids(&state)[0].clone();
         let old_shard = DfsMetadataShardConfig {
@@ -3148,8 +3164,8 @@ mod tests {
         append_cluster_raft_command(
             &cluster_paths,
             &state.local_node_id,
-            sinomo_kv::KvCommand::Op(
-                sinomo_kv::KvOp::put_serde(
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
                     metadata_shard_key(&file_system.file_system_id, "root"),
                     &old_shard,
                     None,
@@ -3181,8 +3197,8 @@ mod tests {
         append_cluster_raft_command(
             &cluster_paths,
             &state.local_node_id,
-            sinomo_kv::KvCommand::Op(
-                sinomo_kv::KvOp::put_serde(
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
                     metadata_shard_key(&file_system.file_system_id, "root"),
                     &migrated,
                     None,
@@ -3217,7 +3233,8 @@ mod tests {
                 "node_dfs_default_path_shards_remote_b",
             ],
         );
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
         let file_system = sinomo_dfs::default_cluster_sifs(&state);
         let runtime = daemon_test_runtime("default-dfs-bootstrap-default-path-shards");
         let mut host = test_default_cluster_bootstrap_host(
@@ -3276,7 +3293,8 @@ mod tests {
                 "node_dfs_default_all_replicas_remote_e",
             ],
         );
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
         let file_system = sinomo_dfs::default_cluster_sifs(&state);
         let service_nodes = sinomo_dfs::stable_dfs_service_node_ids(&state);
         assert_eq!(service_nodes.len(), 6);
@@ -3329,7 +3347,8 @@ mod tests {
         let bootstrap_primary = service_nodes[0].clone();
         let target_primary = service_nodes[1].clone();
         state.local_node_id = bootstrap_primary.clone();
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
         let file_system = sinomo_dfs::default_cluster_sifs(&state);
         let old_services_shard = DfsMetadataShardConfig {
             file_system_id: file_system.file_system_id.clone(),
@@ -3345,8 +3364,8 @@ mod tests {
         append_cluster_raft_command(
             &cluster_paths,
             &state.local_node_id,
-            sinomo_kv::KvCommand::Op(
-                sinomo_kv::KvOp::put_serde(
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
                     metadata_shard_key(&file_system.file_system_id, "services"),
                     &old_services_shard,
                     None,
@@ -3408,7 +3427,8 @@ mod tests {
         let bootstrap_primary = service_nodes[0].clone();
         let target_primary = service_nodes[1].clone();
         state.local_node_id = bootstrap_primary.clone();
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
         let file_system = sinomo_dfs::default_cluster_sifs(&state);
         let services_shard = DfsMetadataShardConfig {
             file_system_id: file_system.file_system_id.clone(),
@@ -3428,8 +3448,8 @@ mod tests {
         append_cluster_raft_command(
             &cluster_paths,
             &state.local_node_id,
-            sinomo_kv::KvCommand::Op(
-                sinomo_kv::KvOp::put_serde(
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
                     metadata_shard_key(&file_system.file_system_id, "services"),
                     &services_shard,
                     None,
@@ -3492,9 +3512,10 @@ mod tests {
         data_dir.ensure_root_layout().expect("data dir");
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
-        let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_bootstrap_migrate_services")
-                .expect("cluster");
+        let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(
+            "cluster_dfs_bootstrap_migrate_services",
+        )
+        .expect("cluster");
         let local = NodeId::from_legacy_named("node_dfs_bootstrap_migrate_services").expect("node");
         let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
@@ -3505,9 +3526,10 @@ mod tests {
             now,
         );
         state.members[0].capabilities =
-            sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("sync raft");
         let file_system = sinomo_dfs::default_cluster_sifs(&state);
         let mut legacy_object = distributed_sifs_bootstrap_objects(local.clone())
@@ -3541,7 +3563,7 @@ mod tests {
             ))
             .expect("bootstrap dfs");
 
-        let shards = sinomo_kv::read_cluster_kv_prefix_entries(
+        let shards = sinomo_core::kv::read_cluster_kv_prefix_entries(
             &cluster_paths.kv_paths(),
             &format!(
                 "{}/",
@@ -3588,7 +3610,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_bootstrap_non_primary")
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_bootstrap_non_primary")
                 .expect("cluster");
         let mut node_ids = [
             NodeId::from_legacy_named("node_dfs_bootstrap_non_primary_a").expect("node a"),
@@ -3615,7 +3637,8 @@ mod tests {
                 now,
             ));
         assert_ne!(sinomo_dfs::default_cluster_sifs_owner(&state), local);
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
 
         let runtime = daemon_test_runtime("default-dfs-bootstrap-non-primary");
         runtime
@@ -3651,7 +3674,8 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let local = NodeId::from_legacy_named("node_dfs_smoke_single").expect("local node");
         let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_smoke_single").expect("cluster");
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_smoke_single")
+                .expect("cluster");
         let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id,
             "dfs smoke single",
@@ -3661,9 +3685,10 @@ mod tests {
             now,
         );
         state.members[0].capabilities =
-            sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("sync raft");
         let runtime = daemon_test_runtime("daemon-dfs-smoke-single-node");
         runtime
@@ -3703,8 +3728,9 @@ mod tests {
     #[test]
     fn dfs_service_endpoint_prefers_internet_direct_for_remote_members() {
         let now = OffsetDateTime::now_utc();
-        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_dfs_service_endpoint")
-            .expect("cluster");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_service_endpoint")
+                .expect("cluster");
         let local = NodeId::from_legacy_named("node_dfs_service_endpoint_local").expect("local");
         let remote = NodeId::from_legacy_named("node_dfs_service_endpoint_remote").expect("remote");
         let state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -3723,7 +3749,7 @@ mod tests {
             now,
         );
         member.endpoints = vec![
-            sinomo_network::daemon_lan_endpoint(&remote, "10.0.0.41:21353".to_string(), 10),
+            sinomo_core::network::daemon_lan_endpoint(&remote, "10.0.0.41:21353".to_string(), 10),
             ClusterEndpointRecord {
                 endpoint_id: sinomo_core::Id::from_legacy_named(
                     "endpoint_dfs_service_internet_direct",
@@ -3760,8 +3786,9 @@ mod tests {
         address: &str,
     ) {
         let now = OffsetDateTime::now_utc();
-        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_daemon_dfs_protocol")
-            .expect("cluster");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_dfs_protocol")
+                .expect("cluster");
         let mut remote = sinomo_core::ClusterMemberRecord::local_non_voting(
             cluster_id.clone(),
             remote_node_id.clone(),
@@ -3769,13 +3796,15 @@ mod tests {
             format!("pk-{remote_node_id}"),
             now,
         );
-        remote.capabilities = sinomo_node::main_daemon_capabilities(&remote.role);
+        remote.capabilities = sinomo_core::node::main_daemon_capabilities(&remote.role);
         remote.allowed_capabilities = remote.capabilities.clone();
-        remote.endpoints.push(sinomo_network::daemon_lan_endpoint(
-            remote_node_id,
-            address.to_string(),
-            5,
-        ));
+        remote
+            .endpoints
+            .push(sinomo_core::network::daemon_lan_endpoint(
+                remote_node_id,
+                address.to_string(),
+                5,
+            ));
         write_test_cluster_state_with_members(data_root, local_node_id, vec![remote]);
     }
 
@@ -3787,8 +3816,9 @@ mod tests {
         let data_dir = SinomoDataDir::new(data_root);
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
-        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_daemon_dfs_protocol")
-            .expect("cluster");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_dfs_protocol")
+                .expect("cluster");
         let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id,
             "daemon dfs protocol",
@@ -3798,7 +3828,8 @@ mod tests {
             now,
         );
         state.members.extend(members);
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
     }
 
     fn test_cluster_state_with_members(
@@ -3808,7 +3839,7 @@ mod tests {
     ) -> sinomo_core::ClusterBootstrapState {
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named(cluster_name).expect("cluster id");
+            sinomo_core::node::ClusterId::from_legacy_named(cluster_name).expect("cluster id");
         let local = NodeId::from_legacy_named(local_name).expect("local node");
         let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
@@ -3835,7 +3866,7 @@ mod tests {
 
     fn test_endpoint(node_id: &NodeId, address: &str) -> ClusterEndpointRecord {
         ClusterEndpointRecord {
-            endpoint_id: sinomo_network::ClusterEndpointId::derived(
+            endpoint_id: sinomo_core::network::ClusterEndpointId::derived(
                 "sinomo.test.endpoint",
                 format!("{}\0{address}", node_id.as_str()),
             ),

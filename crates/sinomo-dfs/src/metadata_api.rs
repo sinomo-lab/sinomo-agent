@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::intent::write_intent_status_is_active;
 use crate::metadata_error::Result;

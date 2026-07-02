@@ -9,9 +9,9 @@ use crate::{
 };
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sinomo_events::EventId;
-use sinomo_node::NodeId;
-use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
+use sinomo_core::events::EventId;
+use sinomo_core::node::NodeId;
+use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
@@ -1706,8 +1706,8 @@ mod tests {
         DfsObjectKind, DfsObjectMetadata, DfsReplicaReceiptRecord, DfsReplicationPolicy,
         DfsWriteIntentRecord, LocalSobjMetadataBackend,
     };
+    use sinomo_core::events::EventId;
     use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt};
-    use sinomo_events::EventId;
 
     #[test]
     fn operator_inspector_reports_status_object_conflicts_and_repairs() {

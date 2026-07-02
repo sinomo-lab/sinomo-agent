@@ -5,7 +5,7 @@
 //! maintenance against the service's stores, and schedule metadata journal
 //! replication to configured shard replicas.
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::*;
 

@@ -32,9 +32,9 @@ use crate::{
     NetworkedDfsReadOutcome, NetworkedDfsService, NetworkedDfsWriteOutcome, sifs_file_system_id,
 };
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
+use sinomo_core::events::EventId;
+use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
-use sinomo_events::EventId;
-use sinomo_node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::time::{Duration, Instant};

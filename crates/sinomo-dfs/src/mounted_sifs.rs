@@ -4,10 +4,12 @@
 //! networked DFS service from a local data directory.
 
 use sinomo_core::ClusterBootstrapState;
-use sinomo_kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
-use sinomo_local::SinomoDataDir;
-use sinomo_network::{ClusterPaths, NetworkError, ObjectRpcRequest, ObjectRpcResponse};
-use sinomo_node::NodeId;
+#[allow(unused_imports)]
+use sinomo_core::cluster::ClusterKvPathsExt;
+use sinomo_core::kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::{ClusterPaths, NetworkError, ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_core::node::NodeId;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,7 +48,7 @@ pub fn open_mounted_sifs_service(
         })?;
     let cluster_paths = ClusterPaths::new(&data_dir);
     let cluster_state = if cluster_paths.state.exists() {
-        sinomo_network::read_cluster_state_without_kv(&cluster_paths).ok()
+        sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).ok()
     } else {
         None
     };
@@ -64,7 +66,7 @@ pub fn open_mounted_sifs_service(
     });
     let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
     let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
-    let control_plane = if cluster_paths.kv_snapshot.exists() {
+    let control_plane = if cluster_paths.kv_paths().snapshot.exists() {
         Some(Box::new(MountedSifsControlPlaneKvClient {
             data_dir: data_dir.clone(),
             cluster_paths: cluster_paths.clone(),
@@ -106,7 +108,7 @@ fn mounted_sifs_replica_candidates(
 ) -> Vec<DfsNodeId> {
     let mut candidates = vec![local_node_id];
     if cluster_state.is_some()
-        && let Ok(entries) = sinomo_kv::read_cluster_kv_prefix_entries(
+        && let Ok(entries) = sinomo_core::kv::read_cluster_kv_prefix_entries(
             &cluster_paths.kv_paths(),
             content_services_prefix(),
         )
@@ -131,11 +133,11 @@ struct MountedSifsControlPlaneKvClient {
 
 impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-        sinomo_kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
+        sinomo_core::kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
     }
 
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-        sinomo_kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
+        sinomo_core::kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
     }
 
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
@@ -152,11 +154,11 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
     }
 
     fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-        let state = sinomo_network::read_cluster_state(&self.cluster_paths)
+        let state = sinomo_core::cluster::read_cluster_state(&self.cluster_paths)
             .map_err(|source| mounted_sifs_kv_io_error(&self.cluster_paths, source))?;
         let rpc_payload =
-            sinomo_kv::cluster_kv_txn_rpc_payload(&txn).map_err(|source| KvError::Io {
-                path: self.cluster_paths.kv_snapshot.display().to_string(),
+            sinomo_core::kv::cluster_kv_txn_rpc_payload(&txn).map_err(|source| KvError::Io {
+                path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
                 detail: source.to_string(),
             })?;
         let request = object_rpc_request_from_kv_payload(rpc_payload);
@@ -164,19 +166,19 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
             .enable_all()
             .build()
             .map_err(|source| KvError::Io {
-                path: self.cluster_paths.kv_snapshot.display().to_string(),
+                path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
                 detail: format!("mounted SIFS cluster KV txn runtime: {source}"),
             })?;
         let mut host = MountedSifsObjectRpcHost {
             data_dir: self.data_dir.clone(),
             runtime: runtime.handle().clone(),
         };
-        let options = sinomo_network::ClusterObjectRpcOptions::new(
-            sinomo_network::DaemonRpcTimeouts::connect_and_idle(
+        let options = sinomo_core::network::ClusterObjectRpcOptions::new(
+            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
                 MOUNTED_SIFS_CLUSTER_KV_TXN_TIMEOUT,
             ),
         );
-        let mut client = sinomo_network::ClusterObjectRpcClient::routed(
+        let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
             &mut host,
             runtime.handle(),
             &self.cluster_paths,
@@ -190,16 +192,18 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
         runtime.shutdown_timeout(Duration::from_millis(250));
         let response = response_result
             .map_err(|source| mounted_sifs_kv_io_error(&self.cluster_paths, source))?;
-        sinomo_kv::decode_cluster_kv_txn_rpc_body(&response.body).map_err(|source| KvError::Io {
-            path: self.cluster_paths.kv_snapshot.display().to_string(),
-            detail: source.to_string(),
+        sinomo_core::kv::decode_cluster_kv_txn_rpc_body(&response.body).map_err(|source| {
+            KvError::Io {
+                path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
+                detail: source.to_string(),
+            }
         })
     }
 }
 
 fn mounted_sifs_kv_io_error(cluster_paths: &ClusterPaths, source: NetworkError) -> KvError {
     KvError::Io {
-        path: cluster_paths.kv_snapshot.display().to_string(),
+        path: cluster_paths.kv_paths().snapshot.display().to_string(),
         detail: source.to_string(),
     }
 }
@@ -218,20 +222,25 @@ impl MountedSifsPeerTransport {
         options: DfsObjectRpcSendOptions,
         runtime: &tokio::runtime::Handle,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        let state = sinomo_network::read_cluster_state(&self.cluster_paths)?;
+        let state = sinomo_core::cluster::read_cluster_state(&self.cluster_paths)?;
         let mut host = MountedSifsObjectRpcHost {
             data_dir: self.data_dir.clone(),
             runtime: runtime.clone(),
         };
-        let mut client =
-            sinomo_network::ClusterObjectRpcClient::routed(&mut host, runtime, &self.cluster_paths);
+        let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
+            &mut host,
+            runtime,
+            &self.cluster_paths,
+        );
         let response = client
             .call_target(
                 &state,
                 target_node_id,
                 request,
-                sinomo_network::ClusterObjectRpcOptions::new(
-                    sinomo_network::DaemonRpcTimeouts::connect_and_idle(options.connect_timeout),
+                sinomo_core::network::ClusterObjectRpcOptions::new(
+                    sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
+                        options.connect_timeout,
+                    ),
                 ),
             )
             .await?;
@@ -305,18 +314,18 @@ struct MountedSifsObjectRpcHost {
     runtime: tokio::runtime::Handle,
 }
 
-impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for MountedSifsObjectRpcHost {
+impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for MountedSifsObjectRpcHost {
     fn sign_endpoint_rpc_request_async<'a>(
         &'a mut self,
         request: &'a ObjectRpcRequest,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+    ) -> sinomo_core::network::ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
         let data_dir = self.data_dir.clone();
         let request = request.clone();
         let runtime = self.runtime.clone();
         Box::pin(async move {
             runtime
                 .spawn_blocking(move || {
-                    sinomo_network::sign_daemon_rpc_request_from_data_dir(&data_dir, &request)
+                    sinomo_core::network::sign_daemon_rpc_request_from_data_dir(&data_dir, &request)
                 })
                 .await
                 .map_err(|source| NetworkError::Io {

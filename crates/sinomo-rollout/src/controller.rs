@@ -6,14 +6,15 @@ use crate::{
     write_rollout_telemetry_advance_state,
 };
 use serde::{Deserialize, Serialize};
+use sinomo_core::events::{
+    EventId, EventSequence, EventStore, ReplayDirection, ReplayQuery, StoredEvent,
+};
+use sinomo_core::node::NodeId;
 use sinomo_core::{
     ArtifactManifest, Confidence, EvaluationMetric, EvaluationOutcome, EvaluationScorecard,
     EventEnvelope, EventKind, HotSwapState, LatencyClass, MetricValue, ModuleLoaderState,
     PolicyDecision, PrivacyClass, RollbackTrigger, RolloutPlan, RolloutStrategy, RoutingMetadata,
     RoutingScope, Salience, Source, TrustRing,
-};
-use sinomo_events::{
-    EventId, EventSequence, EventStore, ReplayDirection, ReplayQuery, StoredEvent,
 };
 use sinomo_module::{
     ArtifactId, MODULE_CRASH_EVENT_KIND, MODULE_INVOCATION_DECISION_EVENT_KIND,
@@ -22,7 +23,6 @@ use sinomo_module::{
     ModuleShadowTelemetryReport, module_loader_applied_at_now, module_loader_state_path,
     verify_artifact_signature, write_module_loader_runtime_state,
 };
-use sinomo_node::NodeId;
 use sinomo_registry::{TrustedArtifactSigner, authorize_artifact_signature};
 use std::path::PathBuf;
 use time::OffsetDateTime;
@@ -116,7 +116,7 @@ pub fn shadow_telemetry_scorecard_from_event_store<S>(
     state: &RolloutRuntimeState,
     event_store: &S,
     limit: usize,
-) -> Result<EvaluationScorecard, sinomo_events::EventStoreError>
+) -> Result<EvaluationScorecard, sinomo_core::events::EventStoreError>
 where
     S: EventStore,
 {
@@ -150,7 +150,7 @@ pub fn canary_telemetry_scorecard_from_event_store<S>(
     limit: usize,
     minimum_candidate_event_count: u64,
     maximum_candidate_latency_p95_ms: Option<u64>,
-) -> Result<EvaluationScorecard, sinomo_events::EventStoreError>
+) -> Result<EvaluationScorecard, sinomo_core::events::EventStoreError>
 where
     S: EventStore,
 {
@@ -510,7 +510,7 @@ fn canary_telemetry_events_from_event_store<S>(
     event_store: &S,
     after_sequence: Option<EventSequence>,
     event_limit: usize,
-) -> Result<Vec<StoredEvent>, sinomo_events::EventStoreError>
+) -> Result<Vec<StoredEvent>, sinomo_core::events::EventStoreError>
 where
     S: EventStore,
 {
@@ -548,7 +548,7 @@ fn rollout_telemetry_events_from_event_store<S>(
     telemetry_kind: &str,
     after_sequence: Option<EventSequence>,
     event_limit: usize,
-) -> Result<Vec<StoredEvent>, sinomo_events::EventStoreError>
+) -> Result<Vec<StoredEvent>, sinomo_core::events::EventStoreError>
 where
     S: EventStore,
 {
@@ -1386,7 +1386,7 @@ fn append_rollout_transition_event(
         detail: "rollout root has no parent data directory".to_string(),
     })?;
     let path = data_dir.join("events").join("event-log.jsonl");
-    let mut store = sinomo_events::JsonlEventStore::new(&path);
+    let mut store = sinomo_core::events::JsonlEventStore::new(&path);
     store
         .append(event)
         .map_err(|source| crate::RolloutError::Json {
@@ -1569,12 +1569,12 @@ fn rollout_stage_label(stage: &RolloutStage) -> &'static str {
 mod tests {
     use super::*;
     use crate::{RolloutPlanId, ScorecardId};
+    use sinomo_core::events::EventStore;
     use sinomo_core::{
         ActorKind, ActorRef, ArtifactManifest, ArtifactProvenance, CapabilityDiff, EvaluationGate,
         EvaluationGateResult, ModuleManifest, PolicyAction, PolicyDecision, RollbackPolicy,
         RollbackScope,
     };
-    use sinomo_events::EventStore;
     use sinomo_module::{
         ModuleId, read_module_loader_runtime_state, sign_artifact_manifest_with_node_identity,
     };
@@ -1639,7 +1639,7 @@ mod tests {
             rollout_plan(&node, &artifact_id, &module_id),
             active_artifact_id.clone(),
         );
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         event_store
             .append(module_shadow_decision_event(
                 &node,
@@ -1674,7 +1674,7 @@ mod tests {
         state.stage = RolloutStage::Canary;
         state.current_weight_bps = 500;
         state.loader_state.hot_swap_state = HotSwapState::ActiveCandidate;
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         event_store
             .append(module_invocation_decision_event(
                 &node,
@@ -1714,7 +1714,7 @@ mod tests {
             active_artifact_id.clone(),
         );
         crate::write_rollout_runtime_state(&paths, &state).expect("runtime state");
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         event_store
             .append(module_shadow_decision_event(
                 &node,
@@ -1795,7 +1795,7 @@ mod tests {
             active_artifact_id.clone(),
         );
         crate::write_rollout_runtime_state(&paths, &state).expect("runtime state");
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         event_store
             .append(module_shadow_decision_event(
                 &node,
@@ -1852,7 +1852,7 @@ mod tests {
         state.current_weight_bps = 500;
         state.loader_state.hot_swap_state = HotSwapState::ActiveCandidate;
         crate::write_rollout_runtime_state(&paths, &state).expect("runtime state");
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         event_store
             .append(module_invocation_decision_event(
                 &node,
@@ -1930,7 +1930,7 @@ mod tests {
         state.current_weight_bps = 500;
         state.loader_state.hot_swap_state = HotSwapState::ActiveCandidate;
         crate::write_rollout_runtime_state(&paths, &state).expect("runtime state");
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         event_store
             .append(module_user_correction_event(
                 &node,
@@ -1993,7 +1993,7 @@ mod tests {
         state.current_weight_bps = 500;
         state.loader_state.hot_swap_state = HotSwapState::ActiveCandidate;
         crate::write_rollout_runtime_state(&paths, &state).expect("runtime state");
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         event_store
             .append(module_runtime_failure_event(
                 &node,
@@ -2057,7 +2057,7 @@ mod tests {
         let candidate_artifact_id =
             ArtifactId::from_legacy_named("artifact_candidate").expect("candidate");
         let active_artifact_id = ArtifactId::from_legacy_named("artifact_active").expect("active");
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         for kind in [
             MODULE_CRASH_EVENT_KIND,
             MODULE_TIMEOUT_EVENT_KIND,
@@ -2117,7 +2117,7 @@ mod tests {
             ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
         let candidate_artifact_id =
             ArtifactId::from_legacy_named("artifact_candidate").expect("candidate");
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         event_store
             .append(module_invocation_decision_event(
                 &node,
@@ -2164,7 +2164,7 @@ mod tests {
         state.current_weight_bps = 500;
         state.loader_state.hot_swap_state = HotSwapState::ActiveCandidate;
         crate::write_rollout_runtime_state(&paths, &state).expect("runtime state");
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         let mut event =
             module_invocation_decision_event(&node, &module_id, &artifact_id, "candidate", None);
         event.payload["primary_latency_ms"] = serde_json::json!(250);
@@ -2215,7 +2215,7 @@ mod tests {
             active_artifact_id.clone(),
         );
         crate::write_rollout_runtime_state(&paths, &state).expect("runtime state");
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         event_store
             .append(module_shadow_decision_event(
                 &node,
@@ -2740,7 +2740,8 @@ mod tests {
         attestations: Vec<String>,
     ) -> (ArtifactManifest, TrustedArtifactSigner) {
         let (_identity_dir, identity_path) = unique_identity_path("rollout-artifact-signature");
-        let identity = sinomo_node::load_or_create_node_identity(&identity_path).expect("identity");
+        let identity =
+            sinomo_core::node::load_or_create_node_identity(&identity_path).expect("identity");
         let mut artifact = artifact_manifest(artifact_id, module_id, content_hash, attestations);
         artifact.signature =
             Some(sign_artifact_manifest_with_node_identity(&artifact, &identity).expect("sign"));

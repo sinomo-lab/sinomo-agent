@@ -1,5 +1,5 @@
 use crate::DaemonError;
-use sinomo_local::SinomoDataDir;
+use sinomo_core::local::SinomoDataDir;
 use std::fs;
 use std::path::PathBuf;
 

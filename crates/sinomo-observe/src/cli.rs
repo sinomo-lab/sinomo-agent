@@ -12,7 +12,7 @@ use sinomo_cli_registry::{
     CliCommandContext, CliCommandError, CliCommandHandler, CliCommandHelp, CliCommandMetadata,
     CliCommandPolicy, CliParseError,
 };
-use sinomo_local::SinomoDataDir;
+use sinomo_core::local::SinomoDataDir;
 use std::fmt;
 use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
@@ -73,8 +73,8 @@ struct ObserveControlOptions {
 type ObserveCliRpc = Arc<
     dyn Fn(
             Option<&str>,
-            sinomo_network::ObjectRpcRequest,
-        ) -> Result<sinomo_network::ObjectRpcResponse, String>
+            sinomo_core::network::ObjectRpcRequest,
+        ) -> Result<sinomo_core::network::ObjectRpcResponse, String>
         + Send
         + Sync,
 >;
@@ -96,8 +96,8 @@ pub fn observe_cli_command_handler() -> ObserveCliCommandHandler {
 pub fn observe_cli_command_handler_with_rpc(
     rpc: impl Fn(
         Option<&str>,
-        sinomo_network::ObjectRpcRequest,
-    ) -> Result<sinomo_network::ObjectRpcResponse, String>
+        sinomo_core::network::ObjectRpcRequest,
+    ) -> Result<sinomo_core::network::ObjectRpcResponse, String>
     + Send
     + Sync
     + 'static,
@@ -111,8 +111,8 @@ pub fn observe_cli_command_handler_with_rpc(
 pub fn observe_cli_command_handler_with_cluster_rpc(
     rpc: impl Fn(
         Option<&str>,
-        sinomo_network::ObjectRpcRequest,
-    ) -> Result<sinomo_network::ObjectRpcResponse, String>
+        sinomo_core::network::ObjectRpcRequest,
+    ) -> Result<sinomo_core::network::ObjectRpcResponse, String>
     + Send
     + Sync
     + 'static,
@@ -950,9 +950,10 @@ where
             "observe --all requires daemon-backed observe CLI registration",
         ));
     };
-    let request = sinomo_network::ObjectRpcRequest::encode_body(route, OBSERVE_RPC_CATEGORY, body)
-        .map_err(command_error)?
-        .with_trace_context_if_missing();
+    let request =
+        sinomo_core::network::ObjectRpcRequest::encode_body(route, OBSERVE_RPC_CATEGORY, body)
+            .map_err(command_error)?
+            .with_trace_context_if_missing();
     let mut responses = Vec::new();
     let mut errors = Vec::new();
     for target_node_id in targets {
@@ -1025,8 +1026,9 @@ where
             "observe target queries require daemon-backed observe CLI registration",
         ));
     };
-    let request = sinomo_network::ObjectRpcRequest::encode_body(route, OBSERVE_RPC_CATEGORY, body)
-        .map_err(command_error)?;
+    let request =
+        sinomo_core::network::ObjectRpcRequest::encode_body(route, OBSERVE_RPC_CATEGORY, body)
+            .map_err(command_error)?;
     let response = rpc(target_node_id, request).map_err(CliCommandError::new)?;
     response.decode_body().map_err(command_error)
 }

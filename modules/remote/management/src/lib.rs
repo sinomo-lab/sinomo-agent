@@ -488,6 +488,8 @@ pub fn remote_management_module_descriptor() -> sinomo_module_api::NativeModuleD
                 .iter()
                 .map(|capability| capability.to_string())
                 .collect(),
+            // Not a network module: no runtime transports.
+            network_transports: Vec::new(),
         },
     }
 }

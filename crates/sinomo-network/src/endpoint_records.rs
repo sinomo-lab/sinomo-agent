@@ -1,9 +1,39 @@
 use crate::ClusterPaths;
 use crate::error::NetworkError;
 use crate::prelude::*;
-use sinomo_node::cluster_endpoint_stable_eq;
+use sinomo_node::{cluster_endpoint_stable_eq, cluster_has_remote_peers};
 
-pub(crate) fn cleanup_cluster_iroh_endpoints(state: &mut ClusterBootstrapState) -> bool {
+/// True for an endpoint the local node learned over the LAN bridge rather
+/// than from a member advertisement: a TCP-ish observed endpoint whose
+/// address is a host:port string that does not parse as a socket address.
+pub(crate) fn locally_learned_bridge_route_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
+    matches!(
+        endpoint.transport,
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+    ) && endpoint.address.parse::<SocketAddr>().is_err()
+        && endpoint.address.contains(':')
+        && matches!(endpoint.source, ClusterEndpointSource::Observed)
+        && endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+}
+
+/// Whether the local node still needs to run join registration: it either has
+/// no member record yet, or its record is an unauthorized learner.
+pub fn cluster_state_needs_join_registration(state: &ClusterBootstrapState) -> bool {
+    state
+        .members
+        .iter()
+        .find(|member| member.node_id == state.local_node_id)
+        .is_none_or(|member| {
+            matches!(member.role, ClusterMemberRole::Learner) && !member.state.is_authorized()
+        })
+}
+
+/// A settled solo cluster: no remote peers and no pending join registration.
+pub fn cluster_is_settled_solo(state: &ClusterBootstrapState) -> bool {
+    !cluster_has_remote_peers(state) && !cluster_state_needs_join_registration(state)
+}
+
+pub fn cleanup_cluster_iroh_endpoints(state: &mut ClusterBootstrapState) -> bool {
     state.members.iter_mut().fold(false, |changed, member| {
         cleanup_member_iroh_endpoints(member) || changed
     })
@@ -34,7 +64,7 @@ fn apply_local_iroh_endpoint_record_to_state(
     changed
 }
 
-pub(crate) fn refresh_local_iroh_endpoints_from_disk(
+pub fn refresh_local_iroh_endpoints_from_disk(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
     timestamp: OffsetDateTime,
@@ -52,7 +82,7 @@ pub(crate) fn refresh_local_iroh_endpoints_from_disk(
     Ok(changed)
 }
 
-pub(crate) async fn refresh_local_iroh_endpoints_from_disk_async(
+pub async fn refresh_local_iroh_endpoints_from_disk_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
@@ -102,7 +132,7 @@ fn fold_local_shadow_iroh_endpoint_node_id(
     }
 }
 
-pub(crate) fn cleanup_member_iroh_endpoints(member: &mut ClusterMemberRecord) -> bool {
+pub fn cleanup_member_iroh_endpoints(member: &mut ClusterMemberRecord) -> bool {
     let original = member.endpoints.clone();
     let mut endpoints: Vec<ClusterEndpointRecord> = Vec::new();
     let mut iroh_stable_flags: Vec<bool> = Vec::new();
@@ -164,7 +194,7 @@ fn iroh_endpoint_preference_rank(endpoint: &ClusterEndpointRecord, was_stable: b
     (stable_rank, reachability_rank)
 }
 
-pub(crate) fn upsert_member_endpoint(
+pub fn upsert_member_endpoint(
     member: &mut ClusterMemberRecord,
     mut endpoint: ClusterEndpointRecord,
 ) -> bool {
@@ -206,7 +236,7 @@ pub(crate) fn upsert_member_endpoint(
     }
 }
 
-pub(crate) fn iroh_endpoint_public_key(endpoint: &ClusterEndpointRecord) -> Option<String> {
+pub fn iroh_endpoint_public_key(endpoint: &ClusterEndpointRecord) -> Option<String> {
     if endpoint.transport != ClusterTransportKind::Iroh {
         return None;
     }

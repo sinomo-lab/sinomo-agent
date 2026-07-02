@@ -1,5 +1,5 @@
 use crate::internal::*;
-use sinomo_kv::InProcessKvStore;
+use sinomo_core::kv::InProcessKvStore;
 
 #[test]
 fn sandbox_policy_denied_event_reports_denial_shape() {
@@ -860,10 +860,10 @@ fn sandbox_policy_config_rejects_invalid_allowed_capability_on_write_and_read() 
 
     let entry = KvEntry {
         key: SANDBOX_POLICY_CONFIG_KV_KEY.to_string(),
-        value: sinomo_kv::encode_kv_value(&config).expect("encode invalid policy"),
-        create_revision: sinomo_kv::KvRevision(1),
-        modify_revision: sinomo_kv::KvRevision(1),
-        version: sinomo_kv::KvVersion(1),
+        value: sinomo_core::kv::encode_kv_value(&config).expect("encode invalid policy"),
+        create_revision: sinomo_core::kv::KvRevision(1),
+        modify_revision: sinomo_core::kv::KvRevision(1),
+        version: sinomo_core::kv::KvVersion(1),
         lease_id: None,
     };
     let read_error = sandbox_policy_config_from_cluster_kv_entries(&[entry])

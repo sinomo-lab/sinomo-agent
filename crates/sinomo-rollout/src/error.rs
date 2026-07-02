@@ -78,8 +78,8 @@ impl fmt::Display for RolloutError {
 
 impl std::error::Error for RolloutError {}
 
-impl From<sinomo_events::EventStoreError> for RolloutError {
-    fn from(error: sinomo_events::EventStoreError) -> Self {
+impl From<sinomo_core::events::EventStoreError> for RolloutError {
+    fn from(error: sinomo_core::events::EventStoreError) -> Self {
         Self::Object {
             path: "events/event-log.jsonl".to_string(),
             detail: error.to_string(),

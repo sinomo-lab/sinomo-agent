@@ -2,12 +2,12 @@ use crate::error::NetworkError;
 use crate::prelude::*;
 use crate::rpc::ObjectRpcRequest;
 use arc_swap::ArcSwap;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::future::Future;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::pin::Pin;
 use std::sync::Condvar;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::time::Instant;
 
 fn try_reserve_vec_deque<T>(
@@ -24,7 +24,7 @@ fn try_reserve_vec_deque<T>(
 }
 
 #[derive(Clone, Debug, Default)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct PeerRegistry {
     cluster_id: Option<ClusterId>,
     nodes: BTreeMap<NodeId, NodeProfile>,
@@ -37,7 +37,7 @@ pub struct PeerRegistry {
     routable_sessions: BTreeMap<SessionId, BTreeSet<NodeId>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl PeerRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -268,13 +268,13 @@ impl PeerRegistry {
 }
 
 #[derive(Clone, Debug, Default)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct InProcessRouter {
     registry: PeerRegistry,
     next_delivery_id: u64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl InProcessRouter {
     pub fn new(registry: PeerRegistry) -> Self {
         Self {
@@ -346,14 +346,14 @@ impl InProcessRouter {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct NodeEndpoint {
     pub node_id: NodeId,
     pub transport: TransportKind,
     pub address: String,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl NodeEndpoint {
     pub fn in_process(node_id: NodeId) -> Self {
         Self {
@@ -374,7 +374,7 @@ impl NodeEndpoint {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub enum TransportKind {
     InProcess,
     Loopback,
@@ -386,18 +386,18 @@ pub enum TransportKind {
     HttpsRelay,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl TransportKind {
-    pub fn from_cluster_transport(transport: &sinomo_core::ClusterTransportKind) -> Self {
+    pub fn from_cluster_transport(transport: &sinomo_base::ClusterTransportKind) -> Self {
         match transport {
-            sinomo_core::ClusterTransportKind::InProcess => Self::InProcess,
-            sinomo_core::ClusterTransportKind::Loopback => Self::Loopback,
-            sinomo_core::ClusterTransportKind::LanTcp => Self::Tcp,
-            sinomo_core::ClusterTransportKind::LanQuic => Self::Quic,
-            sinomo_core::ClusterTransportKind::Iroh => Self::Iroh,
-            sinomo_core::ClusterTransportKind::WebRtc => Self::WebRtc,
-            sinomo_core::ClusterTransportKind::TurnRelay => Self::TurnRelay,
-            sinomo_core::ClusterTransportKind::HttpsRelay => Self::HttpsRelay,
+            sinomo_base::ClusterTransportKind::InProcess => Self::InProcess,
+            sinomo_base::ClusterTransportKind::Loopback => Self::Loopback,
+            sinomo_base::ClusterTransportKind::LanTcp => Self::Tcp,
+            sinomo_base::ClusterTransportKind::LanQuic => Self::Quic,
+            sinomo_base::ClusterTransportKind::Iroh => Self::Iroh,
+            sinomo_base::ClusterTransportKind::WebRtc => Self::WebRtc,
+            sinomo_base::ClusterTransportKind::TurnRelay => Self::TurnRelay,
+            sinomo_base::ClusterTransportKind::HttpsRelay => Self::HttpsRelay,
         }
     }
 }
@@ -450,14 +450,14 @@ pub enum EndpointCandidateStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct PeerState {
     pub endpoint: NodeEndpoint,
     pub status: PeerStatus,
     pub link: LinkState,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl PeerState {
     pub fn new(endpoint: NodeEndpoint) -> Self {
         Self {
@@ -470,7 +470,7 @@ impl PeerState {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub enum PeerStatus {
     Healthy,
     Degraded,
@@ -479,7 +479,7 @@ pub enum PeerStatus {
     Unknown,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl PeerStatus {
     pub fn can_route_reactive(&self) -> bool {
         matches!(self, Self::Healthy | Self::Degraded | Self::Unknown)
@@ -487,14 +487,14 @@ impl PeerStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct LinkState {
     pub peer_node_id: NodeId,
     pub last_seen_tick: Option<u64>,
     pub missed_heartbeats: u16,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl LinkState {
     pub fn new(peer_node_id: NodeId) -> Self {
         Self {
@@ -506,13 +506,13 @@ impl LinkState {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct HeartbeatPolicy {
     pub suspect_after_missed: u16,
     pub offline_after_missed: u16,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Default for HeartbeatPolicy {
     fn default() -> Self {
         Self {
@@ -523,29 +523,29 @@ impl Default for HeartbeatPolicy {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg(test)]
-pub(crate) struct Heartbeat {
-    pub(crate) node_id: NodeId,
-    pub(crate) tick: u64,
+#[cfg(any(test, feature = "test-support"))]
+pub struct Heartbeat {
+    pub node_id: NodeId,
+    pub tick: u64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash)]
-#[cfg(test)]
-pub(crate) struct MeshMessageId(pub(crate) u64);
+#[cfg(any(test, feature = "test-support"))]
+pub struct MeshMessageId(pub u64);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg(test)]
-pub(crate) struct MeshMessage {
-    pub(crate) message_id: MeshMessageId,
-    pub(crate) origin_node_id: NodeId,
-    pub(crate) target_node_id: NodeId,
-    pub(crate) body: MeshMessageBody,
+#[cfg(any(test, feature = "test-support"))]
+pub struct MeshMessage {
+    pub message_id: MeshMessageId,
+    pub origin_node_id: NodeId,
+    pub target_node_id: NodeId,
+    pub body: MeshMessageBody,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-#[cfg(test)]
-pub(crate) enum MeshMessageBody {
+#[cfg(any(test, feature = "test-support"))]
+pub enum MeshMessageBody {
     Event {
         delivery_id: RouteDeliveryId,
         event: Box<EventEnvelope>,
@@ -555,39 +555,39 @@ pub(crate) enum MeshMessageBody {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[cfg(test)]
-pub(crate) struct EventFrameId(pub(crate) u64);
+#[cfg(any(test, feature = "test-support"))]
+pub struct EventFrameId(pub u64);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg(test)]
-pub(crate) struct EventFrame {
-    pub(crate) frame_id: EventFrameId,
-    pub(crate) source_node_id: NodeId,
-    pub(crate) target_node_id: NodeId,
-    pub(crate) message: MeshMessage,
+#[cfg(any(test, feature = "test-support"))]
+pub struct EventFrame {
+    pub frame_id: EventFrameId,
+    pub source_node_id: NodeId,
+    pub target_node_id: NodeId,
+    pub message: MeshMessage,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg(test)]
-pub(crate) struct InboundEventFrame {
-    pub(crate) received_by: NodeId,
-    pub(crate) frame: EventFrame,
+#[cfg(any(test, feature = "test-support"))]
+pub struct InboundEventFrame {
+    pub received_by: NodeId,
+    pub frame: EventFrame,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub(crate) struct InProcessObjectRpcMessage {
-    pub(crate) source_node_id: NodeId,
-    pub(crate) target_node_id: NodeId,
-    pub(crate) request: ObjectRpcRequest,
+pub struct InProcessObjectRpcMessage {
+    pub source_node_id: NodeId,
+    pub target_node_id: NodeId,
+    pub request: ObjectRpcRequest,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub(crate) struct InboundObjectRpcMessage {
-    pub(crate) received_by: NodeId,
-    pub(crate) message: InProcessObjectRpcMessage,
+pub struct InboundObjectRpcMessage {
+    pub received_by: NodeId,
+    pub message: InProcessObjectRpcMessage,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub type AsyncNetworkTransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -627,8 +627,8 @@ impl AsyncNetworkSendOptions {
     }
 }
 
-#[cfg(test)]
-pub(crate) trait AsyncNetworkTransport {
+#[cfg(any(test, feature = "test-support"))]
+pub trait AsyncNetworkTransport {
     fn local_node_id(&self) -> &NodeId;
 
     fn send_async<'a>(
@@ -653,24 +653,24 @@ pub(crate) trait AsyncNetworkTransport {
     ) -> AsyncNetworkTransportFuture<'a, Result<bool, NetworkError>>;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) const SEEN_EVENT_CACHE_CAPACITY: usize = 16_384;
 
 #[derive(Clone, Debug)]
-#[cfg(test)]
-pub(crate) struct SeenEventCache {
+#[cfg(any(test, feature = "test-support"))]
+pub struct SeenEventCache {
     capacity: usize,
     keys: HashSet<(NodeId, EventId)>,
     order: VecDeque<(NodeId, EventId)>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl SeenEventCache {
     pub(crate) fn new() -> Self {
         Self::with_capacity(SEEN_EVENT_CACHE_CAPACITY)
     }
 
-    pub(crate) fn with_capacity(capacity: usize) -> Self {
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
             keys: HashSet::new(),
@@ -678,16 +678,16 @@ impl SeenEventCache {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn len(&self) -> usize {
         self.keys.len()
     }
 
-    pub(crate) fn contains(&self, key: &(NodeId, EventId)) -> bool {
+    pub fn contains(&self, key: &(NodeId, EventId)) -> bool {
         self.keys.contains(key)
     }
 
-    pub(crate) fn insert(&mut self, key: (NodeId, EventId)) {
+    pub fn insert(&mut self, key: (NodeId, EventId)) {
         if !self.keys.insert(key.clone()) {
             return;
         }
@@ -704,7 +704,7 @@ impl SeenEventCache {
 /// Core event-ingest step used by the [`NetworkService`] actor's inbound dispatch:
 /// dedups on `(origin_node_id, event_id)` and, for a new event, appends it to `store`.
 /// A store-level `DuplicateEventId` is folded into the same idempotent dedup result.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn event_addresses_local_node(event: &EventEnvelope, local_node_id: &NodeId) -> bool {
     if let Some(target_node_id) = &event.target_node_id {
         return target_node_id == local_node_id;
@@ -719,7 +719,7 @@ fn event_addresses_local_node(event: &EventEnvelope, local_node_id: &NodeId) -> 
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn ingest_event<S: EventStore>(
     seen_events: &mut SeenEventCache,
     store: &mut S,
@@ -761,12 +761,12 @@ pub struct InProcessNetwork {
     inner: Arc<InProcessNetworkInner>,
 }
 
-pub(crate) const IN_PROCESS_MAILBOX_CAPACITY: usize = 4096;
-#[cfg(test)]
+pub const IN_PROCESS_MAILBOX_CAPACITY: usize = 4096;
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) const DELIVERY_LEDGER_CAPACITY: usize = 8192;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) const DELIVERY_LEDGER_TERMINAL_RECORD_CAP: usize = 1024;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const LATENCY_CLASS_READY_PRIORITY_COUNT: usize = 4;
 
 impl InProcessNetwork {
@@ -776,7 +776,7 @@ impl InProcessNetwork {
 
     pub fn add_node(&self, node_id: NodeId) -> InProcessTransport {
         let mut state = self.inner.state.lock().expect("in-process network lock");
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         state.mailboxes.entry(node_id.clone()).or_default();
         state
             .object_rpc_mailboxes
@@ -799,7 +799,7 @@ struct InProcessNetworkInner {
 
 #[derive(Clone, Debug, Default)]
 struct InProcessNetworkState {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     mailboxes: BTreeMap<NodeId, VecDeque<InboundEventFrame>>,
     object_rpc_mailboxes: BTreeMap<NodeId, VecDeque<InboundObjectRpcMessage>>,
 }
@@ -815,12 +815,8 @@ impl InProcessTransport {
         &self.local_node_id
     }
 
-    #[cfg(test)]
-    pub(crate) fn send(
-        &mut self,
-        target_node_id: &NodeId,
-        frame: EventFrame,
-    ) -> Result<(), NetworkError> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn send(&mut self, target_node_id: &NodeId, frame: EventFrame) -> Result<(), NetworkError> {
         if &frame.source_node_id != self.local_node_id() {
             return Err(NetworkError::FrameSourceMismatch {
                 local_node_id: self.local_node_id.clone(),
@@ -905,8 +901,8 @@ impl InProcessTransport {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn drain_incoming(&mut self) -> Result<Vec<InboundEventFrame>, NetworkError> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn drain_incoming(&mut self) -> Result<Vec<InboundEventFrame>, NetworkError> {
         let mut inner = self
             .inner
             .state
@@ -931,7 +927,7 @@ impl InProcessTransport {
         Ok(frames)
     }
 
-    pub(crate) fn drain_incoming_object_rpc_messages(
+    pub fn drain_incoming_object_rpc_messages(
         &mut self,
     ) -> Result<Vec<InboundObjectRpcMessage>, NetworkError> {
         let mut inner = self
@@ -974,8 +970,8 @@ impl InProcessTransport {
         Ok(requests)
     }
 
-    #[cfg(test)]
-    pub(crate) fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
         let inner = self
             .inner
             .state
@@ -1010,8 +1006,8 @@ impl InProcessTransport {
         Ok(Some(mailbox.len()))
     }
 
-    #[cfg(test)]
-    pub(crate) fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
         let mut inner = self
             .inner
             .state
@@ -1145,16 +1141,16 @@ impl AsyncInProcessNetwork {
     }
 
     pub fn add_node(&self, node_id: NodeId) -> AsyncInProcessTransport {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let (sender, incoming) = tokio::sync::mpsc::channel(self.inner.mailbox_capacity);
         let (object_rpc_sender, object_rpc_incoming) =
             tokio::sync::mpsc::channel(self.inner.mailbox_capacity);
         let target = AsyncInProcessTarget {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             sender,
             object_rpc_sender,
             mailbox_capacity: self.inner.mailbox_capacity,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             send_limiter: Arc::new(tokio::sync::Semaphore::new(
                 self.inner.per_target_send_limit,
             )),
@@ -1174,9 +1170,9 @@ impl AsyncInProcessNetwork {
         AsyncInProcessTransport {
             local_node_id: node_id,
             inner: Arc::clone(&self.inner),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             incoming,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             pending: VecDeque::new(),
             object_rpc_incoming,
             object_rpc_pending: VecDeque::new(),
@@ -1193,11 +1189,11 @@ struct AsyncInProcessNetworkInner {
 
 #[derive(Clone)]
 struct AsyncInProcessTarget {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     sender: tokio::sync::mpsc::Sender<InboundEventFrame>,
     object_rpc_sender: tokio::sync::mpsc::Sender<InboundObjectRpcMessage>,
     mailbox_capacity: usize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     send_limiter: Arc<tokio::sync::Semaphore>,
     object_rpc_send_limiter: Arc<tokio::sync::Semaphore>,
 }
@@ -1205,9 +1201,9 @@ struct AsyncInProcessTarget {
 pub struct AsyncInProcessTransport {
     local_node_id: NodeId,
     inner: Arc<AsyncInProcessNetworkInner>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     incoming: tokio::sync::mpsc::Receiver<InboundEventFrame>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pending: VecDeque<InboundEventFrame>,
     object_rpc_incoming: tokio::sync::mpsc::Receiver<InboundObjectRpcMessage>,
     object_rpc_pending: VecDeque<InboundObjectRpcMessage>,
@@ -1218,7 +1214,7 @@ impl AsyncInProcessTransport {
         &self.local_node_id
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn validate_outbound_frame(
         &self,
         target_node_id: &NodeId,
@@ -1255,7 +1251,7 @@ impl AsyncInProcessTransport {
             })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn pending_count(&self) -> usize {
         self.pending.len() + self.incoming.len()
     }
@@ -1281,7 +1277,7 @@ impl AsyncInProcessTransport {
         .await
     }
 
-    pub(crate) async fn drain_incoming_object_rpc_messages(
+    pub async fn drain_incoming_object_rpc_messages(
         &mut self,
         max_messages: usize,
     ) -> Result<Vec<InboundObjectRpcMessage>, NetworkError> {
@@ -1362,7 +1358,7 @@ impl AsyncInProcessTransport {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl AsyncNetworkTransport for AsyncInProcessTransport {
     fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
@@ -1443,7 +1439,7 @@ impl AsyncNetworkTransport for AsyncInProcessTransport {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 async fn send_async_in_process_frame(
     target: AsyncInProcessTarget,
     target_node_id: &NodeId,
@@ -1583,7 +1579,7 @@ fn async_transport_send_timed_out(target_node_id: &NodeId, timeout: Duration) ->
 }
 
 #[derive(Clone, Debug)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct NetworkService<T> {
     router: InProcessRouter,
     pub(crate) transport: T,
@@ -1593,7 +1589,7 @@ pub struct NetworkService<T> {
     next_message_id: u64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl<T> NetworkService<T> {
     pub fn new(registry: PeerRegistry, transport: T) -> Self {
         Self {
@@ -1611,8 +1607,8 @@ impl<T> NetworkService<T> {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_seen_event_cache_capacity(mut self, capacity: usize) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_seen_event_cache_capacity(mut self, capacity: usize) -> Self {
         self.seen_events = SeenEventCache::with_capacity(capacity);
         self
     }
@@ -1630,7 +1626,7 @@ impl<T> NetworkService<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl<T: AsyncNetworkTransport> NetworkService<T> {
     fn enqueue_event_async(
         &mut self,
@@ -1998,22 +1994,22 @@ impl<T: AsyncNetworkTransport> NetworkService<T> {
 
 /// Bounded command-queue depth for a spawned [`NetworkService`] actor. Once this many
 /// commands are in flight, [`AsyncNetworkServiceHandle`] methods await room (backpressure).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const NETWORK_SERVICE_QUEUE_CAPACITY: usize = 256;
-#[cfg(test)]
-pub(crate) const NETWORK_SERVICE_INBOUND_BATCH_LIMIT: usize = 256;
-#[cfg(test)]
-pub(crate) const NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT: usize = 256;
+#[cfg(any(test, feature = "test-support"))]
+pub const NETWORK_SERVICE_INBOUND_BATCH_LIMIT: usize = 256;
+#[cfg(any(test, feature = "test-support"))]
+pub const NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct NetworkServiceActorOptions {
     pub command_queue_capacity: usize,
     pub inbound_batch_limit: usize,
     pub outbound_batch_limit: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl NetworkServiceActorOptions {
     fn normalized(self) -> Self {
         Self {
@@ -2024,7 +2020,7 @@ impl NetworkServiceActorOptions {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Default for NetworkServiceActorOptions {
     fn default() -> Self {
         Self {
@@ -2036,13 +2032,13 @@ impl Default for NetworkServiceActorOptions {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub enum NetworkServiceCommandBackpressure {
     WaitForCapacity,
     FailIfFull,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Default for NetworkServiceCommandBackpressure {
     fn default() -> Self {
         Self::WaitForCapacity
@@ -2050,13 +2046,13 @@ impl Default for NetworkServiceCommandBackpressure {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct NetworkServiceCommandOptions {
     timeout: Option<Duration>,
     backpressure: NetworkServiceCommandBackpressure,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl NetworkServiceCommandOptions {
     pub const fn timeout(timeout: Duration) -> Self {
         Self {
@@ -2081,7 +2077,7 @@ impl NetworkServiceCommandOptions {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 enum AsyncNetworkServiceCommand {
     EnqueueEvent {
         stored_event: StoredEvent,
@@ -2122,7 +2118,7 @@ enum AsyncNetworkServiceCommand {
     },
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl AsyncNetworkServiceCommand {
     fn caller_is_waiting(&self) -> bool {
         match self {
@@ -2139,7 +2135,7 @@ impl AsyncNetworkServiceCommand {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn remaining_async_command_timeout(deadline: Option<tokio::time::Instant>) -> Option<Duration> {
     deadline.map(|deadline| {
         deadline
@@ -2148,7 +2144,7 @@ fn remaining_async_command_timeout(deadline: Option<tokio::time::Instant>) -> Op
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn actor_send_options_for_deadline(
     deadline: Option<tokio::time::Instant>,
 ) -> AsyncNetworkSendOptions {
@@ -2158,7 +2154,7 @@ fn actor_send_options_for_deadline(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl<T: AsyncNetworkTransport + Send + 'static> NetworkService<T> {
     /// Run the async transport actor on the caller-owned Tokio runtime.
     pub fn spawn_on_runtime<S: EventStore + Send + 'static>(
@@ -2307,13 +2303,13 @@ impl<T: AsyncNetworkTransport + Send + 'static> NetworkService<T> {
 /// Handle to a [`NetworkService`] running with an [`AsyncNetworkTransport`] actor
 /// (see [`NetworkService::spawn_on_runtime`]). Transport send/drain work is awaited inside
 /// the actor instead of running through synchronous transport calls.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct AsyncNetworkServiceHandle<S> {
     commands: tokio::sync::mpsc::Sender<AsyncNetworkServiceCommand>,
     task: tokio::task::JoinHandle<S>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl<S> AsyncNetworkServiceHandle<S>
 where
     S: Send + 'static,
@@ -2547,13 +2543,13 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct AsyncNetworkServiceCommands<'a, S> {
     handle: &'a AsyncNetworkServiceHandle<S>,
     options: NetworkServiceCommandOptions,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl<S> AsyncNetworkServiceCommands<'_, S>
 where
     S: Send + 'static,
@@ -2622,7 +2618,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn network_service_actor_join_error(source: tokio::task::JoinError) -> NetworkError {
     NetworkError::Io {
         operation: "network-service-actor".to_string(),
@@ -2630,7 +2626,7 @@ fn network_service_actor_join_error(source: tokio::task::JoinError) -> NetworkEr
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn network_service_stopped() -> NetworkError {
     NetworkError::Io {
         operation: "network-service-command".to_string(),
@@ -2638,7 +2634,7 @@ fn network_service_stopped() -> NetworkError {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn network_service_command_queue_full(operation: &str, max_commands: usize) -> NetworkError {
     NetworkError::NetworkServiceCommandQueueFull {
         operation: operation.to_string(),
@@ -2646,7 +2642,7 @@ fn network_service_command_queue_full(operation: &str, max_commands: usize) -> N
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn network_service_command_timed_out(operation: &str, timeout: Duration) -> NetworkError {
     NetworkError::Io {
         operation: format!("network-service-command {operation}"),
@@ -2655,7 +2651,7 @@ fn network_service_command_timed_out(operation: &str, timeout: Duration) -> Netw
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct DeliveryAck {
     pub delivery_id: RouteDeliveryId,
     pub event_id: EventId,
@@ -2664,7 +2660,7 @@ pub struct DeliveryAck {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub enum InboundOutcome {
     EventAccepted {
         delivery_id: RouteDeliveryId,
@@ -2715,12 +2711,12 @@ pub enum InboundOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct RetryPolicy {
     pub max_attempts: u16,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self { max_attempts: 3 }
@@ -2728,7 +2724,7 @@ impl Default for RetryPolicy {
 }
 
 #[derive(Clone, Debug)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct DeliveryLedger {
     retry_policy: RetryPolicy,
     capacity: usize,
@@ -2751,13 +2747,13 @@ pub struct DeliveryLedger {
     terminal_record_ids: BTreeSet<RouteDeliveryId>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl DeliveryLedger {
     pub fn new(retry_policy: RetryPolicy) -> Self {
         Self::with_capacity(retry_policy, DELIVERY_LEDGER_CAPACITY)
     }
 
-    pub(crate) fn with_capacity(retry_policy: RetryPolicy, capacity: usize) -> Self {
+    pub fn with_capacity(retry_policy: RetryPolicy, capacity: usize) -> Self {
         Self {
             retry_policy,
             capacity: capacity.max(1),
@@ -2824,12 +2820,12 @@ impl DeliveryLedger {
         self.ready_delivery_ids_at(Instant::now())
     }
 
-    pub(crate) fn ready_delivery_ids_at(&self, now: Instant) -> Vec<RouteDeliveryId> {
+    pub fn ready_delivery_ids_at(&self, now: Instant) -> Vec<RouteDeliveryId> {
         self.ready_delivery_ids_limited_at(now, usize::MAX)
     }
 
-    #[cfg(test)]
-    pub(crate) fn ready_delivery_ids_limited(&self, max_deliveries: usize) -> Vec<RouteDeliveryId> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn ready_delivery_ids_limited(&self, max_deliveries: usize) -> Vec<RouteDeliveryId> {
         self.ready_delivery_ids_limited_at(Instant::now(), max_deliveries)
     }
 
@@ -2841,8 +2837,8 @@ impl DeliveryLedger {
         self.ready_delivery_ids_limited_at_inner(now, max_deliveries, |_| {})
     }
 
-    #[cfg(test)]
-    pub(crate) fn ready_delivery_ids_limited_at_counting(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn ready_delivery_ids_limited_at_counting(
         &self,
         now: Instant,
         max_deliveries: usize,
@@ -2928,7 +2924,7 @@ impl DeliveryLedger {
         self.next_outbound_wake_at_at(Instant::now())
     }
 
-    pub(crate) fn next_outbound_wake_at_at(&self, now: Instant) -> Option<Instant> {
+    pub fn next_outbound_wake_at_at(&self, now: Instant) -> Option<Instant> {
         if !self.queued_record_ids.is_empty()
             || !self.immediate_retry_ids.is_empty()
             || !self.sent_without_ack_deadline_ids.is_empty()
@@ -2955,7 +2951,7 @@ impl DeliveryLedger {
         self.mark_sent_at(delivery_id, Instant::now())
     }
 
-    pub(crate) fn mark_sent_at(
+    pub fn mark_sent_at(
         &mut self,
         delivery_id: RouteDeliveryId,
         now: Instant,
@@ -3065,7 +3061,7 @@ impl DeliveryLedger {
         Ok(())
     }
 
-    pub(crate) fn mark_attempt_failed_at(
+    pub fn mark_attempt_failed_at(
         &mut self,
         delivery_id: RouteDeliveryId,
         now: Instant,
@@ -3103,8 +3099,8 @@ impl DeliveryLedger {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn expire_ack_deadlines_at(&mut self, now: Instant) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn expire_ack_deadlines_at(&mut self, now: Instant) -> usize {
         let mut expired_count = 0;
         while let Some((deadline, _)) = self.ack_deadline_ids.first_key_value() {
             if *deadline > now {
@@ -3133,7 +3129,7 @@ impl DeliveryLedger {
         expired_count
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn expire_ack_deadline_delivery_at(
         &mut self,
         delivery_id: RouteDeliveryId,
@@ -3187,8 +3183,8 @@ impl DeliveryLedger {
         true
     }
 
-    #[cfg(test)]
-    pub(crate) fn clear_ack_deadline_for_test(&mut self, delivery_id: RouteDeliveryId) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn clear_ack_deadline_for_test(&mut self, delivery_id: RouteDeliveryId) {
         self.clear_ack_deadline(delivery_id);
         if self
             .records
@@ -3252,8 +3248,8 @@ impl DeliveryLedger {
         requeued
     }
 
-    #[cfg(test)]
-    pub(crate) fn requeue_target_after_recovery_counting_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn requeue_target_after_recovery_counting_for_test(
         &mut self,
         target_node_id: &NodeId,
         inspected: &mut usize,
@@ -3298,8 +3294,8 @@ impl DeliveryLedger {
         waiting
     }
 
-    #[cfg(test)]
-    pub(crate) fn mark_target_waiting_for_peer_counting_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mark_target_waiting_for_peer_counting_for_test(
         &mut self,
         target_node_id: &NodeId,
         inspected: &mut usize,
@@ -3555,7 +3551,7 @@ impl DeliveryLedger {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn remove_deadline_index_entry(
     index: &mut BTreeMap<Instant, BTreeSet<RouteDeliveryId>>,
     deadline: Instant,
@@ -3572,7 +3568,7 @@ fn remove_deadline_index_entry(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn remove_target_index_entry(
     index: &mut BTreeMap<NodeId, BTreeSet<RouteDeliveryId>>,
     target_node_id: &NodeId,
@@ -3589,12 +3585,12 @@ fn remove_target_index_entry(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const MAX_DELIVERY_RETRY_BACKOFF: Duration = Duration::from_secs(30);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const MAX_DELIVERY_RETRY_JITTER: Duration = Duration::from_secs(2);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn latency_class_ready_priority(latency_class: &LatencyClass) -> u8 {
     match latency_class {
         LatencyClass::Reactive => 0,
@@ -3604,8 +3600,8 @@ fn latency_class_ready_priority(latency_class: &LatencyClass) -> u8 {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn ack_timeout_for_latency_class(latency_class: &LatencyClass) -> Duration {
+#[cfg(any(test, feature = "test-support"))]
+pub fn ack_timeout_for_latency_class(latency_class: &LatencyClass) -> Duration {
     match latency_class {
         LatencyClass::Reactive => Duration::from_millis(250),
         LatencyClass::Interactive => Duration::from_secs(1),
@@ -3614,12 +3610,12 @@ pub(crate) fn ack_timeout_for_latency_class(latency_class: &LatencyClass) -> Dur
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn ack_timeout_for_record(record: &DeliveryRecord) -> Duration {
     ack_timeout_for_latency_class(&record.delivery.latency_class)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn retry_delay_for_record(record: &DeliveryRecord) -> Duration {
     let base = match record.delivery.latency_class {
         LatencyClass::Reactive => Duration::from_millis(25),
@@ -3634,7 +3630,7 @@ fn retry_delay_for_record(record: &DeliveryRecord) -> Duration {
     backoff + retry_jitter_for_record(record, backoff)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn retry_jitter_for_record(record: &DeliveryRecord, backoff: Duration) -> Duration {
     if !matches!(
         record.delivery.latency_class,
@@ -3652,7 +3648,7 @@ fn retry_jitter_for_record(record: &DeliveryRecord, backoff: Duration) -> Durati
     Duration::from_millis(jitter_ms)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Default for DeliveryLedger {
     fn default() -> Self {
         Self::new(RetryPolicy::default())
@@ -3660,7 +3656,7 @@ impl Default for DeliveryLedger {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct DeliveryRecord {
     pub delivery: RouteDelivery,
     pub event: EventEnvelope,
@@ -3671,7 +3667,7 @@ pub struct DeliveryRecord {
 pub struct RouteDeliveryId(pub u64);
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct RouteDelivery {
     pub delivery_id: RouteDeliveryId,
     pub event_sequence: EventSequence,
@@ -3683,7 +3679,7 @@ pub struct RouteDelivery {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub enum DeliveryStatus {
     Queued,
     Sent,
@@ -3693,7 +3689,7 @@ pub enum DeliveryStatus {
     Failed,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl DeliveryStatus {
     fn is_terminal(&self) -> bool {
         matches!(self, Self::Delivered | Self::Failed)

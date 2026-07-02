@@ -10,9 +10,9 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::time::Instant;
 
+use sinomo_core::events::EventId;
+use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
-use sinomo_events::EventId;
-use sinomo_node::NodeId;
 use time::OffsetDateTime;
 
 use crate::metadata_pages::walk_metadata_pages;

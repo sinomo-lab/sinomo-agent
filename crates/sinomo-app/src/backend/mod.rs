@@ -21,10 +21,11 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use sinomo_runtime::cluster::ClusterControlInitRequest;
 use sinomo_runtime::config::{ConfigClient, ConfigRegistry, ConfigStore, LocalConfigClient};
 use sinomo_runtime::daemon::{
-    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonServiceRegistryHook, DaemonStatus,
-    RemoteConfigClient, probe_daemon_status, run_daemon_control_loop_with_services,
+    DaemonApiClient, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonServiceRegistryHook,
+    DaemonStatus, RemoteConfigClient, probe_daemon_status, run_daemon_control_loop_with_services,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::node::NodeProfile;
@@ -104,6 +105,10 @@ impl Backend {
     /// thread; `progress` reports each step for the launch status indicator.
     pub fn connect(progress: impl Fn(&str)) -> Self {
         progress("Preparing…");
+        // When attached to an external daemon no in-process daemon installs the
+        // KV-backed cluster directory, and the app's direct-probe fallbacks
+        // (cluster health, endpoint hydration) would read an empty directory.
+        sinomo_runtime::cluster::install_kv_cluster_directory();
         let data_dir = app_config::default_data_dir();
         // Best-effort: a missing layout shouldn't stop the app from opening.
         let _ = data_dir.ensure_root_layout();
@@ -301,7 +306,7 @@ fn ensure_app_cluster(
     }
 
     progress("Initializing single-node cluster...");
-    match sinomo_cli::app_api::ensure_single_node_cluster(data_dir, node.display_name.as_str()) {
+    match ensure_app_cluster_through_daemon(&connection, data_dir, node) {
         Ok(_) => match probe_daemon_status(paths, DAEMON_RPC_TIMEOUT) {
             DaemonProbeStatus::Running(status)
             | DaemonProbeStatus::Locked {
@@ -320,6 +325,31 @@ fn ensure_app_cluster(
             connection
         }
     }
+}
+
+/// Daemon-first cluster init for a fresh app node: the attached daemon
+/// initializes its own cluster through `/cluster/control/init`. Skipped when
+/// cluster state already exists (the daemon's status simply lagged).
+fn ensure_app_cluster_through_daemon(
+    connection: &Connection,
+    data_dir: &SinomoDataDir,
+    node: &NodeProfile,
+) -> Result<(), String> {
+    if sinomo_cli::app_api::cluster_status(data_dir).clustered {
+        return Ok(());
+    }
+    let address = connection
+        .daemon_address()
+        .ok_or_else(|| "no daemon connection for cluster init".to_string())?;
+    let name = node.display_name.trim();
+    let name = if name.is_empty() { "Sinomo App" } else { name };
+    DaemonApiClient::at_address(address)
+        .cluster_init(ClusterControlInitRequest {
+            cluster_name: name.to_string(),
+            node_display_name: Some(name.to_string()),
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Build the [`ConfigClient`] for the current connection. Normally this is an RPC client to the

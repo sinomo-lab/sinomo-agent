@@ -17,9 +17,9 @@ pub const SINOMO_DFS_NATIVE_REGISTRATION_KEY: &str = "sinomo-dfs";
 pub const DFS_POLICY_VIOLATION_EVENT_KIND: &str = "dfs.policy.violation";
 
 pub fn register_storage_paths(
-    layout: &mut sinomo_storage::StorageLayout,
-) -> Result<(), sinomo_storage::StorageContractError> {
-    use sinomo_storage::StorageRing;
+    layout: &mut sinomo_core::storage::StorageLayout,
+) -> Result<(), sinomo_core::storage::StorageContractError> {
+    use sinomo_core::storage::StorageRing;
 
     for (relative_path, reason) in [
         ("dfs/content/blobs", "content-addressed DFS blob bytes"),
@@ -202,8 +202,8 @@ mod tests {
     use super::*;
     use crate::{DFS_DATA_READ_ROUTE, DFS_OBJECT_RPC_ROUTES};
     use sinomo_core::ModuleKind;
+    use sinomo_core::storage::StorageLayout;
     use sinomo_module::{ModuleBackendRegistration, NativeRustBackendRegistration};
-    use sinomo_storage::StorageLayout;
 
     #[test]
     fn dfs_registers_as_r1_native_rust_module() {

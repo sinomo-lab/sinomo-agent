@@ -17,12 +17,14 @@ use crate::{
     DaemonPaths, authenticate_daemon_control_request, daemon_paths_are_shadow,
     handle_daemon_clear_rollout_status, handle_daemon_finalize_shadow_rollout, read_daemon_status,
 };
+#[allow(unused_imports)]
+use sinomo_core::cluster::ClusterKvPathsExt;
+use sinomo_core::events::EventStore;
+use sinomo_core::node::NodeId;
 use sinomo_core::{
     ClusterModuleRolloutDesiredRecord, ClusterModuleRolloutReconciliationRecord,
     ClusterModuleRolloutStatusRecord, cluster_module_rollout_reconcile_key,
 };
-use sinomo_events::EventStore;
-use sinomo_node::NodeId;
 use sinomo_rollout::{
     AppliedRolloutTransition, ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_FINALIZE_SHADOW_ROUTE,
     ROLLOUT_RPC_CATEGORY, RolloutController, RolloutTelemetryAdvanceOptions,
@@ -39,7 +41,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
-pub const DAEMON_COMMAND_MAX_BYTES: usize = sinomo_network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES;
+pub const DAEMON_COMMAND_MAX_BYTES: usize =
+    sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES;
 pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
 pub const DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 pub const DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
@@ -67,7 +70,7 @@ static DAEMON_CLUSTER_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = O
 #[derive(Clone)]
 enum DaemonDfsMessageReplayState {
     InFlight,
-    Complete(sinomo_network::ObjectRpcResponse),
+    Complete(sinomo_core::network::ObjectRpcResponse),
 }
 
 #[derive(Clone)]
@@ -275,6 +278,7 @@ pub fn run_daemon_control_loop_with_services(
     cluster: Option<DaemonClusterStatus>,
     service_hooks: Vec<crate::DaemonServiceRegistryHook>,
 ) -> Result<(), DaemonError> {
+    crate::cluster::ensure_cluster_directory_installed();
     let _lock = DaemonLock::acquire(&paths, &options, cluster.clone())?;
     let _data_owner_lock = if label == "daemon" {
         Some(DaemonDataOwnerLock::acquire(&paths)?)
@@ -299,9 +303,9 @@ pub fn run_daemon_control_loop_with_services(
     let daemon_runtime = crate::build_daemon_async_runtime(label)?;
     let daemon_runtime_handle = daemon_runtime.handle().clone();
     let bind_address = format!("{}:{}", options.host, options.port);
-    let listener = daemon_runtime.block_on(sinomo_network::AsyncDaemonControlListener::bind(
-        &bind_address,
-    ))?;
+    let listener = daemon_runtime.block_on(
+        sinomo_core::network::AsyncDaemonControlListener::bind(&bind_address),
+    )?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let shutdown_signal = shutdown_tx.clone();
     let mut runtime_tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -320,6 +324,67 @@ pub fn run_daemon_control_loop_with_services(
             "cluster_node_id": cluster.as_ref().map(|status| status.node_id.to_string()),
         }),
     );
+    // Stage C (docs/plans/r0-r1-crate-boundary-refactor.md): load native-dylib
+    // network modules (e.g. modules/network/iroh) into the process-wide
+    // NetworkModuleRegistry before serving traffic. Loopback/LAN-TCP — and the
+    // built-in iroh path while the `iroh-transport` feature remains — keep
+    // their in-crate dial paths inside sinomo-network; only dylib modules go
+    // through the registry.
+    match daemon_data_dir_path(&paths) {
+        Ok(data_dir_root) => {
+            let network_module_context = match cluster_paths_from_daemon_paths(&paths) {
+                Ok(cluster_paths) => {
+                    cluster
+                        .as_ref()
+                        .map(|status| sinomo_core::network::NetworkModuleContext {
+                            cluster_root: cluster_paths.root.clone(),
+                            node_id: crate::cluster::daemon_iroh_proxy_node_id(status),
+                            cluster_id: Some(status.cluster_id.clone()),
+                            // Connect address, not the bind address: a wildcard
+                            // bind (0.0.0.0/::) is not dialable by the module's
+                            // inbound-frame forwarder.
+                            daemon_forward_address: crate::status::daemon_connect_address(
+                                &options.host,
+                                options.port,
+                            ),
+                        })
+                }
+                Err(error) => {
+                    tracing::warn!("sinomo {label} network module context unavailable: {error}");
+                    None
+                }
+            };
+            let modules = crate::registry::load_daemon_network_module_registry(
+                &data_dir_root,
+                network_module_context,
+            );
+            let loaded = modules.registry.snapshot();
+            if !loaded.is_empty() {
+                tracing::info!(
+                    "sinomo {label} network modules loaded: {}",
+                    loaded
+                        .iter()
+                        .map(|status| {
+                            format!(
+                                "{}({})",
+                                status.descriptor.id,
+                                if status.enabled {
+                                    "enabled"
+                                } else {
+                                    "disabled"
+                                }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!("sinomo {label} network module registry skipped: {error}");
+        }
+    }
+
     match start_daemon_iroh_proxy_if_clustered(
         &paths,
         &options,
@@ -371,10 +436,22 @@ pub fn run_daemon_control_loop_with_services(
     crate::install_process_idle_stats(idle_stats.clone());
     crate::register_io_observer(idle_stats.clone());
 
+    // The service host is built before the maintenance loop so the loop can
+    // publish the active service-registry snapshot's instances on its cluster
+    // tick.
+    let service_host = daemon_runtime.block_on(
+        crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_services(
+            paths.clone(),
+            daemon_runtime_handle.clone(),
+            service_hooks,
+        ),
+    )?;
+
     let maintenance_paths = paths.clone();
     let maintenance_options = options.clone();
     let maintenance_label = label.to_string();
     let maintenance_idle_stats = idle_stats.clone();
+    let maintenance_service_registry = service_host.service_registry_snapshot_store();
     let maintenance_runtime = daemon_runtime_handle.clone();
     runtime_tasks.push((
         "background maintenance",
@@ -383,18 +460,11 @@ pub fn run_daemon_control_loop_with_services(
             maintenance_options,
             maintenance_label,
             maintenance_idle_stats,
+            maintenance_service_registry,
             maintenance_runtime,
             shutdown_rx.clone(),
         )),
     ));
-
-    let service_host = daemon_runtime.block_on(
-        crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_services(
-            paths.clone(),
-            daemon_runtime_handle.clone(),
-            service_hooks,
-        ),
-    )?;
 
     daemon_runtime.block_on(run_daemon_control_accept_loop(
         listener,
@@ -477,10 +547,13 @@ async fn run_daemon_background_maintenance_loop(
     options: crate::DaemonRunOptions,
     label: String,
     idle_stats: Arc<crate::IdleStatsAtomics>,
+    service_registry: sinomo_core::service::ServiceRegistrySnapshotStore,
     runtime: tokio::runtime::Handle,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut cluster_network = ClusterNetworkMaintenance::with_idle_stats(idle_stats.clone()).await;
+    let mut cluster_network = ClusterNetworkMaintenance::with_idle_stats(idle_stats.clone())
+        .await
+        .with_service_registry(service_registry);
     let dfs_maintenance_enabled = background_dfs_maintenance_enabled();
     let maintenance_started = std::time::Instant::now();
     let mut last_dfs_maintenance = maintenance_started
@@ -757,7 +830,7 @@ async fn run_daemon_background_maintenance_loop(
 }
 
 pub(crate) async fn run_daemon_control_accept_loop(
-    listener: sinomo_network::AsyncDaemonControlListener,
+    listener: sinomo_core::network::AsyncDaemonControlListener,
     paths: DaemonPaths,
     label: String,
     bind_address: String,
@@ -815,7 +888,7 @@ pub(crate) async fn run_daemon_control_accept_loop(
 }
 
 pub(crate) async fn handle_daemon_connection_async(
-    mut stream: sinomo_network::AsyncDaemonControlStream,
+    mut stream: sinomo_core::network::AsyncDaemonControlStream,
     paths: DaemonPaths,
     service_host: crate::service_adapter::DaemonServiceRegistryHost,
     service_runtime: tokio::runtime::Handle,
@@ -881,7 +954,7 @@ pub(crate) async fn handle_daemon_connection_async(
                     let _ = stream.shutdown_write(&stream_address).await;
                     return Ok(false);
                 }
-                if let Ok(response) = sinomo_network::ObjectRpcResponse::encode_error(
+                if let Ok(response) = sinomo_core::network::ObjectRpcResponse::encode_error(
                     request.route.clone(),
                     DaemonError::AuthDenied.to_string(),
                 ) {
@@ -904,7 +977,7 @@ pub(crate) async fn handle_daemon_connection_async(
         }
         let rpc_request = Some(request);
         if let Some(request) = rpc_request.as_ref()
-            && request.route == sinomo_network::CLUSTER_NETWORK_PING_ROUTE
+            && request.route == sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE
         {
             let response = daemon_cluster_network_ping_response(&paths, request.clone())?;
             write_daemon_rpc_response_frame_async_for_rpc_request(
@@ -918,7 +991,7 @@ pub(crate) async fn handle_daemon_connection_async(
             continue;
         }
         if let Some(request) = rpc_request.as_ref()
-            && request.route == sinomo_network::CLUSTER_RELAY_ROUTE
+            && request.route == sinomo_core::network::CLUSTER_RELAY_ROUTE
         {
             if try_handle_streamed_cluster_relay_request_async(
                 request,
@@ -940,8 +1013,8 @@ pub(crate) async fn handle_daemon_connection_async(
             .await
             {
                 Ok(response) => response,
-                Err(error) => sinomo_network::ObjectRpcResponse::encode_error(
-                    sinomo_network::CLUSTER_RELAY_ROUTE,
+                Err(error) => sinomo_core::network::ObjectRpcResponse::encode_error(
+                    sinomo_core::network::CLUSTER_RELAY_ROUTE,
                     error.to_string(),
                 )
                 .map_err(DaemonError::from)?,
@@ -1006,8 +1079,8 @@ pub(crate) async fn handle_daemon_connection_async(
 pub(crate) async fn dispatch_daemon_control_request_in_process_async(
     paths: DaemonPaths,
     service_runtime: tokio::runtime::Handle,
-    request: sinomo_network::DaemonControlRequest,
-) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    request: sinomo_core::network::DaemonControlRequest,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
     let replay_key = daemon_dfs_message_replay_key(&request);
     if let Some(key) = replay_key.as_ref()
         && let Some(response) = wait_for_daemon_dfs_message_replay(&paths, key).await
@@ -1015,8 +1088,8 @@ pub(crate) async fn dispatch_daemon_control_request_in_process_async(
         return Ok(response);
     }
 
-    if request.route == sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE
-        && request.category == sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
+    if request.route == sinomo_core::network::CLUSTER_JOIN_CHALLENGE_ROUTE
+        && request.category == sinomo_core::network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
     {
         let service_host = crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
             paths.clone(),
@@ -1043,8 +1116,11 @@ pub(crate) async fn dispatch_daemon_control_request_in_process_async(
                 return Ok(response);
             }
             let detail = error.to_string();
-            return sinomo_network::ObjectRpcResponse::encode_error(request.route.clone(), detail)
-                .map_err(DaemonError::from);
+            return sinomo_core::network::ObjectRpcResponse::encode_error(
+                request.route.clone(),
+                detail,
+            )
+            .map_err(DaemonError::from);
         }
     };
     if let Some(key) = replay_key.as_ref() {
@@ -1061,7 +1137,7 @@ pub(crate) async fn dispatch_daemon_control_request_in_process_async(
             detail: "sandbox stream routes cannot be delivered through cluster relay".to_string(),
         });
     }
-    if rpc_request.route == sinomo_network::CLUSTER_NETWORK_PING_ROUTE {
+    if rpc_request.route == sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE {
         return daemon_cluster_network_ping_response(&paths, rpc_request);
     }
     let service_host = crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
@@ -1095,19 +1171,22 @@ pub(crate) async fn dispatch_daemon_control_request_in_process_async(
             if let Some(key) = replay_key.as_ref() {
                 abandon_daemon_dfs_message_replay(&paths, key);
             }
-            sinomo_network::ObjectRpcResponse::encode_error(rpc_request.route, error.to_string())
-                .map_err(DaemonError::from)
+            sinomo_core::network::ObjectRpcResponse::encode_error(
+                rpc_request.route,
+                error.to_string(),
+            )
+            .map_err(DaemonError::from)
         }
     }
 }
 
 fn daemon_cluster_network_ping_response(
     paths: &DaemonPaths,
-    request: sinomo_network::ObjectRpcRequest,
-) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
-    let data_dir = sinomo_local::SinomoDataDir::new(daemon_data_dir_path(paths)?);
+    request: sinomo_core::network::ObjectRpcRequest,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    let data_dir = sinomo_core::local::SinomoDataDir::new(daemon_data_dir_path(paths)?);
     let node_id = crate::service_adapter::cached_cluster_network_ping_node_id(paths, &data_dir)?;
-    sinomo_network::handle_cluster_network_ping_rpc_request_for_node(
+    sinomo_core::cluster::handle_cluster_network_ping_rpc_request_for_node(
         &node_id,
         request,
         time::OffsetDateTime::now_utc(),
@@ -1116,21 +1195,21 @@ fn daemon_cluster_network_ping_response(
 }
 
 async fn try_handle_streamed_cluster_relay_request_async(
-    request: &sinomo_network::ObjectRpcRequest,
-    stream: &mut sinomo_network::AsyncDaemonControlStream,
+    request: &sinomo_core::network::ObjectRpcRequest,
+    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
     paths: &DaemonPaths,
     service_host: &crate::service_adapter::DaemonServiceRegistryHost,
     service_runtime: &tokio::runtime::Handle,
     stream_address: &str,
 ) -> Result<bool, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let state =
-        sinomo_network::read_cluster_state_without_kv(&cluster_paths).map_err(DaemonError::from)?;
-    match sinomo_network::cluster_relay_stream_request_action(&state.local_node_id, request)
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+        .map_err(DaemonError::from)?;
+    match sinomo_core::network::cluster_relay_stream_request_action(&state.local_node_id, request)
         .map_err(DaemonError::from)?
     {
-        sinomo_network::ClusterRelayStreamRequestAction::NotStreamed => return Ok(false),
-        sinomo_network::ClusterRelayStreamRequestAction::DeliverLocal(inner_request) => {
+        sinomo_core::network::ClusterRelayStreamRequestAction::NotStreamed => return Ok(false),
+        sinomo_core::network::ClusterRelayStreamRequestAction::DeliverLocal(inner_request) => {
             dispatch_streamed_cluster_relay_local_request_async(
                 inner_request,
                 stream,
@@ -1140,7 +1219,7 @@ async fn try_handle_streamed_cluster_relay_request_async(
             )
             .await?;
         }
-        sinomo_network::ClusterRelayStreamRequestAction::Forward => {
+        sinomo_core::network::ClusterRelayStreamRequestAction::Forward => {
             handle_daemon_cluster_relay_stream_forward_on_runtime(
                 paths,
                 request,
@@ -1155,8 +1234,8 @@ async fn try_handle_streamed_cluster_relay_request_async(
 }
 
 async fn dispatch_streamed_cluster_relay_local_request_async(
-    request: sinomo_network::ObjectRpcRequest,
-    stream: &mut sinomo_network::AsyncDaemonControlStream,
+    request: sinomo_core::network::ObjectRpcRequest,
+    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
     paths: &DaemonPaths,
     service_host: &crate::service_adapter::DaemonServiceRegistryHost,
     stream_address: &str,
@@ -1184,7 +1263,7 @@ async fn dispatch_streamed_cluster_relay_local_request_async(
                 stream_address,
                 paths,
                 &request,
-                sinomo_network::ObjectRpcResponse::encode_error(
+                sinomo_core::network::ObjectRpcResponse::encode_error(
                     request.route.clone(),
                     error.to_string(),
                 )
@@ -1225,7 +1304,7 @@ async fn dispatch_streamed_cluster_relay_local_request_async(
             if let Some(key) = replay_key.as_ref() {
                 abandon_daemon_dfs_message_replay(paths, key);
             }
-            let response = sinomo_network::ObjectRpcResponse::encode_error(
+            let response = sinomo_core::network::ObjectRpcResponse::encode_error(
                 route,
                 "streamed relay local delivery has no registered object RPC route",
             )
@@ -1235,12 +1314,14 @@ async fn dispatch_streamed_cluster_relay_local_request_async(
     }
 }
 
-fn daemon_rpc_request_allows_reusable_stream(request: &sinomo_network::ObjectRpcRequest) -> bool {
-    sinomo_network::object_rpc_request_stream_mode(request).reuses_daemon_stream()
+fn daemon_rpc_request_allows_reusable_stream(
+    request: &sinomo_core::network::ObjectRpcRequest,
+) -> bool {
+    sinomo_core::network::object_rpc_request_stream_mode(request).reuses_daemon_stream()
 }
 
 pub(crate) fn daemon_dfs_message_replay_key(
-    request: &sinomo_network::DaemonControlRequest,
+    request: &sinomo_core::network::DaemonControlRequest,
 ) -> Option<Vec<u8>> {
     if !sinomo_dfs::dfs_route_is_message_data_plane(&request.route) {
         return None;
@@ -1271,7 +1352,7 @@ fn prune_daemon_dfs_message_replay_cache(
 }
 
 fn daemon_dfs_message_response_is_replay_cacheable(
-    response: &sinomo_network::ObjectRpcResponse,
+    response: &sinomo_core::network::ObjectRpcResponse,
 ) -> bool {
     !sinomo_dfs::dfs_route_is_message_data_plane(&response.route)
         || response.body.len() < DAEMON_DFS_MESSAGE_REPLAY_MAX_CACHED_BODY_BYTES
@@ -1280,7 +1361,7 @@ fn daemon_dfs_message_response_is_replay_cacheable(
 async fn wait_for_daemon_dfs_message_replay(
     paths: &DaemonPaths,
     key: &[u8],
-) -> Option<sinomo_network::ObjectRpcResponse> {
+) -> Option<sinomo_core::network::ObjectRpcResponse> {
     let started = Instant::now();
     loop {
         let notify = {
@@ -1321,7 +1402,7 @@ fn begin_daemon_dfs_message_replay(paths: &DaemonPaths, key: &[u8]) {
 pub(crate) fn complete_daemon_dfs_message_replay(
     paths: &DaemonPaths,
     key: &[u8],
-    response: &sinomo_network::ObjectRpcResponse,
+    response: &sinomo_core::network::ObjectRpcResponse,
 ) {
     let notify = {
         let Ok(mut cache) = daemon_dfs_message_replay_cache().lock() else {
@@ -1385,9 +1466,9 @@ pub(crate) fn abandon_daemon_dfs_message_replay(paths: &DaemonPaths, key: &[u8])
 
 async fn handle_authenticated_daemon_command_async(
     authenticated: AuthenticatedDaemonCommand,
-    rpc_request: Option<sinomo_network::ObjectRpcRequest>,
+    rpc_request: Option<sinomo_core::network::ObjectRpcRequest>,
     replay_key: Option<Vec<u8>>,
-    mut stream: sinomo_network::AsyncDaemonControlStream,
+    mut stream: sinomo_core::network::AsyncDaemonControlStream,
     paths: DaemonPaths,
     service_host: crate::service_adapter::DaemonServiceRegistryHost,
     service_runtime: tokio::runtime::Handle,
@@ -1406,7 +1487,7 @@ async fn handle_authenticated_daemon_command_async(
         .await;
     }
     if let Some(request) = rpc_request.as_ref()
-        && request.route == sinomo_network::CLUSTER_NETWORK_PING_ROUTE
+        && request.route == sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE
     {
         let response = daemon_cluster_network_ping_response(&paths, request.clone())?;
         write_daemon_rpc_response_frame_async_for_rpc_request(
@@ -1420,7 +1501,7 @@ async fn handle_authenticated_daemon_command_async(
         return Ok(false);
     }
     if let Some(request) = rpc_request.as_ref()
-        && request.route == sinomo_network::CLUSTER_RELAY_ROUTE
+        && request.route == sinomo_core::network::CLUSTER_RELAY_ROUTE
     {
         if try_handle_streamed_cluster_relay_request_async(
             request,
@@ -1442,8 +1523,8 @@ async fn handle_authenticated_daemon_command_async(
         .await
         {
             Ok(response) => response,
-            Err(error) => sinomo_network::ObjectRpcResponse::encode_error(
-                sinomo_network::CLUSTER_RELAY_ROUTE,
+            Err(error) => sinomo_core::network::ObjectRpcResponse::encode_error(
+                sinomo_core::network::CLUSTER_RELAY_ROUTE,
                 error.to_string(),
             )
             .map_err(DaemonError::from)?,
@@ -1502,7 +1583,7 @@ async fn handle_authenticated_daemon_command_async(
                 address: "daemon rollout finalization".to_string(),
                 detail: format!("rollout finalization task failed: {source}"),
             })??;
-            let response = sinomo_network::ObjectRpcResponse::encode_body(
+            let response = sinomo_core::network::ObjectRpcResponse::encode_body(
                 ROLLOUT_FINALIZE_SHADOW_ROUTE,
                 &response,
             )
@@ -1526,7 +1607,7 @@ async fn handle_authenticated_daemon_command_async(
                 address: "daemon rollout clear-status".to_string(),
                 detail: format!("rollout clear-status task failed: {source}"),
             })??;
-            let response = sinomo_network::ObjectRpcResponse::encode_body(
+            let response = sinomo_core::network::ObjectRpcResponse::encode_body(
                 ROLLOUT_CLEAR_STATUS_ROUTE,
                 &response,
             )
@@ -1550,10 +1631,10 @@ async fn handle_authenticated_daemon_command_async(
 }
 
 async fn dispatch_sandbox_stream_route_async(
-    mut stream: sinomo_network::AsyncDaemonControlStream,
+    mut stream: sinomo_core::network::AsyncDaemonControlStream,
     stream_address: String,
     paths: DaemonPaths,
-    request: sinomo_network::ObjectRpcRequest,
+    request: sinomo_core::network::ObjectRpcRequest,
     service_runtime: tokio::runtime::Handle,
 ) -> Result<bool, DaemonError> {
     crate::service_adapter::dispatch_sandbox_stream_route_async_on_runtime(
@@ -1568,62 +1649,62 @@ async fn dispatch_sandbox_stream_route_async(
 }
 
 async fn read_daemon_control_frame_async(
-    stream: &mut sinomo_network::AsyncDaemonControlStream,
+    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
     address: &str,
-) -> Result<sinomo_network::DaemonControlRequest, DaemonError> {
+) -> Result<sinomo_core::network::DaemonControlRequest, DaemonError> {
     stream
         .read_request(
             address,
             DAEMON_COMMAND_MAX_BYTES,
-            sinomo_network::ObjectFrameIoOptions::none(),
+            sinomo_core::network::ObjectFrameIoOptions::none(),
         )
         .await
         .map_err(DaemonError::from)
 }
 
 async fn write_daemon_rpc_response_frame_async(
-    stream: &mut sinomo_network::AsyncDaemonControlStream,
+    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
     address: &str,
-    response: sinomo_network::ObjectRpcResponse,
+    response: sinomo_core::network::ObjectRpcResponse,
 ) -> Result<(), DaemonError> {
     stream
         .write_response(
             address,
             &response,
-            sinomo_network::ObjectFrameIoOptions::none(),
+            sinomo_core::network::ObjectFrameIoOptions::none(),
         )
         .await
         .map_err(DaemonError::from)
 }
 
 async fn write_daemon_rpc_response_frame_async_for_control_request(
-    stream: &mut sinomo_network::AsyncDaemonControlStream,
+    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
     address: &str,
     paths: &DaemonPaths,
-    _request: &sinomo_network::DaemonControlRequest,
-    mut response: sinomo_network::ObjectRpcResponse,
+    _request: &sinomo_core::network::DaemonControlRequest,
+    mut response: sinomo_core::network::ObjectRpcResponse,
 ) -> Result<(), DaemonError> {
     crate::service_adapter::mark_daemon_rpc_response_responder(paths, &mut response);
     write_daemon_rpc_response_frame_async(stream, address, response).await
 }
 
 async fn write_daemon_rpc_response_frame_async_for_rpc_request(
-    stream: &mut sinomo_network::AsyncDaemonControlStream,
+    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
     address: &str,
     paths: &DaemonPaths,
-    _request: &sinomo_network::ObjectRpcRequest,
-    mut response: sinomo_network::ObjectRpcResponse,
+    _request: &sinomo_core::network::ObjectRpcRequest,
+    mut response: sinomo_core::network::ObjectRpcResponse,
 ) -> Result<(), DaemonError> {
     crate::service_adapter::mark_daemon_rpc_response_responder(paths, &mut response);
     write_daemon_rpc_response_frame_async(stream, address, response).await
 }
 
 fn rpc_error_response_for_request(
-    request: &Option<sinomo_network::ObjectRpcRequest>,
+    request: &Option<sinomo_core::network::ObjectRpcRequest>,
     error: &DaemonError,
-) -> Option<sinomo_network::ObjectRpcResponse> {
+) -> Option<sinomo_core::network::ObjectRpcResponse> {
     let route = request.as_ref()?.route.clone();
-    sinomo_network::ObjectRpcResponse::encode_error(route, error.to_string()).ok()
+    sinomo_core::network::ObjectRpcResponse::encode_error(route, error.to_string()).ok()
 }
 
 pub(crate) fn accepted_rollout_should_stop_current_daemon(
@@ -1707,10 +1788,10 @@ fn shadow_rollout_finalization_poll_due_in(paths: &DaemonPaths) -> Duration {
 }
 
 fn require_daemon_rpc_request(
-    request: Option<sinomo_network::ObjectRpcRequest>,
+    request: Option<sinomo_core::network::ObjectRpcRequest>,
     expected_route: &str,
     expected_category: &str,
-) -> Result<sinomo_network::ObjectRpcRequest, DaemonError> {
+) -> Result<sinomo_core::network::ObjectRpcRequest, DaemonError> {
     let request = request.ok_or_else(|| DaemonError::Parse {
         detail: format!("missing daemon rpc request for {expected_route}"),
     })?;
@@ -2362,7 +2443,7 @@ pub(crate) fn handle_daemon_sandbox_write_on_runtime(
 
 fn append_daemon_sandbox_write_denial_event(
     paths: &DaemonPaths,
-    node_id: &sinomo_node::NodeId,
+    node_id: &sinomo_core::node::NodeId,
     sandbox_id: &sinomo_sandbox::SandboxId,
     request_path: &sinomo_sandbox::SandboxPath,
     error: &sinomo_sandbox::SandboxFsError,
@@ -3073,8 +3154,8 @@ fn handle_daemon_sandbox_run_process_plan_with_output_sink_on_runtime(
 
 #[cfg(feature = "sandbox")]
 fn append_daemon_sandbox_new_command_record_events<T: sinomo_dfs::DfsMessageTransport>(
-    event_store: &mut sinomo_events::JsonlEventStore,
-    node_id: sinomo_node::NodeId,
+    event_store: &mut sinomo_core::events::JsonlEventStore,
+    node_id: sinomo_core::node::NodeId,
     manifest: &sinomo_sandbox::SandboxInstanceManifest,
     fs: &mut sinomo_sandbox::SifsSandboxFileSystem<T>,
     before_command_history: &[sinomo_sandbox::SandboxCommandId],
@@ -3262,8 +3343,8 @@ fn handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(
 
 #[cfg(feature = "sandbox")]
 fn append_daemon_sandbox_command_events<T: sinomo_dfs::DfsMessageTransport>(
-    event_store: &mut sinomo_events::JsonlEventStore,
-    node_id: sinomo_node::NodeId,
+    event_store: &mut sinomo_core::events::JsonlEventStore,
+    node_id: sinomo_core::node::NodeId,
     manifest: &sinomo_sandbox::SandboxInstanceManifest,
     fs: &mut sinomo_sandbox::SifsSandboxFileSystem<T>,
     command: &sinomo_sandbox::SandboxLocalCommandOutcome,
@@ -3292,7 +3373,7 @@ fn append_daemon_sandbox_command_events<T: sinomo_dfs::DfsMessageTransport>(
 pub(crate) async fn handle_daemon_sandbox_run_toolchain_stream_async_on_runtime(
     paths: &DaemonPaths,
     request: sinomo_sandbox::SandboxRunToolchainRequest,
-    stream: &mut sinomo_network::AsyncDaemonControlStream,
+    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
     stream_address: &str,
     runtime: &tokio::runtime::Handle,
 ) -> Result<(), DaemonError> {
@@ -3401,7 +3482,7 @@ pub(crate) async fn handle_daemon_sandbox_run_toolchain_stream_async_on_runtime(
 pub(crate) async fn handle_daemon_sandbox_run_process_plan_stream_async_on_runtime(
     paths: &DaemonPaths,
     request: sinomo_sandbox::SandboxRunProcessPlanRequest,
-    stream: &mut sinomo_network::AsyncDaemonControlStream,
+    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
     stream_address: &str,
     runtime: &tokio::runtime::Handle,
 ) -> Result<(), DaemonError> {
@@ -3533,11 +3614,11 @@ fn sandbox_output_chunk_stream_key(
 }
 
 async fn write_daemon_sandbox_stream_frame_async(
-    stream: &mut sinomo_network::AsyncDaemonControlStream,
+    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
     stream_address: &str,
     frame: &sinomo_sandbox::SandboxRunToolchainStreamFrame,
 ) -> Result<(), DaemonError> {
-    let response = sinomo_network::ObjectRpcResponse::encode_body(
+    let response = sinomo_core::network::ObjectRpcResponse::encode_body(
         sinomo_sandbox::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
         frame,
     )
@@ -3546,11 +3627,11 @@ async fn write_daemon_sandbox_stream_frame_async(
 }
 
 async fn write_daemon_sandbox_process_plan_stream_frame_async(
-    stream: &mut sinomo_network::AsyncDaemonControlStream,
+    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
     stream_address: &str,
     frame: &sinomo_sandbox::SandboxRunProcessPlanStreamFrame,
 ) -> Result<(), DaemonError> {
-    let response = sinomo_network::ObjectRpcResponse::encode_body(
+    let response = sinomo_core::network::ObjectRpcResponse::encode_body(
         sinomo_sandbox::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
         frame,
     )
@@ -3572,7 +3653,7 @@ fn load_daemon_sandbox_policy_config(
 fn validate_daemon_sandbox_manifest_policy(
     paths: &DaemonPaths,
     policy: &sinomo_sandbox::SandboxPolicy,
-    node_id: &sinomo_node::NodeId,
+    node_id: &sinomo_core::node::NodeId,
     manifest: &sinomo_sandbox::SandboxInstanceManifest,
     phase: &str,
 ) -> Result<(), DaemonError> {
@@ -3607,7 +3688,7 @@ fn validate_daemon_sandbox_manifest_policy(
 fn validate_daemon_sandbox_toolchain_update_policy(
     paths: &DaemonPaths,
     policy: &sinomo_sandbox::SandboxPolicy,
-    node_id: &sinomo_node::NodeId,
+    node_id: &sinomo_core::node::NodeId,
     manifest: &sinomo_sandbox::SandboxToolchainManifest,
     phase: &str,
 ) -> Result<(), DaemonError> {
@@ -3625,11 +3706,11 @@ fn validate_daemon_sandbox_toolchain_update_policy(
 
 fn daemon_sandbox_replica_candidates(
     paths: &DaemonPaths,
-    local_node_id: &sinomo_node::NodeId,
-) -> Vec<sinomo_node::NodeId> {
+    local_node_id: &sinomo_core::node::NodeId,
+) -> Vec<sinomo_core::node::NodeId> {
     let advertisements = cluster_paths_from_daemon_paths(paths)
         .and_then(|cluster_paths| {
-            sinomo_kv::read_cluster_kv_prefix_entries(
+            sinomo_core::kv::read_cluster_kv_prefix_entries(
                 &cluster_paths.kv_paths(),
                 sinomo_dfs::content_services_prefix(),
             )
@@ -3646,9 +3727,9 @@ fn daemon_sandbox_replica_candidates(
 }
 
 fn daemon_sandbox_replica_candidates_from_content_advertisements(
-    local_node_id: &sinomo_node::NodeId,
+    local_node_id: &sinomo_core::node::NodeId,
     advertisements: Vec<sinomo_dfs::DfsNodeAdvertisement>,
-) -> Vec<sinomo_node::NodeId> {
+) -> Vec<sinomo_core::node::NodeId> {
     let mut candidates = BTreeSet::new();
     candidates.insert(local_node_id.clone());
     for advertisement in advertisements {
@@ -3670,10 +3751,10 @@ pub(crate) fn open_daemon_sandbox_dfs_service_on_runtime(
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_dfs::NetworkedDfsService<sinomo_dfs::DfsEndpointTransport>, DaemonError> {
     let data_dir = daemon_data_dir_path(paths)?;
-    let data_dir = sinomo_local::SinomoDataDir::new(&data_dir);
+    let data_dir = sinomo_core::local::SinomoDataDir::new(&data_dir);
     data_dir.ensure_root_layout()?;
-    let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
-    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
+    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
     let content = sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content")).map_err(
         |source| DaemonError::Io {
             path: data_dir.dfs_dir().join("content").display().to_string(),
@@ -3734,9 +3815,10 @@ fn publish_daemon_module_rollout_status_from_data_dir(
     data_dir: &Path,
     rollout_paths: &SelfRolloutPaths,
 ) -> Result<Option<ClusterModuleRolloutStatusRecord>, DaemonError> {
-    let data_dir_handle = sinomo_local::SinomoDataDir::new(data_dir);
-    let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir_handle);
-    let Ok(cluster_state) = sinomo_network::read_cluster_state_without_kv(&cluster_paths) else {
+    let data_dir_handle = sinomo_core::local::SinomoDataDir::new(data_dir);
+    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir_handle);
+    let Ok(cluster_state) = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+    else {
         return Ok(None);
     };
     let Some(runtime_state) = sinomo_rollout::read_rollout_runtime_state(rollout_paths)? else {
@@ -3781,9 +3863,10 @@ pub fn run_daemon_module_rollout_desired_reconciliation_tick(
     paths: &DaemonPaths,
 ) -> Result<Vec<ClusterModuleRolloutReconciliationRecord>, DaemonError> {
     let data_dir = daemon_data_dir_path(paths)?;
-    let data_dir_handle = sinomo_local::SinomoDataDir::new(&data_dir);
-    let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir_handle);
-    let Ok(cluster_state) = sinomo_network::read_cluster_state_without_kv(&cluster_paths) else {
+    let data_dir_handle = sinomo_core::local::SinomoDataDir::new(&data_dir);
+    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir_handle);
+    let Ok(cluster_state) = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+    else {
         return Ok(Vec::new());
     };
     let desired_records =
@@ -3871,7 +3954,7 @@ fn daemon_module_rollout_desired_targets_node(
 
 fn daemon_module_rollout_reconciliation_record(
     data_dir: &Path,
-    cluster_id: &sinomo_node::ClusterId,
+    cluster_id: &sinomo_core::node::ClusterId,
     node_id: &NodeId,
     desired: &ClusterModuleRolloutDesiredRecord,
     runtime_state: Option<&sinomo_rollout::RolloutRuntimeState>,
@@ -4033,14 +4116,16 @@ fn daemon_verified_rollout_material_mismatch(
     None
 }
 
-fn daemon_rollout_controller_node_id(data_dir: &Path) -> Result<sinomo_node::NodeId, DaemonError> {
-    let data_dir_handle = sinomo_local::SinomoDataDir::new(data_dir);
-    let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir_handle);
-    if let Ok(state) = sinomo_network::read_cluster_state_without_kv(&cluster_paths) {
+fn daemon_rollout_controller_node_id(
+    data_dir: &Path,
+) -> Result<sinomo_core::node::NodeId, DaemonError> {
+    let data_dir_handle = sinomo_core::local::SinomoDataDir::new(data_dir);
+    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir_handle);
+    if let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) {
         return Ok(state.local_node_id);
     }
-    let identity = sinomo_node::load_or_create_main_node_identity(data_dir)?;
-    Ok(sinomo_node::NodeId::derived(
+    let identity = sinomo_core::node::load_or_create_main_node_identity(data_dir)?;
+    Ok(sinomo_core::node::NodeId::derived(
         "sinomo.rollout.local-node",
         identity.public_key.as_bytes(),
     ))
@@ -4091,9 +4176,11 @@ fn append_daemon_sandbox_event(
     Ok(())
 }
 
-fn daemon_event_store(paths: &DaemonPaths) -> Result<sinomo_events::JsonlEventStore, DaemonError> {
+fn daemon_event_store(
+    paths: &DaemonPaths,
+) -> Result<sinomo_core::events::JsonlEventStore, DaemonError> {
     let data_dir = daemon_data_dir_path(paths)?;
-    Ok(sinomo_events::JsonlEventStore::new(
+    Ok(sinomo_core::events::JsonlEventStore::new(
         data_dir.join("events/event-log.jsonl"),
     ))
 }
@@ -4245,8 +4332,8 @@ pub(crate) async fn daemon_status_response_async(
 mod tests {
     use super::*;
     use crate::{DaemonRunOptions, sign_daemon_rpc_request_from_data_dir};
-    use sinomo_local::SinomoDataDir;
-    use sinomo_node::NodeId;
+    use sinomo_core::local::SinomoDataDir;
+    use sinomo_core::node::NodeId;
     use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
 
@@ -4276,36 +4363,36 @@ mod tests {
     }
 
     fn append_cluster_raft_command(
-        paths: &sinomo_network::ClusterPaths,
+        paths: &sinomo_core::network::ClusterPaths,
         node_id: &NodeId,
-        command: sinomo_kv::KvCommand,
-    ) -> Result<sinomo_kv::KvSnapshot, sinomo_network::NetworkError> {
+        command: sinomo_core::kv::KvCommand,
+    ) -> Result<sinomo_core::kv::KvSnapshot, sinomo_core::network::NetworkError> {
         paths
             .kv_paths()
             .append_kv_command_and_publish(
                 node_id,
                 command,
-                sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
+                sinomo_core::kv::cluster_kv_key_can_defer_materialized_snapshot,
             )
-            .map_err(Into::into)
+            .map_err(sinomo_core::network::NetworkError::directory)
     }
 
     #[test]
     fn dfs_message_replay_skips_large_data_plane_responses() {
-        let small = sinomo_network::ObjectRpcResponse::from_encoded_body(
+        let small = sinomo_core::network::ObjectRpcResponse::from_encoded_body(
             sinomo_dfs::DFS_DATA_FETCH_BLOB_ROUTE,
             vec![0_u8; DAEMON_DFS_MESSAGE_REPLAY_MAX_CACHED_BODY_BYTES - 1],
         );
         assert!(daemon_dfs_message_response_is_replay_cacheable(&small));
 
-        let large = sinomo_network::ObjectRpcResponse::from_encoded_body(
+        let large = sinomo_core::network::ObjectRpcResponse::from_encoded_body(
             sinomo_dfs::DFS_DATA_FETCH_BLOB_ROUTE,
             vec![0_u8; DAEMON_DFS_MESSAGE_REPLAY_MAX_CACHED_BODY_BYTES],
         );
         assert!(!daemon_dfs_message_response_is_replay_cacheable(&large));
 
-        let large_non_dfs = sinomo_network::ObjectRpcResponse::from_encoded_body(
-            sinomo_network::CLUSTER_NETWORK_PING_ROUTE,
+        let large_non_dfs = sinomo_core::network::ObjectRpcResponse::from_encoded_body(
+            sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE,
             vec![0_u8; DAEMON_DFS_MESSAGE_REPLAY_MAX_CACHED_BODY_BYTES],
         );
         assert!(daemon_dfs_message_response_is_replay_cacheable(
@@ -4319,7 +4406,7 @@ mod tests {
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
         let paths = DaemonPaths::new(&data_dir);
-        let request = sinomo_network::ObjectRpcRequest::encode_body(
+        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
             sinomo_rollout::ROLLOUT_DIAGNOSTICS_ROUTE,
             ROLLOUT_RPC_CATEGORY,
             &(),
@@ -4332,9 +4419,10 @@ mod tests {
             let service_runtime = runtime.handle().clone();
             runtime
                 .block_on(async move {
-                    let listener = sinomo_network::AsyncDaemonControlListener::bind("127.0.0.1:0")
-                        .await
-                        .expect("listener");
+                    let listener =
+                        sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+                            .await
+                            .expect("listener");
                     let stream_address = listener.local_addr_string().expect("listener address");
                     address_tx
                         .send(stream_address.clone())
@@ -4366,14 +4454,16 @@ mod tests {
             .expect("client runtime");
         let response = client_runtime
             .block_on(async {
-                let timeouts =
-                    sinomo_network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(2));
-                let frame_options = sinomo_network::ObjectFrameIoOptions::none()
+                let timeouts = sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
+                    Duration::from_secs(2),
+                );
+                let frame_options = sinomo_core::network::ObjectFrameIoOptions::none()
                     .with_idle_timeout(timeouts.idle_timeout);
-                let mut stream = sinomo_network::AsyncDaemonControlStream::connect_with_options(
-                    &address, timeouts,
-                )
-                .await?;
+                let mut stream =
+                    sinomo_core::network::AsyncDaemonControlStream::connect_with_options(
+                        &address, timeouts,
+                    )
+                    .await?;
                 stream
                     .write_request(&address, &control_request, frame_options)
                     .await?;
@@ -4386,7 +4476,10 @@ mod tests {
         let error = response
             .error_detail()
             .expect_err("auth failures are RPC errors");
-        assert!(matches!(error, sinomo_network::NetworkError::AuthDenied));
+        assert!(matches!(
+            error,
+            sinomo_core::network::NetworkError::AuthDenied
+        ));
         server.join().expect("server thread");
     }
 
@@ -4447,7 +4540,7 @@ mod tests {
         )
         .expect("telemetry gate config");
         let mut event_store =
-            sinomo_events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
+            sinomo_core::events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
         event_store
             .append(module_shadow_decision_event(
                 &node,
@@ -4513,7 +4606,7 @@ mod tests {
         )
         .expect("telemetry gate config");
         let mut event_store =
-            sinomo_events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
+            sinomo_core::events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
         event_store
             .append(module_shadow_decision_event(
                 &node,
@@ -4578,7 +4671,7 @@ mod tests {
         )
         .expect("telemetry gate config");
         let mut event_store =
-            sinomo_events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
+            sinomo_core::events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
         event_store
             .append(module_invocation_decision_event(
                 &node,
@@ -4612,10 +4705,10 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-rollout-status");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
-        let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         cluster_paths.ensure().expect("cluster paths");
         let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_daemon_module_rollout_status")
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_module_rollout_status")
                 .expect("cluster");
         let node = NodeId::from_legacy_named("node_daemon_module_rollout_status").expect("node id");
         let cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -4626,10 +4719,13 @@ mod tests {
             "public-key",
             OffsetDateTime::now_utc(),
         );
-        sinomo_network::write_cluster_state(&cluster_paths, &cluster_state)
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &cluster_state)
             .expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &cluster_state)
-            .expect("sync cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(
+            &cluster_paths,
+            &cluster_state,
+        )
+        .expect("sync cluster state");
 
         let rollout_paths = SelfRolloutPaths::new(&root);
         let module_id =
@@ -4663,7 +4759,7 @@ mod tests {
                 module_id: module_id.clone(),
                 candidate_artifact_id: artifact_id.clone(),
                 telemetry_kind: "module.invocation.decision".to_string(),
-                last_consumed_sequence: Some(sinomo_events::EventSequence(7)),
+                last_consumed_sequence: Some(sinomo_core::events::EventSequence(7)),
                 last_transition_record_id: Some(
                     sinomo_core::Id::from_legacy_named("transition_daemon_status")
                         .expect("transition"),
@@ -4699,10 +4795,10 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-rollout-desired-blocked");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
-        let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         cluster_paths.ensure().expect("cluster paths");
         let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_daemon_desired_blocked")
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_desired_blocked")
                 .expect("cluster");
         let node = NodeId::from_legacy_named("node_daemon_desired_blocked").expect("node id");
         let cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -4713,10 +4809,13 @@ mod tests {
             "public-key",
             OffsetDateTime::now_utc(),
         );
-        sinomo_network::write_cluster_state(&cluster_paths, &cluster_state)
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &cluster_state)
             .expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &cluster_state)
-            .expect("sync cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(
+            &cluster_paths,
+            &cluster_state,
+        )
+        .expect("sync cluster state");
 
         let module_id =
             sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
@@ -4785,10 +4884,10 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-rollout-desired-prepared");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
-        let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         cluster_paths.ensure().expect("cluster paths");
         let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_daemon_desired_prepared")
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_desired_prepared")
                 .expect("cluster");
         let node = NodeId::from_legacy_named("node_daemon_desired_prepared").expect("node id");
         let cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -4799,10 +4898,13 @@ mod tests {
             "public-key",
             OffsetDateTime::now_utc(),
         );
-        sinomo_network::write_cluster_state(&cluster_paths, &cluster_state)
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &cluster_state)
             .expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &cluster_state)
-            .expect("sync cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(
+            &cluster_paths,
+            &cluster_state,
+        )
+        .expect("sync cluster state");
 
         let module_id =
             sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
@@ -4913,10 +5015,10 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-rollout-desired-matched");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
-        let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         cluster_paths.ensure().expect("cluster paths");
         let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_daemon_desired_matched")
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_desired_matched")
                 .expect("cluster");
         let node = NodeId::from_legacy_named("node_daemon_desired_matched").expect("node id");
         let cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -4927,10 +5029,13 @@ mod tests {
             "public-key",
             OffsetDateTime::now_utc(),
         );
-        sinomo_network::write_cluster_state(&cluster_paths, &cluster_state)
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &cluster_state)
             .expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &cluster_state)
-            .expect("sync cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(
+            &cluster_paths,
+            &cluster_state,
+        )
+        .expect("sync cluster state");
 
         let module_id =
             sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
@@ -5001,10 +5106,11 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-sharded-dfs-metadata");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data dir");
-        let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
-        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_daemon_sharded_dfs")
-            .expect("cluster");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_sharded_dfs")
+                .expect("cluster");
         let local = NodeId::from_legacy_named("node_daemon_sharded_dfs").expect("node");
         let state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id,
@@ -5014,8 +5120,8 @@ mod tests {
             "pk-local",
             now,
         );
-        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("sync raft");
         let file_system = sinomo_dfs::distributed_sifs(local.clone());
         let root_shard = sinomo_dfs::DfsMetadataShardConfig {
@@ -5041,16 +5147,16 @@ mod tests {
         append_cluster_raft_command(
             &cluster_paths,
             &local,
-            sinomo_kv::KvCommand::Txn(sinomo_kv::KvTxn {
+            sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
                 compares: Vec::new(),
                 success: vec![
-                    sinomo_kv::KvOp::put_serde(
+                    sinomo_core::kv::KvOp::put_serde(
                         sinomo_dfs::metadata_shard_key(&file_system.file_system_id, "root"),
                         &root_shard,
                         None,
                     )
                     .expect("root shard op"),
-                    sinomo_kv::KvOp::put_serde(
+                    sinomo_core::kv::KvOp::put_serde(
                         sinomo_dfs::metadata_shard_key(&file_system.file_system_id, "services"),
                         &services_shard,
                         None,
@@ -5386,8 +5492,8 @@ mod tests {
         sinomo_registry::TrustedArtifactSigner,
     ) {
         let identity_path = root.join(format!("{signer_id}.sobj"));
-        let identity =
-            sinomo_node::load_or_create_node_identity(&identity_path).expect("signer identity");
+        let identity = sinomo_core::node::load_or_create_node_identity(&identity_path)
+            .expect("signer identity");
         let mut artifact = sinomo_core::ArtifactManifest {
             artifact_id: artifact_id.clone(),
             module_id: module_id.clone(),
@@ -5466,7 +5572,7 @@ mod tests {
         matched: bool,
     ) -> sinomo_core::EventEnvelope {
         sinomo_core::EventEnvelope::new(
-            sinomo_events::EventId::generate(),
+            sinomo_core::events::EventId::generate(),
             OffsetDateTime::now_utc(),
             node_id.clone(),
             sinomo_core::Source::new("module.live").expect("source"),
@@ -5503,7 +5609,7 @@ mod tests {
         primary_error: Option<&str>,
     ) -> sinomo_core::EventEnvelope {
         sinomo_core::EventEnvelope::new(
-            sinomo_events::EventId::generate(),
+            sinomo_core::events::EventId::generate(),
             OffsetDateTime::now_utc(),
             node_id.clone(),
             sinomo_core::Source::new("module.live").expect("source"),
@@ -5536,7 +5642,7 @@ mod tests {
         address: &str,
         timeout: Duration,
     ) -> Result<crate::DaemonStatus, DaemonError> {
-        let request = sinomo_network::ObjectRpcRequest::encode_body(
+        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
             crate::DAEMON_STATUS_ROUTE,
             crate::DAEMON_RPC_CATEGORY,
             &(),
@@ -5550,7 +5656,7 @@ mod tests {
         address: &str,
         timeout: Duration,
     ) -> Result<String, DaemonError> {
-        let request = sinomo_network::ObjectRpcRequest::encode_body(
+        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
             crate::DAEMON_SHUTDOWN_ROUTE,
             crate::DAEMON_RPC_CATEGORY,
             &(),
@@ -5562,9 +5668,9 @@ mod tests {
     fn send_test_rpc(
         data_dir: &SinomoDataDir,
         address: &str,
-        request: &sinomo_network::ObjectRpcRequest,
+        request: &sinomo_core::network::ObjectRpcRequest,
         timeout: Duration,
-    ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
         let signed = sign_daemon_rpc_request_from_data_dir(data_dir, request)?;
         crate::send_daemon_rpc_raw(address, Some(&signed), request, timeout)
             .map_err(DaemonError::from)

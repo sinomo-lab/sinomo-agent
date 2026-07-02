@@ -1,19 +1,21 @@
 [package]
 name = "sinomo-runtime"
 version.workspace = true
-description = "Explicit R0/R1 runtime boundary facade for Sinomo service crates"
+description = "Explicit R1 runtime boundary facade for Sinomo service crates"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [package.metadata.sinomo]
-ring = "r0-r1-boundary"
+ring = "r1-boundary"
 
 [features]
 default = []
 # Enable sandbox execution through the native-module host loader. This does not
 # link the build-heavy WASIX engine.
 sandbox = ["dep:sinomo-sandbox-wasix-host", "sinomo-daemon/sandbox"]
+# Forwards the cluster test-support surface to application-crate tests.
+cluster-test-support = ["sinomo-core/cluster-test-support"]
 
 [dependencies]
 sinomo-cli-registry = { path = "../sinomo-cli-registry" }
@@ -24,15 +26,8 @@ sinomo-device = { path = "../sinomo-device" }
 sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-dfs-cloud-files-api = { path = "../sinomo-dfs-cloud-files-api" }
 sinomo-eval = { path = "../sinomo-eval" }
-sinomo-events = { path = "../sinomo-events" }
-sinomo-local = { path = "../sinomo-local" }
-sinomo-kv = { path = "../sinomo-kv" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-module-api = { path = "../sinomo-module-api" }
-sinomo-network = { path = "../sinomo-network", features = ["iroh-transport"] }
-sinomo-network-module = { path = "../sinomo-network-module" }
-sinomo-node = { path = "../sinomo-node" }
-sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 sinomo-observe = { path = "../sinomo-observe" }
 sinomo-policy = { path = "../sinomo-policy" }
 sinomo-registry = { path = "../sinomo-registry" }
@@ -41,7 +36,5 @@ sinomo-sandbox = { path = "../sinomo-sandbox" }
 sinomo-sandbox-simple = { path = "../sinomo-sandbox-simple" }
 sinomo-sandbox-wasix-api = { path = "../sinomo-sandbox-wasix-api" }
 sinomo-sandbox-wasix-host = { path = "../sinomo-sandbox-wasix-host", optional = true }
-sinomo-service = { path = "../sinomo-service" }
-sinomo-storage = { path = "../sinomo-storage" }
 sinomo-supervision = { path = "../sinomo-supervision" }
 sinomo-test = { path = "../sinomo-test" }

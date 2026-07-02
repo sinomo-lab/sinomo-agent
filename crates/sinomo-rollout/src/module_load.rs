@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
+use sinomo_core::events::EventId;
+use sinomo_core::node::NodeId;
 use sinomo_core::{
     ArtifactManifest, Confidence, EventEnvelope, EventKind, HotSwapState, LatencyClass,
     ModuleLoaderState, PolicyAction, PolicyDecision, PrivacyClass, RolloutPlan, RoutingMetadata,
     RoutingScope, Salience, Source, TrustRing,
 };
-use sinomo_events::EventId;
 use sinomo_module::{ArtifactId, ModuleId, verify_artifact_signature};
-use sinomo_node::NodeId;
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -259,7 +259,8 @@ mod tests {
             ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
         let artifact_id = ArtifactId::from_legacy_named("artifact_candidate").expect("artifact");
         let (_identity_dir, identity_path) = unique_identity_path("valid-artifact-signature");
-        let identity = sinomo_node::load_or_create_node_identity(&identity_path).expect("identity");
+        let identity =
+            sinomo_core::node::load_or_create_node_identity(&identity_path).expect("identity");
         let mut artifact = artifact_manifest(&artifact_id, &module_id, "blake3:abc", Vec::new());
         artifact.signature =
             Some(sign_artifact_manifest_with_node_identity(&artifact, &identity).expect("sign"));
@@ -288,7 +289,8 @@ mod tests {
             ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
         let artifact_id = ArtifactId::from_legacy_named("artifact_candidate").expect("artifact");
         let (_identity_dir, identity_path) = unique_identity_path("tampered-artifact-signature");
-        let identity = sinomo_node::load_or_create_node_identity(&identity_path).expect("identity");
+        let identity =
+            sinomo_core::node::load_or_create_node_identity(&identity_path).expect("identity");
         let mut artifact = artifact_manifest(&artifact_id, &module_id, "blake3:abc", Vec::new());
         artifact.signature =
             Some(sign_artifact_manifest_with_node_identity(&artifact, &identity).expect("sign"));

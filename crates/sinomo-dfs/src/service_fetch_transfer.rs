@@ -5,7 +5,7 @@
 //! module owns fetch requests, inline/chunked fetch responses, and the retry
 //! wakeups that follow successful or failed fetches.
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::transfer::{
     DFS_BLOB_CHUNK_BYTES, InProgressFetchBlobTransfer, blob_chunk_count_for_size, chunk_hash,

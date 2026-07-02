@@ -5,7 +5,7 @@
 //! module owns the shared response-batch collection and replay validation
 //! rather than leaving that logic in the generic inbound protocol dispatcher.
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::*;
 

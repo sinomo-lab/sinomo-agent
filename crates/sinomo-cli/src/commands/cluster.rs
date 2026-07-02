@@ -1,29 +1,33 @@
 use super::*;
 
 #[cfg(test)]
-pub(crate) use network::apply_cluster_node_role;
+pub(crate) use cluster::apply_cluster_node_role;
 #[cfg(test)]
-pub(crate) use network::cluster_state_sync_txn;
+pub(crate) use cluster::cluster_state_sync_txn;
 #[cfg(test)]
-pub(crate) use network::invite_channels_for_join_registration;
+pub(crate) use cluster::invite_channels_for_join_registration;
 #[cfg(test)]
-pub(crate) use network::invite_communication_channels;
+pub(crate) use cluster::invite_communication_channels;
 #[cfg(test)]
-pub(crate) use network::invite_introducer_endpoint;
+pub(crate) use cluster::invite_introducer_endpoint;
 #[cfg(test)]
-pub(crate) use network::read_cluster_members_from_kv;
+pub(crate) use cluster::read_cluster_members_from_kv;
 #[cfg(test)]
-pub(crate) use network::read_cluster_node_statuses_from_kv;
+pub(crate) use cluster::read_cluster_node_statuses_from_kv;
 #[cfg(test)]
-pub(crate) use network::sign_cluster_join_invite;
-pub(crate) use network::{
-    cluster_join_command, cluster_state_needs_join_registration, cluster_status_summary_label,
-    decode_cluster_join_invite, encode_cluster_join_invite, extract_invite_from_join_command,
+pub(crate) use cluster::sign_cluster_join_invite;
+use cluster::{
+    cluster_join_command, cluster_status_summary_label, decode_cluster_join_invite,
+    encode_cluster_join_invite, extract_invite_from_join_command,
     invite_introducer_endpoint_from_state, is_remote_usable_invite_endpoint,
     verify_cluster_join_invite_signature,
 };
 #[cfg(test)]
-pub(crate) use network::{compact_default_invite_introducers, push_unique_introducer};
+pub(crate) use cluster::{compact_default_invite_introducers, push_unique_introducer};
+pub(crate) use network::cluster_state_needs_join_registration;
+use sinomo_runtime::cluster;
+#[allow(unused_imports)]
+use sinomo_runtime::cluster::ClusterKvPathsExt;
 #[cfg(test)]
 pub(crate) use sinomo_runtime::node::apply_cluster_raft_role;
 use sinomo_runtime::node::{
@@ -39,7 +43,7 @@ pub(crate) fn build_cluster_raft_append_request_from_next_index(
     paths
         .kv_paths()
         .build_raft_append_request_from_next_index(state, next_index)
-        .map_err(Into::into)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,6 +91,9 @@ pub(crate) struct ClusterJoinOptions {
     pub(crate) cluster_id: Option<ClusterId>,
     pub(crate) node_id: Option<NodeId>,
     pub(crate) name: String,
+    /// True when `--name` was passed explicitly (vs the hostname default);
+    /// a daemon-mediated join then applies the name with a follow-up rename.
+    pub(crate) name_explicit: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -319,6 +326,7 @@ pub(crate) fn parse_cluster_join_options(args: &[String]) -> Result<ClusterJoinO
         cluster_id: None,
         node_id: None,
         name: default_cluster_node_name("sinomo-node"),
+        name_explicit: false,
     };
     let mut index = 0;
     while index < rest.len() {
@@ -348,6 +356,7 @@ pub(crate) fn parse_cluster_join_options(args: &[String]) -> Result<ClusterJoinO
                     return Err(CliError::Usage);
                 };
                 options.name = non_empty_cluster_name(name)?;
+                options.name_explicit = true;
             }
             _ => return Err(CliError::Usage),
         }
@@ -768,6 +777,33 @@ pub(crate) fn cluster_paths_from_defaults() -> Result<ClusterPaths, CliError> {
     Ok(ClusterPaths::new(&data_dir))
 }
 
+/// Daemon-first access for cluster control commands: a client bound to the
+/// reachable local main daemon, or `None` when no daemon answers its status
+/// probe (or the CLI runs with `--local`).
+fn reachable_cluster_control_daemon() -> Result<Option<DaemonApiClient>, CliError> {
+    if cli_force_local_mode() {
+        return Ok(None);
+    }
+    Ok(default_main_daemon_status()?.map(|status| DaemonApiClient::at_address(status.address)))
+}
+
+/// Cluster control mutations are executed by the daemon (`/cluster/control/*`);
+/// without a reachable daemon they fail with guidance instead of mutating
+/// cluster state directly.
+fn cluster_control_daemon_client(action: &str) -> Result<DaemonApiClient, CliError> {
+    reachable_cluster_control_daemon()?.ok_or_else(|| cluster_daemon_required_error(action))
+}
+
+/// Actionable failure for daemon-first cluster commands when no main daemon is
+/// reachable.
+pub(crate) fn cluster_daemon_required_error(action: &str) -> CliError {
+    CliError::DaemonNotRunning {
+        detail: format!(
+            "`sinomo cluster {action}` is executed by the local main daemon; start it with `sinomo daemon start` and retry"
+        ),
+    }
+}
+
 fn append_cluster_raft_command(
     paths: &ClusterPaths,
     node_id: &NodeId,
@@ -780,7 +816,7 @@ fn append_cluster_raft_command(
             command,
             sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
-        .map_err(Into::into)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
 }
 
 pub(crate) fn cluster_kv_state_authority_id(
@@ -790,7 +826,7 @@ pub(crate) fn cluster_kv_state_authority_id(
     paths
         .kv_paths()
         .known_raft_voter_leader_id(state)
-        .map_err(Into::into)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
 }
 
 #[cfg(test)]
@@ -802,7 +838,7 @@ pub(crate) fn set_cluster_raft_leader(
     paths
         .kv_paths()
         .set_raft_leader_and_write_snapshot_if_changed(node_id, term)
-        .map_err(Into::into)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
 }
 
 pub(crate) fn locked_set_cluster_raft_leader(
@@ -813,7 +849,7 @@ pub(crate) fn locked_set_cluster_raft_leader(
     paths
         .kv_paths()
         .locked_set_raft_leader_and_write_snapshot_if_changed(node_id, term)
-        .map_err(Into::into)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
 }
 
 #[cfg(test)]
@@ -824,7 +860,7 @@ pub(crate) fn clear_cluster_raft_leader(
     paths
         .kv_paths()
         .clear_raft_leader_and_write_snapshot_if_changed(node_id)
-        .map_err(Into::into)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
 }
 
 pub(crate) fn require_cluster_bootstrap_state() -> Result<ClusterBootstrapState, CliError> {
@@ -880,8 +916,27 @@ pub(crate) fn local_daemon_can_serve_cluster_kv_snapshot(
     daemon_fetch_cluster_kv_snapshot(&daemon.address, DAEMON_PROBE_TIMEOUT).is_ok()
 }
 
+/// `sinomo cluster init`: daemon-first — a reachable main daemon initializes
+/// the cluster through `/cluster/control/init`. Without a daemon the direct
+/// local path stays available for first boot (it still fails with "already
+/// initialized" guidance when cluster state exists).
 pub(crate) fn cluster_init(options: ClusterInitOptions) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
+    if let Some(client) = reachable_cluster_control_daemon()? {
+        if options.cluster_id.is_some() || options.node_id.is_some() {
+            return Err(CliError::Parse {
+                detail: "--cluster-id/--node-id are only supported by the local first-boot fallback; the daemon assigns cluster and node ids (stop the daemon with `sinomo daemon stop` to initialize with explicit ids)".to_string(),
+            });
+        }
+        let response = client.cluster_init(cluster::ClusterControlInitRequest {
+            cluster_name: options.name.clone(),
+            node_display_name: Some(options.name),
+        })?;
+        println!("cluster initialized: {}", response.cluster_id);
+        println!("local node: {}", response.node_id);
+        println!("state: {}", paths.state.display());
+        return Ok(());
+    }
     cluster_init_with_paths(options, &paths)?;
     nudge_local_daemon_cluster_activation();
     Ok(())
@@ -931,23 +986,61 @@ pub(crate) fn initialize_single_node_cluster_with_paths(
         &DaemonRunOptions::shadow_default(),
         now,
     );
-    network::assign_local_daemon_member_public_keys(&mut state, main_public_key, shadow_public_key);
-    network::write_cluster_state(paths, &state)?;
+    cluster::assign_local_daemon_member_public_keys(&mut state, main_public_key, shadow_public_key);
+    cluster::write_cluster_state(paths, &state)?;
     locked_set_cluster_raft_leader(paths, &state.local_node_id, 1)?;
     sync_cluster_state_to_kv(paths, &state)?;
 
     Ok(state)
 }
 
+/// `sinomo cluster invite`: daemon-required — the daemon builds, signs, and
+/// publishes the invite through `/cluster/control/invite` with its own
+/// advertised introducers and the default ttl. The direct implementation
+/// stays reachable through [`cluster_invite_with_paths`].
 pub(crate) fn cluster_invite(options: ClusterInviteOptions) -> Result<(), CliError> {
-    let paths = cluster_paths_from_defaults()?;
-    let rendered = cluster_invite_with_paths(options, &paths)?;
-    println!("invite: {}", rendered.uri);
-    println!("join command: {}", rendered.join_command);
-    println!("cluster: {}", rendered.invite.cluster_id);
-    println!("expires: {}", format_rfc3339(rendered.invite.expires_at));
-    println!("saved: {}", rendered.persisted_key);
-    if let Some(output) = rendered.output_path {
+    let client = cluster_control_daemon_client("invite")?;
+    if options.ttl_seconds != CLUSTER_INVITE_DEFAULT_TTL_SECONDS {
+        return Err(CliError::Parse {
+            detail: "--ttl-seconds is not supported for daemon-mediated invites yet; the daemon issues invites with the default 24h ttl".to_string(),
+        });
+    }
+    if !options.introducers.is_empty() {
+        return Err(CliError::Parse {
+            detail: "--introducer is not supported for daemon-mediated invites yet; the daemon publishes its own advertised endpoints as introducers".to_string(),
+        });
+    }
+    let uri = client.cluster_invite()?.invite;
+    let invite = decode_cluster_join_invite(&uri)?;
+    if invite
+        .introducers
+        .iter()
+        .all(|endpoint| !is_remote_usable_invite_endpoint(endpoint))
+    {
+        println!(
+            "warning: invite only contains local-only introducers; remote machines cannot use it until the daemon advertises a LAN-reachable address"
+        );
+    }
+    let join_command = cluster_join_command(&uri);
+    println!("invite: {uri}");
+    println!("join command: {join_command}");
+    println!("cluster: {}", invite.cluster_id);
+    println!("expires: {}", format_rfc3339(invite.expires_at));
+    println!(
+        "saved: {}",
+        sinomo_runtime::node::cluster_invitation_key(&invite.invite_id)
+    );
+    if let Some(output) = &options.output {
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent).map_err(|source| CliError::Io {
+                path: parent.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+        fs::write(output, format!("{join_command}\n")).map_err(|source| CliError::Io {
+            path: output.display().to_string(),
+            detail: source.to_string(),
+        })?;
         println!("output: {}", output.display());
     }
     Ok(())
@@ -1020,7 +1113,7 @@ pub(crate) fn cluster_migration_plan_with_paths(
 
     let timestamp = OffsetDateTime::now_utc();
     let invite = parse_cluster_join_invite_argument(&options.invite)?;
-    if network::invite_has_embedded_signature(&invite) {
+    if cluster::invite_has_embedded_signature(&invite) {
         verify_cluster_join_invite_signature(&invite)?;
     }
     if invite.expires_at != OffsetDateTime::UNIX_EPOCH && invite.expires_at <= timestamp {
@@ -1168,7 +1261,7 @@ pub(crate) fn publish_cluster_invitation(
     state: &ClusterBootstrapState,
     invite: &ClusterJoinInvite,
 ) -> Result<(), CliError> {
-    match network::publish_cluster_invitation_to_quorum_with_host(
+    match cluster::publish_cluster_invitation_to_quorum_with_host(
         paths,
         state,
         invite,
@@ -1235,7 +1328,7 @@ pub(crate) fn build_cluster_invite(
         detail: "cluster paths have no data directory parent".to_string(),
     })?;
     let issuer_identity = load_or_create_main_node_identity(data_dir)?;
-    network::build_cluster_join_invite(
+    cluster::build_cluster_join_invite(
         state,
         &issuer_identity,
         introducers,
@@ -1256,10 +1349,10 @@ pub(crate) fn default_invite_introducers(
             probe_daemon_status(&daemon_paths, DAEMON_PROBE_TIMEOUT)
         {
             for endpoint in invite_introducers_from_daemon_status(&state.local_node_id, &status) {
-                network::push_unique_introducer(&mut introducers, endpoint);
+                cluster::push_unique_introducer(&mut introducers, endpoint);
             }
             if let Ok(record) = network::IrohEndpointRecord::read(paths, &state.local_node_id) {
-                network::push_unique_introducer(&mut introducers, record.endpoint());
+                cluster::push_unique_introducer(&mut introducers, record.endpoint());
             }
         }
     }
@@ -1276,17 +1369,82 @@ pub(crate) fn default_invite_introducers(
         })
         .flat_map(|member| member.endpoints.iter().cloned())
     {
-        network::push_unique_introducer(&mut introducers, endpoint);
+        cluster::push_unique_introducer(&mut introducers, endpoint);
     }
-    network::sort_default_invite_introducers(&mut introducers);
-    network::compact_default_invite_introducers(&mut introducers);
+    cluster::sort_default_invite_introducers(&mut introducers);
+    cluster::compact_default_invite_introducers(&mut introducers);
     introducers
 }
 
+/// `sinomo cluster join`: daemon-first — fresh joins and stale-pending
+/// retries run inside the daemon through `/cluster/control/join`. A node
+/// already settled in a cluster re-joins through the direct single-node
+/// migration path, which the daemon does not mediate yet (its handler
+/// directs operators back to this path).
 pub(crate) fn cluster_join(options: ClusterJoinOptions) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
-    cluster_join_with_paths(options, &paths)?;
-    nudge_local_daemon_cluster_activation();
+    paths.ensure()?;
+    if paths.state.exists() {
+        let existing = read_cluster_state(&paths)?;
+        if !cluster_state_needs_join_registration(&existing) {
+            cluster_join_single_node_migration_with_paths(options, &paths, existing)?;
+            nudge_local_daemon_cluster_activation();
+            return Ok(());
+        }
+    }
+    let client = cluster_control_daemon_client("join <invite>")?;
+    cluster_join_via_daemon(&client, options, &paths)
+}
+
+/// Sends a fresh (or stale-pending retry) cluster join through the daemon,
+/// with a best-effort follow-up rename when `--name` was explicit.
+fn cluster_join_via_daemon(
+    client: &DaemonApiClient,
+    options: ClusterJoinOptions,
+    paths: &ClusterPaths,
+) -> Result<(), CliError> {
+    if options.node_id.is_some() {
+        return Err(CliError::Parse {
+            detail: "--node-id is not supported for daemon-mediated cluster join; the daemon keeps its own node identity (rerun without --node-id)".to_string(),
+        });
+    }
+    let invite_uri = cluster_join_invite_argument_uri(&options.invite)?;
+    let invite = decode_cluster_join_invite(&invite_uri)?;
+    if let Some(cluster_id) = &options.cluster_id {
+        if !cluster::invite_has_embedded_cluster_identity(&invite) {
+            return Err(CliError::Parse {
+                detail: "--cluster-id is not supported for daemon-mediated cluster join; the daemon uses the invite's embedded cluster identity".to_string(),
+            });
+        }
+        if cluster_id != &invite.cluster_id {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "cluster id override `{cluster_id}` does not match invite cluster `{}`",
+                    invite.cluster_id
+                ),
+            });
+        }
+    }
+    let response =
+        client.cluster_join(cluster::ClusterControlJoinRequest { invite: invite_uri })?;
+    if options.name_explicit
+        && let Err(error) = client.cluster_rename(cluster::ClusterControlRenameRequest {
+            node_id: Some(response.node_id.clone()),
+            display_name: options.name.clone(),
+        })
+    {
+        eprintln!(
+            "warning: joined cluster but failed to apply node name `{}`: {error}",
+            options.name
+        );
+    }
+    if let Some(endpoint) = &response.accepted_endpoint {
+        println!("introducer accepted join: {endpoint}");
+    }
+    println!("cluster join completed: {}", response.cluster_id);
+    println!("local node: {}", response.node_id);
+    println!("invite: {}", options.invite);
+    println!("state: {}", paths.state.display());
     Ok(())
 }
 
@@ -1335,7 +1493,7 @@ fn cluster_join_fresh_with_paths(
     let local_node_id = options.node_id.unwrap_or_else(NodeId::generate);
     let timestamp = OffsetDateTime::now_utc();
     let invite = parse_cluster_join_invite_argument(&options.invite)?;
-    if network::invite_has_embedded_signature(&invite) {
+    if cluster::invite_has_embedded_signature(&invite) {
         verify_cluster_join_invite_signature(&invite)?;
     }
     if invite.expires_at != OffsetDateTime::UNIX_EPOCH && invite.expires_at <= timestamp {
@@ -1347,7 +1505,7 @@ fn cluster_join_fresh_with_paths(
         });
     }
     if let Some(cluster_id) = &options.cluster_id
-        && network::invite_has_embedded_cluster_identity(&invite)
+        && cluster::invite_has_embedded_cluster_identity(&invite)
         && cluster_id != &invite.cluster_id
     {
         return Err(CliError::Parse {
@@ -1363,7 +1521,7 @@ fn cluster_join_fresh_with_paths(
         .unwrap_or_else(|| invite.cluster_id.clone());
     let (main_options, shadow_options) = local_daemon_cluster_options()?;
     let (main_public_key, shadow_public_key) = local_daemon_public_keys(paths)?;
-    let mut state = network::prepare_pending_cluster_join_state(
+    let mut state = cluster::prepare_pending_cluster_join_state(
         cluster_id,
         invite
             .cluster_name
@@ -1382,7 +1540,7 @@ fn cluster_join_fresh_with_paths(
             detail: "cluster join was not accepted by any introducer; local cluster state was not changed".to_string(),
         });
     }
-    network::write_cluster_state(paths, &state)?;
+    cluster::write_cluster_state(paths, &state)?;
     println!("cluster join completed: {}", state.cluster_id);
     println!("local node: {}", state.local_node_id);
     println!("invite: {}", options.invite);
@@ -1512,37 +1670,37 @@ fn quarantine_cluster_storage_for_migration(
         &mut quarantine,
     )?;
     move_cluster_path_if_exists(
-        paths.kv_snapshot.clone(),
+        paths.kv_paths().snapshot.clone(),
         quarantine.root.join("kv-snapshot.sobj"),
         &mut quarantine,
     )?;
     move_cluster_path_if_exists(
-        paths.kv_raft.clone(),
+        paths.kv_paths().raft.clone(),
         quarantine.root.join("kv-raft"),
         &mut quarantine,
     )?;
     move_cluster_path_if_exists(
-        paths.kv_watches.clone(),
+        paths.kv_paths().watches.clone(),
         quarantine.root.join("watches"),
         &mut quarantine,
     )?;
     move_cluster_path_if_exists(
-        paths.kv_watches_lock.clone(),
+        paths.kv_paths().watches_lock.clone(),
         quarantine.root.join("watches.lock"),
         &mut quarantine,
     )?;
     move_cluster_path_if_exists(
-        paths.kv_watches_next_id.clone(),
+        paths.kv_paths().watches_next_id.clone(),
         quarantine.root.join("watches-next.sobj"),
         &mut quarantine,
     )?;
     move_cluster_path_if_exists(
-        paths.kv_watch_events.clone(),
+        paths.kv_paths().watch_events.clone(),
         quarantine.root.join("watch-events.sobj"),
         &mut quarantine,
     )?;
     move_cluster_path_if_exists(
-        paths.kv_watch_events_log.clone(),
+        paths.kv_paths().watch_events_log.clone(),
         quarantine.root.join("watch-events.sobjlog"),
         &mut quarantine,
     )?;
@@ -1586,37 +1744,37 @@ fn quarantine_cluster_storage_for_leave(
         &mut quarantine,
     )?;
     move_cluster_path_if_exists(
-        paths.kv_snapshot.clone(),
+        paths.kv_paths().snapshot.clone(),
         quarantine.root.join("kv-snapshot.sobj"),
         &mut quarantine,
     )?;
     move_cluster_path_if_exists(
-        paths.kv_raft.clone(),
+        paths.kv_paths().raft.clone(),
         quarantine.root.join("kv-raft"),
         &mut quarantine,
     )?;
     move_cluster_path_if_exists(
-        paths.kv_watches.clone(),
+        paths.kv_paths().watches.clone(),
         quarantine.root.join("watches"),
         &mut quarantine,
     )?;
     move_cluster_path_if_exists(
-        paths.kv_watches_lock.clone(),
+        paths.kv_paths().watches_lock.clone(),
         quarantine.root.join("watches.lock"),
         &mut quarantine,
     )?;
     move_cluster_path_if_exists(
-        paths.kv_watches_next_id.clone(),
+        paths.kv_paths().watches_next_id.clone(),
         quarantine.root.join("watches-next.sobj"),
         &mut quarantine,
     )?;
     move_cluster_path_if_exists(
-        paths.kv_watch_events.clone(),
+        paths.kv_paths().watch_events.clone(),
         quarantine.root.join("watch-events.sobj"),
         &mut quarantine,
     )?;
     move_cluster_path_if_exists(
-        paths.kv_watch_events_log.clone(),
+        paths.kv_paths().watch_events_log.clone(),
         quarantine.root.join("watch-events.sobjlog"),
         &mut quarantine,
     )?;
@@ -1626,13 +1784,13 @@ fn quarantine_cluster_storage_for_leave(
 fn cluster_storage_has_live_artifacts(paths: &ClusterPaths) -> bool {
     paths.state.exists()
         || paths.connectivity_local.exists()
-        || paths.kv_snapshot.exists()
-        || paths.kv_raft.exists()
-        || paths.kv_watches.exists()
-        || paths.kv_watches_lock.exists()
-        || paths.kv_watches_next_id.exists()
-        || paths.kv_watch_events.exists()
-        || paths.kv_watch_events_log.exists()
+        || paths.kv_paths().snapshot.exists()
+        || paths.kv_paths().raft.exists()
+        || paths.kv_paths().watches.exists()
+        || paths.kv_paths().watches_lock.exists()
+        || paths.kv_paths().watches_next_id.exists()
+        || paths.kv_paths().watch_events.exists()
+        || paths.kv_paths().watch_events_log.exists()
 }
 
 fn move_cluster_path_if_exists(
@@ -1780,7 +1938,8 @@ fn import_node_local_configs_from_source_kv(
     }
 
     let source_snapshot = sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&source_kv_paths)
-        .map_err(network::NetworkError::from)?;
+        .map_err(sinomo_runtime::network::NetworkError::directory)
+        .map_err(sinomo_runtime::network::NetworkError::directory)?;
     report.source_snapshot_present = true;
     report.source_entry_count = source_snapshot.entries.len();
 
@@ -1887,7 +2046,7 @@ fn ensure_local_daemon_cluster_members(
 ) -> bool {
     let (main_endpoints, shadow_endpoints) =
         local_daemon_member_endpoints(state, main_options, shadow_options);
-    network::ensure_daemon_cluster_members(state, main_endpoints, shadow_endpoints, timestamp)
+    cluster::ensure_daemon_cluster_members(state, main_endpoints, shadow_endpoints, timestamp)
 }
 
 fn local_daemon_member_endpoints(
@@ -1925,14 +2084,14 @@ fn refresh_local_daemon_membership_from_disk_for_cli(
     main_options: &DaemonRunOptions,
     shadow_options: &DaemonRunOptions,
     timestamp: OffsetDateTime,
-) -> Result<network::ClusterLocalDaemonMembershipRefresh, CliError> {
+) -> Result<cluster::ClusterLocalDaemonMembershipRefresh, CliError> {
     let (main_endpoints, shadow_endpoints) =
         local_daemon_member_endpoints(state, main_options, shadow_options);
     let (main_public_key, shadow_public_key) = local_daemon_public_keys(paths)?;
-    network::refresh_local_daemon_membership_from_disk(
+    cluster::refresh_local_daemon_membership_from_disk(
         paths,
         state,
-        network::ClusterLocalDaemonMembershipObservation {
+        cluster::ClusterLocalDaemonMembershipObservation {
             main_endpoints,
             shadow_endpoints,
             main_public_key,
@@ -1958,7 +2117,7 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
 
     struct CliClusterJoinReconciliationTransport;
 
-    impl network::ClusterControlPlaneTransport for CliClusterJoinReconciliationTransport {
+    impl cluster::ClusterControlPlaneTransport for CliClusterJoinReconciliationTransport {
         fn send_kv_replication(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
@@ -2047,8 +2206,8 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
         }
     }
 
-    let mut host = network::ClusterControlPlaneDriver::new(CliClusterJoinReconciliationTransport);
-    let reconciliation = network::reconcile_cluster_join_with_introducers_with_host(
+    let mut host = cluster::ClusterControlPlaneDriver::new(CliClusterJoinReconciliationTransport);
+    let reconciliation = cluster::reconcile_cluster_join_with_introducers_with_host(
         state,
         invite,
         DAEMON_JOIN_TIMEOUT,
@@ -2082,7 +2241,7 @@ fn send_cluster_join_registration_to_endpoint(
     request: &ClusterJoinRegistrationRequest,
     timeout: Duration,
 ) -> Result<ClusterJoinRegistrationResponse, CliError> {
-    network::send_cluster_join_registration_over_membership_rpc(
+    cluster::send_cluster_join_registration_over_membership_rpc(
         endpoint,
         request,
         timeout,
@@ -2178,6 +2337,12 @@ async fn send_join_endpoint_rpc_async(
 const CLUSTER_JOIN_RPC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) fn parse_cluster_join_invite_argument(raw: &str) -> Result<ClusterJoinInvite, CliError> {
+    decode_cluster_join_invite(&cluster_join_invite_argument_uri(raw)?).map_err(Into::into)
+}
+
+/// Expands a join invite argument (URI, join command, `@file`, or file path)
+/// to the raw invite URI carried by a daemon-mediated join request.
+pub(crate) fn cluster_join_invite_argument_uri(raw: &str) -> Result<String, CliError> {
     let raw = raw.trim();
     let invite = if let Some(path) = raw.strip_prefix('@') {
         fs::read_to_string(path).map_err(|source| CliError::Io {
@@ -2192,9 +2357,12 @@ pub(crate) fn parse_cluster_join_invite_argument(raw: &str) -> Result<ClusterJoi
     } else {
         raw.to_string()
     };
-    decode_cluster_join_invite(extract_invite_from_join_command(invite.trim())).map_err(Into::into)
+    Ok(extract_invite_from_join_command(invite.trim()).to_string())
 }
 
+/// `sinomo cluster status`: local state summary (KV-synced from the daemon
+/// first), plus node health counts from the daemon's `/cluster/health` view
+/// when a daemon is reachable.
 pub(crate) fn cluster_status() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     let _ = refresh_cluster_kv_from_local_daemon(&paths);
@@ -2206,8 +2374,21 @@ pub(crate) fn cluster_status() -> Result<(), CliError> {
             println!("status: {}", cluster_status_summary_label(&state));
             println!("term: {}", state.term);
             println!("kv revision: {}", state.kv_revision);
-            println!("kv snapshot: {}", paths.kv_snapshot.display());
+            println!("kv snapshot: {}", paths.kv_paths().snapshot.display());
             println!("members: {}", state.members.len());
+            if let Some(rows) = try_fetch_daemon_cluster_health_rows()? {
+                let count = |availability: ClusterNodeAvailability| {
+                    rows.iter()
+                        .filter(|row| row.availability == availability)
+                        .count()
+                };
+                println!(
+                    "health: {} online, {} offline, {} unknown",
+                    count(ClusterNodeAvailability::Online),
+                    count(ClusterNodeAvailability::Offline),
+                    count(ClusterNodeAvailability::Unknown)
+                );
+            }
             println!("state: {}", paths.state.display());
             Ok(())
         }
@@ -2319,7 +2500,7 @@ pub(crate) fn cluster_doctor() -> Result<(), CliError> {
     refresh_cluster_kv_from_local_daemon(&paths)?;
     let state = read_cluster_state(&paths)?;
     let rows = cluster_health_rows_for_cli(&paths, &state)?;
-    let graph = network::read_cluster_connectivity_graph_from_kv(&paths).unwrap_or_default();
+    let graph = cluster::read_cluster_connectivity_graph_from_kv(&paths).unwrap_or_default();
     let mut findings = cluster_doctor_findings(&state, &graph, &rows);
     if let Some(data_dir) = paths.root.parent() {
         findings.extend(data_dir_storage_contract_findings(data_dir)?);
@@ -2350,7 +2531,7 @@ pub(crate) fn cluster_connectivity() -> Result<(), CliError> {
     refresh_cluster_kv_from_local_daemon(&paths)?;
     let state = read_cluster_state(&paths)?;
     let local = network::read_local_cluster_connectivity_records(&paths)?;
-    let kv = network::read_cluster_connectivity_graph_from_kv(&paths).unwrap_or_default();
+    let kv = cluster::read_cluster_connectivity_graph_from_kv(&paths).unwrap_or_default();
     println!("cluster: {}", state.cluster_id);
     println!("local node: {}", state.local_node_id);
     print_connectivity_records("local", local);
@@ -2408,7 +2589,7 @@ fn cluster_health_rows_from_local_state(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Vec<ClusterHealthRow>, CliError> {
-    network::cluster_health_rows_with_probe(
+    cluster::cluster_health_rows_with_probe(
         paths,
         state,
         &CliClusterStatusProbe { paths },
@@ -2418,16 +2599,36 @@ fn cluster_health_rows_from_local_state(
     .map_err(Into::into)
 }
 
+/// Cluster health rows from the daemon's `/cluster/health` aggregation via
+/// [`DaemonApiClient`]; `None` when no daemon is reachable or the call fails
+/// (readers fall back to the local state).
 fn try_fetch_daemon_cluster_health_rows() -> Result<Option<Vec<ClusterHealthRow>>, CliError> {
-    let Some(status) = default_main_daemon_status()? else {
+    let Some(client) = reachable_cluster_control_daemon()? else {
         return Ok(None);
     };
-    Ok(cli_fetch_cluster_health_rows(&status.address, CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT).ok())
+    Ok(client
+        .with_timeout(CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT)
+        .cluster_health()
+        .ok())
 }
 
+/// `sinomo cluster peers`: prefers the daemon's aggregated `/cluster/health`
+/// member view when a daemon is reachable, falling back to the local cluster
+/// state read.
 pub(crate) fn cluster_peers() -> Result<(), CliError> {
-    let paths = cluster_paths_from_defaults()?;
-    let members = cluster_peer_members(&paths)?;
+    let members = match try_fetch_daemon_cluster_health_rows()? {
+        Some(rows) => {
+            let mut seen = BTreeSet::new();
+            rows.into_iter()
+                .map(|row| row.member)
+                .filter(|member| seen.insert(member.node_id.clone()))
+                .collect()
+        }
+        None => {
+            let paths = cluster_paths_from_defaults()?;
+            cluster_peer_members(&paths)?
+        }
+    };
     for member in members {
         println!(
             "{}\t{}\t{}\t{}",
@@ -2440,18 +2641,15 @@ pub(crate) fn cluster_peers() -> Result<(), CliError> {
     Ok(())
 }
 
+/// `sinomo cluster rename`: daemon-required — the member rename commits inside
+/// the running daemon through `/cluster/control/rename`. The direct rename
+/// machinery stays reachable through `cluster rename-hostnames`.
 pub(crate) fn cluster_rename(options: ClusterRenameOptions) -> Result<(), CliError> {
-    let paths = cluster_paths_from_defaults()?;
-    refresh_cluster_kv_from_local_daemon(&paths)?;
-    let state = network::read_cluster_state(&paths)?;
-    let update = network::update_cluster_node_name_with_host(
-        &paths,
-        state,
-        options.node_id.clone(),
-        options.name.clone(),
-        OffsetDateTime::now_utc(),
-        &mut CliClusterMemberMutationHost,
-    )?;
+    let client = cluster_control_daemon_client("rename <node-id> <name>")?;
+    let update = client.cluster_rename(cluster::ClusterControlRenameRequest {
+        node_id: Some(options.node_id),
+        display_name: options.name,
+    })?;
     if !update.changed {
         println!(
             "cluster member {} already has name {}",
@@ -2464,7 +2662,6 @@ pub(crate) fn cluster_rename(options: ClusterRenameOptions) -> Result<(), CliErr
         "cluster member {} renamed: {} -> {}",
         update.node_id, update.previous_name, update.name
     );
-    nudge_local_daemon_cluster_activation();
     Ok(())
 }
 
@@ -2473,7 +2670,7 @@ pub(crate) fn cluster_rename_hostnames() -> Result<(), CliError> {
     refresh_cluster_kv_from_local_daemon(&paths)?;
     let mut state = read_cluster_state(&paths)?;
     let local_hostname = local_hostname();
-    let statuses = match network::read_cluster_node_statuses_from_kv(&paths) {
+    let statuses = match cluster::read_cluster_node_statuses_from_kv(&paths) {
         Ok(statuses) => statuses,
         Err(error) => {
             eprintln!("warning: cluster node-status hostname lookup skipped: {error}");
@@ -2489,7 +2686,7 @@ pub(crate) fn cluster_rename_hostnames() -> Result<(), CliError> {
     let mut changed_count = 0usize;
     let mut unchanged_count = 0usize;
     for target in targets {
-        let update = network::update_cluster_node_name_with_host(
+        let update = cluster::update_cluster_node_name_with_host(
             &paths,
             state,
             target.node_id,
@@ -2510,7 +2707,7 @@ pub(crate) fn cluster_rename_hostnames() -> Result<(), CliError> {
                 update.node_id, update.name
             );
         }
-        state = network::read_cluster_state(&paths)?;
+        state = cluster::read_cluster_state(&paths)?;
     }
     println!("hostname rename summary: {changed_count} changed, {unchanged_count} unchanged");
     if changed_count > 0 {
@@ -2521,7 +2718,7 @@ pub(crate) fn cluster_rename_hostnames() -> Result<(), CliError> {
 
 pub(crate) struct CliClusterMemberMutationHost;
 
-impl network::ClusterMemberMutationHost for CliClusterMemberMutationHost {
+impl cluster::ClusterMemberMutationHost for CliClusterMemberMutationHost {
     fn current_cluster_kv_store(
         &mut self,
         paths: &ClusterPaths,
@@ -2540,18 +2737,14 @@ impl network::ClusterMemberMutationHost for CliClusterMemberMutationHost {
     }
 }
 
+/// `sinomo cluster role`: daemon-required — the node-role change commits
+/// inside the running daemon through `/cluster/control/role`.
 pub(crate) fn cluster_role(options: ClusterRoleOptions) -> Result<(), CliError> {
-    let paths = cluster_paths_from_defaults()?;
-    refresh_cluster_kv_from_local_daemon(&paths)?;
-    let state = network::read_cluster_state(&paths)?;
-    let update = network::update_cluster_node_role_with_host(
-        &paths,
-        state,
-        options.node_id.clone(),
-        options.role.clone(),
-        OffsetDateTime::now_utc(),
-        &mut CliClusterMemberMutationHost,
-    )?;
+    let client = cluster_control_daemon_client("role <node-id> <role>")?;
+    let update = client.cluster_role(cluster::ClusterControlRoleRequest {
+        node_id: options.node_id,
+        role: options.role,
+    })?;
     if !update.changed {
         println!(
             "cluster member {} already has role {}",
@@ -2575,8 +2768,8 @@ pub(crate) fn cluster_state_authority_role(
 ) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     refresh_cluster_kv_from_local_daemon(&paths)?;
-    let state = network::read_cluster_state(&paths)?;
-    let update = network::update_cluster_state_authority_with_host(
+    let state = cluster::read_cluster_state(&paths)?;
+    let update = cluster::update_cluster_state_authority_with_host(
         &paths,
         state,
         options.node_id.clone(),
@@ -2621,7 +2814,7 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
     };
     let mut imported = Vec::new();
     let mut endpoint_updates = Vec::new();
-    for mut member in network::read_cluster_members_from_snapshot(&peer_snapshot)? {
+    for mut member in cluster::read_cluster_members_from_snapshot(&peer_snapshot)? {
         if member.cluster_id != state.cluster_id {
             continue;
         }
@@ -2712,8 +2905,8 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
     }
 
     if let Some(node_id) = options.promote {
-        let state = network::read_cluster_state(&paths)?;
-        let update = network::update_cluster_state_authority_with_host(
+        let state = cluster::read_cluster_state(&paths)?;
+        let update = cluster::update_cluster_state_authority_with_host(
             &paths,
             state,
             node_id,
@@ -2745,7 +2938,7 @@ fn explicit_cluster_repair_endpoint(address: &str) -> Option<ClusterEndpointReco
     if !address.starts_with("iroh://") {
         return None;
     }
-    Some(network::invite_introducer_endpoint(
+    Some(cluster::invite_introducer_endpoint(
         &NodeId::from_legacy_named("node_cluster_repair_explicit_peer")
             .expect("static cluster repair peer node id"),
         address.to_string(),
@@ -2754,7 +2947,7 @@ fn explicit_cluster_repair_endpoint(address: &str) -> Option<ClusterEndpointReco
 
 fn observed_cluster_repair_endpoint(node_id: &NodeId, address: &str) -> ClusterEndpointRecord {
     if address.starts_with("iroh://") {
-        network::invite_introducer_endpoint(node_id, address.to_string())
+        cluster::invite_introducer_endpoint(node_id, address.to_string())
     } else {
         network::daemon_lan_endpoint(node_id, address.to_string(), 0)
     }
@@ -2790,15 +2983,14 @@ fn merge_cluster_member_endpoint(
     }
 }
 
+/// `sinomo cluster remove`: daemon-required — member removal commits inside
+/// the running daemon through `/cluster/control/remove`. The direct removal
+/// machinery stays reachable through `cluster cleanup-legacy-shadow-members`.
 pub(crate) fn cluster_remove(options: ClusterRemoveOptions) -> Result<(), CliError> {
-    let paths = cluster_paths_from_defaults()?;
-    let state = network::read_cluster_state(&paths)?;
-    let removal = network::remove_cluster_members_with_host(
-        &paths,
-        state,
-        options.node_ids.clone(),
-        &mut CliClusterMemberMutationHost,
-    )?;
+    let client = cluster_control_daemon_client("remove <node-id>")?;
+    let removal = client.cluster_remove(cluster::ClusterControlRemoveRequest {
+        node_ids: options.node_ids,
+    })?;
     for member in removal.removed {
         println!(
             "cluster member {} removed: {} {}",
@@ -2813,8 +3005,8 @@ pub(crate) fn cluster_remove(options: ClusterRemoveOptions) -> Result<(), CliErr
 pub(crate) fn cluster_cleanup_legacy_shadow_members() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     refresh_cluster_kv_from_local_daemon(&paths)?;
-    let state = network::read_cluster_state(&paths)?;
-    let removal = network::cleanup_legacy_shadow_daemon_members_with_host(
+    let state = cluster::read_cluster_state(&paths)?;
+    let removal = cluster::cleanup_legacy_shadow_daemon_members_with_host(
         &paths,
         state,
         &mut CliClusterMemberMutationHost,
@@ -2849,25 +3041,24 @@ pub(crate) fn cluster_peer_members(
             &shadow_options,
             OffsetDateTime::now_utc(),
         );
-        network::write_cluster_state(paths, &state)?;
+        cluster::write_cluster_state(paths, &state)?;
     }
     Ok(state.members)
 }
 
+/// `sinomo cluster leave`: daemon-required — the daemon quarantines the old
+/// cluster storage and re-initializes a fresh single-node cluster through
+/// `/cluster/control/leave`.
 pub(crate) fn cluster_leave() -> Result<(), CliError> {
-    let paths = cluster_paths_from_defaults()?;
-    let report = cluster_leave_with_paths(&paths)?;
-    nudge_local_daemon_cluster_activation();
-    match &report.previous_cluster_id {
+    let client = cluster_control_daemon_client("leave")?;
+    let response = client.cluster_leave()?;
+    match &response.previous_cluster_id {
         Some(cluster_id) => println!("cluster left: {cluster_id}"),
         None => println!("cluster left: no previous local cluster state"),
     }
-    println!("single-node cluster: {}", report.new_cluster_id);
-    println!("local node: {}", report.local_node_id);
-    if let Some(root) = &report.quarantine_root {
-        println!("source quarantine: {}", root.display());
-    }
-    println!("state: {}", report.state_path.display());
+    println!("single-node cluster: {}", response.new_cluster_id);
+    println!("local node: {}", response.node_id);
+    println!("state: {}", cluster_paths_from_defaults()?.state.display());
     Ok(())
 }
 
@@ -2884,7 +3075,7 @@ pub(crate) fn cluster_leave_with_paths(
     paths: &ClusterPaths,
 ) -> Result<ClusterLeaveReport, CliError> {
     paths.ensure()?;
-    let existing = match network::read_cluster_state_without_kv(paths) {
+    let existing = match cluster::read_cluster_state_without_kv(paths) {
         Ok(state) => Some(state),
         Err(network::NetworkError::ClusterOrphan) => None,
         Err(error) => return Err(error.into()),
@@ -2941,7 +3132,7 @@ pub(crate) fn cluster_leave_with_paths(
 }
 
 pub(crate) fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState, CliError> {
-    let mut state = network::read_cluster_state(paths)?;
+    let mut state = cluster::read_cluster_state(paths)?;
     prepare_local_cluster_state_for_cli(paths, &mut state)?;
     Ok(state)
 }
@@ -2967,7 +3158,7 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Resu
     match daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {
         Ok(snapshot) => {
             write_imported_cluster_kv_snapshot(paths, &snapshot)?;
-            if network::read_cluster_state(paths)
+            if cluster::read_cluster_state(paths)
                 .map(|state| sinomo_runtime::kv::cluster_kv_raft_local_is_voter(&state))
                 .unwrap_or(false)
             {
@@ -2983,7 +3174,7 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Resu
 fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), CliError> {
     struct CliClusterKvSnapshotRefreshHost;
 
-    impl network::ClusterKvSnapshotRefreshHost for CliClusterKvSnapshotRefreshHost {
+    impl cluster::ClusterKvSnapshotRefreshHost for CliClusterKvSnapshotRefreshHost {
         fn known_kv_state_authority_id(
             &mut self,
             paths: &ClusterPaths,
@@ -3013,22 +3204,23 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
         ) -> Result<bool, network::NetworkError> {
             let _raft_guard =
                 sinomo_runtime::kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths())
-                    .map_err(network::NetworkError::from)?;
+                    .map_err(sinomo_runtime::network::NetworkError::directory)
+                    .map_err(sinomo_runtime::network::NetworkError::directory)?;
             paths
                 .kv_paths()
                 .local_cache()
                 .restore_raft_from_snapshot_if_newer(local_node_id.clone(), snapshot)
-                .map_err(network::NetworkError::from)
+                .map_err(sinomo_runtime::network::NetworkError::directory)
         }
     }
 
-    let Ok(state) = network::read_cluster_state(paths) else {
+    let Ok(state) = cluster::read_cluster_state(paths) else {
         return Ok(());
     };
-    match network::refresh_current_cluster_kv_store_with_host(
+    match cluster::refresh_current_cluster_kv_store_with_host(
         paths,
         &state,
-        network::ClusterControlPlaneTimeouts::default_daemon_transport()
+        cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
             .kv_snapshot_refresh_options(),
         &mut CliClusterKvSnapshotRefreshHost,
     ) {
@@ -3042,7 +3234,7 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
 pub(crate) fn read_cluster_kv_store(
     paths: &ClusterPaths,
 ) -> Result<sinomo_runtime::kv::InProcessKvStore, CliError> {
-    let state = network::read_cluster_state_without_kv(paths)?;
+    let state = cluster::read_cluster_state_without_kv(paths)?;
     sinomo_runtime::kv::read_cluster_kv_store_for_node(&paths.kv_paths(), state.local_node_id)
         .map_err(Into::into)
 }
@@ -3050,7 +3242,7 @@ pub(crate) fn read_cluster_kv_store(
 #[cfg(test)]
 pub(crate) fn read_cluster_kv_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
     match sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
-        .map_err(network::NetworkError::from)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
     {
         Ok(snapshot) => Ok(snapshot),
         Err(error) => {
@@ -3072,7 +3264,7 @@ pub(crate) fn write_cluster_kv_snapshot(
 ) -> Result<(), CliError> {
     sinomo_runtime::kv::write_cluster_kv_snapshot_if_changed(&paths.kv_paths(), snapshot)
         .map(|_| ())
-        .map_err(network::NetworkError::from)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
         .map_err(Into::into)
 }
 
@@ -3093,7 +3285,7 @@ pub(crate) fn sync_cluster_state_to_kv(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<KvSnapshot, CliError> {
-    network::sync_cluster_state_to_kv_with_host(paths, state, &mut CliClusterMemberMutationHost)
+    cluster::sync_cluster_state_to_kv_with_host(paths, state, &mut CliClusterMemberMutationHost)
         .map_err(Into::into)
 }
 
@@ -3105,7 +3297,7 @@ pub(crate) fn expire_cluster_network_records_in_kv(
 ) -> Result<Option<KvSnapshot>, CliError> {
     struct CliClusterNetworkRecordExpiryHost;
 
-    impl network::ClusterNetworkRecordExpiryHost for CliClusterNetworkRecordExpiryHost {
+    impl cluster::ClusterNetworkRecordExpiryHost for CliClusterNetworkRecordExpiryHost {
         type Error = CliError;
 
         fn commit_cluster_kv_txn_with_quorum(
@@ -3123,7 +3315,7 @@ pub(crate) fn expire_cluster_network_records_in_kv(
         }
     }
 
-    network::expire_cluster_network_records_with_host(
+    cluster::expire_cluster_network_records_with_host(
         paths,
         state,
         now,
@@ -3133,7 +3325,7 @@ pub(crate) fn expire_cluster_network_records_in_kv(
 
 struct CliClusterInvitePublishHost;
 
-impl network::ClusterInvitePublishHost for CliClusterInvitePublishHost {
+impl cluster::ClusterInvitePublishHost for CliClusterInvitePublishHost {
     type Error = CliError;
 
     fn commit_cluster_kv_txn_with_quorum(
@@ -3175,7 +3367,7 @@ pub(crate) fn register_daemon_cluster_node(
         &registration.shadow_options,
         OffsetDateTime::now_utc(),
     );
-    network::write_cluster_state(&paths, &state)?;
+    cluster::write_cluster_state(&paths, &state)?;
     daemon_cluster_status(&state, registration.process).ok_or_else(|| CliError::Parse {
         detail: "daemon cluster member could not be registered".to_string(),
     })
@@ -3185,7 +3377,7 @@ pub(crate) fn daemon_cluster_status_from_local_state(
     paths: &ClusterPaths,
     registration: &DaemonClusterRegistration,
 ) -> Result<DaemonClusterStatus, CliError> {
-    let mut state = network::read_cluster_state_without_kv(paths)?;
+    let mut state = cluster::read_cluster_state_without_kv(paths)?;
     refresh_local_daemon_membership_from_disk_for_cli(
         paths,
         &mut state,
@@ -3256,8 +3448,8 @@ mod tests {
         let shadow_node = shadow_daemon_node_id(&main_node);
         let now = OffsetDateTime::now_utc();
         let address = "iroh://repair_same_address?relay=https://relay.example./".to_string();
-        let shadow_endpoint = network::invite_introducer_endpoint(&shadow_node, address.clone());
-        let main_endpoint = network::invite_introducer_endpoint(&main_node, address);
+        let shadow_endpoint = cluster::invite_introducer_endpoint(&shadow_node, address.clone());
+        let main_endpoint = cluster::invite_introducer_endpoint(&main_node, address);
         let mut member = ClusterMemberRecord::local_voter(
             cluster_id,
             main_node,

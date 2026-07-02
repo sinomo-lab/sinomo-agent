@@ -1,8 +1,8 @@
 use crate::{DeviceId, DeviceKind, DevicePermission, DeviceProfile};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
+use sinomo_core::node::NodeId;
 use sinomo_core::{CapabilityName, DeviceCapability};
-use sinomo_node::NodeId;
 use std::collections::VecDeque;
 #[cfg(target_os = "linux")]
 use std::fs;

@@ -1,14 +1,14 @@
 use crate::NetworkError;
+use crate::directory::cluster_directory_for;
+use crate::endpoint_records::locally_learned_bridge_route_endpoint;
 use crate::is_loopback_connect_address;
-use crate::kv_read_model::{cluster_node_status_map_from_kv, read_cluster_endpoints_from_kv};
 use crate::lan::{
     discover_local_ip_candidates_for_targets, discover_local_ip_candidates_for_targets_async,
     is_invitable_ip,
 };
-use crate::membership::locally_learned_bridge_route_endpoint;
 use crate::{ClusterConnectivityGraph, ClusterConnectivityState};
 use crate::{ClusterPaths, iroh_endpoint_public_key};
-use sinomo_core::{
+use sinomo_base::{
     ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
     ClusterNodeAvailability, ClusterNodeStatusRecord, ClusterTransportKind,
 };
@@ -24,9 +24,9 @@ use std::net::{IpAddr, SocketAddr};
 const DEFAULT_DAEMON_SHADOW_PORT: u16 = 21_354;
 
 fn try_clone_selector_id(
-    id: &sinomo_core::Id,
+    id: &sinomo_base::Id,
     operation: &str,
-) -> Result<sinomo_core::Id, NetworkError> {
+) -> Result<sinomo_base::Id, NetworkError> {
     crate::object::try_clone_id(id, operation)
 }
 
@@ -83,13 +83,13 @@ impl EndpointNodeSet {
 
 #[derive(Clone, Debug, Default)]
 struct EndpointIdSet {
-    ids: Vec<sinomo_core::Id>,
+    ids: Vec<sinomo_base::Id>,
 }
 
 impl EndpointIdSet {
     fn try_insert_clone(
         &mut self,
-        endpoint_id: &sinomo_core::Id,
+        endpoint_id: &sinomo_base::Id,
         operation: &str,
     ) -> Result<bool, NetworkError> {
         match self.position(endpoint_id) {
@@ -103,7 +103,7 @@ impl EndpointIdSet {
         }
     }
 
-    fn position(&self, endpoint_id: &sinomo_core::Id) -> Result<usize, usize> {
+    fn position(&self, endpoint_id: &sinomo_base::Id) -> Result<usize, usize> {
         self.ids.binary_search(endpoint_id)
     }
 }
@@ -225,6 +225,52 @@ impl EndpointByNodeIndex {
     }
 }
 
+/// Stage C dialability filter: moves endpoints whose transport currently has
+/// no dial path — neither built-in support nor a registered enabled
+/// network-module dialer — to the end of the candidate list. They are never
+/// dropped (a module may be enabled between selection and dial, and callers
+/// may still want them as last-resort evidence), but keeping them early would
+/// burn per-endpoint timeout budgets on transports nothing can dial.
+///
+/// The sort is stable, so the relative order produced by the purpose-specific
+/// ranking above is preserved within each partition.
+fn deprioritize_endpoints_without_dialable_transport(endpoints: &mut [ClusterEndpointRecord]) {
+    // One registry snapshot per selection pass, not per endpoint.
+    let module_transports = crate::network_module::registered_enabled_dialer_transports();
+    if endpoints.iter().all(|endpoint| {
+        cluster_endpoint_transport_is_dialable(&endpoint.transport, &module_transports)
+    }) {
+        return;
+    }
+    endpoints.sort_by_key(|endpoint| {
+        !cluster_endpoint_transport_is_dialable(&endpoint.transport, &module_transports)
+    });
+}
+
+/// Whether the local process can currently dial `transport`.
+/// Loopback/LAN-TCP are always built in; Iroh is built in only under the
+/// `iroh-transport` feature; everything else needs an enabled module dialer.
+fn cluster_endpoint_transport_is_dialable(
+    transport: &ClusterTransportKind,
+    module_transports: &[ClusterTransportKind],
+) -> bool {
+    match transport {
+        ClusterTransportKind::Loopback | ClusterTransportKind::LanTcp => true,
+        ClusterTransportKind::Iroh => {
+            // Test/test-support builds mirror the crate-wide `cfg(any(...))`
+            // gate on the in-crate iroh code so purpose-ranking tests keep
+            // their historical ordering; production dialability is the
+            // feature (built-in path) or a registered module.
+            cfg!(any(
+                feature = "iroh-transport",
+                test,
+                feature = "test-support"
+            )) || module_transports.contains(transport)
+        }
+        other => module_transports.contains(other),
+    }
+}
+
 fn cluster_endpoint_transport_rank(transport: &ClusterTransportKind) -> u8 {
     match transport {
         ClusterTransportKind::InProcess => 0,
@@ -256,7 +302,7 @@ pub enum ClusterEndpointSelectionPurpose {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ClusterEndpointInternalSelectionPurpose {
+pub enum ClusterEndpointInternalSelectionPurpose {
     Public(ClusterEndpointSelectionPurpose),
     LiveClusterStateAuthorityCommand,
     MemberPublishClusterStateAuthorityFirst,
@@ -328,7 +374,7 @@ impl<'a> ClusterEndpointSelector<'a> {
         self.try_select_internal(purpose.into())
     }
 
-    pub(crate) fn select_internal(
+    pub fn select_internal(
         &self,
         purpose: ClusterEndpointInternalSelectionPurpose,
     ) -> Vec<ClusterEndpointRecord> {
@@ -430,7 +476,7 @@ impl<'a> ClusterEndpointSelector<'a> {
         Self::try_unique_node_targets(self.try_select(purpose)?)
     }
 
-    pub(crate) fn select_internal_unique_node_targets(
+    pub fn select_internal_unique_node_targets(
         &self,
         purpose: ClusterEndpointInternalSelectionPurpose,
     ) -> Vec<ClusterEndpointRecord> {
@@ -455,7 +501,7 @@ impl<'a> ClusterEndpointSelector<'a> {
         ClusterEndpointSelector::new(paths, state).try_select(purpose)
     }
 
-    pub(crate) async fn select_internal_async(
+    pub async fn select_internal_async(
         runtime: &tokio::runtime::Handle,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
@@ -475,7 +521,7 @@ impl<'a> ClusterEndpointSelector<'a> {
         ClusterEndpointSelector::new(paths, state).try_select_unique_node_targets(purpose)
     }
 
-    pub(crate) async fn select_internal_unique_node_targets_async(
+    pub async fn select_internal_unique_node_targets_async(
         runtime: &tokio::runtime::Handle,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
@@ -520,7 +566,7 @@ fn try_cluster_member_daemon_status_targets_impl(
     state: &ClusterBootstrapState,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
-    let kv_endpoints = match read_cluster_endpoints_from_kv(paths) {
+    let kv_endpoints = match cluster_directory_for(paths).endpoints() {
         Ok(endpoints) => endpoints,
         Err(error @ NetworkError::ResourceExhausted { .. }) => return Err(error),
         Err(_) => Vec::new(),
@@ -612,13 +658,15 @@ fn cluster_sync_targets_with_connectivity_cmp(
         ))
 }
 
-#[cfg(test)]
-pub(crate) fn cluster_sync_targets_with_connectivity(
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_sync_targets_with_connectivity(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
-    let node_statuses = cluster_node_status_map_from_kv(paths);
+    let node_statuses = cluster_directory_for(paths)
+        .node_statuses()
+        .unwrap_or_default();
     try_cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)
         .unwrap_or_default()
 }
@@ -628,7 +676,9 @@ pub(crate) fn try_cluster_raft_command_targets_impl(
     state: &ClusterBootstrapState,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
-    let node_statuses = cluster_node_status_map_from_kv(paths);
+    let node_statuses = cluster_directory_for(paths)
+        .node_statuses()
+        .unwrap_or_default();
     let mut endpoints_by_node = EndpointByNodeIndex::default();
     let mut command_targets =
         try_cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)?;
@@ -690,6 +740,8 @@ pub(crate) fn try_cluster_raft_command_targets_impl(
             }
         }
     }
+    // Stage C: undialable transports go last (see the helper for rationale).
+    deprioritize_endpoints_without_dialable_transport(&mut targets);
     Ok(targets)
 }
 
@@ -697,11 +749,13 @@ fn try_cluster_live_voter_command_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
-    let node_statuses = cluster_node_status_map_from_kv(paths);
+    let node_statuses = cluster_directory_for(paths)
+        .node_statuses()
+        .unwrap_or_default();
     let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
     let mut targets = Vec::new();
     for endpoint in try_cluster_raft_command_targets_impl(paths, state)? {
-        if !sinomo_kv::cluster_kv_raft_node_is_voter(state, &endpoint.node_id) {
+        if !state.node_is_raft_voter(&endpoint.node_id) {
             continue;
         }
         if node_statuses
@@ -721,7 +775,9 @@ pub(crate) fn try_cluster_raft_member_replication_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
-    let node_statuses = cluster_node_status_map_from_kv(paths);
+    let node_statuses = cluster_directory_for(paths)
+        .node_statuses()
+        .unwrap_or_default();
     let mut targets = Vec::new();
     for endpoint in try_cluster_raft_command_targets_impl(paths, state)? {
         if endpoint.node_id == state.local_node_id {
@@ -750,7 +806,7 @@ pub(crate) fn try_cluster_raft_member_replication_targets_impl(
     Ok(targets)
 }
 
-pub(crate) async fn cluster_node_blocks_leader_preference_async(
+pub async fn cluster_node_blocks_leader_preference_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -760,7 +816,7 @@ pub(crate) async fn cluster_node_blocks_leader_preference_async(
     Ok(cluster_node_blocks_leader_preference(paths, state, node_id))
 }
 
-pub(crate) fn cluster_node_blocks_leader_preference(
+pub fn cluster_node_blocks_leader_preference(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     node_id: &NodeId,
@@ -769,7 +825,9 @@ pub(crate) fn cluster_node_blocks_leader_preference(
     // offline, or if active connectivity probes can no longer reach it. The
     // self-reported `observed_at` is not consulted: it is no longer refreshed on
     // a timer, so an idle-but-healthy node must not be deprioritized.
-    let node_statuses = cluster_node_status_map_from_kv(paths);
+    let node_statuses = cluster_directory_for(paths)
+        .node_statuses()
+        .unwrap_or_default();
     if node_statuses
         .get(node_id)
         .is_some_and(|status| status.availability == ClusterNodeAvailability::Offline)
@@ -825,7 +883,9 @@ pub(crate) fn try_cluster_daemon_command_targets_impl(
     state: &ClusterBootstrapState,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
-    let node_statuses = cluster_node_status_map_from_kv(paths);
+    let node_statuses = cluster_directory_for(paths)
+        .node_statuses()
+        .unwrap_or_default();
     let mut sync_targets =
         try_cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)?;
     append_cluster_kv_main_daemon_endpoints(paths, state, &mut sync_targets)?;
@@ -874,7 +934,9 @@ pub(crate) fn try_cluster_dfs_data_targets_impl(
     state: &ClusterBootstrapState,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
-    let node_statuses = cluster_node_status_map_from_kv(paths);
+    let node_statuses = cluster_directory_for(paths)
+        .node_statuses()
+        .unwrap_or_default();
     let mut targets =
         try_cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)?;
     let main_daemon_node_ids = collect_remote_main_daemon_node_ids(state)?;
@@ -923,7 +985,7 @@ fn append_cluster_kv_main_daemon_endpoints(
     targets: &mut Vec<ClusterEndpointRecord>,
 ) -> Result<(), NetworkError> {
     let main_daemon_node_ids = collect_remote_main_daemon_node_ids(state)?;
-    match read_cluster_endpoints_from_kv(paths) {
+    match cluster_directory_for(paths).endpoints() {
         Ok(kv_endpoints) => {
             for endpoint in kv_endpoints {
                 if !dfs_data_endpoint_is_usable_for_main_daemon(&main_daemon_node_ids, &endpoint) {
@@ -1114,9 +1176,7 @@ pub(crate) fn try_cluster_member_publish_targets_voter_first_impl(
     state: &ClusterBootstrapState,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let mut targets = try_cluster_member_publish_targets_impl(paths, state)?;
-    targets.sort_by_key(|endpoint| {
-        !sinomo_kv::cluster_kv_raft_node_is_voter(state, &endpoint.node_id)
-    });
+    targets.sort_by_key(|endpoint| !state.node_is_raft_voter(&endpoint.node_id));
     Ok(targets)
 }
 
@@ -1206,7 +1266,7 @@ pub(crate) fn try_cluster_voter_command_targets_impl(
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let mut targets = Vec::new();
     for endpoint in try_cluster_raft_command_targets_impl(paths, state)? {
-        if !sinomo_kv::cluster_kv_raft_node_is_voter(state, &endpoint.node_id) {
+        if !state.node_is_raft_voter(&endpoint.node_id) {
             continue;
         }
         crate::object::try_reserve_vec(&mut targets, 1, "collect voter command endpoints")?;
@@ -1338,7 +1398,7 @@ pub(crate) fn try_cluster_rollout_endpoint_targets_impl(
             )?);
         }
     }
-    match read_cluster_endpoints_from_kv(paths) {
+    match cluster_directory_for(paths).endpoints() {
         Ok(kv_endpoints) => {
             for endpoint in kv_endpoints {
                 if endpoint.privacy == ClusterEndpointPrivacy::LocalOnly
@@ -1638,8 +1698,8 @@ pub(crate) fn try_cluster_network_probe_targets_impl(
     Ok(endpoints)
 }
 
-#[cfg(test)]
-pub(crate) fn prefer_bounded_daemon_command_targets(
+#[cfg(any(test, feature = "test-support"))]
+pub fn prefer_bounded_daemon_command_targets(
     endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
 ) -> Vec<ClusterEndpointRecord> {
     try_prefer_bounded_daemon_command_targets(endpoints).unwrap_or_default()
@@ -1685,6 +1745,8 @@ pub(crate) fn try_prefer_bounded_daemon_command_targets(
             selected.push(endpoint);
         }
     }
+    // Stage C: undialable transports go last (see the helper for rationale).
+    deprioritize_endpoints_without_dialable_transport(&mut selected);
     Ok(selected)
 }
 
@@ -1726,8 +1788,8 @@ pub(crate) async fn discover_peer_route_ip_candidates_async(
     discover_local_ip_candidates_for_targets_async(advertised_peer_route_targets(state)).await
 }
 
-#[cfg(test)]
-pub(crate) fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpointRecord> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpointRecord> {
     try_cluster_sync_targets(state).unwrap_or_default()
 }
 

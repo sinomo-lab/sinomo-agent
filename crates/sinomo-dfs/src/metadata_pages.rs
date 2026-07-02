@@ -908,7 +908,7 @@ mod tests {
         DfsMetadataTableOp, DfsObjectVersionRecord, DfsWriteIntentRecord, DfsWriteIntentStatus,
     };
     use crate::{DfsFileSystemId, DfsReplicationPolicy};
-    use sinomo_node::NodeId;
+    use sinomo_core::node::NodeId;
     use time::OffsetDateTime;
 
     fn node(value: &str) -> NodeId {

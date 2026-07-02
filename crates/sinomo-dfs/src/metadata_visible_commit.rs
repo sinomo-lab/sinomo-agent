@@ -15,7 +15,7 @@ use crate::metadata_records::{
 };
 use crate::metadata_tables::DfsMetadataTables;
 use crate::{DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion};
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 use time::OffsetDateTime;
 
 pub(crate) fn object_by_path_from_tables(
@@ -221,9 +221,9 @@ mod tests {
     use crate::metadata_records::{
         DfsMetadataTableOp, DfsObjectVersionRecord, DfsReplicaReceiptRecord,
     };
+    use sinomo_core::events::EventId;
+    use sinomo_core::node::NodeId;
     use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt};
-    use sinomo_events::EventId;
-    use sinomo_node::NodeId;
     use time::OffsetDateTime;
 
     fn node(value: &str) -> NodeId {

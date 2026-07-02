@@ -138,29 +138,38 @@ pub(super) fn print_cluster_help() {
     println!(
         "  sinomo cluster init [--name <name>] [--cluster-id cluster_...] [--node-id node_...]"
     );
-    println!("      Bootstrap a new single-node cluster.");
+    println!("      Bootstrap a new single-node cluster through the running daemon.");
     println!(
-        "  sinomo cluster invite [--introducer <host:port>] [--ttl-seconds <seconds>] [--output <path>]"
+        "      First boot only: with no daemon and no cluster state, initializes directly (--cluster-id/--node-id apply only there)."
+    );
+    println!("  sinomo cluster invite [--output <path>]");
+    println!(
+        "      Create a portable join invite through the running daemon (requires `sinomo daemon start`)."
     );
     println!(
-        "      Create a portable join invite. Pass a LAN-reachable introducer address for remote nodes."
+        "      The daemon publishes its own advertised introducers; --introducer/--ttl-seconds are not supported through the daemon yet."
+    );
+    println!("  sinomo cluster join <invite> [--name <name>]");
+    println!(
+        "      Join an existing cluster through the running daemon from a signed sinomo-join URI or invite file."
     );
     println!(
-        "  sinomo cluster join <invite> [--name <name>] [--cluster-id cluster_...] [--node-id node_...]"
-    );
-    println!(
-        "      Record intent to join an existing cluster from a signed sinomo-join URI or invite file."
+        "      A node already settled in a cluster migrates via the direct path instead; --cluster-id/--node-id overrides apply only there."
     );
     println!("  sinomo cluster migrate plan <invite> [--mode single-node|cluster-merge]");
     println!(
         "      Plan migration from the current initialized cluster into another cluster without mutating local state."
     );
     println!("  sinomo cluster rename <node-id> <name>");
-    println!("      Change a node display name in quorum-backed cluster membership.");
+    println!(
+        "      Change a node display name in quorum-backed cluster membership (through the running daemon)."
+    );
     println!("  sinomo cluster rename-hostnames");
     println!("      Rename inferable cluster members to their advertised hostnames.");
     println!("  sinomo cluster role <node-id> <workstation|mobile|server|sensor|test>");
-    println!("      Change the documented node role in quorum-backed cluster membership.");
+    println!(
+        "      Change the documented node role in quorum-backed cluster membership (through the running daemon)."
+    );
     println!("  sinomo cluster state-authority <node-id> <authority|replica|observer>");
     println!("      Change state authority membership through quorum-backed cluster membership.");
     println!("  sinomo cluster repair-members --from <host:port> [--promote <node-id>]");
@@ -168,7 +177,9 @@ pub(super) fn print_cluster_help() {
         "      Import same-cluster members from a reachable peer snapshot, then optionally promote one."
     );
     println!("  sinomo cluster remove <node-id> [node-id ...]");
-    println!("      Remove members without state authority from quorum-backed cluster membership.");
+    println!(
+        "      Remove members without state authority from quorum-backed cluster membership (through the running daemon)."
+    );
     println!("  sinomo cluster cleanup-legacy-shadow-members");
     println!(
         "      Remove stale shadow-only daemon member records from quorum-backed cluster membership."
@@ -184,9 +195,13 @@ pub(super) fn print_cluster_help() {
         "      Diagnose endpoint advertisement, reachability records, stale status, and duplicated roaming endpoints."
     );
     println!("  sinomo cluster peers");
-    println!("      List known peers. Fails when the node has no local cluster state.");
+    println!(
+        "      List known peers, preferring the daemon's health view; falls back to local cluster state."
+    );
     println!("  sinomo cluster leave");
-    println!("      Leave the current cluster and start a fresh single-node cluster.");
+    println!(
+        "      Leave the current cluster and start a fresh single-node cluster (through the running daemon)."
+    );
 }
 
 pub(super) fn print_install_help() {

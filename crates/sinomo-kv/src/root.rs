@@ -1,7 +1,7 @@
 use fs2::FileExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sinomo_core::{
+use sinomo_base::{
     ClusterBootstrapState, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, Id,
 };
 use sinomo_node::NodeId;

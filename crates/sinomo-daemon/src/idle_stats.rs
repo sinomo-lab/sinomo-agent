@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+#[allow(unused_imports)]
+use sinomo_core::cluster::ClusterKvPathsExt;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -169,7 +171,7 @@ struct DaemonIoObserver {
     stats: Arc<IdleStatsAtomics>,
 }
 
-impl sinomo_network::IoObserver for DaemonIoObserver {
+impl sinomo_core::network::IoObserver for DaemonIoObserver {
     fn on_disk_read(&self, bytes: u64) {
         self.stats
             .disk_bytes_read
@@ -214,5 +216,5 @@ impl sinomo_network::IoObserver for DaemonIoObserver {
 
 pub fn register_io_observer(stats: Arc<IdleStatsAtomics>) {
     let observer = Arc::new(DaemonIoObserver { stats });
-    let _ = sinomo_network::set_io_observer(Some(observer));
+    let _ = sinomo_core::network::set_io_observer(Some(observer));
 }

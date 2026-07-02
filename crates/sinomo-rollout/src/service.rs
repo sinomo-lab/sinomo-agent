@@ -4,8 +4,8 @@
 //! data directory and works with no daemon and no cluster. Binary/build activation
 //! routes still need daemon-local process ownership and remain daemon adapters.
 
-use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse};
-use sinomo_service::{
+use sinomo_core::network::{ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_core::service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
     ServiceRegistryBuilder, ServiceRoute,
 };
@@ -82,8 +82,8 @@ pub fn register_services(builder: ServiceRegistryBuilder) -> ServiceRegistryBuil
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_local::SinomoDataDir;
-    use sinomo_service::{ResponseSink, ServiceRegistry, ServiceSigner};
+    use sinomo_core::local::SinomoDataDir;
+    use sinomo_core::service::{ResponseSink, ServiceRegistry, ServiceSigner};
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]

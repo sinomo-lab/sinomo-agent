@@ -252,9 +252,9 @@ mod tests {
     use crate::metadata_keys::path_record_for_object;
     use crate::metadata_records::{DfsInodeRecord, DfsMetadataTableOp, DfsObjectVersionRecord};
     use crate::{DfsFileSystem, DfsObjectKind};
+    use sinomo_core::events::EventId;
+    use sinomo_core::node::NodeId;
     use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt};
-    use sinomo_events::EventId;
-    use sinomo_node::NodeId;
     use time::OffsetDateTime;
 
     fn node(value: &str) -> NodeId {

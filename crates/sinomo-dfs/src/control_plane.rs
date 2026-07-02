@@ -10,10 +10,10 @@ use crate::namespace::{SIFS_SERVICES_PATH, SIFS_USERS_PATH};
 use crate::{DfsFileSystem, DfsSubtreePolicy, sifs_file_system_id};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_core::DfsObjectPolicy;
-use sinomo_kv::{
+use sinomo_core::kv::{
     InProcessKvStore, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
 };
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -329,7 +329,7 @@ impl<'a> DfsControlPlaneStore<'a> {
         T: Serialize,
     {
         self.kv
-            .put(key.to_string(), sinomo_kv::encode_kv_value(value)?)?;
+            .put(key.to_string(), sinomo_core::kv::encode_kv_value(value)?)?;
         Ok(())
     }
 
@@ -466,7 +466,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         T: Serialize,
     {
         self.kv
-            .put_async(key.to_string(), sinomo_kv::encode_kv_value(value)?)
+            .put_async(key.to_string(), sinomo_core::kv::encode_kv_value(value)?)
             .await?;
         Ok(())
     }

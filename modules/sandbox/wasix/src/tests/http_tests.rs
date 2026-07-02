@@ -840,7 +840,7 @@ fn http_exchange_events_append_from_sandbox_logs() {
     )
     .expect("record");
     persist_http_exchange_record(&mut sandbox_fs, &record).expect("persist");
-    let mut event_store = sinomo_events::InMemoryEventStore::new();
+    let mut event_store = sinomo_core::events::InMemoryEventStore::new();
     let node_id = NodeId::from_legacy_named("node_http_exchange_events").expect("node");
 
     let receipts =
@@ -849,7 +849,7 @@ fn http_exchange_events_append_from_sandbox_logs() {
 
     assert_eq!(receipts.len(), 1);
     let events = event_store
-        .replay(sinomo_events::ReplayQuery::by_kind_prefix(
+        .replay(sinomo_core::events::ReplayQuery::by_kind_prefix(
             "sandbox.network",
         ))
         .expect("replay");

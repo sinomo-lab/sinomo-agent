@@ -8,8 +8,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use sinomo_network::NetworkError;
-use sinomo_node::NodeId;
+use sinomo_core::network::NetworkError;
+use sinomo_core::node::NodeId;
 
 use crate::protocol::DfsRoutedMessage;
 use crate::routes::{dfs_routed_message_from_object_rpc_request, dfs_routed_message_rpc_request};
@@ -18,13 +18,13 @@ pub trait DfsTransportIdentity {
     fn local_node_id(&self) -> &NodeId;
 }
 
-impl DfsTransportIdentity for sinomo_network::InProcessTransport {
+impl DfsTransportIdentity for sinomo_core::network::InProcessTransport {
     fn local_node_id(&self) -> &NodeId {
         self.local_node_id()
     }
 }
 
-impl DfsTransportIdentity for sinomo_network::AsyncInProcessTransport {
+impl DfsTransportIdentity for sinomo_core::network::AsyncInProcessTransport {
     fn local_node_id(&self) -> &NodeId {
         self.local_node_id()
     }
@@ -37,12 +37,14 @@ pub enum DfsTransferProfile {
     Local,
 }
 
-impl From<sinomo_network::ClusterEndpointTransferProfile> for DfsTransferProfile {
-    fn from(profile: sinomo_network::ClusterEndpointTransferProfile) -> Self {
+impl From<sinomo_core::network::ClusterEndpointTransferProfile> for DfsTransferProfile {
+    fn from(profile: sinomo_core::network::ClusterEndpointTransferProfile) -> Self {
         match profile {
-            sinomo_network::ClusterEndpointTransferProfile::Conservative => Self::Conservative,
-            sinomo_network::ClusterEndpointTransferProfile::Lan => Self::Lan,
-            sinomo_network::ClusterEndpointTransferProfile::Local => Self::Local,
+            sinomo_core::network::ClusterEndpointTransferProfile::Conservative => {
+                Self::Conservative
+            }
+            sinomo_core::network::ClusterEndpointTransferProfile::Lan => Self::Lan,
+            sinomo_core::network::ClusterEndpointTransferProfile::Local => Self::Local,
         }
     }
 }
@@ -140,7 +142,7 @@ pub trait AsyncDfsMessageTransport: Send {
     }
 }
 
-impl DfsMessageTransport for sinomo_network::InProcessTransport {
+impl DfsMessageTransport for sinomo_core::network::InProcessTransport {
     fn send_routed_message(
         &mut self,
         target_node_id: &NodeId,
@@ -171,7 +173,7 @@ impl DfsMessageTransport for sinomo_network::InProcessTransport {
     }
 }
 
-impl AsyncDfsMessageTransport for sinomo_network::AsyncInProcessTransport {
+impl AsyncDfsMessageTransport for sinomo_core::network::AsyncInProcessTransport {
     fn local_node_id(&self) -> &NodeId {
         self.local_node_id()
     }
@@ -186,7 +188,7 @@ impl AsyncDfsMessageTransport for sinomo_network::AsyncInProcessTransport {
             self.send_object_rpc_request_async(
                 target_node_id,
                 request,
-                sinomo_network::AsyncNetworkSendOptions::default(),
+                sinomo_core::network::AsyncNetworkSendOptions::default(),
             )
             .await
         })

@@ -4,13 +4,13 @@
 //! service advertisements that make a cluster's DFS usable after bootstrap.
 
 use serde::Serialize;
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::ClusterPaths;
+use sinomo_core::node::NodeId;
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
     ClusterMemberRole, DfsObjectPolicy,
 };
-use sinomo_local::SinomoDataDir;
-use sinomo_network::ClusterPaths;
-use sinomo_node::NodeId;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -175,7 +175,7 @@ impl DfsControlPlaneDefaultClusterBootstrapHost {
     where
         T: Serialize,
     {
-        let encoded = sinomo_kv::encode_kv_value(value)?;
+        let encoded = sinomo_core::kv::encode_kv_value(value)?;
         if self
             .control_plane
             .get(&key)?
@@ -215,7 +215,7 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
     where
         T: Serialize,
     {
-        let encoded = sinomo_kv::encode_kv_value(value)?;
+        let encoded = sinomo_core::kv::encode_kv_value(value)?;
         if self
             .control_plane
             .get_async(&key)
@@ -603,9 +603,9 @@ pub fn ensure_default_cluster_dfs(
         return Ok(None);
     }
     let state = if options.publish_cluster_control {
-        sinomo_network::read_cluster_state(cluster_paths)
+        sinomo_core::cluster::read_cluster_state(cluster_paths)
     } else {
-        sinomo_network::read_cluster_state_without_kv(cluster_paths)
+        sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
     }
     .map_err(DfsError::from_network)?;
     let mut host = DfsControlPlaneDefaultClusterBootstrapHost::new(
@@ -632,9 +632,9 @@ pub async fn ensure_default_cluster_dfs_async(
         return Ok(None);
     }
     let state = if options.publish_cluster_control {
-        sinomo_network::read_cluster_state(&cluster_paths)
+        sinomo_core::cluster::read_cluster_state(&cluster_paths)
     } else {
-        sinomo_network::read_cluster_state_without_kv(&cluster_paths)
+        sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
     }
     .map_err(DfsError::from_network)?;
     let mut host = DfsControlPlaneDefaultClusterAsyncBootstrapHost::new(
@@ -1037,14 +1037,16 @@ pub fn dfs_service_endpoint_for_member(
         .endpoints
         .iter()
         .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
-        .filter(|endpoint| sinomo_network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint))
+        .filter(|endpoint| {
+            sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
+        })
         .min_by_key(|endpoint| dfs_service_endpoint_rank(endpoint))
         .or_else(|| {
             member
                 .endpoints
                 .iter()
                 .filter(|endpoint| {
-                    sinomo_network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
+                    sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
                 })
                 .min_by_key(|endpoint| dfs_service_endpoint_rank(endpoint))
         })

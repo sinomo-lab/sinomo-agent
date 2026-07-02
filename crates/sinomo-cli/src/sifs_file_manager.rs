@@ -5,6 +5,9 @@ use crate::file_manager::{
     FileManagerBackend, FileManagerEntry, FileManagerEntryKind, FileManagerMetadata,
     FileManagerRead, validated_relative_child_path,
 };
+#[allow(unused_imports)]
+use sinomo_runtime::cluster;
+use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::dfs::{
     AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsControlPlaneStore, DfsEndpointTransport,
     DfsMetadataJournalReplicationOptions, DfsMetadataShardConfig, DfsNodeAdvertisement,
@@ -125,7 +128,7 @@ impl SifsFileManagerBackend {
             return false;
         }
         refresh_sifs_cluster_kv_snapshot(&cluster_paths);
-        let Ok(state) = network::read_cluster_state(&cluster_paths) else {
+        let Ok(state) = cluster::read_cluster_state(&cluster_paths) else {
             return false;
         };
         service.refresh_endpoint_targets(cluster_dfs_data_endpoints(&cluster_paths, &state));
@@ -413,7 +416,7 @@ impl SifsFileManagerBackend {
             return Err("SIFS metadata primary transfer requires a cluster".to_string());
         }
         refresh_sifs_cluster_kv_snapshot(&cluster_paths);
-        let state = network::read_cluster_state(&cluster_paths)
+        let state = cluster::read_cluster_state(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
         let local_node_id = state.local_node_id;
         let mut kv = SifsControlPlaneKvClient::new(&cluster_paths);
@@ -910,7 +913,7 @@ fn open_sifs_service_with_hydration(
         Arc::clone(&sync_peer_transport),
     );
     let (local_node_id, endpoints) = if cluster_paths.state.exists() {
-        let state = network::read_cluster_state_without_kv(&cluster_paths)
+        let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
         let endpoints = cluster_dfs_data_endpoints(&cluster_paths, &state);
         (state.local_node_id, endpoints)
@@ -984,7 +987,7 @@ impl SifsControlPlaneKvClient {
 
     fn kv_error(&self, source: impl std::fmt::Display) -> KvError {
         KvError::Io {
-            path: self.cluster_paths.kv_snapshot.display().to_string(),
+            path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
             detail: source.to_string(),
         }
     }
@@ -1017,7 +1020,7 @@ impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
     }
 
     fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-        let mut state = network::read_cluster_state(&self.cluster_paths)
+        let mut state = cluster::read_cluster_state(&self.cluster_paths)
             .map_err(|source| self.kv_error(source))?;
         let result =
             cli_commit_cluster_kv_txn_with_quorum_response(&self.cluster_paths, &mut state, txn)
@@ -1066,7 +1069,7 @@ fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> 
     if !cluster_paths.state.exists() {
         return candidates;
     }
-    let Ok(state) = network::read_cluster_state_without_kv(&cluster_paths) else {
+    let Ok(state) = cluster::read_cluster_state_without_kv(&cluster_paths) else {
         return candidates;
     };
     let routable_node_ids = cluster_dfs_data_endpoints(&cluster_paths, &state)

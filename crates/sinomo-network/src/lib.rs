@@ -13,101 +13,62 @@
 //! here.
 
 mod connectivity;
-mod connectivity_publish;
 mod connectivity_store;
-mod control_plane_adapters;
-mod control_plane_driver;
-mod control_plane_options;
 mod daemon_auth;
+mod directory;
 mod endpoint_advertisement;
 mod endpoint_records;
 mod endpoint_selector;
 mod error;
 mod fallible_serde;
 mod file_mark;
-mod health;
-mod invite;
-mod invite_publish;
 mod io_observer;
-mod join_registration;
-mod keyspace;
-mod kv_forward;
-mod kv_local_store;
-mod kv_read_model;
-mod kv_semantics;
-mod kv_snapshot;
-mod kv_txn_quorum;
 mod lan;
-mod local_membership;
-mod local_state_store;
 mod maintenance;
-mod member_mutation;
-mod member_publish;
-mod member_store;
-mod membership;
-mod membership_forward;
-mod membership_rpc;
 mod network_info;
+mod network_module;
+pub mod network_module_abi;
 mod object;
 mod object_file_store;
 mod paths;
 mod peer;
-mod raft_election;
-mod raft_fanout;
-mod raft_quorum;
-mod raft_replication;
-mod raft_rpc;
 mod roaming;
 mod route;
 mod route_graph_read_model;
 mod rpc;
 mod rpc_future;
-mod state_authority_reachability;
-mod status_publish;
 
+pub use connectivity::cluster_network_record_live;
 pub use connectivity::{
     CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD, CLUSTER_CONNECTIVITY_TTL_SECONDS,
     CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS, ClusterConnectivityFailureReason,
     ClusterConnectivityGraph, ClusterConnectivityProbeBatch, ClusterConnectivityProbeBatchEntry,
     ClusterConnectivityProbeObservation, ClusterConnectivityProbeState, ClusterConnectivityRecord,
     ClusterConnectivityRecordQuery, ClusterConnectivityState,
-    apply_cluster_connectivity_probe_results, cluster_connectivity_probe_due_with_graph,
-    cluster_connectivity_probe_due_with_startup_settle, cluster_connectivity_record,
-    cluster_connectivity_record_for_probe_observation, select_cluster_connectivity_probe_batch,
+    MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, apply_cluster_connectivity_probe_results,
+    cluster_connectivity_probe_due_with_graph, cluster_connectivity_probe_due_with_startup_settle,
+    cluster_connectivity_record, cluster_connectivity_record_for_probe_observation,
+    select_cluster_connectivity_probe_batch,
 };
-#[cfg(test)]
-pub(crate) use connectivity::{
+#[cfg(any(test, feature = "test-support"))]
+pub use connectivity::{
     cluster_connectivity_probe_key, cluster_connectivity_record_for_hard_failure,
     cluster_connectivity_record_for_identity_mismatch,
     cluster_connectivity_record_for_probe_outcome,
     cluster_connectivity_record_for_startup_probe_failure,
 };
-pub use connectivity_publish::{
-    ClusterConnectivityPublishAsyncHost, ClusterConnectivityPublishHost,
-    ClusterNetworkRecordExpiryHost, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
-    cluster_connectivity_publish_record_matches, cluster_network_publish_interval_for_node,
-    expire_cluster_network_records_with_host, sync_cluster_connectivity_records_to_kv,
-    sync_cluster_connectivity_records_to_quorum_async_with_host,
-    sync_cluster_connectivity_records_to_quorum_with_host,
+pub use connectivity::{
+    cluster_connectivity_stable_eq, validate_cluster_connectivity_records_for_source,
 };
 pub use connectivity_store::read_local_cluster_connectivity_records;
-#[cfg(test)]
-pub(crate) use connectivity_store::write_local_cluster_connectivity_records;
+#[cfg(any(test, feature = "test-support"))]
+pub use connectivity_store::write_local_cluster_connectivity_records;
 pub use connectivity_store::{
     read_local_cluster_connectivity_records_for_source,
     record_local_cluster_endpoint_command_connectivity,
 };
-pub use control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
-pub use control_plane_options::{
-    ClusterControlPlaneTimeouts, ClusterKvTxnQuorumOptions,
-    DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
-    DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
-    DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
-    DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
-    DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_MAX_ATTEMPTS,
-    DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT, DEFAULT_CLUSTER_CONTROL_PLANE_RPC_TIMEOUT,
-    DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT,
-    DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
+pub use connectivity_store::{
+    write_local_cluster_connectivity_record_set, write_local_cluster_connectivity_record_set_async,
 };
 pub use daemon_auth::{
     DAEMON_AUTH_PROTOCOL, SignedDaemonCommand, daemon_auth_decode_public_key,
@@ -115,8 +76,12 @@ pub use daemon_auth::{
     sign_daemon_rpc_request_digest_for_local_node, sign_daemon_rpc_request_digest_from_data_dir,
     sign_daemon_rpc_request_for_local_node, sign_daemon_rpc_request_from_data_dir,
 };
-#[cfg(test)]
-pub(crate) use endpoint_advertisement::{
+pub use directory::{
+    ClusterDirectory, ClusterDirectoryFactory, DirectoryVersion, EmptyClusterDirectory,
+    cluster_directory_for, set_cluster_directory_provider,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use endpoint_advertisement::{
     MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES,
     PUBLIC_ENDPOINT_REACHABILITY_NEGATIVE_CACHE_TTL, clear_public_endpoint_reachability_cache,
     daemon_loopback_endpoint, public_endpoint_is_reachable_for_local_ips_async,
@@ -128,119 +93,41 @@ pub use endpoint_advertisement::{
     daemon_advertised_endpoints_from_static_addresses, daemon_lan_endpoint,
 };
 pub use endpoint_records::apply_cluster_iroh_endpoint_advertisement;
-#[cfg(test)]
-pub(crate) use endpoint_records::cleanup_member_iroh_endpoints;
-pub(crate) use endpoint_records::iroh_endpoint_public_key;
-pub(crate) use endpoint_records::upsert_member_endpoint;
-#[cfg(test)]
-pub(crate) use endpoint_records::{
-    refresh_local_iroh_endpoints_from_disk, refresh_local_iroh_endpoints_from_disk_async,
+pub use endpoint_records::iroh_endpoint_public_key;
+pub use endpoint_records::{
+    cleanup_cluster_iroh_endpoints, refresh_local_iroh_endpoints_from_disk,
+    refresh_local_iroh_endpoints_from_disk_async,
+};
+pub use endpoint_records::{cleanup_member_iroh_endpoints, upsert_member_endpoint};
+pub use endpoint_records::{cluster_is_settled_solo, cluster_state_needs_join_registration};
+pub use endpoint_selector::{
+    ClusterEndpointInternalSelectionPurpose, cluster_node_blocks_leader_preference,
+    cluster_node_blocks_leader_preference_async,
 };
 pub use endpoint_selector::{
     ClusterEndpointSelectionPurpose, ClusterEndpointSelector, ClusterEndpointTransferProfile,
     cluster_endpoint_can_carry_main_daemon_rpc,
 };
-#[cfg(test)]
-pub(crate) use endpoint_selector::{
+#[cfg(any(test, feature = "test-support"))]
+pub use endpoint_selector::{
     cluster_sync_targets, cluster_sync_targets_with_connectivity,
     prefer_bounded_daemon_command_targets,
 };
 pub use error::NetworkError;
-pub use health::{
-    ClusterDoctorFinding, ClusterHealthRow, ClusterNetworkPingRequest, ClusterNetworkPingResponse,
-    ClusterStatusAsyncProbe, ClusterStatusProbe, cluster_doctor_findings,
-    cluster_health_rows_with_probe, cluster_health_rpc_request, cluster_local_health_rpc_request,
-    cluster_network_ping_rpc_request, cluster_network_ping_rpc_request_with_response_payload,
-    decode_cluster_health_rpc_response, decode_cluster_network_ping_rpc_response,
-    handle_cluster_network_ping_rpc_request_for_node,
-    handle_current_cluster_health_rpc_request_async, unknown_cluster_node_status,
+pub use fallible_serde::{
+    deserialize_bytes, deserialize_bytes_with_operation, deserialize_vec, serialize_bytes,
+    serialize_optional_bytes,
 };
-pub use invite::{
-    ClusterInviteChallengeProof, ClusterInviteChallengeRequest, PENDING_INVITE_CLUSTER_ID,
-    SINOMO_JOIN_URI_PREFIX, build_cluster_join_invite, cluster_join_command,
-    compact_default_invite_introducers, create_cluster_invite_challenge_proof,
-    decode_cluster_join_invite, encode_cluster_join_invite, extract_invite_from_join_command,
-    invite_channels_for_join_registration, invite_communication_channels,
-    invite_has_embedded_cluster_identity, invite_has_embedded_signature,
-    invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_loopback_connect_address,
-    is_remote_usable_invite_endpoint, push_unique_introducer, sign_cluster_join_invite,
-    sort_default_invite_introducers, verify_cluster_join_invite_signature,
-};
-pub use invite_publish::{
-    ClusterInvitePublishHost, handle_cluster_invite_publish_request_async_with_host,
-    publish_cluster_invitation_to_quorum_with_host, read_cluster_invitation_from_kv,
-    sync_cluster_invitation_to_kv,
-};
-#[cfg(test)]
-pub(crate) use invite_publish::{
-    cluster_invitation_publish_txn_from_kv, handle_cluster_invite_publish_request_with_host,
-};
+pub use file_mark::{ClusterFileMark, cluster_file_mark};
+pub use io_observer::io_observer as current_io_observer;
 pub(crate) use io_observer::io_observer;
 pub use io_observer::{IoObserver, set_io_observer};
-#[cfg(test)]
-pub(crate) use join_registration::prepare_cluster_join_registration_response;
-pub use join_registration::{
-    ClusterJoinReconciliation, ClusterJoinReconciliationHost, ClusterJoinRegistrationAsyncHost,
-    ClusterJoinRegistrationDriver, ClusterJoinRegistrationHost,
-    ClusterLocalDaemonMembershipAsyncObserver, ClusterLocalDaemonMembershipObserver,
-    accepted_cluster_join_state_from_kv_snapshot, cluster_join_challenge_rpc_request,
-    handle_cluster_join_registration_request_async_with_host,
-    handle_cluster_join_registration_request_with_host, join_channel_endpoint_for_accepted_state,
-    reconcile_accepted_cluster_join_response, reconcile_cluster_join_with_introducers_with_host,
-    record_forwarded_join_registration_acceptance_with_host,
-    send_cluster_join_registration_over_membership_rpc,
-};
-#[cfg(test)]
-pub(crate) use keyspace::cluster_identity_key;
-#[cfg(test)]
-pub(crate) use keyspace::{
-    cluster_capability_policy_key, cluster_connectivity_key, cluster_invitation_key,
-    cluster_invitation_state_key, cluster_member_key, cluster_network_info_key,
-    cluster_node_status_key, cluster_node_status_key_for_process,
-    cluster_node_status_key_for_record,
-};
-#[cfg(test)]
-pub(crate) use kv_forward::ClusterKvTxnForwardHost;
-#[cfg(test)]
-pub(crate) use kv_forward::ClusterKvTxnForwardOptions;
-#[cfg(test)]
-pub(crate) use kv_forward::forward_cluster_kv_txn_to_state_authority_with_host;
-pub use kv_read_model::{
-    read_cluster_connectivity_graph_from_kv, read_cluster_members_from_kv,
-    read_cluster_members_from_snapshot, read_cluster_node_statuses_from_kv,
-};
-#[cfg(test)]
-pub(crate) use kv_semantics::cluster_semantic_txn_no_effect_response;
-pub use kv_snapshot::{
-    ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions,
-    refresh_current_cluster_kv_store_with_host,
-    refresh_current_cluster_kv_store_with_local_storage_and_transport,
-};
-pub use kv_txn_quorum::{
-    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost,
-    commit_cluster_kv_txn_with_quorum_response_async_with_host,
-    commit_cluster_kv_txn_with_quorum_response_with_host,
-    handle_cluster_kv_txn_request_async_with_host,
-};
+pub use lan::is_loopback_connect_address;
 pub use lan::{
     AsyncMdnsDiscoverySocket, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache, MdnsDiscoveryRecord,
     apply_lan_discovery_advertisements, discover_default_lan_ip_candidates,
     discover_default_lan_ip_candidates_async, format_ip_port, iroh_disabled_by_env,
     lan_discovery_advertisement_for_state,
-};
-pub use local_membership::{
-    ClusterLocalDaemonMembershipObservation, ClusterLocalDaemonMembershipRefresh,
-    apply_cluster_node_role, assign_local_daemon_member_public_keys,
-    cluster_state_needs_join_registration, cluster_status_summary_label,
-    ensure_daemon_cluster_members, merge_cluster_join_registration,
-    prepare_pending_cluster_join_state, refresh_cluster_connectivity_environment,
-    refresh_cluster_connectivity_environment_async, refresh_local_daemon_membership_from_disk,
-    refresh_local_daemon_membership_from_disk_async,
-};
-pub use local_state_store::{
-    read_cluster_state, read_cluster_state_async, read_cluster_state_cached,
-    read_cluster_state_without_kv, read_cluster_state_without_kv_async, write_cluster_state,
-    write_cluster_state_async,
 };
 pub use maintenance::{
     CLUSTER_CONNECTIVITY_MOBILE_PROBE_MAX_ENDPOINTS_PER_TICK,
@@ -260,53 +147,40 @@ pub use maintenance::{
     cluster_network_maintenance_next_due_duration, cluster_network_probe_interval_for_role,
     cluster_network_publish_interval_for_role, cluster_network_stable_discovery_announcement_due,
 };
-#[cfg(test)]
-pub(crate) use member_mutation::sync_cluster_state_to_local_raft_unchecked;
-pub use member_mutation::{
-    ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver, ClusterMemberMutationHost,
-    ClusterMemberRemoval, ClusterNodeNameUpdate, ClusterNodeRoleUpdate,
-    ClusterStateAuthorityUpdate, cleanup_legacy_shadow_daemon_members_with_host,
-    cluster_state_sync_txn, remove_cluster_members_with_host,
-    sync_cluster_state_to_kv_async_with_host, sync_cluster_state_to_kv_with_host,
-    sync_cluster_state_to_local_kv_unchecked, update_cluster_node_name_with_host,
-    update_cluster_node_role_with_host, update_cluster_state_authority_with_host,
-};
-pub use member_publish::{
-    ClusterLocalMemberPublishAsyncHost, ClusterLocalMemberPublishHost,
-    ClusterLocalMemberPublishOptions, ClusterMemberPublishHost,
-    handle_cluster_member_publish_request_async_with_host,
-    publish_local_members_to_quorum_if_needed_async_with_host,
-    publish_local_members_to_quorum_if_needed_with_host,
-};
-#[cfg(test)]
-pub(crate) use member_publish::{
-    cluster_member_publish_authorized_for_signer, cluster_member_publish_matches_kv,
-    cluster_member_publish_txn, cluster_member_publish_txn_from_snapshot,
-    handle_cluster_member_publish_request_with_host,
-};
-pub use membership::cluster_is_settled_solo;
-#[cfg(test)]
-pub(crate) use membership_forward::ClusterMembershipRpcForwardHost;
-#[cfg(test)]
-pub(crate) use membership_forward::forward_cluster_membership_rpc_to_state_authority_with_host;
-#[cfg(test)]
-pub(crate) use membership_forward::{
-    forward_cluster_join_challenge_rpc_to_state_authority_async_with_host,
-    forward_cluster_join_challenge_rpc_to_state_authority_with_host,
-};
-pub use membership_rpc::{
-    ClusterAuthenticatedPeer, ClusterInvitePublishRequest, ClusterInvitePublishResponse,
-    ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterMemberPublishRequest,
-    ClusterMemberPublishResponse, handle_cluster_membership_rpc_request_with_hosts,
-};
+pub use network_info::cluster_network_info_stable_eq;
+pub use network_info::cluster_network_record_should_refresh;
 pub use network_info::{
     CLUSTER_NETWORK_INFO_TTL_SECONDS, ClusterNetworkInfoRecord, build_cluster_network_info_record,
     cluster_network_info_publish_record_matches,
 };
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) use object::read_object_frame_async;
-#[cfg(test)]
-pub(crate) use object::write_object_frame_async;
+pub use network_module::{
+    NETWORK_MODULES_ADMIN_CAPABILITY, NETWORK_MODULES_LIST_ROUTE, NETWORK_MODULES_RPC_CATEGORY,
+    NETWORK_MODULES_RPC_ROUTE_POLICIES, NETWORK_MODULES_RPC_ROUTES,
+    NETWORK_MODULES_SET_ENABLED_ROUTE, NetworkFuture, NetworkModule, NetworkModuleContext,
+    NetworkModuleDescriptor, NetworkModuleListResponse, NetworkModuleRegistry,
+    NetworkModuleRoutePolicy, NetworkModuleSetEnabledRequest, NetworkModuleSetEnabledResponse,
+    NetworkModuleStatus, network_module_registry, set_network_module_registry,
+};
+pub use network_module_abi::FfiNetworkModule;
+pub use object::try_clone_id;
+pub use object::{try_reserve_vec, try_zeroed_vec};
+pub use object_file_store::remove_optional_file;
+pub use object_file_store::{
+    read_object_file, read_optional_object_file, write_object_file,
+    write_object_file_with_semantic_skip,
+};
+pub use route::cluster_route_next_hop;
+pub use route::invalidate_cluster_delivery_routing_table_cache;
+pub use route_graph_read_model::invalidate_cluster_route_graph_cache;
+pub use route_graph_read_model::{
+    read_cluster_connectivity_graph, read_cluster_connectivity_graph_with_query,
+};
+pub use rpc::{CLUSTER_HEALTH_SCOPE_LOCAL, CLUSTER_HEALTH_SCOPE_METADATA_KEY};
+// Unconditional since stage C: dylib network modules reuse the object frame
+// codec through the sinomo-core facade.
+pub use object::read_object_frame_async;
+#[cfg(any(test, feature = "test-support"))]
+pub use object::write_object_frame_async;
 pub use object::{
     AsyncDaemonControlListener, AsyncDaemonControlStream, DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
     DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts, OBJECT_STREAM_MAX_CHUNK_BYTES,
@@ -324,8 +198,8 @@ pub(crate) use object::{
     object_rpc_request_expects_raw_daemon_response, send_daemon_control_request_async,
     send_daemon_control_rpc_request_raw_response_async,
 };
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) use object::{
+// Unconditional since stage C: see read_object_frame_async above.
+pub use object::{
     OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL, decode_single_object_frame_from_slice,
     encode_object_frame_to_vec,
 };
@@ -334,32 +208,11 @@ pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, InProcessNetwork,
     InProcessTransport,
 };
-#[cfg(test)]
-pub(crate) use raft_election::ClusterRaftVoteTransportHost;
-#[cfg(test)]
-pub(crate) use raft_fanout::ClusterRaftCommittedFanoutAsyncHost;
-pub use raft_fanout::{
-    ClusterKvCommittedFanoutAsyncHost, spawn_cluster_kv_committed_fanout_worker_on_runtime,
-};
-pub use raft_quorum::ClusterKvQuorumAsyncHost;
-#[cfg(test)]
-pub(crate) use raft_quorum::ClusterRaftQuorumAsyncHost;
-pub use raft_replication::{
-    ClusterKvAppendReplicationAsyncHost, replicate_cluster_kv_to_endpoint_async_with_host,
-};
-#[cfg(test)]
-pub(crate) use raft_replication::{
-    ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
-    replicate_cluster_raft_to_endpoint_async_with_host,
-    replicate_cluster_raft_to_endpoint_with_host,
-};
-pub use raft_rpc::handle_cluster_kv_consensus_rpc_request_async;
-#[cfg(test)]
-pub(crate) use raft_rpc::handle_cluster_raft_rpc_request;
-pub(crate) use roaming::read_iroh_endpoint_record_async;
-#[cfg(test)]
-pub(crate) use roaming::send_daemon_rpc_to_cluster_endpoint_async;
-pub(crate) use roaming::stable_iroh_endpoint_id;
+pub use roaming::iroh_endpoint_record_from_address;
+pub use roaming::read_iroh_endpoint_record_async;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::send_daemon_rpc_to_cluster_endpoint_async;
+pub use roaming::stable_iroh_endpoint_id;
 pub use roaming::{
     IROH_DAEMON_COMMAND_MAX_BYTES, IrohDaemonProxyHandle, IrohEndpointRecord, IrohRelayMode,
     start_iroh_daemon_proxy,
@@ -388,34 +241,13 @@ pub use rpc::{
     ObjectRpcRouteRegistry, ObjectRpcRouteRegistryBuilder, ObjectRpcRouter, ServiceCatalog,
     ServiceCatalogSnapshot, ServiceCategory, call_object_rpc_service_async,
 };
-#[cfg(test)]
-pub(crate) use rpc::{call_object_rpc_frame_async, serve_object_rpc_frame_async};
+#[cfg(any(test, feature = "test-support"))]
+pub use rpc::{call_object_rpc_frame_async, serve_object_rpc_frame_async};
 pub use rpc_future::ClusterMembershipRpcFuture;
-#[cfg(test)]
-pub(crate) use sinomo_node::upsert_member_record;
-pub use state_authority_reachability::{
-    ClusterStateAuthorityReachabilityAsyncHost, ClusterStateAuthorityReachabilityHost,
-    ClusterStateAuthorityReachabilityOptions, cluster_has_local_quorum_async_with_host,
-    cluster_has_local_quorum_with_host, cluster_reachable_state_authority_count_async_with_host,
-    cluster_reachable_state_authority_count_with_host, local_cluster_state_authority_member,
-};
-pub use status_publish::{
-    ClusterNetworkInfoPublishAsyncHost, ClusterNetworkInfoPublishHost,
-    ClusterNodePresencePublishMatches, ClusterNodeStatusPublishAsyncHost,
-    ClusterNodeStatusPublishHost, cluster_node_presence_publish_matches_async_with_host,
-    cluster_node_presence_publish_matches_with_host, cluster_node_status_publish_record_matches,
-    publish_cluster_network_info_to_quorum_async_with_host,
-    publish_cluster_network_info_to_quorum_with_host,
-    publish_cluster_node_status_to_quorum_async_with_host,
-    publish_cluster_node_status_to_quorum_with_host,
-};
-#[cfg(test)]
-pub(crate) use status_publish::{
-    cluster_network_info_publish_matches_with_host, cluster_node_status_publish_matches_with_host,
-    sync_cluster_network_info_to_kv, sync_cluster_node_status_to_kv,
-};
+#[cfg(any(test, feature = "test-support"))]
+pub use sinomo_node::upsert_member_record;
 
-pub type ClusterEndpointId = sinomo_core::Id;
+pub type ClusterEndpointId = sinomo_base::Id;
 
 pub const NETWORK_PROTOCOL: &str = "sinomo.network.v1";
 pub const SINOMO_NETWORK_MODULE_LEGACY_ID: &str = "module.network";
@@ -549,15 +381,6 @@ pub fn register_storage_paths(
     layout.register_sinomo_object(
         "sinomo-network",
         StorageRing::R1,
-        "cluster/state.sobj",
-        ObjectSchema::new("ClusterBootstrapState", STORAGE_CONTRACT_OBJECT_VERSION)
-            .field("cluster_id", "ClusterId")
-            .field("local_node_id", "NodeId")
-            .field("members", "Vec<ClusterMemberRecord>"),
-    )?;
-    layout.register_sinomo_object(
-        "sinomo-network",
-        StorageRing::R1,
         "cluster/connectivity-local.sobj",
         ObjectSchema::new(
             "Vec<ClusterConnectivityRecord>",
@@ -578,40 +401,33 @@ pub fn register_storage_paths(
 pub(crate) mod prelude {
     pub(crate) use crate::ClusterEndpointId;
     pub(crate) use serde::{Deserialize, Serialize};
-    #[cfg(test)]
-    pub(crate) use sinomo_core::ClusterCertificate;
-    #[cfg(test)]
-    pub(crate) use sinomo_core::EventEnvelope;
-    pub(crate) use sinomo_core::{
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) use sinomo_base::ClusterCertificate;
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) use sinomo_base::EventEnvelope;
+    pub(crate) use sinomo_base::{
         CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
         ClusterEndpointSource, ClusterInvitationChannel, ClusterJoinInvite, ClusterMemberRecord,
         ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole,
         ClusterNodeStatusRecord, ClusterTransportKind, TrustDomain,
     };
-    #[cfg(test)]
-    pub(crate) use sinomo_core::{LatencyClass, RoutingScope};
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) use sinomo_base::{LatencyClass, RoutingScope};
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) use sinomo_events::EventStore;
     pub(crate) use sinomo_events::{EventId, EventStoreError};
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) use sinomo_events::{EventSequence, SessionId, StoredEvent};
-    #[cfg(test)]
-    pub(crate) use sinomo_kv::LeaseId;
-    pub(crate) use sinomo_kv::{
-        ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, InProcessKvStore, KvCommand,
-        KvError, KvEvent, KvOp, KvSnapshot, KvTxn, KvTxnResponse, RaftRequestVoteRequest,
-        RaftRequestVoteResponse,
-    };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) use sinomo_local::SinomoDataDir;
     pub(crate) use sinomo_node::ClusterId;
     pub(crate) use sinomo_node::ClusterInviteId;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) use sinomo_node::main_daemon_capabilities;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) use sinomo_node::{NodeAvailability, NodeHealth, NodeProfile};
     pub(crate) use sinomo_node::{NodeId, shadow_daemon_node_id};
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) use std::collections::HashSet;
     pub(crate) use std::collections::{BTreeMap, BTreeSet, VecDeque};
     pub(crate) use std::io;
@@ -625,5 +441,251 @@ pub(crate) mod prelude {
     pub(crate) use time::OffsetDateTime;
 }
 
-#[cfg(test)]
-mod tests;
+// test-support re-exports (crate internals for sibling integration tests)
+#[cfg(any(test, feature = "test-support"))]
+pub use connectivity_store::local_cluster_connectivity_content_generation;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::PublicIpDiscoveryResult;
+#[cfg(any(test, feature = "test-support"))]
+pub use object::write_object_frame_blocking;
+#[cfg(any(test, feature = "test-support"))]
+pub use object_file_store::object_file_write_mark_cache_capacity_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use object_file_store::object_file_write_mark_cache_contains_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use object_file_store::record_object_file_write_mark_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use object_file_store::refresh_object_file_write_mark_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use object_file_store::remove_object_file_write_mark_entries_under_root_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use object_file_store::write_object_file_compare_read_bytes_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::SeenEventCache;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::IrohProxyByteBudget;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::ClusterDeliveryFailedEdges;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::ClusterDeliveryRouteGraph;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::RelayEnvelope;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::cluster_delivery_build_routing_table;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::cluster_delivery_route_plan;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::cluster_delivery_route_plan_async;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::cluster_delivery_routing_table_cache_mark;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::cluster_delivery_shortest_path_next_hop;
+#[cfg(any(test, feature = "test-support"))]
+pub use route_graph_read_model::cluster_route_graph_cache_mark;
+// Unconditional since stage C: dylib network modules reuse the no-clobber
+// object-file write (iroh secret-key create) through the sinomo-core facade.
+#[cfg(any(test, feature = "test-support"))]
+pub use connectivity_store::local_cluster_connectivity_prune_passes_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use connectivity_store::local_cluster_connectivity_record_cache_capacity_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use connectivity_store::local_cluster_connectivity_record_cache_contains_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use connectivity_store::remove_local_cluster_connectivity_record_cache_entries_under_root_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use connectivity_store::reset_local_cluster_connectivity_prune_passes_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::LanQuicEventFrameCodec;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::MAX_MDNS_DISCOVERY_RECORDS;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::MAX_SINOMO_LAN_DISCOVERY_TTL_TICKS;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::PUBLIC_IP_DISCOVERY_DEFERRED_CACHE_TTL;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::PUBLIC_IP_DISCOVERY_EMPTY_CACHE_TTL;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::age_public_ip_discovery_cache_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::cached_default_lan_ip_candidates_with;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::cached_default_lan_ip_candidates_with_async;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::cached_default_public_ip_candidates_for_local_ips_with;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::cached_default_public_ip_candidates_for_local_ips_with_async;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::clear_default_lan_ip_discovery_cache;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::clear_public_ip_discovery_cache;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::decode_lan_discovery_datagram;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::discover_local_ip_candidates_for_targets_async;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::fetch_public_ip_candidates_from_service_async;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::is_advertisable_interface_ip;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::is_invitable_ip;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::parse_public_ip_discovery_response;
+#[cfg(any(test, feature = "test-support"))]
+pub use object::DaemonControlStream;
+#[cfg(any(test, feature = "test-support"))]
+pub use object::read_object_frame_blocking;
+#[cfg(any(test, feature = "test-support"))]
+pub use object_file_store::clear_write_object_file_create_new_unsupported_link_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use object_file_store::force_write_object_file_create_new_unsupported_link_for_test;
+pub use object_file_store::write_object_file_create_new_serialized;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::AsyncNetworkServiceHandle;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::AsyncNetworkTransport;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::AsyncNetworkTransportFuture;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::DeliveryAck;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::DeliveryLedger;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::DeliveryStatus;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::EventFrame;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::EventFrameId;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::Heartbeat;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::HeartbeatPolicy;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::IN_PROCESS_MAILBOX_CAPACITY;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::InProcessRouter;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::InboundEventFrame;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::InboundOutcome;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::MeshMessage;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::MeshMessageBody;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::MeshMessageId;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::NETWORK_SERVICE_INBOUND_BATCH_LIMIT;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::NetworkService;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::NetworkServiceActorOptions;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::NetworkServiceCommandOptions;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::NodeEndpoint;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::PeerEndpointCandidate;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::PeerRegistry;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::PeerStatus;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::RetryPolicy;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::RouteDelivery;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::RouteDeliveryId;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::TransportKind;
+#[cfg(any(test, feature = "test-support"))]
+pub use peer::ack_timeout_for_latency_class;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::ClusterAuthMaterial;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::ClusterAuthVerifier;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::IROH_DAEMON_PROXY_ERROR_ROUTE;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::IROH_DAEMON_PROXY_MAX_CONNECTIONS;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::IROH_DAEMON_PROXY_RESTART_BACKOFF_MAX;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::IROH_DAEMON_PROXY_RESTART_JITTER_MAX;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::IceCandidateRecord;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::IceCandidateType;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::IrohKvExchange;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::LanConnectionPlanner;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::RoamingConnectionPlanner;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::RoamingPathSelection;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::WebRtcKvExchange;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::WebRtcSignalMessage;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::WebRtcSignalingEnvelope;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::accept_iroh_proxy_command_stream_with_idle_timeout;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::configure_daemon_control_stream_idle_timeout;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::decode_iroh_daemon_control_response_bytes;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::default_sinomo_iroh_relay_urls;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::encode_iroh_proxy_error_response_frame;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::iroh_daemon_control_request_allows_response_retry;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::iroh_daemon_proxy_restart_backoff;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::iroh_daemon_proxy_restart_delay;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::iroh_daemon_response_error_is_retryable;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::iroh_daemon_rpc_retry_delay;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::iroh_endpoint_record_from_cluster_endpoint;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::iroh_proxy_command_stream_accept_error_is_peer_close;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::iroh_proxy_route_hint;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::read_iroh_daemon_control_response_async;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::read_iroh_proxy_frame_async;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::read_iroh_proxy_frame_async_with_idle_timeout;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::sinomo_iroh_relay_url_strings_from_env;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::try_acquire_iroh_proxy_permit;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::write_iroh_daemon_control_request_bytes_with_idle_timeout;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::write_iroh_endpoint_record_async;
+#[cfg(any(test, feature = "test-support"))]
+pub use roaming::write_iroh_proxy_frame_async_with_idle_timeout;
+#[cfg(any(test, feature = "test-support"))]
+pub use rpc::ObjectRpcFuture;

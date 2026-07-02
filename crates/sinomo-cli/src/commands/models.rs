@@ -1,4 +1,7 @@
 use super::*;
+#[allow(unused_imports)]
+use sinomo_runtime::cluster;
+use sinomo_runtime::cluster::ClusterKvPathsExt;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelDefaultOptions {
@@ -877,7 +880,7 @@ pub(crate) fn model_config_uses_cluster(data_dir: &SinomoDataDir) -> bool {
     if cli_force_local_mode() {
         return false;
     }
-    network::read_cluster_state(&ClusterPaths::new(data_dir)).is_ok()
+    cluster::read_cluster_state(&ClusterPaths::new(data_dir)).is_ok()
 }
 
 pub(crate) fn load_model_config_for_node(
@@ -889,7 +892,7 @@ pub(crate) fn load_model_config_for_node(
         let config = model_config_from_cluster_kv_snapshot(&snapshot)
             .map_err(CliError::LanguageModel)?
             .unwrap_or_default();
-        return Ok((config, paths.kv_snapshot));
+        return Ok((config, paths.kv_paths().snapshot));
     }
     let store = model_config_store().map_err(CliError::LanguageModel)?;
     let config = store
@@ -914,7 +917,7 @@ pub(crate) fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSn
     #[cfg(test)]
     {
         return sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
-            .map_err(network::NetworkError::from)
+            .map_err(sinomo_runtime::network::NetworkError::directory)
             .map_err(Into::into);
     }
     #[cfg(not(test))]
@@ -934,7 +937,7 @@ pub(crate) fn write_model_config_for_node(
         paths.ensure()?;
         let txn = model_config_cluster_kv_txn(config).map_err(CliError::LanguageModel)?;
         commit_model_config_cluster_txn(data_dir, txn)?;
-        return Ok(paths.kv_snapshot);
+        return Ok(paths.kv_paths().snapshot);
     }
     let store = model_config_store().map_err(CliError::LanguageModel)?;
     store
@@ -960,7 +963,7 @@ pub(crate) fn load_model_runtime_config_for_node(
         let config = model_runtime_config_from_cluster_kv_snapshot(&snapshot)
             .map_err(CliError::LanguageModel)?
             .unwrap_or_default();
-        return Ok((config, paths.kv_snapshot));
+        return Ok((config, paths.kv_paths().snapshot));
     }
     load_local_model_runtime_config(data_dir)
 }
@@ -976,7 +979,7 @@ pub(crate) fn write_model_runtime_config_for_node(
     paths.ensure()?;
     let txn = model_runtime_config_cluster_kv_txn(config).map_err(CliError::LanguageModel)?;
     commit_model_config_cluster_txn(data_dir, txn)?;
-    Ok(paths.kv_snapshot)
+    Ok(paths.kv_paths().snapshot)
 }
 
 fn local_model_runtime_config_path(data_dir: &SinomoDataDir) -> PathBuf {

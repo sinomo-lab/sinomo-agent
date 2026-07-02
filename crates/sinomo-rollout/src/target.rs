@@ -1,5 +1,5 @@
 use crate::RolloutError;
-use sinomo_network::is_loopback_connect_address;
+use sinomo_core::network::is_loopback_connect_address;
 
 pub fn rollout_target_platform_matches_local(
     target_os: Option<&str>,

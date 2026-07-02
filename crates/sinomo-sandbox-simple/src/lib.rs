@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 #[cfg(not(windows))]
 use sinomo_sandbox::SandboxCancellationToken;
 use sinomo_sandbox::{

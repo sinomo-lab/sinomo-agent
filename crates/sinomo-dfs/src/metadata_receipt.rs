@@ -1,6 +1,6 @@
 //! Receipt lookup helpers shared by metadata replay and migration paths.
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_error::Result;
@@ -47,7 +47,7 @@ pub(crate) fn replay_receipt_matches_existing(
 mod tests {
     use super::*;
     use sinomo_core::DfsWriteReceipt;
-    use sinomo_events::EventId;
+    use sinomo_core::events::EventId;
     use time::OffsetDateTime;
 
     fn node(value: &str) -> NodeId {

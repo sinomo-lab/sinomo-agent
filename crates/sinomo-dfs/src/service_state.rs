@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::transfer::{
     InProgressBlobTransfer, InProgressFetchBlobTransfer, InProgressPatchTransfer,

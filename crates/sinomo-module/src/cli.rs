@@ -18,7 +18,7 @@ use sinomo_cli_registry::{
     CliCommandMetadata, CliCommandPolicy, CliParseError,
 };
 use sinomo_core::ModuleKind;
-use sinomo_local::SinomoDataDir;
+use sinomo_core::local::SinomoDataDir;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};

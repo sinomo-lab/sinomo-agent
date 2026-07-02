@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::*;
 

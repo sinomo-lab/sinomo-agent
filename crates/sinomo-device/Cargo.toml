@@ -15,7 +15,6 @@ ring = "r1"
 cpal.workspace = true
 serde.workspace = true
 sinomo-core = { path = "../sinomo-core" }
-sinomo-node = { path = "../sinomo-node" }
 thiserror.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

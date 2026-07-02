@@ -10,8 +10,8 @@ use std::io::{self, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
-use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
-use sinomo_storage::durable_file;
+use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
+use sinomo_core::storage::durable_file;
 use time::OffsetDateTime;
 
 use crate::metadata_error::{MetadataBackendError, Result};

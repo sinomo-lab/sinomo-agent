@@ -284,10 +284,10 @@ fn prepare_rollout_cluster_targets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_core::node::NodeId;
     use sinomo_core::{
         CapabilityName, ClusterEndpointRecord, ClusterMemberRecord, ClusterTransportKind, Id,
     };
-    use sinomo_node::NodeId;
     use time::OffsetDateTime;
 
     type ClusterId = Id;

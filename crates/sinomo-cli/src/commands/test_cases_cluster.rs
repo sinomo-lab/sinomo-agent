@@ -5,6 +5,9 @@
 //! cluster, join it into a live target cluster, then verify the resulting target
 //! KV and local quarantine evidence.
 
+#[allow(unused_imports)]
+use sinomo_runtime::cluster;
+use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::core::{ClusterMigrationPhase, ClusterMigrationRecord};
 use sinomo_runtime::dfs::{default_dfs_metadata_shards_root, dfs_import_metadata_root};
 use sinomo_runtime::kv::{KvCommand, KvOp, KvTxn};
@@ -58,7 +61,7 @@ sinomo_runtime::test::sinomo_test_case! {
 fn run_cluster_migration_seed_source(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let paths = ClusterPaths::new(&data_dir);
-    let state = network::read_cluster_state_without_kv(&paths)
+    let state = cluster::read_cluster_state_without_kv(&paths)
         .map_err(|source| SinomoTestError::failed(format!("cannot read source state: {source}")))?;
     if !network::cluster_is_settled_solo(&state) {
         return Ok(SinomoTestOutcome::failed(
@@ -141,7 +144,7 @@ fn run_cluster_migration_seed_source(ctx: &mut SinomoTestContext) -> SinomoTestR
 fn run_cluster_migration_verify_joined(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let paths = ClusterPaths::new(&data_dir);
-    let state = network::read_cluster_state_without_kv(&paths)
+    let state = cluster::read_cluster_state_without_kv(&paths)
         .map_err(|source| SinomoTestError::failed(format!("cannot read target state: {source}")))?;
     let migration = find_migration_record_for_target(&paths, &state.cluster_id)?;
     let source_quarantine = paths

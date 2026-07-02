@@ -5,7 +5,7 @@ use crate::{
     DfsObjectId, DfsObjectKind, DfsObjectMetadata, dfs_now_unix_nanos, sifs_file_system_id,
 };
 use sinomo_core::DfsObjectPolicy;
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 pub(crate) fn new_posix_metadata_object(
     node_id: &NodeId,

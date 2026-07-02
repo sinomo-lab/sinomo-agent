@@ -1,10 +1,10 @@
 //! Artifact registry metadata skeleton.
 
 use serde::{Deserialize, Serialize};
+use sinomo_core::kv::{KvEntry, KvOp, KvTxn};
 use sinomo_core::{
     ArtifactManifest, EvaluationScorecard, Id, PolicyAction, PolicyDecision, RolloutPlan, TrustRing,
 };
-use sinomo_kv::{KvEntry, KvOp, KvTxn};
 use sinomo_module::{
     ArtifactId, ModuleId, artifact_signature_signer_public_key, verify_artifact_signature,
 };
@@ -1084,9 +1084,9 @@ pub fn trusted_artifact_signers_from_kv_entries(
 }
 
 pub fn register_storage_paths(
-    layout: &mut sinomo_storage::StorageLayout,
-) -> Result<(), sinomo_storage::StorageContractError> {
-    use sinomo_storage::StorageRing;
+    layout: &mut sinomo_core::storage::StorageLayout,
+) -> Result<(), sinomo_core::storage::StorageContractError> {
+    use sinomo_core::storage::StorageRing;
 
     layout.register_human_text(
         "sinomo-registry",
@@ -1708,7 +1708,7 @@ mod tests {
             .expect("build signer txn");
         assert_eq!(txn.success.len(), 1);
 
-        let mut store = sinomo_kv::InProcessKvStore::new();
+        let mut store = sinomo_core::kv::InProcessKvStore::new();
         let response = store.txn(txn).expect("apply signer txn");
         assert!(response.succeeded);
         assert!(store.get(&key).is_some());
@@ -1737,7 +1737,7 @@ mod tests {
         let txn = trusted_artifact_signers_kv_txn(std::slice::from_ref(&signer))
             .expect("build signer txn");
 
-        let mut store = sinomo_kv::InProcessKvStore::new();
+        let mut store = sinomo_core::kv::InProcessKvStore::new();
         store.txn(txn).expect("apply signer txn");
         let mut entries = store
             .range_prefix(CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX)
@@ -1759,7 +1759,8 @@ mod tests {
     fn signed_artifact_fixture(signer_id: &str) -> (ArtifactManifest, TrustedArtifactSigner) {
         let root = unique_test_root(signer_id);
         let identity_path = root.join("identity.sobj");
-        let identity = sinomo_node::load_or_create_node_identity(&identity_path).expect("identity");
+        let identity =
+            sinomo_core::node::load_or_create_node_identity(&identity_path).expect("identity");
         let module_id =
             ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
         let artifact_id = ArtifactId::from_legacy_named("artifact_candidate").expect("artifact");

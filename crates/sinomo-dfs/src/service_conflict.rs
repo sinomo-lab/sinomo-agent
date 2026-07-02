@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 use time::OffsetDateTime;
 
 use crate::metadata_pages::collect_metadata_pages;

@@ -1,7 +1,9 @@
 use crate::{DaemonError, DaemonPaths, read_daemon_status};
 use sinomo_core::Id;
-use sinomo_local::SinomoDataDir;
-use sinomo_network::ClusterPaths;
+#[allow(unused_imports)]
+use sinomo_core::cluster::ClusterKvPathsExt;
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::ClusterPaths;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -110,7 +112,7 @@ fn kv_observe_metrics(
     data_dir: &SinomoDataDir,
 ) -> Result<Vec<sinomo_observe::ObserveMetricRecord>, sinomo_observe::ObserveError> {
     let cluster_paths = ClusterPaths::new(data_dir);
-    let state = match sinomo_network::read_cluster_state_without_kv(&cluster_paths) {
+    let state = match sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) {
         Ok(state) => state,
         Err(_) if !cluster_paths.state.exists() => return Ok(Vec::new()),
         Err(source) => {
@@ -120,7 +122,7 @@ fn kv_observe_metrics(
         }
     };
     let kv_paths = cluster_paths.kv_paths();
-    let snapshot = sinomo_kv::read_cluster_kv_current_snapshot_for_node(
+    let snapshot = sinomo_core::kv::read_cluster_kv_current_snapshot_for_node(
         &kv_paths,
         state.local_node_id.clone(),
     )

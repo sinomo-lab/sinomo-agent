@@ -1,10 +1,10 @@
 use crate::error::NetworkError;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::object::ObjectFrameIoOptions;
 use crate::object::SinomoObjectCodec;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
-use sinomo_core::{CapabilityName, Id};
+use sinomo_base::{CapabilityName, Id};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use time::OffsetDateTime;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower_layer::Layer;
 use tower_service::Service;
@@ -1365,8 +1365,8 @@ where
     }
 }
 
-#[cfg(test)]
-pub(crate) async fn call_object_rpc_frame_async<IO>(
+#[cfg(any(test, feature = "test-support"))]
+pub async fn call_object_rpc_frame_async<IO>(
     stream: &mut IO,
     request: &ObjectRpcRequest,
     max_response_bytes: usize,
@@ -1390,8 +1390,8 @@ where
     service.call(request).await
 }
 
-#[cfg(test)]
-pub(crate) async fn serve_object_rpc_frame_async<IO, S>(
+#[cfg(any(test, feature = "test-support"))]
+pub async fn serve_object_rpc_frame_async<IO, S>(
     stream: &mut IO,
     service: &mut S,
     max_request_bytes: usize,

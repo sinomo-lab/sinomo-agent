@@ -3,15 +3,15 @@ use crate::{
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::DaemonRpcTimeouts;
+use sinomo_core::node::{
+    ClusterId, DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, NodeId,
+    cluster_node_is_local_process,
+};
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRole, ClusterMemberState,
     ClusterNodeAvailability, ClusterNodeRolloutStatus, ClusterNodeStatusRecord,
-};
-use sinomo_local::SinomoDataDir;
-use sinomo_network::DaemonRpcTimeouts;
-use sinomo_node::{
-    ClusterId, DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, NodeId,
-    cluster_node_is_local_process,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -120,10 +120,12 @@ pub(crate) fn ensure_daemon_cluster_members(
     timestamp: OffsetDateTime,
 ) -> bool {
     let main_node_id = state.local_node_id.clone();
-    let shadow_node_id = sinomo_node::shadow_daemon_node_id(&state.local_node_id);
-    let lan_ips = sinomo_network::discover_default_lan_ip_candidates();
+    let shadow_node_id = sinomo_core::node::shadow_daemon_node_id(&state.local_node_id);
+    let lan_ips = sinomo_core::network::discover_default_lan_ip_candidates();
     let route_ips =
-        sinomo_network::ClusterEndpointSelector::discover_peer_route_ip_candidates_for_state(state);
+        sinomo_core::network::ClusterEndpointSelector::discover_peer_route_ip_candidates_for_state(
+            state,
+        );
     let main_endpoints = daemon_advertised_endpoints_for_state(
         state,
         &main_node_id,
@@ -140,7 +142,7 @@ pub(crate) fn ensure_daemon_cluster_members(
         &lan_ips,
         &route_ips,
     );
-    sinomo_network::ensure_daemon_cluster_members(
+    sinomo_core::cluster::ensure_daemon_cluster_members(
         state,
         main_endpoints,
         shadow_endpoints,
@@ -196,7 +198,7 @@ fn daemon_advertised_endpoints_from_ips(
     allow_public_endpoints: bool,
 ) -> Vec<ClusterEndpointRecord> {
     let advertise_host = std::env::var(SINOMO_DAEMON_ADVERTISE_HOST_ENV).ok();
-    sinomo_network::daemon_advertised_endpoints_from_static_addresses(
+    sinomo_core::network::daemon_advertised_endpoints_from_static_addresses(
         node_id,
         daemon_connect_address(&options.host, options.port),
         &options.host,
@@ -218,7 +220,7 @@ async fn daemon_advertised_endpoints_from_ips_async(
     allow_public_ip_discovery: bool,
 ) -> Vec<ClusterEndpointRecord> {
     let advertise_host = std::env::var(SINOMO_DAEMON_ADVERTISE_HOST_ENV).ok();
-    sinomo_network::daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host_async(
+    sinomo_core::network::daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host_async(
         node_id,
         daemon_connect_address(&options.host, options.port),
         &options.host,
@@ -510,19 +512,19 @@ pub fn invite_introducers_from_daemon_status(
 ) -> Vec<sinomo_core::ClusterEndpointRecord> {
     if matches!(status.host.as_str(), "0.0.0.0" | "::") {
         let mut endpoints = Vec::new();
-        for ip in sinomo_network::discover_default_lan_ip_candidates() {
-            endpoints.push(sinomo_network::invite_introducer_endpoint(
+        for ip in sinomo_core::network::discover_default_lan_ip_candidates() {
+            endpoints.push(sinomo_core::cluster::invite_introducer_endpoint(
                 node_id,
-                sinomo_network::format_ip_port(ip, status.port),
+                sinomo_core::network::format_ip_port(ip, status.port),
             ));
         }
-        endpoints.push(sinomo_network::invite_introducer_endpoint(
+        endpoints.push(sinomo_core::cluster::invite_introducer_endpoint(
             node_id,
             status.address.clone(),
         ));
         endpoints
     } else {
-        vec![sinomo_network::invite_introducer_endpoint(
+        vec![sinomo_core::cluster::invite_introducer_endpoint(
             node_id,
             status.address.clone(),
         )]
@@ -584,7 +586,7 @@ impl DaemonLock {
                 path: paths.lock.display().to_string(),
                 detail: source.to_string(),
             })?;
-        let status_bytes = sinomo_network::SinomoObjectCodec::default().encode(&status)?;
+        let status_bytes = sinomo_core::network::SinomoObjectCodec::default().encode(&status)?;
         (&file)
             .write_all(&status_bytes)
             .map_err(|source| DaemonError::Io {
@@ -749,7 +751,7 @@ pub(crate) async fn probe_daemon_status_with_timeouts_async(
 }
 
 pub fn probe_daemon_status_at_address(address: &str, timeout: Duration) -> Option<DaemonStatus> {
-    let request = sinomo_network::ObjectRpcRequest::encode_body(
+    let request = sinomo_core::network::ObjectRpcRequest::encode_body(
         crate::DAEMON_STATUS_ROUTE,
         crate::DAEMON_RPC_CATEGORY,
         &(),
@@ -766,7 +768,7 @@ pub(crate) fn probe_daemon_status_at_address_on_runtime(
     timeout: Duration,
     runtime: &tokio::runtime::Handle,
 ) -> Option<DaemonStatus> {
-    let request = sinomo_network::ObjectRpcRequest::encode_body(
+    let request = sinomo_core::network::ObjectRpcRequest::encode_body(
         crate::DAEMON_STATUS_ROUTE,
         crate::DAEMON_RPC_CATEGORY,
         &(),
@@ -783,7 +785,7 @@ pub(crate) async fn probe_daemon_status_at_address_with_timeouts_async(
     timeouts: DaemonRpcTimeouts,
     runtime: &tokio::runtime::Handle,
 ) -> Option<DaemonStatus> {
-    let request = sinomo_network::ObjectRpcRequest::encode_body(
+    let request = sinomo_core::network::ObjectRpcRequest::encode_body(
         crate::DAEMON_STATUS_ROUTE,
         crate::DAEMON_RPC_CATEGORY,
         &(),
@@ -845,13 +847,13 @@ pub fn read_daemon_status(paths: &DaemonPaths) -> Result<DaemonStatus, DaemonErr
         path: paths.status.display().to_string(),
         detail: source.to_string(),
     })?;
-    sinomo_network::SinomoObjectCodec::default()
+    sinomo_core::network::SinomoObjectCodec::default()
         .decode(&bytes)
         .map_err(DaemonError::from)
 }
 
 pub fn write_daemon_status(paths: &DaemonPaths, status: &DaemonStatus) -> Result<(), DaemonError> {
-    let status_bytes = sinomo_network::SinomoObjectCodec::default().encode(status)?;
+    let status_bytes = sinomo_core::network::SinomoObjectCodec::default().encode(status)?;
     fs::write(&paths.status, status_bytes).map_err(|source| DaemonError::Io {
         path: paths.status.display().to_string(),
         detail: source.to_string(),
@@ -861,11 +863,11 @@ pub fn write_daemon_status(paths: &DaemonPaths, status: &DaemonStatus) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_core::node::shadow_daemon_node_id;
     use sinomo_core::{
         ClusterEndpointPrivacy, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState,
         ClusterTransportKind,
     };
-    use sinomo_node::shadow_daemon_node_id;
 
     fn cluster_status(cluster_id: ClusterId, node_id: NodeId) -> DaemonClusterStatus {
         DaemonClusterStatus {
@@ -933,7 +935,7 @@ mod tests {
     #[test]
     fn advertised_host_adds_stable_hostname_endpoint_for_wildcard_bind() {
         let node_id = NodeId::from_legacy_named("node_advertise_hostname").expect("node");
-        let endpoints = sinomo_network::daemon_advertised_endpoints_from_static_addresses(
+        let endpoints = sinomo_core::network::daemon_advertised_endpoints_from_static_addresses(
             &node_id,
             "127.0.0.1:21353".to_string(),
             "0.0.0.0",
@@ -979,7 +981,7 @@ mod tests {
             now,
         );
         let endpoint =
-            sinomo_network::daemon_lan_endpoint(&remote, "172.23.0.2:21353".to_string(), 5);
+            sinomo_core::network::daemon_lan_endpoint(&remote, "172.23.0.2:21353".to_string(), 5);
         member.endpoints = vec![endpoint.clone()];
         state.members.push(member);
 
@@ -1015,7 +1017,7 @@ mod tests {
             now,
         );
         let endpoint =
-            sinomo_network::daemon_lan_endpoint(&remote, "172.23.0.3:21353".to_string(), 5);
+            sinomo_core::network::daemon_lan_endpoint(&remote, "172.23.0.3:21353".to_string(), 5);
         member.endpoints = vec![endpoint.clone()];
         state.members.push(member);
 

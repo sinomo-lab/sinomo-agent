@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
-use sinomo_local::SinomoDataDir;
-use sinomo_network::ClusterPaths;
-use sinomo_node::NodeId;
+#[allow(unused_imports)]
+use sinomo_core::cluster::ClusterKvPathsExt;
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::ClusterPaths;
+use sinomo_core::node::NodeId;
 use std::collections::BTreeSet;
 use time::OffsetDateTime;
 
@@ -121,10 +123,10 @@ pub(crate) fn run_cluster_dfs_smoke_with_message_sender(
         return Ok(None);
     }
 
-    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(DfsError::from_network)?;
     let local_node_id = state.local_node_id.clone();
-    let content_advertisements = sinomo_kv::read_cluster_kv_prefix_entries(
+    let content_advertisements = sinomo_core::kv::read_cluster_kv_prefix_entries(
         &cluster_paths.kv_paths(),
         content_services_prefix(),
     )

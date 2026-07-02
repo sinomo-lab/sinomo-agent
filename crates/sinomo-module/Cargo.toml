@@ -25,12 +25,7 @@ zip = { version = "7.2", default-features = false, features = ["deflate-flate2-z
 sinomo-cli-registry = { path = "../sinomo-cli-registry" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-core = { path = "../sinomo-core" }
-sinomo-events = { path = "../sinomo-events" }
-sinomo-local = { path = "../sinomo-local" }
 sinomo-module-api = { path = "../sinomo-module-api" }
-sinomo-node = { path = "../sinomo-node" }
-sinomo-object = { path = "../sinomo-object", features = ["serde"] }
-sinomo-storage = { path = "../sinomo-storage" }
 
 [dev-dependencies]
 sinomo-testdir = { path = "../sinomo-testdir" }

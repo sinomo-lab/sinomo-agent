@@ -6,7 +6,7 @@
 //! boundary.
 
 use sinomo_core::DfsObjectPolicy;
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::*;
 

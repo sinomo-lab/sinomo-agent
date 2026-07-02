@@ -11,7 +11,7 @@ use std::io::Read;
 use std::time::Instant;
 
 use sinomo_core::DfsObjectPolicy;
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::transfer::{
     DFS_BLOB_CHUNK_BYTES, DFS_READ_CHUNK_WINDOW_SIZE, PendingNetworkedRead, chunk_prefix_bytes,

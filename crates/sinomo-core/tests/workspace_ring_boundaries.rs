@@ -2,6 +2,19 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Stage F of docs/plans/r0-r1-crate-boundary-refactor.md flips this to `true`,
+/// at which point R1 crates must reach R0 exclusively through the `sinomo-core`
+/// facade instead of depending on R0 crates directly.
+const FACADE_MIGRATION_COMPLETE: bool = true;
+
+/// Stable dylib ABI crates may depend directly on `sinomo-object` so native
+/// modules do not have to link the whole R0 graph for the wire codec.
+const ABI_OBJECT_EXEMPT: &[&str] = &[
+    "sinomo-module-api",
+    "sinomo-sandbox-wasix-api",
+    "sinomo-dfs-cloud-files-api",
+];
+
 #[derive(Clone, Debug)]
 struct PackageManifest {
     name: String,
@@ -10,31 +23,104 @@ struct PackageManifest {
     manifest_path: PathBuf,
 }
 
+fn ring_is_known(ring: &str) -> bool {
+    matches!(
+        ring,
+        "r0" | "r0-boundary" | "r1" | "r1-boundary" | "r2" | "application"
+    )
+}
+
+fn is_native_module_package(package: &PackageManifest) -> bool {
+    package
+        .manifest_path
+        .components()
+        .any(|component| component.as_os_str() == "modules")
+}
+
 #[test]
-fn every_workspace_crate_declares_a_trust_ring() {
+fn every_workspace_crate_declares_a_known_trust_ring() {
     let packages = read_workspace_packages();
 
     assert!(
+        packages.contains_key("sinomo-core"),
+        "workspace should expose the explicit sinomo-core R0 boundary crate"
+    );
+    assert!(
         packages.contains_key("sinomo-runtime"),
-        "workspace should expose an explicit sinomo-runtime R0/R1 boundary crate"
+        "workspace should expose the explicit sinomo-runtime R1 boundary crate"
     );
 
     for package in packages.values() {
         assert!(
-            !package.ring.is_empty(),
-            "{} must declare [package.metadata.sinomo] ring = \"...\" in {}",
+            ring_is_known(&package.ring),
+            "{} must declare [package.metadata.sinomo] ring = \"r0\" | \"r0-boundary\" | \"r1\" | \"r1-boundary\" | \"r2\" | \"application\" in {} (found {:?})",
             package.name,
-            package.manifest_path.display()
+            package.manifest_path.display(),
+            package.ring
         );
     }
 }
 
 #[test]
-fn r0_r1_crates_do_not_depend_on_r2_or_application_crates() {
+fn r0_crates_depend_only_on_r0_crates() {
     let packages = read_workspace_packages();
 
     for package in packages.values() {
-        if !matches!(package.ring.as_str(), "r0" | "r1" | "r0-r1-boundary") {
+        if package.ring != "r0" {
+            continue;
+        }
+        for dependency in &package.dependencies {
+            let Some(dependency_manifest) = packages.get(dependency) else {
+                continue;
+            };
+            assert_eq!(
+                dependency_manifest.ring, "r0",
+                "{} (r0) must not depend on {} ({}); the R0 cluster foundation only builds on itself",
+                package.name, dependency_manifest.name, dependency_manifest.ring
+            );
+        }
+    }
+}
+
+#[test]
+fn sinomo_core_is_the_only_r0_boundary_and_aggregates_only_r0() {
+    let packages = read_workspace_packages();
+
+    for package in packages.values() {
+        if package.ring == "r0-boundary" {
+            assert_eq!(
+                package.name, "sinomo-core",
+                "sinomo-core is the only crate allowed to declare ring = \"r0-boundary\""
+            );
+        }
+    }
+
+    let core = packages
+        .get("sinomo-core")
+        .expect("sinomo-core package should exist");
+    assert_eq!(core.ring, "r0-boundary");
+    assert!(
+        !core.dependencies.is_empty(),
+        "sinomo-core should explicitly aggregate the R0 crates"
+    );
+    for dependency in &core.dependencies {
+        let dependency_manifest = packages.get(dependency).unwrap_or_else(|| {
+            panic!("sinomo-core depends on unknown workspace crate {dependency}")
+        });
+        assert_eq!(
+            dependency_manifest.ring, "r0",
+            "sinomo-core must only depend on R0 crates, but depends on {} ({})",
+            dependency_manifest.name, dependency_manifest.ring
+        );
+    }
+}
+
+#[test]
+fn r1_crates_cross_the_r0_boundary_through_sinomo_core() {
+    let packages = read_workspace_packages();
+
+    for package in packages.values() {
+        if package.ring != "r1" {
             continue;
         }
 
@@ -42,23 +128,79 @@ fn r0_r1_crates_do_not_depend_on_r2_or_application_crates() {
             let Some(dependency_manifest) = packages.get(dependency) else {
                 continue;
             };
-            assert!(
-                matches!(
-                    dependency_manifest.ring.as_str(),
-                    "r0" | "r1" | "r0-r1-boundary"
+            let dependency_ring = dependency_manifest.ring.as_str();
+
+            match dependency_ring {
+                "r1" | "r0-boundary" => {}
+                "r0" => {
+                    if dependency == "sinomo-object"
+                        && ABI_OBJECT_EXEMPT.contains(&package.name.as_str())
+                    {
+                        continue;
+                    }
+                    assert!(
+                        !FACADE_MIGRATION_COMPLETE,
+                        "{} (r1) must depend on sinomo-core instead of directly on {} (r0)",
+                        package.name, dependency_manifest.name
+                    );
+                }
+                "r1-boundary" => {
+                    // Native-dylib module packages under modules/ are leaf
+                    // plugin artifacts, not part of the runtime aggregation;
+                    // they may build against the runtime facade.
+                    assert!(
+                        is_native_module_package(package),
+                        "{} (r1) must not depend on {} ({}); only native module packages under modules/ may build against the runtime facade",
+                        package.name,
+                        dependency_manifest.name,
+                        dependency_ring
+                    );
+                }
+                _ => panic!(
+                    "{} (r1) must not depend on {} ({})",
+                    package.name, dependency_manifest.name, dependency_ring
                 ),
-                "{} ({}) must not depend on {} ({})",
-                package.name,
-                package.ring,
-                dependency_manifest.name,
-                dependency_manifest.ring
-            );
+            }
         }
     }
 }
 
 #[test]
-fn r2_and_application_crates_cross_runtime_boundary_through_runtime_crate() {
+fn sinomo_runtime_is_the_only_r1_boundary_and_aggregates_core_plus_r1() {
+    let packages = read_workspace_packages();
+
+    for package in packages.values() {
+        if package.ring == "r1-boundary" {
+            assert_eq!(
+                package.name, "sinomo-runtime",
+                "sinomo-runtime is the only crate allowed to declare ring = \"r1-boundary\""
+            );
+        }
+    }
+
+    let runtime = packages
+        .get("sinomo-runtime")
+        .expect("sinomo-runtime package should exist");
+    assert_eq!(runtime.ring, "r1-boundary");
+    assert!(
+        !runtime.dependencies.is_empty(),
+        "sinomo-runtime should explicitly aggregate sinomo-core and the R1 crates"
+    );
+    for dependency in &runtime.dependencies {
+        let dependency_manifest = packages.get(dependency).unwrap_or_else(|| {
+            panic!("sinomo-runtime depends on unknown workspace crate {dependency}")
+        });
+        assert!(
+            matches!(dependency_manifest.ring.as_str(), "r0-boundary" | "r1"),
+            "sinomo-runtime must only depend on sinomo-core and R1 crates, but depends on {} ({})",
+            dependency_manifest.name,
+            dependency_manifest.ring
+        );
+    }
+}
+
+#[test]
+fn r2_and_application_crates_cross_the_boundary_through_sinomo_runtime() {
     let packages = read_workspace_packages();
 
     for package in packages.values() {
@@ -71,7 +213,10 @@ fn r2_and_application_crates_cross_runtime_boundary_through_runtime_crate() {
                 continue;
             };
             assert!(
-                !matches!(dependency_manifest.ring.as_str(), "r0" | "r1"),
+                !matches!(
+                    dependency_manifest.ring.as_str(),
+                    "r0" | "r0-boundary" | "r1"
+                ),
                 "{} ({}) must depend on sinomo-runtime instead of directly depending on {} ({})",
                 package.name,
                 package.ring,
@@ -83,27 +228,31 @@ fn r2_and_application_crates_cross_runtime_boundary_through_runtime_crate() {
 }
 
 #[test]
-fn runtime_boundary_crate_exports_only_r0_r1_dependencies() {
+fn network_and_kv_stay_decoupled_through_the_cluster_crate() {
+    // Optional dependencies are exempt only when every feature enabling them
+    // is the dev-only `test-support` feature (or they are explicitly
+    // allowlisted); see `optional_dependency_is_ring_exempt`.
     let packages = read_workspace_packages();
-    let runtime = packages
-        .get("sinomo-runtime")
-        .expect("sinomo-runtime package should exist");
 
-    assert_eq!(runtime.ring, "r0-r1-boundary");
-    assert!(
-        !runtime.dependencies.is_empty(),
-        "sinomo-runtime should explicitly aggregate the R0/R1 crates"
-    );
-
-    for dependency in &runtime.dependencies {
-        let dependency_manifest = packages.get(dependency).unwrap_or_else(|| {
-            panic!("sinomo-runtime depends on unknown workspace crate {dependency}")
-        });
+    let network = packages
+        .get("sinomo-network")
+        .expect("sinomo-network package should exist");
+    for forbidden in ["sinomo-kv", "sinomo-cluster"] {
         assert!(
-            matches!(dependency_manifest.ring.as_str(), "r0" | "r1"),
-            "sinomo-runtime must only depend on R0/R1 crates, but depends on {} ({})",
-            dependency_manifest.name,
-            dependency_manifest.ring
+            !network.dependencies.contains(&forbidden.to_string()),
+            "sinomo-network must stay a pure networking library and not depend on {forbidden}; \
+             cluster state reaches routing through the ClusterDirectory provider seam"
+        );
+    }
+
+    let kv = packages
+        .get("sinomo-kv")
+        .expect("sinomo-kv package should exist");
+    for forbidden in ["sinomo-network", "sinomo-cluster"] {
+        assert!(
+            !kv.dependencies.contains(&forbidden.to_string()),
+            "sinomo-kv must stay transport-free and not depend on {forbidden}; \
+             sinomo-cluster is the only bridge between KV and the network layer"
         );
     }
 }
@@ -115,6 +264,10 @@ fn native_dylib_modules_are_not_default_workspace_build_members() {
     assert!(
         !default_members.is_empty(),
         "workspace should declare default-members so heavy native modules stay opt-in"
+    );
+    assert!(
+        default_members.contains(&"crates/sinomo-base".to_string()),
+        "the base contracts crate should remain in default builds"
     );
     assert!(
         default_members.contains(&"crates/sinomo-sandbox-wasix-api".to_string()),
@@ -183,7 +336,7 @@ fn read_workspace_packages() -> BTreeMap<String, PackageManifest> {
         let name = parse_package_name(&manifest_text)
             .unwrap_or_else(|| panic!("missing package name in {}", manifest_path.display()));
         let ring = parse_sinomo_ring(&manifest_text).unwrap_or_default();
-        let dependencies = parse_workspace_dependencies(&manifest_text);
+        let dependencies = parse_workspace_dependencies(&manifest_text, &name);
         packages.insert(
             name.clone(),
             PackageManifest {
@@ -294,7 +447,18 @@ fn parse_sinomo_ring(manifest_text: &str) -> Option<String> {
     None
 }
 
-fn parse_workspace_dependencies(manifest_text: &str) -> Vec<String> {
+/// Production feature-gated cross-ring dependencies that predate the R0/R1
+/// facade sweep and are knowingly outside the ring rules (feature-off in
+/// default builds). Additions require an architecture review; prefer routing
+/// new surfaces through sinomo-core/sinomo-runtime instead.
+const OPTIONAL_PRODUCTION_DEPENDENCY_ALLOWLIST: &[(&str, &str)] = &[
+    ("sinomo-cli", "sinomo-dfs-fuse"),
+    ("sinomo-cli", "sinomo-models"),
+    ("sinomo-daemon", "sinomo-sandbox-wasix-host"),
+    ("sinomo-runtime", "sinomo-sandbox-wasix-host"),
+];
+
+fn parse_workspace_dependencies(manifest_text: &str, package_name: &str) -> Vec<String> {
     let mut in_dependencies = false;
     let mut dependencies = Vec::new();
 
@@ -314,14 +478,78 @@ fn parse_workspace_dependencies(manifest_text: &str) -> Vec<String> {
             continue;
         };
         let name = name.trim();
-        if name.starts_with("sinomo-") && rest.contains("path") {
-            dependencies.push(name.to_string());
+        if !(name.starts_with("sinomo-") && rest.contains("path")) {
+            continue;
         }
+        if rest.contains("optional = true")
+            && optional_dependency_is_ring_exempt(manifest_text, package_name, name)
+        {
+            continue;
+        }
+        dependencies.push(name.to_string());
     }
 
     dependencies.sort();
     dependencies.dedup();
     dependencies
+}
+
+/// An optional dependency escapes the ring rules only when every feature that
+/// activates it is the dev-only `test-support` feature (never enabled by a
+/// production build), or when it is explicitly allowlisted above. Any other
+/// optional dependency is checked like a plain one: a production feature must
+/// not be a ring bypass.
+fn optional_dependency_is_ring_exempt(
+    manifest_text: &str,
+    package_name: &str,
+    dependency_name: &str,
+) -> bool {
+    if OPTIONAL_PRODUCTION_DEPENDENCY_ALLOWLIST.contains(&(package_name, dependency_name)) {
+        return true;
+    }
+    let enabling = features_enabling_dependency(manifest_text, dependency_name);
+    !enabling.is_empty()
+        && enabling
+            .iter()
+            .all(|feature| feature == "test-support" || feature == "cluster-test-support")
+}
+
+/// Names of `[features]` entries whose activation list references
+/// `dependency_name` (as `dep:<name>`, `<name>/feature`, or bare `<name>`).
+fn features_enabling_dependency(manifest_text: &str, dependency_name: &str) -> Vec<String> {
+    let mut in_features = false;
+    let mut features = Vec::new();
+    for line in manifest_text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[features]" {
+            in_features = true;
+            continue;
+        }
+        if in_features && trimmed.starts_with('[') {
+            break;
+        }
+        if !in_features || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((feature_name, activation)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let activates_dependency =
+            activation
+                .split(['[', ']', ',', '"'])
+                .map(str::trim)
+                .any(|entry| {
+                    entry == format!("dep:{dependency_name}")
+                        || entry == dependency_name
+                        || entry
+                            .strip_prefix(dependency_name)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                });
+        if activates_dependency {
+            features.push(feature_name.trim().to_string());
+        }
+    }
+    features
 }
 
 fn parse_string_value(line: &str, key: &str) -> Option<String> {

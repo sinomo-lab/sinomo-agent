@@ -23,15 +23,7 @@ tokio = { workspace = true, features = ["rt", "time"] }
 tracing.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 sinomo-config = { path = "../sinomo-config" }
-sinomo-events = { path = "../sinomo-events" }
-sinomo-kv = { path = "../sinomo-kv" }
-sinomo-local = { path = "../sinomo-local" }
 sinomo-module = { path = "../sinomo-module" }
-sinomo-network = { path = "../sinomo-network" }
-sinomo-node = { path = "../sinomo-node" }
-sinomo-object = { path = "../sinomo-object", features = ["serde"] }
-sinomo-service = { path = "../sinomo-service" }
-sinomo-storage = { path = "../sinomo-storage" }
 
 [dev-dependencies]
 sinomo-testdir = { path = "../sinomo-testdir" }

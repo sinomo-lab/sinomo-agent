@@ -10,12 +10,12 @@ use crate::{
     sifs_file_system_id,
 };
 use serde::{Deserialize, Serialize};
+use sinomo_core::events::EventId;
+use sinomo_core::node::NodeId;
 use sinomo_core::{
     Confidence, DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest, EventEnvelope, EventKind,
     LatencyClass, PrivacyClass, RoutingMetadata, RoutingScope, Salience, Source,
 };
-use sinomo_events::EventId;
-use sinomo_node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 

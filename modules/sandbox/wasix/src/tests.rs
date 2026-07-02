@@ -1,9 +1,9 @@
 use super::*;
 use crate::internal::*;
+use sinomo_core::network::InProcessNetwork;
 use sinomo_dfs::{
     DfsMetadataShardId, LocalContentStore, LocalSobjMetadataBackend, NetworkedDfsService,
 };
-use sinomo_network::InProcessNetwork;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -116,7 +116,7 @@ fn sandbox_manifest_uses_services_sandbox_root_and_default_tmp_policy() {
 
 #[test]
 fn sandbox_storage_paths_are_registered_by_sandbox_crate() {
-    let mut layout = sinomo_storage::StorageLayout::new();
+    let mut layout = sinomo_core::storage::StorageLayout::new();
     register_storage_paths(&mut layout).expect("register");
 
     for path in [
@@ -127,8 +127,8 @@ fn sandbox_storage_paths_are_registered_by_sandbox_crate() {
     ] {
         let owner = layout.owner_for(path).expect("owner");
         let module = match owner {
-            sinomo_storage::StoragePathOwner::File(file) => file.module.as_str(),
-            sinomo_storage::StoragePathOwner::Escape(escape) => escape.module.as_str(),
+            sinomo_core::storage::StoragePathOwner::File(file) => file.module.as_str(),
+            sinomo_core::storage::StoragePathOwner::Escape(escape) => escape.module.as_str(),
         };
         assert_eq!(module, SANDBOX_STORAGE_MODULE);
     }
@@ -143,8 +143,9 @@ fn sandbox_create_response_encodes_for_daemon_rpc() {
     )
     .expect("manifest");
     let response = SandboxCreateInstanceResponse { manifest };
-    let encoded = sinomo_network::ObjectRpcResponse::encode_body(SANDBOX_CREATE_ROUTE, &response)
-        .expect("encode response");
+    let encoded =
+        sinomo_core::network::ObjectRpcResponse::encode_body(SANDBOX_CREATE_ROUTE, &response)
+            .expect("encode response");
     let decoded: SandboxCreateInstanceResponse = encoded.decode_body().expect("decode response");
     assert_eq!(decoded.manifest.sandbox_id, response.manifest.sandbox_id);
 }

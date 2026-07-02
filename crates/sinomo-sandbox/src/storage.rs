@@ -1,5 +1,5 @@
 use crate::SANDBOX_STORAGE_MODULE;
-use sinomo_storage::{StorageContractError, StorageLayout, StorageRing};
+use sinomo_core::storage::{StorageContractError, StorageLayout, StorageRing};
 
 pub fn register_storage_paths(layout: &mut StorageLayout) -> Result<(), StorageContractError> {
     for (relative_path, reason) in [
@@ -35,9 +35,9 @@ pub fn register_storage_paths(layout: &mut StorageLayout) -> Result<(), StorageC
         SANDBOX_STORAGE_MODULE,
         StorageRing::R1,
         "sandbox/module-wasm-artifacts.sobj",
-        sinomo_storage::ObjectSchema::new(
+        sinomo_core::storage::ObjectSchema::new(
             "SandboxWasmModuleArtifactRegistry",
-            sinomo_storage::STORAGE_CONTRACT_OBJECT_VERSION,
+            sinomo_core::storage::STORAGE_CONTRACT_OBJECT_VERSION,
         )
         .field("artifacts", "Vec<SandboxWasmModuleArtifact>"),
     )?;

@@ -925,7 +925,7 @@ fn local_owned_mount_nodes(mounts: &[SandboxMount]) -> Result<Vec<NodeId>, Sandb
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_kv::{KvOp, KvRevision, KvVersion};
+    use sinomo_core::kv::{KvOp, KvRevision, KvVersion};
 
     fn kv_entry_from_put(op: KvOp) -> KvEntry {
         let KvOp::Put { key, value, .. } = op else {

@@ -1,0 +1,47 @@
+[package]
+name = "sinomo-cluster"
+version.workspace = true
+description = "Cluster control plane: membership, invites, joins, KV/Raft replication drivers, cluster state publishing"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r0"
+
+[features]
+# Exposes crate internals for sibling-crate integration tests.
+test-support = []
+
+[dependencies]
+arc-swap.workspace = true
+base64.workspace = true
+blake3.workspace = true
+fs2.workspace = true
+metrics.workspace = true
+ring = "0.17"
+serde.workspace = true
+serde_bytes.workspace = true
+serde_json.workspace = true
+sinomo-base = { path = "../sinomo-base" }
+sinomo-events = { path = "../sinomo-events" }
+sinomo-kv = { path = "../sinomo-kv" }
+sinomo-local = { path = "../sinomo-local" }
+sinomo-network = { path = "../sinomo-network" }
+sinomo-node = { path = "../sinomo-node" }
+sinomo-object = { path = "../sinomo-object", features = ["serde"] }
+sinomo-storage = { path = "../sinomo-storage" }
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+sinomo-cluster = { path = ".", features = ["test-support"] }
+sinomo-network = { path = "../sinomo-network", features = ["test-support"] }
+sinomo-kv = { path = "../sinomo-kv", features = ["test-support"] }
+sinomo-testdir = { path = "../sinomo-testdir" }
+tower-layer = "0.3"
+tower-service = "0.3"

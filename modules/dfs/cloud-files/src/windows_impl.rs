@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use sinomo_runtime::cluster::ClusterKvPathsExt;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, c_void};
 use std::fs;
@@ -1069,6 +1071,11 @@ struct OpenedSifsService {
 fn open_sifs_service(
     data_dir_root: Option<PathBuf>,
 ) -> Result<OpenedSifsService, CloudFilesModuleError> {
+    // This cdylib links its own copy of sinomo-network, so the host's cluster
+    // directory install never reaches this image; without an in-module install
+    // every directory read (endpoint selection, route hydration) comes back
+    // empty.
+    sinomo_runtime::cluster::install_kv_cluster_directory();
     let data_dir = match data_dir_root {
         Some(path) => SinomoDataDir::new(path),
         None => SinomoDataDir::from_env_or_home().map_err(error("local-data"))?,
@@ -1076,7 +1083,7 @@ fn open_sifs_service(
     data_dir.ensure_root_layout().map_err(error("local-data"))?;
     let cluster_paths = network::ClusterPaths::new(&data_dir);
     let cluster_state = if cluster_paths.state.exists() {
-        network::read_cluster_state_without_kv(&cluster_paths).ok()
+        sinomo_runtime::cluster::read_cluster_state_without_kv(&cluster_paths).ok()
     } else {
         None
     };
@@ -1097,7 +1104,7 @@ fn open_sifs_service(
         DfsCloudFilesEndpointTransport::new(local_node_id, endpoints),
         content,
     );
-    if cluster_paths.kv_snapshot.exists() {
+    if cluster_paths.kv_paths().snapshot.exists() {
         service = service.with_control_plane(DfsCloudFilesControlPlaneKvClient {
             cluster_paths: cluster_paths.clone(),
         });
@@ -1148,7 +1155,7 @@ struct DfsCloudFilesControlPlaneKvClient {
 impl DfsCloudFilesControlPlaneKvClient {
     fn daemon_error(&self, source: impl std::fmt::Display) -> KvError {
         KvError::Io {
-            path: self.cluster_paths.kv_snapshot.display().to_string(),
+            path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
             detail: source.to_string(),
         }
     }
@@ -1177,7 +1184,7 @@ impl DfsControlPlaneKvClient for DfsCloudFilesControlPlaneKvClient {
     }
 
     fn txn(&mut self, txn: KvTxn) -> std::result::Result<KvTxnResponse, KvError> {
-        let mut state = network::read_cluster_state(&self.cluster_paths)
+        let mut state = sinomo_runtime::cluster::read_cluster_state(&self.cluster_paths)
             .map_err(|source| self.daemon_error(source))?;
         let snapshot =
             daemon::commit_cluster_kv_txn_with_quorum(&self.cluster_paths, &mut state, txn)

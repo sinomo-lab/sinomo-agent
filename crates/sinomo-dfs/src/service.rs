@@ -13,6 +13,8 @@
 //! data-plane routes bind to a [`DfsDataPlaneHost`], so `sinomo-dfs` still owns
 //! the route contract while an embedding process supplies cluster transport.
 
+#[allow(unused_imports)]
+use sinomo_core::cluster::ClusterKvPathsExt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -33,12 +35,11 @@ use crate::{
     read_dfs_repair_attempt_snapshot, resolve_dfs_conflicts, sifs_file_system_id,
     use_dfs_conflict_version,
 };
-use sinomo_local::SinomoDataDir;
-use sinomo_network::{
-    ClusterPaths, ObjectRpcRequest, ObjectRpcResponse, read_cluster_state_without_kv,
-};
+use sinomo_core::cluster::read_cluster_state_without_kv;
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::{ClusterPaths, ObjectRpcRequest, ObjectRpcResponse};
 
-use sinomo_service::{
+use sinomo_core::service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
     ServiceRegistryBuilder, ServiceRoute,
 };
@@ -263,7 +264,7 @@ fn open_metadata_backend(
     let cluster_paths = ClusterPaths::new(data_dir);
     if cluster_paths.state.exists() {
         let file_system_id = sifs_file_system_id();
-        let mut shards = sinomo_kv::read_cluster_kv_prefix_entries(
+        let mut shards = sinomo_core::kv::read_cluster_kv_prefix_entries(
             &cluster_paths.kv_paths(),
             &format!("{}/", metadata_shards_prefix(&file_system_id)),
         )?
@@ -487,7 +488,7 @@ mod tests {
         DfsMetadataSnapshotInstallResult, DfsObjectId, DfsSmokeAttempt, DfsVersion,
         LocalSobjMetadataBackend, sifs_file_system_id,
     };
-    use sinomo_service::{ResponseSink, ServiceRegistry, ServiceSigner};
+    use sinomo_core::service::{ResponseSink, ServiceRegistry, ServiceSigner};
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
@@ -512,9 +513,10 @@ mod tests {
         fn run_smoke<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsSmokeReport> {
             Box::pin(async move {
                 *self.smoke_calls.lock().expect("smoke calls") += 1;
-                let local =
-                    sinomo_node::NodeId::from_legacy_named("node_dfs_service_data_plane_local")
-                        .expect("local node");
+                let local = sinomo_core::node::NodeId::from_legacy_named(
+                    "node_dfs_service_data_plane_local",
+                )
+                .expect("local node");
                 Ok(DfsSmokeReport {
                     path: "/services/dfs-smoke/service-route.txt".to_string(),
                     file_system_id: sifs_file_system_id(),
@@ -699,7 +701,7 @@ mod tests {
         .export_table_snapshot();
         let command = DfsMetadataSnapshotInstallCommand {
             request_id: "req-snapshot-1".to_string(),
-            source_node_id: sinomo_node::NodeId::from_legacy_named("node_snapshot_source")
+            source_node_id: sinomo_core::node::NodeId::from_legacy_named("node_snapshot_source")
                 .expect("source node"),
             shard_id: DfsMetadataShardId::new("shard-snapshot-local"),
             next_after_sequence: 7,
@@ -764,7 +766,7 @@ mod tests {
         assert_eq!(*host.smoke_calls.lock().expect("smoke calls"), 1);
 
         let local =
-            sinomo_node::NodeId::from_legacy_named("node_dfs_service_data_plane_frame_local")
+            sinomo_core::node::NodeId::from_legacy_named("node_dfs_service_data_plane_frame_local")
                 .expect("local node");
         let typed_command = DfsMessageCommand {
             request_id: "message-route-1".to_string(),

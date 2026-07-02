@@ -6,8 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::DfsWriteReceipt;
-use sinomo_events::EventId;
-use sinomo_node::NodeId;
+use sinomo_core::events::EventId;
+use sinomo_core::node::NodeId;
 use std::time::Duration;
 use time::OffsetDateTime;
 

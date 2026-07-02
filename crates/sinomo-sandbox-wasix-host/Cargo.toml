@@ -12,11 +12,10 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "r1"
 
 [dependencies]
+sinomo-core = { path = "../sinomo-core" }
 sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-module-api = { path = "../sinomo-module-api" }
-sinomo-network = { path = "../sinomo-network" }
-sinomo-node = { path = "../sinomo-node" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }
 sinomo-sandbox-wasix-api = { path = "../sinomo-sandbox-wasix-api" }
 thiserror.workspace = true

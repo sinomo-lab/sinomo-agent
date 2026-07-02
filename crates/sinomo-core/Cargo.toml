@@ -1,7 +1,7 @@
 [package]
 name = "sinomo-core"
 version.workspace = true
-description = "Shared Sinomo contracts, IDs, events, and domain types"
+description = "R0 boundary facade: the minimal set of crates that defines the cluster"
 authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
@@ -9,12 +9,24 @@ license.workspace = true
 include = ["**/*.rs", "Cargo.toml"]
 
 [package.metadata.sinomo]
-ring = "r0"
+ring = "r0-boundary"
+
+[features]
+# Forwards the cluster test-support surface to sibling-crate tests.
+cluster-test-support = ["sinomo-cluster/test-support"]
 
 [dependencies]
-serde.workspace = true
-serde_bytes.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-time.workspace = true
-ulid.workspace = true
+sinomo-base = { path = "../sinomo-base" }
+sinomo-cluster = { path = "../sinomo-cluster" }
+sinomo-events = { path = "../sinomo-events" }
+sinomo-kv = { path = "../sinomo-kv" }
+sinomo-local = { path = "../sinomo-local" }
+# TODO(stage-C-followup): drop the iroh-transport enablement together with the
+# feature itself. Stage C extracted the implementation to modules/network/iroh
+# and dispatch prefers a registered module, but the built-in path stays until
+# the daemon proxy loop and cli/cluster direct-dial tests migrate.
+sinomo-network = { path = "../sinomo-network", features = ["iroh-transport"] }
+sinomo-node = { path = "../sinomo-node" }
+sinomo-object = { path = "../sinomo-object", features = ["serde"] }
+sinomo-service = { path = "../sinomo-service" }
+sinomo-storage = { path = "../sinomo-storage" }

@@ -7,12 +7,14 @@
 //! `metadata_backend`.
 
 use serde::{Deserialize, Serialize};
+#[allow(unused_imports)]
+use sinomo_core::cluster::ClusterKvPathsExt;
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::{ClusterPaths, NetworkError};
+use sinomo_core::node::NodeId;
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterTransportKind,
 };
-use sinomo_local::SinomoDataDir;
-use sinomo_network::{ClusterPaths, NetworkError};
-use sinomo_node::NodeId;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
@@ -59,7 +61,7 @@ pub fn publish_cluster_dfs_metadata_journal(
         });
     }
 
-    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(DfsError::from_network)?;
     let file_system = distributed_sifs(state.local_node_id.clone());
     let shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
@@ -168,9 +170,9 @@ pub fn refresh_cluster_dfs_kv_snapshot_with_peer_transport(
     if !cluster_paths.state.exists() {
         return Ok(());
     }
-    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(DfsError::from_network)?;
-    if sinomo_kv::cluster_kv_raft_local_is_voter(&state) {
+    if sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
         return Ok(());
     }
     refresh_cluster_dfs_kv_snapshot_with_peer_transport_for_state(
@@ -187,9 +189,9 @@ pub(crate) fn refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_
     if !cluster_paths.state.exists() {
         return Ok(());
     }
-    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(DfsError::from_network)?;
-    if sinomo_kv::cluster_kv_raft_local_is_voter(&state) {
+    if sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
         return Ok(());
     }
     let file_system = distributed_sifs(state.local_node_id.clone());
@@ -212,11 +214,11 @@ fn refresh_cluster_dfs_kv_snapshot_with_peer_transport_for_state(
     state: &ClusterBootstrapState,
     peer_transport: &dyn DfsPeerTransport,
 ) -> Result<(), DfsError> {
-    let payload = sinomo_kv::cluster_kv_snapshot_rpc_payload()?;
+    let payload = sinomo_core::kv::cluster_kv_snapshot_rpc_payload()?;
     let request = object_rpc_request_from_kv_payload(payload);
-    let options = sinomo_network::ClusterControlPlaneTimeouts::default_daemon_transport()
+    let options = sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
         .kv_snapshot_refresh_options();
-    let _ = sinomo_network::refresh_current_cluster_kv_store_with_local_storage_and_transport(
+    let _ = sinomo_core::cluster::refresh_current_cluster_kv_store_with_local_storage_and_transport(
         cluster_paths,
         state,
         options,
@@ -232,7 +234,8 @@ fn refresh_cluster_dfs_kv_snapshot_with_peer_transport_for_state(
                     detail: source.to_string(),
                 })?;
             response.error_detail()?;
-            sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
+            sinomo_core::kv::decode_cluster_kv_snapshot_rpc_body(&response.body)
+                .map_err(sinomo_core::network::NetworkError::directory)
         },
     );
     Ok(())
@@ -1356,7 +1359,7 @@ fn prepare_cluster_dfs_metadata_journal_publish(
         return Ok(None);
     }
 
-    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DfsError::from_network)?;
     let file_system = distributed_sifs(state.local_node_id.clone());
     let shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
@@ -2007,10 +2010,10 @@ pub fn cluster_dfs_metadata_replica_shard_context(
     if !cluster_paths.state.exists() {
         return Ok(None);
     }
-    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(DfsError::from_network)?;
     let mut shard = None;
-    for entry in sinomo_kv::read_cluster_kv_prefix_entries(
+    for entry in sinomo_core::kv::read_cluster_kv_prefix_entries(
         &cluster_paths.kv_paths(),
         &format!("{}/", metadata_shards_prefix(&sifs_file_system_id())),
     )? {

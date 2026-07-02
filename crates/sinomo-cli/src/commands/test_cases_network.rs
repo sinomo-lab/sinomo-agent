@@ -4,6 +4,7 @@
 //! The Docker cluster gate uses them before DFS scenarios so routing, relay,
 //! authentication, and concurrent request handling must be healthy first.
 
+use sinomo_runtime::cluster;
 use sinomo_runtime::core::{ClusterBootstrapState, ClusterMemberRecord};
 use sinomo_runtime::daemon::sign_daemon_rpc_request_for_local_node;
 use sinomo_runtime::local::SinomoDataDir;
@@ -85,7 +86,7 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         ))
     })?;
     let cluster_state = Arc::new(
-        network::read_cluster_state(&cluster_paths)
+        cluster::read_cluster_state(&cluster_paths)
             .map_err(|error| SinomoTestError::failed(error.to_string()))?,
     );
     let targets = network_ping_targets_from_state(&cluster_state)?;
@@ -124,7 +125,7 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             for attempt in 0..requests_per_target {
                 for target_node_id in &targets {
                     let nonce = format!("ping-{phase}-{nonce_prefix}-{target_node_id}-{attempt}");
-                    let request = network::cluster_network_ping_rpc_request_with_response_payload(
+                    let request = cluster::cluster_network_ping_rpc_request_with_response_payload(
                         &nonce,
                         payload_bytes,
                         response_payload_bytes,
@@ -461,7 +462,7 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
         Ok(response) => response,
         Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
     };
-    let response = match network::decode_cluster_network_ping_rpc_response(&response) {
+    let response = match cluster::decode_cluster_network_ping_rpc_response(&response) {
         Ok(response) => response,
         Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
     };

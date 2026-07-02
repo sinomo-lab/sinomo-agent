@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use sinomo_node::NodeId;
+use sinomo_core::node::NodeId;
 
 use crate::transfer::{
     DFS_BLOB_CHUNK_BYTES, DFS_REPAIR_RETRY_SUPPRESSED_TICK, InProgressBlobTransfer,

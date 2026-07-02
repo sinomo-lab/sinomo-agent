@@ -1,5 +1,7 @@
 use super::*;
 use serde::Serialize;
+#[allow(unused_imports)]
+use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::test::{
     SinomoTestCaseMetadata, SinomoTestContext, SinomoTestRegistry, SinomoTestReport,
     SinomoTestStatus,
@@ -441,7 +443,7 @@ fn test_context(
     if model_config_uses_cluster(&data_dir) {
         let paths = ClusterPaths::new(&data_dir);
         let snapshot = model_config_cluster_snapshot(&paths)?;
-        context = context.with_cluster_snapshot(snapshot, paths.kv_snapshot);
+        context = context.with_cluster_snapshot(snapshot, paths.kv_paths().snapshot);
     } else if require_cluster {
         return Err(CliError::Parse {
             detail: "test requires cluster runtime, but this CLI invocation is in local mode"

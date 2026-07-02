@@ -6,8 +6,8 @@ use crate::{
     DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsNamespaceCommand,
     DfsNamespaceOperation, DfsNetworkMessage, DfsOperatorStatus, DfsRoutedMessage, DfsSmokeReport,
 };
-use sinomo_network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse};
-use sinomo_node::NodeId;
+use sinomo_core::network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_core::node::NodeId;
 
 pub const DFS_RPC_CATEGORY: &str = "dfs";
 pub const DFS_STATUS_ROUTE: &str = "/dfs/status";
@@ -368,9 +368,9 @@ pub fn dfs_message_rpc_request(
     let mut request =
         ObjectRpcRequest::encode_body(dfs_message_route(command), DFS_RPC_CATEGORY, command)?;
     request.ensure_trace_context();
-    sinomo_network::set_object_rpc_request_stream_mode(
+    sinomo_core::network::set_object_rpc_request_stream_mode(
         &mut request,
-        sinomo_network::ObjectRpcRequestStreamMode::ReuseDaemonStream,
+        sinomo_core::network::ObjectRpcRequestStreamMode::ReuseDaemonStream,
     );
     Ok(request)
 }

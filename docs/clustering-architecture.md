@@ -16,6 +16,16 @@ The first implementation should optimize for correctness, debuggability, and loc
 
 The cluster KV is for compact, strongly ordered control-plane state. Large artifacts and file bytes belong in DFS content stores, local filesystems, Git repositories, or future object stores.
 
+## Crate Ownership
+
+Three R0 crates split the clustering stack, and they are deliberately decoupled (`crates/sinomo-core/tests/workspace_ring_boundaries.rs` enforces the cut).
+
+`sinomo-kv` owns KV storage semantics and the Raft consensus core: models, WAL, snapshots, revisions, transactions, leases, prefix watches, and the election/replication state machines. It is transport-free and depends on neither `sinomo-network` nor `sinomo-cluster`.
+
+`sinomo-cluster` owns the cluster control plane: membership, invites, join registration, member mutation, member/state/connectivity/status publishing, the KV/Raft replication and election drivers that move consensus traffic over network-selected routes, cluster health rows and doctor findings, cluster bootstrap-state I/O, and the daemon-mediated `/cluster/control/*` object-RPC routes.
+
+`sinomo-network` owns routing and endpoint selection only. It has no dependency on `sinomo-kv` or `sinomo-cluster`; everything routing needs from cluster state (members, endpoints, node statuses, connectivity records) arrives through the `ClusterDirectory` provider that `sinomo-cluster` implements on top of cluster KV. `sinomo-service` owns service registration, discovery records, and routing target selection above this stack.
+
 ## CLI Surface
 
 The cluster lifecycle starts with `sinomo cluster`.
@@ -41,6 +51,8 @@ A node's normal lifecycle starts as a single-node cluster. A data directory with
 - `sinomo cluster join`
 - local daemon lifecycle and install commands, so a machine can be prepared before joining
 - local help and credential setup commands that do not mutate cluster state
+
+Normal cluster lifecycle operations are daemon-mediated: `cluster init`, `join`, `invite`, `rename`, `role`, `remove`, and `leave` reach the local daemon through the `/cluster/control/{init,join,invite,rename,role,remove,leave}` object-RPC routes registered by `sinomo-cluster`, so they require a running daemon. Documented debug/repair commands stay direct against local state: `cluster doctor`, `cluster connectivity`, `cluster repair-members`, `cluster cleanup-legacy-shadow-members`, `cluster state-authority-role`, and `cluster migrate` planning.
 
 `sinomo cluster init` creates a single-node cluster. `sinomo cluster join` records an intent to join an existing cluster and moves a pre-bootstrap node into pending learner state until the cluster control plane accepts it. When a node already has initialized cluster state, joining another cluster is treated as migration rather than delete-and-join. `sinomo cluster leave` leaves the current cluster by quarantining old cluster state/KV/Raft/watch storage under `$SINOMO_DATA_DIR/cluster/migrations/<leave_id>/leave-source/`, then creates a fresh single-node cluster with the preserved local node identity. The left cluster's KV remains archived evidence and is not imported into the new single-node cluster.
 
@@ -79,7 +91,7 @@ Initial local state lives at:
 $SINOMO_DATA_DIR/cluster/state.sobj
 ```
 
-The state file uses the shared `ClusterBootstrapState` contract from `sinomo-core` for the local cluster identity, local node identity, current Raft term/revision, and current member records. It records the current cluster status through member records, keeping the documented node role separate from Raft membership state. Durable membership and config state come from the replicated KV log; the file remains the local anchor that tells the daemon which cluster identity and local node identity to use at startup.
+The state file uses the shared `ClusterBootstrapState` contract from `sinomo-base` (re-exported as `sinomo_core::cluster::ClusterBootstrapState`) for the local cluster identity, local node identity, current Raft term/revision, and current member records; `sinomo-cluster` owns the read/write helpers. It records the current cluster status through member records, keeping the documented node role separate from Raft membership state. Durable membership and config state come from the replicated KV log; the file remains the local anchor that tells the daemon which cluster identity and local node identity to use at startup.
 
 Each local installation has one normal cluster member: the main daemon node, which is eligible to be the local voter when this installation owns a voting role. The shadow daemon is a supervision and routing process, not a `/cluster/members/<node_id>` participant. It advertises reachable endpoints through the main member so other nodes can route to the installation when main is down, but it is not counted in consensus quorum and should not own DFS objects, run normal scheduled workloads, or publish routine cluster services.
 
@@ -241,7 +253,7 @@ The KV is not a general database. It stores:
 - cluster metadata
 - membership and endpoint records
 - capability advertisements
-- service registry records
+- service instance records, published by the daemon from the `sinomo-service` registry
 - active session summaries
 - DFS filesystem config, shard placement, service routing, and compact policies
 - policy config
@@ -334,7 +346,7 @@ Use slash-delimited namespaces:
 /cluster/invitations/<invite_id>/state
 /cluster/rollout/desired
 /cluster/rollout/nodes/<node_id>
-/services/<service_name>/<node_id>
+/cluster/services/<service_name>/<node_id>
 /sessions/<session_id>/summary
 /sessions/<session_id>/participants/<node_id>
 /sinomo/imports/<source_cluster_id>/...
@@ -398,7 +410,7 @@ The KV gives every node a consistent answer to "which metadata shard is responsi
 
 ## Event Routing Integration
 
-Cluster membership feeds `sinomo-network` routing.
+Cluster membership feeds `sinomo-network` routing through the `ClusterDirectory` provider that `sinomo-cluster` implements over cluster KV.
 
 Routing rules:
 
@@ -454,21 +466,21 @@ Phase 0, local cluster state:
 
 Phase 1, contracts:
 
-- Add cluster identity, membership, endpoint, invite, and certificate structs. Implemented in `crates/sinomo-core/src/cluster.rs`.
+- Add cluster identity, membership, endpoint, invite, and certificate structs. Implemented in `crates/sinomo-base/src/cluster.rs`, re-exported through the `sinomo-core` facade.
 - Add cluster migration contract records and CLI planning. Implemented as `ClusterMigrationRecord`, `ClusterMigrationMode`, `ClusterMigrationPhase`, `/cluster/migrations/<migration_id>` keys, and `sinomo cluster migrate plan`.
 - Extend `sinomo-network` transport kinds for QUIC, iroh, and WebRTC candidate metadata. Implemented through `TransportKind`, `NodeEndpoint::from_cluster_endpoint`, and `PeerEndpointCandidate`.
 - Add cluster-aware peer registry records. Implemented through `PeerRegistry` cluster member and endpoint candidate indexes.
-- Represent the local installation as one main cluster member while preserving shadow reachability. Implemented in `crates/sinomo-network`: main and shadow daemon endpoints are folded into the main member, and stale local shadow members are removed during daemon membership refresh.
+- Represent the local installation as one main cluster member while preserving shadow reachability. Implemented in `crates/sinomo-cluster`: main and shadow daemon endpoints are folded into the main member, and stale local shadow members are removed during daemon membership refresh.
 - Use real cluster identity material. Implemented by generating the local Ed25519 identity before cluster state creation, storing explicit member public keys in every member record, signing invites with the issuer node identity, and verifying invite signatures before local join or introducer acceptance.
 
 Phase 2, KV core:
 
 - Implement a real Raft/KV core for tests, local development, and daemon integration. Implemented in `crates/sinomo-kv` with voter quorum commit, append-entries validation, vote requests, leader transfer, follower catch-up, committed-index tracking, hard-state records, and deterministic multi-node tests.
 - Add WAL, snapshots, revisions, compare-and-swap transactions, and watches. Implemented as `DurableRaftKvNode`, `KvWalPaths`, `RaftHardState`, `KvLogEntry`, `RaftSnapshot`, `KvRevision`, `KvTxn`, and prefix watches; durable nodes replay JSONL WAL entries, persist hard state, save and restore snapshots, preserve watchable event history across snapshot restore, and compact WAL after snapshots.
-- Store membership and service registry records in the KV. Implemented for cluster identity under `/cluster/config/identity`, Raft role config under `/cluster/raft/config`, membership records under `/cluster/members/<node_id>`, split endpoint records under `/cluster/endpoints/<node_id>/<endpoint_id>`, capability policy under `/cluster/policy/capabilities/<node_id>`, invitations and invite state under `/cluster/invitations/...`, rollout desired/node state under `/cluster/rollout/...`, and runtime health records under `/cluster/node-status/<node_id>`; service registry records use the same generic keyspace and lease primitives.
+- Store membership and service registry records in the KV. Implemented for cluster identity under `/cluster/config/identity`, Raft role config under `/cluster/raft/config`, membership records under `/cluster/members/<node_id>`, split endpoint records under `/cluster/endpoints/<node_id>/<endpoint_id>`, capability policy under `/cluster/policy/capabilities/<node_id>`, invitations and invite state under `/cluster/invitations/...`, rollout desired/node state under `/cluster/rollout/...`, and runtime health records under `/cluster/node-status/<node_id>`; service instance records are published by the daemon through `sinomo-service` under `/cluster/services/<service_name>/<node_id>`.
 - Generate node identity key pairs and publish public keys in KV membership records. Implemented with node-local Ed25519 identity files under `$SINOMO_DATA_DIR/identity/`; the main daemon identity is the cluster member identity, and the shadow identity remains local to supervision/routing traffic.
 - Expose the KV through the local daemon control plane for internal Sinomo use. Implemented as daemon-owned object RPC routes backed by a per-node durable Raft WAL under `$SINOMO_DATA_DIR/cluster/kv-raft/<node_id>/`; `$SINOMO_DATA_DIR/cluster/kv-snapshot.sobj` stores the current local snapshot. Cluster init, daemon registration, and join registration persist member records into the KV, daemon maintenance publishes version/health/rollout node-status records, and join responses carry the current snapshot to the joining node.
-- Integrate the daemon's cluster KV transport with the durable Raft core. Implemented with authenticated `CLUSTER_RAFT_APPEND`, `CLUSTER_RAFT_VOTE`, and `CLUSTER_KV_WATCH_EVENTS` daemon messages. The periodic cluster path no longer exchanges and merges whole KV snapshots; the current durable Raft leader sends append-entries with optional Raft snapshot-install payloads to followers, and vote requests are handled against durable local hard state. Daemon maintenance checks leader reachability, starts a new election when the known leader is missing, persists the elected leader after quorum, steps down when it cannot observe quorum during replication, and fans out watch event history over the authenticated transport so local daemon-backed prefix watches can resume and drain committed changes.
+- Integrate the daemon's cluster KV transport with the durable Raft core. Implemented with authenticated `CLUSTER_RAFT_APPEND`, `CLUSTER_RAFT_VOTE`, and `CLUSTER_KV_WATCH_EVENTS` daemon messages. The periodic cluster path no longer exchanges and merges whole KV snapshots; the current durable Raft leader sends append-entries with optional Raft snapshot-install payloads to followers, and vote requests are handled against durable local hard state. Daemon maintenance checks leader reachability, starts a new election when the known leader is missing, persists the elected leader after quorum, steps down when it cannot observe quorum during replication, and fans out watch event history over the authenticated transport so local daemon-backed prefix watches can resume and drain committed changes. The replication, election, quorum, and committed-watch fanout drivers are owned by `crates/sinomo-cluster`; `sinomo-kv` stays transport-free.
 
 Phase 3, real local network:
 
@@ -478,7 +490,7 @@ Phase 3, real local network:
 
 Phase 4, roaming:
 
-- Add iroh as the preferred roaming backend after LAN direct paths. Implemented as the optional `iroh-transport` Cargo feature, `ClusterTransportKind::Iroh`, `IrohEndpointRecord`, and KV endpoint publication under `/iroh/endpoints/<cluster>/<node>`.
+- Add iroh as the preferred roaming backend after LAN direct paths. Implemented as the optional `iroh-transport` Cargo feature, `ClusterTransportKind::Iroh`, `IrohEndpointRecord`, and KV endpoint publication under `/iroh/endpoints/<cluster>/<node>`. The iroh implementation moves into the `modules/network/iroh` native-dylib network module in stage C of the crate-boundary refactor; until then the optional feature builds it into `sinomo-network`.
 - Add WebRTC signaling abstraction. Implemented in `sinomo-network` as `WebRtcSignalingEnvelope`, `WebRtcSignalMessage`, and `IceCandidateRecord`.
 - Add ICE candidate exchange through the KV or rendezvous service. Implemented `WebRtcKvExchange` helpers for `/webrtc/signals/...` and `/webrtc/candidates/...` keys using the Phase 2 KV operation surface.
 - Add TURN/relay fallback. Implemented `RoamingConnectionPlanner`, which prefers LAN direct candidates, then iroh candidates, then WebRTC candidates, then TURN/HTTPS relay candidates when direct paths fail or disappear.
@@ -491,6 +503,6 @@ Phase 5, DFS integration:
 
 Phase 6, operations:
 
-- Add `sinomo cluster invite`, `promote`, `demote`, `remove`, `doctor`, and `kv` inspection commands. `sinomo cluster invite` is implemented for local signed invites; `cluster role` updates the documented node role; `cluster raft-role` and `cluster promote` update Raft membership state; and `cluster status` / `cluster health` / `cluster peers` read the daemon-backed KV membership and node-status view when available. Approval, revocation, demotion, removal, and explicit KV inspection remain future work.
+- Add `sinomo cluster invite`, `promote`, `demote`, `remove`, `doctor`, and `kv` inspection commands. `sinomo cluster invite` is implemented for local signed invites; `cluster role` updates the documented node role; `cluster raft-role` and `cluster promote` update Raft membership state; and `cluster status` / `cluster health` / `cluster peers` read the daemon-backed KV membership and node-status view when available. Cluster lifecycle commands are daemon-mediated through the `/cluster/control/*` routes; doctor/repair-style commands stay direct. Approval, revocation, demotion, removal, and explicit KV inspection remain future work.
 - Add snapshot export/import.
 - Add metrics and event traces for elections, watches, membership changes, and replication lag.

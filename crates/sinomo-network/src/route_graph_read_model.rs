@@ -1,18 +1,15 @@
 use crate::connectivity::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityRecordQuery,
+    cluster_network_record_live,
 };
-use crate::connectivity_publish::cluster_network_record_live;
 use crate::connectivity_store::{
     local_cluster_connectivity_content_generation, read_local_cluster_connectivity_records,
     sort_cluster_connectivity_records,
 };
 use crate::error::NetworkError;
 use crate::file_mark::{ClusterFileMark, cluster_file_mark};
-use crate::kv_local_store::local_cluster_kv_snapshot_revision;
-use crate::kv_read_model::KvBackedClusterConnectivityRecordQuery;
 use crate::{ClusterEndpointId, ClusterPaths};
-use sinomo_core::ClusterBootstrapState;
-use sinomo_kv::KvRevision;
+use sinomo_base::ClusterBootstrapState;
 use sinomo_node::NodeId;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -35,10 +32,9 @@ struct ClusterRouteGraphCacheEntry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ClusterRouteGraphCacheMark {
+pub struct ClusterRouteGraphCacheMark {
     state: ClusterFileMark,
-    kv_snapshot: ClusterFileMark,
-    kv_revision: Option<KvRevision>,
+    pub directory_version: Option<crate::directory::DirectoryVersion>,
     local_connectivity: ClusterFileMark,
     local_connectivity_generation: u64,
 }
@@ -102,7 +98,7 @@ impl ClusterConnectivityGraph {
         let graph = Self::try_read_for_local_with_query(
             paths,
             state,
-            &KvBackedClusterConnectivityRecordQuery,
+            &crate::connectivity::DirectoryConnectivityRecordQuery,
         )?;
         let after_mark = cluster_route_graph_cache_mark(paths);
         if before_mark == after_mark {
@@ -117,8 +113,11 @@ impl ClusterConnectivityGraph {
         if let Some(graph) = read_cluster_route_graph_from_cache(paths, state, before_mark, now) {
             return graph;
         }
-        let graph =
-            Self::read_for_local_with_query(paths, state, &KvBackedClusterConnectivityRecordQuery);
+        let graph = Self::read_for_local_with_query(
+            paths,
+            state,
+            &crate::connectivity::DirectoryConnectivityRecordQuery,
+        );
         let after_mark = cluster_route_graph_cache_mark(paths);
         if before_mark == after_mark {
             store_cluster_route_graph_cache_entry(paths, after_mark, graph.clone(), now);
@@ -172,11 +171,17 @@ fn cluster_route_graph_cache_tick() -> u64 {
     CLUSTER_ROUTE_GRAPH_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
 }
 
-fn cluster_route_graph_cache_mark(paths: &ClusterPaths) -> Option<ClusterRouteGraphCacheMark> {
+pub fn cluster_route_graph_cache_mark(paths: &ClusterPaths) -> Option<ClusterRouteGraphCacheMark> {
     Some(ClusterRouteGraphCacheMark {
         state: cluster_file_mark(&paths.state)?,
-        kv_snapshot: cluster_file_mark(&paths.kv_snapshot)?,
-        kv_revision: local_cluster_kv_snapshot_revision(paths),
+        // A directory version error means "unknown": return no mark at all
+        // (skip caching) rather than a `None` field that would compare equal
+        // to itself and keep validating a stale graph.
+        directory_version: Some(
+            crate::directory::cluster_directory_for(paths)
+                .version()
+                .ok()?,
+        ),
         local_connectivity: cluster_file_mark(&paths.connectivity_local)?,
         local_connectivity_generation: local_cluster_connectivity_content_generation(paths),
     })
@@ -234,7 +239,7 @@ fn store_cluster_route_graph_cache_entry(
     );
 }
 
-pub(crate) fn invalidate_cluster_route_graph_cache(paths: &ClusterPaths) {
+pub fn invalidate_cluster_route_graph_cache(paths: &ClusterPaths) {
     if let Ok(mut cache) = CLUSTER_ROUTE_GRAPHS.lock() {
         cache.remove(&paths.root);
     }
@@ -257,13 +262,16 @@ fn evict_cluster_route_graph_cache_entry_if_needed(
     }
 }
 
-pub(crate) fn read_cluster_connectivity_graph(
+pub fn read_cluster_connectivity_graph(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
-    read_cluster_connectivity_graph_with_query(paths, &KvBackedClusterConnectivityRecordQuery)
+    read_cluster_connectivity_graph_with_query(
+        paths,
+        &crate::connectivity::DirectoryConnectivityRecordQuery,
+    )
 }
 
-pub(crate) fn read_cluster_connectivity_graph_with_query<Q>(
+pub fn read_cluster_connectivity_graph_with_query<Q>(
     paths: &ClusterPaths,
     query: &Q,
 ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError>
@@ -325,54 +333,4 @@ where
     let mut records = records_by_key.into_records();
     sort_cluster_connectivity_records(&mut records);
     Ok(records)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::kv_local_store::write_cluster_kv_snapshot;
-    use crate::write_cluster_state;
-    use sinomo_kv::InProcessKvStore;
-    use sinomo_local::SinomoDataDir;
-    use sinomo_node::{ClusterId, NodeId};
-
-    #[test]
-    fn route_graph_cache_mark_tracks_current_kv_revision() {
-        let root = sinomo_testdir::TestDir::new("sinomo-network-route-graph-kv-revision");
-        let data_dir = SinomoDataDir::new(&root);
-        let paths = ClusterPaths::new(&data_dir);
-        paths.ensure().expect("cluster paths");
-        let cluster_id =
-            ClusterId::from_legacy_named("cluster_route_graph_kv_revision").expect("cluster id");
-        let local =
-            NodeId::from_legacy_named("node_route_graph_kv_revision_local").expect("node id");
-        let state = ClusterBootstrapState::initialized_locally(
-            cluster_id,
-            "route graph test",
-            local,
-            "local",
-            "pk-local",
-            OffsetDateTime::now_utc(),
-        );
-        write_cluster_state(&paths, &state).expect("write state");
-
-        let mut first_store = InProcessKvStore::new();
-        first_store
-            .put("/route/graph/revision", b"first".to_vec(), None)
-            .expect("seed first revision");
-        write_cluster_kv_snapshot(&paths, &first_store.snapshot().unwrap())
-            .expect("write first snapshot");
-        let first_mark = cluster_route_graph_cache_mark(&paths).expect("first mark");
-
-        let mut second_store = first_store;
-        second_store
-            .put("/route/graph/revision", b"second".to_vec(), None)
-            .expect("seed second revision");
-        write_cluster_kv_snapshot(&paths, &second_store.snapshot().unwrap())
-            .expect("write second snapshot");
-        let second_mark = cluster_route_graph_cache_mark(&paths).expect("second mark");
-
-        assert_ne!(first_mark.kv_revision, second_mark.kv_revision);
-        assert_ne!(first_mark, second_mark);
-    }
 }

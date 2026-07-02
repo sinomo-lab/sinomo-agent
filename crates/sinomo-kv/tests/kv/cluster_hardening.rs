@@ -1,5 +1,5 @@
 use crate::internal::*;
-use sinomo_core::{ClusterBootstrapState, ClusterMemberRole, ClusterMemberState, Id};
+use sinomo_base::{ClusterBootstrapState, ClusterMemberRole, ClusterMemberState, Id};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 
@@ -655,19 +655,21 @@ fn cluster_snapshot_compaction_preserves_retained_tail_across_reopen() {
 #[test]
 fn cluster_rpc_contract_rejects_malformed_bodies_and_ignores_unknown_routes() {
     assert!(decode_cluster_kv_txn_rpc_request_body(b"not a sinomo object").is_err());
-    let malformed_append = handle_cluster_raft_rpc_payload::<_, _, KvError>(
+    let malformed_append = handle_cluster_raft_rpc_payload::<_, _, KvError, _>(
         CLUSTER_RAFT_APPEND_ROUTE,
         b"not a raft append payload",
         |_| panic!("malformed append must not reach handler"),
         |_| panic!("append route must not reach vote handler"),
+        |error| error,
     );
     assert!(malformed_append.is_err());
 
-    let unknown = handle_cluster_raft_rpc_payload::<_, _, KvError>(
+    let unknown = handle_cluster_raft_rpc_payload::<_, _, KvError, _>(
         "/cluster/raft/unknown",
         b"ignored",
         |_| panic!("unknown route must not call append handler"),
         |_| panic!("unknown route must not call vote handler"),
+        |error| error,
     )
     .expect("unknown route");
     assert!(unknown.is_none());

@@ -1,20 +1,24 @@
 //! Cluster topology snapshot used by the graphical Cluster tab.
 
+use sinomo_runtime::cluster;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 pub use sinomo_cli::app_api::{AppClusterInvite, AppClusterStatus};
+use sinomo_runtime::cluster::ClusterHealthRow;
 use sinomo_runtime::core::{
     ClusterEndpointPrivacy, ClusterMemberRecord, ClusterMemberState, ClusterNodeAvailability,
     ClusterNodeStatusRecord,
 };
-use sinomo_runtime::network::{
-    self, ClusterConnectivityRecord, ClusterConnectivityState, ClusterHealthRow, ClusterPaths,
+use sinomo_runtime::daemon::DaemonApiClient;
+use sinomo_runtime::network::{ClusterConnectivityRecord, ClusterConnectivityState, ClusterPaths};
+use sinomo_runtime::node::{
+    cluster_invitation_key, cluster_member_expected_daemon_process, cluster_node_is_local_process,
 };
-use sinomo_runtime::node::{cluster_member_expected_daemon_process, cluster_node_is_local_process};
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::backend::{Backend, Connection};
 
@@ -91,23 +95,68 @@ impl Backend {
         sinomo_cli::app_api::cluster_status(self.data_dir.as_ref())
     }
 
+    /// Daemon-first cluster mutations: a client for the attached daemon's
+    /// `/cluster/control/*` API, or an actionable error on the degraded
+    /// daemonless fallback.
+    fn cluster_control_client(&self) -> Result<DaemonApiClient, String> {
+        self.connection
+            .daemon_address()
+            .map(DaemonApiClient::at_address)
+            .ok_or_else(|| {
+                "no daemon connection; cluster changes need the Sinomo daemon (restart the app or run `sinomo daemon start`)"
+                    .to_string()
+            })
+    }
+
     pub fn create_cluster_invite(&self) -> Result<AppClusterInvite, String> {
-        sinomo_cli::app_api::create_cluster_invite(self.data_dir.as_ref())
-            .map_err(|error| error.to_string())
+        let uri = self
+            .cluster_control_client()?
+            .cluster_invite()
+            .map_err(|error| error.to_string())?
+            .invite;
+        let invite =
+            cluster::decode_cluster_join_invite(&uri).map_err(|error| error.to_string())?;
+        Ok(AppClusterInvite {
+            join_command: cluster::cluster_join_command(&uri),
+            uri,
+            expires_at: invite
+                .expires_at
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string()),
+            persisted_key: cluster_invitation_key(&invite.invite_id),
+        })
     }
 
     pub fn join_cluster(&self, invite: &str) -> Result<AppClusterStatus, String> {
-        sinomo_cli::app_api::join_cluster(
-            self.data_dir.as_ref(),
-            invite,
-            self.node.display_name.as_str(),
-        )
-        .map_err(|error| error.to_string())
+        let invite = invite.trim();
+        if invite.is_empty() {
+            return Err("enter an invitation link before joining".to_string());
+        }
+        let client = self.cluster_control_client()?;
+        let response = client
+            .cluster_join(cluster::ClusterControlJoinRequest {
+                invite: invite.to_string(),
+            })
+            .map_err(|error| error.to_string())?;
+        // Preserve the app's node display name; the daemon defaults to the
+        // hostname. Best effort: the join itself already succeeded.
+        let display_name = self.node.display_name.trim();
+        if !display_name.is_empty()
+            && let Err(error) = client.cluster_rename(cluster::ClusterControlRenameRequest {
+                node_id: Some(response.node_id.clone()),
+                display_name: display_name.to_string(),
+            })
+        {
+            tracing::warn!(%error, "joined cluster but could not apply app node display name");
+        }
+        Ok(sinomo_cli::app_api::cluster_status(self.data_dir.as_ref()))
     }
 
     pub fn leave_cluster(&self) -> Result<AppClusterStatus, String> {
-        sinomo_cli::app_api::leave_cluster(self.data_dir.as_ref())
-            .map_err(|error| error.to_string())
+        self.cluster_control_client()?
+            .cluster_leave()
+            .map_err(|error| error.to_string())?;
+        Ok(sinomo_cli::app_api::cluster_status(self.data_dir.as_ref()))
     }
 
     pub fn cluster_snapshot(&self) -> ClusterSnapshot {
@@ -126,7 +175,7 @@ impl Backend {
         let paths = ClusterPaths::new(self.data_dir.as_ref());
         let mut warnings = Vec::new();
 
-        let state = match network::read_cluster_state(&paths) {
+        let state = match cluster::read_cluster_state(&paths) {
             Ok(state) => Some(state),
             Err(error) => {
                 warnings.push(format!("cluster state unavailable: {error}"));
@@ -189,7 +238,7 @@ impl Backend {
             },
         };
 
-        let connectivity = match network::read_cluster_connectivity_graph_from_kv(&paths) {
+        let connectivity = match cluster::read_cluster_connectivity_graph_from_kv(&paths) {
             Ok(records) => records,
             Err(error) => {
                 warnings.push(format!("connectivity graph unavailable: {error}"));
@@ -248,22 +297,21 @@ fn fetch_daemon_health_rows(
 }
 
 fn fetch_cluster_health_rows(address: &str) -> Result<Vec<ClusterHealthRow>, String> {
-    let request = network::cluster_health_rpc_request().map_err(|error| error.to_string())?;
-    let response =
-        sinomo_runtime::daemon::send_daemon_rpc(address, &request, CLUSTER_REFRESH_RPC_TIMEOUT)
-            .map_err(|error| error.to_string())?;
-    network::decode_cluster_health_rpc_response(&response).map_err(|error| error.to_string())
+    DaemonApiClient::at_address(address)
+        .with_timeout(CLUSTER_REFRESH_RPC_TIMEOUT)
+        .cluster_health()
+        .map_err(|error| error.to_string())
 }
 
 fn fetch_local_health_rows(address: &str) -> Result<Vec<ClusterHealthRow>, String> {
-    let request = network::cluster_local_health_rpc_request().map_err(|error| error.to_string())?;
+    let request = cluster::cluster_local_health_rpc_request().map_err(|error| error.to_string())?;
     let response = sinomo_runtime::daemon::send_daemon_rpc(
         address,
         &request,
         CLUSTER_LOCAL_SNAPSHOT_RPC_TIMEOUT,
     )
     .map_err(|error| error.to_string())?;
-    network::decode_cluster_health_rpc_response(&response).map_err(|error| error.to_string())
+    cluster::decode_cluster_health_rpc_response(&response).map_err(|error| error.to_string())
 }
 
 fn rows_from_state(
@@ -272,7 +320,7 @@ fn rows_from_state(
     observed_at: OffsetDateTime,
     warnings: &mut Vec<String>,
 ) -> Vec<ClusterHealthRow> {
-    let cached_statuses = match network::read_cluster_node_statuses_from_kv(paths) {
+    let cached_statuses = match cluster::read_cluster_node_statuses_from_kv(paths) {
         Ok(statuses) => statuses,
         Err(error) => {
             warnings.push(format!("cluster node status cache unavailable: {error}"));
@@ -289,7 +337,7 @@ fn rows_from_state(
                 .find(|status| status_matches_member(status, member))
                 .cloned()
                 .unwrap_or_else(|| {
-                    network::unknown_cluster_node_status(state, member, observed_at)
+                    cluster::unknown_cluster_node_status(state, member, observed_at)
                 });
             let availability = status.availability.clone();
             ClusterHealthRow {

@@ -81,10 +81,10 @@ use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 #[cfg(test)]
 use sinomo_core::DfsWriteReceipt;
 #[cfg(test)]
-use sinomo_events::EventId;
-use sinomo_node::NodeId;
+use sinomo_core::events::EventId;
+use sinomo_core::node::NodeId;
 #[cfg(test)]
-use sinomo_object::serde_ext as sinomo_object_serde;
+use sinomo_core::object::serde_ext as sinomo_object_serde;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]

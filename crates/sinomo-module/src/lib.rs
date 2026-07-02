@@ -13,17 +13,17 @@ use arc_swap::ArcSwap;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sinomo_core::events::{EventId, EventStore, EventStoreError, StoredEvent};
+use sinomo_core::node::{NodeId, NodeIdentity};
+use sinomo_core::object::{LengthMode, serde_ext};
 use sinomo_core::{
     ArtifactManifest, CapabilityName, Confidence, EventEnvelope, EventKind, HotSwapState,
     LatencyClass, ModuleCapabilities, ModuleKind, ModuleLoaderState, PrivacyClass, RoutingMetadata,
     RoutingScope, Salience, Source, TrustRing,
 };
-use sinomo_events::{EventId, EventStore, EventStoreError, StoredEvent};
 use sinomo_module_api::{
     NativeModuleDeclarativeResource, NativeModuleDescriptor, NativeModuleObjectRpcRoute,
 };
-use sinomo_node::{NodeId, NodeIdentity};
-use sinomo_object::{LengthMode, serde_ext};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -846,7 +846,9 @@ pub struct NativeRustModuleBinding {
         ) -> Result<sinomo_config::ConfigRegistryBuilder, String>,
     >,
     pub register_storage_paths: Option<
-        fn(&mut sinomo_storage::StorageLayout) -> Result<(), sinomo_storage::StorageContractError>,
+        fn(
+            &mut sinomo_core::storage::StorageLayout,
+        ) -> Result<(), sinomo_core::storage::StorageContractError>,
     >,
 }
 
@@ -884,8 +886,9 @@ impl NativeRustModuleBinding {
     pub const fn with_storage_paths(
         mut self,
         register_storage_paths: fn(
-            &mut sinomo_storage::StorageLayout,
-        ) -> Result<(), sinomo_storage::StorageContractError>,
+            &mut sinomo_core::storage::StorageLayout,
+        )
+            -> Result<(), sinomo_core::storage::StorageContractError>,
     ) -> Self {
         self.register_storage_paths = Some(register_storage_paths);
         self
@@ -906,6 +909,13 @@ pub struct ModuleSurfaces {
     pub declarative_resources: Vec<ModuleDeclarativeResourceExport>,
     #[serde(default, skip_serializing_if = "ModuleCapabilities::is_empty")]
     pub capabilities: ModuleCapabilities,
+    /// Cluster transport kinds this module serves as a runtime network module
+    /// (mirrors `sinomo_module_api::NativeModuleSurfaces::network_transports`).
+    /// Non-empty means the module's dylib also exports the network-module
+    /// entry symbol and should be loaded into the daemon's
+    /// `NetworkModuleRegistry`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network_transports: Vec<String>,
 }
 
 impl ModuleSurfaces {
@@ -916,6 +926,7 @@ impl ModuleSurfaces {
             && self.agent_definitions.is_empty()
             && self.declarative_resources.is_empty()
             && self.capabilities.is_empty()
+            && self.network_transports.is_empty()
     }
 
     pub fn with_object_rpc_route(mut self, route: ModuleObjectRpcRoute) -> Self {
@@ -959,6 +970,16 @@ impl ModuleSurfaces {
 
     pub fn with_prompt_resource(self, id: impl Into<String>, path: impl Into<String>) -> Self {
         self.with_declarative_resource(ModuleDeclarativeResourceExport::prompt(id, path))
+    }
+
+    /// Declares one cluster transport kind this module serves as a runtime
+    /// network module (deduplicated).
+    pub fn with_network_transport(mut self, transport: impl Into<String>) -> Self {
+        let transport = transport.into();
+        if !self.network_transports.contains(&transport) {
+            self.network_transports.push(transport);
+        }
+        self
     }
 
     pub fn with_capability_import(mut self, capability: CapabilityName) -> Self {
@@ -2557,6 +2578,9 @@ fn native_descriptor_surfaces_to_module_surfaces(
     for resource in &descriptor.surfaces.declarative_resources {
         surfaces = surfaces
             .with_declarative_resource(native_descriptor_resource_to_module_resource(resource)?);
+    }
+    for transport in &descriptor.surfaces.network_transports {
+        surfaces = surfaces.with_network_transport(transport.clone());
     }
     surfaces.capabilities = ModuleCapabilities {
         imports: descriptor
@@ -4318,9 +4342,9 @@ fn write_object<T: Serialize>(path: &Path, value: &T) -> Result<(), ModuleLoader
 }
 
 pub fn register_storage_paths(
-    layout: &mut sinomo_storage::StorageLayout,
-) -> Result<(), sinomo_storage::StorageContractError> {
-    use sinomo_storage::{STORAGE_CONTRACT_OBJECT_VERSION, StorageRing};
+    layout: &mut sinomo_core::storage::StorageLayout,
+) -> Result<(), sinomo_core::storage::StorageContractError> {
+    use sinomo_core::storage::{STORAGE_CONTRACT_OBJECT_VERSION, StorageRing};
 
     layout.register_escape_path(
         "sinomo-module",
@@ -4332,7 +4356,7 @@ pub fn register_storage_paths(
         "sinomo-module",
         StorageRing::R1,
         "module/loader-state/example.sobj",
-        sinomo_storage::ObjectSchema::new(
+        sinomo_core::storage::ObjectSchema::new(
             "ModuleLoaderRuntimeState",
             STORAGE_CONTRACT_OBJECT_VERSION,
         )
@@ -4393,7 +4417,7 @@ pub fn register_storage_paths(
         "sinomo-module",
         StorageRing::R1,
         "module/loader-state/native-dylib/example.sobj",
-        sinomo_storage::ObjectSchema::new(
+        sinomo_core::storage::ObjectSchema::new(
             "NativeDylibModuleLoaderState",
             STORAGE_CONTRACT_OBJECT_VERSION,
         )
@@ -4412,7 +4436,7 @@ pub fn register_storage_paths(
         "sinomo-module",
         StorageRing::R1,
         "module/loader-state/native-rust/example.sobj",
-        sinomo_storage::ObjectSchema::new(
+        sinomo_core::storage::ObjectSchema::new(
             "NativeRustModuleRuntimeState",
             STORAGE_CONTRACT_OBJECT_VERSION,
         )
@@ -4426,7 +4450,7 @@ pub fn register_storage_paths(
         "sinomo-module",
         StorageRing::R1,
         "module/loader-state/declarative/example.sobj",
-        sinomo_storage::ObjectSchema::new(
+        sinomo_core::storage::ObjectSchema::new(
             "DeclarativeModuleLoaderState",
             STORAGE_CONTRACT_OBJECT_VERSION,
         )
@@ -4442,34 +4466,40 @@ pub fn register_storage_paths(
         "sinomo-module",
         StorageRing::R1,
         "module/catalog/declarative/example.sobj",
-        sinomo_storage::ObjectSchema::new("ModuleRegistration", STORAGE_CONTRACT_OBJECT_VERSION)
-            .field("manifest", "ModuleManifest")
-            .field("backend", "ModuleBackendRegistration")
-            .field("surfaces", "ModuleSurfaces"),
+        sinomo_core::storage::ObjectSchema::new(
+            "ModuleRegistration",
+            STORAGE_CONTRACT_OBJECT_VERSION,
+        )
+        .field("manifest", "ModuleManifest")
+        .field("backend", "ModuleBackendRegistration")
+        .field("surfaces", "ModuleSurfaces"),
     )?;
     layout.register_sinomo_object(
         "sinomo-module",
         StorageRing::R1,
         "module/lifecycle/unload-records/example.sobj",
-        sinomo_storage::ObjectSchema::new("ModuleUnloadRecord", STORAGE_CONTRACT_OBJECT_VERSION)
-            .field("module_id", "ModuleId")
-            .field("backend", "ModuleKind")
-            .field("artifact_id", "Option<ArtifactId>")
-            .field("content_hash", "Option<String>")
-            .field("cache_key", "Option<String>")
-            .field("library_name", "Option<String>")
-            .field("state_removed", "bool")
-            .field("runtime_unload_attempted", "bool")
-            .field("runtime_unload_succeeded", "bool")
-            .field("runtime_unload_detail", "String")
-            .field("unloaded_at", "String")
-            .field("source", "String"),
+        sinomo_core::storage::ObjectSchema::new(
+            "ModuleUnloadRecord",
+            STORAGE_CONTRACT_OBJECT_VERSION,
+        )
+        .field("module_id", "ModuleId")
+        .field("backend", "ModuleKind")
+        .field("artifact_id", "Option<ArtifactId>")
+        .field("content_hash", "Option<String>")
+        .field("cache_key", "Option<String>")
+        .field("library_name", "Option<String>")
+        .field("state_removed", "bool")
+        .field("runtime_unload_attempted", "bool")
+        .field("runtime_unload_succeeded", "bool")
+        .field("runtime_unload_detail", "String")
+        .field("unloaded_at", "String")
+        .field("source", "String"),
     )?;
     layout.register_sinomo_object(
         "sinomo-module",
         StorageRing::R1,
         "module/local-command-artifacts.sobj",
-        sinomo_storage::ObjectSchema::new(
+        sinomo_core::storage::ObjectSchema::new(
             "ModuleLocalCommandRegistry",
             STORAGE_CONTRACT_OBJECT_VERSION,
         )
@@ -4804,6 +4834,7 @@ mod tests {
                 storage_owners: vec!["dynamic-native".to_string()],
                 capability_imports: vec!["filesystem.read".to_string()],
                 capability_exports: vec!["dynamic.native.inspect".to_string()],
+                network_transports: vec!["iroh".to_string()],
             },
         };
 
@@ -4814,6 +4845,11 @@ mod tests {
         assert_eq!(registration.module_id(), &module_id);
         assert_eq!(registration.manifest.owner, "dynamic-native");
         assert_eq!(registration.manifest.kind, ModuleKind::NativeDylib);
+        assert_eq!(
+            registration.surfaces.network_transports,
+            vec!["iroh".to_string()],
+            "descriptor network transports map onto module surfaces"
+        );
         assert_eq!(registration.surfaces.object_rpc_routes.len(), 1);
         assert_eq!(
             registration.surfaces.object_rpc_routes[0].auth,
@@ -5566,7 +5602,7 @@ mod tests {
             (active_artifact_id.clone(), Ok("same-output".to_string())),
             (shadow_artifact_id.clone(), Ok("same-output".to_string())),
         ]);
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
 
         let outcome = execute_routed_module_invocation_with_event_store(
             &root,
@@ -5581,7 +5617,7 @@ mod tests {
         .expect("execute")
         .expect("route");
         let events = event_store
-            .replay(sinomo_events::ReplayQuery::by_kind_prefix(
+            .replay(sinomo_core::events::ReplayQuery::by_kind_prefix(
                 MODULE_SHADOW_DECISION_EVENT_KIND,
             ))
             .expect("replay events");
@@ -5624,7 +5660,7 @@ mod tests {
                 Ok("candidate-output".to_string()),
             ),
         ]);
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         let route_key = route_key_with_bucket(&module_id, 0..500);
 
         let outcome = execute_routed_module_invocation_with_event_store(
@@ -5640,12 +5676,12 @@ mod tests {
         .expect("execute")
         .expect("route");
         let invocation_events = event_store
-            .replay(sinomo_events::ReplayQuery::by_kind_prefix(
+            .replay(sinomo_core::events::ReplayQuery::by_kind_prefix(
                 MODULE_INVOCATION_DECISION_EVENT_KIND,
             ))
             .expect("replay invocation events");
         let shadow_events = event_store
-            .replay(sinomo_events::ReplayQuery::by_kind_prefix(
+            .replay(sinomo_core::events::ReplayQuery::by_kind_prefix(
                 MODULE_SHADOW_DECISION_EVENT_KIND,
             ))
             .expect("replay shadow events");
@@ -5746,10 +5782,10 @@ mod tests {
         let outcome = execute_module_route_decision(route, "input".to_string(), &runner);
         let event =
             module_invocation_decision_event_from_outcome(None, &route_key, None, "live", &outcome);
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         event_store.append(event).expect("append event");
         let events = event_store
-            .replay(sinomo_events::ReplayQuery::by_kind_prefix(
+            .replay(sinomo_core::events::ReplayQuery::by_kind_prefix(
                 MODULE_INVOCATION_DECISION_EVENT_KIND,
             ))
             .expect("replay events");
@@ -5792,10 +5828,10 @@ mod tests {
         let mut event =
             module_invocation_decision_event_from_outcome(None, &route_key, None, "live", &outcome);
         event.payload["primary_latency_ms"] = serde_json::json!(250);
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         event_store.append(event).expect("append event");
         let events = event_store
-            .replay(sinomo_events::ReplayQuery::by_kind_prefix(
+            .replay(sinomo_core::events::ReplayQuery::by_kind_prefix(
                 MODULE_INVOCATION_DECISION_EVENT_KIND,
             ))
             .expect("replay events");
@@ -5836,12 +5872,12 @@ mod tests {
             "primary_lane": "candidate",
             "reason": "user corrected candidate output",
         }));
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         event_store
             .append(correction_event)
             .expect("append correction");
         let events = event_store
-            .replay(sinomo_events::ReplayQuery::by_kind_prefix(
+            .replay(sinomo_core::events::ReplayQuery::by_kind_prefix(
                 MODULE_USER_CORRECTION_EVENT_KIND,
             ))
             .expect("replay corrections");
@@ -5885,10 +5921,10 @@ mod tests {
             &outcome,
         )
         .expect("shadow event");
-        let mut event_store = sinomo_events::InMemoryEventStore::new();
+        let mut event_store = sinomo_core::events::InMemoryEventStore::new();
         event_store.append(event).expect("append event");
         let events = event_store
-            .replay(sinomo_events::ReplayQuery::by_kind_prefix(
+            .replay(sinomo_core::events::ReplayQuery::by_kind_prefix(
                 MODULE_SHADOW_DECISION_EVENT_KIND,
             ))
             .expect("replay events");

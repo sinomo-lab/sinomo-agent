@@ -48,14 +48,8 @@ thiserror.workspace = true
 time.workspace = true
 sinomo-core = { path = "../../../crates/sinomo-core" }
 sinomo-dfs = { path = "../../../crates/sinomo-dfs" }
-sinomo-events = { path = "../../../crates/sinomo-events" }
-sinomo-kv = { path = "../../../crates/sinomo-kv" }
 sinomo-module = { path = "../../../crates/sinomo-module" }
-sinomo-network = { path = "../../../crates/sinomo-network" }
-sinomo-node = { path = "../../../crates/sinomo-node" }
-sinomo-object = { path = "../../../crates/sinomo-object", features = ["serde"] }
 sinomo-sandbox-wasix-api = { path = "../../../crates/sinomo-sandbox-wasix-api" }
-sinomo-storage = { path = "../../../crates/sinomo-storage" }
 wasmtime = { version = "41.0.4", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "wat"], optional = true }
 tokio = { version = "1.44", features = ["rt-multi-thread", "time"], optional = true }
 virtual-fs = { version = "0.700.0-alpha.2", default-features = false, features = ["host-fs"], optional = true }

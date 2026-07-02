@@ -3,16 +3,18 @@ use sinomo_cli_registry::{
     CliAutocompleteOption, CliAutocompleteSpec, CliCommand, CliCommandContext, CliCommandError,
     CliCommandHandler, CliCommandHelp, CliCommandMetadata, CliCommandPolicy, CliParseError,
 };
-use sinomo_events::EventStore;
-use sinomo_kv::{
+#[allow(unused_imports)]
+use sinomo_core::cluster::ClusterKvPathsExt;
+use sinomo_core::events::EventStore;
+use sinomo_core::kv::{
     CLUSTER_KV_RPC_CATEGORY, CLUSTER_KV_SNAPSHOT_ROUTE, KvSnapshot, KvTxn, KvTxnResponse,
 };
-use sinomo_local::SinomoDataDir;
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network;
+use sinomo_core::network::ClusterPaths;
+use sinomo_core::network::ObjectRpcResponse;
+use sinomo_core::node::NodeId;
 use sinomo_module::ModuleReplayReport;
-use sinomo_network as network;
-use sinomo_network::ClusterPaths;
-use sinomo_network::ObjectRpcResponse;
-use sinomo_node::NodeId;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -56,9 +58,9 @@ pub enum SandboxCliError {
         path: String,
         detail: String,
     },
-    LocalData(sinomo_local::LocalDataError),
-    EventStore(sinomo_events::EventStoreError),
-    Kv(sinomo_kv::KvError),
+    LocalData(sinomo_core::local::LocalDataError),
+    EventStore(sinomo_core::events::EventStoreError),
+    Kv(sinomo_core::kv::KvError),
     DaemonAlreadyRunning {
         lock_file: String,
         detail: String,
@@ -154,20 +156,20 @@ impl From<SandboxCliError> for CliParseError {
     }
 }
 
-impl From<sinomo_local::LocalDataError> for SandboxCliError {
-    fn from(error: sinomo_local::LocalDataError) -> Self {
+impl From<sinomo_core::local::LocalDataError> for SandboxCliError {
+    fn from(error: sinomo_core::local::LocalDataError) -> Self {
         Self::LocalData(error)
     }
 }
 
-impl From<sinomo_events::EventStoreError> for SandboxCliError {
-    fn from(error: sinomo_events::EventStoreError) -> Self {
+impl From<sinomo_core::events::EventStoreError> for SandboxCliError {
+    fn from(error: sinomo_core::events::EventStoreError) -> Self {
         Self::EventStore(error)
     }
 }
 
-impl From<sinomo_kv::KvError> for SandboxCliError {
-    fn from(error: sinomo_kv::KvError) -> Self {
+impl From<sinomo_core::kv::KvError> for SandboxCliError {
+    fn from(error: sinomo_core::kv::KvError) -> Self {
         Self::Kv(error)
     }
 }
@@ -294,7 +296,10 @@ impl From<network::NetworkError> for SandboxCliError {
             network::NetworkError::Json { path, detail } => Self::Json { path, detail },
             network::NetworkError::StorageIo { path, detail } => Self::Io { path, detail },
             network::NetworkError::ClusterReadOnly { detail } => Self::ClusterReadOnly { detail },
-            network::NetworkError::Kv(error) => Self::Kv(error),
+            network::NetworkError::Directory { detail } => Self::Network {
+                address: "cluster-directory".to_string(),
+                detail,
+            },
             network::NetworkError::Io { operation, detail } => Self::Network {
                 address: operation,
                 detail,
@@ -306,13 +311,15 @@ impl From<network::NetworkError> for SandboxCliError {
     }
 }
 
-impl From<sinomo_node::NodeIdentityError> for SandboxCliError {
-    fn from(error: sinomo_node::NodeIdentityError) -> Self {
+impl From<sinomo_core::node::NodeIdentityError> for SandboxCliError {
+    fn from(error: sinomo_core::node::NodeIdentityError) -> Self {
         match error {
-            sinomo_node::NodeIdentityError::Parse { detail } => Self::Parse { detail },
-            sinomo_node::NodeIdentityError::Io { path, detail } => Self::Io { path, detail },
-            sinomo_node::NodeIdentityError::Json { path, detail } => Self::Json { path, detail },
-            sinomo_node::NodeIdentityError::Object { path, detail } => Self::Parse {
+            sinomo_core::node::NodeIdentityError::Parse { detail } => Self::Parse { detail },
+            sinomo_core::node::NodeIdentityError::Io { path, detail } => Self::Io { path, detail },
+            sinomo_core::node::NodeIdentityError::Json { path, detail } => {
+                Self::Json { path, detail }
+            }
+            sinomo_core::node::NodeIdentityError::Object { path, detail } => Self::Parse {
                 detail: format!("node identity object error at {path}: {detail}"),
             },
         }
@@ -3430,8 +3437,9 @@ pub fn sandbox_write(options: SandboxWriteOptions) -> Result<(), CliError> {
     let bytes = sandbox_write_input_bytes(&options.input)?;
     match options.execution {
         SandboxMetadataExecution::Local => {
-            let mut event_store =
-                sinomo_events::JsonlEventStore::new(data_dir.root().join("events/event-log.jsonl"));
+            let mut event_store = sinomo_core::events::JsonlEventStore::new(
+                data_dir.root().join("events/event-log.jsonl"),
+            );
             sandbox_write_with_store_and_event_store(
                 options,
                 bytes,
@@ -3476,7 +3484,7 @@ pub fn sandbox_fetch(options: SandboxFetchOptions) -> Result<(), CliError> {
     };
     let transport = DaemonMediatedSandboxHttpTransport { address: address };
     let mut event_store =
-        sinomo_events::JsonlEventStore::new(data_dir.root().join("events/event-log.jsonl"));
+        sinomo_core::events::JsonlEventStore::new(data_dir.root().join("events/event-log.jsonl"));
     let _ = sandbox_fetch_with_store_transport_and_event_store(
         options,
         &sandbox_store_from_data_dir(&data_dir),
@@ -3589,7 +3597,7 @@ pub fn sandbox_doctor_findings_with_stores_and_events(
     store: &crate::LocalSandboxInstanceStore,
     toolchain_store: &crate::LocalSandboxToolchainStore,
     policy: &crate::SandboxPolicy,
-    resource_events: &[sinomo_events::StoredEvent],
+    resource_events: &[sinomo_core::events::StoredEvent],
 ) -> Result<Vec<SandboxDoctorFinding>, CliError> {
     let mut findings = Vec::new();
     findings.push(SandboxDoctorFinding::info(
@@ -3917,21 +3925,21 @@ fn append_sandbox_doctor_coding_toolchain_findings(
 
 fn sandbox_doctor_audit_events(
     data_dir: &SinomoDataDir,
-) -> Result<Vec<sinomo_events::StoredEvent>, CliError> {
+) -> Result<Vec<sinomo_core::events::StoredEvent>, CliError> {
     let event_path = data_dir.root().join("events").join("event-log.jsonl");
     if !event_path.exists() {
         return Ok(Vec::new());
     }
-    let event_store = sinomo_events::JsonlEventStore::new(event_path);
-    let mut query = sinomo_events::ReplayQuery::by_kind_prefix("sandbox.").limit(32);
-    query.direction = sinomo_events::ReplayDirection::Reverse;
+    let event_store = sinomo_core::events::JsonlEventStore::new(event_path);
+    let mut query = sinomo_core::events::ReplayQuery::by_kind_prefix("sandbox.").limit(32);
+    query.direction = sinomo_core::events::ReplayDirection::Reverse;
     event_store.replay(query).map_err(CliError::from)
 }
 
 fn append_sandbox_doctor_audit_findings(
     findings: &mut Vec<SandboxDoctorFinding>,
     sandbox_id: Option<&crate::SandboxId>,
-    events: &[sinomo_events::StoredEvent],
+    events: &[sinomo_core::events::StoredEvent],
 ) {
     for event in events {
         if !sandbox_doctor_event_matches_sandbox(event, sandbox_id) {
@@ -3946,7 +3954,7 @@ fn append_sandbox_doctor_audit_findings(
 }
 
 fn sandbox_doctor_event_matches_sandbox(
-    event: &sinomo_events::StoredEvent,
+    event: &sinomo_core::events::StoredEvent,
     sandbox_id: Option<&crate::SandboxId>,
 ) -> bool {
     let Some(sandbox_id) = sandbox_id else {
@@ -3957,7 +3965,7 @@ fn sandbox_doctor_event_matches_sandbox(
 
 fn append_sandbox_doctor_policy_finding(
     findings: &mut Vec<SandboxDoctorFinding>,
-    event: &sinomo_events::StoredEvent,
+    event: &sinomo_core::events::StoredEvent,
 ) {
     let event_sandbox_id = event.event.payload["sandbox_id"].as_str();
     let scope = event_sandbox_id
@@ -3974,7 +3982,7 @@ fn append_sandbox_doctor_policy_finding(
 
 fn append_sandbox_doctor_resource_finding(
     findings: &mut Vec<SandboxDoctorFinding>,
-    event: &sinomo_events::StoredEvent,
+    event: &sinomo_core::events::StoredEvent,
 ) {
     let event_sandbox_id = event.event.payload["sandbox_id"]
         .as_str()
@@ -4086,7 +4094,7 @@ pub fn sandbox_policy_uses_cluster(data_dir: &SinomoDataDir) -> bool {
     if cli_force_local_mode() {
         return false;
     }
-    network::read_cluster_state(&ClusterPaths::new(data_dir)).is_ok()
+    sinomo_core::cluster::read_cluster_state(&ClusterPaths::new(data_dir)).is_ok()
 }
 
 pub fn load_sandbox_policy_config_for_node(
@@ -4113,7 +4121,7 @@ pub fn write_sandbox_policy_config_for_node(
     paths.ensure()?;
     let txn = crate::sandbox_policy_config_cluster_kv_txn(config)?;
     commit_sandbox_policy_cluster_txn(data_dir, txn)?;
-    Ok(paths.kv_snapshot)
+    Ok(paths.kv_paths().snapshot)
 }
 
 fn local_sandbox_policy_config_path(data_dir: &SinomoDataDir) -> PathBuf {
@@ -4192,9 +4200,8 @@ fn sandbox_policy_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, C
     }
     #[cfg(test)]
     {
-        return sinomo_kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
-            .map_err(network::NetworkError::from)
-            .map_err(Into::into);
+        return sinomo_core::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+            .map_err(SandboxCliError::Kv);
     }
     #[cfg(not(test))]
     {
@@ -4207,16 +4214,20 @@ fn sandbox_policy_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, C
 #[cfg(test)]
 fn commit_sandbox_policy_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Result<(), CliError> {
     let paths = ClusterPaths::new(data_dir);
-    let snapshot =
-        sinomo_kv::read_cluster_kv_cached_snapshot(&paths.kv_paths()).unwrap_or_else(|_| {
-            sinomo_kv::InProcessKvStore::new()
+    let snapshot = sinomo_core::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+        .unwrap_or_else(|_| {
+            sinomo_core::kv::InProcessKvStore::new()
                 .snapshot()
                 .expect("snapshot")
         });
-    let mut store = sinomo_kv::InProcessKvStore::restore(snapshot)?;
-    let _: KvTxnResponse = store.txn(txn)?;
-    sinomo_kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot().expect("snapshot"))
-        .map_err(network::NetworkError::from)?;
+    let mut store =
+        sinomo_core::kv::InProcessKvStore::restore(snapshot).map_err(SandboxCliError::Kv)?;
+    let _: KvTxnResponse = store.txn(txn).map_err(SandboxCliError::Kv)?;
+    sinomo_core::kv::write_cluster_kv_snapshot(
+        &paths.kv_paths(),
+        &store.snapshot().expect("snapshot"),
+    )
+    .map_err(SandboxCliError::Kv)?;
     Ok(())
 }
 
@@ -4232,7 +4243,7 @@ fn commit_sandbox_policy_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Re
         });
     };
     let request = network::ObjectRpcRequest::encode_body(
-        sinomo_kv::CLUSTER_KV_TXN_ROUTE,
+        sinomo_core::kv::CLUSTER_KV_TXN_ROUTE,
         CLUSTER_KV_RPC_CATEGORY,
         &txn,
     )
@@ -5508,7 +5519,7 @@ fn sandbox_module_artifact_write_rollout_material_if_requested(
         return Ok(None);
     };
     let bundle = read_sandbox_module_candidate_bundle_manifest(&options.candidate_bundle_path)?;
-    let identity = sinomo_node::load_or_create_main_node_identity(data_dir_root)?;
+    let identity = sinomo_core::node::load_or_create_main_node_identity(data_dir_root)?;
     let candidate_bundle_ref = format!("candidate-bundle://{}", bundle.job_id);
     let registry_artifact_evidence_ref = format!("registry://artifact-evidence/{}", bundle.job_id);
     let sandbox_artifact_ref = format!("sandbox://module-artifact/{artifact_id}");
@@ -7273,7 +7284,7 @@ pub fn sandbox_write_with_store(
     bytes: Vec<u8>,
     store: &crate::LocalSandboxInstanceStore,
 ) -> Result<(), CliError> {
-    let mut event_store = sinomo_events::InMemoryEventStore::new();
+    let mut event_store = sinomo_core::events::InMemoryEventStore::new();
     sandbox_write_with_store_and_event_store(options, bytes, store, &mut event_store)
 }
 

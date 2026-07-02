@@ -255,7 +255,12 @@ pub struct ClusterKvRaftLeaderElectionOptions {
 }
 
 pub trait ClusterKvRaftLeaderElectionHost {
-    type Error: From<KvError>;
+    type Error;
+
+    /// Wraps a KV store error in the host's error type. Replaces the old
+    /// `From<KvError>` bound so host error types in other crates do not need
+    /// orphan-rule-breaking `From` impls.
+    fn kv_error(error: KvError) -> Self::Error;
 
     fn begin_election_attempt(&mut self) -> Result<(), Self::Error> {
         Ok(())
@@ -289,22 +294,11 @@ pub fn cluster_kv_raft_quorum_size(voter_count: usize) -> usize {
 }
 
 pub fn cluster_kv_member_has_raft_vote(member: &ClusterMemberRecord) -> bool {
-    matches!(member.state, ClusterMemberState::Voter)
-        || (matches!(member.state, ClusterMemberState::Active)
-            && matches!(member.role, ClusterMemberRole::Voter))
+    member.has_raft_vote()
 }
 
 pub fn cluster_kv_raft_node_is_voter(state: &ClusterBootstrapState, node_id: &NodeId) -> bool {
-    state.members.iter().any(|member| {
-        member.node_id == *node_id
-            && member.cluster_id == state.cluster_id
-            && member.state.is_authorized()
-            && cluster_kv_member_has_raft_vote(member)
-            && member
-                .capabilities
-                .iter()
-                .any(|capability| capability.as_str() == sinomo_node::DAEMON_MAIN_RUN_CAPABILITY)
-    })
+    state.node_is_raft_voter(node_id)
 }
 
 pub fn cluster_kv_raft_candidate_is_authorized_voter(
@@ -475,7 +469,7 @@ pub fn elect_cluster_kv_raft_leader_with_host<H>(
 where
     H: ClusterKvRaftLeaderElectionHost,
 {
-    let voter_ids = RaftNodeIdSet::from_iter(voter_ids, "collect raft election voters")?;
+    let voter_ids = RaftNodeIdSet::from_iter(voter_ids, "collect raft election voters").map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?;
     if !voter_ids.contains(local_node_id) {
         return Ok(false);
     }
@@ -483,7 +477,7 @@ where
     let mut remote_vote_targets_vec = Vec::new();
     for voter_id in remote_vote_targets {
         if voter_id != *local_node_id && voter_ids.contains(&voter_id) {
-            try_reserve_kv_items(&mut remote_vote_targets_vec, 1, "collect raft vote targets")?;
+            try_reserve_kv_items(&mut remote_vote_targets_vec, 1, "collect raft vote targets").map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?;
             remote_vote_targets_vec.push(voter_id);
         }
     }
@@ -497,7 +491,7 @@ where
             .saturating_add(CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP);
         let vote_request = RaftRequestVoteRequest {
             term: election_term,
-            candidate_id: try_clone_kv_node_id(local_node_id, "build raft election vote request")?,
+            candidate_id: try_clone_kv_node_id(local_node_id, "build raft election vote request").map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?,
             last_log_index: metadata.last_log_index,
             last_log_term: metadata.last_log_term,
         };
@@ -506,14 +500,14 @@ where
             candidate_id: try_clone_kv_node_id(
                 &vote_request.candidate_id,
                 "apply local raft vote",
-            )?,
+            ).map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?,
             last_log_index: vote_request.last_log_index,
             last_log_term: vote_request.last_log_term,
         })?;
         let mut highest_observed_term = local_vote.term.max(election_term);
         let mut granted = RaftNodeIdSet::default();
         if local_vote.vote_granted {
-            granted.try_insert_clone(local_node_id, "record local raft vote")?;
+            granted.try_insert_clone(local_node_id, "record local raft vote").map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?;
         }
 
         for (target_index, voter_id) in remote_vote_targets.iter().enumerate() {
@@ -529,7 +523,7 @@ where
             };
             highest_observed_term = highest_observed_term.max(response.term);
             if response.vote_granted {
-                granted.try_insert_clone(voter_id, "record remote raft vote")?;
+                granted.try_insert_clone(voter_id, "record remote raft vote").map_err(<H as ClusterKvRaftLeaderElectionHost>::kv_error)?;
             }
         }
 
@@ -547,7 +541,12 @@ where
 }
 
 pub trait ClusterKvRaftLeaderElectionAsyncHost {
-    type Error: From<KvError>;
+    type Error;
+
+    /// Wraps a KV store error in the host's error type. Replaces the old
+    /// `From<KvError>` bound so host error types in other crates do not need
+    /// orphan-rule-breaking `From` impls.
+    fn kv_error(error: KvError) -> Self::Error;
 
     fn begin_election_attempt_async<'a>(
         &'a mut self,
@@ -592,7 +591,7 @@ pub async fn elect_cluster_kv_raft_leader_async_with_host<H>(
 where
     H: ClusterKvRaftLeaderElectionAsyncHost,
 {
-    let voter_ids = RaftNodeIdSet::from_iter(voter_ids, "collect async raft election voters")?;
+    let voter_ids = RaftNodeIdSet::from_iter(voter_ids, "collect async raft election voters").map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?;
     if !voter_ids.contains(local_node_id) {
         return Ok(false);
     }
@@ -604,7 +603,7 @@ where
                 &mut remote_vote_targets_vec,
                 1,
                 "collect async raft vote targets",
-            )?;
+            ).map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?;
             remote_vote_targets_vec.push(voter_id);
         }
     }
@@ -621,7 +620,7 @@ where
             candidate_id: try_clone_kv_node_id(
                 local_node_id,
                 "build async raft election vote request",
-            )?,
+            ).map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?,
             last_log_index: metadata.last_log_index,
             last_log_term: metadata.last_log_term,
         };
@@ -631,7 +630,7 @@ where
                 candidate_id: try_clone_kv_node_id(
                     &vote_request.candidate_id,
                     "apply local async raft vote",
-                )?,
+                ).map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?,
                 last_log_index: vote_request.last_log_index,
                 last_log_term: vote_request.last_log_term,
             })
@@ -639,7 +638,7 @@ where
         let mut highest_observed_term = local_vote.term.max(election_term);
         let mut granted = RaftNodeIdSet::default();
         if local_vote.vote_granted {
-            granted.try_insert_clone(local_node_id, "record local async raft vote")?;
+            granted.try_insert_clone(local_node_id, "record local async raft vote").map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?;
         }
 
         for (target_index, voter_id) in remote_vote_targets.iter().enumerate() {
@@ -657,7 +656,7 @@ where
             };
             highest_observed_term = highest_observed_term.max(response.term);
             if response.vote_granted {
-                granted.try_insert_clone(voter_id, "record remote async raft vote")?;
+                granted.try_insert_clone(voter_id, "record remote async raft vote").map_err(<H as ClusterKvRaftLeaderElectionAsyncHost>::kv_error)?;
             }
         }
 
@@ -679,7 +678,12 @@ where
 /// Implementors own KV/Raft durability only. They must not choose peers, route
 /// messages, score endpoints, or interpret the cluster connectivity graph.
 pub trait ClusterKvRaftCommandStorage {
-    type Error: From<KvError>;
+    type Error;
+
+    /// Wraps a KV store error in the host's error type. Replaces the old
+    /// `From<KvError>` bound so host error types in other crates do not need
+    /// orphan-rule-breaking `From` impls.
+    fn kv_error(error: KvError) -> Self::Error;
 
     /// Locks the whole commit sequence against concurrent committers (see
     /// [`lock_cluster_kv_commit_sequence`]). Hosts backed by a shared on-disk
@@ -748,7 +752,12 @@ pub struct ClusterKvRaftAppendReplicationOutcome {
 /// append backoff, acceptance detection, and watch-event fanout eligibility.
 /// Hosts own durability access and transport-specific timeout/sending policy.
 pub trait ClusterKvRaftAppendReplicationHost {
-    type Error: From<KvError>;
+    type Error;
+
+    /// Wraps a KV store error in the host's error type. Replaces the old
+    /// `From<KvError>` bound so host error types in other crates do not need
+    /// orphan-rule-breaking `From` impls.
+    fn kv_error(error: KvError) -> Self::Error;
     type Target: Clone;
 
     fn last_local_raft_log_index(
@@ -782,7 +791,12 @@ pub trait ClusterKvRaftAppendReplicationHost {
 }
 
 pub trait ClusterKvRaftAppendReplicationAsyncHost {
-    type Error: From<KvError>;
+    type Error;
+
+    /// Wraps a KV store error in the host's error type. Replaces the old
+    /// `From<KvError>` bound so host error types in other crates do not need
+    /// orphan-rule-breaking `From` impls.
+    fn kv_error(error: KvError) -> Self::Error;
     type Target: Clone + Send + Sync;
 
     fn last_local_raft_log_index_async<'a>(
@@ -1008,7 +1022,12 @@ pub trait ClusterKvRaftQuorumCommitHost: ClusterKvRaftCommandStorage {
 /// cross an async storage or transport boundary is supplied by the caller. KV
 /// still owns the quorum decision flow; the host owns transport and topology.
 pub trait ClusterKvRaftQuorumCommitAsyncHost {
-    type Error: From<KvError> + ToString;
+    type Error: ToString;
+
+    /// Wraps a KV store error in the host's error type. Replaces the old
+    /// `From<KvError>` bound so host error types in other crates do not need
+    /// orphan-rule-breaking `From` impls.
+    fn kv_error(error: KvError) -> Self::Error;
     type Target: Clone + Send + Sync;
 
     /// Async counterpart of
@@ -1108,7 +1127,7 @@ where
 
     let mut voter_acks = RaftNodeIdSet::default();
     if cluster_kv_raft_local_is_voter(state) {
-        voter_acks.try_insert_clone(&state.local_node_id, "record local raft commit ack")?;
+        voter_acks.try_insert_clone(&state.local_node_id, "record local raft commit ack").map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?;
     }
     let quorum_size = cluster_kv_raft_quorum_size_for_state(state);
     let mut failures = Vec::new();
@@ -1140,7 +1159,7 @@ where
                 voter_acks.try_insert_clone(
                     host.target_node_id(target),
                     "record remote raft commit ack",
-                )?;
+                ).map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?;
                 host.observe_accepted_append_state(state, target, response.state)?;
             }
             Ok(response) => {
@@ -1228,7 +1247,7 @@ where
 
     let mut voter_acks = RaftNodeIdSet::default();
     if cluster_kv_raft_local_is_voter(state) {
-        voter_acks.try_insert_clone(&state.local_node_id, "record local async raft commit ack")?;
+        voter_acks.try_insert_clone(&state.local_node_id, "record local async raft commit ack").map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
     }
     let quorum_size = cluster_kv_raft_quorum_size_for_state(state);
     let mut failures = Vec::new();
@@ -1264,7 +1283,7 @@ where
                 voter_acks.try_insert_clone(
                     host.target_node_id(target),
                     "record remote async raft commit ack",
-                )?;
+                ).map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
                 host.observe_accepted_append_state_async(state, target, response.state)
                     .await?;
             }
@@ -1339,7 +1358,12 @@ pub struct ClusterKvTxnQuorumDriverOptions {
 }
 
 pub trait ClusterKvTxnQuorumHost {
-    type Error: From<KvError> + ToString;
+    type Error: ToString;
+
+    /// Wraps a KV store error in the host's error type. Replaces the old
+    /// `From<KvError>` bound so host error types in other crates do not need
+    /// orphan-rule-breaking `From` impls.
+    fn kv_error(error: KvError) -> Self::Error;
 
     fn refresh_current_cluster_kv_store(
         &mut self,
@@ -1381,7 +1405,12 @@ pub trait ClusterKvTxnQuorumHost {
 }
 
 pub trait ClusterKvTxnQuorumAsyncHost {
-    type Error: From<KvError> + ToString;
+    type Error: ToString;
+
+    /// Wraps a KV store error in the host's error type. Replaces the old
+    /// `From<KvError>` bound so host error types in other crates do not need
+    /// orphan-rule-breaking `From` impls.
+    fn kv_error(error: KvError) -> Self::Error;
 
     fn refresh_current_cluster_kv_store_async<'a>(
         &'a mut self,
@@ -2513,6 +2542,10 @@ where
     F: FnMut(&str) -> bool,
 {
     type Error = KvError;
+
+    fn kv_error(error: KvError) -> Self::Error {
+        error
+    }
 
     fn append_cluster_raft_command_uncommitted_or_no_effect(
         &mut self,

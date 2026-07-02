@@ -1,4 +1,4 @@
-use sinomo_core::{ClusterBootstrapState, ClusterNodeRole};
+use sinomo_base::{ClusterBootstrapState, ClusterNodeRole};
 use std::time::{Duration, Instant};
 
 pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;

@@ -5,13 +5,13 @@ mod runtime;
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sinomo_core::service::{
+    Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
+    ServiceRegistryBuilder, ServiceRoute,
+};
 use sinomo_core::{
     Confidence, EventEnvelope, EventKind, Id, LatencyClass, PrivacyClass, RoutingMetadata,
     RoutingScope, Salience, Source, TrustRing,
-};
-use sinomo_service::{
-    Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
-    ServiceRegistryBuilder, ServiceRoute,
 };
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -806,9 +806,9 @@ pub fn set_observe_module_enabled(
 }
 
 pub fn register_storage_paths(
-    layout: &mut sinomo_storage::StorageLayout,
-) -> Result<(), sinomo_storage::StorageContractError> {
-    use sinomo_storage::StorageRing;
+    layout: &mut sinomo_core::storage::StorageLayout,
+) -> Result<(), sinomo_core::storage::StorageContractError> {
+    use sinomo_core::storage::StorageRing;
 
     for relative_path in [
         OPERATIONAL_EVENTS_RELATIVE_PATH,
@@ -865,7 +865,7 @@ impl Service for ObserveService {
     fn handle(
         &self,
         mut ctx: ServiceContext,
-        request: sinomo_network::ObjectRpcRequest,
+        request: sinomo_core::network::ObjectRpcRequest,
     ) -> ServiceFuture<'_> {
         Box::pin(async move {
             let response = match request.route.as_str() {
@@ -873,7 +873,7 @@ impl Service for ObserveService {
                     let request: ObserveEventsRequest = request.decode_body()?;
                     let records = read_operational_events(ctx.data_dir.root(), &request.into())
                         .map_err(service_error)?;
-                    sinomo_network::ObjectRpcResponse::encode_body(
+                    sinomo_core::network::ObjectRpcResponse::encode_body(
                         OBSERVE_EVENTS_ROUTE,
                         &ObserveEventsResponse { records },
                     )?
@@ -882,28 +882,28 @@ impl Service for ObserveService {
                     let request: ObserveLogsRequest = request.decode_body()?;
                     let records = read_operational_logs(ctx.data_dir.root(), &request.into())
                         .map_err(service_error)?;
-                    sinomo_network::ObjectRpcResponse::encode_body(
+                    sinomo_core::network::ObjectRpcResponse::encode_body(
                         OBSERVE_LOGS_ROUTE,
                         &ObserveLogsResponse { records },
                     )?
                 }
                 OBSERVE_METRICS_ROUTE => {
                     let request: ObserveMetricsRequest = request.decode_body()?;
-                    sinomo_network::ObjectRpcResponse::encode_body(
+                    sinomo_core::network::ObjectRpcResponse::encode_body(
                         OBSERVE_METRICS_ROUTE,
                         &read_observe_metrics_for_data_dir(ctx.data_dir.as_ref(), &request),
                     )?
                 }
                 OBSERVE_TRACES_ROUTE => {
                     let request: ObserveTracesRequest = request.decode_body()?;
-                    sinomo_network::ObjectRpcResponse::encode_body(
+                    sinomo_core::network::ObjectRpcResponse::encode_body(
                         OBSERVE_TRACES_ROUTE,
                         &read_observe_traces(&request),
                     )?
                 }
                 OBSERVE_CONTROL_ROUTE => {
                     let request: ObserveControlRequest = request.decode_body()?;
-                    sinomo_network::ObjectRpcResponse::encode_body(
+                    sinomo_core::network::ObjectRpcResponse::encode_body(
                         OBSERVE_CONTROL_ROUTE,
                         &update_observe_control(request).map_err(service_error)?,
                     )?
@@ -940,7 +940,7 @@ fn service_error(error: ObserveError) -> ServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_service::ServiceRegistry;
+    use sinomo_core::service::ServiceRegistry;
 
     #[test]
     fn observe_service_route_metadata_matches_module_surfaces() {

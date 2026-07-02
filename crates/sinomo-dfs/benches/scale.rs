@@ -1,4 +1,6 @@
 use serde_json::json;
+use sinomo_core::network::InProcessNetwork;
+use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_dfs::{
     DfsFileSystem, DfsFileSystemId, DfsMessageTransport, DfsMetadataShardId, DfsNamespaceJobStatus,
@@ -6,8 +8,6 @@ use sinomo_dfs::{
     DfsReplicationPolicy, DfsVersion, DfsWriteOptions, LocalContentStore, LocalSobjMetadataBackend,
     NetworkedDfsRangeReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
 };
-use sinomo_network::InProcessNetwork;
-use sinomo_node::NodeId;
 use std::env;
 use std::fs;
 use std::io::{Read, Result as IoResult};

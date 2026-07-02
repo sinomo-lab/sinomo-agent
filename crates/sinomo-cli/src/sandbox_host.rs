@@ -1,4 +1,6 @@
 use super::*;
+#[allow(unused_imports)]
+use sinomo_runtime::cluster::ClusterKvPathsExt;
 use std::{path::Path, sync::Arc, time::Duration};
 
 #[derive(Debug, Default)]
@@ -52,7 +54,7 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
     {
         Some(
             sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
-                .map_err(sinomo_runtime::network::NetworkError::from)
+                .map_err(sinomo_runtime::network::NetworkError::directory)
                 .map_err(Into::into),
         )
     }
@@ -77,7 +79,8 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
                 &paths.kv_paths(),
                 &store.snapshot().expect("snapshot"),
             )
-            .map_err(sinomo_runtime::network::NetworkError::from)?;
+            .map_err(sinomo_runtime::network::NetworkError::directory)
+            .map_err(sinomo_runtime::network::NetworkError::directory)?;
             Ok(())
         })();
         Some(result)

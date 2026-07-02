@@ -1,4 +1,7 @@
 use super::*;
+#[allow(unused_imports)]
+use sinomo_runtime::cluster;
+use sinomo_runtime::cluster::ClusterKvPathsExt;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DaemonCliCommand {
@@ -552,7 +555,7 @@ pub(crate) fn cli_current_cluster_kv_store(
     state: &ClusterBootstrapState,
 ) -> Result<InProcessKvStore, network::NetworkError> {
     let mut driver = cli_cluster_control_plane_driver();
-    network::refresh_current_cluster_kv_store_with_host(
+    cluster::refresh_current_cluster_kv_store_with_host(
         paths,
         state,
         cli_cluster_kv_snapshot_refresh_options(),
@@ -574,7 +577,7 @@ pub(crate) fn cli_commit_cluster_kv_txn_with_quorum_response(
     txn: KvTxn,
 ) -> Result<sinomo_runtime::kv::ClusterKvTxnCommitResult, network::NetworkError> {
     let mut driver = cli_cluster_control_plane_driver();
-    network::commit_cluster_kv_txn_with_quorum_response_with_host(
+    cluster::commit_cluster_kv_txn_with_quorum_response_with_host(
         paths,
         state,
         txn,
@@ -594,7 +597,7 @@ pub(crate) fn handle_daemon_cluster_kv_txn_request(
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
     let state =
-        network::read_cluster_state_without_kv(&cluster_paths).map_err(|error| match error {
+        cluster::read_cluster_state_without_kv(&cluster_paths).map_err(|error| match error {
             network::NetworkError::ClusterOrphan => CliError::ClusterReadOnly {
                 detail: "local node has no cluster state".to_string(),
             },
@@ -602,7 +605,7 @@ pub(crate) fn handle_daemon_cluster_kv_txn_request(
         })?;
     let mut state = state;
     let mut driver = cli_cluster_control_plane_driver();
-    let result = network::commit_cluster_kv_txn_with_quorum_response_with_host(
+    let result = cluster::commit_cluster_kv_txn_with_quorum_response_with_host(
         &cluster_paths,
         &mut state,
         txn,
@@ -622,8 +625,8 @@ pub(crate) fn handle_daemon_cluster_kv_txn_request(
 }
 
 fn cli_cluster_control_plane_driver()
--> network::ClusterControlPlaneDriver<CliClusterControlPlaneTransport> {
-    network::ClusterControlPlaneDriver::with_timeouts(
+-> cluster::ClusterControlPlaneDriver<CliClusterControlPlaneTransport> {
+    cluster::ClusterControlPlaneDriver::with_timeouts(
         CliClusterControlPlaneTransport,
         cli_cluster_control_plane_timeouts(),
     )
@@ -631,7 +634,7 @@ fn cli_cluster_control_plane_driver()
 
 struct CliClusterControlPlaneTransport;
 
-impl network::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
+impl cluster::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
     fn send_kv_replication(
         &mut self,
         endpoint: &ClusterEndpointRecord,
@@ -664,7 +667,8 @@ impl network::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
         endpoint: &ClusterEndpointRecord,
         timeout: Duration,
     ) -> Result<KvSnapshot, network::NetworkError> {
-        let request = cluster_kv_snapshot_rpc_request()?;
+        let request = cluster_kv_snapshot_rpc_request()
+            .map_err(sinomo_runtime::network::NetworkError::directory)?;
         let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
             .map_err(|error| cli_daemon_rpc_network_error("cluster kv snapshot refresh", error))?;
         decode_cluster_kv_snapshot_rpc_response(&response)
@@ -715,8 +719,8 @@ impl network::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
     }
 }
 
-fn cli_cluster_control_plane_timeouts() -> network::ClusterControlPlaneTimeouts {
-    network::ClusterControlPlaneTimeouts {
+fn cli_cluster_control_plane_timeouts() -> cluster::ClusterControlPlaneTimeouts {
+    cluster::ClusterControlPlaneTimeouts {
         max_raft_append_attempts: 3,
         raft_append_timeout: Duration::from_secs(10),
         rpc_timeout: Duration::from_secs(5),
@@ -729,7 +733,7 @@ fn cli_cluster_control_plane_timeouts() -> network::ClusterControlPlaneTimeouts 
     }
 }
 
-fn cli_cluster_kv_txn_quorum_options(allow_forwarding: bool) -> network::ClusterKvTxnQuorumOptions {
+fn cli_cluster_kv_txn_quorum_options(allow_forwarding: bool) -> cluster::ClusterKvTxnQuorumOptions {
     cli_cluster_control_plane_timeouts()
         .kv_txn_quorum_options(allow_forwarding)
         .with_state_authority_reachability_options(
@@ -737,7 +741,7 @@ fn cli_cluster_kv_txn_quorum_options(allow_forwarding: bool) -> network::Cluster
         )
 }
 
-fn cli_cluster_kv_snapshot_refresh_options() -> network::ClusterKvSnapshotRefreshOptions {
+fn cli_cluster_kv_snapshot_refresh_options() -> cluster::ClusterKvSnapshotRefreshOptions {
     cli_cluster_control_plane_timeouts().kv_snapshot_refresh_options()
 }
 
@@ -746,14 +750,15 @@ fn cli_send_cluster_raft_append(
     request: &sinomo_runtime::kv::ClusterRaftAppendRequest,
     timeout: Duration,
 ) -> Result<sinomo_runtime::kv::ClusterRaftAppendResponse, network::NetworkError> {
-    let payload = sinomo_runtime::kv::cluster_raft_append_rpc_payload(request)?;
+    let payload = sinomo_runtime::kv::cluster_raft_append_rpc_payload(request)
+        .map_err(sinomo_runtime::network::NetworkError::directory)?;
     let rpc_request =
         network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)
         .map_err(|error| cli_daemon_rpc_network_error("cluster raft append", error))?;
     response.error_detail()?;
     sinomo_runtime::kv::decode_cluster_raft_append_rpc_response_body(&response.body)
-        .map_err(Into::into)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
 }
 
 fn cli_send_cluster_raft_vote(
@@ -761,14 +766,15 @@ fn cli_send_cluster_raft_vote(
     request: &sinomo_runtime::kv::ClusterRaftVoteRequest,
     timeout: Duration,
 ) -> Result<sinomo_runtime::kv::ClusterRaftVoteResponse, network::NetworkError> {
-    let payload = sinomo_runtime::kv::cluster_raft_vote_rpc_payload(request)?;
+    let payload = sinomo_runtime::kv::cluster_raft_vote_rpc_payload(request)
+        .map_err(sinomo_runtime::network::NetworkError::directory)?;
     let rpc_request =
         network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)
         .map_err(|error| cli_daemon_rpc_network_error("cluster raft vote", error))?;
     response.error_detail()?;
     sinomo_runtime::kv::decode_cluster_raft_vote_rpc_response_body(&response.body)
-        .map_err(Into::into)
+        .map_err(sinomo_runtime::network::NetworkError::directory)
 }
 
 fn cli_daemon_rpc_network_error(
@@ -791,7 +797,7 @@ pub(crate) fn handle_daemon_cluster_join_request(
         detail: "daemon paths have no data directory parent".to_string(),
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    network::handle_cluster_join_registration_request_with_host(
+    cluster::handle_cluster_join_registration_request_with_host(
         &cluster_paths,
         request,
         OffsetDateTime::now_utc(),
@@ -804,7 +810,7 @@ pub(crate) fn handle_daemon_cluster_join_request(
 struct CliClusterJoinRegistrationHost;
 
 #[cfg(test)]
-impl network::ClusterJoinRegistrationHost for CliClusterJoinRegistrationHost {
+impl cluster::ClusterJoinRegistrationHost for CliClusterJoinRegistrationHost {
     fn call_node_object_rpc(
         &mut self,
         _state: &ClusterBootstrapState,
@@ -822,7 +828,7 @@ impl network::ClusterJoinRegistrationHost for CliClusterJoinRegistrationHost {
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<KvSnapshot, network::NetworkError> {
-        network::sync_cluster_state_to_local_kv_unchecked(paths, state)
+        cluster::sync_cluster_state_to_local_kv_unchecked(paths, state)
     }
 }
 

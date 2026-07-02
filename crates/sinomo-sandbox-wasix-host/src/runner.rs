@@ -144,7 +144,7 @@ impl SandboxWasixModuleCommandRunner {
         argv: Vec<String>,
         stdin: Option<Vec<u8>>,
         timeout_ms: u64,
-        execution_node_id: &sinomo_node::NodeId,
+        execution_node_id: &sinomo_core::node::NodeId,
         policy: &SandboxPolicy,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         self.run_toolchain_command_with_stdin_policy_and_output_sink(
@@ -171,7 +171,7 @@ impl SandboxWasixModuleCommandRunner {
         argv: Vec<String>,
         stdin: Option<Vec<u8>>,
         timeout_ms: u64,
-        execution_node_id: &sinomo_node::NodeId,
+        execution_node_id: &sinomo_core::node::NodeId,
         policy: &SandboxPolicy,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
@@ -200,7 +200,7 @@ impl SandboxWasixModuleCommandRunner {
         argv: Vec<String>,
         stdin: Option<Vec<u8>>,
         timeout_ms: u64,
-        execution_node_id: &sinomo_node::NodeId,
+        execution_node_id: &sinomo_core::node::NodeId,
         policy: &SandboxPolicy,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
         cancellation_token: SandboxCancellationToken,
@@ -232,7 +232,7 @@ impl SandboxWasixModuleCommandRunner {
         argv: Vec<String>,
         stdin: Option<Vec<u8>>,
         timeout_ms: u64,
-        execution_node_id: &sinomo_node::NodeId,
+        execution_node_id: &sinomo_core::node::NodeId,
         policy: &SandboxPolicy,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
         cwd_override: Option<SandboxPath>,
@@ -265,7 +265,7 @@ impl SandboxWasixModuleCommandRunner {
         argv: Vec<String>,
         stdin: Option<Vec<u8>>,
         timeout_ms: u64,
-        execution_node_id: &sinomo_node::NodeId,
+        execution_node_id: &sinomo_core::node::NodeId,
         policy: &SandboxPolicy,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
         cwd_override: Option<SandboxPath>,
@@ -318,7 +318,7 @@ impl SandboxWasixModuleCommandRunner {
         argv: Vec<String>,
         stdin: Option<Vec<u8>>,
         timeout_ms: u64,
-        execution_node_id: &sinomo_node::NodeId,
+        execution_node_id: &sinomo_core::node::NodeId,
         policy: &SandboxPolicy,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
         cwd_override: Option<SandboxPath>,
@@ -575,7 +575,7 @@ impl SandboxWasixModuleCommandRunner {
         sandbox_id: &SandboxId,
         plan: &SandboxProcessPlan,
         timeout_ms: u64,
-        execution_node_id: &sinomo_node::NodeId,
+        execution_node_id: &sinomo_core::node::NodeId,
         policy: &SandboxPolicy,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
     ) -> Result<SandboxProcessPlanOutcome, SandboxCommandExecutionError> {
@@ -600,7 +600,7 @@ impl SandboxWasixModuleCommandRunner {
         sandbox_id: &SandboxId,
         plan: &SandboxProcessPlan,
         timeout_ms: u64,
-        execution_node_id: &sinomo_node::NodeId,
+        execution_node_id: &sinomo_core::node::NodeId,
         policy: &SandboxPolicy,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
         cancellation_token: SandboxCancellationToken,
@@ -676,7 +676,7 @@ impl SandboxWasixModuleCommandRunner {
         store: &LocalSandboxInstanceStore,
         toolchain_store: &LocalSandboxToolchainStore,
         sandbox_id: &SandboxId,
-        execution_node_id: &sinomo_node::NodeId,
+        execution_node_id: &sinomo_core::node::NodeId,
         policy: &SandboxPolicy,
         cases: &[SandboxBusyBoxFidelityCase],
     ) -> Result<Vec<SandboxToolFidelityResult>, SandboxToolFidelityError> {
@@ -773,7 +773,7 @@ pub struct SandboxWasixSifsProcessPlanOutcome<T> {
 
 pub struct SandboxWasixSifsCommandRunner {
     local_runner: SandboxWasixModuleCommandRunner,
-    replica_candidates: Vec<sinomo_node::NodeId>,
+    replica_candidates: Vec<sinomo_core::node::NodeId>,
 }
 
 impl SandboxWasixSifsCommandRunner {
@@ -786,7 +786,10 @@ impl SandboxWasixSifsCommandRunner {
         })
     }
 
-    pub fn with_replica_candidates(mut self, replica_candidates: Vec<sinomo_node::NodeId>) -> Self {
+    pub fn with_replica_candidates(
+        mut self,
+        replica_candidates: Vec<sinomo_core::node::NodeId>,
+    ) -> Self {
         self.replica_candidates = replica_candidates;
         self.replica_candidates.sort();
         self.replica_candidates.dedup();
@@ -961,7 +964,7 @@ impl SandboxWasixSifsCommandRunner {
     ) -> Result<
         (
             NetworkedDfsService<T>,
-            sinomo_node::NodeId,
+            sinomo_core::node::NodeId,
             SandboxInstanceManifest,
             LocalSandboxToolchainStore,
         ),

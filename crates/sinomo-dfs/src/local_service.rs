@@ -5,9 +5,9 @@
 
 use std::collections::BTreeMap;
 
+use sinomo_core::events::EventId;
+use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
-use sinomo_events::EventId;
-use sinomo_node::NodeId;
 
 use crate::{
     DfsError, DfsFileSystem, DfsMessageTransport, DfsMetadataStore, DfsNetworkMessage, DfsObjectId,

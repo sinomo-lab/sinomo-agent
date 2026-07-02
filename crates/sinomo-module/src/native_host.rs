@@ -52,6 +52,74 @@ pub trait NativeModuleHostCallbacks: Send + Sync {
     }
 }
 
+/// Content-verified raw dynamic-library handle for trusted modules that
+/// export entry points beyond the six standard module symbols (e.g. the
+/// network-module vtable entry). Unlike [`NativeModule`], it resolves no
+/// symbols and calls no lifecycle hooks by itself.
+///
+/// The handle keeps the `libloading::Library` alive: every symbol resolved
+/// through [`NativeLibrary::symbol`] (and everything reachable from it, such
+/// as vtable function pointers an entry symbol returns) is only valid while
+/// this value lives. Hosts that hand resolved pointers to long-lived
+/// registries must keep the `NativeLibrary` alive alongside them (e.g. boxed
+/// as an adapter's keep-alive token).
+pub struct NativeLibrary {
+    library: Library,
+    path: PathBuf,
+}
+
+impl NativeLibrary {
+    /// Load a trusted library from a content-addressed path, verifying the
+    /// blake3 content hash first (same verification as
+    /// [`NativeModule::load_from_content_addressed_path`]).
+    ///
+    /// # Safety
+    ///
+    /// The loaded library can execute arbitrary native code in the host
+    /// process (static initializers run at load time).
+    pub unsafe fn load_from_content_addressed_path(
+        library_path: impl AsRef<Path>,
+        expected_content_hash: &str,
+    ) -> Result<Self, NativeModuleHostError> {
+        let library_path = library_path.as_ref();
+        verify_native_module_hash(library_path, expected_content_hash)?;
+        unsafe { Self::load_verified(library_path) }
+    }
+
+    /// Load a library after the caller has already verified its bytes.
+    ///
+    /// # Safety
+    ///
+    /// The same trust requirements as
+    /// [`Self::load_from_content_addressed_path`] apply.
+    pub unsafe fn load_verified(
+        library_path: impl AsRef<Path>,
+    ) -> Result<Self, NativeModuleHostError> {
+        let library_path = library_path.as_ref();
+        let library = unsafe { load_native_module_library(library_path) }?;
+        Ok(Self {
+            library,
+            path: library_path.to_path_buf(),
+        })
+    }
+
+    /// Resolve a typed symbol by name. `name` may or may not include the
+    /// trailing NUL byte (`libloading` appends one when missing).
+    ///
+    /// # Safety
+    ///
+    /// `T` must match the symbol's actual type in the library; the resolved
+    /// value must not be used after this `NativeLibrary` is dropped.
+    pub unsafe fn symbol<T: Copy>(&self, name: &[u8]) -> Result<T, NativeModuleHostError> {
+        unsafe { load_symbol::<T>(&self.library, name, &self.path) }
+    }
+
+    /// The path this library was loaded from (diagnostics).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 pub struct NativeModule {
     _library: Library,
     descriptor: NativeModuleDescriptor,

@@ -199,7 +199,7 @@ mod tests {
             file_system_id: file_system_id(),
             object_id: object_id(),
             version: version(),
-            replica_node_id: sinomo_node::NodeId::from_legacy_named("node_replica")
+            replica_node_id: sinomo_core::node::NodeId::from_legacy_named("node_replica")
                 .expect("valid node"),
         });
 
