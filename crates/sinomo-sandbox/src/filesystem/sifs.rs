@@ -10,6 +10,7 @@ pub struct SifsSandboxFileSystem<T: DfsMessageTransport> {
     mounts: Vec<SandboxMount>,
     temp_epoch: u64,
     replica_candidates: Vec<NodeId>,
+    symlink_target_cache: BTreeMap<String, PathBuf>,
 }
 
 impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
@@ -21,6 +22,7 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
             mounts: manifest.mounts.clone(),
             temp_epoch: manifest.temp_epoch,
             replica_candidates,
+            symlink_target_cache: BTreeMap::new(),
         }
     }
 
@@ -295,9 +297,13 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
     fn read_sifs_path(
         &mut self,
         sifs_path: &str,
-        _update_access: bool,
+        update_access: bool,
     ) -> Result<Vec<u8>, DfsPosixError> {
-        self.dfs.posix_read_file_distributed(sifs_path)
+        if update_access {
+            self.dfs.posix_read_file_update_access(sifs_path)
+        } else {
+            self.dfs.posix_read_file_distributed(sifs_path)
+        }
     }
 
     fn read_sifs_file_mut(
@@ -318,14 +324,23 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
     fn readlink_sifs_path_mut(
         &mut self,
         path: &SandboxPath,
-        _update_access: bool,
+        update_access: bool,
     ) -> Result<PathBuf, SandboxFsError> {
         self.process_incoming_dfs_messages(path)?;
         let sifs_path = self.sifs_path(path);
-        self.dfs
-            .posix_readlink_distributed(&sifs_path)
+        if !update_access && let Some(target) = self.symlink_target_cache.get(&sifs_path) {
+            return Ok(target.clone());
+        }
+        let result = if update_access {
+            self.dfs.posix_readlink_update_access(&sifs_path)
+        } else {
+            self.dfs.posix_readlink_distributed(&sifs_path)
+        };
+        let target = result
             .map(PathBuf::from)
-            .map_err(|error| sandbox_fs_error_from_dfs(path, error))
+            .map_err(|error| sandbox_fs_error_from_dfs(path, error))?;
+        self.symlink_target_cache.insert(sifs_path, target.clone());
+        Ok(target)
     }
 
     fn ensure_parent_dir(&mut self, path: &SandboxPath) -> Result<(), SandboxFsError> {
@@ -346,6 +361,26 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
             return Err(SandboxFsError::NotFound { path: path.clone() });
         }
         match self.dfs.posix_lstat(&self.sifs_path(path)) {
+            Ok(stat) => Ok(self.metadata_from_stat(path, stat)),
+            Err(error) => {
+                if let Some(metadata) = self.synthetic_mount_directory_metadata(path) {
+                    Ok(metadata)
+                } else {
+                    Err(sandbox_fs_error_from_dfs(path, error))
+                }
+            }
+        }
+    }
+
+    fn stat_raw_mut(&mut self, path: &SandboxPath) -> Result<SandboxMetadata, SandboxFsError> {
+        if let Some(metadata) = sandbox_virtual_device_metadata(path) {
+            return Ok(metadata);
+        }
+        if sandbox_path_is_dev_tree(path) {
+            return Err(SandboxFsError::NotFound { path: path.clone() });
+        }
+        self.process_incoming_dfs_messages(path)?;
+        match self.dfs.posix_lstat_distributed(&self.sifs_path(path)) {
             Ok(stat) => Ok(self.metadata_from_stat(path, stat)),
             Err(error) => {
                 if let Some(metadata) = self.synthetic_mount_directory_metadata(path) {
@@ -477,7 +512,7 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
                     resolved = candidate;
                     continue;
                 }
-                match self.stat_raw(&candidate) {
+                match self.stat_raw_mut(&candidate) {
                     Ok(metadata) if metadata.is_symlink => {
                         let target = self.readlink_sifs_path_mut(&candidate, false)?;
                         current = self.resolve_symlink_target(&candidate, &target)?;
@@ -551,7 +586,7 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
         let resolved_parent = self.resolve_path_mut(&parent, true)?;
         self.ensure_writable_path(&parent)?;
         self.ensure_writable_path(&resolved_parent)?;
-        let metadata = self.stat_raw(&resolved_parent)?;
+        let metadata = self.stat_raw_mut(&resolved_parent)?;
         if !metadata.is_dir {
             return Err(SandboxFsError::NotDirectory { path: parent });
         }
@@ -589,7 +624,7 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
         &mut self,
         path: &SandboxPath,
     ) -> Result<(), SandboxFsError> {
-        match self.stat_raw(path) {
+        match self.stat_raw_mut(path) {
             Ok(metadata) if metadata.is_dir => {
                 Err(SandboxFsError::IsDirectory { path: path.clone() })
             }
@@ -617,7 +652,7 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
             .filter(|component| !component.is_empty())
         {
             current = current.join(component)?;
-            match self.stat_raw(&current) {
+            match self.stat_raw_mut(&current) {
                 Ok(metadata) if metadata.is_dir => {
                     if !sandbox_mode_allows_directory_search(metadata.mode) {
                         return Err(SandboxFsError::ReadOnly {
@@ -813,7 +848,7 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
 
     fn stat_mut(&mut self, path: &SandboxPath) -> Result<SandboxMetadata, SandboxFsError> {
         let resolved = self.resolve_path_mut(path, false)?;
-        let mut metadata = self.stat_raw(&resolved)?;
+        let mut metadata = self.stat_raw_mut(&resolved)?;
         metadata.path = path.clone();
         Ok(metadata)
     }
@@ -830,7 +865,7 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
         path: &SandboxPath,
     ) -> Result<SandboxMetadata, SandboxFsError> {
         let resolved = self.resolve_path_unchecked_mut(path, false)?;
-        let mut metadata = self.stat_raw(&resolved)?;
+        let mut metadata = self.stat_raw_mut(&resolved)?;
         metadata.path = path.clone();
         Ok(metadata)
     }
@@ -844,7 +879,7 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
 
     fn stat_follow_mut(&mut self, path: &SandboxPath) -> Result<SandboxMetadata, SandboxFsError> {
         let resolved = self.resolve_path_mut(path, true)?;
-        let mut metadata = self.stat_raw(&resolved)?;
+        let mut metadata = self.stat_raw_mut(&resolved)?;
         metadata.path = path.clone();
         Ok(metadata)
     }
@@ -861,7 +896,7 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
         path: &SandboxPath,
     ) -> Result<SandboxMetadata, SandboxFsError> {
         let resolved = self.resolve_path_unchecked_mut(path, true)?;
-        let mut metadata = self.stat_raw(&resolved)?;
+        let mut metadata = self.stat_raw_mut(&resolved)?;
         metadata.path = path.clone();
         Ok(metadata)
     }
@@ -1026,7 +1061,7 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
             return Err(SandboxFsError::NotFound { path: path.clone() });
         }
         self.ensure_file_allows_read(&resolved)?;
-        self.read_sifs_file_mut(path, &resolved, range, false)
+        self.read_sifs_file_mut(path, &resolved, range, true)
     }
 
     fn read_unchecked_update_access(
@@ -1047,7 +1082,7 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
         if sandbox_path_is_dev_tree(&resolved) {
             return Err(SandboxFsError::NotFound { path: path.clone() });
         }
-        self.read_sifs_file_mut(path, &resolved, range, false)
+        self.read_sifs_file_mut(path, &resolved, range, true)
     }
 
     fn create_dir(&mut self, path: &SandboxPath) -> Result<(), SandboxFsError> {
@@ -1100,7 +1135,7 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
             return Err(SandboxFsError::ReadOnly { path: path.clone() });
         }
         let resolved = self.resolve_path_mut(path, true)?;
-        match self.stat_raw(&resolved) {
+        match self.stat_raw_mut(&resolved) {
             Ok(metadata) if metadata.is_dir => return Ok(()),
             Ok(_) => return Err(SandboxFsError::NotDirectory { path: path.clone() }),
             Err(SandboxFsError::NotFound { .. }) => {}
@@ -1381,6 +1416,10 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
         if self.synthetic_mount_directory_metadata(&resolved).is_some() {
             return Ok(entries);
         }
+        self.dfs
+            .posix_list_dir_update_access(&self.sifs_path(&resolved))
+            .map(|_| ())
+            .map_err(|error| sandbox_fs_error_from_dfs(path, error))?;
         Ok(entries)
     }
 
@@ -1586,7 +1625,9 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
                 &self.sifs_path(&resolved_from),
                 &self.sifs_path(&resolved_to),
             )
-            .map(|_| ())
+            .map(|_| {
+                self.symlink_target_cache.clear();
+            })
             .map_err(|error| sandbox_fs_error_from_dfs(from, error))
     }
 
@@ -1610,7 +1651,9 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
             Ok(_) => self
                 .dfs
                 .posix_unlink(&self.sifs_path(&resolved))
-                .map(|_| ())
+                .map(|_| {
+                    self.symlink_target_cache.clear();
+                })
                 .map_err(|error| sandbox_fs_error_from_dfs(path, error)),
             Err(error) => Err(sandbox_fs_error_from_dfs(path, error)),
         }
@@ -1659,7 +1702,7 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
             return Err(SandboxFsError::NotFound { path: path.clone() });
         }
         let resolved = self.resolve_path_mut(path, false)?;
-        self.readlink_sifs_path_mut(&resolved, false)
+        self.readlink_sifs_path_mut(&resolved, true)
     }
 
     fn symlink(&mut self, target: &Path, link_path: &SandboxPath) -> Result<(), SandboxFsError> {
@@ -1683,7 +1726,9 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
                 &self.sifs_path(&resolved_link_path),
                 self.write_options(),
             )
-            .map(|_| ())
+            .map(|_| {
+                self.symlink_target_cache.clear();
+            })
             .map_err(|error| sandbox_fs_error_from_dfs(link_path, error))
     }
 

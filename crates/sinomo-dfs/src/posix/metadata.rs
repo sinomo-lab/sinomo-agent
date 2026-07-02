@@ -450,19 +450,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         object_id: &DfsObjectId,
     ) -> Result<Option<DfsObjectMetadata>> {
-        if let Some(backend) = self.metadata_backend.as_ref()
-            && let Some(object) = backend.get_object(object_id)?
-        {
-            return self
-                .object_metadata_with_receipt_locations(object)
-                .map(Some)
-                .map_err(Into::into);
-        }
-        self.metadata
-            .object(object_id)
-            .cloned()
-            .map(|object| self.object_metadata_with_receipt_locations(object))
-            .transpose()
+        let memory_object = self.metadata.object(object_id).cloned();
+        let backend_object = if let Some(backend) = self.metadata_backend.as_ref() {
+            backend.get_object(object_id)?
+        } else {
+            None
+        };
+        let object = match (memory_object.as_ref(), backend_object.as_ref()) {
+            (None, None) => return Ok(None),
+            _ => self.resolve_authoritative_object_metadata(
+                object_id,
+                memory_object.as_ref(),
+                backend_object.as_ref(),
+            )?,
+        };
+        self.object_metadata_with_receipt_locations(object)
+            .map(Some)
             .map_err(Into::into)
     }
 

@@ -85,8 +85,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     Some(&backend_object),
                 )
             {
+                self.coordinator.set_committed_version(
+                    memory_object.file_system_id.clone(),
+                    memory_object.object_id.clone(),
+                    memory_object.version.clone(),
+                );
                 return Ok(memory_object.clone());
             }
+            self.coordinator.set_committed_version(
+                backend_object.file_system_id.clone(),
+                backend_object.object_id.clone(),
+                backend_object.version.clone(),
+            );
             self.metadata.add_object(backend_object.clone())?;
             return Ok(backend_object);
         }
