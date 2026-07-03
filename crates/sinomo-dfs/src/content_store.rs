@@ -44,6 +44,7 @@ const CONTENT_STORE_STATS_VERSION: u32 = 1;
 const CONTENT_STORE_STATS_FILE: &str = "stats.sobj";
 const CONTENT_STORE_STATS_LOCK_FILE: &str = "stats.lock";
 const STREAMED_OBJECT_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
+const STREAMED_BLOB_ONLY_MIN_BYTES: usize = 1024 * 1024;
 
 fn content_store_perf_trace(args: std::fmt::Arguments<'_>) {
     tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "dfs content store perf");
@@ -703,6 +704,17 @@ impl LocalContentStore {
             sync_dir(&dir)?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_deferred_durable_blob_count(&self) -> Result<usize> {
+        self.deferred_durable_blobs
+            .lock()
+            .map(|blobs| blobs.len())
+            .map_err(|_| ContentStoreError::Io {
+                path: self.root.clone(),
+                source: io::Error::other("deferred durable blob lock is poisoned"),
+            })
     }
 
     pub fn put_object_version_from_reader<R: Read>(
@@ -1904,12 +1916,12 @@ impl LocalContentStore {
         durability: BlobOnlyDurability,
     ) -> Result<ContentManifest> {
         let trace_started = Instant::now();
-        let hash_started = Instant::now();
-        let hash = content_hash(bytes);
-        let hash_ms = hash_started.elapsed().as_millis();
         let manifest_check_started = Instant::now();
         let manifest_path = self.manifest_path(object_id, version);
         if manifest_path.is_file() {
+            let hash_started = Instant::now();
+            let hash = content_hash(bytes);
+            let hash_ms = hash_started.elapsed().as_millis();
             let existing = decode_manifest(&read_file(&manifest_path)?)?;
             if existing.content_hash != hash {
                 return Err(ContentStoreError::VersionHashConflict {
@@ -1932,6 +1944,23 @@ impl LocalContentStore {
         }
         let manifest_check_ms = manifest_check_started.elapsed().as_millis();
 
+        if durability == BlobOnlyDurability::Deferred
+            && !self.tracks_stats_deltas()
+            && self.quota.is_none()
+            && bytes.len() >= STREAMED_BLOB_ONLY_MIN_BYTES
+        {
+            return self.write_object_version_blob_only_streamed_deferred(
+                object_id,
+                version,
+                bytes,
+                manifest_check_ms,
+                trace_started,
+            );
+        }
+
+        let hash_started = Instant::now();
+        let hash = content_hash(bytes);
+        let hash_ms = hash_started.elapsed().as_millis();
         let blob_path = self.blob_path(&hash)?;
         let manifest = ContentManifest {
             object_id: object_id.to_owned(),
@@ -1985,6 +2014,115 @@ impl LocalContentStore {
             trace_started.elapsed().as_millis()
         ));
         Ok(manifest)
+    }
+
+    fn write_object_version_blob_only_streamed_deferred(
+        &self,
+        object_id: &str,
+        version: &str,
+        bytes: &[u8],
+        manifest_check_ms: u128,
+        trace_started: Instant,
+    ) -> Result<ContentManifest> {
+        let tmp_anchor = self.root.join("blob-tmp").join("blob-only");
+        let tmp_path = temporary_path_for(&tmp_anchor);
+        let result = (|| {
+            if let Some(parent) = tmp_path.parent() {
+                create_dir_all(parent.to_owned())?;
+            }
+            let stream_started = Instant::now();
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .map_err(|source| ContentStoreError::Io {
+                    path: tmp_path.clone(),
+                    source,
+                })?;
+            let mut hasher = blake3::Hasher::new();
+            for chunk in bytes.chunks(STREAMED_OBJECT_WRITE_BUFFER_BYTES) {
+                hasher.update(chunk);
+                file.write_all(chunk)
+                    .map_err(|source| ContentStoreError::Io {
+                        path: tmp_path.clone(),
+                        source,
+                    })?;
+            }
+            drop(file);
+            let stream_hash_write_ms = stream_started.elapsed().as_millis();
+            let hash = format!("{HASH_PREFIX}{}", hasher.finalize().to_hex());
+            let blob_path = self.blob_path(&hash)?;
+            let manifest = ContentManifest {
+                object_id: object_id.to_owned(),
+                version: version.to_owned(),
+                content_hash: hash,
+                size_bytes: bytes.len() as u64,
+                extents: Vec::new(),
+            };
+
+            let create_dir_started = Instant::now();
+            if let Some(parent) = blob_path.parent() {
+                create_dir_all(parent.to_owned())?;
+            }
+            let create_dir_ms = create_dir_started.elapsed().as_millis();
+
+            let publish_started = Instant::now();
+            let mut blob_exists = false;
+            if blob_path.is_file() {
+                if file_content_hash(&blob_path).is_ok_and(|actual| actual == manifest.content_hash)
+                {
+                    remove_file_if_exists(&tmp_path)?;
+                    blob_exists = true;
+                } else {
+                    remove_file_if_exists(&blob_path)?;
+                }
+            }
+            if !blob_exists {
+                match fs::hard_link(&tmp_path, &blob_path) {
+                    Ok(()) => {
+                        remove_file_if_exists(&tmp_path)?;
+                        if let Some(parent) = blob_path.parent() {
+                            self.defer_durable_blob_sync(blob_path.clone(), parent.to_path_buf())?;
+                        }
+                    }
+                    Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                        let actual = file_content_hash(&blob_path)?;
+                        if actual != manifest.content_hash {
+                            return Err(ContentStoreError::BlobHashMismatch {
+                                expected: manifest.content_hash,
+                                actual,
+                            });
+                        }
+                        remove_file_if_exists(&tmp_path)?;
+                        blob_exists = true;
+                    }
+                    Err(source) => {
+                        return Err(ContentStoreError::Io {
+                            path: blob_path.clone(),
+                            source,
+                        });
+                    }
+                }
+            }
+            let publish_ms = publish_started.elapsed().as_millis();
+            content_store_perf_trace(format_args!(
+                "blob-only-write-streamed object={} version={} bytes={} existing_manifest=false blob_exists={} manifest_check_ms={} stream_hash_write_ms={} create_dir_ms={} publish_ms={} total_ms={}",
+                object_id,
+                version,
+                bytes.len(),
+                blob_exists,
+                manifest_check_ms,
+                stream_hash_write_ms,
+                create_dir_ms,
+                publish_ms,
+                trace_started.elapsed().as_millis()
+            ));
+            Ok(manifest)
+        })();
+        if result.is_err() {
+            remove_file_if_exists(&tmp_path).ok();
+        }
+        result
     }
 
     fn write_small_object_versions_batch<'a>(
@@ -4017,6 +4155,36 @@ mod tests {
                 .expect("read invalidated packed cache")
                 .is_some(),
             "same-process packed writes must invalidate the cached index"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn packed_blob_index_cache_observes_external_writer() {
+        let root = temp_root("packed_blob_index_cache_observes_external_writer");
+        let reader = LocalContentStore::new(&root).expect("reader store");
+        let writer = LocalContentStore::new(&root).expect("writer store");
+
+        let first = writer
+            .put_object_version("object-packed-external-a", "v1", b"packed external alpha")
+            .expect("put first packed object");
+        assert_eq!(
+            reader
+                .read_blob(&first.content_hash)
+                .expect("read first packed blob"),
+            b"packed external alpha"
+        );
+
+        let second = writer
+            .put_object_version("object-packed-external-b", "v1", b"packed external bravo")
+            .expect("put second packed object");
+        assert_eq!(
+            reader
+                .read_blob(&second.content_hash)
+                .expect("reader must observe externally updated packed index"),
+            b"packed external bravo",
+            "packed index cache must not hide blobs written by another process"
         );
 
         cleanup(&root);

@@ -34,6 +34,8 @@ pub struct ClusterJoinRegistrationResponse {
     pub state: ClusterBootstrapState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_snapshot: Option<KvSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responder_node_id: Option<NodeId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -242,12 +242,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
-            if let Some(object) = self.lookup_sifs_path(&resolved)?
-                && object.kind != DfsObjectKind::Tombstone
-            {
-                return Ok((resolved, Some(object)));
-            }
+            let local_object = self.lookup_sifs_path(&resolved)?;
             let Some(shard) = self.routed_namespace_shard_for_path_cached(&resolved)? else {
+                if let Some(object) = local_object
+                    && object.kind != DfsObjectKind::Tombstone
+                {
+                    return Ok((resolved, Some(object)));
+                }
                 break;
             };
             if shard.primary_node_id != self.node_id {
@@ -260,13 +261,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     Ok(Some(object)) if object.kind != DfsObjectKind::Tombstone => {
                         return Ok((resolved, Some(object)));
                     }
-                    Ok(_) if self.is_local_metadata_replica_for_shard(&shard) => break,
-                    Ok(_) => break,
+                    Ok(Some(object)) => return Ok((resolved, Some(object))),
+                    Ok(None) => return Ok((resolved, None)),
                     Err(error) if self.is_local_metadata_replica_for_shard(&shard) => {
                         return Err(error.into());
                     }
                     Err(_) => {}
                 }
+            }
+            if let Some(object) = local_object
+                && object.kind != DfsObjectKind::Tombstone
+            {
+                return Ok((resolved, Some(object)));
             }
             if self.is_local_metadata_replica_for_shard(&shard) {
                 break;
@@ -295,10 +301,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
     ) -> Result<()> {
+        let file_system_id = sifs_file_system_id();
         let mut primary = primary_node_id;
         for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
             let routed = match self.route_namespace_operation_to_metadata_primary(
-                sifs_file_system_id(),
+                file_system_id.clone(),
                 primary.clone(),
                 operation.clone(),
             ) {
@@ -329,7 +336,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         return self.execute_namespace_operation_local(&operation);
                     }
                     Some(current) if current != primary => {
-                        primary = current;
+                        primary = self
+                            .refreshed_primary_after_authority_redirect(
+                                &file_system_id,
+                                &operation,
+                                &primary,
+                                current,
+                            )
+                            .map_err(DfsPosixError::Dfs)?;
+                        if primary == self.node_id {
+                            return self.execute_namespace_operation_local(&operation);
+                        }
                     }
                     _ => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
                 },
@@ -347,11 +364,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
     ) -> Result<()> {
+        let file_system_id = sifs_file_system_id();
         let mut primary = primary_node_id;
         for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
             let routed = match self
                 .route_namespace_operation_to_metadata_primary_without_local_replay(
-                    sifs_file_system_id(),
+                    file_system_id.clone(),
                     primary.clone(),
                     operation.clone(),
                 ) {
@@ -381,7 +399,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         return self.execute_namespace_operation_local(&operation);
                     }
                     Some(current) if current != primary => {
-                        primary = current;
+                        primary = self
+                            .refreshed_primary_after_authority_redirect(
+                                &file_system_id,
+                                &operation,
+                                &primary,
+                                current,
+                            )
+                            .map_err(DfsPosixError::Dfs)?;
+                        if primary == self.node_id {
+                            return self.execute_namespace_operation_local(&operation);
+                        }
                     }
                     _ => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
                 },

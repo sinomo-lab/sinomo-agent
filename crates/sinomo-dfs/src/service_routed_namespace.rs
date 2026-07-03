@@ -537,8 +537,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     current_primary_node_id: Some(current),
                     ..
                 } if current != primary => {
-                    self.cached_sifs_metadata_shards = None;
-                    primary = current;
+                    let next_primary = self.refreshed_primary_after_authority_redirect(
+                        &file_system_id,
+                        &operation,
+                        &primary,
+                        current,
+                    )?;
+                    if next_primary == self.node_id {
+                        return self
+                            .synced_namespace_object_for_operation(&file_system_id, &operation);
+                    }
+                    primary = next_primary;
                 }
                 DfsNamespaceResult::Rejected { reason, .. } => {
                     return Err(DfsError::Distributed { message: reason });
@@ -588,8 +597,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     current_primary_node_id: Some(current),
                     ..
                 } if current != primary => {
-                    self.cached_sifs_metadata_shards = None;
-                    primary = current;
+                    let next_primary = self.refreshed_primary_after_authority_redirect(
+                        &file_system_id,
+                        &operation,
+                        &primary,
+                        current,
+                    )?;
+                    if next_primary == self.node_id {
+                        return self
+                            .synced_namespace_objects_for_operation(&file_system_id, &operation);
+                    }
+                    primary = next_primary;
                 }
                 DfsNamespaceResult::Rejected { reason, .. } => {
                     return Err(DfsError::Distributed { message: reason });
@@ -619,6 +637,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 false,
             )?
             .result)
+    }
+
+    pub(crate) fn refreshed_primary_after_authority_redirect(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        operation: &DfsNamespaceOperation,
+        attempted_primary: &NodeId,
+        redirected_primary: NodeId,
+    ) -> Result<NodeId, DfsError> {
+        self.cached_sifs_metadata_shards = None;
+        Ok(
+            match self
+                .refreshed_single_primary_for_namespace_operation(file_system_id, operation)?
+            {
+                Some(refreshed_primary) if refreshed_primary != *attempted_primary => {
+                    refreshed_primary
+                }
+                _ => redirected_primary,
+            },
+        )
+    }
+
+    fn refreshed_single_primary_for_namespace_operation(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        operation: &DfsNamespaceOperation,
+    ) -> Result<Option<NodeId>, DfsError> {
+        let shards = self.affected_namespace_shards(file_system_id, operation)?;
+        let Some(first) = shards.first().map(|shard| shard.primary_node_id.clone()) else {
+            return Ok(None);
+        };
+        if shards.iter().all(|shard| shard.primary_node_id == first) {
+            Ok(Some(first))
+        } else {
+            Ok(None)
+        }
     }
 
     fn route_namespace_operation_to_metadata_primary_with_timeout_and_options(

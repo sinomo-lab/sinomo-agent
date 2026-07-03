@@ -142,12 +142,11 @@ pub(super) fn print_cluster_help() {
     println!(
         "      First boot only: with no daemon and no cluster state, initializes directly (--cluster-id/--node-id apply only there)."
     );
-    println!("  sinomo cluster invite [--output <path>]");
     println!(
-        "      Create a portable join invite through the running daemon (requires `sinomo daemon start`)."
+        "  sinomo cluster invite [--introducer <host:port>] [--ttl-seconds <seconds>] [--output <path>]"
     );
     println!(
-        "      The daemon publishes its own advertised introducers; --introducer/--ttl-seconds are not supported through the daemon yet."
+        "      Create a portable join invite through the running daemon (defaults to daemon-advertised introducers)."
     );
     println!("  sinomo cluster join <invite> [--name <name>]");
     println!(

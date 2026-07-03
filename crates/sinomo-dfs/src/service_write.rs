@@ -129,7 +129,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 );
             }
         }
-        self.content.flush_deferred_durable_dirs()?;
+        if !detach_request {
+            self.content.flush_deferred_durable_dirs()?;
+        }
         self.write_distributed_eventual_from_remote_manifest_with_base(
             request,
             expected_base_version,

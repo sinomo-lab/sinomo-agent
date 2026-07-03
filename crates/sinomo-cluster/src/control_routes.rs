@@ -121,10 +121,17 @@ pub struct ClusterControlJoinResponse {
     pub accepted_endpoint: Option<String>,
 }
 
-/// Create and publish a cluster join invite with daemon-default introducers
-/// and TTL.
+/// Create and publish a cluster join invite.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterControlInviteRequest {}
+pub struct ClusterControlInviteRequest {
+    /// Optional TTL override in seconds. When omitted, the daemon default is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<i64>,
+    /// Optional introducer address overrides. When empty, daemon-default
+    /// advertised introducers are used.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub introducers: Vec<String>,
+}
 
 /// A freshly published invite.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

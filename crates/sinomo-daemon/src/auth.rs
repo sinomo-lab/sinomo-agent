@@ -577,6 +577,11 @@ fn authorize_daemon_signer(
     {
         return Ok(authority);
     }
+    if let Some(authority) =
+        authorize_join_relay_signer_from_local_state(paths, request, envelope, &envelope_public_key)
+    {
+        return Ok(authority);
+    }
     Err(DaemonError::AuthDenied)
 }
 
@@ -611,6 +616,45 @@ fn authorize_daemon_signer_after_membership_refresh(
     replace_cached_daemon_auth_verifier_context(data_dir, None);
     let verifier = cached_daemon_auth_verifier_context(data_dir).ok()?;
     verifier_authority_for_signer(&verifier, &envelope.node_id, envelope_public_key)
+}
+
+fn authorize_join_relay_signer_from_local_state(
+    paths: &DaemonPaths,
+    request: &sinomo_core::network::ObjectRpcRequest,
+    envelope: &SignedDaemonCommand,
+    envelope_public_key: &str,
+) -> Option<DaemonSignerAuthority> {
+    if request.route != sinomo_core::network::CLUSTER_RELAY_ROUTE {
+        return None;
+    }
+    let inner_route = sinomo_core::network::relay_request_inner_route(request).ok()?;
+    if !matches!(
+        inner_route.as_str(),
+        route if route == sinomo_core::network::CLUSTER_JOIN_CHALLENGE_ROUTE
+            || route == sinomo_core::network::CLUSTER_JOIN_REGISTER_ROUTE
+    ) {
+        return None;
+    }
+    let data_dir = paths.root.parent()?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).ok()?;
+    if sinomo_core::network::cluster_state_needs_join_registration(&state) {
+        return None;
+    }
+    state
+        .members
+        .iter()
+        .find(|member| {
+            member.state.is_authorized()
+                && member.node_id.to_string() == envelope.node_id
+                && member.node_public_key == envelope_public_key
+        })
+        .or_else(|| {
+            state.members.iter().find(|member| {
+                member.state.is_authorized() && member.node_public_key == envelope_public_key
+            })
+        })
+        .map(signer_authority_for_member)
 }
 
 fn load_uncached_daemon_auth_verifier_context(
@@ -1176,6 +1220,99 @@ mod tests {
             DaemonSignerAuthority::StatusProbe,
         );
         assert!(authorize_authenticated_daemon_command(&cluster_health).is_err());
+    }
+
+    #[test]
+    fn join_relay_local_state_fallback_authorizes_join_challenge_bridge_member() {
+        let data_root = unique_auth_test_root("sinomo-daemon-auth-join-challenge-relay");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let daemon_paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let local_identity = load_or_create_main_node_identity(&data_root).expect("local identity");
+        let peer_root = unique_auth_test_root("sinomo-daemon-auth-join-challenge-relay-peer");
+        let peer_identity = load_or_create_main_node_identity(&peer_root).expect("peer identity");
+        let peer_public_key =
+            daemon_auth_decode_public_key(&peer_identity.public_key).expect("peer public key");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_auth_join_relay")
+                .expect("cluster id");
+        let local_node = sinomo_core::Id::from_legacy_named("node_daemon_auth_join_relay_local")
+            .expect("local node");
+        let peer_node = sinomo_core::Id::from_legacy_named("node_daemon_auth_join_relay_peer")
+            .expect("peer node");
+        let now = OffsetDateTime::now_utc();
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "auth-join-relay",
+            local_node.clone(),
+            "local",
+            local_identity.public_key,
+            now,
+        );
+        let mut peer = ClusterMemberRecord::pending_learner(
+            cluster_id.clone(),
+            peer_node.clone(),
+            "peer",
+            peer_identity.public_key.clone(),
+            now,
+        );
+        peer.state = ClusterMemberState::Learner;
+        state.members.push(peer);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write accepted state");
+
+        let inner = sinomo_core::network::ObjectRpcRequest::encode_body(
+            sinomo_core::network::CLUSTER_JOIN_CHALLENGE_ROUTE,
+            sinomo_core::network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+            &(),
+        )
+        .expect("join challenge request");
+        #[derive(serde::Serialize)]
+        struct TestRelayEnvelope {
+            cluster_id: sinomo_core::node::ClusterId,
+            target_node_id: sinomo_core::node::NodeId,
+            ttl: u8,
+            visited: Vec<sinomo_core::node::NodeId>,
+            planned_path: Vec<sinomo_core::node::NodeId>,
+            target_endpoints: Vec<sinomo_core::ClusterEndpointRecord>,
+            max_hop_timeout_ms: Option<u64>,
+            inner: sinomo_core::network::ObjectRpcRequest,
+        }
+
+        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
+            sinomo_core::network::CLUSTER_RELAY_ROUTE,
+            sinomo_core::network::CLUSTER_ROUTING_RPC_CATEGORY,
+            &TestRelayEnvelope {
+                cluster_id,
+                target_node_id: local_node,
+                ttl: 8,
+                visited: Vec::new(),
+                planned_path: Vec::new(),
+                target_endpoints: Vec::new(),
+                max_hop_timeout_ms: None,
+                inner,
+            },
+        )
+        .expect("relay request");
+        let envelope = SignedDaemonCommand {
+            protocol: DAEMON_AUTH_PROTOCOL.to_string(),
+            node_id: peer_node.to_string(),
+            public_key: peer_public_key,
+            timestamp: now.format(&Rfc3339).expect("timestamp"),
+            nonce: "join-challenge-relay".to_string(),
+            rpc_body_sha256: None,
+            signature: Vec::new(),
+        };
+
+        assert_eq!(
+            authorize_join_relay_signer_from_local_state(
+                &daemon_paths,
+                &request,
+                &envelope,
+                &peer_identity.public_key,
+            ),
+            Some(DaemonSignerAuthority::Member)
+        );
     }
 
     #[test]

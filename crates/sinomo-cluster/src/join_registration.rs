@@ -70,6 +70,7 @@ pub fn prepare_cluster_join_registration_response(
             detail: "invitation rejected".to_string(),
             state,
             kv_snapshot: None,
+            responder_node_id: None,
         });
     }
     if let Err(error) = crate::verify_cluster_join_invite_signature(&persisted_invite) {
@@ -78,6 +79,7 @@ pub fn prepare_cluster_join_registration_response(
             detail: format!("invite signature rejected: {error}"),
             state,
             kv_snapshot: None,
+            responder_node_id: None,
         });
     }
     if !state.members.iter().any(|member| {
@@ -93,6 +95,7 @@ pub fn prepare_cluster_join_registration_response(
             ),
             state,
             kv_snapshot: None,
+            responder_node_id: None,
         });
     }
     if persisted_invite.cluster_id != state.cluster_id {
@@ -104,6 +107,7 @@ pub fn prepare_cluster_join_registration_response(
             ),
             state,
             kv_snapshot: None,
+            responder_node_id: None,
         });
     }
     if persisted_invite.expires_at <= now {
@@ -118,6 +122,7 @@ pub fn prepare_cluster_join_registration_response(
             ),
             state,
             kv_snapshot: None,
+            responder_node_id: None,
         });
     }
     if request
@@ -130,6 +135,7 @@ pub fn prepare_cluster_join_registration_response(
             detail: "join request includes a member role not allowed by the invite".to_string(),
             state,
             kv_snapshot: None,
+            responder_node_id: None,
         });
     }
 
@@ -153,6 +159,7 @@ pub fn prepare_cluster_join_registration_response(
         detail: "join registered".to_string(),
         state: accepted_state,
         kv_snapshot: None,
+        responder_node_id: None,
     })
 }
 
@@ -200,7 +207,9 @@ pub fn handle_cluster_join_registration_request_with_host(
 
     let snapshot = host.commit_join_registration_state(paths, &prepared.state)?;
     write_cluster_state(paths, &prepared.state)?;
-    host.remember_successful_join_targets(paths, &prepared.state, &request.members)?;
+    if join_registration_should_remember_successful_targets(&prepared.state, &request.invite) {
+        host.remember_successful_join_targets(paths, &prepared.state, &request.members)?;
+    }
     prepared.kv_snapshot = Some(snapshot);
     Ok(prepared)
 }
@@ -316,8 +325,10 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
             operation: "write cluster state".to_string(),
             detail: format!("cluster state write task failed: {source}"),
         })??;
-    host.remember_successful_join_targets_async(paths, &prepared.state, &request.members)
-        .await?;
+    if join_registration_should_remember_successful_targets(&prepared.state, &request.invite) {
+        host.remember_successful_join_targets_async(paths, &prepared.state, &request.members)
+            .await?;
+    }
     prepared.kv_snapshot = Some(snapshot);
     Ok(prepared)
 }
@@ -356,7 +367,14 @@ where
         request,
     )?;
     let response = send_rpc(endpoint, &register_rpc, timeout)?;
-    response.decode_body()
+    let responder_node_id = response
+        .responder_node_id()
+        .and_then(|node_id| NodeId::new(node_id).ok());
+    let mut decoded: ClusterJoinRegistrationResponse = response.decode_body()?;
+    if decoded.responder_node_id.is_none() {
+        decoded.responder_node_id = responder_node_id;
+    }
+    Ok(decoded)
 }
 
 pub fn record_forwarded_join_registration_acceptance_with_host(
@@ -696,6 +714,7 @@ pub fn reconcile_accepted_cluster_join_response(
     endpoint: &ClusterEndpointRecord,
     response: ClusterJoinRegistrationResponse,
 ) -> Result<Option<ClusterJoinReconciliation>, NetworkError> {
+    let responder_node_id = response.responder_node_id.clone();
     if let Some(snapshot) = response.kv_snapshot {
         let snapshot = snapshot.canonicalized();
         let Some(accepted_state) =
@@ -703,10 +722,15 @@ pub fn reconcile_accepted_cluster_join_response(
         else {
             return Ok(None);
         };
+        let endpoint = accepted_join_endpoint_with_responder(
+            &accepted_state,
+            endpoint,
+            responder_node_id.as_ref(),
+        );
         return Ok(Some(apply_accepted_cluster_join_state(
             state,
             invite,
-            endpoint,
+            &endpoint,
             accepted_state,
             Some(snapshot),
         )));
@@ -718,10 +742,15 @@ pub fn reconcile_accepted_cluster_join_response(
         return Ok(None);
     }
 
+    let endpoint = accepted_join_endpoint_with_responder(
+        &response.state,
+        endpoint,
+        responder_node_id.as_ref(),
+    );
     Ok(Some(apply_accepted_cluster_join_state(
         state,
         invite,
-        endpoint,
+        &endpoint,
         response.state,
         None,
     )))
@@ -785,12 +814,51 @@ pub fn join_channel_endpoint_for_accepted_state(
             state
                 .members
                 .iter()
+                .any(|member| member.node_id == endpoint.node_id && member.state.is_authorized())
+                .then_some(&endpoint.node_id)
+        })
+        .or_else(|| {
+            state
+                .members
+                .iter()
                 .any(|member| {
                     member.node_id == invite.issuer_node_id && member.state.is_authorized()
                 })
                 .then_some(&invite.issuer_node_id)
         })
         .unwrap_or(&endpoint.node_id);
+    retarget_cluster_endpoint_to_node(endpoint, node_id)
+}
+
+fn join_registration_should_remember_successful_targets(
+    state: &ClusterBootstrapState,
+    invite: &ClusterJoinInvite,
+) -> bool {
+    let channels = crate::invite_channels_for_join_registration(invite);
+    if channels.is_empty() {
+        return true;
+    }
+    channels.into_iter().any(|channel| {
+        join_channel_endpoint_for_accepted_state(state, invite, &channel.endpoint).node_id
+            == state.local_node_id
+    })
+}
+
+fn accepted_join_endpoint_with_responder(
+    accepted_state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    responder_node_id: Option<&NodeId>,
+) -> ClusterEndpointRecord {
+    let Some(node_id) = responder_node_id else {
+        return endpoint.clone();
+    };
+    if !accepted_state
+        .members
+        .iter()
+        .any(|member| member.node_id == *node_id && member.state.is_authorized())
+    {
+        return endpoint.clone();
+    }
     retarget_cluster_endpoint_to_node(endpoint, node_id)
 }
 

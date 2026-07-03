@@ -46,6 +46,7 @@ pub use connectivity_publish::{
     cluster_network_publish_interval_for_node, expire_cluster_network_records_with_host,
     sync_cluster_connectivity_records_to_kv,
     sync_cluster_connectivity_records_to_quorum_async_with_host,
+    sync_cluster_connectivity_records_to_quorum_async_with_state_and_host,
     sync_cluster_connectivity_records_to_quorum_with_host,
 };
 pub use control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
@@ -91,7 +92,8 @@ pub use control_routes::{
 pub use health::{
     ClusterDoctorFinding, ClusterHealthRow, ClusterNetworkPingRequest, ClusterNetworkPingResponse,
     ClusterStatusAsyncProbe, ClusterStatusProbe, cluster_doctor_findings,
-    cluster_health_rows_with_probe, cluster_health_rpc_request, cluster_local_health_rpc_request,
+    cluster_health_rows_with_probe, cluster_health_rpc_request,
+    cluster_health_rpc_request_without_peer_views, cluster_local_health_rpc_request,
     cluster_network_ping_rpc_request, cluster_network_ping_rpc_request_with_response_payload,
     decode_cluster_health_rpc_response, decode_cluster_network_ping_rpc_response,
     handle_cluster_network_ping_rpc_request_for_node,
@@ -124,7 +126,11 @@ pub use join_registration::{
     record_forwarded_join_registration_acceptance_with_host,
     send_cluster_join_registration_over_membership_rpc,
 };
-pub use kv_local_store::ClusterKvPathsExt;
+pub use kv_local_store::{
+    ClusterKvPathsExt, read_cluster_kv_latest_observed_entry,
+    read_cluster_kv_latest_observed_prefix_entries, read_cluster_kv_latest_observed_snapshot,
+    read_cluster_kv_latest_observed_snapshot_arc_if_present,
+};
 pub use kv_read_model::KvClusterDirectory;
 pub use kv_read_model::{
     read_cluster_connectivity_graph_from_kv, read_cluster_members_from_kv,

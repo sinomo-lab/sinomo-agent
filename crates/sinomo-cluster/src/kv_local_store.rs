@@ -321,7 +321,7 @@ pub(crate) fn read_cluster_kv_current_or_cached_snapshot_arc_if_present(
     }
 }
 
-pub(crate) fn read_cluster_kv_latest_observed_snapshot_arc_if_present(
+pub fn read_cluster_kv_latest_observed_snapshot_arc_if_present(
     paths: &ClusterPaths,
 ) -> Result<Option<Arc<KvSnapshot>>, NetworkError> {
     let current = match read_cluster_kv_current_snapshot_arc(paths) {
@@ -335,6 +335,15 @@ pub(crate) fn read_cluster_kv_latest_observed_snapshot_arc_if_present(
         (Some(current), _) => Some(current),
         (None, cached) => cached,
     })
+}
+
+pub fn read_cluster_kv_latest_observed_snapshot(
+    paths: &ClusterPaths,
+) -> Result<KvSnapshot, NetworkError> {
+    read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)?
+        .as_deref()
+        .cloned()
+        .ok_or(NetworkError::ClusterOrphan)
 }
 
 pub(crate) fn read_cluster_kv_current_or_empty_snapshot_arc(
@@ -354,6 +363,28 @@ pub(crate) fn read_cluster_kv_entry(
 ) -> Result<Option<KvEntry>, NetworkError> {
     let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
     Ok(snapshot.get(key).cloned())
+}
+
+pub fn read_cluster_kv_latest_observed_entry(
+    paths: &ClusterPaths,
+    key: &str,
+) -> Result<Option<KvEntry>, NetworkError> {
+    let Some(snapshot) = read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)? else {
+        return Ok(None);
+    };
+    Ok(snapshot.get(key).cloned())
+}
+
+pub fn read_cluster_kv_latest_observed_prefix_entries(
+    paths: &ClusterPaths,
+    prefix: &str,
+) -> Result<Vec<KvEntry>, NetworkError> {
+    let Some(snapshot) = read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)? else {
+        return Ok(Vec::new());
+    };
+    snapshot
+        .range_prefix_limited(prefix, sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)
+        .map_err(kv_err)
 }
 
 #[cfg(any(test, feature = "test-support"))]

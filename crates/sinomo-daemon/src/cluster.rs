@@ -15,9 +15,9 @@ use crate::{
     fetch_daemon_status_from_endpoint_on_runtime, handle_daemon_rollout_build_request,
     read_daemon_status, send_cluster_kv_watch_events_async, send_cluster_member_publish_async,
     send_cluster_raft_append_async, send_cluster_raft_append_on_runtime,
-    send_cluster_raft_vote_async, send_cluster_raft_vote_on_runtime,
-    send_daemon_rpc_to_endpoint_on_runtime, write_daemon_status,
+    send_cluster_raft_vote_async, send_cluster_raft_vote_on_runtime, write_daemon_status,
 };
+#[cfg(test)]
 use sinomo_core::cluster::ClusterJoinRegistrationResponse;
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
@@ -33,15 +33,15 @@ use sinomo_core::cluster::{
     ClusterHealthRow, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
     ClusterMemberPublishRequest, ClusterMemberPublishResponse, ClusterStatusAsyncProbe,
 };
+#[cfg(test)]
+use sinomo_core::kv::KvCommand;
 use sinomo_core::kv::{
     ClusterKvRaftAppendReplicationOutcome, ClusterKvReplicationRequest,
     ClusterKvReplicationResponse, ClusterKvStateAuthorityVoteRequest,
     ClusterKvStateAuthorityVoteResponse, ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse,
     ClusterRaftAppendRequest, ClusterRaftAppendResponse,
 };
-use sinomo_core::kv::{InProcessKvStore, KvEvent, KvSnapshot, KvTxn, KvTxnResponse};
-#[cfg(test)]
-use sinomo_core::kv::{KvCommand, KvOp};
+use sinomo_core::kv::{InProcessKvStore, KvEvent, KvOp, KvSnapshot, KvTxn, KvTxnResponse};
 #[cfg(test)]
 use sinomo_core::kv::{KvCompare, KvOpResponse};
 use sinomo_core::local::SinomoDataDir;
@@ -80,7 +80,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 pub const DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const CLUSTER_HEALTH_IROH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const CLUSTER_HEALTH_ROUTED_PING_TIMEOUT: Duration = Duration::from_millis(750);
+const CLUSTER_HEALTH_DIRECT_STATUS_TIMEOUT: Duration = Duration::from_millis(750);
 pub const DAEMON_CLUSTER_TICK_INTERVAL: Duration = Duration::from_secs(15);
 #[cfg(test)]
 const DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL: Duration =
@@ -94,7 +95,12 @@ pub const DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF: Duration = Duration::from_secs
 /// publication, and a flat long backoff freezes the loser past the formation
 /// window (relay routes need connectivity records, which need relayed
 /// publishes — only fast retry breaks the cycle once the bridge publishes).
-pub const DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_secs(15);
+pub const DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const DAEMON_CLUSTER_FORMATION_CONTROL_PLANE_TIMEOUT: Duration = Duration::from_millis(1500);
+const DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT: Duration = Duration::from_millis(750);
+const DAEMON_CLUSTER_FORMATION_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(350);
+const DAEMON_CLUSTER_JOIN_CONNECTIVITY_RETRY_WINDOW: Duration = Duration::from_secs(8);
+const DAEMON_CLUSTER_JOIN_CONNECTIVITY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// Learner KV snapshot pull cadence. Convergence is event-driven — the voter
 /// pushes committed raft appends to every member on commit — so this pull is
 /// only a recovery net for lost pushes and restarts, deliberately slow to keep
@@ -212,6 +218,7 @@ pub(crate) struct ClusterConnectivityPendingProbe {
     source_node_id: NodeId,
     state: ClusterBootstrapState,
     plan: ClusterConnectivityProbePlan,
+    use_formation_timeouts: bool,
 }
 
 #[derive(Default)]
@@ -234,6 +241,7 @@ impl ClusterNetworkMaintenancePendingWork {
 struct ClusterServiceInstancePendingPublish {
     daemon_paths: DaemonPaths,
     local_node_id: NodeId,
+    use_formation_timeouts: bool,
 }
 
 struct ClusterMemberPublishPendingWork {
@@ -242,9 +250,11 @@ struct ClusterMemberPublishPendingWork {
     force_kv_snapshot_sync: bool,
 }
 
+#[derive(Clone)]
 struct ClusterNodeStatusPendingRefresh {
     paths: DaemonPaths,
     label: &'static str,
+    use_formation_timeouts: bool,
 }
 
 static PUBLISHED_NETWORK_INFO: OnceLock<Mutex<BTreeMap<String, ClusterNetworkInfoRecord>>> =
@@ -254,6 +264,8 @@ static PUBLISHED_NODE_STATUS: OnceLock<Mutex<BTreeMap<String, ClusterNodeStatusR
 static PUBLISHED_CONNECTIVITY: OnceLock<
     Mutex<BTreeMap<PublishedConnectivitySourceKey, PublishedConnectivitySourceCache>>,
 > = OnceLock::new();
+static JOIN_CONNECTIVITY_SYNC_IN_FLIGHT: OnceLock<Mutex<BTreeSet<PublishedConnectivitySourceKey>>> =
+    OnceLock::new();
 
 thread_local! {
     static COMMAND_CONNECTIVITY_SYNC_IN_FLIGHT: std::cell::Cell<bool> =
@@ -691,6 +703,30 @@ fn remember_connectivity_record_set(
     }
 }
 
+fn mark_join_connectivity_sync_in_flight(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+) -> Option<PublishedConnectivitySourceKey> {
+    let source_key = connectivity_cache_source_key(paths, source_node_id);
+    let mut guard = JOIN_CONNECTIVITY_SYNC_IN_FLIGHT
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .ok()?;
+    if guard.insert(source_key.clone()) {
+        Some(source_key)
+    } else {
+        None
+    }
+}
+
+fn clear_join_connectivity_sync_in_flight(source_key: &PublishedConnectivitySourceKey) {
+    if let Some(lock) = JOIN_CONNECTIVITY_SYNC_IN_FLIGHT.get()
+        && let Ok(mut guard) = lock.lock()
+    {
+        guard.remove(source_key);
+    }
+}
+
 fn publish_command_connectivity_if_needed(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -713,10 +749,20 @@ fn publish_join_connectivity_if_needed(
         ));
         return;
     }
+    let Some(source_key) = mark_join_connectivity_sync_in_flight(paths, &state.local_node_id)
+    else {
+        crate::cluster_join_trace(format_args!(
+            "connectivity publish source={} target={} endpoint={} skipped coalesced",
+            record.source_node_id, record.target_node_id, record.endpoint_id
+        ));
+        return;
+    };
     let paths = paths.clone();
+    let state = state.clone();
     let source_node_id = state.local_node_id.clone();
     let target_node_id = record.target_node_id.clone();
     let endpoint_id = record.endpoint_id.clone();
+    let observed_record = record.clone();
     let spawn_runtime = runtime.clone();
     let task_runtime = runtime.clone();
     spawn_runtime.spawn(async move {
@@ -724,45 +770,76 @@ fn publish_join_connectivity_if_needed(
         crate::cluster_join_trace(format_args!(
             "connectivity publish source={source_node_id} target={target_node_id} endpoint={endpoint_id} start"
         ));
-        let records = sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut records = sinomo_core::network::read_local_cluster_connectivity_records_for_source(
             &paths,
             &source_node_id,
         )
         .unwrap_or_default();
+        if !records.iter().any(|record| {
+            record.target_node_id == observed_record.target_node_id
+                && record.endpoint_id == observed_record.endpoint_id
+        }) {
+            records.push(observed_record);
+        }
         let record_count = records.len();
-        let mut host = DaemonClusterControlPlaneTransport {
-            rpc_mode: DaemonClusterRpcMode::new(task_runtime.clone()),
+        let deadline = Instant::now() + DAEMON_CLUSTER_JOIN_CONNECTIVITY_RETRY_WINDOW;
+        let mut attempt = 0_u32;
+        let result = loop {
+            attempt = attempt.saturating_add(1);
+            let mut host = DaemonClusterControlPlaneTransport::formation(task_runtime.clone());
+            let attempt_result = sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_async_with_state_and_host(
+                &task_runtime,
+                &paths,
+                &source_node_id,
+                records.clone(),
+                state.clone(),
+                &mut host,
+            )
+            .await;
+            match attempt_result {
+                Ok(result) => break Ok(result),
+                Err(error) => {
+                    let remaining = deadline
+                        .checked_duration_since(Instant::now())
+                        .unwrap_or_default();
+                    if remaining.is_zero() {
+                        break Err(error);
+                    }
+                    crate::cluster_join_trace(format_args!(
+                        "connectivity publish source={source_node_id} records={record_count} attempt={attempt} failed in {:?}, retrying: {error}",
+                        started.elapsed()
+                    ));
+                    tokio::time::sleep(
+                        DAEMON_CLUSTER_JOIN_CONNECTIVITY_RETRY_INTERVAL.min(remaining),
+                    )
+                    .await;
+                }
+            }
         };
-        let result = sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_async_with_host(
-            &task_runtime,
-            &paths,
-            &source_node_id,
-            records,
-            &mut host,
-        )
-        .await;
         match result {
             Ok(Some(snapshot)) => {
                 crate::cluster_join_trace(format_args!(
-                    "connectivity publish source={source_node_id} records={record_count} committed revision={:?} in {:?}",
+                    "connectivity publish source={source_node_id} records={record_count} attempts={attempt} committed revision={:?} in {:?}",
                     snapshot.revision,
                     started.elapsed()
                 ));
             }
             Ok(None) => {
                 crate::cluster_join_trace(format_args!(
-                    "connectivity publish source={source_node_id} records={record_count} no-op in {:?}",
+                    "connectivity publish source={source_node_id} records={record_count} attempts={attempt} no-op in {:?}",
                     started.elapsed()
                 ));
             }
             Err(error) => {
                 crate::cluster_join_trace(format_args!(
-                    "connectivity publish source={source_node_id} records={record_count} failed in {:?}: {error}",
+                    "connectivity publish source={source_node_id} records={record_count} attempts={attempt} failed in {:?}: {error}",
                     started.elapsed()
                 ));
                 tracing::warn!("sinomo daemon join connectivity publish failed: {error}");
             }
         }
+        clear_join_connectivity_sync_in_flight(&source_key);
     });
 }
 
@@ -1370,7 +1447,13 @@ pub(crate) fn start_shadow_daemon_status_publisher(
             };
             let mut status_publish_outcome = None;
             if !settled_solo {
-                match refresh_daemon_node_status_in_kv_async(&status_paths, runtime.clone()).await {
+                match refresh_daemon_node_status_in_kv_async_with_timeouts(
+                    &status_paths,
+                    runtime.clone(),
+                    cluster_formation_control_plane_timeouts(),
+                )
+                .await
+                {
                     Ok(outcome) => status_publish_outcome = Some(outcome),
                     Err(error) => {
                         tracing::warn!("sinomo shadow daemon cluster status tick failed: {error}")
@@ -1467,12 +1550,8 @@ pub(crate) fn handle_daemon_cluster_kv_snapshot(
     paths: &DaemonPaths,
 ) -> Result<KvSnapshot, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
-    sinomo_core::kv::read_cluster_kv_current_snapshot_for_node(
-        &cluster_paths.kv_paths(),
-        state.local_node_id,
-    )
-    .map_err(Into::into)
+    sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&cluster_paths)
+        .map_err(Into::into)
 }
 
 pub(crate) async fn handle_daemon_cluster_kv_snapshot_async(
@@ -1510,6 +1589,18 @@ pub(crate) async fn handle_daemon_cluster_kv_txn_request_async_on_runtime(
     handle_daemon_cluster_kv_txn_request_async_with_forwarding(paths, txn, true, runtime).await
 }
 
+pub(crate) async fn handle_daemon_cluster_kv_txn_request_async_on_runtime_with_timeouts(
+    paths: &DaemonPaths,
+    txn: KvTxn,
+    runtime: &tokio::runtime::Handle,
+    timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
+) -> Result<KvTxnResponse, DaemonError> {
+    handle_daemon_cluster_kv_txn_request_async_with_forwarding_and_timeouts(
+        paths, txn, true, runtime, timeouts,
+    )
+    .await
+}
+
 pub(crate) async fn handle_forwarded_daemon_cluster_kv_txn_request_async_on_runtime(
     paths: &DaemonPaths,
     txn: KvTxn,
@@ -1524,12 +1615,30 @@ async fn handle_daemon_cluster_kv_txn_request_async_with_forwarding(
     allow_forwarding: bool,
     runtime: &tokio::runtime::Handle,
 ) -> Result<KvTxnResponse, DaemonError> {
+    handle_daemon_cluster_kv_txn_request_async_with_forwarding_and_timeouts(
+        paths,
+        txn,
+        allow_forwarding,
+        runtime,
+        cluster_control_plane_timeouts(),
+    )
+    .await
+}
+
+async fn handle_daemon_cluster_kv_txn_request_async_with_forwarding_and_timeouts(
+    paths: &DaemonPaths,
+    txn: KvTxn,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+    timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
+) -> Result<KvTxnResponse, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    handle_cluster_kv_txn_request_with_cluster_paths_async_on_runtime(
+    handle_cluster_kv_txn_request_with_cluster_paths_async_on_runtime_with_timeouts(
         &cluster_paths,
         txn,
         allow_forwarding,
         runtime,
+        timeouts,
     )
     .await
 }
@@ -1557,14 +1666,32 @@ pub(crate) async fn handle_cluster_kv_txn_request_with_cluster_paths_async_on_ru
     allow_forwarding: bool,
     runtime: &tokio::runtime::Handle,
 ) -> Result<KvTxnResponse, DaemonError> {
-    let mut host = DaemonClusterControlPlaneTransport {
-        rpc_mode: DaemonClusterRpcMode::from_handle(runtime),
-    };
+    handle_cluster_kv_txn_request_with_cluster_paths_async_on_runtime_with_timeouts(
+        cluster_paths,
+        txn,
+        allow_forwarding,
+        runtime,
+        cluster_control_plane_timeouts(),
+    )
+    .await
+}
+
+async fn handle_cluster_kv_txn_request_with_cluster_paths_async_on_runtime_with_timeouts(
+    cluster_paths: &ClusterPaths,
+    txn: KvTxn,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+    timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
+) -> Result<KvTxnResponse, DaemonError> {
+    let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+        DaemonClusterRpcMode::from_handle(runtime),
+        timeouts,
+    );
     sinomo_core::cluster::handle_cluster_kv_txn_request_async_with_host(
         runtime,
         cluster_paths,
         txn,
-        cluster_kv_txn_quorum_options(allow_forwarding),
+        timeouts.kv_txn_quorum_options(allow_forwarding),
         &mut host,
     )
     .await
@@ -2005,9 +2132,7 @@ pub(crate) async fn publish_local_members_to_quorum_if_needed_async(
     force_kv_snapshot_sync: bool,
     runtime: tokio::runtime::Handle,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
-    let mut host = DaemonClusterControlPlaneTransport {
-        rpc_mode: DaemonClusterRpcMode::new(runtime.clone()),
-    };
+    let mut host = DaemonClusterControlPlaneTransport::new(runtime.clone());
     sinomo_core::cluster::publish_local_members_to_quorum_if_needed_async_with_host(
         &runtime,
         paths,
@@ -2378,27 +2503,16 @@ impl ClusterNetworkMaintenance {
                         force_kv_snapshot_sync: kv_snapshot_pull_due,
                     });
             }
-            // Register this node's services for cluster-wide discovery.
-            // Best-effort: a failed publish never breaks the tick and retries
-            // on the next publish window.
-            if let Some(service_registry) = self.service_registry.as_ref() {
-                let snapshot = service_registry.active_snapshot();
-                let cluster_access = crate::service_adapter::DaemonClusterAccess::new(
-                    paths.clone(),
-                    &SinomoDataDir::new(data_dir),
-                    Some(&runtime),
-                );
-                if let Err(error) = sinomo_core::service::publish_local_service_instances(
-                    &cluster_access,
-                    snapshot.registry(),
-                    &state.local_node_id,
-                    snapshot.version(),
-                    OffsetDateTime::now_utc(),
-                )
-                .await
-                {
-                    tracing::warn!("sinomo daemon service instance publish failed: {error}");
-                }
+            let use_formation_timeouts = self
+                .startup_settle_until
+                .is_some_and(|settle_until| settle_until > now);
+            if self.service_registry.is_some() {
+                pending_work.service_instance_publish =
+                    Some(ClusterServiceInstancePendingPublish {
+                        daemon_paths: paths.clone(),
+                        local_node_id: state.local_node_id.clone(),
+                        use_formation_timeouts,
+                    });
             }
             if !cluster_is_solo {
                 pending_work
@@ -2406,6 +2520,7 @@ impl ClusterNetworkMaintenance {
                     .push(ClusterNodeStatusPendingRefresh {
                         paths: paths.clone(),
                         label: "node status",
+                        use_formation_timeouts,
                     });
                 let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
                 let shadow_status = crate::probe_daemon_status_async(
@@ -2420,6 +2535,7 @@ impl ClusterNetworkMaintenance {
                         .push(ClusterNodeStatusPendingRefresh {
                             paths: shadow_paths,
                             label: "shadow status",
+                            use_formation_timeouts,
                         });
                 }
             }
@@ -2447,6 +2563,10 @@ impl ClusterNetworkMaintenance {
                     source_node_id: state.local_node_id.clone(),
                     state: state.clone(),
                     plan,
+                    use_formation_timeouts: self
+                        .startup_settle_until
+                        .is_some_and(|settle_until| settle_until > now)
+                        || !self.connectivity_converged,
                 });
             } else {
                 self.connectivity_converged = true;
@@ -2646,18 +2766,49 @@ impl ClusterNetworkMaintenance {
         pending: ClusterNetworkMaintenancePendingWork,
         runtime: tokio::runtime::Handle,
     ) {
+        let ClusterNetworkMaintenancePendingWork {
+            connectivity_probe,
+            member_publishes,
+            node_status_refreshes,
+            service_instance_publish,
+        } = pending;
+        let formation_status_first = node_status_refreshes
+            .iter()
+            .any(|refresh| refresh.use_formation_timeouts);
+        let mut retry_status_refreshes = Vec::new();
+        if formation_status_first {
+            for refresh in &node_status_refreshes {
+                if !self
+                    .run_pending_node_status_refresh_async(refresh.clone(), runtime.clone())
+                    .await
+                {
+                    retry_status_refreshes.push(refresh.clone());
+                }
+            }
+        }
         // Connectivity refreshes must run before cluster writes that may need those
         // freshly-probed relay routes to reach a voter from a segmented learner.
-        if let Some(probe) = pending.connectivity_probe {
+        if let Some(probe) = connectivity_probe {
             self.run_pending_connectivity_probe_async(probe, runtime.clone())
                 .await;
         }
-        for publish in pending.member_publishes {
+        for publish in member_publishes {
             self.run_pending_member_publish_async(publish, runtime.clone())
                 .await;
         }
-        for refresh in pending.node_status_refreshes {
-            self.run_pending_node_status_refresh_async(refresh, runtime.clone())
+        if formation_status_first {
+            for refresh in retry_status_refreshes {
+                self.run_pending_node_status_refresh_async(refresh, runtime.clone())
+                    .await;
+            }
+        } else {
+            for refresh in node_status_refreshes {
+                self.run_pending_node_status_refresh_async(refresh, runtime.clone())
+                    .await;
+            }
+        }
+        if let Some(publish) = service_instance_publish {
+            self.run_pending_service_instance_publish_async(publish, runtime)
                 .await;
         }
     }
@@ -2666,15 +2817,28 @@ impl ClusterNetworkMaintenance {
         &mut self,
         pending: ClusterNodeStatusPendingRefresh,
         runtime: tokio::runtime::Handle,
-    ) {
-        match refresh_daemon_node_status_in_kv_async(&pending.paths, runtime).await {
+    ) -> bool {
+        let timeouts = if pending.use_formation_timeouts {
+            cluster_formation_control_plane_timeouts()
+        } else {
+            cluster_control_plane_timeouts()
+        };
+        match refresh_daemon_node_status_in_kv_async_with_timeouts(
+            &pending.paths,
+            runtime,
+            timeouts,
+        )
+        .await
+        {
             Ok(published) => {
                 self.record_node_status_publish(&published);
                 self.record_publish_success();
+                true
             }
             Err(error) => {
                 tracing::warn!("sinomo daemon {} publish failed: {error}", pending.label);
                 self.record_publish_failure();
+                false
             }
         }
     }
@@ -2703,6 +2867,49 @@ impl ClusterNetworkMaintenance {
                 tracing::warn!("sinomo daemon cluster member publish failed: {error}");
                 self.record_publish_failure();
             }
+        }
+    }
+
+    async fn run_pending_service_instance_publish_async(
+        &mut self,
+        pending: ClusterServiceInstancePendingPublish,
+        runtime: tokio::runtime::Handle,
+    ) {
+        let Some(service_registry) = self.service_registry.as_ref() else {
+            return;
+        };
+        let Some(data_dir) = pending.daemon_paths.root.parent() else {
+            tracing::warn!(
+                "sinomo daemon service instance publish failed: daemon paths have no data directory parent"
+            );
+            return;
+        };
+        let data_dir = SinomoDataDir::new(data_dir);
+        let cluster_access = if pending.use_formation_timeouts {
+            crate::service_adapter::DaemonClusterAccess::new_with_control_plane_timeouts(
+                pending.daemon_paths.clone(),
+                &data_dir,
+                Some(&runtime),
+                cluster_formation_control_plane_timeouts(),
+            )
+        } else {
+            crate::service_adapter::DaemonClusterAccess::new(
+                pending.daemon_paths.clone(),
+                &data_dir,
+                Some(&runtime),
+            )
+        };
+        let snapshot = service_registry.active_snapshot();
+        if let Err(error) = sinomo_core::service::publish_local_service_instances(
+            &cluster_access,
+            snapshot.registry(),
+            &pending.local_node_id,
+            snapshot.version(),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        {
+            tracing::warn!("sinomo daemon service instance publish failed: {error}");
         }
     }
 
@@ -2749,7 +2956,7 @@ impl ClusterNetworkMaintenance {
     /// while the cluster is still forming, the full backoff once a failure
     /// looks persistent.
     fn publish_failure_backoff(&self) -> Duration {
-        let exponent = self.publish_failure_streak.saturating_sub(1).min(8);
+        let exponent = self.publish_failure_streak.saturating_sub(1).min(10);
         DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF
             .saturating_mul(1_u32 << exponent)
             .min(DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF)
@@ -2767,8 +2974,10 @@ impl ClusterNetworkMaintenance {
         let records = self
             .execute_connectivity_probe_plan_async(&pending.state, pending.plan)
             .await;
-        let mut host = DaemonClusterControlPlaneTransport {
-            rpc_mode: DaemonClusterRpcMode::new(runtime.clone()),
+        let mut host = if pending.use_formation_timeouts {
+            DaemonClusterControlPlaneTransport::formation(runtime.clone())
+        } else {
+            DaemonClusterControlPlaneTransport::new(runtime.clone())
         };
         let published =
             sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_async_with_host(
@@ -2790,7 +2999,7 @@ impl ClusterNetworkMaintenance {
                 self.record_publish_success();
             }
             Err(error) => {
-                self.connectivity_converged = true;
+                self.connectivity_converged = false;
                 self.record_connectivity_publish_failure();
                 tracing::warn!("sinomo daemon cluster connectivity publish failed: {error}");
             }
@@ -3064,9 +3273,10 @@ pub(crate) fn refresh_daemon_node_status_in_kv_on_runtime(
     Ok(outcome)
 }
 
-pub(crate) async fn refresh_daemon_node_status_in_kv_async(
+async fn refresh_daemon_node_status_in_kv_async_with_timeouts(
     paths: &DaemonPaths,
     runtime: tokio::runtime::Handle,
+    timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
 ) -> Result<NodeStatusPublishOutcome, DaemonError> {
     let read_paths = paths.clone();
     let read_path = read_paths.root.display().to_string();
@@ -3116,9 +3326,10 @@ pub(crate) async fn refresh_daemon_node_status_in_kv_async(
         rollout_status,
         time::OffsetDateTime::now_utc(),
     );
-    let mut publish_match_host = DaemonClusterControlPlaneTransport {
-        rpc_mode: DaemonClusterRpcMode::new(runtime.clone()),
-    };
+    let mut publish_match_host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+        DaemonClusterRpcMode::new(runtime.clone()),
+        timeouts,
+    );
     let publish_matches =
         sinomo_core::cluster::cluster_node_presence_publish_matches_async_with_host(
             &runtime,
@@ -3128,23 +3339,43 @@ pub(crate) async fn refresh_daemon_node_status_in_kv_async(
             &mut publish_match_host,
         )
         .await;
-    if publish_matches.all_match() {
+    let force_node_status_publish = timeouts == cluster_formation_control_plane_timeouts();
+    if publish_matches.all_match() && !force_node_status_publish {
         return Ok(NodeStatusPublishOutcome::default());
     }
 
     let mut outcome = NodeStatusPublishOutcome::default();
     if !publish_matches.network_info_matches {
-        if let Err(error) =
-            sync_cluster_network_info_to_kv_async(&cluster_paths, network_info, runtime.clone())
-                .await
+        if let Err(error) = sync_cluster_network_info_to_kv_async_with_timeouts(
+            &cluster_paths,
+            network_info,
+            runtime.clone(),
+            timeouts,
+        )
+        .await
         {
             tracing::warn!("sinomo daemon network info publish failed: {error}");
         } else {
             outcome.network_info_published = true;
         }
     }
-    if !publish_matches.node_status_matches {
-        sync_cluster_node_status_to_kv_async(&cluster_paths, record, runtime).await?;
+    if force_node_status_publish {
+        force_sync_cluster_node_status_to_kv_async_with_timeouts(
+            &cluster_paths,
+            record,
+            runtime,
+            timeouts,
+        )
+        .await?;
+        outcome.node_status_published = true;
+    } else if !publish_matches.node_status_matches {
+        sync_cluster_node_status_to_kv_async_with_timeouts(
+            &cluster_paths,
+            record,
+            runtime,
+            timeouts,
+        )
+        .await?;
         outcome.node_status_published = true;
     }
     Ok(outcome)
@@ -3463,218 +3694,155 @@ async fn probe_member_daemon_status_async(
     {
         return Ok(Some(status));
     }
-    let request = sinomo_core::network::ObjectRpcRequest::encode_body(
-        crate::DAEMON_STATUS_ROUTE,
-        crate::DAEMON_RPC_CATEGORY,
-        &(),
-    )?;
-    if let Some(status) = probe_member_daemon_status_endpoints_async(
-        paths,
-        state,
-        member,
-        &request,
-        CLUSTER_HEALTH_PROBE_TIMEOUT,
-        runtime,
-    )
-    .await?
+    if let Some(status) =
+        probe_member_routed_ping_status_async(paths, state, member, runtime).await?
     {
         return Ok(Some(status));
     }
+    if let Some(status) = probe_member_direct_daemon_status_async(state, member, runtime).await? {
+        return Ok(Some(status));
+    }
+    Ok(None)
+}
+
+async fn probe_member_direct_daemon_status_async(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    _runtime: &tokio::runtime::Handle,
+) -> Result<Option<ClusterNodeStatusRecord>, DaemonError> {
+    for endpoint in member.endpoints.iter().filter(|endpoint| {
+        endpoint.node_id == member.node_id
+            && endpoint.privacy != sinomo_core::ClusterEndpointPrivacy::LocalOnly
+            && sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
+    }) {
+        let status = match fetch_daemon_status_from_endpoint_direct_async(
+            endpoint,
+            CLUSTER_HEALTH_DIRECT_STATUS_TIMEOUT,
+        )
+        .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::debug!(
+                    "sinomo daemon cluster health direct status probe of {} via {} failed: {error}",
+                    member.node_id,
+                    endpoint.address
+                );
+                continue;
+            }
+        };
+        let Some(cluster) = status.cluster.as_ref() else {
+            continue;
+        };
+        if cluster.cluster_id != state.cluster_id || cluster.node_id != member.node_id {
+            tracing::warn!(
+                "sinomo daemon cluster health direct status identity mismatch: endpoint {} expected node {}, responder reported cluster={:?} node={:?}",
+                endpoint.address,
+                member.node_id,
+                status
+                    .cluster
+                    .as_ref()
+                    .map(|cluster| cluster.cluster_id.to_string()),
+                status
+                    .cluster
+                    .as_ref()
+                    .map(|cluster| cluster.node_id.to_string()),
+            );
+            continue;
+        }
+        let record = cluster_node_status_from_daemon_status(
+            &status,
+            cluster,
+            None,
+            OffsetDateTime::now_utc(),
+        );
+        if cluster_member_expected_daemon_process(member)
+            .is_some_and(|process| record.process != process)
+        {
+            continue;
+        }
+        return Ok(Some(record));
+    }
+    Ok(None)
+}
+
+async fn probe_member_routed_ping_status_async(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<ClusterNodeStatusRecord>, DaemonError> {
+    let request = sinomo_core::cluster::cluster_network_ping_rpc_request(
+        format!("cluster-health-{}", member.node_id),
+        0,
+    )?;
     let Some(response) = call_member_object_rpc_target_async(
         paths,
         state,
         member,
         &request,
-        CLUSTER_HEALTH_PROBE_TIMEOUT,
+        CLUSTER_HEALTH_ROUTED_PING_TIMEOUT,
         runtime,
-        "cluster health probe",
+        "cluster health routed ping probe",
     )
     .await?
     else {
         return Ok(None);
     };
-    Ok(
-        match decode_cluster_health_probe_response(state, member, &response) {
-            ClusterHealthProbeResponse::Accepted(status) => Some(status),
-            ClusterHealthProbeResponse::ShadowResponder | ClusterHealthProbeResponse::Ignored => {
-                None
-            }
-        },
-    )
-}
-
-async fn probe_member_daemon_status_endpoints_async(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    member: &ClusterMemberRecord,
-    request: &sinomo_core::network::ObjectRpcRequest,
-    timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<Option<ClusterNodeStatusRecord>, DaemonError> {
-    let endpoints = sinomo_core::network::ClusterEndpointSelector::new(paths, state)
-        .try_select(sinomo_core::network::ClusterEndpointSelectionPurpose::MemberDaemonStatus)?;
-    let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, true);
-    let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
-    for endpoint in endpoints
-        .into_iter()
-        .filter(|endpoint| endpoint.node_id == member.node_id)
-    {
-        let options = sinomo_core::network::ClusterObjectRpcOptions::new(
-            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
-                cluster_health_endpoint_probe_timeout(&endpoint, timeout),
-            ),
-        );
-        match client.call_endpoint(&endpoint, request, options).await {
-            Ok(response) => match decode_cluster_health_probe_response(state, member, &response) {
-                ClusterHealthProbeResponse::Accepted(status) => return Ok(Some(status)),
-                ClusterHealthProbeResponse::ShadowResponder => {
-                    if let Some(status) = probe_member_status_via_shadow_endpoint_async(
-                        member, &endpoint, timeout, runtime,
-                    )
-                    .await?
-                    {
-                        return Ok(Some(status));
-                    }
-                }
-                ClusterHealthProbeResponse::Ignored => {}
-            },
-            Err(error) => {
-                tracing::warn!(
-                    "sinomo daemon cluster health endpoint probe of {} via {} ({:?}) failed: {error}",
-                    member.node_id,
-                    endpoint.address,
-                    endpoint.transport
-                );
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn cluster_health_endpoint_probe_timeout(
-    endpoint: &ClusterEndpointRecord,
-    default_timeout: Duration,
-) -> Duration {
-    if matches!(endpoint.transport, ClusterTransportKind::Iroh) {
-        default_timeout.max(CLUSTER_HEALTH_IROH_PROBE_TIMEOUT)
-    } else {
-        default_timeout
-    }
-}
-
-enum ClusterHealthProbeResponse {
-    Accepted(ClusterNodeStatusRecord),
-    ShadowResponder,
-    Ignored,
-}
-
-fn decode_cluster_health_probe_response(
-    state: &ClusterBootstrapState,
-    member: &ClusterMemberRecord,
-    response: &sinomo_core::network::ObjectRpcResponse,
-) -> ClusterHealthProbeResponse {
-    let status: crate::DaemonStatus = match response.decode_body() {
-        Ok(status) => status,
+    let ping = match sinomo_core::cluster::decode_cluster_network_ping_rpc_response(&response) {
+        Ok(ping) => ping,
         Err(error) => {
             tracing::warn!(
-                "sinomo daemon cluster health probe of {} failed to decode: {error}",
-                member.node_id
-            );
-            return ClusterHealthProbeResponse::Ignored;
-        }
-    };
-    let Some(cluster) = status.cluster.as_ref() else {
-        tracing::warn!(
-            "sinomo daemon cluster health probe of {}: status has no cluster section",
-            member.node_id
-        );
-        return ClusterHealthProbeResponse::Ignored;
-    };
-    let cluster_id_matches =
-        cluster.cluster_id == state.cluster_id || cluster.cluster_id == member.cluster_id;
-    if !cluster_id_matches || cluster.node_id != member.node_id {
-        tracing::warn!(
-            "sinomo daemon cluster health probe of {}: identity mismatch (expected cluster {} or member cluster {}, responder cluster {} node {})",
-            member.node_id,
-            state.cluster_id,
-            member.cluster_id,
-            cluster.cluster_id,
-            cluster.node_id
-        );
-        return ClusterHealthProbeResponse::Ignored;
-    }
-    let status =
-        cluster_node_status_from_daemon_status(&status, cluster, None, OffsetDateTime::now_utc());
-    if cluster_member_expected_daemon_process(member)
-        .is_some_and(|process| status.process != process)
-    {
-        tracing::warn!(
-            "sinomo daemon cluster health probe of {}: process mismatch (expected {}, responder {})",
-            member.node_id,
-            cluster_member_expected_daemon_process(member).unwrap_or("unknown"),
-            status.process
-        );
-        return if cluster_member_expected_daemon_process(member)
-            == Some(sinomo_core::node::DAEMON_MAIN_CLUSTER_ROLE)
-            && status.process == sinomo_core::node::DAEMON_SHADOW_CLUSTER_ROLE
-        {
-            ClusterHealthProbeResponse::ShadowResponder
-        } else {
-            ClusterHealthProbeResponse::Ignored
-        };
-    }
-    ClusterHealthProbeResponse::Accepted(status)
-}
-
-async fn probe_member_status_via_shadow_endpoint_async(
-    member: &ClusterMemberRecord,
-    endpoint: &ClusterEndpointRecord,
-    timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<Option<ClusterNodeStatusRecord>, DaemonError> {
-    let request = sinomo_core::cluster::cluster_local_health_rpc_request()?;
-    let mut host = DaemonSignedEndpointRpcAsyncHost::direct_only(runtime);
-    let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
-    let options = sinomo_core::network::ClusterObjectRpcOptions::new(
-        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
-            cluster_health_endpoint_probe_timeout(endpoint, timeout),
-        ),
-    );
-    let response = match client.call_endpoint(endpoint, &request, options).await {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::warn!(
-                "sinomo daemon cluster health shadow-local probe of {} via {} ({:?}) failed: {error}",
-                member.node_id,
-                endpoint.address,
-                endpoint.transport
-            );
-            return Ok(None);
-        }
-    };
-    let rows = match sinomo_core::cluster::decode_cluster_health_rpc_response(&response) {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::warn!(
-                "sinomo daemon cluster health shadow-local rows from {} failed to decode: {error}",
+                "sinomo daemon cluster health routed ping from {} failed to decode: {error}",
                 member.node_id
             );
             return Ok(None);
         }
     };
-    Ok(rows.into_iter().find_map(|row| {
-        let expected_process = cluster_member_expected_daemon_process(member);
-        if row.availability == ClusterNodeAvailability::Online
-            && row.status.node_id == member.node_id
-            && expected_process
-                .map(|process| row.status.process == process)
-                .unwrap_or(true)
-        {
-            Some(row.status)
-        } else {
-            None
-        }
-    }))
+    if ping.responder_node_id != member.node_id {
+        tracing::warn!(
+            "sinomo daemon cluster health routed ping of {} got responder {}",
+            member.node_id,
+            ping.responder_node_id
+        );
+        return Ok(None);
+    }
+    let expected_process = cluster_member_expected_daemon_process(member).map(str::to_string);
+    let paths_for_statuses = paths.clone();
+    let member_for_statuses = member.clone();
+    let stored = tokio::task::spawn_blocking(move || {
+        sinomo_core::cluster::read_cluster_node_statuses_from_kv(&paths_for_statuses)
+            .map(|statuses| {
+                statuses
+                    .into_iter()
+                    .find(|status| {
+                        status.node_id == member_for_statuses.node_id
+                            && expected_process
+                                .as_deref()
+                                .map(|process| status.process == process)
+                                .unwrap_or(true)
+                    })
+                    .map(|mut status| {
+                        status.availability = ClusterNodeAvailability::Online;
+                        status
+                    })
+            })
+            .map_err(DaemonError::from)
+    })
+    .await
+    .map_err(|source| DaemonError::Io {
+        path: paths.root.display().to_string(),
+        detail: format!("cluster health status fallback task failed: {source}"),
+    })??;
+    Ok(Some(stored.unwrap_or_else(|| {
+        let mut status = sinomo_core::cluster::unknown_cluster_node_status(
+            state,
+            member,
+            OffsetDateTime::now_utc(),
+        );
+        status.availability = ClusterNodeAvailability::Online;
+        status
+    })))
 }
 
 async fn call_member_object_rpc_target_async(
@@ -4149,7 +4317,7 @@ impl sinomo_core::cluster::ClusterInvitePublishHost for DaemonClusterInvitePubli
 /// `/cluster/control/invite`: create, sign, and publish a join invite.
 pub(crate) fn handle_daemon_cluster_control_invite_on_runtime(
     daemon_paths: &DaemonPaths,
-    _request: ClusterControlInviteRequest,
+    request: ClusterControlInviteRequest,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ClusterControlInviteResponse, DaemonError> {
     let paths = cluster_paths_from_daemon_paths(daemon_paths)?;
@@ -4160,8 +4328,26 @@ pub(crate) fn handle_daemon_cluster_control_invite_on_runtime(
             detail: "local node is not a voter; create the invite on a voter node or restore voter connectivity".to_string(),
         });
     }
+    let ttl_seconds = request
+        .ttl_seconds
+        .unwrap_or(DAEMON_CLUSTER_CONTROL_INVITE_TTL_SECONDS);
+    if ttl_seconds <= 0 {
+        return Err(DaemonError::Parse {
+            detail: "invite ttl must be greater than zero seconds".to_string(),
+        });
+    }
     let now = OffsetDateTime::now_utc();
-    let introducers = daemon_default_invite_introducers(daemon_paths, &paths, &state);
+    let introducers = if request.introducers.is_empty() {
+        daemon_default_invite_introducers(daemon_paths, &paths, &state)
+    } else {
+        request
+            .introducers
+            .iter()
+            .map(|address| {
+                sinomo_core::cluster::invite_introducer_endpoint_from_state(&state, address.clone())
+            })
+            .collect()
+    };
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
         path: paths.root.display().to_string(),
         detail: "cluster paths have no data directory parent".to_string(),
@@ -4171,7 +4357,7 @@ pub(crate) fn handle_daemon_cluster_control_invite_on_runtime(
         &state,
         &issuer_identity,
         introducers,
-        DAEMON_CLUSTER_CONTROL_INVITE_TTL_SECONDS,
+        ttl_seconds,
         now,
     )?;
     let uri = sinomo_core::cluster::encode_cluster_join_invite(&invite)?;
@@ -4646,13 +4832,9 @@ async fn commit_cluster_kv_txn_with_quorum_async_on_transport(
     transport: &mut DaemonClusterControlPlaneTransport,
 ) -> Result<KvSnapshot, sinomo_core::network::NetworkError> {
     let runtime = transport.rpc_mode.runtime().clone();
+    let options = transport.cluster_kv_txn_quorum_options(allow_forwarding);
     sinomo_core::cluster::commit_cluster_kv_txn_with_quorum_response_async_with_host(
-        &runtime,
-        paths,
-        state,
-        txn,
-        cluster_kv_txn_quorum_options(allow_forwarding),
-        transport,
+        &runtime, paths, state, txn, options, transport,
     )
     .await
     .map(|result| result.snapshot)
@@ -4692,9 +4874,7 @@ impl sinomo_core::cluster::ClusterMemberMutationAsyncHost for DaemonClusterMembe
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, KvSnapshot> {
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            let mut transport = DaemonClusterControlPlaneTransport {
-                rpc_mode: DaemonClusterRpcMode::new(runtime),
-            };
+            let mut transport = DaemonClusterControlPlaneTransport::new(runtime);
             commit_cluster_kv_txn_with_quorum_async_on_transport(
                 paths,
                 state,
@@ -4710,9 +4890,19 @@ impl sinomo_core::cluster::ClusterMemberMutationAsyncHost for DaemonClusterMembe
 fn daemon_cluster_control_plane_driver_with_mode(
     rpc_mode: DaemonClusterRpcMode,
 ) -> sinomo_core::cluster::ClusterControlPlaneDriver<DaemonClusterControlPlaneTransport> {
-    sinomo_core::cluster::ClusterControlPlaneDriver::with_timeouts(
-        DaemonClusterControlPlaneTransport { rpc_mode },
+    daemon_cluster_control_plane_driver_with_mode_and_timeouts(
+        rpc_mode,
         cluster_control_plane_timeouts(),
+    )
+}
+
+fn daemon_cluster_control_plane_driver_with_mode_and_timeouts(
+    rpc_mode: DaemonClusterRpcMode,
+    timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
+) -> sinomo_core::cluster::ClusterControlPlaneDriver<DaemonClusterControlPlaneTransport> {
+    sinomo_core::cluster::ClusterControlPlaneDriver::with_timeouts(
+        DaemonClusterControlPlaneTransport::with_mode_and_timeouts(rpc_mode, timeouts),
+        timeouts,
     )
 }
 
@@ -4725,6 +4915,43 @@ pub(crate) fn daemon_cluster_control_plane_driver_on_runtime(
 #[derive(Clone, Debug)]
 pub(crate) struct DaemonClusterControlPlaneTransport {
     rpc_mode: DaemonClusterRpcMode,
+    timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
+}
+
+impl DaemonClusterControlPlaneTransport {
+    fn new(runtime: tokio::runtime::Handle) -> Self {
+        Self::with_mode_and_timeouts(
+            DaemonClusterRpcMode::new(runtime),
+            cluster_control_plane_timeouts(),
+        )
+    }
+
+    fn formation(runtime: tokio::runtime::Handle) -> Self {
+        Self::with_mode_and_timeouts(
+            DaemonClusterRpcMode::new(runtime),
+            cluster_formation_control_plane_timeouts(),
+        )
+    }
+
+    fn with_mode_and_timeouts(
+        rpc_mode: DaemonClusterRpcMode,
+        timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
+    ) -> Self {
+        Self { rpc_mode, timeouts }
+    }
+
+    fn state_authority_reachability_options(
+        &self,
+    ) -> sinomo_core::cluster::ClusterStateAuthorityReachabilityOptions {
+        self.timeouts.state_authority_reachability_options()
+    }
+
+    fn cluster_kv_txn_quorum_options(
+        &self,
+        allow_forwarding: bool,
+    ) -> sinomo_core::cluster::ClusterKvTxnQuorumOptions {
+        self.timeouts.kv_txn_quorum_options(allow_forwarding)
+    }
 }
 
 impl sinomo_core::cluster::ClusterControlPlaneTransport for DaemonClusterControlPlaneTransport {
@@ -5012,7 +5239,7 @@ impl sinomo_core::cluster::ClusterLocalMemberPublishAsyncHost
             sinomo_core::cluster::cluster_has_local_quorum_async_with_host(
                 paths,
                 state,
-                cluster_state_authority_reachability_options(),
+                self.state_authority_reachability_options(),
                 self,
             )
             .await
@@ -5246,7 +5473,7 @@ impl sinomo_core::cluster::ClusterKvCommittedFanoutAsyncHost
                 state,
                 endpoint,
                 watch_events,
-                cluster_control_plane_timeouts(),
+                self.timeouts,
                 timeout,
                 self,
             )
@@ -5337,19 +5564,64 @@ pub(crate) fn sync_cluster_node_status_to_kv_on_runtime(
         .map_err(Into::into)
 }
 
-pub(crate) async fn sync_cluster_node_status_to_kv_async(
+async fn sync_cluster_node_status_to_kv_async_with_timeouts(
     paths: &ClusterPaths,
     status: ClusterNodeStatusRecord,
     runtime: tokio::runtime::Handle,
+    timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
-    let mut host = DaemonClusterControlPlaneTransport {
-        rpc_mode: DaemonClusterRpcMode::new(runtime.clone()),
-    };
+    let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+        DaemonClusterRpcMode::new(runtime.clone()),
+        timeouts,
+    );
     sinomo_core::cluster::publish_cluster_node_status_to_quorum_async_with_host(
         &runtime, paths, status, &mut host,
     )
     .await
     .map_err(Into::into)
+}
+
+async fn force_sync_cluster_node_status_to_kv_async_with_timeouts(
+    paths: &ClusterPaths,
+    status: ClusterNodeStatusRecord,
+    runtime: tokio::runtime::Handle,
+    timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
+) -> Result<KvSnapshot, DaemonError> {
+    let state_paths = paths.clone();
+    let state_path = state_paths.root.display().to_string();
+    let mut state = runtime
+        .spawn_blocking(move || sinomo_core::cluster::read_cluster_state(&state_paths))
+        .await
+        .map_err(|source| DaemonError::Io {
+            path: state_path,
+            detail: format!("cluster state read task failed: {source}"),
+        })?
+        .map_err(DaemonError::from)?;
+    let key = sinomo_core::node::cluster_node_status_key_for_record(&status);
+    let txn = KvTxn {
+        compares: Vec::new(),
+        success: vec![KvOp::put_serde(key, &status, None).map_err(DaemonError::from)?],
+        failure: Vec::new(),
+    };
+    let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+        DaemonClusterRpcMode::new(runtime),
+        timeouts,
+    );
+    let snapshot =
+        sinomo_core::cluster::ClusterNodeStatusPublishAsyncHost::commit_cluster_kv_txn_with_quorum_async(
+            &mut host,
+            paths,
+            &mut state,
+            txn,
+        )
+        .await
+        .map_err(DaemonError::from)?;
+    sinomo_core::cluster::ClusterNodeStatusPublishAsyncHost::remember_published_node_status_async(
+        &mut host, paths, &status,
+    )
+    .await
+    .map_err(DaemonError::from)?;
+    Ok(snapshot)
 }
 
 #[cfg(test)]
@@ -5371,14 +5643,16 @@ pub(crate) fn sync_cluster_network_info_to_kv_on_runtime(
         .map_err(Into::into)
 }
 
-pub(crate) async fn sync_cluster_network_info_to_kv_async(
+async fn sync_cluster_network_info_to_kv_async_with_timeouts(
     paths: &ClusterPaths,
     info: ClusterNetworkInfoRecord,
     runtime: tokio::runtime::Handle,
+    timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
-    let mut host = DaemonClusterControlPlaneTransport {
-        rpc_mode: DaemonClusterRpcMode::new(runtime.clone()),
-    };
+    let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+        DaemonClusterRpcMode::new(runtime.clone()),
+        timeouts,
+    );
     sinomo_core::cluster::publish_cluster_network_info_to_quorum_async_with_host(
         &runtime, paths, info, &mut host,
     )
@@ -6442,6 +6716,20 @@ fn cluster_control_plane_timeouts() -> sinomo_core::cluster::ClusterControlPlane
     sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
 }
 
+fn cluster_formation_control_plane_timeouts() -> sinomo_core::cluster::ClusterControlPlaneTimeouts {
+    let mut timeouts = cluster_control_plane_timeouts();
+    timeouts.raft_append_timeout = DAEMON_CLUSTER_FORMATION_CONTROL_PLANE_TIMEOUT;
+    timeouts.rpc_timeout = DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT;
+    timeouts.membership_rpc_timeout = DAEMON_CLUSTER_FORMATION_CONTROL_PLANE_TIMEOUT;
+    timeouts.tcp_command_timeout = DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT;
+    timeouts.iroh_command_timeout = DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT;
+    timeouts.tcp_foreground_attempt_timeout = DAEMON_CLUSTER_FORMATION_FOREGROUND_ATTEMPT_TIMEOUT;
+    timeouts.public_foreground_attempt_timeout = DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT;
+    timeouts.iroh_foreground_attempt_timeout = DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT;
+    timeouts
+}
+
+#[cfg(test)]
 fn cluster_state_authority_reachability_options()
 -> sinomo_core::cluster::ClusterStateAuthorityReachabilityOptions {
     cluster_control_plane_timeouts().state_authority_reachability_options()
@@ -7143,6 +7431,7 @@ mod tests {
             detail: "join registered".to_string(),
             state: accepted_state,
             kv_snapshot: None,
+            responder_node_id: None,
         };
 
         sinomo_core::cluster::record_forwarded_join_registration_acceptance_with_host(
@@ -7366,6 +7655,7 @@ mod tests {
             detail: "join registered".to_string(),
             state: accepted_state,
             kv_snapshot: None,
+            responder_node_id: None,
         };
         let endpoint =
             sinomo_core::network::daemon_lan_endpoint(&voter, "node1:21353".to_string(), 0);
@@ -7600,14 +7890,12 @@ mod tests {
         assert_eq!(maintenance.publish_failure_streak, 1);
         let after_record = Instant::now();
         let before_backoff = after_record
-            .checked_add(
-                DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF
-                    .checked_sub(Duration::from_secs(1))
-                    .expect("initial backoff should exceed one second"),
-            )
+            .checked_add(DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF / 2)
             .expect("before backoff instant");
         let after_backoff = after_record
-            .checked_add(DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF + Duration::from_secs(1))
+            .checked_add(
+                DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF + Duration::from_millis(100),
+            )
             .expect("after backoff instant");
 
         assert!(

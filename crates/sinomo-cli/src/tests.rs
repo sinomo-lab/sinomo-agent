@@ -6158,6 +6158,7 @@ fn cluster_join_registration_works_over_iroh() {
                         detail: "join registered".to_string(),
                         state: fixture_response_state.clone(),
                         kv_snapshot: None,
+                        responder_node_id: None,
                     };
                     let rpc_response = sinomo_runtime::network::ObjectRpcResponse::encode_body(
                         sinomo_runtime::network::CLUSTER_JOIN_REGISTER_ROUTE,

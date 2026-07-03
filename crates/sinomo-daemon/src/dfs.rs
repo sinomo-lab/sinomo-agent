@@ -146,11 +146,16 @@ impl DaemonDfsControlPlaneKvClient {
 
 impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-        sinomo_core::kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
+        sinomo_core::cluster::read_cluster_kv_latest_observed_entry(&self.cluster_paths, key)
+            .map_err(|source| self.daemon_error(source.into()))
     }
 
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-        sinomo_core::kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
+        sinomo_core::cluster::read_cluster_kv_latest_observed_prefix_entries(
+            &self.cluster_paths,
+            prefix,
+        )
+        .map_err(|source| self.daemon_error(source.into()))
     }
 
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
@@ -183,7 +188,8 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
         key: &'a str,
     ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Option<KvEntry>> {
         Box::pin(async move {
-            sinomo_core::kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
+            sinomo_core::cluster::read_cluster_kv_latest_observed_entry(&self.cluster_paths, key)
+                .map_err(|source| self.daemon_error(source.into()))
         })
     }
 
@@ -192,7 +198,11 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
         prefix: &'a str,
     ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Vec<KvEntry>> {
         Box::pin(async move {
-            sinomo_core::kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
+            sinomo_core::cluster::read_cluster_kv_latest_observed_prefix_entries(
+                &self.cluster_paths,
+                prefix,
+            )
+            .map_err(|source| self.daemon_error(source.into()))
         })
     }
 

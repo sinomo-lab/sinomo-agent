@@ -935,7 +935,7 @@ where
                 .unwrap_or(0);
             let max_chunks = self.adaptive_fetch_chunk_window(&source_node_id, pending.size_bytes);
             let sent = self
-                .send_dfs_message_if_routable_async(
+                .send_best_effort_message_if_routable_async(
                     &source_node_id,
                     DfsNetworkMessage::FetchBlob(DfsFetchBlobCommand {
                         request_id: request_id.clone(),
@@ -996,7 +996,7 @@ where
                 .unwrap_or(0);
             let max_chunks = self.adaptive_fetch_chunk_window(&source_node_id, pending.size_bytes);
             let sent = self
-                .send_dfs_message_if_routable_async(
+                .send_best_effort_message_if_routable_async(
                     &source_node_id,
                     DfsNetworkMessage::FetchBlob(DfsFetchBlobCommand {
                         request_id: request_id.clone(),
@@ -1587,7 +1587,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .copied()
                 .unwrap_or(0);
             let max_chunks = self.adaptive_fetch_chunk_window(&source_node_id, pending.size_bytes);
-            let sent = self.send_dfs_message_if_routable(
+            let sent = self.send_best_effort_message_if_routable(
                 &source_node_id,
                 DfsNetworkMessage::FetchBlob(DfsFetchBlobCommand {
                     request_id: request_id.clone(),
@@ -1702,7 +1702,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let object_id = pending.object_id.clone();
         let version = pending.version.clone();
         let content_hash = pending.content_hash.clone();
-        let sent = self.send_dfs_message_if_routable(
+        let sent = self.send_best_effort_message_if_routable(
             source_node_id,
             DfsNetworkMessage::FetchBlob(DfsFetchBlobCommand {
                 request_id: request_id.clone(),
@@ -2395,7 +2395,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .copied()
                 .unwrap_or(0);
             let max_chunks = self.adaptive_fetch_chunk_window(&source_node_id, pending.size_bytes);
-            let sent = self.send_dfs_message_if_routable(
+            let sent = self.send_best_effort_message_if_routable(
                 &source_node_id,
                 DfsNetworkMessage::FetchBlob(DfsFetchBlobCommand {
                     request_id: request_id.clone(),

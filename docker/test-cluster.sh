@@ -78,7 +78,7 @@
 #   SINOMO_TEST_NETWORK_MAX_FAILURES        allowed failed network ping RPCs (default 0)
 #   SINOMO_TEST_NETWORK_MAX_P50_MS          max network ping p50 latency (default 50)
 #   SINOMO_TEST_NETWORK_MAX_P95_MS          max network ping p95 latency (default 250)
-#   SINOMO_TEST_NETWORK_MAX_P50_US          max network ping p50 latency (default 10000)
+#   SINOMO_TEST_NETWORK_MAX_P50_US          max aggregate network ping p50 latency (default 25000)
 #   SINOMO_TEST_NETWORK_MAX_P95_US          max network ping p95 latency (default 50000)
 #   SINOMO_TEST_NETWORK_MIN_RPS             min network ping throughput (default 250)
 #   SINOMO_TEST_NETWORK_PAYLOAD_BYTES       request bytes per latency-baseline ping payload (default 0)
@@ -154,7 +154,7 @@ NETWORK_TIMEOUT_MS="${SINOMO_TEST_NETWORK_TIMEOUT_MS:-2000}"
 NETWORK_MAX_FAILURES="${SINOMO_TEST_NETWORK_MAX_FAILURES:-0}"
 NETWORK_MAX_P50_MS="${SINOMO_TEST_NETWORK_MAX_P50_MS:-50}"
 NETWORK_MAX_P95_MS="${SINOMO_TEST_NETWORK_MAX_P95_MS:-250}"
-NETWORK_MAX_P50_US="${SINOMO_TEST_NETWORK_MAX_P50_US:-10000}"
+NETWORK_MAX_P50_US="${SINOMO_TEST_NETWORK_MAX_P50_US:-25000}"
 NETWORK_MAX_P95_US="${SINOMO_TEST_NETWORK_MAX_P95_US:-50000}"
 NETWORK_MIN_RPS="${SINOMO_TEST_NETWORK_MIN_RPS:-250}"
 NETWORK_PAYLOAD_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_BYTES:-0}"
@@ -229,12 +229,16 @@ wait_for_cluster_ready() {
   while :; do
     online="$(main_online_count)"
     warnings="$(doctor_connectivity_warnings)"
-    if [ "${online:-0}" -ge "$EXPECTED_MAINS" ] && [ -z "$warnings" ]; then
-      elapsed=$(( $(date +%s) - started ))
-      log "$label: cluster ready (${online} main daemons online, ${elapsed}s)"
-      return 0
-    fi
     now="$(date +%s)"
+    elapsed=$(( now - started ))
+    if [ "${online:-0}" -ge "$EXPECTED_MAINS" ] && [ -z "$warnings" ]; then
+      if [ "$now" -le "$deadline" ]; then
+        log "$label: cluster ready (${online} main daemons online, ${elapsed}s)"
+        return 0
+      fi
+      log "$label: cluster NOT ready within ${FORMATION_WAIT}s (online=${online:-0}, elapsed=${elapsed}s)"
+      return 1
+    fi
     if [ "$now" -ge "$deadline" ]; then
       log "$label: cluster NOT ready after ${FORMATION_WAIT}s (online=${online:-0})"
       return 1
@@ -283,9 +287,10 @@ wait_for_network_ready() {
   deadline=$(( $(date +%s) + NETWORK_READY_WAIT ))
   while :; do
     still=""
-    for node in node1 node6; do
+    for node in $NODES; do
       if compose exec -T "$node" sinomo test run cluster.network.ping-benchmark \
           --require-cluster \
+          --json \
           --param "requests-per-target=$NETWORK_READY_REQUESTS_PER_TARGET" \
           --param "warmup-requests-per-target=$NETWORK_WARMUP_REQUESTS_PER_TARGET" \
           --param "concurrency=$NETWORK_READY_CONCURRENCY" \
@@ -365,7 +370,7 @@ dfs_protocol_codec_baseline() {
 
 network_baseline() {
   local rc=0 node
-  for node in node1 node6; do
+  for node in $NODES; do
     run_probe "$node" cluster.network.ping-benchmark \
       --param "requests-per-target=$NETWORK_REQUESTS_PER_TARGET" \
       --param "warmup-requests-per-target=$NETWORK_WARMUP_REQUESTS_PER_TARGET" \
@@ -386,7 +391,7 @@ network_baseline() {
 
 network_payload_baseline() {
   local rc=0 node
-  for node in node1 node6; do
+  for node in $NODES; do
     run_probe "$node" cluster.network.ping-benchmark \
       --param "requests-per-target=$NETWORK_PAYLOAD_REQUESTS_PER_TARGET" \
       --param "warmup-requests-per-target=$NETWORK_PAYLOAD_WARMUP_REQUESTS_PER_TARGET" \
@@ -566,6 +571,7 @@ disk_damage_recovery() {
     --param "path=$path" \
     --param "payload-seed=$seed" \
     --param "payload-bytes=$DAMAGE_BYTES" \
+    --param "foreground-repair=true" \
   && run_probe node3 cluster.dfs.expect-replicated \
     --param "path=$path" \
     --param "min-locations=2" \

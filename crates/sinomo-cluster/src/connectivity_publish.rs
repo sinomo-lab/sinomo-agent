@@ -1,4 +1,5 @@
 use crate::keyspace::{cluster_connectivity_key, cluster_connectivity_source_prefix};
+use crate::kv_local_store::ClusterKvPathsExt;
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
 use crate::kv_local_store::{
@@ -17,8 +18,7 @@ use sinomo_network::write_local_cluster_connectivity_record_set;
 use sinomo_network::{CLUSTER_NETWORK_PUBLISH_INTERVAL, cluster_network_publish_interval_for_role};
 use sinomo_network::{
     ClusterConnectivityRecord, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
-    cluster_connectivity_stable_eq, cluster_network_record_live,
-    validate_cluster_connectivity_records_for_source,
+    cluster_connectivity_stable_eq, validate_cluster_connectivity_records_for_source,
 };
 use sinomo_node::cluster_node_is_local_process;
 use std::collections::BTreeMap;
@@ -157,6 +157,28 @@ pub fn sync_cluster_connectivity_records_to_kv(
     }
 }
 
+fn empty_cluster_kv_snapshot_arc() -> Result<Arc<KvSnapshot>, NetworkError> {
+    Ok(Arc::new(
+        sinomo_kv::InProcessKvStore::new()
+            .try_snapshot()
+            .map_err(kv_err)?,
+    ))
+}
+
+fn read_cluster_kv_current_or_empty_snapshot_arc_for_source(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+) -> Result<Arc<KvSnapshot>, NetworkError> {
+    if !paths.kv_paths().raft.exists() {
+        return empty_cluster_kv_snapshot_arc();
+    }
+    sinomo_kv::read_cluster_kv_current_snapshot_arc_for_node(
+        &paths.kv_paths(),
+        source_node_id.clone(),
+    )
+    .map_err(kv_err)
+}
+
 pub fn sync_cluster_connectivity_records_to_quorum_with_host<H>(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
@@ -212,6 +234,50 @@ pub async fn sync_cluster_connectivity_records_to_quorum_async_with_host<H>(
 where
     H: ClusterConnectivityPublishAsyncHost,
 {
+    sync_cluster_connectivity_records_to_quorum_async_inner(
+        runtime,
+        paths,
+        source_node_id,
+        records,
+        None,
+        host,
+    )
+    .await
+}
+
+pub async fn sync_cluster_connectivity_records_to_quorum_async_with_state_and_host<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    records: Vec<ClusterConnectivityRecord>,
+    state: ClusterBootstrapState,
+    host: &mut H,
+) -> Result<Option<KvSnapshot>, H::Error>
+where
+    H: ClusterConnectivityPublishAsyncHost,
+{
+    sync_cluster_connectivity_records_to_quorum_async_inner(
+        runtime,
+        paths,
+        source_node_id,
+        records,
+        Some(state),
+        host,
+    )
+    .await
+}
+
+async fn sync_cluster_connectivity_records_to_quorum_async_inner<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    records: Vec<ClusterConnectivityRecord>,
+    initial_state: Option<ClusterBootstrapState>,
+    host: &mut H,
+) -> Result<Option<KvSnapshot>, H::Error>
+where
+    H: ClusterConnectivityPublishAsyncHost,
+{
     let write_paths = paths.clone();
     let write_source_node_id = source_node_id.clone();
     let write_records = records.clone();
@@ -239,7 +305,7 @@ where
         return Ok(None);
     }
 
-    let mut state = None;
+    let mut state = initial_state;
     let mut latest: Option<KvSnapshot> = None;
     let mut previous_ops: Option<Vec<KvOp>> = None;
     loop {
@@ -261,14 +327,30 @@ where
                 let batch_paths = paths.clone();
                 let batch_source_node_id = source_node_id.clone();
                 let batch_records = records.clone();
+                let read_by_source = state.is_some();
                 runtime
                     .spawn_blocking(move || {
-                        cluster_connectivity_full_sync_batch_ops(
-                            &batch_paths,
-                            &batch_source_node_id,
-                            &batch_records,
-                            sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-                        )
+                        if read_by_source {
+                            let snapshot =
+                                read_cluster_kv_current_or_empty_snapshot_arc_for_source(
+                                    &batch_paths,
+                                    &batch_source_node_id,
+                                )?;
+                            cluster_connectivity_full_sync_batch_ops_from_snapshot(
+                                snapshot.as_ref(),
+                                &batch_source_node_id,
+                                &batch_records,
+                                OffsetDateTime::now_utc(),
+                                sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+                            )
+                        } else {
+                            cluster_connectivity_full_sync_batch_ops(
+                                &batch_paths,
+                                &batch_source_node_id,
+                                &batch_records,
+                                sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+                            )
+                        }
                     })
                     .await
                     .map_err(|source| {

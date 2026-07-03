@@ -88,6 +88,7 @@ use crate::cluster::{
     handle_daemon_cluster_control_remove_on_runtime,
     handle_daemon_cluster_control_rename_on_runtime, handle_daemon_cluster_control_role_on_runtime,
     handle_daemon_cluster_kv_snapshot_async, handle_daemon_cluster_kv_txn_request_async_on_runtime,
+    handle_daemon_cluster_kv_txn_request_async_on_runtime_with_timeouts,
     handle_daemon_cluster_relay_request_on_runtime,
     handle_forwarded_daemon_cluster_kv_txn_request_async_on_runtime,
 };
@@ -163,6 +164,7 @@ pub(crate) struct DaemonClusterAccess {
     paths: DaemonPaths,
     cluster_paths: ClusterPaths,
     runtime: Option<tokio::runtime::Handle>,
+    control_plane_timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
 }
 
 impl DaemonClusterAccess {
@@ -175,6 +177,22 @@ impl DaemonClusterAccess {
             cluster_paths: ClusterPaths::new(data_dir),
             paths,
             runtime: runtime.cloned(),
+            control_plane_timeouts:
+                sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport(),
+        }
+    }
+
+    pub(crate) fn new_with_control_plane_timeouts(
+        paths: DaemonPaths,
+        data_dir: &SinomoDataDir,
+        runtime: Option<&tokio::runtime::Handle>,
+        control_plane_timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
+    ) -> Self {
+        Self {
+            cluster_paths: ClusterPaths::new(data_dir),
+            paths,
+            runtime: runtime.cloned(),
+            control_plane_timeouts,
         }
     }
 
@@ -202,9 +220,14 @@ impl ClusterAccess for DaemonClusterAccess {
     > {
         Box::pin(async move {
             let runtime = self.runtime()?;
-            handle_daemon_cluster_kv_txn_request_async_on_runtime(&self.paths, txn, runtime)
-                .await
-                .map_err(daemon_error)
+            handle_daemon_cluster_kv_txn_request_async_on_runtime_with_timeouts(
+                &self.paths,
+                txn,
+                runtime,
+                self.control_plane_timeouts,
+            )
+            .await
+            .map_err(daemon_error)
         })
     }
 }

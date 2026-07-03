@@ -848,6 +848,22 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
         "lookup requests still require fresh daemon metadata before answering primary path checks"
     );
 
+    let write = test_dfs_message_command_from_message(
+        &local,
+        &remote,
+        6,
+        DfsNetworkMessage::DistributedWriteRequest(test_routed_write_command(
+            "write-request",
+            &local,
+            &DfsObjectId::from_legacy_named("write_object").expect("object id"),
+        )),
+    );
+    assert!(!dfs_message_is_read_only_request(&write));
+    assert!(
+        dfs_message_requires_fresh_metadata(&write),
+        "routed writes must hydrate daemon metadata before accepting primary-side commits"
+    );
+
     let lookup_paths = test_dfs_message_command_from_message(
         &local,
         &remote,
@@ -10013,6 +10029,59 @@ fn eventual_write_with_local_receipt_tolerates_unreachable_desired_replica() {
     };
     assert_eq!(repair_jobs.len(), 1);
     assert_eq!(repair_jobs[0].missing_replica_node_id, replica);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn remote_manifest_write_defers_failed_post_commit_fetch() {
+    let root = temp_root("remote-manifest-defers-fetch-error");
+    let primary =
+        NodeId::from_legacy_named("node_remote_manifest_fetch_primary").expect("primary node");
+    let requester =
+        NodeId::from_legacy_named("node_remote_manifest_fetch_requester").expect("requester node");
+    let object_id = DfsObjectId::from_legacy_named("obj_remote_manifest_fetch").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(
+        FailingSendTransport {
+            local_node_id: primary.clone(),
+        },
+        content,
+    )
+    .with_metadata_backend(metadata)
+    .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let mut metadata = file_metadata(primary.clone());
+    metadata.object_id = object_id.clone();
+    metadata.version = version_1.clone();
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    dfs.add_object_metadata(metadata).expect("object");
+
+    let remote_content_hash = content_hash(b"remote manifest bytes");
+    let write = dfs
+        .write_distributed_eventual_from_remote_manifest_with_base(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id,
+                target_version: version_2,
+                requesting_node_id: requester.clone(),
+            },
+            Some(version_1),
+            remote_content_hash,
+            21,
+            vec![primary.clone(), requester],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+            true,
+        )
+        .expect("post-commit fetch failure should be deferred");
+
+    let NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } = write else {
+        panic!("expected committed write with deferred repair, got {write:?}");
+    };
+    assert_eq!(repair_jobs.len(), 1);
+    assert_eq!(repair_jobs[0].missing_replica_node_id, primary);
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -23304,6 +23373,49 @@ fn sifs_cluster_primary_posix_write(cluster: &mut SifsPosixCluster, path: &str, 
     );
 }
 
+#[test]
+fn sifs_cluster_primary_detached_large_write_defers_blob_durability_flush() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-primary-detached-large");
+    let path = "/services/primary-detached-large.bin";
+    let bytes = (0..(DFS_BLOB_INLINE_LIMIT_BYTES + 8192))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let expected_hash = content_hash(&bytes);
+    let mut options = sifs_cluster_write_options(&cluster.primary_node.clone());
+    options.foreground_replica_repair = false;
+
+    let stat = cluster
+        .primary
+        .posix_write_file(path, &bytes, options)
+        .expect("primary detached large write");
+
+    assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
+    assert_eq!(
+        cluster
+            .primary
+            .content
+            .debug_deferred_durable_blob_count()
+            .expect("deferred durable blob count"),
+        1,
+        "local metadata-primary detached writes must not synchronously flush blob durability"
+    );
+
+    cluster
+        .primary
+        .flush_deferred_content_durability()
+        .expect("flush deferred durability");
+    assert_eq!(
+        cluster
+            .primary
+            .content
+            .debug_deferred_durable_blob_count()
+            .expect("deferred durable blob count after flush"),
+        0
+    );
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
 /// Publishes the primary's metadata journal to the configured replicas and
 /// pumps the cluster until `done` observes the replicated state.
 fn sifs_cluster_publish_metadata_until(
@@ -27021,11 +27133,13 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
     let services_thread =
         std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
-    let batch = (0..100)
+    let batch = (0..64)
         .map(|index| {
             (
                 format!("{remote_dir}/bulk-{index:06}.bin"),
-                format!("bulk remote primary payload {index:06}").into_bytes(),
+                format!("bulk remote primary payload {index:06} ")
+                    .repeat(128)
+                    .into_bytes(),
             )
         })
         .collect::<Vec<_>>();
@@ -27038,6 +27152,11 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
         .expect("remote-primary bulk write");
     assert_eq!(stats.len(), batch.len());
 
+    let replica_stop = Arc::new(AtomicBool::new(false));
+    let replica_thread_stop = Arc::clone(&replica_stop);
+    let replica_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(replica, replica_thread_stop));
+
     for (path, bytes) in &batch {
         assert_eq!(
             users_primary
@@ -27047,6 +27166,20 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
                 .as_deref(),
             Some(content_hash(bytes).as_str()),
             "missing remote-primary bulk path {path}"
+        );
+    }
+    let read_paths = batch
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let read_results = users_primary.posix_read_files_distributed(&read_paths);
+    replica_stop.store(true, Ordering::SeqCst);
+    let _replica = replica_thread.join().expect("replica thread");
+    for ((path, bytes), result) in batch.iter().zip(read_results) {
+        assert_eq!(
+            result.expect("bulk remote read"),
+            *bytes,
+            "remote primary bulk read returned wrong bytes for {path}"
         );
     }
 
@@ -27389,6 +27522,48 @@ fn sifs_cluster_posix_rename_across_shard_primaries_moves_object_transactionally
             .any(|entry| entry.path == "/services/moved.txt"),
         "new path must be listed on replicas: {services_entries:?}"
     );
+
+    let SifsTwoPrimaryCluster {
+        root,
+        users_primary_node,
+        services_primary_node,
+        replica_node,
+        shared_kv,
+        mut users_primary,
+        services_primary,
+        replica,
+        rejections,
+    } = cluster;
+    let unlink_stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&unlink_stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+    let unlinked = users_primary
+        .posix_unlink("/services/moved.txt")
+        .expect("users primary routes unlink to services primary after cross-shard move");
+    assert_eq!(unlinked.kind, DfsObjectKind::Tombstone);
+    unlink_stop.store(true, Ordering::SeqCst);
+    let services_primary = services_thread.join().expect("services thread");
+    let mut cluster = SifsTwoPrimaryCluster {
+        root,
+        users_primary_node,
+        services_primary_node,
+        replica_node,
+        shared_kv,
+        users_primary,
+        services_primary,
+        replica,
+        rejections,
+    };
+    sifs_two_primary_publish_until(&mut cluster, "post-move unlink convergence", |cluster| {
+        matches!(
+            cluster.replica.posix_stat("/services/moved.txt"),
+            Err(DfsPosixError::NotFound { .. })
+        ) && matches!(
+            cluster.users_primary.posix_stat("/services/moved.txt"),
+            Err(DfsPosixError::NotFound { .. })
+        )
+    });
 
     std::fs::remove_dir_all(&cluster.root).ok();
 }
@@ -29336,8 +29511,8 @@ fn sifs_non_replica_node_reads_converge_via_sync_pulls() {
 }
 
 #[test]
-fn sifs_replica_distributed_stat_uses_local_hit_without_primary_lookup() {
-    let mut cluster = sifs_posix_cluster("sifs-replica-stat-stale-live");
+fn sifs_replica_distributed_stat_prefers_primary_tombstone_over_stale_local_hit() {
+    let mut cluster = sifs_posix_cluster("sifs-replica-stat-primary-tombstone");
     let path = "/users/stat-stale-live.txt";
     let bytes = b"writer-local stale entry should lose to primary tombstone".to_vec();
 
@@ -29358,13 +29533,31 @@ fn sifs_replica_distributed_stat_uses_local_hit_without_primary_lookup() {
         "test setup must leave a stale local live entry on the writer"
     );
 
-    let stale_stat = cluster
-        .writer
-        .posix_stat_distributed(path)
-        .expect("configured replica serves its local hit without a primary lookup");
-    assert_eq!(stale_stat.size_bytes, Some(bytes.len() as u64));
+    let SifsPosixCluster {
+        root,
+        mut primary,
+        mut writer,
+        ..
+    } = cluster;
+    let stop_primary = Arc::new(AtomicBool::new(false));
+    let primary_stop = Arc::clone(&stop_primary);
+    let primary_thread = std::thread::spawn(move || {
+        while !primary_stop.load(Ordering::SeqCst) {
+            primary.process_incoming().expect("primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        primary
+    });
 
-    std::fs::remove_dir_all(&cluster.root).ok();
+    let distributed_stat = writer.posix_stat_distributed(path);
+    stop_primary.store(true, Ordering::SeqCst);
+    primary_thread.join().expect("primary thread");
+    assert!(
+        matches!(distributed_stat, Err(DfsPosixError::NotFound { .. })),
+        "distributed stat must prefer the shard primary tombstone over a stale replica-local hit, got {distributed_stat:?}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]
@@ -29816,5 +30009,136 @@ fn sifs_routed_lookup_follows_authority_redirect() {
     stop.store(true, Ordering::SeqCst);
     old_thread.join().expect("old primary thread");
     new_thread.join().expect("new primary thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_routed_lookup_reselects_refreshed_primary_after_redirect_chain() {
+    let root = temp_root("sifs-lookup-redirect-refreshes-primary");
+    let old_primary =
+        NodeId::from_legacy_named("node_sifs_lookup_refresh_old_primary").expect("old primary");
+    let intermediate_primary =
+        NodeId::from_legacy_named("node_sifs_lookup_refresh_mid_primary").expect("mid primary");
+    let current_primary =
+        NodeId::from_legacy_named("node_sifs_lookup_refresh_current_primary").expect("primary");
+    let requester_node =
+        NodeId::from_legacy_named("node_sifs_lookup_refresh_requester").expect("requester");
+
+    let network = InProcessNetwork::new();
+    let shard_config = |primary: &NodeId, epoch: u64| DfsMetadataShardConfig {
+        file_system_id: sifs_file_system_id(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![
+            old_primary.clone(),
+            intermediate_primary.clone(),
+            current_primary.clone(),
+        ],
+        epoch,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let put_control_plane = |kv_client: &SharedDfsControlPlaneKvClient<InProcessKvStore>,
+                             primary: &NodeId,
+                             epoch: u64| {
+        kv_client.with_client(|kv| {
+            let mut control = DfsControlPlaneStore::new(kv);
+            control
+                .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                    current_primary.clone(),
+                )))
+                .expect("filesystem config");
+            control
+                .put_metadata_shard(&shard_config(primary, epoch))
+                .expect("shard config");
+        });
+    };
+
+    let kv_old = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    put_control_plane(&kv_old, &intermediate_primary, 2);
+    let kv_intermediate = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    put_control_plane(&kv_intermediate, &old_primary, 2);
+    let kv_current = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    put_control_plane(&kv_current, &current_primary, 3);
+    let kv_requester = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    put_control_plane(&kv_requester, &old_primary, 1);
+
+    let old_node =
+        sifs_posix_cluster_node(&network, &kv_old, &root, "old-primary", old_primary.clone());
+    let intermediate_node = sifs_posix_cluster_node(
+        &network,
+        &kv_intermediate,
+        &root,
+        "intermediate-primary",
+        intermediate_primary.clone(),
+    );
+    let mut current_node = sifs_posix_cluster_node(
+        &network,
+        &kv_current,
+        &root,
+        "current-primary",
+        current_primary.clone(),
+    );
+    let mut requester =
+        sifs_posix_cluster_node(&network, &kv_requester, &root, "requester", requester_node);
+    requester.cached_sifs_metadata_shards = Some(CachedSifsMetadataShards {
+        recorded_at: Instant::now(),
+        shards: vec![shard_config(&old_primary, 1)],
+    });
+    put_control_plane(&kv_requester, &current_primary, 3);
+
+    current_node
+        .bootstrap_distributed_sifs()
+        .expect("current primary SIFS bootstrap");
+    let path = "/users/lookup-refreshes-primary.txt";
+    let bytes = b"routed lookup reselects refreshed primary".to_vec();
+    current_node
+        .posix_mkdir_all("/users")
+        .expect("current primary creates parent");
+    current_node
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![current_primary.clone()]),
+        )
+        .expect("current primary writes file");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let old_stop = Arc::clone(&stop);
+    let old_thread = std::thread::spawn(move || {
+        let mut node = old_node;
+        while !old_stop.load(Ordering::SeqCst) {
+            node.process_incoming().expect("old primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let intermediate_stop = Arc::clone(&stop);
+    let intermediate_thread = std::thread::spawn(move || {
+        let mut node = intermediate_node;
+        while !intermediate_stop.load(Ordering::SeqCst) {
+            node.process_incoming().expect("intermediate primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let current_stop = Arc::clone(&stop);
+    let current_thread = std::thread::spawn(move || {
+        let mut node = current_node;
+        while !current_stop.load(Ordering::SeqCst) {
+            node.process_incoming().expect("current primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let stat = requester
+        .posix_stat_distributed(path)
+        .expect("lookup reselects refreshed primary instead of following redirect chain");
+    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
+
+    stop.store(true, Ordering::SeqCst);
+    old_thread.join().expect("old primary thread");
+    intermediate_thread
+        .join()
+        .expect("intermediate primary thread");
+    current_thread.join().expect("current primary thread");
     std::fs::remove_dir_all(&root).ok();
 }

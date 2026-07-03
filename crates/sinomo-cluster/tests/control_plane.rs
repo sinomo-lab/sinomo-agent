@@ -5385,6 +5385,38 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
 }
 
 #[test]
+fn unknown_cluster_status_fallback_prefers_main_daemon_endpoint() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_unknown_status_main_endpoint").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_unknown_status_main_endpoint_local").expect("local");
+    let remote =
+        NodeId::from_legacy_named("node_unknown_status_main_endpoint_remote").expect("remote");
+    let shadow = shadow_daemon_node_id(&remote);
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "unknown status main endpoint",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    let main_endpoint = daemon_lan_endpoint(&remote, "node2:21353".to_string(), 5);
+    let mut folded_shadow_endpoint = daemon_lan_endpoint(&shadow, "node2:21354".to_string(), 5);
+    folded_shadow_endpoint.node_id = remote.clone();
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![folded_shadow_endpoint, main_endpoint];
+
+    let status = unknown_cluster_node_status(&state, &member, now);
+
+    assert_eq!(status.address.as_deref(), Some("node2:21353"));
+}
+
+#[test]
 fn main_daemon_command_targets_filter_known_unreachable_endpoints() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-main-daemon-targets-unreachable");
     let data_dir = SinomoDataDir::new(&root);
@@ -12433,6 +12465,111 @@ fn cluster_join_registration_handler_voter_commits_through_host() {
 }
 
 #[test]
+fn cluster_join_registration_handler_voter_skips_bridge_channel_target_connectivity() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-join-handler-bridge-channel");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_join_handler_bridge_channel").expect("cluster");
+    let issuer_node_id =
+        NodeId::from_legacy_named("node_join_handler_bridge_channel_issuer").expect("issuer");
+    let bridge_node_id =
+        NodeId::from_legacy_named("node_join_handler_bridge_channel_bridge").expect("bridge");
+    let joined_node_id =
+        NodeId::from_legacy_named("node_join_handler_bridge_channel_joined").expect("joined");
+    let issuer_identity =
+        sinomo_node::load_or_create_main_node_identity(&root).expect("issuer identity");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "join handler bridge channel",
+        issuer_node_id.clone(),
+        "issuer",
+        issuer_identity.public_key.clone(),
+        now,
+    );
+    let capabilities = sinomo_node::main_daemon_capabilities(&ClusterMemberRole::Voter);
+    state.members[0].capabilities = capabilities.clone();
+    state.members[0].allowed_capabilities = capabilities;
+    let mut bridge_member = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        bridge_node_id.clone(),
+        "bridge",
+        "pk-bridge",
+        now,
+    );
+    apply_cluster_raft_role(&mut bridge_member, ClusterMemberRole::Learner, now);
+    bridge_member.endpoints = vec![daemon_lan_endpoint(
+        &bridge_node_id,
+        "bridge:21353".to_string(),
+        0,
+    )];
+    upsert_member_record(&mut state, bridge_member);
+    write_cluster_state(&paths, &state).expect("write state");
+    let bridge_channel_endpoint =
+        daemon_lan_endpoint(&issuer_node_id, "bridge:21353".to_string(), 0);
+    let mut invite = ClusterJoinInvite {
+        invite_id: ClusterInviteId::from_legacy_named("invite_join_handler_bridge_channel")
+            .expect("invite"),
+        cluster_id: cluster_id.clone(),
+        cluster_name: Some("join handler bridge channel".to_string()),
+        cluster_public_key: issuer_identity.public_key.clone(),
+        invitation_secret: "secret-join-handler-bridge-channel".to_string(),
+        communication_channels: vec![ClusterInvitationChannel {
+            endpoint: bridge_channel_endpoint,
+            node_public_key: issuer_identity.public_key.clone(),
+        }],
+        introducers: Vec::new(),
+        token_id: "token-join-handler-bridge-channel".to_string(),
+        expires_at: now + time::Duration::hours(1),
+        trust_domain: TrustDomain::new("trust.local").expect("trust domain"),
+        allowed_member_roles: vec![ClusterMemberRole::Learner],
+        issuer_node_id: issuer_node_id.clone(),
+        issuer_public_key: issuer_identity.public_key.clone(),
+        signature: String::new(),
+    };
+    invite.signature = sign_cluster_join_invite(&invite, &issuer_identity).expect("sign invite");
+    sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invitation");
+    let mut learner_member = ClusterMemberRecord::pending_learner(
+        cluster_id,
+        joined_node_id.clone(),
+        "joined",
+        "pk-joined",
+        now,
+    );
+    learner_member.endpoints = vec![daemon_lan_endpoint(
+        &joined_node_id,
+        "leaf:21353".to_string(),
+        10,
+    )];
+    let mut host = RecordingJoinRegistrationHost::default();
+
+    let response = handle_cluster_join_registration_request_with_host(
+        &paths,
+        ClusterJoinRegistrationRequest {
+            invite: invite.clone(),
+            invitation_secret: invite.invitation_secret,
+            members: vec![learner_member],
+        },
+        now,
+        &mut host,
+    )
+    .expect("handle join registration");
+
+    assert!(response.accepted, "join should be accepted");
+    assert_eq!(host.committed.len(), 1);
+    assert_eq!(
+        host.remembered_targets, 0,
+        "the voter did not observe a direct response path to the bridge-channel joiner"
+    );
+    let stored = read_cluster_state_without_kv(&paths).expect("read stored state");
+    assert!(stored.members.iter().any(|member| {
+        member.node_id == joined_node_id && member.state == ClusterMemberState::Learner
+    }));
+}
+
+#[test]
 fn cluster_join_registration_async_handler_voter_commits_through_host() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-join-async-handler-voter");
     let data_dir = SinomoDataDir::new(&root);
@@ -12811,6 +12948,7 @@ fn identityless_invite_requires_snapshot_for_accepted_join_response() {
         detail: "join registered".to_string(),
         state: accepted_state,
         kv_snapshot: None,
+        responder_node_id: None,
     };
     let endpoint = daemon_lan_endpoint(&voter, "node1:21353".to_string(), 0);
     let mut reconciled = pending.clone();
@@ -12825,6 +12963,91 @@ fn identityless_invite_requires_snapshot_for_accepted_join_response() {
     );
     assert_eq!(reconciled.cluster_id, pending.cluster_id);
     assert!(cluster_state_needs_join_registration(&reconciled));
+}
+
+#[test]
+fn accepted_join_response_uses_authorized_responder_as_endpoint_owner() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_join_responder_endpoint").expect("cluster");
+    let issuer = NodeId::from_legacy_named("node_network_join_responder_issuer").expect("issuer");
+    let bridge = NodeId::from_legacy_named("node_network_join_responder_bridge").expect("bridge");
+    let joined = NodeId::from_legacy_named("node_network_join_responder_joined").expect("joined");
+    let mut pending = ClusterBootstrapState::pending_join(
+        cluster_id.clone(),
+        "join responder endpoint",
+        joined.clone(),
+        "joined",
+        "pk-joined",
+        now,
+    );
+    let mut accepted_state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "join responder endpoint",
+        issuer.clone(),
+        "issuer",
+        "pk-issuer",
+        now,
+    );
+    let mut bridge_member = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        bridge.clone(),
+        "bridge",
+        "pk-bridge",
+        now,
+    );
+    apply_cluster_raft_role(&mut bridge_member, ClusterMemberRole::Learner, now);
+    upsert_member_record(&mut accepted_state, bridge_member);
+    let mut joined_member =
+        ClusterMemberRecord::local_voter(cluster_id.clone(), joined, "joined", "pk-joined", now);
+    apply_cluster_raft_role(&mut joined_member, ClusterMemberRole::Learner, now);
+    upsert_member_record(&mut accepted_state, joined_member);
+    let endpoint = daemon_lan_endpoint(&issuer, "node3:21353".to_string(), 0);
+    let invite = ClusterJoinInvite {
+        invite_id: ClusterInviteId::from_legacy_named("invite_network_join_responder_endpoint")
+            .expect("invite"),
+        cluster_id,
+        cluster_name: Some("join responder endpoint".to_string()),
+        cluster_public_key: "pk-issuer".to_string(),
+        invitation_secret: "secret".to_string(),
+        communication_channels: vec![ClusterInvitationChannel {
+            endpoint: endpoint.clone(),
+            node_public_key: "pk-issuer".to_string(),
+        }],
+        introducers: Vec::new(),
+        token_id: "token".to_string(),
+        expires_at: now + time::Duration::hours(1),
+        trust_domain: TrustDomain::new("trust.local").expect("trust"),
+        allowed_member_roles: vec![ClusterMemberRole::Learner],
+        issuer_node_id: issuer,
+        issuer_public_key: "pk-issuer".to_string(),
+        signature: String::new(),
+    };
+    let response = ClusterJoinRegistrationResponse {
+        accepted: true,
+        detail: "join registered".to_string(),
+        state: accepted_state,
+        kv_snapshot: None,
+        responder_node_id: Some(bridge.clone()),
+    };
+
+    let reconciliation =
+        reconcile_accepted_cluster_join_response(&mut pending, &invite, &endpoint, response)
+            .expect("reconcile response")
+            .expect("accepted response");
+    let accepted_endpoint = reconciliation
+        .accepted_endpoint
+        .expect("accepted endpoint should be recorded");
+
+    assert_eq!(accepted_endpoint.node_id, bridge);
+    assert_eq!(accepted_endpoint.address, "node3:21353");
+    assert!(pending.members.iter().any(|member| {
+        member.node_id == bridge
+            && member
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.address == "node3:21353")
+    }));
 }
 
 #[derive(Default)]
@@ -12937,6 +13160,7 @@ fn cluster_join_reconciliation_driver_merges_acceptance_through_host() {
             detail: "join registered".to_string(),
             state: accepted,
             kv_snapshot: None,
+            responder_node_id: None,
         }),
         ..Default::default()
     };
@@ -13054,6 +13278,7 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
                             detail: format!("accepted {}", registration.invite.invite_id.as_str()),
                             state: self.accepted_state.clone(),
                             kv_snapshot: None,
+                            responder_node_id: None,
                         },
                     )
                 }
@@ -17865,8 +18090,8 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
             .find(|row| row.member.node_id == target_node)
             .expect("target row")
             .availability,
-        ClusterNodeAvailability::Offline,
-        "a probeable member without a live probe result is offline"
+        ClusterNodeAvailability::Unknown,
+        "an unproven member without stored liveness or connectivity evidence remains unknown"
     );
     assert_eq!(
         local_rows
@@ -17876,6 +18101,25 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
             .availability,
         ClusterNodeAvailability::Unknown,
         "a member with no probeable endpoint remains unknown"
+    );
+    let no_peer_response = handle_cluster_health_rpc_request(
+        &paths,
+        &state,
+        &probe,
+        cluster_health_rpc_request_without_peer_views().expect("no-peer health request"),
+        now,
+    )
+    .expect("no-peer health response");
+    let no_peer_rows =
+        decode_cluster_health_rpc_response(&no_peer_response).expect("no-peer response rows");
+    assert_eq!(
+        no_peer_rows
+            .iter()
+            .find(|row| row.member.node_id == target_node)
+            .expect("no-peer target row")
+            .availability,
+        ClusterNodeAvailability::Unknown,
+        "no-peer health requests must not spend the peer-view merge budget"
     );
 
     let merged_rows =
@@ -18078,7 +18322,7 @@ fn cluster_health_rows_select_member_process_status() {
     );
     assert_eq!(
         row.availability,
-        ClusterNodeAvailability::Offline,
+        ClusterNodeAvailability::Unknown,
         "a shadow response should not make the main daemon appear online"
     );
 
@@ -18099,7 +18343,110 @@ fn cluster_health_rows_select_member_process_status() {
         async_row.status.process,
         sinomo_node::DAEMON_MAIN_CLUSTER_ROLE
     );
-    assert_eq!(async_row.availability, ClusterNodeAvailability::Offline);
+    assert_eq!(async_row.availability, ClusterNodeAvailability::Unknown);
+}
+
+#[test]
+fn cluster_health_keeps_stored_online_until_connectivity_proves_unreachable() {
+    struct EmptyStatusProbe;
+
+    impl ClusterStatusProbe for EmptyStatusProbe {
+        fn probe_member_status(
+            &self,
+            _state: &ClusterBootstrapState,
+            _member: &ClusterMemberRecord,
+        ) -> Option<ClusterNodeStatusRecord> {
+            None
+        }
+    }
+
+    let root = sinomo_testdir::TestDir::new("sinomo-network-health-stored-online");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_health_stored_online").expect("cluster");
+    let local_node = NodeId::from_legacy_named("node_health_stored_online_local").expect("local");
+    let remote_node =
+        NodeId::from_legacy_named("node_health_stored_online_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "stored online health",
+        local_node.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    state.members[0].capabilities =
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+
+    let mut remote = ClusterMemberRecord::local_non_voting(
+        cluster_id.clone(),
+        remote_node.clone(),
+        "remote",
+        "pk-remote",
+        now,
+    );
+    remote.capabilities =
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+    remote.allowed_capabilities = remote.capabilities.clone();
+    remote.endpoints = vec![daemon_lan_endpoint(
+        &remote_node,
+        "10.61.0.2:21353".to_string(),
+        10,
+    )];
+    state.members.push(remote.clone());
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let mut stored = unknown_cluster_node_status(&state, &remote, now);
+    stored.availability = ClusterNodeAvailability::Online;
+    stored.daemon_version = "0.1.0-test".to_string();
+    sync_cluster_node_status_to_kv(&paths, stored).expect("sync stored status");
+
+    let rows = cluster_health_rows_with_probe(&paths, &state, &EmptyStatusProbe, false, now)
+        .expect("health rows");
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.member.node_id == remote_node)
+            .expect("remote row")
+            .availability,
+        ClusterNodeAvailability::Online,
+        "stored online status remains online until connectivity proves the member unreachable"
+    );
+
+    let endpoint = remote.endpoints.first().expect("remote endpoint");
+    let unreachable = ClusterConnectivityRecord {
+        cluster_id: cluster_id.clone(),
+        source_node_id: local_node.clone(),
+        target_node_id: remote_node.clone(),
+        endpoint_id: endpoint.endpoint_id.clone(),
+        transport: endpoint.transport.clone(),
+        address: endpoint.address.clone(),
+        state: ClusterConnectivityState::Unreachable,
+        latency_ms: None,
+        consecutive_failures: 3,
+        last_success_at: None,
+        last_failure_at: Some("failed".to_string()),
+        failure_reason: None,
+        observed_at: now,
+        expires_at: now + time::Duration::seconds(900),
+    };
+    sync_cluster_connectivity_records_to_kv(&paths, &local_node, vec![unreachable])
+        .expect("sync unreachable connectivity");
+
+    let rows = cluster_health_rows_with_probe(&paths, &state, &EmptyStatusProbe, false, now)
+        .expect("health rows");
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.member.node_id == remote_node)
+            .expect("remote row")
+            .availability,
+        ClusterNodeAvailability::Offline,
+        "connectivity records own offline liveness once every probeable endpoint is unreachable"
+    );
 }
 
 #[test]
@@ -20124,6 +20471,79 @@ fn async_connectivity_quorum_sync_terminates_when_local_kv_lags_forwarded_commit
         "stale response progress must be detected on the iteration after the first commit"
     );
     assert!(stale_result.is_some());
+}
+
+#[test]
+fn async_connectivity_quorum_sync_can_use_in_memory_state_before_join_state_is_written() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-in-memory-join-state");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_in_memory_join_state").expect("cluster");
+    let source_node =
+        NodeId::from_legacy_named("node_connectivity_in_memory_join_source").expect("source");
+    let target_node =
+        NodeId::from_legacy_named("node_connectivity_in_memory_join_target").expect("target");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity in-memory join state",
+        source_node.clone(),
+        "source",
+        "pk-source",
+        now,
+    );
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state to kv");
+    assert!(
+        !paths.state.exists(),
+        "daemon-mediated join publishes before accepted state is durable"
+    );
+
+    let endpoint = daemon_lan_endpoint(&target_node, "10.56.0.1:21353".to_string(), 10);
+    let record = cluster_connectivity_record(
+        &state,
+        &endpoint,
+        ClusterConnectivityState::Healthy,
+        Some(6),
+        0,
+        Some("ok".to_string()),
+        None,
+        now,
+        600,
+    );
+    let key = cluster_connectivity_key(
+        &record.source_node_id,
+        &record.target_node_id,
+        &record.endpoint_id,
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut host = ForwardingOnlyConnectivityPublishAsyncHost {
+        voter_store: InProcessKvStore::new(),
+        commits: 0,
+        apply_commits: true,
+    };
+    let result = runtime
+        .block_on(
+            sync_cluster_connectivity_records_to_quorum_async_with_state_and_host(
+                runtime.handle(),
+                &paths,
+                &source_node,
+                vec![record],
+                state,
+                &mut host,
+            ),
+        )
+        .expect("connectivity sync should use supplied in-memory state");
+    assert_eq!(host.commits, 1);
+    assert!(
+        result.expect("committed snapshot").get(&key).is_some(),
+        "join-time connectivity should publish without rereading state.sobj"
+    );
 }
 
 #[test]
@@ -31648,6 +32068,92 @@ mod route_cache_tests {
     }
 
     #[test]
+    fn delivery_plan_prefers_verified_direct_target_over_degraded_multihop_first_hop() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-plan-direct-over-degraded-hop");
+        let cluster_id = cid("cluster_delivery_plan_direct_over_degraded_hop");
+        let local = nid("node_delivery_plan_direct_over_degraded_local");
+        let target = nid("node_delivery_plan_direct_over_degraded_target");
+        let bridge = nid("node_delivery_plan_direct_over_degraded_bridge");
+        let mut state = test_state(cluster_id.clone(), local.clone());
+        let target_endpoint = endpoint(&target, "172.24.0.4:21353", 5);
+        let bridge_endpoint = endpoint(&bridge, "172.23.0.2:21353", 0);
+        add_member(
+            &mut state,
+            target.clone(),
+            "target",
+            vec![target_endpoint.clone()],
+        );
+        add_member(
+            &mut state,
+            bridge.clone(),
+            "bridge",
+            vec![bridge_endpoint.clone()],
+        );
+        mark_local_endpoints_healthy(&paths, &state, &[target_endpoint.clone(), bridge_endpoint]);
+        let bridge_to_target_record = connectivity_record_from_source(
+            &cluster_id,
+            &bridge,
+            &target_endpoint,
+            ClusterConnectivityState::Degraded,
+            None,
+        );
+        sinomo_network::write_local_cluster_connectivity_records(
+            &paths,
+            &bridge,
+            std::slice::from_ref(&bridge_to_target_record),
+        )
+        .expect("write degraded bridge record");
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local,
+            &target,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
+
+        assert_eq!(plan.next_hop, target);
+        assert_eq!(plan.endpoints.len(), 1);
+        assert_eq!(plan.endpoints[0].address, target_endpoint.address);
+    }
+
+    #[test]
+    fn delivery_plan_prefers_verified_direct_target_over_exploratory_first_hop() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-plan-direct-over-exploratory");
+        let cluster_id = cid("cluster_delivery_plan_direct_over_exploratory");
+        let local = nid("node_delivery_plan_direct_over_exploratory_local");
+        let target = nid("node_delivery_plan_direct_over_exploratory_target");
+        let bridge = nid("node_delivery_plan_direct_over_exploratory_bridge");
+        let mut state = test_state(cluster_id, local.clone());
+        let target_endpoint = endpoint(&target, "172.24.0.4:21353", 5);
+        let bridge_endpoint = endpoint(&bridge, "172.23.0.2:21353", 0);
+        add_member(
+            &mut state,
+            target.clone(),
+            "target",
+            vec![target_endpoint.clone()],
+        );
+        add_member(&mut state, bridge, "bridge", vec![bridge_endpoint.clone()]);
+        mark_local_endpoints_healthy(&paths, &state, &[target_endpoint.clone(), bridge_endpoint]);
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local,
+            &target,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
+
+        assert_eq!(plan.next_hop, target);
+        assert_eq!(plan.endpoints.len(), 1);
+        assert_eq!(plan.endpoints[0].address, target_endpoint.address);
+    }
+
+    #[test]
     fn delivery_plan_prefers_healthy_multihop_over_unobserved_direct_target() {
         let (_root, paths) = test_paths("sinomo-network-delivery-plan-direct-unobserved");
         let cluster_id = cid("cluster_delivery_plan_direct_unobserved");
@@ -32818,6 +33324,55 @@ mod route_cache_tests {
         envelope.visited.push(origin.clone());
         envelope.planned_path = vec![origin, local.clone(), target.clone()];
         envelope.target_endpoints = vec![target_endpoint.clone()];
+        let relay_request = envelope.into_request().expect("relay request");
+        let runtime = tokio::runtime::Handle::current();
+        let mut host = RecordingRelayHost::default();
+
+        let rpc_response = handle_cluster_relay_async_with_host(
+            &runtime,
+            &paths,
+            &state,
+            &local,
+            &relay_request,
+            ClusterRelayOptions::new(DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5))),
+            &mut host,
+        )
+        .await
+        .expect("relay forward");
+
+        assert_eq!(
+            rpc_response.decode_body::<String>().expect("body"),
+            "forwarded"
+        );
+        assert_eq!(host.sent.len(), 0);
+        assert_eq!(host.target_sent.len(), 1);
+        assert_eq!(host.target_sent[0].0.address, target_endpoint.address);
+        assert_eq!(host.target_sent[0].0.node_id, target);
+    }
+
+    #[tokio::test]
+    async fn relay_forward_replans_when_planned_next_hop_has_no_endpoint() {
+        let (_root, paths) = test_paths("sinomo-network-relay-forward-stale-planned-hop");
+        let cluster_id = cid("cluster_relay_forward_stale_planned_hop");
+        let origin = nid("node_relay_forward_stale_hop_origin");
+        let local = nid("node_relay_forward_stale_hop_local");
+        let stale_bridge = nid("node_relay_forward_stale_hop_bridge");
+        let target = nid("node_relay_forward_stale_hop_target");
+        let mut state = test_state(cluster_id.clone(), local.clone());
+        add_member(&mut state, origin.clone(), "origin", Vec::new());
+        add_member(&mut state, stale_bridge.clone(), "stale-bridge", Vec::new());
+        let target_endpoint = endpoint(&target, "10.90.5.20:21353", 0);
+        add_member(
+            &mut state,
+            target.clone(),
+            "target",
+            vec![target_endpoint.clone()],
+        );
+        mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&target_endpoint));
+        let inner = request().with_auth(b"inner-auth".to_vec());
+        let mut envelope = RelayEnvelope::new(cluster_id, target.clone(), inner);
+        envelope.visited.push(origin.clone());
+        envelope.planned_path = vec![origin, local.clone(), stale_bridge, target.clone()];
         let relay_request = envelope.into_request().expect("relay request");
         let runtime = tokio::runtime::Handle::current();
         let mut host = RecordingRelayHost::default();

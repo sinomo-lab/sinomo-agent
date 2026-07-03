@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub(super) const PACKED_BLOB_INDEX_VERSION: u32 = 1;
 pub(super) const PACKED_BLOB_DIR: &str = "blob-packs";
@@ -55,7 +55,20 @@ pub(super) struct PackedBlobIndexCache {
 #[derive(Debug, Clone)]
 struct PackedBlobIndexCacheEntry {
     loaded_at: Instant,
+    fingerprint: PackedBlobIndexCacheFingerprint,
     index: PackedBlobIndex,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PackedBlobIndexCacheFingerprint {
+    index: Option<PackedBlobIndexFileFingerprint>,
+    log: Option<PackedBlobIndexFileFingerprint>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PackedBlobIndexFileFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
 }
 
 #[derive(Debug)]
@@ -161,6 +174,7 @@ impl LocalContentStore {
 
     fn read_cached_packed_blob_index_for_read(&self) -> Result<PackedBlobIndex> {
         let now = Instant::now();
+        let fingerprint = self.packed_blob_index_cache_fingerprint()?;
         {
             let cache = self
                 .packed_index_cache
@@ -168,6 +182,7 @@ impl LocalContentStore {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(entry) = &cache.entry
                 && now.saturating_duration_since(entry.loaded_at) <= PACKED_BLOB_INDEX_CACHE_TTL
+                && entry.fingerprint == fingerprint
             {
                 return Ok(entry.index.clone());
             }
@@ -175,15 +190,24 @@ impl LocalContentStore {
 
         let _lock = self.lock_packed_blobs_for_read()?;
         let index = self.read_packed_blob_index_unlocked()?;
+        let fingerprint = self.packed_blob_index_cache_fingerprint()?;
         let mut cache = self
             .packed_index_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.entry = Some(PackedBlobIndexCacheEntry {
             loaded_at: now,
+            fingerprint,
             index: index.clone(),
         });
         Ok(index)
+    }
+
+    fn packed_blob_index_cache_fingerprint(&self) -> Result<PackedBlobIndexCacheFingerprint> {
+        Ok(PackedBlobIndexCacheFingerprint {
+            index: packed_blob_index_file_fingerprint(&self.packed_blob_index_path())?,
+            log: packed_blob_index_file_fingerprint(&self.packed_blob_index_log_path())?,
+        })
     }
 
     fn invalidate_packed_blob_index_cache(&self) {
@@ -628,6 +652,22 @@ fn decode_packed_blob_index(bytes: &[u8]) -> Result<PackedBlobIndex> {
 fn encode_packed_blob_index_log_entry(entry: &PackedBlobIndexLogEntry) -> Result<Vec<u8>> {
     sinomo_object_serde::to_bytes(entry, 1, LengthMode::U32)
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn packed_blob_index_file_fingerprint(
+    path: &Path,
+) -> Result<Option<PackedBlobIndexFileFingerprint>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(PackedBlobIndexFileFingerprint {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ContentStoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn replay_packed_blob_index_log(path: &Path, index: &mut PackedBlobIndex) -> Result<u64> {

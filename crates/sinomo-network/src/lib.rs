@@ -176,7 +176,10 @@ pub use route_graph_read_model::invalidate_cluster_route_graph_cache;
 pub use route_graph_read_model::{
     read_cluster_connectivity_graph, read_cluster_connectivity_graph_with_query,
 };
-pub use rpc::{CLUSTER_HEALTH_SCOPE_LOCAL, CLUSTER_HEALTH_SCOPE_METADATA_KEY};
+pub use rpc::{
+    CLUSTER_HEALTH_INCLUDE_PEER_VIEWS_METADATA_KEY, CLUSTER_HEALTH_SCOPE_LOCAL,
+    CLUSTER_HEALTH_SCOPE_METADATA_KEY,
+};
 // Unconditional since stage C: dylib network modules reuse the object frame
 // codec through the sinomo-core facade.
 pub use object::read_object_frame_async;
@@ -226,7 +229,7 @@ pub use route::{
     ClusterSignedEndpointRpcAsyncHost, ClusterSignedEndpointRpcFuture,
     ClusterSignedEndpointRpcObservation, cluster_relay_stream_request_action,
     handle_cluster_relay_async_with_host, handle_cluster_relay_stream_forward_async_with_host,
-    relay_response_is_routing_error,
+    relay_request_inner_route, relay_response_is_routing_error,
 };
 pub use rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_RPC_ROUTE_METADATA,

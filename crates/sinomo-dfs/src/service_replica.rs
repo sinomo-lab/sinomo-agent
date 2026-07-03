@@ -19,7 +19,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(None);
         };
         DfsControlPlaneStore::new(kv.as_mut())
-            .select_metadata_shard_for_path(&object.file_system_id, &object.path)
+            .select_metadata_shard_for_path_strict_default_sifs_split(
+                &object.file_system_id,
+                &object.path,
+            )
             .map_err(DfsError::from)
     }
 

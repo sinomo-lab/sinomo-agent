@@ -27,6 +27,8 @@ ROLE="${ROLE:-joiner}"
 CLUSTER_NAME="${CLUSTER_NAME:-dev-cluster}"
 NODE_NAME="${NODE_NAME:-$(hostname)}"
 JOIN_TIMEOUT="${JOIN_TIMEOUT:-60}"
+JOIN_WAIT_INTERVAL="${JOIN_WAIT_INTERVAL:-0.1}"
+JOIN_WAIT_TICKS_PER_SECOND="${JOIN_WAIT_TICKS_PER_SECOND:-10}"
 MAIN_PORT="${MAIN_PORT:-21353}"
 JOIN_READY_DIR="${JOIN_READY_DIR:-/shared}"
 WAIT_FOR_INTRODUCER_READY="${WAIT_FOR_INTRODUCER_READY:-0}"
@@ -62,20 +64,22 @@ fi
 
 # Wait up to $2 seconds for a file to appear; returns 1 on timeout.
 wait_for_file() {
-  local path="$1" timeout="${2:-$JOIN_TIMEOUT}" i=0
+  local path="$1" timeout="${2:-$JOIN_TIMEOUT}" i=0 max_attempts
+  max_attempts=$(( timeout * JOIN_WAIT_TICKS_PER_SECOND ))
   while [ ! -f "$path" ]; do
-    i=$((i + 1)); [ "$i" -ge "$timeout" ] && return 1
-    sleep 1
+    i=$((i + 1)); [ "$i" -ge "$max_attempts" ] && return 1
+    sleep "$JOIN_WAIT_INTERVAL"
   done
 }
 
 # Wait up to $2 seconds for a host:port to accept a TCP connection; returns 1 on timeout.
 wait_for_tcp() {
-  local hostport="$1" timeout="${2:-$JOIN_TIMEOUT}" host port i=0
+  local hostport="$1" timeout="${2:-$JOIN_TIMEOUT}" host port i=0 max_attempts
+  max_attempts=$(( timeout * JOIN_WAIT_TICKS_PER_SECOND ))
   host="${hostport%%:*}"; port="${hostport##*:}"
   while ! (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; do
-    i=$((i + 1)); [ "$i" -ge "$timeout" ] && return 1
-    sleep 1
+    i=$((i + 1)); [ "$i" -ge "$max_attempts" ] && return 1
+    sleep "$JOIN_WAIT_INTERVAL"
   done
   exec 3>&- 2>/dev/null || true
 }

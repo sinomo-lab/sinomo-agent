@@ -19,7 +19,7 @@ use sinomo_runtime::dfs::{
     open_root_local_metadata_backend, publish_cluster_dfs_metadata_journal_with_peer_transport,
     refresh_cluster_dfs_kv_snapshot_with_peer_transport, sifs_file_system_id,
 };
-use sinomo_runtime::kv::{self, KvError, KvOp, KvTxn, KvTxnResponse};
+use sinomo_runtime::kv::{KvError, KvOp, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
@@ -127,7 +127,9 @@ impl SifsFileManagerBackend {
         if !cluster_paths.state.exists() {
             return false;
         }
-        refresh_sifs_cluster_kv_snapshot(&cluster_paths);
+        if refresh_sifs_cluster_kv_snapshot(&cluster_paths).is_err() {
+            return false;
+        }
         let Ok(state) = cluster::read_cluster_state(&cluster_paths) else {
             return false;
         };
@@ -284,23 +286,34 @@ impl SifsFileManagerBackend {
     }
 
     pub(crate) fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
-        self.write_file_with_publish(path, bytes, true)
+        self.write_file_with_options(path, bytes, false, true)
     }
 
-    fn write_file_with_publish(
+    pub(crate) fn write_file_with_foreground_replica_repair(
         &self,
         path: &str,
         bytes: &[u8],
+    ) -> Result<(), String> {
+        self.write_file_with_options(path, bytes, true, true)
+    }
+
+    fn write_file_with_options(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        foreground_replica_repair: bool,
         publish_metadata: bool,
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         if let Some(parent) = parent_sifs_path(&path) {
             service
                 .posix_mkdir_all(&parent)
                 .map_err(|error| format!("cannot create SIFS directory {parent}: {error}"))?;
         }
-        let options = sifs_write_options(&service, &self.replica_candidates);
+        let mut options = sifs_write_options(&service, &self.replica_candidates);
+        options.foreground_replica_repair = foreground_replica_repair;
         service
             .posix_write_file(&path, bytes, options)
             .map(|_| ())
@@ -321,6 +334,7 @@ impl SifsFileManagerBackend {
             .map(|(path, bytes)| normalize_sifs_path(path).map(|path| (path, bytes.as_slice())))
             .collect::<Result<Vec<_>, _>>()?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         service
             .posix_create_files_local_eventual_with_known_parents(
                 normalized
@@ -339,6 +353,7 @@ impl SifsFileManagerBackend {
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         let options = sifs_deferred_publish_write_options(&service, &self.replica_candidates);
         service
             .posix_write_file_with_known_parent_deferred_local_replay(&path, bytes, options)
@@ -397,7 +412,7 @@ impl SifsFileManagerBackend {
         if !cluster_paths.state.exists() {
             return Ok(None);
         }
-        refresh_sifs_cluster_kv_snapshot(&cluster_paths);
+        refresh_sifs_cluster_kv_snapshot(&cluster_paths)?;
         let mut kv = SifsControlPlaneKvClient::new(&cluster_paths);
         let store = DfsControlPlaneStore::new(&mut kv);
         store
@@ -415,7 +430,7 @@ impl SifsFileManagerBackend {
         if !cluster_paths.state.exists() {
             return Err("SIFS metadata primary transfer requires a cluster".to_string());
         }
-        refresh_sifs_cluster_kv_snapshot(&cluster_paths);
+        refresh_sifs_cluster_kv_snapshot(&cluster_paths)?;
         let state = cluster::read_cluster_state(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
         let local_node_id = state.local_node_id;
@@ -495,6 +510,7 @@ impl SifsFileManagerBackend {
     pub(crate) fn create_dir_all(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         service
             .posix_mkdir_all(&path)
             .map_err(|error| format!("cannot create SIFS directory {path}: {error}"))?;
@@ -506,6 +522,7 @@ impl SifsFileManagerBackend {
     pub(crate) fn create_dir_all_deferred_local_replay(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         service
             .posix_mkdir_all_without_local_replay(&path)
             .map_err(|error| format!("cannot create SIFS directory {path}: {error}"))
@@ -753,6 +770,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn create_file(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         let options = sifs_write_options(&service, &self.replica_candidates);
         service
             .posix_write_file(&path, &[], options)
@@ -766,6 +784,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn create_dir(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         service
             .posix_mkdir(&path)
             .map(|_| ())
@@ -779,6 +798,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
         let from = normalize_sifs_path(from)?;
         let to = normalize_sifs_path(to)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         service
             .posix_rename(&from, &to)
             .map(|_| ())
@@ -791,6 +811,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn delete_file(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         service
             .posix_unlink(&path)
             .map(|_| ())
@@ -803,6 +824,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn delete_dir(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         service
             .posix_rmdir(&path)
             .map(|_| ())
@@ -907,7 +929,7 @@ fn open_sifs_service_with_hydration(
     let cluster_paths = ClusterPaths::new(data_dir);
     let peer_transport = Arc::new(SifsDfsPeerTransport::new(rpc_runtime.clone()));
     let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
-    refresh_sifs_cluster_kv_snapshot(&cluster_paths);
+    let _ = refresh_sifs_cluster_kv_snapshot(&cluster_paths);
     let _ = refresh_cluster_dfs_kv_snapshot_with_peer_transport(
         &cluster_paths,
         Arc::clone(&sync_peer_transport),
@@ -967,10 +989,12 @@ fn open_sifs_service_with_hydration(
     Ok(service)
 }
 
-fn refresh_sifs_cluster_kv_snapshot(cluster_paths: &ClusterPaths) {
+fn refresh_sifs_cluster_kv_snapshot(cluster_paths: &ClusterPaths) -> Result<(), String> {
     if cluster_paths.state.exists() {
-        let _ = refresh_cluster_kv_from_local_daemon(cluster_paths);
+        refresh_cluster_kv_from_local_daemon(cluster_paths)
+            .map_err(|error| format!("cannot refresh SIFS cluster KV snapshot: {error}"))?;
     }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -995,11 +1019,28 @@ impl SifsControlPlaneKvClient {
 
 impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
     fn get(&self, key: &str) -> Result<Option<sinomo_runtime::kv::KvEntry>, KvError> {
-        kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
+        let entry = cluster::read_cluster_kv_latest_observed_entry(&self.cluster_paths, key)
+            .map_err(|source| self.kv_error(source))?;
+        if entry.is_some() {
+            return Ok(entry);
+        }
+        refresh_sifs_cluster_kv_snapshot(&self.cluster_paths)
+            .map_err(|source| self.kv_error(source))?;
+        cluster::read_cluster_kv_latest_observed_entry(&self.cluster_paths, key)
+            .map_err(|source| self.kv_error(source))
     }
 
     fn range_prefix(&self, prefix: &str) -> Result<Vec<sinomo_runtime::kv::KvEntry>, KvError> {
-        kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
+        let entries =
+            cluster::read_cluster_kv_latest_observed_prefix_entries(&self.cluster_paths, prefix)
+                .map_err(|source| self.kv_error(source))?;
+        if !entries.is_empty() {
+            return Ok(entries);
+        }
+        refresh_sifs_cluster_kv_snapshot(&self.cluster_paths)
+            .map_err(|source| self.kv_error(source))?;
+        cluster::read_cluster_kv_latest_observed_prefix_entries(&self.cluster_paths, prefix)
+            .map_err(|source| self.kv_error(source))
     }
 
     fn put(
@@ -1041,8 +1082,8 @@ fn open_sifs_sharded_metadata_backend(
         return Ok(None);
     }
     let file_system_id = sifs_file_system_id();
-    let entries = kv::read_cluster_kv_prefix_entries(
-        &cluster_paths.kv_paths(),
+    let entries = cluster::read_cluster_kv_latest_observed_prefix_entries(
+        cluster_paths,
         &format!("{}/", metadata_shards_prefix(&file_system_id)),
     )
     .map_err(|error| format!("cannot read DFS metadata shard config: {error}"))?;
@@ -1077,9 +1118,10 @@ fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> 
         .map(|endpoint| endpoint.node_id)
         .collect::<BTreeSet<_>>();
     let graph = network::ClusterConnectivityGraph::read_for_local(&cluster_paths, &state);
-    let Ok(entries) =
-        kv::read_cluster_kv_prefix_entries(&cluster_paths.kv_paths(), content_services_prefix())
-    else {
+    let Ok(entries) = cluster::read_cluster_kv_latest_observed_prefix_entries(
+        &cluster_paths,
+        content_services_prefix(),
+    ) else {
         return candidates;
     };
     let mut content_node_ids = entries

@@ -336,20 +336,6 @@ pub fn send_daemon_rpc_to_endpoint_with_timeouts(
     output
 }
 
-pub(crate) fn send_daemon_rpc_to_endpoint_on_runtime(
-    endpoint: &ClusterEndpointRecord,
-    request: &ObjectRpcRequest,
-    timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
-    send_daemon_rpc_to_endpoint_with_timeouts_on_runtime(
-        endpoint,
-        request,
-        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
-        runtime,
-    )
-}
-
 pub(crate) fn send_daemon_rpc_to_endpoint_with_timeouts_on_runtime(
     endpoint: &ClusterEndpointRecord,
     request: &ObjectRpcRequest,

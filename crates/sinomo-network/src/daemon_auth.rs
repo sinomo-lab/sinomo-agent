@@ -138,7 +138,7 @@ fn cached_daemon_signing_identity(
     data_dir: &SinomoDataDir,
 ) -> Result<CachedDaemonSigningIdentity, NetworkError> {
     let root = data_dir.root();
-    if let Some(cached) = DAEMON_SIGNING_IDENTITIES
+    let cached = DAEMON_SIGNING_IDENTITIES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map_err(|source| NetworkError::Io {
@@ -146,8 +146,25 @@ fn cached_daemon_signing_identity(
             detail: source.to_string(),
         })?
         .get(&root)
-        .cloned()
-    {
+        .cloned();
+    if let Some(cached) = cached {
+        if cached.node_id != "node_local" {
+            return Ok(cached);
+        }
+        if let Some(node_id) = local_cluster_node_id(data_dir)
+            && node_id != cached.node_id
+        {
+            let refreshed = CachedDaemonSigningIdentity { node_id, ..cached };
+            DAEMON_SIGNING_IDENTITIES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .map_err(|source| NetworkError::Io {
+                    operation: "daemon RPC auth identity cache".to_string(),
+                    detail: source.to_string(),
+                })?
+                .insert(root, refreshed.clone());
+            return Ok(refreshed);
+        }
         return Ok(cached);
     }
 
@@ -161,13 +178,7 @@ fn cached_daemon_signing_identity(
         operation: "daemon RPC auth identity".to_string(),
         detail: source.to_string(),
     })?;
-    // Raw peek at the bootstrap state file for the signing label only; the
-    // canonical cached cluster-state reader lives in sinomo-cluster.
-    let node_id = crate::object_file_store::read_object_file::<sinomo_base::ClusterBootstrapState>(
-        &ClusterPaths::new(data_dir).state,
-    )
-    .map(|state| state.local_node_id.to_string())
-    .unwrap_or_else(|_| "node_local".to_string());
+    let node_id = local_cluster_node_id(data_dir).unwrap_or_else(|| "node_local".to_string());
     let public_key = daemon_auth_decode_public_key(&identity.public_key)?;
     let key_pair = Arc::new(identity.key_pair().map_err(|source| NetworkError::Io {
         operation: "daemon RPC auth identity".to_string(),
@@ -187,6 +198,16 @@ fn cached_daemon_signing_identity(
             detail: source.to_string(),
         })?;
     Ok(guard.entry(root).or_insert_with(|| loaded).clone())
+}
+
+fn local_cluster_node_id(data_dir: &SinomoDataDir) -> Option<String> {
+    // Raw peek at the bootstrap state file for the signing label only; the
+    // canonical cached cluster-state reader lives in sinomo-cluster.
+    crate::object_file_store::read_object_file::<sinomo_base::ClusterBootstrapState>(
+        &ClusterPaths::new(data_dir).state,
+    )
+    .ok()
+    .map(|state| state.local_node_id.to_string())
 }
 
 pub fn daemon_auth_decode_public_key(public_key: &str) -> Result<Vec<u8>, NetworkError> {

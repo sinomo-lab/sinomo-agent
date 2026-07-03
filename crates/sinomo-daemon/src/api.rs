@@ -182,10 +182,17 @@ impl DaemonApiClient {
 
     /// Creates and publishes a cluster join invite.
     pub fn cluster_invite(&self) -> Result<ClusterControlInviteResponse, DaemonError> {
-        let response =
-            self.call_control_payload(sinomo_core::cluster::cluster_control_invite_rpc_payload(
-                &ClusterControlInviteRequest {},
-            )?)?;
+        self.cluster_invite_with_request(ClusterControlInviteRequest::default())
+    }
+
+    /// Creates and publishes a cluster join invite with explicit request options.
+    pub fn cluster_invite_with_request(
+        &self,
+        request: ClusterControlInviteRequest,
+    ) -> Result<ClusterControlInviteResponse, DaemonError> {
+        let response = self.call_control_payload(
+            sinomo_core::cluster::cluster_control_invite_rpc_payload(&request)?,
+        )?;
         sinomo_core::cluster::decode_cluster_control_invite_rpc_response_body(&response.body)
             .map_err(DaemonError::from)
     }
@@ -240,7 +247,7 @@ impl DaemonApiClient {
     /// Fetches cluster health rows through the daemon's `/cluster/health`
     /// route.
     pub fn cluster_health(&self) -> Result<Vec<ClusterHealthRow>, DaemonError> {
-        let request = sinomo_core::cluster::cluster_health_rpc_request()?;
+        let request = sinomo_core::cluster::cluster_health_rpc_request_without_peer_views()?;
         let response = self.call_request(&request)?;
         sinomo_core::cluster::decode_cluster_health_rpc_response(&response)
             .map_err(DaemonError::from)

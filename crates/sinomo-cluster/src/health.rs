@@ -5,8 +5,8 @@ use crate::kv_read_model::read_cluster_node_statuses_from_kv;
 use crate::local_state_store::read_cluster_state;
 use crate::local_state_store::read_cluster_state_async;
 use crate::prelude::*;
+use sinomo_network::CLUSTER_HEALTH_INCLUDE_PEER_VIEWS_METADATA_KEY;
 use sinomo_network::ClusterMembershipRpcFuture;
-use sinomo_network::cluster_route_next_hop;
 use sinomo_network::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_SCOPE_LOCAL,
     CLUSTER_HEALTH_SCOPE_METADATA_KEY, CLUSTER_NETWORK_PING_ROUTE, CLUSTER_NETWORK_RPC_CATEGORY,
@@ -16,10 +16,10 @@ use sinomo_network::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState,
     ClusterEndpointSelector, ClusterPaths, NetworkError, iroh_endpoint_public_key,
 };
+use sinomo_network::{cluster_endpoint_can_carry_main_daemon_rpc, cluster_route_next_hop};
 use sinomo_node::{
     DAEMON_MAIN_RUN_CAPABILITY, cluster_member_expected_daemon_process,
     cluster_member_is_legacy_shadow_daemon, cluster_member_is_local_process,
-    live_cluster_member_probe_possible,
 };
 
 const CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS: usize = 8;
@@ -67,6 +67,15 @@ pub fn cluster_health_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
     ObjectRpcRequest::encode_body(CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, &())
 }
 
+pub fn cluster_health_rpc_request_without_peer_views() -> Result<ObjectRpcRequest, NetworkError> {
+    let mut request = cluster_health_rpc_request()?;
+    request.metadata.insert(
+        CLUSTER_HEALTH_INCLUDE_PEER_VIEWS_METADATA_KEY.to_string(),
+        "false".to_string(),
+    );
+    Ok(request)
+}
+
 pub fn cluster_network_ping_rpc_request(
     nonce: impl Into<String>,
     payload_bytes: usize,
@@ -106,6 +115,13 @@ pub fn cluster_health_rpc_request_is_local_scope(request: &ObjectRpcRequest) -> 
         .is_some_and(|scope| scope == CLUSTER_HEALTH_SCOPE_LOCAL)
 }
 
+fn cluster_health_rpc_request_includes_peer_views(request: &ObjectRpcRequest) -> bool {
+    !request
+        .metadata
+        .get(CLUSTER_HEALTH_INCLUDE_PEER_VIEWS_METADATA_KEY)
+        .is_some_and(|include| include == "false" || include == "0")
+}
+
 pub fn decode_cluster_health_rpc_response(
     response: &ObjectRpcResponse,
 ) -> Result<Vec<ClusterHealthRow>, NetworkError> {
@@ -130,6 +146,7 @@ pub fn handle_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
         CLUSTER_HEALTH_ROUTE => {
             let _: () = request.decode_body()?;
             let local_scope = cluster_health_rpc_request_is_local_scope(&request);
+            let include_peer_views = cluster_health_rpc_request_includes_peer_views(&request);
             let rows = if local_scope {
                 cluster_health_rows_with_probe_for_scope(
                     paths,
@@ -139,8 +156,16 @@ pub fn handle_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
                     true,
                     observed_at,
                 )?
+            } else if !include_peer_views {
+                cluster_health_rows_from_stored_statuses(paths, state, false, observed_at)?
             } else {
-                cluster_health_rows_with_probe(paths, state, probe, true, observed_at)?
+                cluster_health_rows_with_probe(
+                    paths,
+                    state,
+                    probe,
+                    include_peer_views,
+                    observed_at,
+                )?
             };
             ObjectRpcResponse::encode_body(CLUSTER_HEALTH_ROUTE, &rows)
         }
@@ -175,6 +200,7 @@ pub async fn handle_cluster_health_rpc_request_async<P: ClusterStatusAsyncProbe 
         CLUSTER_HEALTH_ROUTE => {
             let _: () = request.decode_body()?;
             let local_scope = cluster_health_rpc_request_is_local_scope(&request);
+            let include_peer_views = cluster_health_rpc_request_includes_peer_views(&request);
             let rows = if local_scope {
                 cluster_health_rows_with_async_probe_for_scope(
                     paths,
@@ -185,8 +211,18 @@ pub async fn handle_cluster_health_rpc_request_async<P: ClusterStatusAsyncProbe 
                     observed_at,
                 )
                 .await?
+            } else if !include_peer_views {
+                cluster_health_rows_from_stored_statuses_async(paths, state, false, observed_at)
+                    .await?
             } else {
-                cluster_health_rows_with_async_probe(paths, state, probe, true, observed_at).await?
+                cluster_health_rows_with_async_probe(
+                    paths,
+                    state,
+                    probe,
+                    include_peer_views,
+                    observed_at,
+                )
+                .await?
             };
             ObjectRpcResponse::encode_body(CLUSTER_HEALTH_ROUTE, &rows)
         }
@@ -333,6 +369,39 @@ pub fn cluster_health_rows_with_probe<P: ClusterStatusProbe + ?Sized>(
     )
 }
 
+fn cluster_health_rows_from_stored_statuses(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    local_scope: bool,
+    observed_at: OffsetDateTime,
+) -> Result<Vec<ClusterHealthRow>, NetworkError> {
+    let stored_statuses = read_cluster_node_statuses_from_kv(paths)?;
+    let mut rows = Vec::new();
+    for member in state
+        .members
+        .iter()
+        .filter(|member| cluster_health_member_is_in_scope(state, member, local_scope))
+    {
+        let expected_process = cluster_member_expected_daemon_process(member);
+        let stored =
+            stored_cluster_node_status_for_member(&stored_statuses, member, expected_process);
+        let availability = stored
+            .as_ref()
+            .map(|status| status.availability.clone())
+            .unwrap_or(ClusterNodeAvailability::Unknown);
+        let mut status =
+            stored.unwrap_or_else(|| unknown_cluster_node_status(state, member, observed_at));
+        status.availability = availability.clone();
+        rows.push(ClusterHealthRow {
+            member: member.clone(),
+            status,
+            availability,
+        });
+    }
+    rows.sort_by(|left, right| left.member.node_id.cmp(&right.member.node_id));
+    Ok(rows)
+}
+
 fn cluster_health_rows_with_probe_for_scope<P: ClusterStatusProbe + ?Sized>(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -342,6 +411,7 @@ fn cluster_health_rows_with_probe_for_scope<P: ClusterStatusProbe + ?Sized>(
     observed_at: OffsetDateTime,
 ) -> Result<Vec<ClusterHealthRow>, NetworkError> {
     let stored_statuses = read_cluster_node_statuses_from_kv(paths)?;
+    let connectivity = ClusterConnectivityGraph::read_for_local(paths, state);
     let mut rows = Vec::new();
     for member in state
         .members
@@ -355,6 +425,13 @@ fn cluster_health_rows_with_probe_for_scope<P: ClusterStatusProbe + ?Sized>(
         let stored =
             stored_cluster_node_status_for_member(&stored_statuses, member, expected_process);
         let live_online = live.is_some();
+        let availability = cluster_health_member_availability(
+            state,
+            member,
+            &connectivity,
+            live_online,
+            stored.as_ref(),
+        );
         let mut status = if let Some(live) = live {
             let mut live = live;
             if live.rollout.is_none() {
@@ -365,14 +442,6 @@ fn cluster_health_rows_with_probe_for_scope<P: ClusterStatusProbe + ?Sized>(
             stored
         } else {
             unknown_cluster_node_status(state, member, observed_at)
-        };
-        // Availability is driven by the active probe, not by stored status freshness.
-        let availability = if live_online {
-            ClusterNodeAvailability::Online
-        } else if live_cluster_member_probe_possible(state, member) {
-            ClusterNodeAvailability::Offline
-        } else {
-            ClusterNodeAvailability::Unknown
         };
         status.availability = availability.clone();
         rows.push(ClusterHealthRow {
@@ -406,6 +475,24 @@ pub async fn cluster_health_rows_with_async_probe<P: ClusterStatusAsyncProbe + ?
     .await
 }
 
+async fn cluster_health_rows_from_stored_statuses_async(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    local_scope: bool,
+    observed_at: OffsetDateTime,
+) -> Result<Vec<ClusterHealthRow>, NetworkError> {
+    let paths = paths.clone();
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        cluster_health_rows_from_stored_statuses(&paths, &state, local_scope, observed_at)
+    })
+    .await
+    .map_err(|source| NetworkError::Io {
+        operation: "cluster health stored status rows".to_string(),
+        detail: format!("cluster health stored status task failed: {source}"),
+    })?
+}
+
 async fn cluster_health_rows_with_async_probe_for_scope<P: ClusterStatusAsyncProbe + ?Sized>(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -423,6 +510,7 @@ async fn cluster_health_rows_with_async_probe_for_scope<P: ClusterStatusAsyncPro
         operation: "cluster health status read".to_string(),
         detail: format!("cluster health status read task failed: {source}"),
     })??;
+    let connectivity = ClusterConnectivityGraph::read_for_local(paths, state);
     let reportable_members = state
         .members
         .iter()
@@ -442,6 +530,13 @@ async fn cluster_health_rows_with_async_probe_for_scope<P: ClusterStatusAsyncPro
         let stored =
             stored_cluster_node_status_for_member(&stored_statuses, member, expected_process);
         let live_online = live.is_some();
+        let availability = cluster_health_member_availability(
+            state,
+            member,
+            &connectivity,
+            live_online,
+            stored.as_ref(),
+        );
         let mut status = if let Some(live) = live {
             let mut live = live;
             if live.rollout.is_none() {
@@ -452,13 +547,6 @@ async fn cluster_health_rows_with_async_probe_for_scope<P: ClusterStatusAsyncPro
             stored
         } else {
             unknown_cluster_node_status(state, member, observed_at)
-        };
-        let availability = if live_online {
-            ClusterNodeAvailability::Online
-        } else if live_cluster_member_probe_possible(state, member) {
-            ClusterNodeAvailability::Offline
-        } else {
-            ClusterNodeAvailability::Unknown
         };
         status.availability = availability.clone();
         rows.push(ClusterHealthRow {
@@ -639,18 +727,82 @@ pub fn unknown_cluster_node_status(
         target_arch: None,
         hostname: None,
         pid: None,
-        address: member
-            .endpoints
-            .iter()
-            .find(|endpoint| !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly))
-            .or_else(|| member.endpoints.first())
-            .map(|endpoint| endpoint.address.clone()),
+        address: unknown_status_fallback_address(member),
         bind_address: None,
         executable: None,
         rollout: None,
         daemon_started_at: None,
         observed_at,
     }
+}
+
+fn unknown_status_fallback_address(member: &ClusterMemberRecord) -> Option<String> {
+    member
+        .endpoints
+        .iter()
+        .find(|endpoint| {
+            !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly)
+                && cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
+        })
+        .or_else(|| {
+            member
+                .endpoints
+                .iter()
+                .find(|endpoint| !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly))
+        })
+        .or_else(|| member.endpoints.first())
+        .map(|endpoint| endpoint.address.clone())
+}
+
+fn cluster_health_member_availability(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    connectivity: &ClusterConnectivityGraph,
+    live_online: bool,
+    stored: Option<&ClusterNodeStatusRecord>,
+) -> ClusterNodeAvailability {
+    if live_online {
+        return ClusterNodeAvailability::Online;
+    }
+    if stored.is_some_and(|status| status.availability == ClusterNodeAvailability::Offline) {
+        return ClusterNodeAvailability::Offline;
+    }
+    if cluster_health_member_unreachable_via_connectivity(state, member, connectivity) {
+        return ClusterNodeAvailability::Offline;
+    }
+    if stored.is_some_and(|status| status.availability == ClusterNodeAvailability::Online) {
+        return ClusterNodeAvailability::Online;
+    }
+    ClusterNodeAvailability::Unknown
+}
+
+fn cluster_health_member_unreachable_via_connectivity(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    connectivity: &ClusterConnectivityGraph,
+) -> bool {
+    if cluster_member_is_local_process(state, member) {
+        return false;
+    }
+    let mut has_probeable_endpoint = false;
+    for endpoint in &member.endpoints {
+        let probeable = endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+            && cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
+            && matches!(
+                endpoint.transport,
+                ClusterTransportKind::LanTcp
+                    | ClusterTransportKind::Loopback
+                    | ClusterTransportKind::Iroh
+            );
+        if !probeable {
+            continue;
+        }
+        has_probeable_endpoint = true;
+        if connectivity.unavailability_rank(endpoint) == 0 {
+            return false;
+        }
+    }
+    has_probeable_endpoint
 }
 
 fn cluster_node_status_matches_member(

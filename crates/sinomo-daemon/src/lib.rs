@@ -481,7 +481,7 @@ pub(crate) use client::{
     send_cluster_member_publish_async, send_cluster_raft_append_async,
     send_cluster_raft_append_on_runtime, send_cluster_raft_vote_async,
     send_cluster_raft_vote_on_runtime, send_daemon_rpc_on_runtime,
-    send_daemon_rpc_to_endpoint_on_runtime, send_dfs_object_rpc_to_target_on_runtime,
+    send_dfs_object_rpc_to_target_on_runtime,
 };
 pub use client::{
     RemoteConfigClient, fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,

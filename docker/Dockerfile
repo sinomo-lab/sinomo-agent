@@ -17,6 +17,7 @@ RUN apt-get update \
         git \
         ca-certificates \
         iproute2 \
+        libasound2-dev \
         procps \
     && rm -rf /var/lib/apt/lists/*
 

@@ -76,6 +76,7 @@ pub const OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY: &str = "sinomo-observe-sample
 
 pub const CLUSTER_HEALTH_RPC_CATEGORY: &str = "cluster.health";
 pub const CLUSTER_HEALTH_ROUTE: &str = "/cluster/health";
+pub const CLUSTER_HEALTH_INCLUDE_PEER_VIEWS_METADATA_KEY: &str = "sinomo-health-peer-views";
 pub const CLUSTER_HEALTH_SCOPE_METADATA_KEY: &str = "sinomo-health-scope";
 pub const CLUSTER_HEALTH_SCOPE_LOCAL: &str = "local";
 pub const CLUSTER_NETWORK_RPC_CATEGORY: &str = "cluster.network";

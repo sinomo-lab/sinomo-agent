@@ -1068,14 +1068,22 @@ fn validate_lightweight_read_prefix(
 fn run_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let path = ctx.required_parameter("path")?.to_string();
     let payload = required_payload_bytes(ctx)?;
+    let foreground_repair = optional_bool_parameter(ctx, "foreground-repair", false)?;
     let backend = open_backend(ctx)?;
     let node = backend.node_label();
-    backend
-        .write_file(&path, &payload)
-        .map_err(SinomoTestError::failed)?;
+    if foreground_repair {
+        backend
+            .write_file_with_foreground_replica_repair(&path, &payload)
+            .map_err(SinomoTestError::failed)?;
+    } else {
+        backend
+            .write_file(&path, &payload)
+            .map_err(SinomoTestError::failed)?;
+    }
     ctx.record("node", &node);
     ctx.record("path", &path);
     ctx.record("bytes", payload.len());
+    ctx.record("foreground_repair", foreground_repair);
     Ok(SinomoTestOutcome::passed(format!(
         "wrote {} bytes to {path} on node {node}",
         payload.len()

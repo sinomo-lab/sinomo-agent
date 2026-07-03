@@ -267,6 +267,8 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let p95_us = percentile_value(&latencies_us, 95);
     let max_us = latencies_us.iter().copied().max().unwrap_or(0);
     let min_us = latencies_us.iter().copied().min().unwrap_or(0);
+    let slowest_targets_ms = network_ping_slowest_target_summaries(&latencies_by_target, "ms");
+    let slowest_targets_us = network_ping_slowest_target_summaries(&latencies_by_target_us, "us");
     let requests_per_second = rate_per_second(success_count as f64, elapsed);
     let payload_bytes_per_success = payload_bytes.saturating_add(response_payload_bytes);
     let total_success_payload_bytes = payload_bytes_per_success.saturating_mul(success_count);
@@ -346,22 +348,26 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     }
     if max_p50_ms > 0 && p50_ms > max_p50_ms {
         return Ok(SinomoTestOutcome::failed(format!(
-            "network ping p50 latency {p50_ms}ms is above allowed {max_p50_ms}ms"
+            "network ping p50 latency {p50_ms}ms is above allowed {max_p50_ms}ms{}",
+            slowest_target_detail(&slowest_targets_ms)
         )));
     }
     if max_p95_ms > 0 && p95_ms > max_p95_ms {
         return Ok(SinomoTestOutcome::failed(format!(
-            "network ping p95 latency {p95_ms}ms is above allowed {max_p95_ms}ms"
+            "network ping p95 latency {p95_ms}ms is above allowed {max_p95_ms}ms{}",
+            slowest_target_detail(&slowest_targets_ms)
         )));
     }
     if max_p50_us > 0 && p50_us > max_p50_us {
         return Ok(SinomoTestOutcome::failed(format!(
-            "network ping p50 latency {p50_us}us is above allowed {max_p50_us}us"
+            "network ping p50 latency {p50_us}us is above allowed {max_p50_us}us{}",
+            slowest_target_detail(&slowest_targets_us)
         )));
     }
     if max_p95_us > 0 && p95_us > max_p95_us {
         return Ok(SinomoTestOutcome::failed(format!(
-            "network ping p95 latency {p95_us}us is above allowed {max_p95_us}us"
+            "network ping p95 latency {p95_us}us is above allowed {max_p95_us}us{}",
+            slowest_target_detail(&slowest_targets_us)
         )));
     }
     if min_requests_per_second > 0.0 && requests_per_second < min_requests_per_second {
@@ -620,6 +626,52 @@ fn percentile_value(sorted: &[u64], percentile: usize) -> u64 {
     let rank = sorted.len().saturating_mul(percentile).saturating_add(99) / 100;
     let index = rank.saturating_sub(1).min(sorted.len() - 1);
     sorted[index]
+}
+
+fn network_ping_slowest_target_summaries(
+    latencies_by_target: &BTreeMap<String, Vec<u64>>,
+    unit: &str,
+) -> Vec<String> {
+    let mut summaries = latencies_by_target
+        .iter()
+        .filter_map(|(target, latencies)| {
+            if latencies.is_empty() {
+                return None;
+            }
+            let mut sorted = latencies.clone();
+            sorted.sort_unstable();
+            let p50 = percentile_value(&sorted, 50);
+            let p95 = percentile_value(&sorted, 95);
+            let max = sorted.iter().copied().max().unwrap_or(0);
+            Some((
+                p50,
+                p95,
+                max,
+                format!("{target}: p50={p50}{unit} p95={p95}{unit} max={max}{unit}"),
+            ))
+        })
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    summaries
+        .into_iter()
+        .take(3)
+        .map(|(_, _, _, summary)| summary)
+        .collect()
+}
+
+fn slowest_target_detail(slowest_targets: &[String]) -> String {
+    if slowest_targets.is_empty() {
+        String::new()
+    } else {
+        format!("; slowest targets: {}", slowest_targets.join(", "))
+    }
 }
 
 fn rate_per_second(count: f64, elapsed: Duration) -> f64 {

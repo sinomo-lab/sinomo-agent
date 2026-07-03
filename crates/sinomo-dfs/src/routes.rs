@@ -271,6 +271,7 @@ fn dfs_network_message_requires_fresh_metadata(message: &DfsNetworkMessage) -> b
         message,
         DfsNetworkMessage::ReadRequest(_)
             | DfsNetworkMessage::BulkReadRequest(_)
+            | DfsNetworkMessage::DistributedWriteRequest(_)
             | DfsNetworkMessage::NamespaceRequest(_)
     )
 }

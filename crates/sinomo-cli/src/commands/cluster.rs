@@ -996,21 +996,17 @@ pub(crate) fn initialize_single_node_cluster_with_paths(
 
 /// `sinomo cluster invite`: daemon-required — the daemon builds, signs, and
 /// publishes the invite through `/cluster/control/invite` with its own
-/// advertised introducers and the default ttl. The direct implementation
-/// stays reachable through [`cluster_invite_with_paths`].
+/// advertised introducers unless explicit invite options override them. The
+/// direct implementation stays reachable through [`cluster_invite_with_paths`].
 pub(crate) fn cluster_invite(options: ClusterInviteOptions) -> Result<(), CliError> {
     let client = cluster_control_daemon_client("invite")?;
-    if options.ttl_seconds != CLUSTER_INVITE_DEFAULT_TTL_SECONDS {
-        return Err(CliError::Parse {
-            detail: "--ttl-seconds is not supported for daemon-mediated invites yet; the daemon issues invites with the default 24h ttl".to_string(),
-        });
-    }
-    if !options.introducers.is_empty() {
-        return Err(CliError::Parse {
-            detail: "--introducer is not supported for daemon-mediated invites yet; the daemon publishes its own advertised endpoints as introducers".to_string(),
-        });
-    }
-    let uri = client.cluster_invite()?.invite;
+    let uri = client
+        .cluster_invite_with_request(cluster::ClusterControlInviteRequest {
+            ttl_seconds: (options.ttl_seconds != CLUSTER_INVITE_DEFAULT_TTL_SECONDS)
+                .then_some(options.ttl_seconds),
+            introducers: options.introducers.clone(),
+        })?
+        .invite;
     let invite = decode_cluster_join_invite(&uri)?;
     if invite
         .introducers
