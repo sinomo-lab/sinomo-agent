@@ -15,12 +15,6 @@ ring = "r0"
 # Exposes crate internals for sibling-crate integration tests.
 test-support = ["dep:sinomo-kv"]
 default = []
-# TODO(stage-C-followup): remove this feature (and the `iroh` dep) once the
-# daemon's built-in iroh proxy loop, sinomo-cli's direct-dial tests, and the
-# sinomo-cluster proxy tests are migrated to the modules/network/iroh dylib.
-# The extraction landed in stage C; registry-aware dispatch already prefers a
-# registered module over this built-in path.
-iroh-transport = ["dep:iroh"]
 
 [dependencies]
 arc-swap.workspace = true
@@ -35,7 +29,6 @@ thiserror.workspace = true
 time.workspace = true
 metrics.workspace = true
 tracing.workspace = true
-iroh = { version = "0.98.2", optional = true }
 local-ip-address.workspace = true
 tokio.workspace = true
 tower-layer = "0.3"

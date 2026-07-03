@@ -139,7 +139,6 @@ const PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS_PER_SOURCE: usize =
     sinomo_core::network::MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS;
 const PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS: usize =
     sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
-static DAEMON_IROH_PROXY_STARTS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 
 #[cfg(test)]
 fn cluster_network_info_key(node_id: &NodeId) -> String {
@@ -978,85 +977,52 @@ pub(crate) fn cluster_paths_from_daemon_paths(
     Ok(ClusterPaths::new(&SinomoDataDir::new(data_dir)))
 }
 
-/// True while the built-in iroh proxy owns (or is start-retrying for) the
-/// node's iroh listener. `/network/modules/set-enabled` consults this to
-/// refuse enabling an iroh-listener module that would double-bind the node's
-/// iroh identity against the running built-in proxy.
-static DAEMON_BUILTIN_IROH_PROXY_ACTIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-pub(crate) fn daemon_builtin_iroh_proxy_active() -> bool {
-    DAEMON_BUILTIN_IROH_PROXY_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-fn set_daemon_builtin_iroh_proxy_active(active: bool) {
-    DAEMON_BUILTIN_IROH_PROXY_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
-}
-
-pub(crate) fn start_daemon_iroh_proxy_if_clustered(
+/// Hands registered network modules their cluster context once the node has
+/// a cluster identity, starting any enabled module whose listener is not yet
+/// running (modules registered pre-cluster, before `cluster init`/`join`).
+///
+/// This replaces the removed built-in iroh proxy loop: transports are
+/// module-owned now (modules/network/iroh), the module writes its own
+/// endpoint record, and that record reaches cluster KV through the regular
+/// maintenance/status publishes and the repair-route refresh.
+///
+/// Returns `None` when there is nothing to wait for: no registry, no
+/// registered modules, or every enabled module already started at load time
+/// (the daemon booted with a cluster identity).
+pub(crate) fn start_daemon_network_module_context_task(
     paths: &DaemonPaths,
     options: &DaemonRunOptions,
     cluster: Option<&DaemonClusterStatus>,
     runtime: tokio::runtime::Handle,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     label: &str,
-) -> Result<Option<tokio::task::JoinHandle<()>>, DaemonError> {
-    set_daemon_builtin_iroh_proxy_active(false);
-    if sinomo_core::network::iroh_disabled_by_env() {
-        tracing::info!("sinomo {label} iroh disabled (SINOMO_DISABLE_IROH)");
-        return Ok(None);
+) -> Option<tokio::task::JoinHandle<()>> {
+    let needs_context = crate::registry::daemon_network_modules().is_some_and(|modules| {
+        modules
+            .registry
+            .snapshot()
+            .iter()
+            .any(|status| status.enabled && !status.started)
+    });
+    if !needs_context {
+        return None;
     }
-    // Stage C: when an enabled dylib network module claims the iroh transport
-    // (modules/network/iroh), its own proxy owns the listener half — running
-    // the built-in feature-gated proxy too would double-bind the node's iroh
-    // identity and race the endpoint record file.
-    if daemon_registered_network_module_owns_iroh() {
-        tracing::info!(
-            "sinomo {label} built-in iroh proxy skipped: iroh network module is registered"
-        );
-        return Ok(None);
-    }
-    if paths.root.parent().is_none() {
+    let Some(data_dir) = paths.root.parent().map(|path| path.to_path_buf()) else {
         tracing::warn!(
-            "sinomo {label} iroh proxy disabled: daemon paths have no data directory parent"
+            "sinomo {label} network module context task disabled: daemon paths have no data directory parent"
         );
-        return Ok(None);
-    }
-    let proxy_key = daemon_iroh_proxy_start_key(paths, label);
-    if !claim_daemon_iroh_proxy_start(&proxy_key)? {
-        tracing::debug!("sinomo {label} iroh proxy already initialized");
-        return Ok(None);
-    }
+        return None;
+    };
     let paths = paths.clone();
     let options = options.clone();
     let mut cluster = cluster.cloned();
     let label = label.to_string();
-    let runtime = runtime.clone();
     let task = runtime.clone().spawn(async move {
-        let Some(data_dir) = paths.root.parent().map(|path| path.to_path_buf()) else {
-            tracing::warn!(
-                "sinomo {label} iroh proxy disabled: daemon paths have no data directory parent"
-            );
-            return;
-        };
         let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
         let daemon_address = daemon_connect_address(&options.host, options.port);
-        let mut proxy_handle: Option<sinomo_core::network::IrohDaemonProxyHandle> = None;
-        let mut next_republish = Instant::now();
-        let mut proxy_start_failures = 0_u32;
         loop {
             if daemon_cluster_shutdown_requested(&shutdown_rx) {
-                if let Some(handle) = proxy_handle.take() {
-                    let _ = handle.join().await;
-                }
                 return;
-            }
-            if proxy_handle
-                .as_ref()
-                .is_some_and(sinomo_core::network::IrohDaemonProxyHandle::is_finished)
-            {
-                tracing::warn!("sinomo {label} iroh proxy supervisor stopped, restarting");
-                proxy_handle = None;
             }
             if cluster.is_none() {
                 let status_paths = paths.clone();
@@ -1075,16 +1041,13 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
                 })
                 .await;
                 let Ok((status, state_exists)) = status else {
-                    tracing::warn!("sinomo {label} iroh cluster status task failed");
+                    tracing::warn!("sinomo {label} network module cluster status task failed");
                     if daemon_cluster_sleep_or_shutdown(
                         &mut shutdown_rx,
                         DAEMON_CLUSTER_PUBLISH_INTERVAL,
                     )
                     .await
                     {
-                        if let Some(handle) = proxy_handle.take() {
-                            let _ = handle.join().await;
-                        }
                         return;
                     }
                     continue;
@@ -1097,182 +1060,35 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
                         DAEMON_CLUSTER_PUBLISH_INTERVAL
                     };
                     if daemon_cluster_sleep_or_shutdown(&mut shutdown_rx, retry_delay).await {
-                        if let Some(handle) = proxy_handle.take() {
-                            let _ = handle.join().await;
-                        }
                         return;
                     }
                     continue;
                 }
             }
             let Some(current_cluster) = cluster.clone() else {
-                if daemon_cluster_sleep_or_shutdown(
-                    &mut shutdown_rx,
-                    DAEMON_CLUSTER_PUBLISH_INTERVAL,
-                )
-                .await
-                {
-                    if let Some(handle) = proxy_handle.take() {
-                        let _ = handle.join().await;
-                    }
-                    return;
-                }
                 continue;
             };
-            let endpoint_node_id = daemon_iroh_proxy_node_id(&current_cluster);
-            if proxy_handle.is_none() {
-                // The node has a cluster identity now: hand registered network
-                // modules their context first (covers modules registered
-                // pre-cluster, before init/join). When an iroh module ends up
-                // with a running listener, it owns the proxy and this
-                // built-in task stands down for good.
-                let module_context = sinomo_core::network::NetworkModuleContext {
-                    cluster_root: cluster_paths.root.clone(),
-                    node_id: endpoint_node_id.clone(),
-                    cluster_id: Some(current_cluster.cluster_id.clone()),
-                    daemon_forward_address: daemon_address.clone(),
-                };
-                let module_owns_iroh = tokio::task::spawn_blocking(move || {
-                    crate::registry::start_enabled_network_modules_with_context(&module_context);
-                    daemon_registered_network_module_owns_iroh()
-                })
-                .await
-                .unwrap_or(false);
-                if module_owns_iroh {
-                    tracing::info!(
-                        "sinomo {label} built-in iroh proxy stand-down: iroh network module listener started"
-                    );
-                    break;
-                }
-                match sinomo_core::network::start_iroh_daemon_proxy(
-                    runtime.clone(),
-                    cluster_paths.clone(),
-                    current_cluster.cluster_id.clone(),
-                    endpoint_node_id.clone(),
-                    daemon_address.clone(),
-                )
-                .await
-                {
-                    Ok(handle) => {
-                        let record = handle.endpoint_record().clone();
-                        let endpoint = record.endpoint();
-                        let endpoint_address = endpoint.address.clone();
-                        let advertise_paths = paths.clone();
-                        let advertise_runtime = runtime.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            advertise_daemon_iroh_endpoint_on_runtime(
-                                &advertise_paths,
-                                record,
-                                &advertise_runtime,
-                            )
-                        })
-                        .await
-                        {
-                            Ok(Ok(())) => {
-                                tracing::info!("sinomo {label} iroh endpoint: {endpoint_address}");
-                            }
-                            Ok(Err(error)) => {
-                                tracing::warn!(
-                                    "sinomo {label} iroh endpoint advertisement failed: {error}"
-                                );
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    "sinomo {label} iroh endpoint advertisement task failed: {error}"
-                                );
-                            }
-                        }
-                        proxy_handle = Some(handle);
-                        set_daemon_builtin_iroh_proxy_active(true);
-                        proxy_start_failures = 0;
-                        next_republish = Instant::now()
-                            + sinomo_core::cluster::cluster_network_publish_interval_for_node(
-                                &cluster_paths,
-                                &endpoint_node_id,
-                            );
-                    }
-                    Err(error) if error.to_string().contains("without iroh-transport") => {
-                        tracing::warn!("sinomo {label} iroh proxy disabled: {error}");
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::warn!("sinomo {label} iroh proxy unavailable, retrying: {error}");
-                        let retry_delay =
-                            sinomo_core::network::cluster_iroh_proxy_start_retry_sleep_duration(
-                                proxy_start_failures,
-                                sinomo_core::cluster::cluster_network_publish_interval_for_node(
-                                    &cluster_paths,
-                                    &endpoint_node_id,
-                                ),
-                        );
-                        proxy_start_failures = proxy_start_failures.saturating_add(1);
-                        if daemon_cluster_sleep_or_shutdown(&mut shutdown_rx, retry_delay).await {
-                            if let Some(handle) = proxy_handle.take() {
-                                let _ = handle.join().await;
-                            }
-                            return;
-                        }
-                    }
-                }
-                continue;
-            }
-            if Instant::now() >= next_republish {
-                let repair_paths = paths.clone();
-                let repair_runtime = runtime.clone();
-                let repair = tokio::task::spawn_blocking(move || {
-                    let refreshed =
-                        refresh_daemon_iroh_repair_route_on_runtime(&repair_paths, &repair_runtime);
-                    let status =
-                        daemon_cluster_status_from_paths_on_runtime(&repair_paths, Some(&repair_runtime))
-                            .ok()
-                            .flatten();
-                    (refreshed, status)
-                })
-                .await;
-                match repair {
-                    Ok((Ok(_), Some(updated))) => {
-                        cluster = Some(updated);
-                    }
-                    Ok((Ok(_), None)) => {}
-                    Ok((Err(error), _)) => {
-                        tracing::warn!("sinomo {label} iroh repair route publish failed: {error}");
-                    }
-                    Err(error) => {
-                        tracing::warn!("sinomo {label} iroh repair route task failed: {error}");
-                    }
-                }
-                let publish_node = cluster
-                    .as_ref()
-                    .map(|cluster| &cluster.node_id)
-                    .unwrap_or(&current_cluster.node_id);
-                next_republish = Instant::now()
-                    + sinomo_core::cluster::cluster_network_publish_interval_for_node(
-                        &cluster_paths,
-                        publish_node,
-                    );
-            }
-            if daemon_cluster_sleep_or_shutdown(
-                &mut shutdown_rx,
-                sinomo_core::network::cluster_iroh_proxy_republish_sleep_duration(
-                    Instant::now(),
-                    next_republish,
-                ),
-            )
+            // The node has a cluster identity: deliver the context once.
+            // Start failures are logged inside and recoverable through
+            // `/network/modules/set-enabled`, which refreshes the context.
+            let module_context = sinomo_core::network::NetworkModuleContext {
+                cluster_root: cluster_paths.root.clone(),
+                node_id: daemon_iroh_proxy_node_id(&current_cluster),
+                cluster_id: Some(current_cluster.cluster_id.clone()),
+                daemon_forward_address: daemon_address.clone(),
+            };
+            let started = tokio::task::spawn_blocking(move || {
+                crate::registry::start_enabled_network_modules_with_context(&module_context)
+            })
             .await
-            {
-                if let Some(handle) = proxy_handle.take() {
-                    let _ = handle.join().await;
-                }
-                return;
+            .unwrap_or(false);
+            if started {
+                tracing::info!("sinomo {label} network modules started with cluster context");
             }
+            return;
         }
-        // Reached only via `break` (permanent stand-down: an iroh module owns
-        // the listener, or the built-in transport is unavailable) — the
-        // shutdown `return`s above leave the flag as-is since the process is
-        // exiting.
-        set_daemon_builtin_iroh_proxy_active(false);
     });
-    Ok(Some(task))
+    Some(task)
 }
 
 fn daemon_cluster_shutdown_requested(shutdown: &tokio::sync::watch::Receiver<bool>) -> bool {
@@ -1294,45 +1110,12 @@ async fn daemon_cluster_sleep_or_shutdown(
     }
 }
 
-fn daemon_iroh_proxy_start_key(paths: &DaemonPaths, label: &str) -> String {
-    format!("{}\0{label}", paths.root.display())
-}
-
-/// True when the process-wide network-module registry has a STARTED module
-/// listening on the Iroh transport (the module then owns the proxy; the
-/// built-in path must stand down). Keyed on `started`, not merely `enabled`:
-/// an enabled module registered pre-cluster has no running listener yet, and
-/// treating it as the owner would leave the node with no iroh listener at
-/// all after a later init/join.
-pub(crate) fn daemon_registered_network_module_owns_iroh() -> bool {
-    sinomo_core::network::network_module_registry().is_some_and(|registry| {
-        registry.snapshot().iter().any(|status| {
-            status.enabled
-                && status.started
-                && status.descriptor.listener
-                && status
-                    .descriptor
-                    .transports
-                    .contains(&sinomo_core::ClusterTransportKind::Iroh)
-        })
-    })
-}
-
 pub(crate) fn daemon_iroh_proxy_node_id(cluster: &DaemonClusterStatus) -> NodeId {
     if cluster.process == sinomo_core::node::DAEMON_SHADOW_CLUSTER_ROLE {
         shadow_daemon_node_id(&cluster.node_id)
     } else {
         cluster.node_id.clone()
     }
-}
-
-fn claim_daemon_iroh_proxy_start(key: &str) -> Result<bool, DaemonError> {
-    let starts = DAEMON_IROH_PROXY_STARTS.get_or_init(|| Mutex::new(BTreeSet::new()));
-    let mut starts = starts.lock().map_err(|error| DaemonError::Io {
-        path: "daemon iroh proxy start guard".to_string(),
-        detail: error.to_string(),
-    })?;
-    Ok(starts.insert(key.to_string()))
 }
 
 pub(crate) fn daemon_cluster_status_from_paths_on_runtime(
@@ -1490,14 +1273,6 @@ fn daemon_paths_have_settled_solo_cluster(paths: &DaemonPaths) -> Result<bool, D
     }
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
     Ok(sinomo_core::network::cluster_is_settled_solo(&state))
-}
-
-pub(crate) fn advertise_daemon_iroh_endpoint_on_runtime(
-    paths: &DaemonPaths,
-    record: IrohEndpointRecord,
-    runtime: &tokio::runtime::Handle,
-) -> Result<(), DaemonError> {
-    advertise_daemon_iroh_endpoint_with_runtime(paths, record, Some(runtime))
 }
 
 fn advertise_daemon_iroh_endpoint_with_runtime(
@@ -4180,12 +3955,39 @@ pub(crate) fn handle_daemon_cluster_control_join_on_runtime(
                 }
             }
         } else {
-            return Err(DaemonError::Parse {
-                detail: "local node already belongs to a cluster; daemon-mediated single-node migration is not supported yet — use `sinomo cluster join` directly or `sinomo cluster leave` first".to_string(),
-            });
+            // Settled in another cluster: single-node migration (stage G2) —
+            // freeze and quarantine the source, join the target with the same
+            // node identity, then import the node-local configs.
+            return handle_daemon_cluster_control_join_single_node_migration_on_runtime(
+                daemon_paths,
+                &paths,
+                &invite,
+                existing,
+                timestamp,
+                runtime,
+            );
         }
     }
 
+    daemon_cluster_control_join_fresh_on_runtime(
+        &paths,
+        &invite,
+        preserved_node_id,
+        timestamp,
+        runtime,
+    )
+}
+
+/// The fresh-join body shared by plain joins and the join step of a
+/// single-node migration: prepares pending state, reconciles with the
+/// invite's introducers, and persists the accepted state.
+fn daemon_cluster_control_join_fresh_on_runtime(
+    paths: &ClusterPaths,
+    invite: &sinomo_core::ClusterJoinInvite,
+    preserved_node_id: Option<NodeId>,
+    timestamp: OffsetDateTime,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ClusterControlJoinResponse, DaemonError> {
     let local_node_id = preserved_node_id.unwrap_or_else(NodeId::generate);
     let node_display_name = daemon_cluster_control_node_display_name("sinomo-local");
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
@@ -4214,7 +4016,7 @@ pub(crate) fn handle_daemon_cluster_control_join_on_runtime(
             )
         });
     let _ = refresh_local_daemon_membership(
-        &paths,
+        paths,
         &mut state,
         &main_options,
         &shadow_options,
@@ -4224,10 +4026,10 @@ pub(crate) fn handle_daemon_cluster_control_join_on_runtime(
     let mut host = daemon_cluster_control_plane_driver_on_runtime(runtime);
     let reconciliation = sinomo_core::cluster::reconcile_cluster_join_with_introducers_with_host(
         &mut state,
-        &invite,
+        invite,
         DAEMON_CLUSTER_CONTROL_JOIN_TIMEOUT,
         DAEMON_CLUSTER_CONTROL_IROH_JOIN_TIMEOUT,
-        Some(&paths),
+        Some(paths),
         &mut host,
     )?;
     if let Some(snapshot) = reconciliation.kv_snapshot {
@@ -4241,7 +4043,7 @@ pub(crate) fn handle_daemon_cluster_control_join_on_runtime(
                     .to_string(),
         });
     }
-    sinomo_core::cluster::write_cluster_state(&paths, &state)?;
+    sinomo_core::cluster::write_cluster_state(paths, &state)?;
     crate::control::request_daemon_cluster_maintenance_refresh();
     Ok(ClusterControlJoinResponse {
         cluster_id: state.cluster_id,
@@ -4249,7 +4051,157 @@ pub(crate) fn handle_daemon_cluster_control_join_on_runtime(
         accepted_endpoint: reconciliation
             .accepted_endpoint
             .map(|endpoint| endpoint.address),
+        migration: None,
     })
+}
+
+/// `/cluster/control/join` for a node already settled in a source cluster:
+/// the daemon-side port of the CLI's single-node migration (stage G2).
+///
+/// Freezes the source (migration record into source KV, storage quarantined
+/// under `<cluster>/migrations/<id>/source`), joins the target cluster with
+/// the SAME node identity, then imports the node's `/config/nodes/<node>/…`
+/// keys from the quarantined snapshot. A failed target join rolls the
+/// quarantine back so the node stays in its source cluster.
+fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
+    daemon_paths: &DaemonPaths,
+    paths: &ClusterPaths,
+    invite: &sinomo_core::ClusterJoinInvite,
+    source: ClusterBootstrapState,
+    timestamp: OffsetDateTime,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ClusterControlJoinResponse, DaemonError> {
+    // Serialize against the maintenance tick for the whole freeze -> join ->
+    // import window, like the leave handler: the tick must not commit into
+    // storage being moved aside (this handler runs on a blocking service
+    // thread, never on the async workers).
+    let _storage_guard = DAEMON_CLUSTER_STORAGE_MUTATION_LOCK.blocking_lock();
+    let report = sinomo_core::cluster::plan_cluster_migration(
+        paths,
+        invite,
+        sinomo_core::ClusterMigrationMode::SingleNode,
+        timestamp,
+    )?;
+    if report.migration.source_cluster_id != source.cluster_id {
+        return Err(DaemonError::Parse {
+            detail: "source cluster changed while planning migration; run cluster join again"
+                .to_string(),
+        });
+    }
+
+    let mut migration = report.migration;
+    sinomo_core::cluster::write_cluster_migration_record_to_source_kv(paths, &migration)?;
+    // The DFS metadata shards ride along into the import namespace; this r1
+    // layout knowledge stays out of the r0 quarantine helper.
+    let dfs_moves: Vec<(std::path::PathBuf, std::path::PathBuf)> = paths
+        .root
+        .parent()
+        .map(|data_dir_root| {
+            let data_dir = SinomoDataDir::new(data_dir_root);
+            vec![(
+                sinomo_dfs::default_dfs_metadata_shards_root(&data_dir),
+                sinomo_dfs::dfs_import_metadata_root(&data_dir, &migration.source_cluster_id),
+            )]
+        })
+        .unwrap_or_default();
+    let quarantine = sinomo_core::cluster::quarantine_cluster_storage_for_migration(
+        paths, &migration, &dfs_moves,
+    )?;
+    migration.phase = sinomo_core::ClusterMigrationPhase::SourceFrozen;
+    migration.updated_at = OffsetDateTime::now_utc();
+    migration
+        .evidence_refs
+        .push(format!("source-quarantine:{}", quarantine.root.display()));
+    migration.evidence_refs.push(format!(
+        "dfs-import-namespace:{}",
+        sinomo_dfs::dfs_import_namespace_root(&migration.source_cluster_id)
+    ));
+    sinomo_core::cluster::write_local_cluster_migration_record(&quarantine.root, &migration)?;
+
+    match daemon_cluster_control_join_fresh_on_runtime(
+        paths,
+        invite,
+        Some(migration.target_node_id.clone()),
+        timestamp,
+        runtime,
+    ) {
+        Ok(mut response) => {
+            migration.target_cluster_id = response.cluster_id.clone();
+            migration.target_node_id = response.node_id.clone();
+            let mut target_state = daemon_cluster_control_state(paths)?;
+            migration.target_cluster_name = Some(target_state.cluster_name.clone());
+            let mut host = daemon_cluster_control_plane_driver_on_runtime(runtime);
+            let kv_import =
+                sinomo_core::cluster::import_node_local_configs_from_source_kv_with_host(
+                    paths,
+                    &mut target_state,
+                    &quarantine.root,
+                    &migration,
+                    cluster_kv_txn_quorum_options(true),
+                    &mut host,
+                )?;
+            migration.phase = sinomo_core::ClusterMigrationPhase::Finalized;
+            migration.updated_at = OffsetDateTime::now_utc();
+            migration
+                .evidence_refs
+                .push("source-kv-policy:target-authoritative".to_string());
+            migration.evidence_refs.push(format!(
+                "source-kv-import-report:{}",
+                sinomo_core::cluster::cluster_migration_kv_import_report_path(&quarantine.root)
+                    .display()
+            ));
+            migration.detail = Some(format!(
+                "single-node migration finalized; target cluster KV is authoritative; source cluster storage is quarantined locally; imported {} node-local config keys, deferred {}, skipped {} source cluster config keys; DFS shared import is deferred",
+                kv_import.imported_node_local_config_keys.len(),
+                kv_import.deferred_node_local_config_keys.len(),
+                kv_import.skipped_cluster_level_config_count,
+            ));
+            sinomo_core::cluster::write_local_cluster_migration_record(
+                &quarantine.root,
+                &migration,
+            )?;
+            crate::append_operational_event_best_effort(
+                daemon_paths,
+                crate::OperationalSeverity::Info,
+                "daemon-cluster-control",
+                "cluster.migration.finalized",
+                format!(
+                    "single-node migration {} finalized: {} -> {}",
+                    migration.migration_id,
+                    migration.source_cluster_id,
+                    migration.target_cluster_id
+                ),
+                None,
+                serde_json::json!({
+                    "migration_id": migration.migration_id.to_string(),
+                    "source_cluster_id": migration.source_cluster_id.to_string(),
+                    "target_cluster_id": migration.target_cluster_id.to_string(),
+                    "quarantine_root": quarantine.root.display().to_string(),
+                }),
+            );
+            response.migration = Some(sinomo_core::cluster::ClusterControlJoinMigrationSummary {
+                migration_id: migration.migration_id.clone(),
+                source_cluster_id: migration.source_cluster_id.clone(),
+                quarantine_root: quarantine.root.display().to_string(),
+                imported_node_local_config_keys: kv_import.imported_node_local_config_keys.len(),
+                deferred_node_local_config_keys: kv_import.deferred_node_local_config_keys.len(),
+            });
+            Ok(response)
+        }
+        Err(error) => {
+            migration.phase = sinomo_core::ClusterMigrationPhase::RolledBack;
+            migration.updated_at = OffsetDateTime::now_utc();
+            migration.detail = Some(format!(
+                "target join failed and source cluster storage was restored: {error}"
+            ));
+            let _ = sinomo_core::cluster::write_local_cluster_migration_record(
+                &quarantine.root,
+                &migration,
+            );
+            sinomo_core::cluster::rollback_cluster_storage_quarantine(&quarantine)?;
+            Err(error)
+        }
+    }
 }
 
 /// Daemon-side default invite introducers: the daemon's own advertised
@@ -4458,116 +4410,6 @@ pub(crate) fn handle_daemon_cluster_control_remove_on_runtime(
     })
 }
 
-struct DaemonClusterLeaveQuarantine {
-    root: std::path::PathBuf,
-    moved: Vec<(std::path::PathBuf, std::path::PathBuf)>,
-}
-
-fn daemon_cluster_storage_has_live_artifacts(paths: &ClusterPaths) -> bool {
-    paths.state.exists()
-        || paths.connectivity_local.exists()
-        || paths.kv_paths().snapshot.exists()
-        || paths.kv_paths().raft.exists()
-        || paths.kv_paths().watches.exists()
-        || paths.kv_paths().watches_lock.exists()
-        || paths.kv_paths().watches_next_id.exists()
-        || paths.kv_paths().watch_events.exists()
-        || paths.kv_paths().watch_events_log.exists()
-}
-
-fn daemon_move_cluster_path_if_exists(
-    original: std::path::PathBuf,
-    quarantined: std::path::PathBuf,
-    quarantine: &mut DaemonClusterLeaveQuarantine,
-) -> Result<(), DaemonError> {
-    if !original.exists() {
-        return Ok(());
-    }
-    if quarantined.exists() {
-        return Err(DaemonError::Io {
-            path: quarantined.display().to_string(),
-            detail: "cluster leave quarantine target already exists".to_string(),
-        });
-    }
-    if let Some(parent) = quarantined.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    std::fs::rename(&original, &quarantined).map_err(|source| DaemonError::Io {
-        path: original.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    quarantine.moved.push((original, quarantined));
-    Ok(())
-}
-
-/// Moves the live cluster storage (state, KV snapshot/raft, watches) into a
-/// per-leave quarantine directory, mirroring the CLI's leave quarantine.
-fn quarantine_daemon_cluster_storage_for_leave(
-    paths: &ClusterPaths,
-    leave_id: &Id,
-) -> Result<DaemonClusterLeaveQuarantine, DaemonError> {
-    let root = paths
-        .root
-        .join("migrations")
-        .join(leave_id.to_string())
-        .join("leave-source");
-    std::fs::create_dir_all(&root).map_err(|source| DaemonError::Io {
-        path: root.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let mut quarantine = DaemonClusterLeaveQuarantine {
-        root,
-        moved: Vec::new(),
-    };
-    let kv_paths = paths.kv_paths();
-    for (original, quarantined) in [
-        (paths.state.clone(), "state.sobj"),
-        (paths.connectivity_local.clone(), "connectivity-local.sobj"),
-        (kv_paths.snapshot.clone(), "kv-snapshot.sobj"),
-        (kv_paths.raft.clone(), "kv-raft"),
-        (kv_paths.watches.clone(), "watches"),
-        (kv_paths.watches_lock.clone(), "watches.lock"),
-        (kv_paths.watches_next_id.clone(), "watches-next.sobj"),
-        (kv_paths.watch_events.clone(), "watch-events.sobj"),
-        (kv_paths.watch_events_log.clone(), "watch-events.sobjlog"),
-    ] {
-        let target = quarantine.root.join(quarantined);
-        daemon_move_cluster_path_if_exists(original, target, &mut quarantine)?;
-    }
-    Ok(quarantine)
-}
-
-fn rollback_daemon_cluster_leave_quarantine(
-    quarantine: &DaemonClusterLeaveQuarantine,
-) -> Result<(), DaemonError> {
-    for (original, quarantined) in quarantine.moved.iter().rev() {
-        if !quarantined.exists() {
-            continue;
-        }
-        if original.exists() {
-            return Err(DaemonError::Io {
-                path: original.display().to_string(),
-                detail: "cannot rollback cluster leave quarantine because original path exists"
-                    .to_string(),
-            });
-        }
-        if let Some(parent) = original.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
-                path: parent.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        }
-        std::fs::rename(quarantined, original).map_err(|source| DaemonError::Io {
-            path: quarantined.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    Ok(())
-}
-
 /// `/cluster/control/leave`: quarantine the current cluster storage and
 /// re-initialize this node as a fresh single-node cluster.
 pub(crate) fn handle_daemon_cluster_control_leave_on_runtime(
@@ -4604,14 +4446,15 @@ pub(crate) fn handle_daemon_cluster_control_leave_on_runtime(
     // maintenance tick cannot commit into files being moved aside (this
     // handler runs on a blocking service thread, never on the async workers).
     let _storage_guard = DAEMON_CLUSTER_STORAGE_MUTATION_LOCK.blocking_lock();
-    let quarantine = if existing.is_some() || daemon_cluster_storage_has_live_artifacts(&paths) {
-        Some(quarantine_daemon_cluster_storage_for_leave(
-            &paths,
-            &Id::generate(),
-        )?)
-    } else {
-        None
-    };
+    let quarantine =
+        if existing.is_some() || sinomo_core::cluster::cluster_storage_has_live_artifacts(&paths) {
+            Some(sinomo_core::cluster::quarantine_cluster_storage_for_leave(
+                &paths,
+                &Id::generate(),
+            )?)
+        } else {
+            None
+        };
 
     match initialize_local_cluster_on_runtime(
         &paths,
@@ -4632,7 +4475,7 @@ pub(crate) fn handle_daemon_cluster_control_leave_on_runtime(
         }
         Err(error) => {
             if let Some(quarantine) = quarantine {
-                rollback_daemon_cluster_leave_quarantine(&quarantine)?;
+                sinomo_core::cluster::rollback_cluster_storage_quarantine(&quarantine)?;
             }
             Err(error)
         }
@@ -6922,28 +6765,6 @@ mod tests {
     }
 
     #[test]
-    fn daemon_iroh_proxy_start_guard_claims_each_process_once() {
-        let root = unique_cluster_test_root("sinomo-daemon-iroh-proxy-start-guard");
-        let main_paths = DaemonPaths::with_root(root.path().join("daemon"));
-        let shadow_paths = DaemonPaths::with_root(root.path().join("shadow-daemon"));
-        let main_key = daemon_iroh_proxy_start_key(&main_paths, "daemon");
-        let shadow_key = daemon_iroh_proxy_start_key(&shadow_paths, "shadow daemon");
-
-        assert!(
-            claim_daemon_iroh_proxy_start(&main_key).expect("first main claim"),
-            "first main daemon Iroh proxy start should be claimed"
-        );
-        assert!(
-            !claim_daemon_iroh_proxy_start(&main_key).expect("second main claim"),
-            "duplicate main daemon Iroh proxy start should be ignored"
-        );
-        assert!(
-            claim_daemon_iroh_proxy_start(&shadow_key).expect("shadow claim"),
-            "shadow daemon has a distinct Iroh proxy identity"
-        );
-    }
-
-    #[test]
     fn daemon_iroh_proxy_node_id_uses_process_specific_identity() {
         let cluster_id =
             ClusterId::from_legacy_named("cluster_daemon_iroh_proxy_node").expect("cluster");
@@ -6963,6 +6784,82 @@ mod tests {
             daemon_iroh_proxy_node_id(&shadow),
             shadow_daemon_node_id(&node_id)
         );
+    }
+
+    #[test]
+    fn daemon_cluster_control_join_migration_rolls_back_source_when_target_join_fails() {
+        let root = unique_cluster_test_root("sinomo-daemon-join-migration-rollback");
+        let daemon_paths = DaemonPaths::with_root(root.path().join("daemon"));
+        let paths = cluster_paths_from_daemon_paths(&daemon_paths).expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let state =
+            initialize_local_cluster(&paths, None, None, "migration source".to_string(), now)
+                .expect("settled source cluster");
+        let source_cluster_id = state.cluster_id.clone();
+
+        // Invite for a DIFFERENT cluster whose only introducer is unreachable:
+        // the daemon must take the migration branch (settled source), freeze
+        // and quarantine the source, fail the target join, then restore the
+        // source storage.
+        let target_cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_migration_target").expect("target");
+        let invite = sinomo_core::ClusterJoinInvite {
+            invite_id: sinomo_core::node::ClusterInviteId::from_legacy_named(
+                "invite_daemon_migration_rollback",
+            )
+            .expect("invite id"),
+            cluster_id: target_cluster_id,
+            cluster_name: Some("migration target".to_string()),
+            cluster_public_key: "pk-migration-target".to_string(),
+            invitation_secret: "secret_daemon_migration_rollback".to_string(),
+            communication_channels: Vec::new(),
+            introducers: vec![sinomo_core::cluster::invite_introducer_endpoint_from_state(
+                &state,
+                "127.0.0.1:1".to_string(),
+            )],
+            token_id: String::new(),
+            expires_at: OffsetDateTime::UNIX_EPOCH,
+            trust_domain: TrustDomain::new("trust.local").expect("trust"),
+            allowed_member_roles: Vec::new(),
+            issuer_node_id: NodeId::from_legacy_named("node_daemon_migration_issuer")
+                .expect("issuer"),
+            issuer_public_key: String::new(),
+            signature: String::new(),
+        };
+        let uri = sinomo_core::cluster::encode_cluster_join_invite(&invite).expect("invite uri");
+
+        let runtime = daemon_cluster_test_runtime();
+        let error = handle_daemon_cluster_control_join_on_runtime(
+            &daemon_paths,
+            ClusterControlJoinRequest { invite: uri },
+            runtime.handle(),
+        )
+        .expect_err("target join through an unreachable introducer must fail");
+        assert!(
+            error.to_string().contains("introducer"),
+            "unexpected migration failure: {error}"
+        );
+
+        // Source storage restored by the quarantine rollback.
+        let restored = sinomo_core::cluster::read_cluster_state_without_kv(&paths)
+            .expect("restored source state");
+        assert_eq!(
+            restored.cluster_id, source_cluster_id,
+            "rolled-back migration must leave the node in its source cluster"
+        );
+        // The migration record documents the rollback.
+        let migrations_root = paths.root.join("migrations");
+        let record_path = std::fs::read_dir(&migrations_root)
+            .expect("migrations dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path().join("source").join("migration.json"))
+            .find(|path| path.exists())
+            .expect("rolled-back migration record");
+        let record: sinomo_core::ClusterMigrationRecord =
+            serde_json::from_slice(&std::fs::read(&record_path).expect("read migration record"))
+                .expect("decode migration record");
+        assert_eq!(record.phase, sinomo_core::ClusterMigrationPhase::RolledBack);
+        assert_eq!(record.source_cluster_id, source_cluster_id);
     }
 
     fn run_cluster_network_maintenance_tick_for_test(

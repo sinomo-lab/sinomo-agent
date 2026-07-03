@@ -1,7 +1,4 @@
-use crate::cluster::{
-    CLUSTER_HEALTH_PROBE_TIMEOUT, start_daemon_iroh_proxy_if_clustered,
-    start_shadow_daemon_status_publisher,
-};
+use crate::cluster::{CLUSTER_HEALTH_PROBE_TIMEOUT, start_shadow_daemon_status_publisher};
 use crate::{
     CandidateMainDiagnostics, DaemonClusterStatus, DaemonError, DaemonLock, DaemonPaths,
     DaemonProbeStatus, DaemonStatus, daemon_connect_address, prepare_background_command,
@@ -634,7 +631,7 @@ pub fn run_shadow_daemon_supervision_loop(
             "main_binary": main_binary.display().to_string(),
         }),
     );
-    match start_daemon_iroh_proxy_if_clustered(
+    if let Some(task) = crate::cluster::start_daemon_network_module_context_task(
         &shadow_paths,
         &options,
         cluster.as_ref(),
@@ -642,21 +639,7 @@ pub fn run_shadow_daemon_supervision_loop(
         control_shutdown_rx.clone(),
         "shadow daemon",
     ) {
-        Ok(Some(task)) => shadow_runtime_tasks.push(("iroh proxy", task)),
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!("sinomo shadow daemon iroh proxy disabled: {error}");
-            crate::append_operational_log_best_effort(
-                &shadow_paths,
-                crate::OperationalSeverity::Warn,
-                "shadow-daemon",
-                "sinomo shadow daemon iroh proxy disabled",
-                None,
-                serde_json::json!({
-                    "error": error.to_string(),
-                }),
-            );
-        }
+        shadow_runtime_tasks.push(("network module context", task));
     }
     match start_shadow_daemon_status_publisher(
         &shadow_paths,

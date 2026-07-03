@@ -217,10 +217,7 @@ pub use roaming::read_iroh_endpoint_record_async;
 #[cfg(any(test, feature = "test-support"))]
 pub use roaming::send_daemon_rpc_to_cluster_endpoint_async;
 pub use roaming::stable_iroh_endpoint_id;
-pub use roaming::{
-    IROH_DAEMON_COMMAND_MAX_BYTES, IrohDaemonProxyHandle, IrohEndpointRecord, IrohRelayMode,
-    start_iroh_daemon_proxy,
-};
+pub use roaming::{IROH_DAEMON_COMMAND_MAX_BYTES, IrohEndpointRecord, IrohRelayMode};
 pub use route::{
     CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
     ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterRelayAsyncHost, ClusterRelayOptions,
@@ -438,8 +435,6 @@ pub(crate) mod prelude {
     pub(crate) use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
     pub(crate) use std::path::PathBuf;
     pub(crate) use std::sync::{Arc, Mutex};
-    #[cfg(feature = "iroh-transport")]
-    pub(crate) use std::thread;
     pub(crate) use std::time::Duration;
     pub(crate) use thiserror::Error;
     pub(crate) use time::OffsetDateTime;
@@ -466,8 +461,6 @@ pub use object_file_store::remove_object_file_write_mark_entries_under_root_for_
 pub use object_file_store::write_object_file_compare_read_bytes_for_test;
 #[cfg(any(test, feature = "test-support"))]
 pub use peer::SeenEventCache;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::IrohProxyByteBudget;
 #[cfg(any(test, feature = "test-support"))]
 pub use route::CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX;
 #[cfg(any(test, feature = "test-support"))]
@@ -614,24 +607,6 @@ pub use roaming::ClusterAuthMaterial;
 #[cfg(any(test, feature = "test-support"))]
 pub use roaming::ClusterAuthVerifier;
 #[cfg(any(test, feature = "test-support"))]
-pub use roaming::IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::IROH_DAEMON_PROXY_ERROR_ROUTE;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::IROH_DAEMON_PROXY_MAX_CONNECTIONS;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::IROH_DAEMON_PROXY_RESTART_BACKOFF_MAX;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::IROH_DAEMON_PROXY_RESTART_JITTER_MAX;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT;
-#[cfg(any(test, feature = "test-support"))]
 pub use roaming::IceCandidateRecord;
 #[cfg(any(test, feature = "test-support"))]
 pub use roaming::IceCandidateType;
@@ -650,46 +625,10 @@ pub use roaming::WebRtcSignalMessage;
 #[cfg(any(test, feature = "test-support"))]
 pub use roaming::WebRtcSignalingEnvelope;
 #[cfg(any(test, feature = "test-support"))]
-pub use roaming::accept_iroh_proxy_command_stream_with_idle_timeout;
-#[cfg(any(test, feature = "test-support"))]
 pub use roaming::configure_daemon_control_stream_idle_timeout;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::decode_iroh_daemon_control_response_bytes;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::default_sinomo_iroh_relay_urls;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::encode_iroh_proxy_error_response_frame;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::iroh_daemon_control_request_allows_response_retry;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::iroh_daemon_proxy_restart_backoff;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::iroh_daemon_proxy_restart_delay;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::iroh_daemon_response_error_is_retryable;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::iroh_daemon_rpc_retry_delay;
 #[cfg(any(test, feature = "test-support"))]
 pub use roaming::iroh_endpoint_record_from_cluster_endpoint;
 #[cfg(any(test, feature = "test-support"))]
-pub use roaming::iroh_proxy_command_stream_accept_error_is_peer_close;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::iroh_proxy_route_hint;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::read_iroh_daemon_control_response_async;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::read_iroh_proxy_frame_async;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::read_iroh_proxy_frame_async_with_idle_timeout;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::sinomo_iroh_relay_url_strings_from_env;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::try_acquire_iroh_proxy_permit;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::write_iroh_daemon_control_request_bytes_with_idle_timeout;
-#[cfg(any(test, feature = "test-support"))]
 pub use roaming::write_iroh_endpoint_record_async;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::write_iroh_proxy_frame_async_with_idle_timeout;
 #[cfg(any(test, feature = "test-support"))]
 pub use rpc::ObjectRpcFuture;

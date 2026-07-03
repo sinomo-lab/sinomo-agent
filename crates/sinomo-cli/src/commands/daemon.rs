@@ -624,7 +624,7 @@ pub(crate) fn handle_daemon_cluster_kv_txn_request(
     }))
 }
 
-fn cli_cluster_control_plane_driver()
+pub(crate) fn cli_cluster_control_plane_driver()
 -> cluster::ClusterControlPlaneDriver<CliClusterControlPlaneTransport> {
     cluster::ClusterControlPlaneDriver::with_timeouts(
         CliClusterControlPlaneTransport,
@@ -632,7 +632,7 @@ fn cli_cluster_control_plane_driver()
     )
 }
 
-struct CliClusterControlPlaneTransport;
+pub(crate) struct CliClusterControlPlaneTransport;
 
 impl cluster::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
     fn send_kv_replication(
@@ -733,7 +733,9 @@ fn cli_cluster_control_plane_timeouts() -> cluster::ClusterControlPlaneTimeouts 
     }
 }
 
-fn cli_cluster_kv_txn_quorum_options(allow_forwarding: bool) -> cluster::ClusterKvTxnQuorumOptions {
+pub(crate) fn cli_cluster_kv_txn_quorum_options(
+    allow_forwarding: bool,
+) -> cluster::ClusterKvTxnQuorumOptions {
     cli_cluster_control_plane_timeouts()
         .kv_txn_quorum_options(allow_forwarding)
         .with_state_authority_reachability_options(

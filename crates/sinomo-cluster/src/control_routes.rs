@@ -119,6 +119,25 @@ pub struct ClusterControlJoinResponse {
     /// Introducer endpoint address that accepted the join, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_endpoint: Option<String>,
+    /// Present when the join ran as a single-node migration (the node was
+    /// already settled in another cluster and its source storage was
+    /// quarantined).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<ClusterControlJoinMigrationSummary>,
+}
+
+/// Summary of a single-node migration performed by a daemon-mediated join.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterControlJoinMigrationSummary {
+    pub migration_id: sinomo_base::Id,
+    pub source_cluster_id: ClusterId,
+    /// Where the frozen source cluster storage (and the migration/import
+    /// records) live on the node.
+    pub quarantine_root: String,
+    /// Node-local config keys imported into the target cluster's KV.
+    pub imported_node_local_config_keys: usize,
+    /// Node-local config keys deferred (target KV not yet writable).
+    pub deferred_node_local_config_keys: usize,
 }
 
 /// Create and publish a cluster join invite.

@@ -32,6 +32,7 @@ mod member_publish;
 mod member_store;
 mod membership_forward;
 mod membership_rpc;
+mod migration;
 mod raft_election;
 mod raft_fanout;
 mod raft_quorum;
@@ -67,20 +68,20 @@ pub use control_routes::{
     CLUSTER_CONTROL_REMOVE_ROUTE, CLUSTER_CONTROL_RENAME_ROUTE, CLUSTER_CONTROL_ROLE_ROUTE,
     CLUSTER_CONTROL_RPC_CATEGORY, CLUSTER_CONTROL_RPC_ROUTE_POLICIES, CLUSTER_CONTROL_RPC_ROUTES,
     ClusterControlInitRequest, ClusterControlInitResponse, ClusterControlInviteRequest,
-    ClusterControlInviteResponse, ClusterControlJoinRequest, ClusterControlJoinResponse,
-    ClusterControlLeaveRequest, ClusterControlLeaveResponse, ClusterControlRemoveRequest,
-    ClusterControlRemoveResponse, ClusterControlRemovedMember, ClusterControlRenameRequest,
-    ClusterControlRenameResponse, ClusterControlRoleRequest, ClusterControlRoleResponse,
-    ClusterControlRoutePolicy, ClusterControlRpcPayload, cluster_control_init_response_rpc_payload,
-    cluster_control_init_rpc_payload, cluster_control_invite_response_rpc_payload,
-    cluster_control_invite_rpc_payload, cluster_control_join_response_rpc_payload,
-    cluster_control_join_rpc_payload, cluster_control_leave_response_rpc_payload,
-    cluster_control_leave_rpc_payload, cluster_control_remove_response_rpc_payload,
-    cluster_control_remove_rpc_payload, cluster_control_rename_response_rpc_payload,
-    cluster_control_rename_rpc_payload, cluster_control_role_response_rpc_payload,
-    cluster_control_role_rpc_payload, cluster_control_rpc_route_policy,
-    decode_cluster_control_init_rpc_request_body, decode_cluster_control_init_rpc_response_body,
-    decode_cluster_control_invite_rpc_request_body,
+    ClusterControlInviteResponse, ClusterControlJoinMigrationSummary, ClusterControlJoinRequest,
+    ClusterControlJoinResponse, ClusterControlLeaveRequest, ClusterControlLeaveResponse,
+    ClusterControlRemoveRequest, ClusterControlRemoveResponse, ClusterControlRemovedMember,
+    ClusterControlRenameRequest, ClusterControlRenameResponse, ClusterControlRoleRequest,
+    ClusterControlRoleResponse, ClusterControlRoutePolicy, ClusterControlRpcPayload,
+    cluster_control_init_response_rpc_payload, cluster_control_init_rpc_payload,
+    cluster_control_invite_response_rpc_payload, cluster_control_invite_rpc_payload,
+    cluster_control_join_response_rpc_payload, cluster_control_join_rpc_payload,
+    cluster_control_leave_response_rpc_payload, cluster_control_leave_rpc_payload,
+    cluster_control_remove_response_rpc_payload, cluster_control_remove_rpc_payload,
+    cluster_control_rename_response_rpc_payload, cluster_control_rename_rpc_payload,
+    cluster_control_role_response_rpc_payload, cluster_control_role_rpc_payload,
+    cluster_control_rpc_route_policy, decode_cluster_control_init_rpc_request_body,
+    decode_cluster_control_init_rpc_response_body, decode_cluster_control_invite_rpc_request_body,
     decode_cluster_control_invite_rpc_response_body, decode_cluster_control_join_rpc_request_body,
     decode_cluster_control_join_rpc_response_body, decode_cluster_control_leave_rpc_request_body,
     decode_cluster_control_leave_rpc_response_body, decode_cluster_control_remove_rpc_request_body,
@@ -180,6 +181,14 @@ pub use membership_rpc::{
     ClusterAuthenticatedPeer, ClusterInvitePublishRequest, ClusterInvitePublishResponse,
     ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterMemberPublishRequest,
     ClusterMemberPublishResponse, handle_cluster_membership_rpc_request_with_hosts,
+};
+pub use migration::{
+    ClusterMigrationKvImportReport, ClusterMigrationPlanReport, ClusterMigrationQuarantine,
+    cluster_migration_kv_import_report_path, cluster_storage_has_live_artifacts,
+    import_node_local_configs_from_source_kv_with_host, plan_cluster_migration,
+    quarantine_cluster_storage_for_leave, quarantine_cluster_storage_for_migration,
+    rollback_cluster_storage_quarantine, write_cluster_migration_record_to_source_kv,
+    write_local_cluster_migration_record,
 };
 pub use raft_fanout::{
     ClusterKvCommittedFanoutAsyncHost, spawn_cluster_kv_committed_fanout_worker_on_runtime,

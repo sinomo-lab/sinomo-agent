@@ -378,11 +378,10 @@ fn network_capability(name: &str) -> sinomo_core::CapabilityName {
 // --- runtime network-module loading (stage C of
 // docs/plans/r0-r1-crate-boundary-refactor.md) ---
 //
-// Built-in transports (Loopback/LAN-TCP, and Iroh while the `iroh-transport`
-// feature remains) keep their in-crate dial paths inside `sinomo-network`;
-// they are NOT wrapped as registry modules. The registry only carries
-// native-dylib network modules, which routing consults before the built-in
-// paths.
+// Built-in transports (Loopback/LAN-TCP) keep their in-crate dial paths
+// inside `sinomo-network`; they are NOT wrapped as registry modules. The
+// registry carries native-dylib network modules (iroh included), which
+// routing consults before the built-in paths.
 
 /// The daemon's loaded network modules: the registry routing dispatches
 /// through plus the loader-state module id behind each network-module id
@@ -508,6 +507,12 @@ pub fn load_daemon_network_module_registry(
         }
     }
 
+    // The registry is process-wide; in the unit-test binary a lifecycle test
+    // booting a daemon would replace it mid-run and perturb concurrently
+    // running endpoint-ranking tests (with no registry installed the selector
+    // keeps iroh rankable). Tests exercise the loader through the returned
+    // handle instead.
+    #[cfg(not(test))]
     sinomo_core::network::set_network_module_registry(registry.clone());
     let modules = Arc::new(DaemonNetworkModules {
         registry,

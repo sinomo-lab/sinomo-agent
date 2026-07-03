@@ -6,8 +6,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-#[cfg(all(test, feature = "iroh-transport"))]
-use std::collections::HashMap;
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::HashSet;
 #[cfg(any(test, feature = "test-support"))]
@@ -155,8 +153,6 @@ pub fn write_object_file_create_new_serialized<T: Serialize>(
     value: &T,
 ) -> Result<bool, NetworkError> {
     let desired = SinomoObjectCodec::default().encode(value)?;
-    #[cfg(all(test, feature = "iroh-transport"))]
-    record_write_object_file_create_new_attempt_for_test(path);
     let result = durable_file::write_object_file_bytes_create_new_serialized(
         path,
         &desired,
@@ -238,33 +234,6 @@ pub fn refresh_object_file_write_mark_for_test(path: &PathBuf) -> bool {
 #[cfg(any(test, feature = "test-support"))]
 pub fn remove_object_file_write_mark_entries_under_root_for_test(root: &std::path::Path) {
     LAST_WRITTEN_OBJECT_FILES.retain_not_under_root(root);
-}
-
-#[cfg(all(test, feature = "iroh-transport"))]
-static CREATE_NEW_OBJECT_FILE_ATTEMPTS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-#[cfg(all(test, feature = "iroh-transport"))]
-fn record_write_object_file_create_new_attempt_for_test(path: &PathBuf) {
-    if let Ok(mut attempts) = CREATE_NEW_OBJECT_FILE_ATTEMPTS_FOR_TEST.lock() {
-        *attempts.entry(path.clone()).or_default() += 1;
-    }
-}
-
-#[cfg(all(test, feature = "iroh-transport"))]
-pub(crate) fn reset_write_object_file_create_new_attempts_for_test(path: &PathBuf) {
-    if let Ok(mut attempts) = CREATE_NEW_OBJECT_FILE_ATTEMPTS_FOR_TEST.lock() {
-        attempts.remove(path);
-    }
-}
-
-#[cfg(all(test, feature = "iroh-transport"))]
-pub(crate) fn write_object_file_create_new_attempts_for_test(path: &PathBuf) -> u64 {
-    CREATE_NEW_OBJECT_FILE_ATTEMPTS_FOR_TEST
-        .lock()
-        .ok()
-        .and_then(|attempts| attempts.get(path).copied())
-        .unwrap_or_default()
 }
 
 #[cfg(any(test, feature = "test-support"))]

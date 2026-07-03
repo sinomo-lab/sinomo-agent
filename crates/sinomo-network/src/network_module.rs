@@ -491,14 +491,6 @@ pub(crate) fn registered_network_module_for_address_scheme(
     network_module_registry()?.module_for_address_scheme(scheme)
 }
 
-/// Transport kinds with an enabled dialer in the process-wide registry
-/// (empty when no registry is installed).
-pub(crate) fn registered_enabled_dialer_transports() -> Vec<ClusterTransportKind> {
-    network_module_registry()
-        .map(|registry| registry.enabled_dialer_transports())
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

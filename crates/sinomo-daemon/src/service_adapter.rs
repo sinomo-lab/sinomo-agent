@@ -1336,24 +1336,13 @@ fn handle_daemon_network_modules_request(
                                 .transports
                                 .contains(&sinomo_core::ClusterTransportKind::Iroh)
                     });
-                if claims_iroh_listener {
-                    // Doctrine kill switch: the env var silences the built-in
-                    // proxy, so a module listener must not sidestep it.
-                    if sinomo_core::network::iroh_disabled_by_env() {
-                        return Err(ServiceError::Service(format!(
-                            "network module {} not enabled: SINOMO_DISABLE_IROH is set for this daemon",
-                            payload.id
-                        )));
-                    }
-                    // The built-in proxy already owns this node's iroh
-                    // identity; starting a second listener would double-bind
-                    // it and race the endpoint record.
-                    if crate::cluster::daemon_builtin_iroh_proxy_active() {
-                        return Err(ServiceError::Service(format!(
-                            "network module {} not enabled: the built-in iroh proxy owns this node's iroh listener; restart the daemon to hand the listener to the module",
-                            payload.id
-                        )));
-                    }
+                if claims_iroh_listener && sinomo_core::network::iroh_disabled_by_env() {
+                    // Doctrine kill switch: SINOMO_DISABLE_IROH silences every
+                    // iroh listener; a module toggle must not sidestep it.
+                    return Err(ServiceError::Service(format!(
+                        "network module {} not enabled: SINOMO_DISABLE_IROH is set for this daemon",
+                        payload.id
+                    )));
                 }
                 // A module registered pre-cluster has no stored context; give
                 // it the current one so enabling actually starts the listener.
@@ -1376,8 +1365,9 @@ fn handle_daemon_network_modules_request(
                 .map_err(ServiceError::Network)?;
             if !payload.enabled && status.descriptor.listener {
                 tracing::warn!(
-                    "network module {} disabled: its listener is down and the built-in proxy \
-                     (if any) only reclaims the transport on daemon restart",
+                    "network module {} disabled: the node serves no {} listener until the module \
+                     is re-enabled",
+                    payload.id,
                     payload.id
                 );
             }

@@ -235,39 +235,41 @@ impl EndpointByNodeIndex {
 /// The sort is stable, so the relative order produced by the purpose-specific
 /// ranking above is preserved within each partition.
 fn deprioritize_endpoints_without_dialable_transport(endpoints: &mut [ClusterEndpointRecord]) {
-    // One registry snapshot per selection pass, not per endpoint.
-    let module_transports = crate::network_module::registered_enabled_dialer_transports();
+    // One registry snapshot per selection pass, not per endpoint. `None`
+    // means no module system is installed in this process at all.
+    let module_transports = crate::network_module::network_module_registry()
+        .map(|registry| registry.enabled_dialer_transports());
     if endpoints.iter().all(|endpoint| {
-        cluster_endpoint_transport_is_dialable(&endpoint.transport, &module_transports)
+        cluster_endpoint_transport_is_dialable(&endpoint.transport, module_transports.as_deref())
     }) {
         return;
     }
     endpoints.sort_by_key(|endpoint| {
-        !cluster_endpoint_transport_is_dialable(&endpoint.transport, &module_transports)
+        !cluster_endpoint_transport_is_dialable(&endpoint.transport, module_transports.as_deref())
     });
 }
 
 /// Whether the local process can currently dial `transport`.
-/// Loopback/LAN-TCP are always built in; Iroh is built in only under the
-/// `iroh-transport` feature; everything else needs an enabled module dialer.
+/// Loopback/LAN-TCP are always built in; everything else — iroh included,
+/// its dialer lives in the modules/network/iroh dylib — needs an enabled
+/// module dialer.
+///
+/// `module_transports` is `None` when no module registry is installed in
+/// this process (non-daemon tools reading routing state, unit tests). Iroh
+/// stays rankable there: the process is not the one dialing — a daemon with
+/// the module loaded is — so starving iroh paths would misrank evidence.
+/// Every daemon installs a registry before serving, so daemons always get
+/// the registry's answer.
 fn cluster_endpoint_transport_is_dialable(
     transport: &ClusterTransportKind,
-    module_transports: &[ClusterTransportKind],
+    module_transports: Option<&[ClusterTransportKind]>,
 ) -> bool {
     match transport {
         ClusterTransportKind::Loopback | ClusterTransportKind::LanTcp => true,
         ClusterTransportKind::Iroh => {
-            // Test/test-support builds mirror the crate-wide `cfg(any(...))`
-            // gate on the in-crate iroh code so purpose-ranking tests keep
-            // their historical ordering; production dialability is the
-            // feature (built-in path) or a registered module.
-            cfg!(any(
-                feature = "iroh-transport",
-                test,
-                feature = "test-support"
-            )) || module_transports.contains(transport)
+            module_transports.is_none_or(|transports| transports.contains(transport))
         }
-        other => module_transports.contains(other),
+        other => module_transports.is_some_and(|transports| transports.contains(other)),
     }
 }
 

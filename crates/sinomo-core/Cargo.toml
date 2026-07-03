@@ -21,11 +21,7 @@ sinomo-cluster = { path = "../sinomo-cluster" }
 sinomo-events = { path = "../sinomo-events" }
 sinomo-kv = { path = "../sinomo-kv" }
 sinomo-local = { path = "../sinomo-local" }
-# TODO(stage-C-followup): drop the iroh-transport enablement together with the
-# feature itself. Stage C extracted the implementation to modules/network/iroh
-# and dispatch prefers a registered module, but the built-in path stays until
-# the daemon proxy loop and cli/cluster direct-dial tests migrate.
-sinomo-network = { path = "../sinomo-network", features = ["iroh-transport"] }
+sinomo-network = { path = "../sinomo-network" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 sinomo-service = { path = "../sinomo-service" }

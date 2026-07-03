@@ -5,6 +5,7 @@
 /benchmark-results
 
 /.claude/settings.local.json
+/.claude/worktrees/
 
 /crates/sinomo-sandbox/toolchains/**/out-*/
 /crates/sinomo-sandbox/toolchains/**/work-*/

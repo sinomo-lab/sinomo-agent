@@ -4,7 +4,7 @@ use crate::cluster::{
     ensure_daemon_status_cluster_async, handle_daemon_cluster_kv_snapshot,
     handle_daemon_cluster_relay_request_on_runtime,
     handle_daemon_cluster_relay_stream_forward_on_runtime,
-    prune_local_cluster_raft_uncommitted_tail, start_daemon_iroh_proxy_if_clustered,
+    prune_local_cluster_raft_uncommitted_tail,
 };
 use crate::dfs::{
     daemon_dfs_endpoint_transport, daemon_dfs_endpoint_transport_on_runtime,
@@ -326,10 +326,9 @@ pub fn run_daemon_control_loop_with_services(
     );
     // Stage C (docs/plans/r0-r1-crate-boundary-refactor.md): load native-dylib
     // network modules (e.g. modules/network/iroh) into the process-wide
-    // NetworkModuleRegistry before serving traffic. Loopback/LAN-TCP — and the
-    // built-in iroh path while the `iroh-transport` feature remains — keep
-    // their in-crate dial paths inside sinomo-network; only dylib modules go
-    // through the registry.
+    // NetworkModuleRegistry before serving traffic. Loopback/LAN-TCP keep
+    // their in-crate dial paths inside sinomo-network; every other transport
+    // (iroh included) goes through the registry.
     match daemon_data_dir_path(&paths) {
         Ok(data_dir_root) => {
             let network_module_context = match cluster_paths_from_daemon_paths(&paths) {
@@ -385,7 +384,7 @@ pub fn run_daemon_control_loop_with_services(
         }
     }
 
-    match start_daemon_iroh_proxy_if_clustered(
+    if let Some(task) = crate::cluster::start_daemon_network_module_context_task(
         &paths,
         &options,
         cluster.as_ref(),
@@ -393,22 +392,7 @@ pub fn run_daemon_control_loop_with_services(
         shutdown_rx.clone(),
         label,
     ) {
-        Ok(Some(task)) => runtime_tasks.push(("iroh proxy", task)),
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!("sinomo {label} iroh proxy disabled: {error}");
-            crate::append_operational_log_best_effort(
-                &paths,
-                crate::OperationalSeverity::Warn,
-                "daemon-control",
-                format!("sinomo {label} iroh proxy disabled"),
-                None,
-                serde_json::json!({
-                    "label": label,
-                    "error": error.to_string(),
-                }),
-            );
-        }
+        runtime_tasks.push(("network module context", task));
     }
 
     if label == "daemon" && crate::dfs::default_distributed_dfs_enabled() {

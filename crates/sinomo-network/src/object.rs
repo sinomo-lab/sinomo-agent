@@ -1075,19 +1075,6 @@ pub(crate) fn object_frame_len_prefix(len: usize) -> Result<ObjectFrameLenPrefix
     Ok(prefix)
 }
 
-#[cfg(any(feature = "iroh-transport", test, feature = "test-support"))]
-pub(crate) fn object_frame_total_bytes(
-    prefix_bytes: usize,
-    body_bytes: usize,
-) -> Result<usize, NetworkError> {
-    prefix_bytes
-        .checked_add(body_bytes)
-        .ok_or(NetworkError::FrameTooLarge {
-            actual_bytes: usize::MAX,
-            max_bytes: usize::MAX,
-        })
-}
-
 // Unconditional since stage C: registry-aware network-module dispatch frames
 // typed requests before handing them to a module, and dylib network modules
 // reuse this codec through the sinomo-core facade.

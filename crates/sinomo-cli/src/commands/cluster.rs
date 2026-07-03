@@ -1051,15 +1051,7 @@ pub(crate) struct RenderedClusterInvite {
     pub(crate) output_path: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ClusterMigrationPlanReport {
-    pub(crate) migration: ClusterMigrationRecord,
-    pub(crate) target_invite_id: ClusterInviteId,
-    pub(crate) source_member_count: usize,
-    pub(crate) source_remote_member_count: usize,
-    pub(crate) target_introducer_count: usize,
-    pub(crate) target_communication_channel_count: usize,
-}
+pub(crate) use sinomo_runtime::cluster::ClusterMigrationPlanReport;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ClusterLeaveReport {
@@ -1085,92 +1077,9 @@ pub(crate) fn cluster_migration_plan_with_paths(
     options: ClusterMigrationPlanOptions,
     paths: &ClusterPaths,
 ) -> Result<ClusterMigrationPlanReport, CliError> {
-    paths.ensure()?;
-    let source = read_cluster_state(paths).map_err(|error| match error {
-        CliError::ClusterOrphan => CliError::Parse {
-            detail: "local node has no initialized source cluster; use `sinomo cluster join <invite>` for a fresh node".to_string(),
-        },
-        other => other,
-    })?;
-    if cluster_state_needs_join_registration(&source) {
-        return Err(CliError::Parse {
-            detail: "local cluster state is an incomplete legacy join; run `sinomo cluster join <invite>` again for a fresh one-shot attempt or `sinomo cluster leave` to discard it".to_string(),
-        });
-    }
-    if options.mode == ClusterMigrationMode::SingleNode
-        && !network::cluster_is_settled_solo(&source)
-    {
-        return Err(CliError::Parse {
-            detail:
-                "single-node migration requires a settled source cluster with no remote peers; use `--mode cluster-merge` to plan a cluster merge"
-                    .to_string(),
-        });
-    }
-
-    let timestamp = OffsetDateTime::now_utc();
     let invite = parse_cluster_join_invite_argument(&options.invite)?;
-    if cluster::invite_has_embedded_signature(&invite) {
-        verify_cluster_join_invite_signature(&invite)?;
-    }
-    if invite.expires_at != OffsetDateTime::UNIX_EPOCH && invite.expires_at <= timestamp {
-        return Err(CliError::Parse {
-            detail: format!(
-                "cluster invite expired at {}",
-                format_rfc3339(invite.expires_at)
-            ),
-        });
-    }
-    if invite.cluster_id == source.cluster_id {
-        return Err(CliError::Parse {
-            detail: format!(
-                "source cluster `{}` already matches the target invite cluster",
-                source.cluster_id
-            ),
-        });
-    }
-
-    let source_member_count = source
-        .members
-        .iter()
-        .filter(|member| !matches!(member.state, ClusterMemberState::Removed))
-        .count();
-    let source_remote_member_count = source
-        .members
-        .iter()
-        .filter(|member| {
-            !matches!(member.state, ClusterMemberState::Removed)
-                && !cluster_member_is_local_process(&source, member)
-        })
-        .count();
-    let migration = ClusterMigrationRecord {
-        migration_id: Id::generate(),
-        mode: options.mode,
-        phase: ClusterMigrationPhase::Planned,
-        source_cluster_id: source.cluster_id.clone(),
-        source_cluster_name: source.cluster_name.clone(),
-        target_cluster_id: invite.cluster_id.clone(),
-        target_cluster_name: invite.cluster_name.clone(),
-        source_local_node_id: source.local_node_id.clone(),
-        target_node_id: source.local_node_id.clone(),
-        preserved_node_ids: vec![source.local_node_id.clone()],
-        remapped_node_ids: Vec::new(),
-        evidence_refs: vec![format!("cluster-state:{}", paths.state.display())],
-        detail: Some(
-            "migration plan only; execution must freeze the source, quarantine old cluster KV/Raft state, register with the target cluster, then verify imported state"
-                .to_string(),
-        ),
-        created_at: timestamp,
-        updated_at: timestamp,
-    };
-
-    Ok(ClusterMigrationPlanReport {
-        migration,
-        target_invite_id: invite.invite_id,
-        source_member_count,
-        source_remote_member_count,
-        target_introducer_count: invite.introducers.len(),
-        target_communication_channel_count: invite.communication_channels.len(),
-    })
+    cluster::plan_cluster_migration(paths, &invite, options.mode, OffsetDateTime::now_utc())
+        .map_err(Into::into)
 }
 
 fn print_cluster_migration_plan_report(report: &ClusterMigrationPlanReport) {
@@ -1372,22 +1281,14 @@ pub(crate) fn default_invite_introducers(
     introducers
 }
 
-/// `sinomo cluster join`: daemon-first — fresh joins and stale-pending
-/// retries run inside the daemon through `/cluster/control/join`. A node
-/// already settled in a cluster re-joins through the direct single-node
-/// migration path, which the daemon does not mediate yet (its handler
-/// directs operators back to this path).
+/// `sinomo cluster join`: daemon-first — fresh joins, stale-pending retries,
+/// AND single-node migrations (a node already settled in another cluster) all
+/// run inside the daemon through `/cluster/control/join`; the daemon
+/// quarantines the source storage and imports the node-local configs when it
+/// migrates.
 pub(crate) fn cluster_join(options: ClusterJoinOptions) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     paths.ensure()?;
-    if paths.state.exists() {
-        let existing = read_cluster_state(&paths)?;
-        if !cluster_state_needs_join_registration(&existing) {
-            cluster_join_single_node_migration_with_paths(options, &paths, existing)?;
-            nudge_local_daemon_cluster_activation();
-            return Ok(());
-        }
-    }
     let client = cluster_control_daemon_client("join <invite>")?;
     cluster_join_via_daemon(&client, options, &paths)
 }
@@ -1436,6 +1337,15 @@ fn cluster_join_via_daemon(
     }
     if let Some(endpoint) = &response.accepted_endpoint {
         println!("introducer accepted join: {endpoint}");
+    }
+    if let Some(migration) = &response.migration {
+        println!("cluster migration finalized: {}", migration.migration_id);
+        println!("source cluster: {}", migration.source_cluster_id);
+        println!("source quarantine: {}", migration.quarantine_root);
+        println!(
+            "node-local config keys: {} imported, {} deferred",
+            migration.imported_node_local_config_keys, migration.deferred_node_local_config_keys
+        );
     }
     println!("cluster join completed: {}", response.cluster_id);
     println!("local node: {}", response.node_id);
@@ -1544,6 +1454,9 @@ fn cluster_join_fresh_with_paths(
     Ok(())
 }
 
+/// Direct single-node migration (the daemon-less variant of the daemon's
+/// `/cluster/control/join` migration branch): shared machinery lives in
+/// `sinomo_runtime::cluster`.
 fn cluster_join_single_node_migration_with_paths(
     options: ClusterJoinOptions,
     paths: &ClusterPaths,
@@ -1564,8 +1477,20 @@ fn cluster_join_single_node_migration_with_paths(
     }
 
     let mut migration = report.migration;
-    write_cluster_migration_record_to_source_kv(paths, &migration)?;
-    let quarantine = quarantine_cluster_storage_for_migration(paths, &migration)?;
+    cluster::write_cluster_migration_record_to_source_kv(paths, &migration)?;
+    let dfs_moves: Vec<(PathBuf, PathBuf)> = paths
+        .root
+        .parent()
+        .map(|data_dir_root| {
+            let data_dir = SinomoDataDir::new(data_dir_root);
+            vec![(
+                default_dfs_metadata_shards_root(&data_dir),
+                dfs_import_metadata_root(&data_dir, &migration.source_cluster_id),
+            )]
+        })
+        .unwrap_or_default();
+    let quarantine =
+        cluster::quarantine_cluster_storage_for_migration(paths, &migration, &dfs_moves)?;
     let now = OffsetDateTime::now_utc();
     migration.phase = ClusterMigrationPhase::SourceFrozen;
     migration.updated_at = now;
@@ -1576,7 +1501,7 @@ fn cluster_join_single_node_migration_with_paths(
         "dfs-import-namespace:{}",
         dfs_import_namespace_root(&migration.source_cluster_id)
     ));
-    write_local_cluster_migration_record(&quarantine.root, &migration)?;
+    cluster::write_local_cluster_migration_record(&quarantine.root, &migration)?;
 
     let target_join_options = ClusterJoinOptions {
         node_id: Some(migration.target_node_id.clone()),
@@ -1585,12 +1510,19 @@ fn cluster_join_single_node_migration_with_paths(
 
     match cluster_join_fresh_with_paths(target_join_options, paths) {
         Ok(()) => {
-            let joined = read_cluster_state(paths)?;
+            let mut joined = read_cluster_state(paths)?;
             migration.target_cluster_id = joined.cluster_id.clone();
             migration.target_cluster_name = Some(joined.cluster_name.clone());
             migration.target_node_id = joined.local_node_id.clone();
-            let kv_import =
-                import_node_local_configs_from_source_kv(paths, &quarantine, &migration)?;
+            let mut driver = cli_cluster_control_plane_driver();
+            let kv_import = cluster::import_node_local_configs_from_source_kv_with_host(
+                paths,
+                &mut joined,
+                &quarantine.root,
+                &migration,
+                cli_cluster_kv_txn_quorum_options(true),
+                &mut driver,
+            )?;
             migration.phase = ClusterMigrationPhase::Finalized;
             migration.updated_at = OffsetDateTime::now_utc();
             migration
@@ -1598,7 +1530,7 @@ fn cluster_join_single_node_migration_with_paths(
                 .push("source-kv-policy:target-authoritative".to_string());
             migration.evidence_refs.push(format!(
                 "source-kv-import-report:{}",
-                cluster_migration_kv_import_report_path(&quarantine.root).display()
+                cluster::cluster_migration_kv_import_report_path(&quarantine.root).display()
             ));
             migration.detail = Some(format!(
                 "single-node migration finalized; target cluster KV is authoritative; source cluster storage is quarantined locally; imported {} node-local config keys, deferred {}, skipped {} source cluster config keys; DFS shared import is deferred",
@@ -1606,7 +1538,7 @@ fn cluster_join_single_node_migration_with_paths(
                 kv_import.deferred_node_local_config_keys.len(),
                 kv_import.skipped_cluster_level_config_count,
             ));
-            write_local_cluster_migration_record(&quarantine.root, &migration)?;
+            cluster::write_local_cluster_migration_record(&quarantine.root, &migration)?;
             println!("cluster migration finalized: {}", migration.migration_id);
             println!("source cluster: {}", migration.source_cluster_id);
             println!("source quarantine: {}", quarantine.root.display());
@@ -1618,410 +1550,11 @@ fn cluster_join_single_node_migration_with_paths(
             migration.detail = Some(format!(
                 "target join failed and source cluster storage was restored: {error}"
             ));
-            let _ = write_local_cluster_migration_record(&quarantine.root, &migration);
-            rollback_cluster_storage_quarantine(&quarantine)?;
+            let _ = cluster::write_local_cluster_migration_record(&quarantine.root, &migration);
+            cluster::rollback_cluster_storage_quarantine(&quarantine)?;
             Err(error)
         }
     }
-}
-
-#[derive(Clone, Debug)]
-struct ClusterMigrationQuarantine {
-    root: PathBuf,
-    moved: Vec<ClusterMigrationQuarantinedPath>,
-}
-
-#[derive(Clone, Debug)]
-struct ClusterMigrationQuarantinedPath {
-    original: PathBuf,
-    quarantined: PathBuf,
-}
-
-fn quarantine_cluster_storage_for_migration(
-    paths: &ClusterPaths,
-    migration: &ClusterMigrationRecord,
-) -> Result<ClusterMigrationQuarantine, CliError> {
-    let root = paths
-        .root
-        .join("migrations")
-        .join(migration.migration_id.to_string())
-        .join("source");
-    fs::create_dir_all(&root).map_err(|source| CliError::Io {
-        path: root.display().to_string(),
-        detail: source.to_string(),
-    })?;
-
-    let mut quarantine = ClusterMigrationQuarantine {
-        root,
-        moved: Vec::new(),
-    };
-    move_cluster_path_if_exists(
-        paths.state.clone(),
-        quarantine.root.join("state.sobj"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.connectivity_local.clone(),
-        quarantine.root.join("connectivity-local.sobj"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.kv_paths().snapshot.clone(),
-        quarantine.root.join("kv-snapshot.sobj"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.kv_paths().raft.clone(),
-        quarantine.root.join("kv-raft"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.kv_paths().watches.clone(),
-        quarantine.root.join("watches"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.kv_paths().watches_lock.clone(),
-        quarantine.root.join("watches.lock"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.kv_paths().watches_next_id.clone(),
-        quarantine.root.join("watches-next.sobj"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.kv_paths().watch_events.clone(),
-        quarantine.root.join("watch-events.sobj"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.kv_paths().watch_events_log.clone(),
-        quarantine.root.join("watch-events.sobjlog"),
-        &mut quarantine,
-    )?;
-    if let Some(data_dir_root) = paths.root.parent() {
-        let data_dir = SinomoDataDir::new(data_dir_root);
-        move_cluster_path_if_exists(
-            default_dfs_metadata_shards_root(&data_dir),
-            dfs_import_metadata_root(&data_dir, &migration.source_cluster_id),
-            &mut quarantine,
-        )?;
-    }
-    Ok(quarantine)
-}
-
-fn quarantine_cluster_storage_for_leave(
-    paths: &ClusterPaths,
-    leave_id: &Id,
-) -> Result<ClusterMigrationQuarantine, CliError> {
-    let root = paths
-        .root
-        .join("migrations")
-        .join(leave_id.to_string())
-        .join("leave-source");
-    fs::create_dir_all(&root).map_err(|source| CliError::Io {
-        path: root.display().to_string(),
-        detail: source.to_string(),
-    })?;
-
-    let mut quarantine = ClusterMigrationQuarantine {
-        root,
-        moved: Vec::new(),
-    };
-    move_cluster_path_if_exists(
-        paths.state.clone(),
-        quarantine.root.join("state.sobj"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.connectivity_local.clone(),
-        quarantine.root.join("connectivity-local.sobj"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.kv_paths().snapshot.clone(),
-        quarantine.root.join("kv-snapshot.sobj"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.kv_paths().raft.clone(),
-        quarantine.root.join("kv-raft"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.kv_paths().watches.clone(),
-        quarantine.root.join("watches"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.kv_paths().watches_lock.clone(),
-        quarantine.root.join("watches.lock"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.kv_paths().watches_next_id.clone(),
-        quarantine.root.join("watches-next.sobj"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.kv_paths().watch_events.clone(),
-        quarantine.root.join("watch-events.sobj"),
-        &mut quarantine,
-    )?;
-    move_cluster_path_if_exists(
-        paths.kv_paths().watch_events_log.clone(),
-        quarantine.root.join("watch-events.sobjlog"),
-        &mut quarantine,
-    )?;
-    Ok(quarantine)
-}
-
-fn cluster_storage_has_live_artifacts(paths: &ClusterPaths) -> bool {
-    paths.state.exists()
-        || paths.connectivity_local.exists()
-        || paths.kv_paths().snapshot.exists()
-        || paths.kv_paths().raft.exists()
-        || paths.kv_paths().watches.exists()
-        || paths.kv_paths().watches_lock.exists()
-        || paths.kv_paths().watches_next_id.exists()
-        || paths.kv_paths().watch_events.exists()
-        || paths.kv_paths().watch_events_log.exists()
-}
-
-fn move_cluster_path_if_exists(
-    original: PathBuf,
-    quarantined: PathBuf,
-    quarantine: &mut ClusterMigrationQuarantine,
-) -> Result<(), CliError> {
-    if !original.exists() {
-        return Ok(());
-    }
-    if quarantined.exists() {
-        return Err(CliError::Io {
-            path: quarantined.display().to_string(),
-            detail: "migration quarantine target already exists".to_string(),
-        });
-    }
-    if let Some(parent) = quarantined.parent() {
-        fs::create_dir_all(parent).map_err(|source| CliError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    fs::rename(&original, &quarantined).map_err(|source| CliError::Io {
-        path: original.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    quarantine.moved.push(ClusterMigrationQuarantinedPath {
-        original,
-        quarantined,
-    });
-    Ok(())
-}
-
-fn rollback_cluster_storage_quarantine(
-    quarantine: &ClusterMigrationQuarantine,
-) -> Result<(), CliError> {
-    for moved in quarantine.moved.iter().rev() {
-        if !moved.quarantined.exists() {
-            continue;
-        }
-        if moved.original.exists() {
-            return Err(CliError::Io {
-                path: moved.original.display().to_string(),
-                detail: "cannot rollback migration quarantine because original path exists"
-                    .to_string(),
-            });
-        }
-        if let Some(parent) = moved.original.parent() {
-            fs::create_dir_all(parent).map_err(|source| CliError::Io {
-                path: parent.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        }
-        fs::rename(&moved.quarantined, &moved.original).map_err(|source| CliError::Io {
-            path: moved.quarantined.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    Ok(())
-}
-
-fn write_local_cluster_migration_record(
-    quarantine_root: &Path,
-    migration: &ClusterMigrationRecord,
-) -> Result<(), CliError> {
-    fs::create_dir_all(quarantine_root).map_err(|source| CliError::Io {
-        path: quarantine_root.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let path = quarantine_root.join("migration.json");
-    let json = serde_json::to_vec_pretty(migration).map_err(|source| CliError::Json {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    fs::write(&path, json).map_err(|source| CliError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
-}
-
-fn write_cluster_migration_record_to_source_kv(
-    paths: &ClusterPaths,
-    migration: &ClusterMigrationRecord,
-) -> Result<(), CliError> {
-    let op = KvOp::put_serde(
-        cluster_migration_key(&migration.migration_id),
-        migration,
-        None,
-    )?;
-    append_cluster_raft_command(
-        paths,
-        &migration.source_local_node_id,
-        sinomo_runtime::kv::KvCommand::Op(op),
-    )
-    .map(|_| ())
-    .map_err(Into::into)
-}
-
-const CLUSTER_MIGRATION_NODE_LOCAL_CONFIG_ROOT: &str = "/config/nodes/";
-const CLUSTER_MIGRATION_KEY_SAMPLE_LIMIT: usize = 32;
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-struct ClusterMigrationKvImportReport {
-    source_cluster_id: ClusterId,
-    target_cluster_id: ClusterId,
-    source_node_id: NodeId,
-    target_node_id: NodeId,
-    target_kv_authoritative: bool,
-    source_snapshot_present: bool,
-    source_entry_count: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    imported_node_local_config_keys: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    deferred_node_local_config_keys: Vec<String>,
-    skipped_cluster_level_config_count: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    skipped_cluster_level_config_key_samples: Vec<String>,
-    skipped_runtime_or_source_count: usize,
-}
-
-fn import_node_local_configs_from_source_kv(
-    paths: &ClusterPaths,
-    quarantine: &ClusterMigrationQuarantine,
-    migration: &ClusterMigrationRecord,
-) -> Result<ClusterMigrationKvImportReport, CliError> {
-    let mut report = ClusterMigrationKvImportReport {
-        source_cluster_id: migration.source_cluster_id.clone(),
-        target_cluster_id: migration.target_cluster_id.clone(),
-        source_node_id: migration.source_local_node_id.clone(),
-        target_node_id: migration.target_node_id.clone(),
-        target_kv_authoritative: true,
-        source_snapshot_present: false,
-        source_entry_count: 0,
-        imported_node_local_config_keys: Vec::new(),
-        deferred_node_local_config_keys: Vec::new(),
-        skipped_cluster_level_config_count: 0,
-        skipped_cluster_level_config_key_samples: Vec::new(),
-        skipped_runtime_or_source_count: 0,
-    };
-
-    let source_kv_paths = sinomo_runtime::kv::ClusterKvPaths::new(quarantine.root.clone());
-    if !source_kv_paths.snapshot.exists() {
-        write_cluster_migration_kv_import_report(&quarantine.root, &report)?;
-        return Ok(report);
-    }
-
-    let source_snapshot = sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&source_kv_paths)
-        .map_err(sinomo_runtime::network::NetworkError::directory)
-        .map_err(sinomo_runtime::network::NetworkError::directory)?;
-    report.source_snapshot_present = true;
-    report.source_entry_count = source_snapshot.entries.len();
-
-    let source_prefix = cluster_migration_node_local_config_prefix(&migration.source_local_node_id);
-    let target_prefix = cluster_migration_node_local_config_prefix(&migration.target_node_id);
-    let mut import_ops = Vec::new();
-    let mut import_keys = Vec::new();
-    for entry in &source_snapshot.entries {
-        if let Some(suffix) = entry.key.strip_prefix(&source_prefix) {
-            let target_key = format!("{target_prefix}{suffix}");
-            import_keys.push(target_key.clone());
-            import_ops.push(KvOp::Put {
-                key: target_key,
-                value: entry.value.clone(),
-                lease_id: None,
-            });
-            continue;
-        }
-
-        if entry.key.starts_with("/config/") {
-            report.skipped_cluster_level_config_count =
-                report.skipped_cluster_level_config_count.saturating_add(1);
-            if report.skipped_cluster_level_config_key_samples.len()
-                < CLUSTER_MIGRATION_KEY_SAMPLE_LIMIT
-            {
-                report
-                    .skipped_cluster_level_config_key_samples
-                    .push(entry.key.clone());
-            }
-        } else {
-            report.skipped_runtime_or_source_count =
-                report.skipped_runtime_or_source_count.saturating_add(1);
-        }
-    }
-
-    if import_ops.is_empty() {
-        write_cluster_migration_kv_import_report(&quarantine.root, &report)?;
-        return Ok(report);
-    }
-
-    let mut target_state = read_cluster_state(paths)?;
-    if cluster_state_needs_join_registration(&target_state) {
-        report.deferred_node_local_config_keys = import_keys;
-        write_cluster_migration_kv_import_report(&quarantine.root, &report)?;
-        return Ok(report);
-    }
-
-    cli_commit_cluster_kv_txn_with_quorum(
-        paths,
-        &mut target_state,
-        KvTxn {
-            compares: Vec::new(),
-            success: import_ops,
-            failure: Vec::new(),
-        },
-    )?;
-    report.imported_node_local_config_keys = import_keys;
-    write_cluster_migration_kv_import_report(&quarantine.root, &report)?;
-    Ok(report)
-}
-
-fn cluster_migration_node_local_config_prefix(node_id: &NodeId) -> String {
-    format!("{CLUSTER_MIGRATION_NODE_LOCAL_CONFIG_ROOT}{node_id}/")
-}
-
-fn cluster_migration_kv_import_report_path(quarantine_root: &Path) -> PathBuf {
-    quarantine_root.join("kv-import.json")
-}
-
-fn write_cluster_migration_kv_import_report(
-    quarantine_root: &Path,
-    report: &ClusterMigrationKvImportReport,
-) -> Result<(), CliError> {
-    fs::create_dir_all(quarantine_root).map_err(|source| CliError::Io {
-        path: quarantine_root.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let path = cluster_migration_kv_import_report_path(quarantine_root);
-    let json = serde_json::to_vec_pretty(report).map_err(|source| CliError::Json {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    fs::write(&path, json).map_err(|source| CliError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
 }
 
 fn local_daemon_public_keys(paths: &ClusterPaths) -> Result<(String, String), CliError> {
@@ -2221,34 +1754,6 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
         println!("introducer accepted join: {}", endpoint.address);
     }
     Ok(())
-}
-
-#[cfg(test)]
-pub(crate) fn send_cluster_join_registration_over_iroh(
-    endpoint: &ClusterEndpointRecord,
-    request: &ClusterJoinRegistrationRequest,
-) -> Result<ClusterJoinRegistrationResponse, CliError> {
-    send_cluster_join_registration_to_endpoint(endpoint, request, IROH_DAEMON_JOIN_TIMEOUT)
-}
-
-#[cfg(test)]
-fn send_cluster_join_registration_to_endpoint(
-    endpoint: &ClusterEndpointRecord,
-    request: &ClusterJoinRegistrationRequest,
-    timeout: Duration,
-) -> Result<ClusterJoinRegistrationResponse, CliError> {
-    cluster::send_cluster_join_registration_over_membership_rpc(
-        endpoint,
-        request,
-        timeout,
-        |endpoint, request, timeout| {
-            send_join_rpc(endpoint, request, timeout).map_err(|source| network::NetworkError::Io {
-                operation: "cluster join membership rpc".to_string(),
-                detail: source.to_string(),
-            })
-        },
-    )
-    .map_err(Into::into)
 }
 
 fn send_join_rpc(
@@ -3094,8 +2599,8 @@ pub(crate) fn cluster_leave_with_paths(
         .map(str::to_string)
         .unwrap_or_else(|| default_cluster_node_name("sinomo-local"));
 
-    let quarantine = if existing.is_some() || cluster_storage_has_live_artifacts(paths) {
-        Some(quarantine_cluster_storage_for_leave(
+    let quarantine = if existing.is_some() || cluster::cluster_storage_has_live_artifacts(paths) {
+        Some(cluster::quarantine_cluster_storage_for_leave(
             paths,
             &Id::generate(),
         )?)
@@ -3120,7 +2625,7 @@ pub(crate) fn cluster_leave_with_paths(
         }),
         Err(error) => {
             if let Some(quarantine) = quarantine {
-                rollback_cluster_storage_quarantine(&quarantine)?;
+                cluster::rollback_cluster_storage_quarantine(&quarantine)?;
             }
             Err(error)
         }
