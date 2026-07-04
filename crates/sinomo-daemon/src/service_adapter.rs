@@ -40,12 +40,12 @@ use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     AsyncDaemonControlStream, CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE,
     CLUSTER_JOIN_REGISTER_ROUTE, CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY,
-    CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA, CLUSTER_NETWORK_PING_ROUTE, CLUSTER_RELAY_ROUTE,
-    CLUSTER_ROUTING_RPC_ROUTE_METADATA, ClusterPaths, DaemonControlRequest,
-    NETWORK_OBJECT_RPC_ROUTES, NetworkError, ObjectRouteDescriptor, ObjectRpcAuthorizationLayer,
-    ObjectRpcCancelRequest, ObjectRpcCancelResponse, ObjectRpcRequest, ObjectRpcResponse,
-    ObjectRpcRouteCatalog, ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry, ObjectRpcRouter,
-    ServiceCatalog,
+    CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA, CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+    CLUSTER_NETWORK_PING_ROUTE, CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
+    ClusterPaths, DaemonControlRequest, NETWORK_OBJECT_RPC_ROUTES, NetworkError,
+    ObjectRouteDescriptor, ObjectRpcAuthorizationLayer, ObjectRpcCancelRequest,
+    ObjectRpcCancelResponse, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcRouteCatalog,
+    ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry, ObjectRpcRouter, ServiceCatalog,
 };
 use sinomo_core::service::{
     ClusterAccess, ResponseSink, Service, ServiceContext, ServiceDisposition, ServiceError,
@@ -664,6 +664,29 @@ impl Service for ClusterHealthService {
                         time::OffsetDateTime::now_utc(),
                     )
                     .map_err(ServiceError::from)?;
+                ctx.respond(response)?;
+                return Ok(ServiceDisposition::Continue);
+            }
+            if request.route == CLUSTER_NETWORK_CONNECTIVITY_ROUTE {
+                let _: () = request.decode_body()?;
+                let response = run_blocking_service_task(
+                    CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+                    "cluster network connectivity",
+                    move || {
+                        let state =
+                            sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+                                .map_err(ServiceError::from)?;
+                        let records =
+                            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                                &cluster_paths,
+                                &state.local_node_id,
+                            )
+                            .map_err(ServiceError::from)?;
+                        ObjectRpcResponse::encode_body(CLUSTER_NETWORK_CONNECTIVITY_ROUTE, &records)
+                            .map_err(ServiceError::from)
+                    },
+                )
+                .await?;
                 ctx.respond(response)?;
                 return Ok(ServiceDisposition::Continue);
             }
@@ -5640,6 +5663,7 @@ mod tests {
             .chain(sinomo_dfs::DFS_DATA_PLANE_ROUTES.iter().copied())
             .chain([
                 sinomo_core::network::CLUSTER_HEALTH_ROUTE,
+                sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
                 sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE,
                 CLUSTER_RELAY_ROUTE,
                 CLUSTER_JOIN_CHALLENGE_ROUTE,
@@ -5664,6 +5688,10 @@ mod tests {
         );
         assert_eq!(
             registry.category_for_route(sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE),
+            Some(sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY)
+        );
+        assert_eq!(
+            registry.category_for_route(sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE),
             Some(sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY)
         );
         assert_eq!(

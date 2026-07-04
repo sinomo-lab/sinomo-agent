@@ -480,11 +480,12 @@ fn print_daemon_idle_stats(stats: &IdleStatsSnapshot) {
         stats.kv_snapshot_writes_actual, stats.kv_snapshot_writes_skipped
     );
     println!(
-        "    kv publishes: member={} node_status={} network_info={} connectivity={}",
-        stats.kv_publish_member,
-        stats.kv_publish_node_status,
-        stats.kv_publish_network_info,
-        stats.kv_publish_connectivity
+        "    kv publishes: member={} node_status={} network_info={}",
+        stats.kv_publish_member, stats.kv_publish_node_status, stats.kv_publish_network_info
+    );
+    println!(
+        "    connectivity record sets written: {}",
+        stats.connectivity_record_sets_written
     );
     println!(
         "    mdns announces: sent={} recv={}",

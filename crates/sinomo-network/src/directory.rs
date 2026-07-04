@@ -1,12 +1,12 @@
 //! Provider seam between the routing mechanism in this crate and the cluster
-//! control plane that owns cluster state (KV-backed today, `sinomo-cluster`
-//! after the split).
+//! control plane that owns stable cluster state.
 //!
 //! Staying network code must not read cluster KV directly. Everything it needs
 //! from cluster state arrives through [`ClusterDirectory`]: membership records,
-//! endpoint records, node statuses, connectivity records published by peers,
-//! the raft voter check, and a monotonic version stamp used to invalidate
-//! routing caches.
+//! endpoint records, node statuses, the raft voter check, and a monotonic
+//! version stamp used to invalidate routing caches. Active connectivity is
+//! network-plane state persisted locally and imported from reachable peers over
+//! network RPC; it is not a KV ground truth.
 
 use crate::connectivity::ClusterConnectivityRecord;
 use crate::error::NetworkError;
@@ -37,7 +37,10 @@ pub trait ClusterDirectory: Send + Sync {
     /// Latest node status record per node id.
     fn node_statuses(&self) -> Result<BTreeMap<NodeId, ClusterNodeStatusRecord>, NetworkError>;
 
-    /// Live connectivity records published by cluster peers.
+    /// Supplemental connectivity records from the backing directory.
+    ///
+    /// Production KV-backed directories return no active records here; route
+    /// truth comes from the local network-plane connectivity store.
     fn connectivity_records(&self) -> Result<Vec<ClusterConnectivityRecord>, NetworkError>;
 
     /// Monotonic stamp of the backing store used for routing-cache

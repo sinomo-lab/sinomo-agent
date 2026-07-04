@@ -110,9 +110,10 @@ daemon opens the files or triggers maintenance.
 
 Cluster networking and KV storage are separate domains. Their coupling is real
 but narrow: KV replication and KV RPC traffic use the cluster network for data
-transmission, while network routing reads the connectivity graph persisted in KV
-through a small query surface. Those two facts do not make either crate the owner
-of the other's domain.
+transmission, while network routing reads stable cluster facts through a small
+directory surface and reads active connectivity from the network-plane local
+store plus peer imports. Those facts do not make either crate the owner of the
+other's domain.
 
 The target contract is:
 
@@ -120,12 +121,14 @@ The target contract is:
   endpoint selection, endpoint scoring, relay decisions, peer transport
   contracts, inbound peer authorization, connectivity graph interpretation,
   membership routing decisions, join-registration network validation, cluster
-  health probe planning, and network maintenance cadence. It may consume
-  KV-backed connectivity records through a read-only query adapter. Connectivity
-  records are network-domain facts stored in KV; KV stores and serves them, but
-  network defines how they affect routing. Network must not apply KV commands,
-  manage watches, own Raft leaders/elections, own Raft logs, compact snapshots,
-  or define durable KV storage layout.
+  health probe planning, and network maintenance cadence. Active connectivity
+  records are network-domain facts persisted locally and exchanged with reachable
+  peers over authenticated network RPC. KV may store stable endpoint and network
+  configuration metadata, plus legacy diagnostic connectivity rows, but live
+  route choice and quorum formation must not depend on committing fresh
+  connectivity records to KV. Network must not apply KV commands, manage
+  watches, own Raft leaders/elections, own Raft logs, compact snapshots, or
+  define durable KV storage layout.
 - `sinomo-kv` owns KV storage semantics: keyspace revisions, transactions,
   range reads, watches, snapshots, leases, Raft participant state,
   leader/election state, term/vote/log/snapshot behavior, compaction, range
@@ -267,9 +270,8 @@ Good first slices are:
   `sinomo-kv`.
 - Introduce explicit KV-to-network transport traits for KV/Raft traffic so KV can
   request replication without owning peer route selection.
-- Introduce explicit network-to-KV connectivity graph query traits so routing can
-  consume KV-persisted connectivity records without depending on KV storage
-  mechanics.
+- Keep active connectivity on the network plane while preserving explicit
+  directory/query seams for stable cluster facts and legacy diagnostics.
 - Finish moving cluster control-plane and Raft transport decisions out of
   daemon-owned files.
 - Move remaining cluster membership reconciliation and maintenance into the

@@ -101,8 +101,6 @@ const DAEMON_CLUSTER_FORMATION_CONTROL_PLANE_TIMEOUT: Duration = Duration::from_
 const DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT: Duration = Duration::from_millis(750);
 const DAEMON_CLUSTER_FORMATION_IROH_COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 const DAEMON_CLUSTER_FORMATION_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(350);
-const DAEMON_CLUSTER_JOIN_CONNECTIVITY_RETRY_WINDOW: Duration = Duration::from_secs(8);
-const DAEMON_CLUSTER_JOIN_CONNECTIVITY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// Learner KV snapshot pull cadence. Convergence is event-driven — the voter
 /// pushes committed raft appends to every member on commit — so this pull is
 /// only a recovery net for lost pushes and restarts, deliberately slow to keep
@@ -784,60 +782,35 @@ fn publish_join_connectivity_if_needed(
             records.push(observed_record);
         }
         let record_count = records.len();
-        let deadline = Instant::now() + DAEMON_CLUSTER_JOIN_CONNECTIVITY_RETRY_WINDOW;
-        let mut attempt = 0_u32;
-        let result = loop {
-            attempt = attempt.saturating_add(1);
-            let mut host = DaemonClusterControlPlaneTransport::formation(task_runtime.clone());
-            let attempt_result = sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_async_with_state_and_host(
-                &task_runtime,
-                &paths,
-                &source_node_id,
-                records.clone(),
-                state.clone(),
-                &mut host,
-            )
-            .await;
-            match attempt_result {
-                Ok(result) => break Ok(result),
-                Err(error) => {
-                    let remaining = deadline
-                        .checked_duration_since(Instant::now())
-                        .unwrap_or_default();
-                    if remaining.is_zero() {
-                        break Err(error);
-                    }
-                    crate::cluster_join_trace(format_args!(
-                        "connectivity publish source={source_node_id} records={record_count} attempt={attempt} failed in {:?}, retrying: {error}",
-                        started.elapsed()
-                    ));
-                    tokio::time::sleep(
-                        DAEMON_CLUSTER_JOIN_CONNECTIVITY_RETRY_INTERVAL.min(remaining),
-                    )
-                    .await;
-                }
-            }
-        };
+        let result = sinomo_core::network::write_local_cluster_connectivity_record_set_async(
+            &task_runtime,
+            &paths,
+            &source_node_id,
+            &records,
+        )
+        .await;
         match result {
-            Ok(Some(snapshot)) => {
+            Ok(()) => {
+                remember_connectivity_record_set(&paths, &source_node_id, &records);
+                let imported = import_peer_connectivity_records_from_reachable_endpoints_async(
+                    &paths,
+                    &state,
+                    &records,
+                    task_runtime.clone(),
+                    true,
+                )
+                .await;
                 crate::cluster_join_trace(format_args!(
-                    "connectivity publish source={source_node_id} records={record_count} attempts={attempt} committed revision={:?} in {:?}",
-                    snapshot.revision,
-                    started.elapsed()
-                ));
-            }
-            Ok(None) => {
-                crate::cluster_join_trace(format_args!(
-                    "connectivity publish source={source_node_id} records={record_count} attempts={attempt} no-op in {:?}",
+                    "connectivity import source={source_node_id} records={record_count} imported={imported} in {:?}",
                     started.elapsed()
                 ));
             }
             Err(error) => {
                 crate::cluster_join_trace(format_args!(
-                    "connectivity publish source={source_node_id} records={record_count} attempts={attempt} failed in {:?}: {error}",
+                    "connectivity import source={source_node_id} records={record_count} failed in {:?}: {error}",
                     started.elapsed()
                 ));
-                tracing::warn!("sinomo daemon join connectivity publish failed: {error}");
+                tracing::warn!("sinomo daemon join connectivity local write failed: {error}");
             }
         }
         clear_join_connectivity_sync_in_flight(&source_key);
@@ -851,9 +824,8 @@ fn publish_command_connectivity_if_needed_with_policy(
     runtime: Option<&tokio::runtime::Handle>,
     allow_local_voter: bool,
 ) {
-    if (!allow_local_voter && sinomo_core::kv::cluster_kv_raft_local_is_voter(state))
-        || cached_connectivity_matches(paths, record)
-    {
+    let _ = allow_local_voter;
+    if cached_connectivity_matches(paths, record) {
         return;
     }
     COMMAND_CONNECTIVITY_SYNC_IN_FLIGHT.with(|in_flight| {
@@ -866,25 +838,18 @@ fn publish_command_connectivity_if_needed_with_policy(
             &state.local_node_id,
         )
         .unwrap_or_default();
-        match runtime {
-            Some(runtime) => {
-                let _ = sync_cluster_connectivity_records_to_kv_on_runtime(
-                    paths,
-                    &state.local_node_id,
-                    records,
-                    runtime,
-                );
-            }
-            None => {
-                #[cfg(test)]
-                {
-                    let _ = sync_cluster_connectivity_records_to_kv(
-                        paths,
-                        &state.local_node_id,
-                        records,
-                    );
-                }
-            }
+        remember_connectivity_record_set(paths, &state.local_node_id, &records);
+        if let Some(runtime) = runtime {
+            let paths = paths.clone();
+            let state = state.clone();
+            let records = records.clone();
+            let runtime = runtime.clone();
+            runtime.clone().spawn(async move {
+                let _ = import_peer_connectivity_records_from_reachable_endpoints_async(
+                    &paths, &state, &records, runtime, false,
+                )
+                .await;
+            });
         }
         in_flight.set(false);
     });
@@ -2751,34 +2716,36 @@ impl ClusterNetworkMaintenance {
         let records = self
             .execute_connectivity_probe_plan_async(&pending.state, pending.plan)
             .await;
-        let mut host = if pending.use_formation_timeouts {
-            DaemonClusterControlPlaneTransport::formation(runtime.clone())
-        } else {
-            DaemonClusterControlPlaneTransport::new(runtime.clone())
-        };
-        let published =
-            sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_async_with_host(
-                &runtime,
-                &pending.paths,
-                &pending.source_node_id,
-                records,
-                &mut host,
-            )
-            .await;
-        match published {
-            Ok(Some(_)) => {
-                self.connectivity_converged = true;
-                self.record_publish_success();
-                self.idle_stats.incr_kv_publish_connectivity();
-            }
-            Ok(None) => {
+        let written = sinomo_core::network::write_local_cluster_connectivity_record_set_async(
+            &runtime,
+            &pending.paths,
+            &pending.source_node_id,
+            &records,
+        )
+        .await;
+        match written {
+            Ok(()) => {
+                self.idle_stats.incr_connectivity_record_sets_written();
+                let imported = import_peer_connectivity_records_from_reachable_endpoints_async(
+                    &pending.paths,
+                    &pending.state,
+                    &records,
+                    runtime,
+                    pending.use_formation_timeouts,
+                )
+                .await;
+                if imported > 0 {
+                    tracing::debug!(
+                        "sinomo daemon imported {imported} peer connectivity record set(s)"
+                    );
+                }
                 self.connectivity_converged = true;
                 self.record_publish_success();
             }
             Err(error) => {
                 self.connectivity_converged = false;
                 self.record_connectivity_publish_failure();
-                tracing::warn!("sinomo daemon cluster connectivity publish failed: {error}");
+                tracing::warn!("sinomo daemon local connectivity write failed: {error}");
             }
         }
     }
@@ -2844,6 +2811,128 @@ impl ClusterNetworkMaintenance {
             probed,
         )
     }
+}
+
+async fn import_peer_connectivity_records_from_reachable_endpoints_async(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    records: &[ClusterConnectivityRecord],
+    runtime: tokio::runtime::Handle,
+    use_formation_timeouts: bool,
+) -> usize {
+    let request = match ObjectRpcRequest::encode_body(
+        sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+        sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY,
+        &(),
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::warn!("sinomo daemon peer connectivity request encode failed: {error}");
+            return 0;
+        }
+    };
+    let timeouts = if use_formation_timeouts {
+        cluster_formation_control_plane_timeouts()
+    } else {
+        cluster_control_plane_timeouts()
+    };
+    let mut visited = BTreeSet::new();
+    let mut imported = 0_usize;
+    for record in records.iter().filter(|record| {
+        record.state == ClusterConnectivityState::Healthy
+            && record.source_node_id == state.local_node_id
+            && record.target_node_id != state.local_node_id
+    }) {
+        let Some(endpoint) = state
+            .members
+            .iter()
+            .find(|member| member.node_id == record.target_node_id)
+            .and_then(|member| {
+                member.endpoints.iter().find(|endpoint| {
+                    endpoint.endpoint_id == record.endpoint_id
+                        && endpoint.address == record.address
+                        && endpoint.transport == record.transport
+                        && endpoint.privacy != sinomo_core::ClusterEndpointPrivacy::LocalOnly
+                        && sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(
+                            endpoint,
+                        )
+                })
+            })
+            .cloned()
+        else {
+            continue;
+        };
+        let key = format!("{}:{}", endpoint.node_id, endpoint.endpoint_id);
+        if !visited.insert(key) {
+            continue;
+        }
+        let timeout = match endpoint.transport {
+            ClusterTransportKind::Iroh => timeouts.iroh_command_timeout,
+            _ => timeouts.tcp_command_timeout,
+        };
+        let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+            DaemonClusterRpcMode::new(runtime.clone()),
+            timeouts,
+        );
+        let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
+        let response = client
+            .call_endpoint(
+                &endpoint,
+                &request,
+                sinomo_core::network::ClusterObjectRpcOptions::new(
+                    sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+                ),
+            )
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!(
+                    "sinomo daemon peer connectivity import from {} failed: {error}",
+                    endpoint.address
+                );
+                continue;
+            }
+        };
+        if let Err(error) = response.error_detail() {
+            tracing::debug!(
+                "sinomo daemon peer connectivity import from {} returned error: {error}",
+                endpoint.address
+            );
+            continue;
+        }
+        let peer_records = match response.decode_body::<Vec<ClusterConnectivityRecord>>() {
+            Ok(records) => records
+                .into_iter()
+                .filter(|record| {
+                    record.cluster_id == state.cluster_id
+                        && record.source_node_id == endpoint.node_id
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                tracing::debug!(
+                    "sinomo daemon peer connectivity import from {} decode failed: {error}",
+                    endpoint.address
+                );
+                continue;
+            }
+        };
+        match sinomo_core::network::write_local_cluster_connectivity_record_set_async(
+            &runtime,
+            paths,
+            &endpoint.node_id,
+            &peer_records,
+        )
+        .await
+        {
+            Ok(()) => imported = imported.saturating_add(1),
+            Err(error) => tracing::debug!(
+                "sinomo daemon peer connectivity import from {} write failed: {error}",
+                endpoint.address
+            ),
+        }
+    }
+    imported
 }
 
 async fn probe_connectivity_batch_async(
@@ -4789,13 +4878,6 @@ impl DaemonClusterControlPlaneTransport {
         )
     }
 
-    fn formation(runtime: tokio::runtime::Handle) -> Self {
-        Self::with_mode_and_timeouts(
-            DaemonClusterRpcMode::new(runtime),
-            cluster_formation_control_plane_timeouts(),
-        )
-    }
-
     fn with_mode_and_timeouts(
         rpc_mode: DaemonClusterRpcMode,
         timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
@@ -5538,6 +5620,7 @@ pub(crate) fn sync_cluster_connectivity_records_to_kv(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn sync_cluster_connectivity_records_to_kv_on_runtime(
     paths: &ClusterPaths,
     source_node_id: &NodeId,

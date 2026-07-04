@@ -249,9 +249,9 @@ fn first_cluster_rollout_target_endpoint_for_main_with_command_endpoint(
 }
 
 /// Installs the KV-backed cluster directory provider once for the whole test
-/// process, restoring the pre-split read semantics (routing and selection read
-/// cluster KV directly). Tests own distinct data roots, so the per-paths
-/// factory keeps them isolated.
+/// process. Stable cluster facts still come from KV through the registered
+/// directory; active connectivity is supplied by local network-plane records.
+/// Tests own distinct data roots, so the per-paths factory keeps them isolated.
 fn install_kv_directory_for_tests() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(sinomo_cluster::install_kv_cluster_directory);
@@ -265,7 +265,13 @@ fn cluster_network_rpc_route_metadata_matches_owned_routes() {
     );
     assert_eq!(
         CLUSTER_NETWORK_RPC_ROUTE_METADATA,
-        &[(CLUSTER_NETWORK_PING_ROUTE, CLUSTER_NETWORK_RPC_CATEGORY)]
+        &[
+            (
+                CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+                CLUSTER_NETWORK_RPC_CATEGORY
+            ),
+            (CLUSTER_NETWORK_PING_ROUTE, CLUSTER_NETWORK_RPC_CATEGORY),
+        ]
     );
     assert_eq!(
         CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA,
@@ -328,12 +334,17 @@ fn object_rpc_requests_carry_operation_cancellation_metadata() {
 fn network_publishes_agent_cluster_inspection_specs() {
     assert_eq!(
         NETWORK_OBJECT_RPC_ROUTES,
-        &[CLUSTER_HEALTH_ROUTE, CLUSTER_NETWORK_PING_ROUTE]
+        &[
+            CLUSTER_HEALTH_ROUTE,
+            CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+            CLUSTER_NETWORK_PING_ROUTE,
+        ]
     );
     assert_eq!(
         NETWORK_CAPABILITY_EXPORTS,
         &[
             CLUSTER_HEALTH_READ_CAPABILITY,
+            CLUSTER_NETWORK_CONNECTIVITY_READ_CAPABILITY,
             CLUSTER_NETWORK_PING_CAPABILITY
         ]
     );
@@ -347,6 +358,19 @@ fn network_publishes_agent_cluster_inspection_specs() {
     assert_eq!(tool.operation, CLUSTER_HEALTH_READ_CAPABILITY);
     assert_eq!(
         tool.auth.as_scope(),
+        NetworkModuleRouteAuth::LocalOrClusterMember.as_scope()
+    );
+    let connectivity = NETWORK_OBJECT_RPC_TOOL_SURFACES
+        .iter()
+        .find(|surface| surface.route == CLUSTER_NETWORK_CONNECTIVITY_ROUTE)
+        .expect("cluster network connectivity tool surface");
+    assert_eq!(connectivity.category, CLUSTER_NETWORK_RPC_CATEGORY);
+    assert_eq!(
+        connectivity.operation,
+        CLUSTER_NETWORK_CONNECTIVITY_READ_CAPABILITY
+    );
+    assert_eq!(
+        connectivity.auth.as_scope(),
         NetworkModuleRouteAuth::LocalOrClusterMember.as_scope()
     );
     let ping = NETWORK_OBJECT_RPC_TOOL_SURFACES
@@ -4636,6 +4660,64 @@ fn connectivity_graph_reads_kv_records_through_query_boundary() {
     assert_eq!(
         graph.healthy_target_refs(&node_b).collect::<Vec<_>>(),
         vec![&node_c]
+    );
+}
+
+#[test]
+fn kv_cluster_directory_does_not_serve_active_connectivity_records() {
+    install_kv_directory_for_tests();
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-kv-not-active");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_conn_kv_not_active").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_kv_not_active_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_conn_kv_not_active_b").expect("node b");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "connectivity kv not active",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.1.40:21353".to_string(), 10);
+    let mut member_b =
+        ClusterMemberRecord::local_voter(cluster_id.clone(), node_b, "node b", "pk-b", now);
+    member_b.capabilities = main_daemon_capabilities(&member_b.role);
+    member_b.allowed_capabilities = member_b.capabilities.clone();
+    member_b.endpoints = vec![endpoint_b.clone()];
+    state.members.push(member_b);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let record = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Healthy,
+        Some(5),
+        0,
+        Some("legacy kv success".to_string()),
+        None,
+        now,
+        600,
+    );
+    sync_cluster_connectivity_records_to_kv(&paths, &node_a, vec![record.clone()])
+        .expect("sync legacy kv connectivity");
+    write_local_cluster_connectivity_record_set(&paths, &node_a, &[])
+        .expect("clear active local connectivity");
+
+    assert_eq!(
+        read_cluster_connectivity_graph_from_kv(&paths).expect("legacy kv graph"),
+        vec![record],
+        "legacy KV diagnostics should still expose stored connectivity rows"
+    );
+    assert!(
+        read_cluster_connectivity_graph(&paths)
+            .expect("active connectivity graph")
+            .is_empty(),
+        "production route truth must come from network-plane local/peer records, not KV"
     );
 }
 

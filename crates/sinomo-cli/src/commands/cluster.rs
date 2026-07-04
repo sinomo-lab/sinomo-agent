@@ -2022,7 +2022,7 @@ pub(crate) fn cluster_doctor() -> Result<(), CliError> {
     refresh_cluster_kv_from_local_daemon(&paths)?;
     let state = read_cluster_state(&paths)?;
     let rows = cluster_health_rows_for_cli(&paths, &state)?;
-    let graph = cluster::read_cluster_connectivity_graph_from_kv(&paths).unwrap_or_default();
+    let graph = network::read_cluster_connectivity_graph(&paths).unwrap_or_default();
     let mut findings = cluster_doctor_findings(&state, &graph, &rows);
     if let Some(data_dir) = paths.root.parent() {
         findings.extend(data_dir_storage_contract_findings(data_dir)?);
@@ -2053,11 +2053,13 @@ pub(crate) fn cluster_connectivity() -> Result<(), CliError> {
     refresh_cluster_kv_from_local_daemon(&paths)?;
     let state = read_cluster_state(&paths)?;
     let local = network::read_local_cluster_connectivity_records(&paths)?;
-    let kv = cluster::read_cluster_connectivity_graph_from_kv(&paths).unwrap_or_default();
+    let active = network::read_cluster_connectivity_graph(&paths)?;
+    let legacy_kv = cluster::read_cluster_connectivity_graph_from_kv(&paths).unwrap_or_default();
     println!("cluster: {}", state.cluster_id);
     println!("local node: {}", state.local_node_id);
     print_connectivity_records("local", local);
-    print_connectivity_records("kv", kv);
+    print_connectivity_records("active", active);
+    print_connectivity_records("legacy-kv", legacy_kv);
     Ok(())
 }
 

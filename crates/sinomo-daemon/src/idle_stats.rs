@@ -19,7 +19,7 @@ pub struct IdleStatsAtomics {
     pub kv_publish_node_status: AtomicU64,
     pub kv_publish_network_info: AtomicU64,
     pub kv_publish_member: AtomicU64,
-    pub kv_publish_connectivity: AtomicU64,
+    pub connectivity_record_sets_written: AtomicU64,
     pub mdns_announces_sent: AtomicU64,
     pub mdns_announces_recv: AtomicU64,
     pub raft_appends_sent: AtomicU64,
@@ -55,7 +55,9 @@ impl IdleStatsAtomics {
             kv_publish_node_status: self.kv_publish_node_status.load(Ordering::Relaxed),
             kv_publish_network_info: self.kv_publish_network_info.load(Ordering::Relaxed),
             kv_publish_member: self.kv_publish_member.load(Ordering::Relaxed),
-            kv_publish_connectivity: self.kv_publish_connectivity.load(Ordering::Relaxed),
+            connectivity_record_sets_written: self
+                .connectivity_record_sets_written
+                .load(Ordering::Relaxed),
             mdns_announces_sent: self.mdns_announces_sent.load(Ordering::Relaxed),
             mdns_announces_recv: self.mdns_announces_recv.load(Ordering::Relaxed),
             raft_appends_sent: self.raft_appends_sent.load(Ordering::Relaxed),
@@ -97,8 +99,9 @@ impl IdleStatsAtomics {
     pub fn incr_kv_publish_member(&self) {
         self.kv_publish_member.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn incr_kv_publish_connectivity(&self) {
-        self.kv_publish_connectivity.fetch_add(1, Ordering::Relaxed);
+    pub fn incr_connectivity_record_sets_written(&self) {
+        self.connectivity_record_sets_written
+            .fetch_add(1, Ordering::Relaxed);
     }
     pub fn incr_mdns_announces_sent(&self) {
         self.mdns_announces_sent.fetch_add(1, Ordering::Relaxed);
@@ -140,7 +143,8 @@ pub struct IdleStatsSnapshot {
     pub kv_publish_node_status: u64,
     pub kv_publish_network_info: u64,
     pub kv_publish_member: u64,
-    pub kv_publish_connectivity: u64,
+    #[serde(default)]
+    pub connectivity_record_sets_written: u64,
     pub mdns_announces_sent: u64,
     pub mdns_announces_recv: u64,
     pub raft_appends_sent: u64,

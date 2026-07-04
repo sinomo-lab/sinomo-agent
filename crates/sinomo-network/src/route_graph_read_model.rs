@@ -373,12 +373,12 @@ where
         crate::object::try_reserve_vec(&mut local_records, 1, "collect local route graph records")?;
         local_records.push(record);
     }
-    // A node's own live probe results are authoritative for its outgoing edges. Drop any
-    // KV-published edge whose source we hold local records for; when constructing the local
-    // route graph, also drop KV-published edges for this node even if the in-process cache is
-    // empty after restart/network change. Self-published KV edges can be stale (e.g. healthy
-    // before roaming, or unreachable before reconnecting), while other sources' edges are the
-    // remote topology we still need for relay planning.
+    // Source-owned live records are authoritative for their outgoing edges. Drop any
+    // directory-provided edge for a source we hold local network-plane records for; when
+    // constructing a state-aware local route graph, also drop directory-provided edges for this
+    // node even if the in-process cache is empty after restart/network change. Durable directory
+    // rows can be stale, while source-owned records imported from reachable peers are the remote
+    // topology we need for relay planning.
     let mut local_sources = ClusterRouteGraphSourceSet::default();
     for record in &local_records {
         local_sources
@@ -402,7 +402,7 @@ where
         if local_sources.contains(&record.source_node_id) {
             continue;
         }
-        records_by_key.try_insert(record, "index kv route graph records")?;
+        records_by_key.try_insert(record, "index directory route graph records")?;
     }
     for record in local_records {
         records_by_key.try_insert(record, "index local route graph records")?;

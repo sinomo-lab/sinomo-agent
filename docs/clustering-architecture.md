@@ -22,9 +22,9 @@ Three R0 crates split the clustering stack, and they are deliberately decoupled 
 
 `sinomo-kv` owns KV storage semantics and the Raft consensus core: models, WAL, snapshots, revisions, transactions, leases, prefix watches, and the election/replication state machines. It is transport-free and depends on neither `sinomo-network` nor `sinomo-cluster`.
 
-`sinomo-cluster` owns the cluster control plane: membership, invites, join registration, member mutation, member/state/connectivity/status publishing, the KV/Raft replication and election drivers that move consensus traffic over network-selected routes, cluster health rows and doctor findings, cluster bootstrap-state I/O, and the daemon-mediated `/cluster/control/*` object-RPC routes.
+`sinomo-cluster` owns the cluster control plane: membership, invites, join registration, member mutation, stable member/state/network-info/status publishing, the KV/Raft replication and election drivers that move consensus traffic over network-selected routes, cluster health rows and doctor findings, cluster bootstrap-state I/O, and the daemon-mediated `/cluster/control/*` object-RPC routes.
 
-`sinomo-network` owns routing and endpoint selection only. It has no dependency on `sinomo-kv` or `sinomo-cluster`; everything routing needs from cluster state (members, endpoints, node statuses, connectivity records) arrives through the `ClusterDirectory` provider that `sinomo-cluster` implements on top of cluster KV. `sinomo-service` owns service registration, discovery records, and routing target selection above this stack.
+`sinomo-network` owns routing and endpoint selection only. It has no dependency on `sinomo-kv` or `sinomo-cluster`; stable cluster facts such as members, advertised endpoints, node statuses, and configured network information arrive through the `ClusterDirectory` provider that `sinomo-cluster` implements on top of cluster KV. Active connectivity is network-plane state: each daemon records local probe results and imports peer-owned connectivity records from reachable nodes over authenticated network RPC, so quorum formation and live route choice do not depend on first committing connectivity records to KV. `sinomo-service` owns service registration, discovery records, and routing target selection above this stack.
 
 ## CLI Surface
 
@@ -180,7 +180,7 @@ Invite payload fields:
 - `public_key`: the cluster's current public key for invite challenge verification.
 - `invite_id`: the invitation ID the invited node uses when contacting an introducer.
 - `secret`: the short-lived secret presented to prove possession of the invite.
-- repeated `channel`: communication channels containing transport, address, and responder public key. The invite URI does not need to disclose peer node IDs. Default invites keep the fixed fallback order: LAN direct channels first when available, public direct channels next, and Iroh last as the cross-network fallback. Runtime route choice uses the `sinomo-network` connectivity graph to avoid endpoints this node already knows are unavailable; it does not reorder invite channels to guess the remote topology.
+- repeated `channel`: communication channels containing transport, address, and responder public key. The invite URI does not need to disclose peer node IDs. Default invites keep the fixed fallback order: LAN direct channels first when available, public direct channels next, and Iroh last as the cross-network fallback. Runtime route choice uses the active `sinomo-network` connectivity graph to avoid endpoints this node already knows are unavailable; it does not reorder invite channels to guess the remote topology.
 
 The persisted invitation record is larger than the URI. It contains the cluster identity, expiry, allowed roles, issuer identity, signature, and any other policy needed by introducers to validate and register the join.
 

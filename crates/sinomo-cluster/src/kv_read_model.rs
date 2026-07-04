@@ -12,24 +12,10 @@ use sinomo_network::ClusterNetworkInfoRecord;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_network::cleanup_member_iroh_endpoints;
-use sinomo_network::{
-    ClusterConnectivityRecord, ClusterConnectivityRecordQuery, cluster_network_record_live,
-};
+use sinomo_network::{ClusterConnectivityRecord, cluster_network_record_live};
 use sinomo_node::{ClusterCapabilityPolicyRecord, NodeId};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct KvBackedClusterConnectivityRecordQuery;
-
-impl ClusterConnectivityRecordQuery for KvBackedClusterConnectivityRecordQuery {
-    fn read_kv_connectivity_records(
-        &self,
-        paths: &ClusterPaths,
-    ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
-        read_cluster_connectivity_graph_from_kv(paths)
-    }
-}
 
 pub fn read_cluster_members_from_kv(
     paths: &ClusterPaths,
@@ -280,7 +266,11 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
     }
 
     fn connectivity_records(&self) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
-        read_cluster_connectivity_graph_from_kv(&self.paths)
+        // Active connectivity is network-plane state, not a stable cluster
+        // fact. KV keeps durable membership/endpoints/status; route choice uses
+        // local probe records plus peer records fetched directly over the
+        // network plane.
+        Ok(Vec::new())
     }
 
     fn version(&self) -> Result<sinomo_network::DirectoryVersion, NetworkError> {

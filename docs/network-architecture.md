@@ -130,7 +130,8 @@ fn receive(packet: Packet, deadline: Deadline) -> Result<Response, DeliveryError
 }
 ```
 
-The route graph is built from all known authorized endpoints and connectivity records:
+The route graph is built from all known authorized endpoints and active
+network-plane connectivity records:
 
 ```rust
 fn build_route_graph(failed_edges: &Set<Edge>) -> Graph {
@@ -244,7 +245,7 @@ Registered into the crate: everything else. Domain crates declare object-RPC rou
 
 ### Cluster Directory
 
-Staying network code must not read cluster KV directly. Everything routing needs from cluster state arrives through the `ClusterDirectory` provider trait defined in this crate: authorized member records, endpoint records, node statuses, connectivity records published by peers, and a monotonic `DirectoryVersion` stamp used to invalidate routing caches. `sinomo-cluster` implements the trait on top of cluster KV — the version stamp is the local KV snapshot revision — and registers it process-wide with `install_kv_cluster_directory()` at daemon startup. Without a registered provider, as in tests and pre-cluster paths, routing sees an empty directory and works purely from bootstrap state and local observations.
+Staying network code must not read cluster KV directly. Stable cluster facts arrive through the `ClusterDirectory` provider trait defined in this crate: authorized member records, endpoint records, node statuses, configured network information, and a monotonic `DirectoryVersion` stamp used to invalidate routing caches. `sinomo-cluster` implements the trait on top of cluster KV — the version stamp is the local KV snapshot revision — and registers it process-wide with `install_kv_cluster_directory()` at daemon startup. Active connectivity does not come from KV: daemons persist local probe results in the network-plane store and import peer-owned connectivity records from reachable nodes over authenticated network RPC. Without a registered provider, as in tests and pre-cluster paths, routing sees an empty stable directory and works purely from bootstrap state and local observations.
 
 ## Network Modules
 

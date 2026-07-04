@@ -288,8 +288,10 @@ pub trait ClusterConnectivityRecordQuery {
     ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError>;
 }
 
-/// Default [`ClusterConnectivityRecordQuery`]: serves connectivity records
-/// from the registered cluster directory provider.
+/// Default [`ClusterConnectivityRecordQuery`]: asks the registered cluster
+/// directory for supplemental records. In normal production wiring this is not
+/// the live connectivity source; active records come from the network-plane
+/// local store.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DirectoryConnectivityRecordQuery;
 
