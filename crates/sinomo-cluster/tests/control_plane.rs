@@ -33268,6 +33268,57 @@ mod route_cache_tests {
     }
 
     #[test]
+    fn delivery_plan_uses_directory_endpoint_overlay() {
+        super::install_kv_directory_for_tests();
+        let (_root, paths) = test_paths("sinomo-network-delivery-plan-directory-endpoint");
+        let cluster_id = cid("cluster_delivery_plan_directory_endpoint");
+        let local = nid("node_delivery_plan_directory_endpoint_local");
+        let target = nid("node_delivery_plan_directory_endpoint_target");
+        let mut state = test_state(cluster_id.clone(), local.clone());
+        add_member(&mut state, target.clone(), "target", Vec::new());
+        sinomo_cluster::write_cluster_state(&paths, &state).expect("write state");
+
+        let target_endpoint = endpoint(&target, "10.91.0.10:21353", 0);
+        let mut store = InProcessKvStore::new();
+        store
+            .put_serde(
+                sinomo_cluster::cluster_endpoint_key(&target, &target_endpoint),
+                &target_endpoint,
+                None,
+            )
+            .expect("seed target endpoint overlay");
+        sinomo_cluster::write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+            .expect("write kv snapshot");
+        let local_to_target_record = connectivity_record_from_source(
+            &cluster_id,
+            &local,
+            &target_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+        );
+        sinomo_network::write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            std::slice::from_ref(&local_to_target_record),
+        )
+        .expect("write local target connectivity");
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local,
+            &target,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("directory-backed route plan");
+
+        assert_eq!(plan.next_hop, target);
+        assert_eq!(plan.endpoints.len(), 1);
+        assert_eq!(plan.endpoints[0].address, target_endpoint.address);
+    }
+
+    #[test]
     fn stable_connectivity_refresh_does_not_bump_route_generation() {
         let (_root, paths) = test_paths("sinomo-network-stable-connectivity-generation");
         let cluster_id = cid("cluster_stable_connectivity_generation");

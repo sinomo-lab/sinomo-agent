@@ -13,7 +13,7 @@ use crate::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState, ClusterPaths,
     DaemonControlRequest, DaemonRpcTimeouts, NetworkError, ObjectRpcRequest, ObjectRpcResponse,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -998,14 +998,16 @@ pub fn cluster_delivery_build_routing_table(
     local_node_id: &NodeId,
 ) -> Result<ClusterDeliveryRoutingTable, NetworkError> {
     let mut routes = ClusterDeliveryRouteIndex::default();
+    let members = cluster_delivery_members_for_routing(paths, state)?;
     let earliest_expires_at = cluster_delivery_routing_table_earliest_expires_at(paths, state);
-    for member in &state.members {
+    for member in &members {
         if member.node_id == *local_node_id || !member.state.is_authorized() {
             continue;
         }
-        let graph = cluster_delivery_route_graph(
+        let graph = cluster_delivery_route_graph_with_members(
             paths,
             state,
+            &members,
             local_node_id,
             &ClusterDeliveryFailedEdges::default(),
             &member.node_id,
@@ -1128,6 +1130,7 @@ fn evict_cluster_delivery_routing_table_cache_entry_if_needed(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn cluster_delivery_route_graph(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -1135,10 +1138,29 @@ fn cluster_delivery_route_graph(
     failed_edges: &ClusterDeliveryFailedEdges,
     target_node_id: &NodeId,
 ) -> Result<ClusterDeliveryRouteGraph, NetworkError> {
+    let members = cluster_delivery_members_for_routing(paths, state)?;
+    cluster_delivery_route_graph_with_members(
+        paths,
+        state,
+        &members,
+        local_node_id,
+        failed_edges,
+        target_node_id,
+    )
+}
+
+fn cluster_delivery_route_graph_with_members(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    members: &[ClusterMemberRecord],
+    local_node_id: &NodeId,
+    failed_edges: &ClusterDeliveryFailedEdges,
+    target_node_id: &NodeId,
+) -> Result<ClusterDeliveryRouteGraph, NetworkError> {
     let local_connectivity = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
-    let local_private_prefixes = cluster_delivery_local_private_prefixes(state, local_node_id)?;
+    let local_private_prefixes = cluster_delivery_local_private_prefixes(members, local_node_id)?;
     let mut graph = ClusterDeliveryRouteGraph::default();
-    for member in &state.members {
+    for member in members {
         if !member.state.is_authorized() {
             continue;
         }
@@ -1160,7 +1182,7 @@ fn cluster_delivery_route_graph(
             graph.push_edge_clone(local_node_id, &endpoint.node_id, Some(endpoint), cost)?;
         }
     }
-    for member in &state.members {
+    for member in members {
         if member.node_id == *local_node_id
             || !member.state.is_authorized()
             || failed_edges.contains(local_node_id, &member.node_id)
@@ -1202,6 +1224,97 @@ fn cluster_delivery_route_graph(
         graph.push_edge_clone(&record.source_node_id, &record.target_node_id, None, cost)?;
     }
     Ok(graph)
+}
+
+fn cluster_delivery_members_for_routing(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Vec<ClusterMemberRecord>, NetworkError> {
+    let directory = crate::directory::cluster_directory_for(paths);
+    let mut members_by_node: BTreeMap<NodeId, ClusterMemberRecord> = BTreeMap::new();
+    for member in state
+        .members
+        .iter()
+        .filter(|member| member.cluster_id == state.cluster_id)
+    {
+        members_by_node.insert(member.node_id.clone(), member.clone());
+    }
+
+    let directory_members = match directory.members() {
+        Ok(members) => members,
+        Err(error @ NetworkError::ResourceExhausted { .. }) => return Err(error),
+        Err(_) => Vec::new(),
+    };
+    for member in directory_members
+        .into_iter()
+        .filter(|member| member.cluster_id == state.cluster_id)
+    {
+        cluster_delivery_merge_member_record(&mut members_by_node, member)?;
+    }
+
+    let directory_endpoints = match directory.endpoints() {
+        Ok(endpoints) => endpoints,
+        Err(error @ NetworkError::ResourceExhausted { .. }) => return Err(error),
+        Err(_) => Vec::new(),
+    };
+    for endpoint in directory_endpoints {
+        let Some(member) = members_by_node.get_mut(&endpoint.node_id) else {
+            continue;
+        };
+        cluster_delivery_upsert_member_endpoint(member, endpoint)?;
+    }
+
+    Ok(members_by_node.into_values().collect())
+}
+
+fn cluster_delivery_merge_member_record(
+    members_by_node: &mut BTreeMap<NodeId, ClusterMemberRecord>,
+    incoming: ClusterMemberRecord,
+) -> Result<(), NetworkError> {
+    match members_by_node.get_mut(&incoming.node_id) {
+        Some(existing) => {
+            let retained_endpoints = std::mem::take(&mut existing.endpoints);
+            *existing = incoming;
+            for endpoint in retained_endpoints {
+                if existing
+                    .endpoints
+                    .iter()
+                    .any(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
+                {
+                    continue;
+                }
+                cluster_delivery_upsert_member_endpoint(existing, endpoint)?;
+            }
+        }
+        None => {
+            members_by_node.insert(incoming.node_id.clone(), incoming);
+        }
+    }
+    Ok(())
+}
+
+fn cluster_delivery_upsert_member_endpoint(
+    member: &mut ClusterMemberRecord,
+    endpoint: ClusterEndpointRecord,
+) -> Result<(), NetworkError> {
+    if endpoint.node_id != member.node_id {
+        return Ok(());
+    }
+    if let Some(existing) = member
+        .endpoints
+        .iter_mut()
+        .find(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
+    {
+        *existing = endpoint;
+        return Ok(());
+    }
+    crate::object::try_reserve_vec(
+        &mut member.endpoints,
+        1,
+        "merge cluster directory endpoints",
+    )?;
+    member.endpoints.push(endpoint);
+    Ok(())
 }
 
 fn cluster_delivery_local_endpoint_is_usable(
@@ -1511,12 +1624,11 @@ fn cluster_delivery_private_prefix_for_address(
 }
 
 fn cluster_delivery_local_private_prefixes(
-    state: &ClusterBootstrapState,
+    members: &[ClusterMemberRecord],
     local_node_id: &NodeId,
 ) -> Result<ClusterDeliveryPrivatePrefixes, NetworkError> {
     let mut prefixes = ClusterDeliveryPrivatePrefixes::default();
-    for endpoint in state
-        .members
+    for endpoint in members
         .iter()
         .filter(|member| member.node_id == *local_node_id)
         .flat_map(|member| member.endpoints.iter())
@@ -1538,12 +1650,13 @@ fn cluster_delivery_endpoint_shares_local_private_prefix(
 }
 
 fn cluster_delivery_target_endpoint_hints(
+    paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     target_node_id: &NodeId,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let mut endpoints = Vec::new();
-    let Some(member) = state
-        .members
+    let members = cluster_delivery_members_for_routing(paths, state)?;
+    let Some(member) = members
         .iter()
         .find(|member| member.node_id == *target_node_id && member.state.is_authorized())
     else {
@@ -2004,7 +2117,7 @@ where
                 } else {
                     let outer_build_started_at = Instant::now();
                     let target_endpoints =
-                        cluster_delivery_target_endpoint_hints(state, target_node_id)?;
+                        cluster_delivery_target_endpoint_hints(paths, state, target_node_id)?;
                     let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
                         &state.cluster_id,
                         target_node_id,
@@ -3215,7 +3328,8 @@ fn cluster_relay_planned_target_endpoints(
     target_endpoints: &[ClusterEndpointRecord],
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let local_connectivity = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
-    let local_private_prefixes = cluster_delivery_local_private_prefixes(state, local_node_id)?;
+    let members = cluster_delivery_members_for_routing(paths, state)?;
+    let local_private_prefixes = cluster_delivery_local_private_prefixes(&members, local_node_id)?;
     let mut candidates = Vec::new();
     for endpoint in target_endpoints
         .iter()
@@ -3297,10 +3411,10 @@ fn cluster_relay_planned_next_hop_endpoints(
     next_hop: &NodeId,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let local_connectivity = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
-    let local_private_prefixes = cluster_delivery_local_private_prefixes(state, local_node_id)?;
+    let members = cluster_delivery_members_for_routing(paths, state)?;
+    let local_private_prefixes = cluster_delivery_local_private_prefixes(&members, local_node_id)?;
     let mut candidates = Vec::new();
-    for endpoint in state
-        .members
+    for endpoint in members
         .iter()
         .filter(|member| member.node_id == *next_hop && member.state.is_authorized())
         .flat_map(|member| member.endpoints.iter())
