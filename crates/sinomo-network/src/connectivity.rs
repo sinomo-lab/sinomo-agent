@@ -566,15 +566,50 @@ pub fn try_select_cluster_connectivity_probe_batch(
             .min(cluster_connectivity_probe_max_endpoints_per_tick_for_role(
                 local_node_role,
             ));
-    let _ = connectivity_cursor;
-    let next_cursor = 0;
-    probe_entries.truncate(probe_count);
+    let (probe_entries, next_cursor) = select_rotating_cluster_connectivity_probe_entries(
+        probe_entries,
+        probe_count,
+        connectivity_cursor,
+    );
 
     Ok(ClusterConnectivityProbeBatch {
         active_keys,
         entries: probe_entries,
         next_cursor,
     })
+}
+
+fn select_rotating_cluster_connectivity_probe_entries(
+    mut entries: Vec<ClusterConnectivityProbeBatchEntry>,
+    count: usize,
+    cursor: usize,
+) -> (Vec<ClusterConnectivityProbeBatchEntry>, usize) {
+    if entries.len() <= count {
+        return (entries, 0);
+    }
+    if count == 0 {
+        return (Vec::new(), cursor.min(entries.len()));
+    }
+
+    // Always keep the top-ranked entry so the nearest-expiring or brand-new
+    // endpoint is not pushed out by fairness rotation. Rotate the remaining
+    // bounded slots so endpoints behind stale/failing peers still get probed.
+    let first = entries.remove(0);
+    let rotating_len = entries.len();
+    let start = cursor % rotating_len;
+    let rotating_count = count.saturating_sub(1).min(rotating_len);
+    let mut selected = Vec::with_capacity(count);
+    selected.push(first);
+    for offset in 0..rotating_count {
+        let index = (start + offset) % rotating_len;
+        selected.push(entries[index].clone());
+    }
+    let next_cursor = if rotating_len == 0 {
+        0
+    } else {
+        (start + rotating_count) % rotating_len
+    };
+    (selected, next_cursor)
 }
 
 fn cluster_connectivity_probe_entry_cmp(

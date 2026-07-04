@@ -777,6 +777,7 @@ fn interface_name_is_local_only(name: &str) -> bool {
         || name.starts_with("vmnet")
         || name.starts_with("vethernet")
         || name.contains("docker")
+        || name.contains("vmware")
         || name.contains("wsl")
         || name.contains("hyper-v")
         || name.contains("default switch")

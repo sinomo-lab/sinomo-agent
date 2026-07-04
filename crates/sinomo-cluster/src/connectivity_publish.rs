@@ -1,4 +1,6 @@
-use crate::keyspace::{cluster_connectivity_key, cluster_connectivity_source_prefix};
+use crate::keyspace::{
+    cluster_connectivity_key, cluster_connectivity_source_prefix, cluster_endpoint_prefix,
+};
 use crate::kv_local_store::ClusterKvPathsExt;
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
@@ -560,7 +562,9 @@ pub fn expire_cluster_network_record_ops(
         if record.source_node_id == state.local_node_id {
             continue;
         }
-        if cluster_network_record_expired(record.expires_at, now) {
+        if cluster_connectivity_record_target_endpoint_missing(snapshot.as_ref(), &record)
+            || cluster_network_record_expired(record.expires_at, now)
+        {
             compares.push(KvCompare::ValueEquals {
                 key: entry.key.clone(),
                 value: entry.value.clone(),
@@ -574,6 +578,28 @@ pub fn expire_cluster_network_record_ops(
         }
     }
     Ok((compares, ops))
+}
+
+fn cluster_connectivity_record_target_endpoint_missing(
+    snapshot: &KvSnapshot,
+    record: &ClusterConnectivityRecord,
+) -> bool {
+    let endpoint_key = format!(
+        "{}{}",
+        cluster_endpoint_prefix(&record.target_node_id),
+        record.endpoint_id
+    );
+    snapshot.get(&endpoint_key).is_none_or(|entry| {
+        entry
+            .decode::<ClusterEndpointRecord>()
+            .map(|endpoint| {
+                endpoint.node_id != record.target_node_id
+                    || endpoint.endpoint_id != record.endpoint_id
+                    || endpoint.address != record.address
+                    || endpoint.transport != record.transport
+            })
+            .unwrap_or(true)
+    })
 }
 
 pub fn expire_cluster_network_records_with_host<H>(

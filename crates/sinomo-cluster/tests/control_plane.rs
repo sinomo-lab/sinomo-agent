@@ -2244,6 +2244,10 @@ fn interface_candidate_filter_rejects_common_local_only_bridges() {
         "vEthernet (Docker Desktop)",
         "192.168.245.1".parse().expect("docker desktop bridge")
     ));
+    assert!(!is_advertisable_interface_candidate(
+        "VMware Network Adapter VMnet8",
+        "192.168.245.1".parse().expect("vmware nat bridge")
+    ));
     assert!(is_advertisable_interface_candidate("eth0", routable_lan));
 }
 
@@ -3619,6 +3623,90 @@ fn cluster_connectivity_probe_batch_prioritizes_soon_expiring_records() {
             .iter()
             .any(|entry| entry.endpoint.endpoint_id == soon_endpoint.endpoint_id),
         "bounded probe batches must refresh the nearest-expiring link before lower-risk endpoints"
+    );
+}
+
+#[test]
+fn cluster_connectivity_probe_batch_rotates_bounded_slots() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-probe-rotation");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_probe_rotation").expect("cluster");
+    let local = NodeId::from_legacy_named("node_connectivity_probe_rotation_local").expect("local");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "connectivity probe rotation",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let endpoint_count = CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK + 2;
+    let mut endpoints = Vec::new();
+    for index in 0..endpoint_count {
+        let remote = NodeId::from_legacy_named(format!("node_connectivity_probe_rotation_{index}"))
+            .expect("remote");
+        let endpoint = daemon_lan_endpoint(&remote, format!("10.92.0.{index}:21353"), 10);
+        let mut member = ClusterMemberRecord::local_non_voting(
+            cluster_id.clone(),
+            remote,
+            format!("remote-{index}"),
+            format!("pk-remote-{index}"),
+            now,
+        );
+        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        member.endpoints = vec![endpoint.clone()];
+        endpoints.push(endpoint);
+        state.members.push(member);
+    }
+
+    let mut connectivity = std::collections::BTreeMap::new();
+    let first = select_cluster_connectivity_probe_batch(
+        &paths,
+        &state,
+        &mut connectivity,
+        0,
+        &ClusterNodeRole::Workstation,
+        false,
+        now,
+    );
+    let first_ids = first
+        .entries
+        .iter()
+        .map(|entry| entry.endpoint.endpoint_id.clone())
+        .collect::<BTreeSet<_>>();
+    let second = select_cluster_connectivity_probe_batch(
+        &paths,
+        &state,
+        &mut connectivity,
+        first.next_cursor,
+        &ClusterNodeRole::Workstation,
+        false,
+        now,
+    );
+    let second_ids = second
+        .entries
+        .iter()
+        .map(|entry| entry.endpoint.endpoint_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        first.entries.len(),
+        CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK
+    );
+    assert_eq!(
+        second.entries.len(),
+        CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK
+    );
+    assert!(
+        second_ids
+            .iter()
+            .any(|endpoint_id| !first_ids.contains(endpoint_id)),
+        "bounded batches should rotate lower-ranked endpoints instead of probing the same prefix forever"
     );
 }
 
@@ -20184,6 +20272,64 @@ fn expire_cluster_network_records_with_host_delegates_commit() {
         .expect("idle");
     assert!(idle.is_none(), "no remaining records should skip commit");
     assert_eq!(idle_host.commits, 0);
+}
+
+#[test]
+fn expire_cluster_network_record_ops_prunes_missing_target_endpoint() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-expire-missing-endpoint");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_expire_missing_endpoint").expect("cluster");
+    let local_node =
+        NodeId::from_legacy_named("node_network_expire_missing_endpoint_local").expect("local");
+    let remote_node =
+        NodeId::from_legacy_named("node_network_expire_missing_endpoint_remote").expect("remote");
+    let target_node =
+        NodeId::from_legacy_named("node_network_expire_missing_endpoint_target").expect("target");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network expire missing endpoint",
+        local_node,
+        "local",
+        "pk-local",
+        now,
+    );
+    let endpoint = daemon_lan_endpoint(&target_node, "10.45.2.2:21353".to_string(), 10);
+    let record = ClusterConnectivityRecord {
+        cluster_id,
+        source_node_id: remote_node.clone(),
+        target_node_id: target_node.clone(),
+        endpoint_id: endpoint.endpoint_id.clone(),
+        transport: endpoint.transport.clone(),
+        address: endpoint.address.clone(),
+        state: ClusterConnectivityState::Healthy,
+        latency_ms: Some(9),
+        consecutive_failures: 0,
+        last_success_at: Some("ok".to_string()),
+        last_failure_at: None,
+        failure_reason: None,
+        observed_at: now,
+        expires_at: now + time::Duration::seconds(7200),
+    };
+    let key = cluster_connectivity_key(&remote_node, &target_node, &endpoint.endpoint_id);
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(key.clone(), &record, None)
+        .expect("seed orphaned connectivity record");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("write snapshot");
+
+    let (compares, success) =
+        expire_cluster_network_record_ops(&paths, &state, now).expect("expire ops");
+    assert_eq!(compares.len(), 1);
+    assert_eq!(success.len(), 1);
+    assert!(
+        matches!(&success[0], KvOp::Delete { key: deleted } if deleted == &key),
+        "live connectivity records whose target endpoint disappeared should be pruned"
+    );
 }
 
 #[test]
