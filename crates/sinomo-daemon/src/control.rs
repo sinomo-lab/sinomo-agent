@@ -886,6 +886,16 @@ pub(crate) async fn handle_daemon_connection_async(
                 return Ok(false);
             }
         };
+        if try_handle_loopback_daemon_status_request_pre_auth(
+            &request,
+            &mut stream,
+            &stream_address,
+            &paths,
+        )
+        .await?
+        {
+            return Ok(false);
+        }
         if crate::service_adapter::try_dispatch_pre_auth_via_registry_async(
             &request,
             &mut stream,
@@ -1057,6 +1067,38 @@ pub(crate) async fn handle_daemon_connection_async(
         )
         .await;
     }
+}
+
+async fn try_handle_loopback_daemon_status_request_pre_auth(
+    request: &sinomo_core::network::ObjectRpcRequest,
+    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
+    stream_address: &str,
+    paths: &DaemonPaths,
+) -> Result<bool, DaemonError> {
+    if request.route != crate::DAEMON_STATUS_ROUTE {
+        return Ok(false);
+    }
+    if !stream
+        .peer_addr()
+        .map(|address| address.ip().is_loopback())
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    let _: () = request.decode_body().map_err(DaemonError::from)?;
+    let status = daemon_status_response_async(paths, None).await?;
+    let response =
+        sinomo_core::network::ObjectRpcResponse::encode_body(crate::DAEMON_STATUS_ROUTE, &status)
+            .map_err(DaemonError::from)?;
+    write_daemon_rpc_response_frame_async_for_rpc_request(
+        stream,
+        stream_address,
+        paths,
+        request,
+        response,
+    )
+    .await?;
+    Ok(true)
 }
 
 pub(crate) async fn dispatch_daemon_control_request_in_process_async(
@@ -5244,8 +5286,7 @@ mod tests {
 
         let idle_probe = TcpStream::connect(&address).expect("connect idle probe");
         thread::sleep(Duration::from_millis(100));
-        let status_result =
-            send_test_status_request(&data_dir, &address, Duration::from_millis(500));
+        let status_result = send_test_unsigned_status_request(&address, Duration::from_millis(500));
         drop(idle_probe);
         send_test_shutdown_request(&data_dir, &address, Duration::from_secs(3))
             .expect("shutdown request");
@@ -5256,7 +5297,7 @@ mod tests {
 
         assert!(
             status_result.is_ok(),
-            "status should not be blocked by an idle TCP probe: {status_result:?}"
+            "loopback status should bypass auth/registry work and not be blocked by an idle TCP probe: {status_result:?}"
         );
     }
 
@@ -5668,6 +5709,19 @@ mod tests {
             &(),
         )?;
         let response = send_test_rpc(data_dir, address, &request, timeout)?;
+        response.decode_body().map_err(DaemonError::from)
+    }
+
+    fn send_test_unsigned_status_request(
+        address: &str,
+        timeout: Duration,
+    ) -> Result<crate::DaemonStatus, DaemonError> {
+        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
+            crate::DAEMON_STATUS_ROUTE,
+            crate::DAEMON_RPC_CATEGORY,
+            &(),
+        )?;
+        let response = crate::send_daemon_rpc_raw(address, None, &request, timeout)?;
         response.decode_body().map_err(DaemonError::from)
     }
 

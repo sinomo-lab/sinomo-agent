@@ -4,6 +4,7 @@ use sinomo_object::{BorrowedDocumentBuilder, LengthMode, serde_ext};
 use std::collections::HashMap;
 #[cfg(any(test, feature = "test-support"))]
 use std::io::{Read, Write};
+use std::net::SocketAddr;
 #[cfg(any(test, feature = "test-support"))]
 use std::net::TcpStream;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -386,6 +387,13 @@ static ASYNC_DAEMON_CONTROL_STREAM_POOL: LazyLock<
 impl AsyncDaemonControlStream {
     pub fn new(stream: tokio::net::TcpStream) -> Self {
         Self { stream }
+    }
+
+    pub fn peer_addr(&self) -> Result<SocketAddr, NetworkError> {
+        self.stream.peer_addr().map_err(|source| NetworkError::Io {
+            operation: "read async daemon control peer address".to_string(),
+            detail: source.to_string(),
+        })
     }
 
     pub async fn connect(address: &str) -> Result<Self, NetworkError> {
