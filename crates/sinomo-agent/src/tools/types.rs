@@ -103,7 +103,8 @@ fn default_toolsets_for_kind(kind: &crate::AgentToolKind) -> Vec<&'static str> {
         | AgentToolKind::ToolCall
         | AgentToolKind::SkillSearch
         | AgentToolKind::SkillDescribe
-        | AgentToolKind::SkillActivate => vec!["core", "discovery"],
+        | AgentToolKind::SkillActivate
+        | AgentToolKind::SkillUpdate => vec!["core", "discovery", "skill"],
         AgentToolKind::ConfigSearch | AgentToolKind::ConfigGet | AgentToolKind::ConfigSet => {
             vec!["config", "local"]
         }
@@ -754,9 +755,6 @@ impl AgentToolPlanner {
                 );
             }
         }
-        for descriptor in tool_disclosure_descriptors() {
-            plan.push_or_replace(descriptor, AgentToolPlanSource::Runtime, true);
-        }
         for descriptor in module_projection.project_descriptors() {
             plan.push_or_replace(descriptor, AgentToolPlanSource::Module, false);
         }
@@ -768,6 +766,9 @@ impl AgentToolPlanner {
             );
         }
         for descriptor in runtime_descriptors {
+            plan.push_or_replace(descriptor, AgentToolPlanSource::Runtime, true);
+        }
+        for descriptor in tool_disclosure_descriptors() {
             plan.push_or_replace(descriptor, AgentToolPlanSource::Runtime, true);
         }
         plan
@@ -937,6 +938,7 @@ pub enum AgentToolCapability {
     ManageBackgroundTask,
     InspectClusterState,
     ManageConfig,
+    ManageSkills,
 }
 
 impl AgentToolCapability {
@@ -955,6 +957,7 @@ impl AgentToolCapability {
             AgentToolCapability::ManageBackgroundTask => "manage_background_task",
             AgentToolCapability::InspectClusterState => "inspect_cluster_state",
             AgentToolCapability::ManageConfig => "manage_config",
+            AgentToolCapability::ManageSkills => "manage_skills",
         }
     }
 }
@@ -1080,6 +1083,8 @@ pub struct AgentToolExecutionEvidence {
 }
 
 pub const AGENT_CODING_EVIDENCE_KIND: &str = "coding";
+pub const AGENT_SKILL_USAGE_EVIDENCE_KIND: &str = "skill_usage";
+pub const AGENT_SKILL_EVOLUTION_EVIDENCE_KIND: &str = "skill_evolution";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentToolEvidenceRecord {

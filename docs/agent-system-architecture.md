@@ -141,6 +141,30 @@ sinomo agent export [agent-id] [--output <path>]
 sinomo agent import <path> [--json]
 ```
 
+CLI skill commands:
+
+```sh
+sinomo skill list [--all] [--json]
+sinomo skill show <skill-id> [--version <version>] [--text|--json]
+sinomo skill import <path-or-dir> [--id <skill-id>] [--version <version>] [--no-activate] [--json]
+sinomo skill export <skill-id> [--version <version>] [--output <path>] [--json]
+sinomo skill activate <skill-id> [--version <version>] [--scope <scope>] [--json]
+```
+
+Community skill import treats the Markdown `SKILL.md` as the ground-truth body.
+Common frontmatter keys such as `name`, `description`, and
+`metadata.short-description` are used to seed Sinomo descriptors when present,
+but Sinomo-specific SOBJ metadata remains optional. Export preserves existing
+portable frontmatter or synthesizes `name` and `description` for plain
+Markdown bodies.
+
+Agent runtimes expose skill lookup through `skill_search` and `skill_describe`.
+When the host registry is configured with a local data directory, `skill_update`
+persists a prompt-based improvement as a new `evolution` source version, records
+the previous active content hash as `base_hash`, and activates the new version by
+default. This is the lightweight Hermes-style skill evolution path; broader
+mutation campaigns remain owned by `sinomo-evolution`.
+
 ## Prompts and Provider Rendering
 
 Package prompts are role-oriented. They do not hardcode runtime model facts,

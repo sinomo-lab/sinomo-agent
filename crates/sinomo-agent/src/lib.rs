@@ -313,6 +313,7 @@ pub enum AgentToolKind {
     SkillSearch,
     SkillDescribe,
     SkillActivate,
+    SkillUpdate,
     ModuleObjectRpc,
     ReadSifs,
     WriteSifs,

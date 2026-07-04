@@ -3,12 +3,12 @@ use crate::session_store::{
     AgentSessionStoreRecordKind, NoopAgentSessionStore,
 };
 use crate::tools::{
-    AGENT_CODING_EVIDENCE_KIND, AgentCodingToolEvidence, AgentModuleToolProjection,
-    AgentSkillDescriptor, AgentSkillPlan, AgentTool, AgentToolAvailabilityDecision,
-    AgentToolCapability, AgentToolCustomFormat, AgentToolCustomSpec, AgentToolDescriptor,
-    AgentToolEvidence, AgentToolOutcome, AgentToolPlan, AgentToolPlanner, AgentToolProgressEvent,
-    AgentToolProgressSink, AgentToolProviderSpec, AgentToolRegistry, AgentToolStatus,
-    is_tool_disclosure_bridge_name,
+    AGENT_CODING_EVIDENCE_KIND, AGENT_SKILL_USAGE_EVIDENCE_KIND, AgentCodingToolEvidence,
+    AgentModuleToolProjection, AgentSkillDescriptor, AgentSkillPlan, AgentTool,
+    AgentToolAvailabilityDecision, AgentToolCapability, AgentToolCustomFormat, AgentToolCustomSpec,
+    AgentToolDescriptor, AgentToolEvidence, AgentToolOutcome, AgentToolPlan, AgentToolPlanner,
+    AgentToolProgressEvent, AgentToolProgressSink, AgentToolProviderSpec, AgentToolRegistry,
+    AgentToolStatus, is_tool_disclosure_bridge_name,
 };
 use crate::{
     AgentCancellationToken, AgentCompactionEngine, AgentCompactionRequest, AgentDefinition,
@@ -37,7 +37,7 @@ use sinomo_runtime::core::{
 };
 use sinomo_runtime::events::{EventId, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -4002,6 +4002,8 @@ pub struct AgentConfig {
     pub module_tool_projection: AgentModuleToolProjection,
     #[serde(default, skip_serializing_if = "SkillCatalog::is_empty")]
     pub skill_catalog: SkillCatalog,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skill_catalog_texts: BTreeMap<String, String>,
     #[serde(default = "default_workspace_instruction_files")]
     pub workspace_instruction_files: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4048,6 +4050,7 @@ impl AgentConfig {
             visible_toolsets,
             module_tool_projection: AgentModuleToolProjection::default(),
             skill_catalog: SkillCatalog::default(),
+            skill_catalog_texts: BTreeMap::new(),
             workspace_instruction_files: default_workspace_instruction_files(),
             instruction_file_max_bytes: Some(DEFAULT_WORKSPACE_INSTRUCTION_FILE_BYTES),
             expand_prompt_references: default_expand_prompt_references(),
@@ -4182,6 +4185,14 @@ impl AgentConfig {
 
     pub fn with_skill_catalog(mut self, catalog: SkillCatalog) -> Self {
         self.skill_catalog = catalog;
+        self
+    }
+
+    pub fn with_skill_catalog_texts(
+        mut self,
+        texts: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.skill_catalog_texts = texts.into_iter().collect();
         self
     }
 
@@ -6833,6 +6844,15 @@ impl<'a> AgentToolOrchestrator<'a> {
                 "available": false,
                 "mode": "host_runtime",
             }),
+        )
+        .with_record_value(
+            AGENT_SKILL_USAGE_EVIDENCE_KIND,
+            serde_json::json!({
+                "operation": "activate",
+                "skill": skill.id,
+                "available": false,
+                "mode": "host_runtime",
+            }),
         );
         AgentToolOutcome {
             call_id: TaskId::generate(),
@@ -6902,6 +6922,14 @@ impl<'a> AgentToolOrchestrator<'a> {
                     "query": output.get("query").cloned().unwrap_or(serde_json::Value::Null),
                     "count": output.get("count").cloned().unwrap_or(serde_json::Value::Null),
                 }),
+            )
+            .with_record_value(
+                AGENT_SKILL_USAGE_EVIDENCE_KIND,
+                serde_json::json!({
+                    "operation": "search",
+                    "query": output.get("query").cloned().unwrap_or(serde_json::Value::Null),
+                    "count": output.get("count").cloned().unwrap_or(serde_json::Value::Null),
+                }),
             );
         AgentToolOutcome {
             call_id: TaskId::generate(),
@@ -6952,6 +6980,13 @@ impl<'a> AgentToolOrchestrator<'a> {
             .with_output_value(&output, false)
             .with_record_value(
                 "skill_disclosure",
+                serde_json::json!({
+                    "operation": "describe",
+                    "skill": skill.id,
+                }),
+            )
+            .with_record_value(
+                AGENT_SKILL_USAGE_EVIDENCE_KIND,
                 serde_json::json!({
                     "operation": "describe",
                     "skill": skill.id,
@@ -9054,15 +9089,24 @@ impl<M: InteractionModel> Agent<M> {
             self.config.definition.key().to_string(),
             self.config.definition.name.clone(),
         ];
-        let catalog_entries = self
+        let catalog_descriptors = self
             .config
             .skill_catalog
-            .active_entries_for_scopes(agent_keys.iter().map(String::as_str));
-        AgentSkillPlan::from_package_modules_and_catalog_entries(
+            .active_entries_for_scopes(agent_keys.iter().map(String::as_str))
+            .into_iter()
+            .map(|entry| {
+                let text = self
+                    .config
+                    .skill_catalog_texts
+                    .get(&crate::skill_catalog_entry_text_key(entry))
+                    .cloned();
+                entry.to_agent_descriptor(text)
+            });
+        AgentSkillPlan::from_package_modules_and_catalog(
             self.config.definition.skills.clone(),
             &self.config.module_tool_projection,
             agent_keys,
-            catalog_entries,
+            catalog_descriptors,
         )
     }
 }
@@ -10697,8 +10741,8 @@ mod tests {
     use crate::{
         AgentCommandOutput, AgentTool, AgentToolArtifactRef, AgentToolKind, AgentToolRequest,
         AgentToolResult, AgentToolSpec, InteractionSurface, InteractionSurfaceKind,
-        LocalWorkspaceAgentConfig, default_agent_tool_descriptors, default_coding_agent_tools,
-        user_interaction_input_event,
+        LocalWorkspaceAgentConfig, SkillCatalogStore, default_agent_tool_descriptors,
+        default_coding_agent_tools, user_interaction_input_event,
     };
     use sinomo_lm::{LanguageModelError, LanguageModelResponseFormat};
     use sinomo_memory::DurableMemoryStore;
@@ -13157,6 +13201,7 @@ mod tests {
             },
         );
         assert_eq!(search.status, AgentToolStatus::Succeeded);
+        assert!(search.evidence.record_value("skill_usage").is_some());
         let matches = search
             .output
             .get("matches")
@@ -13229,6 +13274,7 @@ mod tests {
             Some(false)
         );
         assert!(describe.evidence.record_value("skill_disclosure").is_some());
+        assert!(describe.evidence.record_value("skill_usage").is_some());
 
         let activate = orchestrator.execute(
             &registry,
@@ -13274,6 +13320,7 @@ mod tests {
             "skill activation requires a host runtime activation executor"
         );
         assert!(activate.evidence.record_value("skill_disclosure").is_some());
+        assert!(activate.evidence.record_value("skill_usage").is_some());
     }
 
     #[test]
@@ -13356,6 +13403,219 @@ mod tests {
             }),
             "{matches:?}"
         );
+    }
+
+    #[test]
+    fn agent_skill_plan_includes_cluster_active_catalog_skills() {
+        let text = "# Catalog shortcut\nUse the catalog shortcut.";
+        let entry = crate::SkillCatalogEntry::new(
+            "skill.catalog.shortcut",
+            "1.0.0",
+            crate::SkillCatalogSource::user("user.test"),
+            text,
+        )
+        .with_description("Catalog-backed shortcut workflow.");
+        let mut catalog = crate::SkillCatalog::default();
+        catalog.upsert_entry(entry.clone()).expect("catalog entry");
+        catalog
+            .set_activation(crate::SkillActivationRecord::new(
+                crate::SkillActivationScope::Cluster.as_str(),
+                &entry,
+                "test",
+                "cluster default",
+            ))
+            .expect("activation");
+        let config = AgentConfig::new("fake", "fake")
+            .with_agent_definition(AgentDefinition::main())
+            .with_skill_catalog(catalog)
+            .with_skill_catalog_texts([(
+                crate::skill_catalog_entry_text_key(&entry),
+                text.to_string(),
+            )]);
+        let agent = Agent::new(SequencedModel::new(["{}"]), "fake", "fake").with_config(config);
+
+        let skill_plan = agent.skill_plan();
+        let skill = skill_plan
+            .get("skill.catalog.shortcut")
+            .expect("catalog skill");
+        assert_eq!(skill.source, crate::tools::AgentSkillSource::Catalog);
+        assert_eq!(skill.catalog_version.as_deref(), Some("1.0.0"));
+        assert_eq!(
+            skill.catalog_content_hash.as_deref(),
+            Some(entry.content_hash.as_str())
+        );
+        assert_eq!(skill.embedded_text.as_deref(), Some(text));
+    }
+
+    #[test]
+    fn agent_can_answer_task_that_requires_catalog_skill_text() {
+        let text = "---\nname: skill.catalog.howto\ndescription: Contains the hidden verification phrase.\n---\n\n# Howto\nWhen asked for the verification phrase, answer `violet-ridge`.\n";
+        let entry = crate::SkillCatalogEntry::new(
+            "skill.catalog.howto",
+            "1.0.0",
+            crate::SkillCatalogSource::user("user.test"),
+            text,
+        )
+        .with_description("Contains task-specific howto instructions.");
+        let mut catalog = crate::SkillCatalog::default();
+        catalog.upsert_entry(entry.clone()).expect("catalog entry");
+        catalog
+            .set_activation(crate::SkillActivationRecord::new(
+                crate::SkillActivationScope::Cluster.as_str(),
+                &entry,
+                "test",
+                "cluster default",
+            ))
+            .expect("activation");
+        let model = SequencedModel::new([
+            r#"{
+                "response_mode": "defer",
+                "text": "I need to inspect the howto skill.",
+                "tool_calls": [{
+                    "tool": "skill_describe",
+                    "input": {"skill": "skill.catalog.howto"},
+                    "async": false,
+                    "summary": "Read the howto skill."
+                }],
+                "background_handoff": null,
+                "next_state": "waiting"
+            }"#,
+            r#"{
+                "response_mode": "answer",
+                "text": "violet-ridge",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "listening"
+            }"#,
+        ]);
+        let config = AgentConfig::new("fake", "fake")
+            .with_agent_definition(AgentDefinition::main())
+            .with_skill_catalog(catalog)
+            .with_skill_catalog_texts([(
+                crate::skill_catalog_entry_text_key(&entry),
+                text.to_string(),
+            )]);
+        let agent = Agent::new(model, "fake", "fake").with_config(config);
+        let probe_input = agent_input("What is the verification phrase?");
+        let probe_plan = agent.tool_plan(&probe_input);
+        assert!(
+            probe_plan.is_executable("skill_describe"),
+            "skill_describe plan entry: {:?}",
+            probe_plan.entry("skill_describe")
+        );
+
+        let run = agent.run(&probe_input).expect("run");
+
+        assert_eq!(run.final_decision.text, "violet-ridge");
+        assert_eq!(run.tool_results.len(), 1);
+        assert_eq!(run.tool_results[0].call.tool, "skill_describe");
+        assert_eq!(
+            run.tool_results[0].status,
+            AgentToolStatus::Succeeded,
+            "skill_describe output: {}",
+            run.tool_results[0].output
+        );
+        assert!(
+            run.tool_results[0].output["descriptor"]["embedded_text"]
+                .as_str()
+                .is_some_and(|value| value.contains("violet-ridge"))
+        );
+        assert!(
+            run.tool_results[0]
+                .evidence
+                .record_value("skill_usage")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn agent_can_persist_learned_shortcut_as_skill_update() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-skill-update-task");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = crate::SkillCatalogSifsStore::open(Some(data_dir.root())).expect("store");
+        let original_text = "---\nname: shortcut-runner\ndescription: Run the long path.\n---\n\n# Shortcut Runner\nUse the long path.\n";
+        let original_write = crate::SkillCatalogWrite::from_markdown_skill(
+            Some("shortcut-runner".to_string()),
+            "1.0.0",
+            crate::SkillCatalogSource::user("test"),
+            original_text,
+        )
+        .expect("original write")
+        .activate_for_scope(
+            crate::SkillActivationScope::Cluster.as_str(),
+            "test",
+            "seed",
+        );
+        let original_entry = original_write.entry.clone();
+        store
+            .write_skill_version(original_write)
+            .expect("write original");
+        let model = SequencedModel::new([
+            r#"{
+                "response_mode": "defer",
+                "text": "The task revealed a shortcut; I will update the skill.",
+                "tool_calls": [{
+                    "tool": "skill_update",
+                    "input": {
+                        "skill": "shortcut-runner",
+                        "version": "1.1.0",
+                        "source_id": "job-shortcut-task",
+                        "reason": "task revealed the fast path",
+                        "markdown": "---\nname: shortcut-runner\ndescription: Run the fast path.\n---\n\n# Shortcut Runner\nUse shortcut command `fast-run` before the long path.\n"
+                    },
+                    "async": false,
+                    "summary": "Persist the learned shortcut."
+                }],
+                "background_handoff": null,
+                "next_state": "waiting"
+            }"#,
+            r#"{
+                "response_mode": "answer",
+                "text": "Recorded the shortcut for future runs.",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "listening"
+            }"#,
+        ]);
+        let agent = Agent::new(model, "fake", "fake").with_tool_registry(crate::skill_registry(
+            crate::SkillAgentToolConfig::new(data_dir.clone()),
+        ));
+
+        let run = agent
+            .run(&agent_input("The shortcut is fast-run; update the skill."))
+            .expect("run");
+
+        assert_eq!(
+            run.final_decision.text,
+            "Recorded the shortcut for future runs."
+        );
+        assert_eq!(run.tool_results.len(), 1);
+        assert_eq!(run.tool_results[0].call.tool, "skill_update");
+        assert_eq!(run.tool_results[0].status, AgentToolStatus::Succeeded);
+        assert!(
+            run.tool_results[0]
+                .evidence
+                .record_value("skill_evolution")
+                .is_some()
+        );
+        let catalog = store.load_catalog().expect("catalog");
+        let active = catalog
+            .active_entry_for_scope(
+                crate::SkillActivationScope::Cluster.as_str(),
+                "shortcut-runner",
+            )
+            .expect("active shortcut");
+        assert_eq!(active.version, "1.1.0");
+        assert_eq!(active.source.kind, crate::SkillCatalogSourceKind::Evolution);
+        assert_eq!(
+            active.base_hash.as_deref(),
+            Some(original_entry.content_hash.as_str())
+        );
+        let updated_text = store
+            .read_skill_text(active)
+            .expect("read updated")
+            .expect("updated text");
+        assert!(updated_text.contains("fast-run"));
     }
 
     #[test]
@@ -14692,6 +14952,7 @@ mod tests {
             "git_diff",
             "run_command",
             "request_user_input",
+            "skill_update",
         ] {
             assert!(names.contains(&expected), "{expected}");
         }

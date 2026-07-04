@@ -44,7 +44,9 @@ use sinomo_agent::{
     AgentTaskTerminalResult, AgentToolProgressEvent, AgentToolRegistry, ConfigAgentToolConfig,
     EventEnvelopeExt, FileAgentDefinitionStore, InteractionModel, InteractionOutput,
     InteractionSession, InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
-    TaskId, interaction_event, run_local_agent_readiness_gate, user_interaction_input_event,
+    SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore, SkillCatalogSource,
+    SkillCatalogSourceKind, SkillCatalogStore, SkillCatalogWrite, TaskId, interaction_event,
+    render_common_skill_markdown, run_local_agent_readiness_gate, user_interaction_input_event,
 };
 use sinomo_lm::{
     AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, ClaudeProvider, CurrentDefaultModel,
@@ -240,7 +242,7 @@ use sinomo_runtime::rollout::{
     cluster_rollout_should_use_remote_build as daemon_cluster_rollout_should_use_remote_build,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -1137,7 +1139,8 @@ pub(crate) fn cli_command_supports_degraded_local_mode(command: &CliCommand) -> 
         CliCommand::Tui
         | CliCommand::Models(_)
         | CliCommand::Providers(_)
-        | CliCommand::Agent(_) => true,
+        | CliCommand::Agent(_)
+        | CliCommand::Skill(_) => true,
         CliCommand::Test(command) => !test_command_requires_cluster_state(command),
         CliCommand::Dfs(command) => !dfs_command_requires_cluster_state(command),
         CliCommand::Registered(command) => command.policy().supports_degraded_local_mode,
@@ -1158,6 +1161,7 @@ pub(crate) fn cli_command_is_help(command: &CliCommand) -> bool {
         | CliCommand::Voice(VoiceCliCommand::Help)
         | CliCommand::Test(TestCliCommand::Help)
         | CliCommand::Agent(AgentCliCommand::Help)
+        | CliCommand::Skill(SkillCliCommand::Help)
         | CliCommand::Agent(AgentCliCommand::Session(AgentSessionCliCommand::Help)) => true,
         CliCommand::Registered(command) => command.is_help(),
         _ => false,
@@ -1269,6 +1273,7 @@ pub(crate) enum CliCommand {
     Voice(VoiceCliCommand),
     Test(TestCliCommand),
     Agent(AgentCliCommand),
+    Skill(SkillCliCommand),
     Registered(RegisteredCliCommand),
     Usage(UsageOptions),
 }
@@ -1413,6 +1418,9 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
         Some((command, rest)) if command == "agent" => {
             Ok(CliCommand::Agent(parse_agent_command(rest)?))
         }
+        Some((command, rest)) if matches!(command.as_str(), "skill" | "skills") => {
+            Ok(CliCommand::Skill(parse_skill_command(rest)?))
+        }
         Some((command, rest)) if command == "usage" => {
             Ok(CliCommand::Usage(parse_usage_options(rest)?))
         }
@@ -1445,6 +1453,59 @@ pub(crate) enum AgentSessionCliCommand {
     FollowUp(AgentSessionMessageOptions),
     Interrupt(AgentSessionMessageOptions),
     Resume(AgentSessionResumeOptions),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum SkillCliCommand {
+    Help,
+    List(SkillListOptions),
+    Show(SkillShowOptions),
+    Import(SkillImportOptions),
+    Export(SkillExportOptions),
+    Activate(SkillActivateOptions),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct SkillListOptions {
+    pub all: bool,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct SkillShowOptions {
+    pub skill_id: String,
+    pub version: Option<String>,
+    pub text: bool,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct SkillImportOptions {
+    pub path: PathBuf,
+    pub skill_id: Option<String>,
+    pub version: String,
+    pub source: SkillCatalogSourceKind,
+    pub source_id: String,
+    pub activate: bool,
+    pub scope: String,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct SkillExportOptions {
+    pub skill_id: String,
+    pub version: Option<String>,
+    pub output: Option<PathBuf>,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct SkillActivateOptions {
+    pub skill_id: String,
+    pub version: Option<String>,
+    pub scope: String,
+    pub reason: String,
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1546,6 +1607,263 @@ pub(crate) fn parse_agent_command(args: &[String]) -> Result<AgentCliCommand, Cl
             parse_agent_validate_options(rest)?,
         )),
         _ => Err(CliError::Usage),
+    }
+}
+
+pub(crate) fn parse_skill_command(args: &[String]) -> Result<SkillCliCommand, CliError> {
+    match args.split_first() {
+        None => Ok(SkillCliCommand::Help),
+        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            Ok(SkillCliCommand::Help)
+        }
+        Some((command, rest)) if matches!(command.as_str(), "list" | "ls") => {
+            Ok(SkillCliCommand::List(parse_skill_list_options(rest)?))
+        }
+        Some((command, rest)) if matches!(command.as_str(), "show" | "inspect" | "describe") => {
+            Ok(SkillCliCommand::Show(parse_skill_show_options(rest)?))
+        }
+        Some((command, rest)) if command == "import" => {
+            Ok(SkillCliCommand::Import(parse_skill_import_options(rest)?))
+        }
+        Some((command, rest)) if command == "export" => {
+            Ok(SkillCliCommand::Export(parse_skill_export_options(rest)?))
+        }
+        Some((command, rest)) if matches!(command.as_str(), "activate" | "enable") => Ok(
+            SkillCliCommand::Activate(parse_skill_activate_options(rest)?),
+        ),
+        _ => Err(CliError::Usage),
+    }
+}
+
+pub(crate) fn parse_skill_list_options(args: &[String]) -> Result<SkillListOptions, CliError> {
+    let mut all = false;
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--all" | "-a" => all = true,
+            "--json" => json = true,
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected skill list argument `{value}`"),
+                });
+            }
+        }
+    }
+    Ok(SkillListOptions { all, json })
+}
+
+pub(crate) fn parse_skill_show_options(args: &[String]) -> Result<SkillShowOptions, CliError> {
+    let mut skill_id = None;
+    let mut version = None;
+    let mut text = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--text" | "--markdown" => text = true,
+            "--version" => {
+                index += 1;
+                version = Some(skill_option_value(args.get(index), "--version")?);
+            }
+            "--skill" | "--id" => {
+                index += 1;
+                skill_id = Some(skill_option_value(args.get(index), "--skill")?);
+            }
+            value if skill_id.is_none() => skill_id = Some(value.to_string()),
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected skill show argument `{value}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    Ok(SkillShowOptions {
+        skill_id: skill_id.ok_or_else(|| CliError::Parse {
+            detail: "skill show requires a skill id".to_string(),
+        })?,
+        version,
+        text,
+        json,
+    })
+}
+
+pub(crate) fn parse_skill_import_options(args: &[String]) -> Result<SkillImportOptions, CliError> {
+    let mut path = None;
+    let mut skill_id = None;
+    let mut version = "1.0.0".to_string();
+    let mut source = SkillCatalogSourceKind::User;
+    let mut source_id = "local-user".to_string();
+    let mut activate = true;
+    let mut scope = SkillActivationScope::Cluster.as_str().to_string();
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--no-activate" => activate = false,
+            "--activate" => activate = true,
+            "--file" | "--path" => {
+                index += 1;
+                path = Some(PathBuf::from(skill_option_value(
+                    args.get(index),
+                    "--file",
+                )?));
+            }
+            "--id" | "--skill" => {
+                index += 1;
+                skill_id = Some(skill_option_value(args.get(index), "--id")?);
+            }
+            "--version" => {
+                index += 1;
+                version = skill_option_value(args.get(index), "--version")?;
+            }
+            "--source" => {
+                index += 1;
+                source =
+                    parse_skill_source_kind(&skill_option_value(args.get(index), "--source")?)?;
+            }
+            "--source-id" => {
+                index += 1;
+                source_id = skill_option_value(args.get(index), "--source-id")?;
+            }
+            "--scope" => {
+                index += 1;
+                scope = skill_option_value(args.get(index), "--scope")?;
+            }
+            value if path.is_none() => path = Some(PathBuf::from(value)),
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected skill import argument `{value}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    Ok(SkillImportOptions {
+        path: path.ok_or_else(|| CliError::Parse {
+            detail: "skill import requires a SKILL.md path or skill directory".to_string(),
+        })?,
+        skill_id,
+        version,
+        source,
+        source_id,
+        activate,
+        scope,
+        json,
+    })
+}
+
+pub(crate) fn parse_skill_export_options(args: &[String]) -> Result<SkillExportOptions, CliError> {
+    let mut skill_id = None;
+    let mut version = None;
+    let mut output = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--version" => {
+                index += 1;
+                version = Some(skill_option_value(args.get(index), "--version")?);
+            }
+            "--output" | "-o" => {
+                index += 1;
+                output = Some(PathBuf::from(skill_option_value(
+                    args.get(index),
+                    "--output",
+                )?));
+            }
+            "--skill" | "--id" => {
+                index += 1;
+                skill_id = Some(skill_option_value(args.get(index), "--skill")?);
+            }
+            value if skill_id.is_none() => skill_id = Some(value.to_string()),
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected skill export argument `{value}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    Ok(SkillExportOptions {
+        skill_id: skill_id.ok_or_else(|| CliError::Parse {
+            detail: "skill export requires a skill id".to_string(),
+        })?,
+        version,
+        output,
+        json,
+    })
+}
+
+pub(crate) fn parse_skill_activate_options(
+    args: &[String],
+) -> Result<SkillActivateOptions, CliError> {
+    let mut skill_id = None;
+    let mut version = None;
+    let mut scope = SkillActivationScope::Cluster.as_str().to_string();
+    let mut reason = "manual skill activation".to_string();
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--version" => {
+                index += 1;
+                version = Some(skill_option_value(args.get(index), "--version")?);
+            }
+            "--scope" => {
+                index += 1;
+                scope = skill_option_value(args.get(index), "--scope")?;
+            }
+            "--reason" => {
+                index += 1;
+                reason = skill_option_value(args.get(index), "--reason")?;
+            }
+            "--skill" | "--id" => {
+                index += 1;
+                skill_id = Some(skill_option_value(args.get(index), "--skill")?);
+            }
+            value if skill_id.is_none() => skill_id = Some(value.to_string()),
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected skill activate argument `{value}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    Ok(SkillActivateOptions {
+        skill_id: skill_id.ok_or_else(|| CliError::Parse {
+            detail: "skill activate requires a skill id".to_string(),
+        })?,
+        version,
+        scope,
+        reason,
+        json,
+    })
+}
+
+fn skill_option_value(value: Option<&String>, option: &str) -> Result<String, CliError> {
+    value.cloned().ok_or_else(|| CliError::Parse {
+        detail: format!("{option} requires a value"),
+    })
+}
+
+fn parse_skill_source_kind(value: &str) -> Result<SkillCatalogSourceKind, CliError> {
+    match value {
+        "sinomo" => Ok(SkillCatalogSourceKind::Sinomo),
+        "module" => Ok(SkillCatalogSourceKind::Module),
+        "user" => Ok(SkillCatalogSourceKind::User),
+        "agent" => Ok(SkillCatalogSourceKind::Agent),
+        "evolution" => Ok(SkillCatalogSourceKind::Evolution),
+        _ => Err(CliError::Parse {
+            detail: format!(
+                "invalid skill source `{value}`; expected sinomo, module, user, agent, or evolution"
+            ),
+        }),
     }
 }
 
@@ -2329,6 +2647,407 @@ fn ensure_local_pytorch_endpoint(endpoint: &str, model: &str) -> Result<(), Lang
             "configured PyTorch endpoint `{endpoint}` is not local loopback; cluster model traffic must go through sinomo-network, not direct HTTP"
         ),
     })
+}
+
+pub(crate) fn run_skill_command(command: SkillCliCommand) -> Result<(), CliError> {
+    match command {
+        SkillCliCommand::Help => {
+            print_skill_help();
+            Ok(())
+        }
+        SkillCliCommand::List(options) => list_skills(options),
+        SkillCliCommand::Show(options) => show_skill(options),
+        SkillCliCommand::Import(options) => import_skill(options),
+        SkillCliCommand::Export(options) => export_skill(options),
+        SkillCliCommand::Activate(options) => activate_skill(options),
+    }
+}
+
+fn list_skills(options: SkillListOptions) -> Result<(), CliError> {
+    let store = skill_store_for_cli()?;
+    let catalog = store.load_catalog().map_err(skill_catalog_cli_error)?;
+    let active_keys = catalog
+        .activations
+        .iter()
+        .map(|activation| (activation.skill_id.clone(), activation.version.clone()))
+        .collect::<BTreeSet<_>>();
+    let entries = if options.all {
+        catalog.entries.iter().collect::<Vec<_>>()
+    } else {
+        catalog.active_entries_for_scopes([SkillActivationScope::Cluster.as_str()])
+    };
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "count": entries.len(),
+                "skills": entries
+                    .iter()
+                    .map(|entry| skill_entry_json(entry, active_keys.contains(&(entry.skill_id.clone(), entry.version.clone()))))
+                    .collect::<Vec<_>>(),
+            }))
+            .map_err(|source| CliError::Json {
+                path: "<skill list>".to_string(),
+                detail: source.to_string(),
+            })?
+        );
+        return Ok(());
+    }
+    println!(
+        "Skills: {}{}",
+        entries.len(),
+        if options.all {
+            " known version(s)"
+        } else {
+            " active"
+        }
+    );
+    for entry in entries {
+        let active = if active_keys.contains(&(entry.skill_id.clone(), entry.version.clone())) {
+            " active"
+        } else {
+            ""
+        };
+        let description = if entry.description.is_empty() {
+            ""
+        } else {
+            entry.description.as_str()
+        };
+        println!(
+            "  {}@{} [{}{}] {}",
+            entry.skill_id,
+            entry.version,
+            entry.source.kind.as_str(),
+            active,
+            description
+        );
+    }
+    Ok(())
+}
+
+fn show_skill(options: SkillShowOptions) -> Result<(), CliError> {
+    let store = skill_store_for_cli()?;
+    let catalog = store.load_catalog().map_err(skill_catalog_cli_error)?;
+    let entry = select_skill_entry(&catalog, &options.skill_id, options.version.as_deref())?;
+    let text = store
+        .read_skill_text(&entry)
+        .map_err(skill_catalog_cli_error)?
+        .unwrap_or_default();
+    if options.text {
+        print!("{text}");
+        return Ok(());
+    }
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "skill": skill_entry_json(&entry, skill_entry_is_active(&catalog, &entry)),
+                "text": text,
+            }))
+            .map_err(|source| CliError::Json {
+                path: "<skill show>".to_string(),
+                detail: source.to_string(),
+            })?
+        );
+        return Ok(());
+    }
+    println!("Skill: {}@{}", entry.skill_id, entry.version);
+    println!("  source: {}", skill_source_label(&entry));
+    println!("  status: {}", entry.status.as_str());
+    println!("  active: {}", skill_entry_is_active(&catalog, &entry));
+    println!("  path: {}", entry.sifs_path);
+    println!("  manifest: {}", entry.manifest_path);
+    println!("  content hash: {}", entry.content_hash);
+    if let Some(base_hash) = entry.base_hash.as_deref() {
+        println!("  base hash: {base_hash}");
+    }
+    if !entry.description.is_empty() {
+        println!("  description: {}", entry.description);
+    }
+    println!(
+        "  target agents: {}",
+        format_string_list(&entry.target_agents)
+    );
+    println!(
+        "  model families: {}",
+        format_string_list(&entry.model_families)
+    );
+    println!(
+        "  activation tags: {}",
+        format_string_list(&entry.activation_tags)
+    );
+    println!(
+        "  required capabilities: {}",
+        format_string_list(&entry.required_capabilities)
+    );
+    Ok(())
+}
+
+fn import_skill(options: SkillImportOptions) -> Result<(), CliError> {
+    let store = skill_store_for_cli()?;
+    let text = read_skill_markdown_import(&options.path)?;
+    let source =
+        skill_source_from_import_options(&options.source, &options.source_id, &options.version);
+    let mut write = SkillCatalogWrite::from_markdown_skill(
+        options.skill_id.clone(),
+        options.version.clone(),
+        source,
+        text,
+    )
+    .map_err(skill_catalog_cli_error)?;
+    if options.activate {
+        write = write.activate_for_scope(options.scope.clone(), "cli", "skill import");
+    }
+    let entry = write.entry.clone();
+    store
+        .write_skill_version(write)
+        .map_err(skill_catalog_cli_error)?;
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "imported",
+                "skill": skill_entry_json(&entry, options.activate),
+                "activated": options.activate,
+                "scope": options.scope,
+            }))
+            .map_err(|source| CliError::Json {
+                path: "<skill import>".to_string(),
+                detail: source.to_string(),
+            })?
+        );
+    } else {
+        println!(
+            "imported skill {}@{}{}",
+            entry.skill_id,
+            entry.version,
+            if options.activate {
+                " and activated"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+fn export_skill(options: SkillExportOptions) -> Result<(), CliError> {
+    let store = skill_store_for_cli()?;
+    let catalog = store.load_catalog().map_err(skill_catalog_cli_error)?;
+    let entry = select_skill_entry(&catalog, &options.skill_id, options.version.as_deref())?;
+    let text = store
+        .read_skill_text(&entry)
+        .map_err(skill_catalog_cli_error)?
+        .ok_or_else(|| CliError::Parse {
+            detail: format!("skill `{}` has no readable SKILL.md body", entry.skill_id),
+        })?;
+    let rendered = render_common_skill_markdown(&entry, &text);
+    if let Some(output) = options.output.as_deref() {
+        let path = skill_export_output_path(output);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| CliError::Io {
+                path: parent.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+        fs::write(&path, rendered.as_bytes()).map_err(|source| CliError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        if options.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "exported",
+                    "path": path,
+                    "skill": skill_entry_json(&entry, skill_entry_is_active(&catalog, &entry)),
+                }))
+                .map_err(|source| CliError::Json {
+                    path: "<skill export>".to_string(),
+                    detail: source.to_string(),
+                })?
+            );
+        } else {
+            println!("exported skill: {}", path.display());
+        }
+    } else if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "exported",
+                "skill": skill_entry_json(&entry, skill_entry_is_active(&catalog, &entry)),
+                "text": rendered,
+            }))
+            .map_err(|source| CliError::Json {
+                path: "<skill export>".to_string(),
+                detail: source.to_string(),
+            })?
+        );
+    } else {
+        print!("{rendered}");
+    }
+    Ok(())
+}
+
+fn activate_skill(options: SkillActivateOptions) -> Result<(), CliError> {
+    let store = skill_store_for_cli()?;
+    let catalog = store.load_catalog().map_err(skill_catalog_cli_error)?;
+    let entry = select_skill_entry(&catalog, &options.skill_id, options.version.as_deref())?;
+    store
+        .activate_skill_version(&entry, options.scope.clone(), "cli", options.reason.clone())
+        .map_err(skill_catalog_cli_error)?;
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "activated",
+                "scope": options.scope,
+                "skill": skill_entry_json(&entry, true),
+            }))
+            .map_err(|source| CliError::Json {
+                path: "<skill activate>".to_string(),
+                detail: source.to_string(),
+            })?
+        );
+    } else {
+        println!(
+            "activated skill {}@{} for {}",
+            entry.skill_id, entry.version, options.scope
+        );
+    }
+    Ok(())
+}
+
+fn skill_store_for_cli() -> Result<SkillCatalogSifsStore, CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    SkillCatalogSifsStore::open(Some(data_dir.root())).map_err(skill_catalog_cli_error)
+}
+
+fn read_skill_markdown_import(path: &Path) -> Result<String, CliError> {
+    let path = if path.is_dir() {
+        path.join(sinomo_agent::SKILL_FILE_NAME)
+    } else {
+        path.to_path_buf()
+    };
+    fs::read_to_string(&path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn skill_export_output_path(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        path.join(sinomo_agent::SKILL_FILE_NAME)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn skill_source_from_import_options(
+    kind: &SkillCatalogSourceKind,
+    source_id: &str,
+    version: &str,
+) -> SkillCatalogSource {
+    match kind {
+        SkillCatalogSourceKind::Sinomo => SkillCatalogSource::sinomo(version),
+        SkillCatalogSourceKind::Module => SkillCatalogSource::module(source_id, version),
+        SkillCatalogSourceKind::User => SkillCatalogSource::user(source_id),
+        SkillCatalogSourceKind::Agent => SkillCatalogSource::agent(source_id),
+        SkillCatalogSourceKind::Evolution => SkillCatalogSource::evolution(source_id),
+    }
+}
+
+fn select_skill_entry(
+    catalog: &sinomo_agent::SkillCatalog,
+    skill_id: &str,
+    version: Option<&str>,
+) -> Result<SkillCatalogEntry, CliError> {
+    if let Some(version) = version {
+        return catalog
+            .entry(skill_id, version)
+            .cloned()
+            .ok_or_else(|| CliError::Parse {
+                detail: format!("unknown skill version {skill_id}@{version}"),
+            });
+    }
+    if let Some(active) =
+        catalog.active_entry_for_scope(SkillActivationScope::Cluster.as_str(), skill_id)
+    {
+        return Ok(active.clone());
+    }
+    let matches = catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.skill_id == skill_id)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [entry] => Ok((*entry).clone()),
+        [] => Err(CliError::Parse {
+            detail: format!("unknown skill `{skill_id}`"),
+        }),
+        _ => Err(CliError::Parse {
+            detail: format!("skill `{skill_id}` has multiple versions; pass --version"),
+        }),
+    }
+}
+
+fn skill_entry_is_active(catalog: &sinomo_agent::SkillCatalog, entry: &SkillCatalogEntry) -> bool {
+    catalog.activations.iter().any(|activation| {
+        activation.skill_id == entry.skill_id
+            && activation.version == entry.version
+            && activation.content_hash == entry.content_hash
+    })
+}
+
+fn skill_entry_json(entry: &SkillCatalogEntry, active: bool) -> serde_json::Value {
+    serde_json::json!({
+        "id": &entry.skill_id,
+        "version": &entry.version,
+        "description": &entry.description,
+        "source": {
+            "kind": entry.source.kind.as_str(),
+            "id": &entry.source.source_id,
+            "version": &entry.source.source_version,
+        },
+        "active": active,
+        "status": entry.status.as_str(),
+        "path": &entry.sifs_path,
+        "manifest_path": &entry.manifest_path,
+        "content_hash": &entry.content_hash,
+        "base_hash": &entry.base_hash,
+        "target_agents": &entry.target_agents,
+        "model_families": &entry.model_families,
+        "activation_tags": &entry.activation_tags,
+        "required_capabilities": &entry.required_capabilities,
+    })
+}
+
+fn skill_source_label(entry: &SkillCatalogEntry) -> String {
+    match (
+        entry.source.kind,
+        entry.source.source_id.as_deref(),
+        entry.source.source_version.as_deref(),
+    ) {
+        (SkillCatalogSourceKind::Module, Some(id), Some(version)) => {
+            format!("module:{id}@{version}")
+        }
+        (_, Some(id), Some(version)) => format!("{}:{id}@{version}", entry.source.kind.as_str()),
+        (_, Some(id), None) => format!("{}:{id}", entry.source.kind.as_str()),
+        _ => entry.source.kind.as_str().to_string(),
+    }
+}
+
+fn skill_catalog_cli_error(error: sinomo_agent::SkillCatalogError) -> CliError {
+    match error {
+        sinomo_agent::SkillCatalogError::Store { path, detail }
+        | sinomo_agent::SkillCatalogError::Object { path, detail }
+        | sinomo_agent::SkillCatalogError::InvalidSkillText { path, detail } => {
+            CliError::Io { path, detail }
+        }
+        other => CliError::Parse {
+            detail: other.to_string(),
+        },
+    }
 }
 
 pub(crate) fn run_agent_command(command: AgentCliCommand) -> Result<(), CliError> {
@@ -3151,6 +3870,13 @@ pub(crate) fn best_effort_reconciled_skill_catalog(
     sinomo_agent::load_reconciled_skill_catalog_from_sifs(data_dir).unwrap_or_default()
 }
 
+pub(crate) fn best_effort_skill_catalog_texts(
+    data_dir: &SinomoDataDir,
+    catalog: &sinomo_agent::SkillCatalog,
+) -> BTreeMap<String, String> {
+    sinomo_agent::load_skill_catalog_texts_from_sifs(data_dir, catalog).unwrap_or_default()
+}
+
 pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let account = if let Some(account_name) = options.account.as_deref() {
@@ -3177,6 +3903,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     let (runtime_config, _) = load_model_runtime_config_for_node(&data_dir)?;
     let tool_registry = main_agent_config_tool_registry(&data_dir)?;
     let skill_catalog = best_effort_reconciled_skill_catalog(&data_dir);
+    let skill_catalog_texts = best_effort_skill_catalog_texts(&data_dir, &skill_catalog);
     let loop_model = ConfiguredInteractionModel {
         data_dir: data_dir.clone(),
         provider: provider.clone(),
@@ -3187,7 +3914,8 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     };
     let agent_config = sinomo_agent::AgentConfig::new(provider.clone(), model.clone())
         .with_agent_definition(AgentDefinition::main())
-        .with_skill_catalog(skill_catalog);
+        .with_skill_catalog(skill_catalog)
+        .with_skill_catalog_texts(skill_catalog_texts);
     let agent = Agent::new(loop_model, provider, model)
         .with_config(agent_config)
         .with_tool_registry(tool_registry)
@@ -3277,6 +4005,10 @@ pub(crate) fn main_agent_configure_tool_registry_for_workspace(
     sinomo_agent::config::register_tools(
         registry,
         ConfigAgentToolConfig::new(data_dir.clone(), store),
+    );
+    sinomo_agent::register_skill_tools(
+        registry,
+        sinomo_agent::SkillAgentToolConfig::new(data_dir.clone()),
     );
     Ok(())
 }
@@ -3374,6 +4106,7 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
         CliCommand::Voice(command) => run_voice_command(command),
         CliCommand::Test(command) => run_test_command(command),
         CliCommand::Agent(command) => run_agent_command(command),
+        CliCommand::Skill(command) => run_skill_command(command),
         CliCommand::Registered(command) => {
             let command_name = command.name().to_string();
             let mut stdout = CliStdoutWriter;

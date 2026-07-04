@@ -15,6 +15,7 @@ pub(crate) const BUILTIN_TOP_LEVEL_USAGE_COMMANDS: &[&str] = &[
     "providers",
     "voice",
     "agent",
+    "skill",
     "test",
 ];
 
@@ -108,6 +109,26 @@ pub(super) fn print_agent_session_help() {
     println!("  sinomo agent session follow-up <session-id> <message> [--json]");
     println!("  sinomo agent session interrupt <session-id> <reason> [--json]");
     println!("  sinomo agent session resume <session-id> [--json]");
+}
+
+pub(super) fn print_skill_help() {
+    println!("Skills:");
+    println!("  sinomo skill");
+    println!("      Show skill commands.");
+    println!("  sinomo skill list [--all] [--json]");
+    println!("      List active catalog skills, or every known version with --all.");
+    println!("  sinomo skill show <skill-id> [--version <version>] [--text|--json]");
+    println!(
+        "      Show a catalog skill descriptor and, when requested, the stored SKILL.md text."
+    );
+    println!(
+        "  sinomo skill import <path-or-dir> [--id <skill-id>] [--version <version>] [--source user|agent|evolution] [--source-id <id>] [--no-activate] [--json]"
+    );
+    println!("      Import a community-style SKILL.md file into the SIFS-backed catalog.");
+    println!("  sinomo skill export <skill-id> [--version <version>] [--output <path>] [--json]");
+    println!("      Export a catalog skill as a portable SKILL.md file.");
+    println!("  sinomo skill activate <skill-id> [--version <version>] [--scope <scope>] [--json]");
+    println!("      Make an existing catalog skill version active for a scope.");
 }
 
 pub(super) fn print_voice_help() {
