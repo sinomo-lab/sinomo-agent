@@ -15,6 +15,11 @@ ring = "application"
 default = ["sandbox", "dfs-fuse"]
 dfs-fuse = ["dep:sinomo-dfs-fuse", "sinomo-dfs-fuse/fuse"]
 native-models = ["dep:candle-core", "dep:sinomo-models", "dep:tokenizers"]
+native-devices = [
+    "sinomo-audio/native-devices",
+    "sinomo-runtime/native-devices",
+    "sinomo-video/native-devices",
+]
 # Enable sandbox execution through the native-module host loader. This does not
 # link the build-heavy WASIX module; it loads an active dylib from the data dir.
 sandbox = ["sinomo-runtime/sandbox"]

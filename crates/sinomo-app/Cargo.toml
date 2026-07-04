@@ -12,8 +12,13 @@ include = ["**/*.rs", "Cargo.toml", "assets/**/*"]
 ring = "application"
 
 [features]
-default = ["gui"]
+default = ["gui", "native-devices"]
 gui = ["dep:sui"]
+native-devices = [
+    "sinomo-audio/native-devices",
+    "sinomo-runtime/native-devices",
+    "sinomo-video/native-devices",
+]
 
 [[bin]]
 name = "sinomo-app"

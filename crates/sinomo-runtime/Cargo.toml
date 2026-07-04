@@ -14,6 +14,7 @@ default = []
 # Enable sandbox execution through the native-module host loader. This does not
 # link the build-heavy WASIX engine.
 sandbox = ["dep:sinomo-sandbox-wasix-host", "sinomo-daemon/sandbox"]
+native-devices = ["sinomo-device/native-devices"]
 # Forwards the cluster test-support surface to application-crate tests.
 cluster-test-support = ["sinomo-core/cluster-test-support"]
 

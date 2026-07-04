@@ -15,6 +15,7 @@ default = ["sandbox", "dfs-fuse"]
 # WASIX engine is built and activated as a separate native-dylib module.
 sandbox = ["sinomo-cli/sandbox"]
 dfs-fuse = ["sinomo-cli/dfs-fuse"]
+native-devices = ["sinomo-cli/native-devices"]
 
 [dependencies]
 sinomo-cli = { path = "../sinomo-cli", default-features = false }

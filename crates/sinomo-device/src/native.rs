@@ -1,17 +1,27 @@
-use crate::{DeviceId, DeviceKind, DevicePermission, DeviceProfile};
+use crate::DeviceProfile;
+#[cfg(feature = "native-devices")]
+use crate::{DeviceId, DeviceKind, DevicePermission};
+#[cfg(feature = "native-devices")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
+#[cfg(feature = "native-devices")]
 use sinomo_core::{CapabilityName, DeviceCapability};
+#[cfg(feature = "native-devices")]
 use std::collections::VecDeque;
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "native-devices", target_os = "linux"))]
 use std::fs;
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "native-devices", target_os = "linux"))]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "native-devices")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "native-devices")]
 use std::sync::{Arc, Mutex, mpsc};
+#[cfg(feature = "native-devices")]
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(feature = "native-devices")]
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const DEFAULT_AUDIO_CHUNK_MS: u64 = 100;
@@ -154,8 +164,10 @@ pub struct NativeVideoFrame {
 }
 
 pub struct NativeMicrophoneCapture {
+    #[cfg(feature = "native-devices")]
     receiver: mpsc::Receiver<Result<NativeRawAudioChunk, NativeDeviceError>>,
     format: NativeRawAudioFormat,
+    #[cfg(feature = "native-devices")]
     _stream: cpal::Stream,
 }
 
@@ -168,6 +180,12 @@ impl NativeMicrophoneCapture {
         &self,
         timeout: Duration,
     ) -> Result<Option<NativeRawAudioChunk>, NativeDeviceError> {
+        #[cfg(not(feature = "native-devices"))]
+        {
+            let _ = timeout;
+            return Err(native_devices_disabled_error("microphone capture"));
+        }
+        #[cfg(feature = "native-devices")]
         match self.receiver.recv_timeout(timeout) {
             Ok(Ok(chunk)) => Ok(Some(chunk)),
             Ok(Err(error)) => Err(error),
@@ -180,8 +198,10 @@ impl NativeMicrophoneCapture {
 }
 
 pub struct NativeSpeakerPlayback {
+    #[cfg(feature = "native-devices")]
     queue: Arc<Mutex<SpeakerQueue>>,
     format: NativeRawAudioFormat,
+    #[cfg(feature = "native-devices")]
     _stream: cpal::Stream,
 }
 
@@ -191,20 +211,31 @@ impl NativeSpeakerPlayback {
     }
 
     pub fn write_raw_interleaved(&self, bytes: &[u8]) -> Result<(), NativeDeviceError> {
-        let mut queue = self
-            .queue
-            .lock()
-            .map_err(|_| NativeDeviceError::AudioStream {
-                detail: "speaker queue lock poisoned".to_string(),
-            })?;
-        queue.push_bytes(bytes);
-        Ok(())
+        #[cfg(not(feature = "native-devices"))]
+        {
+            let _ = bytes;
+            return Err(native_devices_disabled_error("speaker playback"));
+        }
+        #[cfg(feature = "native-devices")]
+        {
+            let mut queue = self
+                .queue
+                .lock()
+                .map_err(|_| NativeDeviceError::AudioStream {
+                    detail: "speaker queue lock poisoned".to_string(),
+                })?;
+            queue.push_bytes(bytes);
+            Ok(())
+        }
     }
 }
 
 pub struct NativeCameraCapture {
+    #[cfg(feature = "native-devices")]
     receiver: mpsc::Receiver<Result<NativeVideoFrame, NativeDeviceError>>,
+    #[cfg(feature = "native-devices")]
     stop: Arc<AtomicBool>,
+    #[cfg(feature = "native-devices")]
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -213,6 +244,12 @@ impl NativeCameraCapture {
         &self,
         timeout: Duration,
     ) -> Result<Option<NativeVideoFrame>, NativeDeviceError> {
+        #[cfg(not(feature = "native-devices"))]
+        {
+            let _ = timeout;
+            return Err(native_devices_disabled_error("camera capture"));
+        }
+        #[cfg(feature = "native-devices")]
         match self.receiver.recv_timeout(timeout) {
             Ok(Ok(frame)) => Ok(Some(frame)),
             Ok(Err(error)) => Err(error),
@@ -226,9 +263,12 @@ impl NativeCameraCapture {
 
 impl Drop for NativeCameraCapture {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        #[cfg(feature = "native-devices")]
+        {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
         }
     }
 }
@@ -253,11 +293,22 @@ pub fn enumerate_native_devices(node_id: NodeId) -> NativeDeviceInventory {
         devices: Vec::new(),
         issues: Vec::new(),
     };
-    enumerate_cpal_devices(&node_id, &mut inventory);
-    enumerate_camera_devices(&node_id, &mut inventory);
-    inventory
+    #[cfg(not(feature = "native-devices"))]
+    {
+        inventory
+            .issues
+            .push("native device backend is disabled in this build".to_string());
+        return inventory;
+    }
+    #[cfg(feature = "native-devices")]
+    {
+        enumerate_cpal_devices(&node_id, &mut inventory);
+        enumerate_camera_devices(&node_id, &mut inventory);
+        inventory
+    }
 }
 
+#[cfg(feature = "native-devices")]
 pub fn start_native_microphone_capture(
     config: NativeMicrophoneCaptureConfig,
 ) -> Result<NativeMicrophoneCapture, NativeDeviceError> {
@@ -309,6 +360,14 @@ pub fn start_native_microphone_capture(
     })
 }
 
+#[cfg(not(feature = "native-devices"))]
+pub fn start_native_microphone_capture(
+    _config: NativeMicrophoneCaptureConfig,
+) -> Result<NativeMicrophoneCapture, NativeDeviceError> {
+    Err(native_devices_disabled_error("microphone capture"))
+}
+
+#[cfg(feature = "native-devices")]
 pub fn start_native_speaker_playback(
     config: NativeSpeakerPlaybackConfig,
 ) -> Result<NativeSpeakerPlayback, NativeDeviceError> {
@@ -360,12 +419,28 @@ pub fn start_native_speaker_playback(
     })
 }
 
+#[cfg(not(feature = "native-devices"))]
+pub fn start_native_speaker_playback(
+    _config: NativeSpeakerPlaybackConfig,
+) -> Result<NativeSpeakerPlayback, NativeDeviceError> {
+    Err(native_devices_disabled_error("speaker playback"))
+}
+
+#[cfg(feature = "native-devices")]
 pub fn start_native_camera_capture(
     config: NativeCameraCaptureConfig,
 ) -> Result<NativeCameraCapture, NativeDeviceError> {
     start_platform_camera_capture(config)
 }
 
+#[cfg(not(feature = "native-devices"))]
+pub fn start_native_camera_capture(
+    _config: NativeCameraCaptureConfig,
+) -> Result<NativeCameraCapture, NativeDeviceError> {
+    Err(native_devices_disabled_error("camera capture"))
+}
+
+#[cfg(feature = "native-devices")]
 fn enumerate_cpal_devices(node_id: &NodeId, inventory: &mut NativeDeviceInventory) {
     let host = cpal::default_host();
     let default_input = host
@@ -425,6 +500,7 @@ fn enumerate_cpal_devices(node_id: &NodeId, inventory: &mut NativeDeviceInventor
     }
 }
 
+#[cfg(feature = "native-devices")]
 fn enumerate_camera_devices(node_id: &NodeId, inventory: &mut NativeDeviceInventory) {
     #[cfg(target_os = "linux")]
     {
@@ -477,6 +553,7 @@ fn enumerate_camera_devices(node_id: &NodeId, inventory: &mut NativeDeviceInvent
     }
 }
 
+#[cfg(feature = "native-devices")]
 fn native_descriptor(
     node_id: &NodeId,
     native_id: String,
@@ -507,6 +584,7 @@ fn native_descriptor(
     }
 }
 
+#[cfg(feature = "native-devices")]
 fn select_cpal_device<I>(
     devices: Result<I, cpal::DevicesError>,
     default_device: Option<cpal::Device>,
@@ -547,6 +625,7 @@ where
     })
 }
 
+#[cfg(feature = "native-devices")]
 fn native_raw_audio_format(
     format: cpal::SampleFormat,
 ) -> Result<NativeRawAudioSampleFormat, NativeDeviceError> {
@@ -560,6 +639,7 @@ fn native_raw_audio_format(
     }
 }
 
+#[cfg(feature = "native-devices")]
 fn build_input_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -591,6 +671,7 @@ where
         })
 }
 
+#[cfg(feature = "native-devices")]
 fn build_output_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -619,10 +700,12 @@ where
         })
 }
 
+#[cfg(feature = "native-devices")]
 trait RawInputSample: Copy {
     fn encode_samples(samples: &[Self], out: &mut Vec<u8>);
 }
 
+#[cfg(feature = "native-devices")]
 impl RawInputSample for f32 {
     fn encode_samples(samples: &[Self], out: &mut Vec<u8>) {
         for sample in samples {
@@ -631,6 +714,7 @@ impl RawInputSample for f32 {
     }
 }
 
+#[cfg(feature = "native-devices")]
 impl RawInputSample for i16 {
     fn encode_samples(samples: &[Self], out: &mut Vec<u8>) {
         for sample in samples {
@@ -639,6 +723,7 @@ impl RawInputSample for i16 {
     }
 }
 
+#[cfg(feature = "native-devices")]
 impl RawInputSample for u16 {
     fn encode_samples(samples: &[Self], out: &mut Vec<u8>) {
         for sample in samples {
@@ -647,6 +732,7 @@ impl RawInputSample for u16 {
     }
 }
 
+#[cfg(feature = "native-devices")]
 trait RawOutputSample: Copy {
     const BYTES: usize;
 
@@ -654,6 +740,7 @@ trait RawOutputSample: Copy {
     fn from_le_bytes(bytes: &[u8]) -> Self;
 }
 
+#[cfg(feature = "native-devices")]
 impl RawOutputSample for f32 {
     const BYTES: usize = 4;
 
@@ -666,6 +753,7 @@ impl RawOutputSample for f32 {
     }
 }
 
+#[cfg(feature = "native-devices")]
 impl RawOutputSample for i16 {
     const BYTES: usize = 2;
 
@@ -678,6 +766,7 @@ impl RawOutputSample for i16 {
     }
 }
 
+#[cfg(feature = "native-devices")]
 impl RawOutputSample for u16 {
     const BYTES: usize = 2;
 
@@ -690,6 +779,7 @@ impl RawOutputSample for u16 {
     }
 }
 
+#[cfg(feature = "native-devices")]
 struct AudioCaptureState {
     tx: mpsc::Sender<Result<NativeRawAudioChunk, NativeDeviceError>>,
     format: NativeRawAudioFormat,
@@ -698,6 +788,7 @@ struct AudioCaptureState {
     sequence: u64,
 }
 
+#[cfg(feature = "native-devices")]
 impl AudioCaptureState {
     fn new(
         tx: mpsc::Sender<Result<NativeRawAudioChunk, NativeDeviceError>>,
@@ -729,11 +820,13 @@ impl AudioCaptureState {
     }
 }
 
+#[cfg(feature = "native-devices")]
 struct SpeakerQueue {
     format: NativeRawAudioFormat,
     bytes: VecDeque<u8>,
 }
 
+#[cfg(feature = "native-devices")]
 impl SpeakerQueue {
     fn new(format: NativeRawAudioFormat) -> Self {
         Self {
@@ -760,6 +853,7 @@ impl SpeakerQueue {
     }
 }
 
+#[cfg(feature = "native-devices")]
 fn raw_audio_chunk_bytes(format: NativeRawAudioFormat, chunk_ms: u64) -> usize {
     let frames = format.sample_rate_hz as u64 * chunk_ms.max(1);
     let frames = frames.saturating_add(999) / 1000;
@@ -769,6 +863,7 @@ fn raw_audio_chunk_bytes(format: NativeRawAudioFormat, chunk_ms: u64) -> usize {
         .min(usize::MAX as u64) as usize
 }
 
+#[cfg(feature = "native-devices")]
 fn stable_component(value: &str) -> String {
     let mut out = String::new();
     for character in value.chars().flat_map(char::to_lowercase) {
@@ -781,7 +876,7 @@ fn stable_component(value: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "native-devices", target_os = "linux"))]
 fn camera_display_name(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
     fs::read_to_string(format!("/sys/class/video4linux/{name}/name"))
@@ -790,7 +885,7 @@ fn camera_display_name(path: &Path) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "native-devices", target_os = "linux"))]
 fn start_platform_camera_capture(
     config: NativeCameraCaptureConfig,
 ) -> Result<NativeCameraCapture, NativeDeviceError> {
@@ -870,7 +965,7 @@ fn start_platform_camera_capture(
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(feature = "native-devices", not(target_os = "linux")))]
 fn start_platform_camera_capture(
     _config: NativeCameraCaptureConfig,
 ) -> Result<NativeCameraCapture, NativeDeviceError> {
@@ -879,7 +974,7 @@ fn start_platform_camera_capture(
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "native-devices", target_os = "linux"))]
 fn select_v4l2_camera(selector: Option<&str>) -> Result<PathBuf, NativeDeviceError> {
     if let Some(selector) = selector.map(str::trim).filter(|value| !value.is_empty()) {
         let path = PathBuf::from(selector);
@@ -905,7 +1000,7 @@ fn select_v4l2_camera(selector: Option<&str>) -> Result<PathBuf, NativeDeviceErr
         })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "native-devices", target_os = "linux"))]
 fn camera_paths() -> Result<Vec<PathBuf>, NativeDeviceError> {
     let entries = fs::read_dir("/dev").map_err(|source| NativeDeviceError::Io {
         path: "/dev".to_string(),
@@ -924,6 +1019,14 @@ fn camera_paths() -> Result<Vec<PathBuf>, NativeDeviceError> {
     Ok(paths)
 }
 
+#[cfg(not(feature = "native-devices"))]
+fn native_devices_disabled_error(operation: &str) -> NativeDeviceError {
+    NativeDeviceError::Unsupported {
+        detail: format!("{operation} requires the native-devices feature"),
+    }
+}
+
+#[cfg(feature = "native-devices")]
 fn now_unix_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -931,7 +1034,7 @@ fn now_unix_ms() -> u128 {
         .unwrap_or_default()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-devices"))]
 mod tests {
     use super::*;
 

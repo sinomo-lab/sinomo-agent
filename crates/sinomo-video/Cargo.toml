@@ -11,6 +11,10 @@ include = ["**/*.rs", "Cargo.toml"]
 [package.metadata.sinomo]
 ring = "r2"
 
+[features]
+default = []
+native-devices = ["sinomo-runtime/native-devices"]
+
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
