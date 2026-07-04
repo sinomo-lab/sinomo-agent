@@ -241,6 +241,15 @@ pub fn authorize_authenticated_daemon_command(
         }
         return Err(DaemonError::AuthDenied);
     }
+    if let Some(surface) = sinomo_core::network::NETWORK_OBJECT_RPC_TOOL_SURFACES
+        .iter()
+        .find(|surface| surface.route == route)
+    {
+        if daemon_signer_authorizes_network_module_route(&authenticated.signer, surface.auth) {
+            return Ok(());
+        }
+        return Err(DaemonError::AuthDenied);
+    }
     if let Some(policy) = sinomo_core::network::network_modules_rpc_route_policy(route) {
         if daemon_signer_authorizes_network_module_route(&authenticated.signer, policy.auth) {
             return Ok(());
@@ -376,17 +385,6 @@ pub fn authorize_authenticated_daemon_command(
         route
             if route == sinomo_core::network::CLUSTER_INVITE_PUBLISH_ROUTE
                 || route == sinomo_core::network::CLUSTER_MEMBER_PUBLISH_ROUTE =>
-        {
-            matches!(
-                authenticated.signer,
-                DaemonSignerAuthority::Local
-                    | DaemonSignerAuthority::Voter
-                    | DaemonSignerAuthority::Member
-            )
-        }
-        route
-            if route == sinomo_core::network::CLUSTER_HEALTH_ROUTE
-                || route == sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE =>
         {
             matches!(
                 authenticated.signer,
@@ -1121,11 +1119,11 @@ mod tests {
     }
 
     #[test]
-    fn cluster_health_authorizes_cluster_members_for_routed_inspection() {
-        for route in [
-            sinomo_core::network::CLUSTER_HEALTH_ROUTE,
-            sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE,
-        ] {
+    fn network_object_rpc_routes_authorize_cluster_members_for_inspection() {
+        for route in sinomo_core::network::NETWORK_OBJECT_RPC_TOOL_SURFACES
+            .iter()
+            .map(|surface| surface.route)
+        {
             for signer in [
                 DaemonSignerAuthority::Local,
                 DaemonSignerAuthority::Voter,
@@ -1133,7 +1131,7 @@ mod tests {
             ] {
                 let authenticated = authenticated_command(route.to_string(), signer);
                 authorize_authenticated_daemon_command(&authenticated)
-                    .expect("cluster members must be able to use routed network inspection");
+                    .unwrap_or_else(|_| panic!("cluster members must be able to use {route}"));
             }
             let authenticated =
                 authenticated_command(route.to_string(), DaemonSignerAuthority::JoinCandidate);
