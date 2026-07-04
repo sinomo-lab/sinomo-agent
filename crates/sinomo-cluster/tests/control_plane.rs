@@ -2249,6 +2249,18 @@ fn interface_candidate_filter_rejects_common_local_only_bridges() {
         "192.168.245.1".parse().expect("vmware nat bridge")
     ));
     assert!(is_advertisable_interface_candidate("eth0", routable_lan));
+    assert!(is_advertisable_interface_candidate(
+        "eth0",
+        "172.18.0.2".parse().expect("docker guest lan")
+    ));
+    assert!(is_advertisable_interface_candidate(
+        "ens160",
+        "192.168.245.42".parse().expect("vm guest lan")
+    ));
+    assert!(is_advertisable_interface_candidate(
+        "Ethernet",
+        "192.168.126.42".parse().expect("windows vm guest lan")
+    ));
 }
 
 #[test]
