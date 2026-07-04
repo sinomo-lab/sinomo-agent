@@ -1,7 +1,6 @@
 use crate::cluster::{
     ClusterNetworkMaintenance, DAEMON_CLUSTER_PUBLISH_INTERVAL, DAEMON_CLUSTER_TICK_INTERVAL,
-    cluster_paths_from_daemon_paths, ensure_daemon_status_cluster,
-    ensure_daemon_status_cluster_async, handle_daemon_cluster_kv_snapshot,
+    cluster_paths_from_daemon_paths, handle_daemon_cluster_kv_snapshot,
     handle_daemon_cluster_relay_request_on_runtime,
     handle_daemon_cluster_relay_stream_forward_on_runtime,
     prune_local_cluster_raft_uncommitted_tail,
@@ -4281,7 +4280,7 @@ where
 
 pub(crate) async fn daemon_status_response_async(
     paths: &DaemonPaths,
-    runtime: Option<&tokio::runtime::Handle>,
+    _runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<crate::DaemonStatus, DaemonError> {
     let read_paths = paths.clone();
     let read_path = read_paths.root.display().to_string();
@@ -4291,14 +4290,8 @@ pub(crate) async fn daemon_status_response_async(
             path: read_path,
             detail: format!("daemon status read task failed: {source}"),
         })??;
-    let cluster_result = if let Some(runtime) = runtime {
-        ensure_daemon_status_cluster_async(paths, &mut status, runtime).await
-    } else {
-        ensure_daemon_status_cluster(paths, &mut status)
-    };
-    if let Err(error) = cluster_result {
-        tracing::warn!("sinomo daemon status cluster enrichment skipped: {error}");
-    }
+    // This route is the rollout and supervision liveness probe. It must report
+    // the local process state without waiting on cluster/KV repair or quorum.
     if let Some(data_dir) = paths.root.parent() {
         let rollout_paths = SelfRolloutPaths::new(data_dir);
         let rollout_path = rollout_paths.root.display().to_string();
