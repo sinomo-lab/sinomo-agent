@@ -4291,20 +4291,31 @@ pub(crate) async fn daemon_status_response_async(
             path: read_path,
             detail: format!("daemon status read task failed: {source}"),
         })??;
-    if let Some(runtime) = runtime {
-        ensure_daemon_status_cluster_async(paths, &mut status, runtime).await?;
+    let cluster_result = if let Some(runtime) = runtime {
+        ensure_daemon_status_cluster_async(paths, &mut status, runtime).await
     } else {
-        ensure_daemon_status_cluster(paths, &mut status)?;
+        ensure_daemon_status_cluster(paths, &mut status)
+    };
+    if let Err(error) = cluster_result {
+        tracing::warn!("sinomo daemon status cluster enrichment skipped: {error}");
     }
     if let Some(data_dir) = paths.root.parent() {
         let rollout_paths = SelfRolloutPaths::new(data_dir);
         let rollout_path = rollout_paths.root.display().to_string();
-        status.rollout = tokio::task::spawn_blocking(move || read_rollout_status(&rollout_paths))
+        match tokio::task::spawn_blocking(move || read_rollout_status(&rollout_paths))
             .await
             .map_err(|source| DaemonError::Io {
-                path: rollout_path,
+                path: rollout_path.clone(),
                 detail: format!("rollout status read task failed: {source}"),
-            })??;
+            }) {
+            Ok(Ok(rollout)) => status.rollout = rollout,
+            Ok(Err(error)) => {
+                tracing::warn!("sinomo daemon status rollout decoration skipped: {error}");
+            }
+            Err(error) => {
+                tracing::warn!("sinomo daemon status rollout decoration skipped: {error}");
+            }
+        }
     }
     if let Some(stats) = crate::process_idle_stats() {
         status.idle_stats = Some(stats.snapshot());
@@ -4318,6 +4329,7 @@ mod tests {
     use crate::{DaemonRunOptions, sign_daemon_rpc_request_from_data_dir};
     use sinomo_core::local::SinomoDataDir;
     use sinomo_core::node::NodeId;
+    use std::fs;
     use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
 
@@ -4344,6 +4356,37 @@ mod tests {
             daemon_runtime_task_join_timeout("control accept"),
             DAEMON_RUNTIME_TASK_JOIN_TIMEOUT
         );
+    }
+
+    #[test]
+    fn daemon_status_response_survives_rollout_decoration_error() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-status-rollout-error");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = DaemonPaths::new(&data_dir);
+        paths.ensure().expect("daemon paths");
+        let options = DaemonRunOptions::default();
+        let expected = crate::DaemonStatus::new(&options, &paths, None);
+        crate::write_daemon_status(&paths, &expected).expect("write daemon status");
+        let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
+        fs::create_dir_all(&rollout_paths.root).expect("rollout dir");
+        fs::write(
+            rollout_paths.root.join("state.sobj"),
+            b"not a rollout state",
+        )
+        .expect("malformed rollout state");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let actual = runtime
+            .block_on(daemon_status_response_async(&paths, Some(runtime.handle())))
+            .expect("status response");
+
+        assert_eq!(actual.pid, expected.pid);
+        assert_eq!(actual.data_dir, expected.data_dir);
+        assert!(actual.rollout.is_none());
     }
 
     fn append_cluster_raft_command(
