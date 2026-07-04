@@ -526,6 +526,8 @@ pub use lan::discover_local_ip_candidates_for_targets_async;
 #[cfg(any(test, feature = "test-support"))]
 pub use lan::fetch_public_ip_candidates_from_service_async;
 #[cfg(any(test, feature = "test-support"))]
+pub use lan::is_advertisable_interface_candidate;
+#[cfg(any(test, feature = "test-support"))]
 pub use lan::is_advertisable_interface_ip;
 #[cfg(any(test, feature = "test-support"))]
 pub use lan::is_invitable_ip;

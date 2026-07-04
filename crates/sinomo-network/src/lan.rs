@@ -337,8 +337,8 @@ pub fn discover_interface_ip_candidates() -> Vec<IpAddr> {
         return Vec::new();
     };
     let mut candidates = Vec::new();
-    for (_name, ip) in interfaces {
-        if is_advertisable_interface_ip(ip) && !candidates.contains(&ip) {
+    for (name, ip) in interfaces {
+        if is_advertisable_interface_candidate(&name, ip) && !candidates.contains(&ip) {
             candidates.push(ip);
         }
     }
@@ -711,6 +711,28 @@ pub fn is_advertisable_interface_ip(ip: IpAddr) -> bool {
                 && !matches!(ip.segments(), [0x2001, 0x0db8, _, _, _, _, _, _])
         }
     }
+}
+
+pub fn is_advertisable_interface_candidate(name: &str, ip: IpAddr) -> bool {
+    is_advertisable_interface_ip(ip) && !interface_name_is_local_only(name)
+}
+
+fn interface_name_is_local_only(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    name == "docker0"
+        || name == "cni0"
+        || name.starts_with("br-")
+        || name.starts_with("veth")
+        || name.starts_with("virbr")
+        || name.starts_with("lxcbr")
+        || name.starts_with("flannel")
+        || name.starts_with("podman")
+        || name.starts_with("nerdctl")
+        || name.starts_with("vboxnet")
+        || name.starts_with("vmnet")
 }
 
 pub fn format_ip_port(ip: IpAddr, port: u16) -> String {

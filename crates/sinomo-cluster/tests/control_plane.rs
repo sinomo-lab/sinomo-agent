@@ -90,7 +90,8 @@ use sinomo_network::*;
 use sinomo_network::{
     AsyncMdnsDiscoverySocket, LanQuicEventFrameCodec, MdnsDiscoveryAdvertisement,
     MdnsDiscoveryCache, MdnsDiscoveryRecord, apply_lan_discovery_advertisements,
-    is_advertisable_interface_ip, is_invitable_ip, lan_discovery_advertisement_for_state,
+    is_advertisable_interface_candidate, is_advertisable_interface_ip, is_invitable_ip,
+    lan_discovery_advertisement_for_state,
 };
 use sinomo_network::{
     AsyncNetworkServiceHandle, AsyncNetworkTransport, AsyncNetworkTransportFuture, DeliveryAck,
@@ -2215,6 +2216,27 @@ fn interface_ip_filter_keeps_routable_lan_addresses() {
     assert!(!is_advertisable_interface_ip(
         "127.0.0.1".parse().expect("loopback")
     ));
+}
+
+#[test]
+fn interface_candidate_filter_rejects_common_local_only_bridges() {
+    let docker_bridge = "172.17.0.1".parse().expect("docker bridge");
+    let docker_network = "172.18.0.1".parse().expect("docker network");
+    let routable_lan = "10.14.5.15".parse().expect("routable lan");
+
+    assert!(!is_advertisable_interface_candidate(
+        "docker0",
+        docker_bridge
+    ));
+    assert!(!is_advertisable_interface_candidate(
+        "br-6f2c4e8a",
+        docker_network
+    ));
+    assert!(!is_advertisable_interface_candidate(
+        "veth1234",
+        "169.254.147.92".parse().expect("link local")
+    ));
+    assert!(is_advertisable_interface_candidate("eth0", routable_lan));
 }
 
 #[test]
@@ -32678,6 +32700,51 @@ mod route_cache_tests {
         assert_eq!(plan.endpoints[0].address, bridge_endpoint.address);
     }
 
+    #[test]
+    fn delivery_plan_ignores_connectivity_for_removed_target_endpoint() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-plan-removed-endpoint");
+        let cluster_id = cid("cluster_delivery_plan_removed_endpoint");
+        let local = nid("node_delivery_plan_removed_endpoint_local");
+        let target = nid("node_delivery_plan_removed_endpoint_target");
+        let stale_endpoint = endpoint(&target, "10.91.0.10:21353", 0);
+        let current_endpoint = endpoint(&target, "10.91.0.11:21353", 1);
+        let mut state = test_state(cluster_id.clone(), local.clone());
+        add_member(
+            &mut state,
+            target.clone(),
+            "target",
+            vec![current_endpoint.clone()],
+        );
+        let stale_record = connectivity_record_from_source(
+            &cluster_id,
+            &local,
+            &stale_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+        );
+        sinomo_network::write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            std::slice::from_ref(&stale_record),
+        )
+        .expect("write stale endpoint record");
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local,
+            &target,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
+
+        assert_eq!(plan.next_hop, target);
+        assert_eq!(plan.endpoints.len(), 1);
+        assert_eq!(plan.endpoints[0].endpoint_id, current_endpoint.endpoint_id);
+        assert_eq!(plan.endpoints[0].address, current_endpoint.address);
+    }
+
     enum SendOutcome {
         Response(&'static str),
         ResponseFrom(&'static str, NodeId),
@@ -32850,15 +32917,31 @@ mod route_cache_tests {
         let local = nid("node_call_target_endpoint_budget_local");
         let target = nid("node_call_target_endpoint_budget_target");
         let stale_endpoint = endpoint(&target, "10.90.7.10:21353", 0);
-        let good_endpoint = endpoint(&target, "10.90.7.11:21353", 1);
+        let stale_endpoint_2 = endpoint(&target, "10.90.7.11:21353", 1);
+        let stale_endpoint_3 = endpoint(&target, "10.90.7.12:21353", 2);
+        let good_endpoint = endpoint(&target, "10.90.7.13:21353", 3);
         let mut state = test_state(cluster_id, local);
         add_member(
             &mut state,
             target.clone(),
             "target",
-            vec![stale_endpoint.clone(), good_endpoint.clone()],
+            vec![
+                stale_endpoint.clone(),
+                stale_endpoint_2.clone(),
+                stale_endpoint_3.clone(),
+                good_endpoint.clone(),
+            ],
         );
-        mark_local_endpoints_healthy(&paths, &state, &[stale_endpoint, good_endpoint]);
+        mark_local_endpoints_healthy(
+            &paths,
+            &state,
+            &[
+                stale_endpoint,
+                stale_endpoint_2,
+                stale_endpoint_3,
+                good_endpoint,
+            ],
+        );
         let runtime = tokio::runtime::Handle::current();
         let mut host = RecordingTargetHost::new([
             SendOutcome::Error("stale endpoint hung"),
@@ -32885,13 +32968,23 @@ mod route_cache_tests {
         assert_eq!(host.sent.len(), 2);
         assert_eq!(host.sent[0].0.address, "10.90.7.10:21353");
         assert_eq!(host.sent[1].0.address, "10.90.7.11:21353");
-        assert_eq!(
-            host.sent[0].3.connect_timeout,
-            Some(CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX)
+        let first_budget = host.sent[0]
+            .3
+            .connect_timeout
+            .expect("first endpoint budget");
+        assert!(
+            first_budget <= Duration::from_millis(3_750)
+                && first_budget >= Duration::from_millis(3_000),
+            "first endpoint budget should reserve time for the remaining candidates: {first_budget:?}"
         );
-        assert_eq!(
-            host.sent[1].3.connect_timeout,
-            Some(CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX)
+        let second_budget = host.sent[1]
+            .3
+            .connect_timeout
+            .expect("second endpoint budget");
+        assert!(
+            second_budget <= CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX
+                && second_budget >= Duration::from_millis(4_000),
+            "second endpoint budget should be capped near the per-endpoint max: {second_budget:?}"
         );
     }
 

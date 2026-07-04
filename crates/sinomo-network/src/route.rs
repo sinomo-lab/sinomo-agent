@@ -1034,7 +1034,7 @@ fn cluster_delivery_routing_table_earliest_expires_at(
         .unwrap_or_default()
         .into_iter()
         .chain(
-            crate::route_graph_read_model::read_cluster_connectivity_graph(paths)
+            crate::route_graph_read_model::read_cluster_connectivity_graph_for_state(paths, state)
                 .unwrap_or_default(),
         )
         .filter(|record| {
@@ -1209,7 +1209,8 @@ fn cluster_delivery_route_graph_with_members(
     }
 
     for record in
-        crate::route_graph_read_model::read_cluster_connectivity_graph(paths).unwrap_or_default()
+        crate::route_graph_read_model::read_cluster_connectivity_graph_for_state(paths, state)
+            .unwrap_or_default()
     {
         if record.cluster_id != state.cluster_id
             || record.source_node_id == record.target_node_id
@@ -2084,7 +2085,7 @@ where
                 "cluster object rpc route plan selected"
             );
             let route_endpoint_count = route_plan.endpoints.len();
-            for endpoint in route_plan.endpoints {
+            for (endpoint_index, endpoint) in route_plan.endpoints.into_iter().enumerate() {
                 let attempt_started_at = Instant::now();
                 let Some(remaining) = deadline.checked_remaining() else {
                     return Err(cluster_target_rpc_timeout_error(
@@ -2093,8 +2094,9 @@ where
                     ));
                 };
                 let final_hop = &route_plan.next_hop == target_node_id;
+                let endpoints_left = route_endpoint_count.saturating_sub(endpoint_index).max(1);
                 let endpoint_attempt_budget =
-                    cluster_target_endpoint_attempt_budget(remaining, route_endpoint_count);
+                    cluster_target_endpoint_attempt_budget(remaining, endpoints_left);
                 let hop_timeouts =
                     cluster_relay_hop_transport_timeouts(options.timeouts, endpoint_attempt_budget);
                 let (outer_build_us, outer_sign_us, send_us, response) = if final_hop {
@@ -2428,12 +2430,27 @@ fn cluster_relay_hop_transport_timeouts(
 
 fn cluster_target_endpoint_attempt_budget(
     remaining_route_budget: Option<Duration>,
-    endpoint_count: usize,
+    endpoints_left: usize,
 ) -> Option<Duration> {
-    if endpoint_count <= 1 {
+    if endpoints_left <= 1 {
         return remaining_route_budget;
     }
-    remaining_route_budget.map(|remaining| remaining.min(CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX))
+    remaining_route_budget.map(|remaining| {
+        duration_div_ceil(remaining, endpoints_left).min(CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX)
+    })
+}
+
+fn duration_div_ceil(duration: Duration, divisor: usize) -> Duration {
+    if divisor <= 1 {
+        return duration;
+    }
+    let divisor = divisor as u128;
+    let nanos = duration.as_nanos();
+    let per_endpoint = nanos
+        .saturating_add(divisor.saturating_sub(1))
+        .saturating_div(divisor)
+        .clamp(1, u128::from(u64::MAX));
+    Duration::from_nanos(per_endpoint as u64)
 }
 
 pub(crate) fn relay_envelope_hop_transport_timeouts(

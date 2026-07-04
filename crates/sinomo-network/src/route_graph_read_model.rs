@@ -9,7 +9,7 @@ use crate::connectivity_store::{
 use crate::error::NetworkError;
 use crate::file_mark::{ClusterFileMark, cluster_file_mark};
 use crate::{ClusterEndpointId, ClusterPaths};
-use sinomo_base::ClusterBootstrapState;
+use sinomo_base::{ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord};
 use sinomo_node::NodeId;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -57,6 +57,55 @@ impl ClusterRouteGraphSourceSet {
 
     fn contains(&self, source_node_id: &NodeId) -> bool {
         self.sources.contains(source_node_id)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ClusterRouteGraphLiveEndpointIndex {
+    known_nodes: BTreeSet<NodeId>,
+    endpoint_ids_by_node: BTreeMap<NodeId, BTreeSet<ClusterEndpointId>>,
+}
+
+impl ClusterRouteGraphLiveEndpointIndex {
+    fn try_insert_known_node(
+        &mut self,
+        node_id: &NodeId,
+        operation: &str,
+    ) -> Result<(), NetworkError> {
+        self.known_nodes
+            .insert(crate::object::try_clone_id(node_id, operation)?);
+        Ok(())
+    }
+
+    fn try_insert_endpoint(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        operation: &str,
+    ) -> Result<(), NetworkError> {
+        let node_id = crate::object::try_clone_id(&endpoint.node_id, operation)?;
+        self.known_nodes.insert(node_id.clone());
+        if endpoint.privacy == ClusterEndpointPrivacy::LocalOnly {
+            return Ok(());
+        }
+        self.endpoint_ids_by_node
+            .entry(node_id)
+            .or_default()
+            .insert(crate::object::try_clone_id(
+                &endpoint.endpoint_id,
+                operation,
+            )?);
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.known_nodes.is_empty() && self.endpoint_ids_by_node.is_empty()
+    }
+
+    fn record_targets_live_endpoint(&self, record: &ClusterConnectivityRecord) -> bool {
+        if let Some(endpoint_ids) = self.endpoint_ids_by_node.get(&record.target_node_id) {
+            return endpoint_ids.contains(&record.endpoint_id);
+        }
+        true
     }
 }
 
@@ -139,6 +188,7 @@ impl ClusterConnectivityGraph {
                 paths,
                 Some(&state.cluster_id),
                 Some(&state.local_node_id),
+                Some(state),
                 query,
             )
             .unwrap_or_default(),
@@ -161,6 +211,7 @@ impl ClusterConnectivityGraph {
                 paths,
                 Some(&state.cluster_id),
                 Some(&state.local_node_id),
+                Some(state),
                 query,
             )?,
         )
@@ -278,25 +329,45 @@ pub fn read_cluster_connectivity_graph_with_query<Q>(
 where
     Q: ClusterConnectivityRecordQuery + ?Sized,
 {
-    read_cluster_connectivity_graph_with_suppressed_local_source_and_query(paths, None, None, query)
+    read_cluster_connectivity_graph_with_suppressed_local_source_and_query(
+        paths, None, None, None, query,
+    )
+}
+
+pub(crate) fn read_cluster_connectivity_graph_for_state(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
+    read_cluster_connectivity_graph_with_suppressed_local_source_and_query(
+        paths,
+        Some(&state.cluster_id),
+        Some(&state.local_node_id),
+        Some(state),
+        &crate::connectivity::DirectoryConnectivityRecordQuery,
+    )
 }
 
 fn read_cluster_connectivity_graph_with_suppressed_local_source_and_query<Q>(
     paths: &ClusterPaths,
     cluster_id: Option<&sinomo_node::ClusterId>,
     local_source_node_id: Option<&NodeId>,
+    state: Option<&ClusterBootstrapState>,
     query: &Q,
 ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError>
 where
     Q: ClusterConnectivityRecordQuery + ?Sized,
 {
     let now = OffsetDateTime::now_utc();
+    let live_endpoint_index = cluster_route_graph_live_endpoint_index(paths, state)?;
     let mut local_records = Vec::new();
     for record in read_local_cluster_connectivity_records(paths)?
         .into_iter()
         .filter(|record| {
             cluster_id.is_none_or(|cluster_id| record.cluster_id == *cluster_id)
                 && cluster_network_record_live(record.expires_at, now)
+                && live_endpoint_index
+                    .as_ref()
+                    .is_none_or(|index| index.record_targets_live_endpoint(record))
         })
     {
         crate::object::try_reserve_vec(&mut local_records, 1, "collect local route graph records")?;
@@ -322,6 +393,12 @@ where
         if cluster_id.is_some_and(|cluster_id| record.cluster_id != *cluster_id) {
             continue;
         }
+        if live_endpoint_index
+            .as_ref()
+            .is_some_and(|index| !index.record_targets_live_endpoint(&record))
+        {
+            continue;
+        }
         if local_sources.contains(&record.source_node_id) {
             continue;
         }
@@ -333,4 +410,42 @@ where
     let mut records = records_by_key.into_records();
     sort_cluster_connectivity_records(&mut records);
     Ok(records)
+}
+
+fn cluster_route_graph_live_endpoint_index(
+    paths: &ClusterPaths,
+    state: Option<&ClusterBootstrapState>,
+) -> Result<Option<ClusterRouteGraphLiveEndpointIndex>, NetworkError> {
+    let mut index = ClusterRouteGraphLiveEndpointIndex::default();
+    if let Some(state) = state {
+        for member in &state.members {
+            index.try_insert_known_node(&member.node_id, "index route graph live endpoints")?;
+            for endpoint in &member.endpoints {
+                index.try_insert_endpoint(endpoint, "index route graph live endpoints")?;
+            }
+        }
+    }
+    let directory = crate::directory::cluster_directory_for(paths);
+    match directory.members() {
+        Ok(members) => {
+            for member in members {
+                index.try_insert_known_node(&member.node_id, "index route graph live endpoints")?;
+                for endpoint in &member.endpoints {
+                    index.try_insert_endpoint(endpoint, "index route graph live endpoints")?;
+                }
+            }
+        }
+        Err(error @ NetworkError::ResourceExhausted { .. }) => return Err(error),
+        Err(_) => {}
+    }
+    match directory.endpoints() {
+        Ok(endpoints) => {
+            for endpoint in endpoints {
+                index.try_insert_endpoint(&endpoint, "index route graph live endpoints")?;
+            }
+        }
+        Err(error @ NetworkError::ResourceExhausted { .. }) => return Err(error),
+        Err(_) => {}
+    }
+    Ok((!index.is_empty()).then_some(index))
 }
