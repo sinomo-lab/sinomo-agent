@@ -82,6 +82,7 @@ pub const DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT: Duration = Duration::from_secs(
 pub const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const CLUSTER_HEALTH_ROUTED_PING_TIMEOUT: Duration = Duration::from_millis(750);
 const CLUSTER_HEALTH_DIRECT_STATUS_TIMEOUT: Duration = Duration::from_millis(750);
+const CLUSTER_HEALTH_DIRECT_STATUS_MAX_ENDPOINTS: usize = 4;
 pub const DAEMON_CLUSTER_TICK_INTERVAL: Duration = Duration::from_secs(15);
 #[cfg(test)]
 const DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL: Duration =
@@ -3470,28 +3471,30 @@ async fn probe_member_daemon_status_async(
         return Ok(Some(status));
     }
     if let Some(status) =
-        probe_member_routed_ping_status_async(paths, state, member, runtime).await?
+        probe_member_direct_daemon_status_async(paths, state, member, runtime).await?
     {
         return Ok(Some(status));
     }
-    if let Some(status) = probe_member_direct_daemon_status_async(state, member, runtime).await? {
+    if let Some(status) =
+        probe_member_routed_ping_status_async(paths, state, member, runtime).await?
+    {
         return Ok(Some(status));
     }
     Ok(None)
 }
 
 async fn probe_member_direct_daemon_status_async(
+    paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
     _runtime: &tokio::runtime::Handle,
 ) -> Result<Option<ClusterNodeStatusRecord>, DaemonError> {
-    for endpoint in member.endpoints.iter().filter(|endpoint| {
-        endpoint.node_id == member.node_id
-            && endpoint.privacy != sinomo_core::ClusterEndpointPrivacy::LocalOnly
-            && sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
-    }) {
+    for endpoint in member_daemon_status_direct_probe_endpoints(paths, state, member)
+        .into_iter()
+        .take(CLUSTER_HEALTH_DIRECT_STATUS_MAX_ENDPOINTS)
+    {
         let status = match fetch_daemon_status_from_endpoint_direct_async(
-            endpoint,
+            &endpoint,
             CLUSTER_HEALTH_DIRECT_STATUS_TIMEOUT,
         )
         .await
@@ -3539,6 +3542,22 @@ async fn probe_member_direct_daemon_status_async(
         return Ok(Some(record));
     }
     Ok(None)
+}
+
+fn member_daemon_status_direct_probe_endpoints(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+) -> Vec<ClusterEndpointRecord> {
+    sinomo_core::network::ClusterEndpointSelector::new(paths, state)
+        .select(sinomo_core::network::ClusterEndpointSelectionPurpose::MemberDaemonStatus)
+        .into_iter()
+        .filter(|endpoint| {
+            endpoint.node_id == member.node_id
+                && endpoint.privacy != sinomo_core::ClusterEndpointPrivacy::LocalOnly
+                && sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
+        })
+        .collect()
 }
 
 async fn probe_member_routed_ping_status_async(
@@ -12109,6 +12128,101 @@ mod tests {
             targets
                 .iter()
                 .any(|endpoint| endpoint.endpoint_id == private_tcp.endpoint_id)
+        );
+    }
+
+    #[test]
+    fn direct_status_probe_prefers_healthy_selected_endpoint() {
+        let root = unique_cluster_test_root("sinomo-daemon-direct-status-selected-endpoint");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_direct_status").expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_daemon_direct_status_local").expect("local node");
+        let remote_node =
+            NodeId::from_legacy_named("node_daemon_direct_status_remote").expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "direct status endpoint order",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let stale_private = sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "10.0.0.41:21353".to_string(),
+            10,
+        );
+        let healthy_public = ClusterEndpointRecord {
+            endpoint_id: sinomo_core::network::ClusterEndpointId::from_legacy_named(
+                "endpoint_daemon_direct_status_public",
+            )
+            .expect("endpoint"),
+            node_id: remote_node.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "203.0.113.41:21353".to_string(),
+            source: sinomo_core::ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 20,
+            last_observed_latency_ms: None,
+        };
+        let mut remote_member = ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            remote_node,
+            "remote",
+            "pk-remote",
+            now,
+        );
+        remote_member.capabilities =
+            sinomo_core::node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![stale_private.clone(), healthy_public.clone()];
+        state.members.push(remote_member.clone());
+
+        sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+            .expect("sync cluster state");
+        sinomo_core::cluster::sync_cluster_connectivity_records_to_kv(
+            &paths,
+            &local_node,
+            vec![
+                sinomo_core::network::cluster_connectivity_record(
+                    &state,
+                    &stale_private,
+                    sinomo_core::network::ClusterConnectivityState::Unreachable,
+                    None,
+                    4,
+                    None,
+                    Some("stale private address".to_string()),
+                    now,
+                    60,
+                ),
+                sinomo_core::network::cluster_connectivity_record(
+                    &state,
+                    &healthy_public,
+                    sinomo_core::network::ClusterConnectivityState::Healthy,
+                    Some(84),
+                    0,
+                    Some("ok".to_string()),
+                    None,
+                    now,
+                    60,
+                ),
+            ],
+        )
+        .expect("connectivity records");
+
+        let endpoints = member_daemon_status_direct_probe_endpoints(&paths, &state, &remote_member);
+
+        assert_eq!(
+            endpoints.first().map(|endpoint| &endpoint.endpoint_id),
+            Some(&healthy_public.endpoint_id),
+            "direct health status should try the selector-ranked healthy endpoint before stale private fallbacks"
         );
     }
 
