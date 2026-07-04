@@ -981,11 +981,12 @@ pub(crate) fn initialize_single_node_cluster_with_paths(
         now,
     );
     ensure_local_daemon_cluster_members(
+        paths,
         &mut state,
         &DaemonRunOptions::default(),
         &DaemonRunOptions::shadow_default(),
         now,
-    );
+    )?;
     cluster::assign_local_daemon_member_public_keys(&mut state, main_public_key, shadow_public_key);
     cluster::write_cluster_state(paths, &state)?;
     locked_set_cluster_raft_leader(paths, &state.local_node_id, 1)?;
@@ -1439,7 +1440,13 @@ fn cluster_join_fresh_with_paths(
         shadow_public_key,
         timestamp,
     );
-    ensure_local_daemon_cluster_members(&mut state, &main_options, &shadow_options, timestamp);
+    ensure_local_daemon_cluster_members(
+        paths,
+        &mut state,
+        &main_options,
+        &shadow_options,
+        timestamp,
+    )?;
     reconcile_cluster_join_with_introducers(&mut state, &invite, Some(paths))?;
     if cluster_state_needs_join_registration(&state) {
         return Err(CliError::ClusterReadOnly {
@@ -1568,43 +1575,57 @@ fn local_daemon_public_keys(paths: &ClusterPaths) -> Result<(String, String), Cl
 }
 
 fn ensure_local_daemon_cluster_members(
+    paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
     main_options: &DaemonRunOptions,
     shadow_options: &DaemonRunOptions,
     timestamp: OffsetDateTime,
-) -> bool {
+) -> Result<bool, CliError> {
     let (main_endpoints, shadow_endpoints) =
-        local_daemon_member_endpoints(state, main_options, shadow_options);
-    cluster::ensure_daemon_cluster_members(state, main_endpoints, shadow_endpoints, timestamp)
+        local_daemon_member_endpoints(paths, state, main_options, shadow_options)?;
+    Ok(cluster::ensure_daemon_cluster_members(
+        state,
+        main_endpoints,
+        shadow_endpoints,
+        timestamp,
+    ))
 }
 
 fn local_daemon_member_endpoints(
+    paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     main_options: &DaemonRunOptions,
     shadow_options: &DaemonRunOptions,
-) -> (Vec<ClusterEndpointRecord>, Vec<ClusterEndpointRecord>) {
+) -> Result<(Vec<ClusterEndpointRecord>, Vec<ClusterEndpointRecord>), CliError> {
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "cluster paths have no data directory parent".to_string(),
+    })?;
+    let endpoint_config = read_daemon_endpoint_advertisement_config(data_dir)?;
     let main_node_id = state.local_node_id.clone();
     let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
     let lan_ips = network::discover_default_lan_ip_candidates();
     let route_ips =
         network::ClusterEndpointSelector::discover_peer_route_ip_candidates_for_state(state);
-    let main_endpoints = daemon_advertised_endpoints_for_state(
+    let main_endpoints = daemon_advertised_endpoints_for_state_with_manual_config(
         state,
         &main_node_id,
         main_options,
         0,
         &lan_ips,
         &route_ips,
+        &endpoint_config.main_endpoints,
     );
-    let shadow_endpoints = daemon_advertised_endpoints_for_state(
+    let shadow_endpoints = daemon_advertised_endpoints_for_state_with_manual_config(
         state,
         &shadow_node_id,
         shadow_options,
         10,
         &lan_ips,
         &route_ips,
+        &endpoint_config.shadow_endpoints,
     );
-    (main_endpoints, shadow_endpoints)
+    Ok((main_endpoints, shadow_endpoints))
 }
 
 fn refresh_local_daemon_membership_from_disk_for_cli(
@@ -1615,7 +1636,7 @@ fn refresh_local_daemon_membership_from_disk_for_cli(
     timestamp: OffsetDateTime,
 ) -> Result<cluster::ClusterLocalDaemonMembershipRefresh, CliError> {
     let (main_endpoints, shadow_endpoints) =
-        local_daemon_member_endpoints(state, main_options, shadow_options);
+        local_daemon_member_endpoints(paths, state, main_options, shadow_options)?;
     let (main_public_key, shadow_public_key) = local_daemon_public_keys(paths)?;
     cluster::refresh_local_daemon_membership_from_disk(
         paths,
@@ -2537,11 +2558,12 @@ pub(crate) fn cluster_peer_members(
     if network::cluster_state_needs_join_registration(&state) {
         let (main_options, shadow_options) = local_daemon_cluster_options()?;
         ensure_local_daemon_cluster_members(
+            paths,
             &mut state,
             &main_options,
             &shadow_options,
             OffsetDateTime::now_utc(),
-        );
+        )?;
         cluster::write_cluster_state(paths, &state)?;
     }
     Ok(state.members)
@@ -2863,11 +2885,12 @@ pub(crate) fn register_daemon_cluster_node(
     let paths = cluster_paths_from_defaults()?;
     let mut state = read_cluster_state(&paths)?;
     ensure_local_daemon_cluster_members(
+        &paths,
         &mut state,
         &registration.main_options,
         &registration.shadow_options,
         OffsetDateTime::now_utc(),
-    );
+    )?;
     cluster::write_cluster_state(&paths, &state)?;
     daemon_cluster_status(&state, registration.process).ok_or_else(|| CliError::Parse {
         detail: "daemon cluster member could not be registered".to_string(),

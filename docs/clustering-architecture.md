@@ -78,6 +78,33 @@ sinomo cluster join join.txt --name <remote-name>
 
 On join, a fresh remote node builds local pending cluster state and then contacts the invite introducers over the daemon control channel. A reachable introducer records the joining installation's main cluster member, with main and shadow daemon endpoints folded into that member's endpoint set, returns the updated cluster member view, and lets `sinomo cluster peers` show the new node on both sides. If the invite contains introducers but none are reachable, join fails with an actionable connectivity error instead of silently recording an isolated pending state. `sinomo cluster health` combines the KV member view, daemon-published node heartbeats, and live endpoint probes to report online/offline state, daemon version, platform, last-seen time, rollout state, and shadow reachability through the main member endpoints.
 
+Nodes behind routers, cloud NAT, or port forwards may have externally reachable addresses that are not visible from the node's own network interfaces. A node can publish those direct TCP daemon endpoints from node-local config at:
+
+```text
+$SINOMO_DATA_DIR/configs/cluster/endpoints.json
+```
+
+The daemon reads this file during membership refresh and merges the configured endpoints into the main and shadow endpoint sets. A missing file keeps the normal automatic LAN/public-IP discovery behavior. A malformed file is treated as a configuration error so an operator can fix stale or invalid routing data instead of silently advertising the wrong endpoint.
+
+```json
+{
+  "main": [
+    {
+      "address": "tcp://129.146.106.76:21353",
+      "scope": "internet-direct"
+    }
+  ],
+  "shadow": [
+    {
+      "address": "tcp://129.146.106.76:21354",
+      "scope": "internet-direct"
+    }
+  ]
+}
+```
+
+`address` may be a URL. `tcp://host[:port]` publishes a direct TCP daemon endpoint; if no scheme is supplied, the address is treated as TCP. A bare host/IP uses the daemon's configured port. Other network modules can define their own URL schemes, such as `iroh://...`, and the endpoint selector will use the corresponding transport when that module is available. `scope` is optional and defaults from the address: public TCP socket addresses become `internet-direct`; private TCP addresses become `lan`; Iroh relay URLs become `relayed`. `privacy` is accepted as a deprecated alias for `scope` in this config file. `priority` is optional and uses the endpoint record priority directly; lower priority is preferred.
+
 `sinomo cluster migrate plan <invite>` validates the current initialized cluster as a migration source and validates the target invite without mutating local state. The implemented planner supports:
 
 - `single-node`, the default mode for a device that initialized a local one-node cluster and later needs to join another cluster;

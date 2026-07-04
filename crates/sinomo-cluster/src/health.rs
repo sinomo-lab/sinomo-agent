@@ -600,6 +600,33 @@ pub fn cluster_doctor_findings(
         state.local_node_id.clone(),
         connectivity.iter().cloned(),
     );
+    let authority_members = state
+        .members
+        .iter()
+        .filter(|member| {
+            cluster_health_member_is_reportable(member)
+                && !matches!(member.state, ClusterMemberState::Removed)
+                && member.has_raft_vote()
+        })
+        .collect::<Vec<_>>();
+    for source in &authority_members {
+        for target in &authority_members {
+            if source.node_id == target.node_id {
+                continue;
+            }
+            if cluster_route_next_hop(&connectivity_graph, &source.node_id, &target.node_id)
+                .is_none()
+            {
+                findings.push(ClusterDoctorFinding::warning(
+                    "authority-route-missing",
+                    format!(
+                        "{} has no healthy route to state authority {}",
+                        source.node_id, target.node_id
+                    ),
+                ));
+            }
+        }
+    }
     let online_nodes = health
         .iter()
         .filter(|row| {

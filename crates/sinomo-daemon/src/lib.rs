@@ -560,14 +560,18 @@ pub(crate) use rollout::{
 };
 pub use status::{
     DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus, DaemonDataOwnerLock,
-    DaemonLock, DaemonProbeStatus, DaemonRunOptions, DaemonStatus, SINOMO_DAEMON_DEFAULT_HOST,
-    SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
-    cluster_node_status_from_daemon_status, current_shadow_daemon_options,
-    daemon_advertised_endpoints_for_state, daemon_advertised_endpoints_for_state_async,
-    daemon_bind_address, daemon_cluster_registration, daemon_cluster_status,
-    daemon_connect_address, daemon_options_from_status, daemon_package_version,
+    DaemonEndpointAdvertisementConfig, DaemonLock, DaemonManualEndpointConfig, DaemonProbeStatus,
+    DaemonRunOptions, DaemonStatus, SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT,
+    SINOMO_SHADOW_DAEMON_DEFAULT_PORT, cluster_node_status_from_daemon_status,
+    current_shadow_daemon_options, daemon_advertised_endpoints_for_state,
+    daemon_advertised_endpoints_for_state_async,
+    daemon_advertised_endpoints_for_state_with_manual_config,
+    daemon_advertised_endpoints_for_state_with_manual_config_async, daemon_bind_address,
+    daemon_cluster_registration, daemon_cluster_status, daemon_connect_address,
+    daemon_endpoint_advertisement_config_file, daemon_options_from_status, daemon_package_version,
     daemon_status_matches_options, default_main_daemon_status,
-    invite_introducers_from_daemon_status, probe_daemon_status, write_daemon_status,
+    invite_introducers_from_daemon_status, probe_daemon_status,
+    read_daemon_endpoint_advertisement_config, write_daemon_status,
 };
 pub(crate) use status::{
     current_daemon_cluster_options, current_shadow_daemon_options_on_runtime,

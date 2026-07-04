@@ -78,6 +78,12 @@ impl SinomoDataDir {
         self.shared_configs_dir().join("dfs").join("expose.json")
     }
 
+    pub fn cluster_endpoint_config_file(&self) -> PathBuf {
+        self.shared_configs_dir()
+            .join("cluster")
+            .join("endpoints.json")
+    }
+
     pub fn providers_dir(&self) -> PathBuf {
         self.root.join("providers")
     }

@@ -10,8 +10,9 @@ use sinomo_core::node::{
     cluster_node_is_local_process,
 };
 use sinomo_core::{
-    ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRole, ClusterMemberState,
-    ClusterNodeAvailability, ClusterNodeRolloutStatus, ClusterNodeStatusRecord,
+    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource,
+    ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRolloutStatus,
+    ClusterNodeStatusRecord, ClusterTransportKind,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -54,6 +55,24 @@ impl DaemonRunOptions {
 pub enum DaemonClusterProcess {
     Main,
     Shadow,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DaemonEndpointAdvertisementConfig {
+    #[serde(alias = "main", alias = "endpoints")]
+    pub main_endpoints: Vec<DaemonManualEndpointConfig>,
+    #[serde(alias = "shadow")]
+    pub shadow_endpoints: Vec<DaemonManualEndpointConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DaemonManualEndpointConfig {
+    pub address: String,
+    #[serde(default, alias = "privacy", skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ClusterEndpointPrivacy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u16>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -189,6 +208,74 @@ pub async fn daemon_advertised_endpoints_for_state_async(
     .await
 }
 
+pub fn daemon_endpoint_advertisement_config_file(data_dir: &Path) -> PathBuf {
+    SinomoDataDir::new(data_dir.to_path_buf()).cluster_endpoint_config_file()
+}
+
+pub fn read_daemon_endpoint_advertisement_config(
+    data_dir: &Path,
+) -> Result<DaemonEndpointAdvertisementConfig, DaemonError> {
+    let path = daemon_endpoint_advertisement_config_file(data_dir);
+    match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|source| DaemonError::Json {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(DaemonEndpointAdvertisementConfig::default())
+        }
+        Err(source) => Err(DaemonError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
+}
+
+pub fn daemon_advertised_endpoints_for_state_with_manual_config(
+    state: &ClusterBootstrapState,
+    node_id: &NodeId,
+    options: &DaemonRunOptions,
+    priority: u16,
+    lan_ips: &[IpAddr],
+    route_ips: &[IpAddr],
+    manual_endpoints: &[DaemonManualEndpointConfig],
+) -> Vec<ClusterEndpointRecord> {
+    let mut endpoints = daemon_advertised_endpoints_for_state(
+        state, node_id, options, priority, lan_ips, route_ips,
+    );
+    append_manual_daemon_endpoints(
+        &mut endpoints,
+        node_id,
+        options.port,
+        priority,
+        manual_endpoints,
+    );
+    endpoints
+}
+
+pub async fn daemon_advertised_endpoints_for_state_with_manual_config_async(
+    state: &ClusterBootstrapState,
+    node_id: &NodeId,
+    options: &DaemonRunOptions,
+    priority: u16,
+    lan_ips: &[IpAddr],
+    route_ips: &[IpAddr],
+    manual_endpoints: &[DaemonManualEndpointConfig],
+) -> Vec<ClusterEndpointRecord> {
+    let mut endpoints = daemon_advertised_endpoints_for_state_async(
+        state, node_id, options, priority, lan_ips, route_ips,
+    )
+    .await;
+    append_manual_daemon_endpoints(
+        &mut endpoints,
+        node_id,
+        options.port,
+        priority,
+        manual_endpoints,
+    );
+    endpoints
+}
+
 fn daemon_advertised_endpoints_from_ips(
     node_id: &NodeId,
     options: &DaemonRunOptions,
@@ -232,6 +319,192 @@ async fn daemon_advertised_endpoints_from_ips_async(
         advertise_host.as_deref(),
     )
     .await
+}
+
+fn append_manual_daemon_endpoints(
+    endpoints: &mut Vec<ClusterEndpointRecord>,
+    node_id: &NodeId,
+    default_port: u16,
+    default_priority: u16,
+    manual_endpoints: &[DaemonManualEndpointConfig],
+) {
+    let env_advertise_host = std::env::var(SINOMO_DAEMON_ADVERTISE_HOST_ENV)
+        .ok()
+        .map(|address| DaemonManualEndpointConfig {
+            address,
+            scope: None,
+            priority: Some(default_priority.saturating_add(5)),
+        });
+    let configured = manual_endpoints.iter().cloned().chain(env_advertise_host);
+    for manual in configured {
+        let Some(parsed) = parse_manual_daemon_endpoint(&manual.address, node_id, default_port)
+        else {
+            continue;
+        };
+        let priority = manual
+            .priority
+            .unwrap_or_else(|| default_priority.saturating_add(5));
+        let configured_scope = manual
+            .scope
+            .clone()
+            .or_else(|| parsed.default_scope.clone());
+        if let Some(endpoint) = endpoints.iter_mut().find(|endpoint| {
+            (endpoint.transport == parsed.transport && endpoint.address == parsed.address)
+                || parsed
+                    .endpoint_id
+                    .as_ref()
+                    .is_some_and(|endpoint_id| endpoint.endpoint_id == *endpoint_id)
+        }) {
+            endpoint.source = ClusterEndpointSource::Static;
+            endpoint.transport = parsed.transport.clone();
+            endpoint.address = parsed.address;
+            endpoint.priority = priority;
+            if let Some(scope) = configured_scope {
+                endpoint.privacy = scope;
+            }
+            continue;
+        }
+        let mut endpoint = parsed.into_endpoint(node_id, priority);
+        endpoint.source = ClusterEndpointSource::Static;
+        if let Some(scope) = manual.scope {
+            endpoint.privacy = scope;
+        }
+        endpoints.push(endpoint);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedManualDaemonEndpoint {
+    transport: ClusterTransportKind,
+    address: String,
+    endpoint_id: Option<sinomo_core::network::ClusterEndpointId>,
+    default_scope: Option<ClusterEndpointPrivacy>,
+}
+
+impl ParsedManualDaemonEndpoint {
+    fn into_endpoint(self, node_id: &NodeId, priority: u16) -> ClusterEndpointRecord {
+        let mut endpoint = match self.transport {
+            ClusterTransportKind::LanTcp => {
+                sinomo_core::network::daemon_lan_endpoint(node_id, self.address, priority)
+            }
+            ClusterTransportKind::Iroh => {
+                let mut endpoint =
+                    sinomo_core::network::daemon_lan_endpoint(node_id, self.address, priority);
+                endpoint.transport = ClusterTransportKind::Iroh;
+                endpoint.privacy = ClusterEndpointPrivacy::Relayed;
+                endpoint
+            }
+            transport => {
+                let mut endpoint =
+                    sinomo_core::network::daemon_lan_endpoint(node_id, self.address, priority);
+                endpoint.transport = transport;
+                endpoint
+            }
+        };
+        if let Some(endpoint_id) = self.endpoint_id {
+            endpoint.endpoint_id = endpoint_id;
+        }
+        if let Some(default_scope) = self.default_scope {
+            endpoint.privacy = default_scope;
+        }
+        endpoint
+    }
+}
+
+fn parse_manual_daemon_endpoint(
+    raw: &str,
+    node_id: &NodeId,
+    default_port: u16,
+) -> Option<ParsedManualDaemonEndpoint> {
+    let value = raw.trim();
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return normalize_tcp_manual_endpoint_address(value, default_port).map(|address| {
+            ParsedManualDaemonEndpoint {
+                transport: ClusterTransportKind::LanTcp,
+                address,
+                endpoint_id: None,
+                default_scope: None,
+            }
+        });
+    };
+    match scheme.to_ascii_lowercase().as_str() {
+        "tcp" | "lan-tcp" => {
+            normalize_tcp_manual_endpoint_address(rest, default_port).map(|address| {
+                ParsedManualDaemonEndpoint {
+                    transport: ClusterTransportKind::LanTcp,
+                    address,
+                    endpoint_id: None,
+                    default_scope: None,
+                }
+            })
+        }
+        "iroh" => {
+            let address = format!("iroh://{rest}");
+            let (public_key, default_scope) = parse_manual_iroh_endpoint_scope(&address)?;
+            Some(ParsedManualDaemonEndpoint {
+                transport: ClusterTransportKind::Iroh,
+                address,
+                endpoint_id: Some(sinomo_core::network::stable_iroh_endpoint_id(
+                    node_id,
+                    &public_key,
+                )),
+                default_scope: Some(default_scope),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn parse_manual_iroh_endpoint_scope(address: &str) -> Option<(String, ClusterEndpointPrivacy)> {
+    let rest = address.strip_prefix("iroh://")?;
+    let (public_key, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let public_key = public_key.trim();
+    if public_key.is_empty() {
+        return None;
+    }
+    let has_relay = query.split('&').any(|part| {
+        part.strip_prefix("relay=")
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    let scope = if has_relay {
+        ClusterEndpointPrivacy::Relayed
+    } else {
+        ClusterEndpointPrivacy::InternetDirect
+    };
+    Some((public_key.to_string(), scope))
+}
+
+fn normalize_tcp_manual_endpoint_address(raw: &str, default_port: u16) -> Option<String> {
+    let host = raw.trim();
+    if host.is_empty()
+        || host.contains("://")
+        || host.chars().any(|char| matches!(char, '/' | '?' | '#'))
+    {
+        return None;
+    }
+    let address = if let Ok(socket) = host.parse::<std::net::SocketAddr>() {
+        if socket.ip().is_unspecified() {
+            return None;
+        }
+        host.to_string()
+    } else if let Ok(ip) = host.parse::<IpAddr>() {
+        if ip.is_unspecified() {
+            return None;
+        }
+        sinomo_core::network::format_ip_port(ip, default_port)
+    } else if let Some((name, explicit_port)) = host.rsplit_once(':') {
+        if !name.contains(':') && explicit_port.parse::<u16>().is_ok() {
+            host.to_string()
+        } else {
+            format!("[{host}]:{default_port}")
+        }
+    } else {
+        format!("{host}:{default_port}")
+    };
+    if sinomo_core::network::is_loopback_connect_address(&address) {
+        return None;
+    }
+    Some(address)
 }
 
 pub fn current_shadow_daemon_options(data_dir: &Path, timeout: Duration) -> DaemonRunOptions {
@@ -954,6 +1227,130 @@ mod tests {
                 && endpoint.privacy == ClusterEndpointPrivacy::Lan
                 && endpoint.priority == 5
         }));
+    }
+
+    #[test]
+    fn manual_endpoint_config_adds_public_endpoint() {
+        let now = OffsetDateTime::now_utc();
+        let state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_manual_endpoint").expect("cluster"),
+            "manual endpoint".to_string(),
+            NodeId::from_legacy_named("node_manual_endpoint").expect("node"),
+            "manual endpoint".to_string(),
+            "main-public-key".to_string(),
+            now,
+        );
+        let endpoints = daemon_advertised_endpoints_for_state_with_manual_config(
+            &state,
+            &state.local_node_id,
+            &DaemonRunOptions {
+                host: "0.0.0.0".to_string(),
+                port: 21_353,
+            },
+            0,
+            &[],
+            &[],
+            &[DaemonManualEndpointConfig {
+                address: "tcp://129.146.106.76".to_string(),
+                scope: None,
+                priority: None,
+            }],
+        );
+
+        assert!(endpoints.iter().any(|endpoint| {
+            endpoint.node_id == state.local_node_id
+                && endpoint.transport == ClusterTransportKind::LanTcp
+                && endpoint.address == "129.146.106.76:21353"
+                && endpoint.source == ClusterEndpointSource::Static
+                && endpoint.privacy == ClusterEndpointPrivacy::InternetDirect
+                && endpoint.priority == 5
+        }));
+    }
+
+    #[test]
+    fn manual_endpoint_config_adds_iroh_url_endpoint() {
+        let now = OffsetDateTime::now_utc();
+        let state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_manual_iroh_endpoint").expect("cluster"),
+            "manual iroh endpoint".to_string(),
+            NodeId::from_legacy_named("node_manual_iroh_endpoint").expect("node"),
+            "manual iroh endpoint".to_string(),
+            "main-public-key".to_string(),
+            now,
+        );
+        let address = "iroh://manual_iroh_key?relay=https://relay.example/".to_string();
+        let endpoints = daemon_advertised_endpoints_for_state_with_manual_config(
+            &state,
+            &state.local_node_id,
+            &DaemonRunOptions::default(),
+            0,
+            &[],
+            &[],
+            &[DaemonManualEndpointConfig {
+                address: address.clone(),
+                scope: None,
+                priority: Some(9),
+            }],
+        );
+
+        assert!(endpoints.iter().any(|endpoint| {
+            endpoint.node_id == state.local_node_id
+                && endpoint.endpoint_id
+                    == sinomo_core::network::stable_iroh_endpoint_id(
+                        &state.local_node_id,
+                        "manual_iroh_key",
+                    )
+                && endpoint.transport == ClusterTransportKind::Iroh
+                && endpoint.address == address
+                && endpoint.source == ClusterEndpointSource::Static
+                && endpoint.privacy == ClusterEndpointPrivacy::Relayed
+                && endpoint.priority == 9
+        }));
+    }
+
+    #[test]
+    fn endpoint_advertisement_config_file_reads_scope_and_privacy_alias() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-endpoint-config");
+        let config_path = daemon_endpoint_advertisement_config_file(&root);
+        fs::create_dir_all(config_path.parent().expect("config parent")).expect("config dir");
+        fs::write(
+            &config_path,
+            br#"{
+                "main": [
+                    {
+                        "address": "tcp://129.146.106.76:21353",
+                        "scope": "internet-direct"
+                    }
+                ],
+                "shadow": [
+                    {
+                        "address": "129.146.106.76",
+                        "privacy": "internet-direct",
+                        "priority": 12
+                    }
+                ]
+            }"#,
+        )
+        .expect("write config");
+
+        let config = read_daemon_endpoint_advertisement_config(&root).expect("read config");
+
+        assert_eq!(config.main_endpoints.len(), 1);
+        assert_eq!(
+            config.main_endpoints[0].address,
+            "tcp://129.146.106.76:21353"
+        );
+        assert_eq!(
+            config.main_endpoints[0].scope,
+            Some(ClusterEndpointPrivacy::InternetDirect)
+        );
+        assert_eq!(config.shadow_endpoints.len(), 1);
+        assert_eq!(config.shadow_endpoints[0].address, "129.146.106.76");
+        assert_eq!(
+            config.shadow_endpoints[0].scope,
+            Some(ClusterEndpointPrivacy::InternetDirect)
+        );
+        assert_eq!(config.shadow_endpoints[0].priority, Some(12));
     }
 
     #[test]

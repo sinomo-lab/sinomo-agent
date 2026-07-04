@@ -18764,6 +18764,103 @@ fn cluster_doctor_warns_unreachable_endpoint_without_healthy_route() {
     );
 }
 
+#[test]
+fn cluster_doctor_warns_missing_authority_route_when_connectivity_is_asymmetric() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_doctor_asymmetric_route").expect("cluster");
+    let first = NodeId::from_legacy_named("node_network_doctor_asymmetric_first").expect("first");
+    let second =
+        NodeId::from_legacy_named("node_network_doctor_asymmetric_second").expect("second");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "doctor asymmetric route",
+        first.clone(),
+        "first",
+        "pk-first",
+        now,
+    );
+    state.members.push(ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        second.clone(),
+        "second",
+        "pk-second",
+        now,
+    ));
+    let records = vec![doctor_connectivity_record(
+        &cluster_id,
+        &first,
+        &second,
+        "endpoint_network_doctor_asymmetric_first_second",
+        "172.25.0.2:21353",
+        ClusterConnectivityState::Healthy,
+    )];
+
+    let findings = cluster_doctor_findings(&state, &records, &[]);
+
+    assert!(
+        findings.iter().any(|finding| {
+            finding.code == "authority-route-missing"
+                && finding.detail.contains(second.as_str())
+                && finding.detail.contains(first.as_str())
+        }),
+        "missing reverse authority routes should be reported: {findings:?}"
+    );
+}
+
+#[test]
+fn cluster_doctor_accepts_bidirectional_authority_routes() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_network_doctor_bidirectional_route")
+        .expect("cluster");
+    let first =
+        NodeId::from_legacy_named("node_network_doctor_bidirectional_first").expect("first");
+    let second =
+        NodeId::from_legacy_named("node_network_doctor_bidirectional_second").expect("second");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "doctor bidirectional route",
+        first.clone(),
+        "first",
+        "pk-first",
+        now,
+    );
+    state.members.push(ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        second.clone(),
+        "second",
+        "pk-second",
+        now,
+    ));
+    let records = vec![
+        doctor_connectivity_record(
+            &cluster_id,
+            &first,
+            &second,
+            "endpoint_network_doctor_bidirectional_first_second",
+            "172.25.0.2:21353",
+            ClusterConnectivityState::Healthy,
+        ),
+        doctor_connectivity_record(
+            &cluster_id,
+            &second,
+            &first,
+            "endpoint_network_doctor_bidirectional_second_first",
+            "172.25.0.1:21353",
+            ClusterConnectivityState::Healthy,
+        ),
+    ];
+
+    let findings = cluster_doctor_findings(&state, &records, &[]);
+
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.code != "authority-route-missing"),
+        "bidirectional authority routes should not warn: {findings:?}"
+    );
+}
+
 #[derive(Default)]
 struct RecordingClusterNetworkInfoPublishHost {
     cache_matches: bool,

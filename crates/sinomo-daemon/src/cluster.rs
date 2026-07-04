@@ -5565,23 +5565,26 @@ fn local_daemon_membership_observation(
         sinomo_core::network::ClusterEndpointSelector::discover_peer_route_ip_candidates_for_state(
             state,
         );
+    let endpoint_config = crate::read_daemon_endpoint_advertisement_config(data_dir)?;
     let main_node_id = state.local_node_id.clone();
     let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
-    let main_endpoints = crate::daemon_advertised_endpoints_for_state(
+    let main_endpoints = crate::daemon_advertised_endpoints_for_state_with_manual_config(
         state,
         &main_node_id,
         main_options,
         0,
         &lan_ips,
         &route_ips,
+        &endpoint_config.main_endpoints,
     );
-    let shadow_endpoints = crate::daemon_advertised_endpoints_for_state(
+    let shadow_endpoints = crate::daemon_advertised_endpoints_for_state_with_manual_config(
         state,
         &shadow_node_id,
         shadow_options,
         10,
         &lan_ips,
         &route_ips,
+        &endpoint_config.shadow_endpoints,
     );
     let main_identity = load_or_create_main_node_identity(data_dir)?;
     let shadow_identity = load_or_create_shadow_node_identity(data_dir)?;
@@ -5610,23 +5613,26 @@ async fn local_daemon_membership_observation_async(
             state,
         );
     let (lan_ips, route_ips) = tokio::join!(lan_ips, route_ips);
+    let endpoint_config = crate::read_daemon_endpoint_advertisement_config(data_dir)?;
     let main_node_id = state.local_node_id.clone();
     let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
-    let main_endpoints = crate::daemon_advertised_endpoints_for_state_async(
+    let main_endpoints = crate::daemon_advertised_endpoints_for_state_with_manual_config_async(
         state,
         &main_node_id,
         main_options,
         0,
         &lan_ips,
         &route_ips,
+        &endpoint_config.main_endpoints,
     );
-    let shadow_endpoints = crate::daemon_advertised_endpoints_for_state_async(
+    let shadow_endpoints = crate::daemon_advertised_endpoints_for_state_with_manual_config_async(
         state,
         &shadow_node_id,
         shadow_options,
         10,
         &lan_ips,
         &route_ips,
+        &endpoint_config.shadow_endpoints,
     );
     let identity_root = data_dir.to_path_buf();
     let identity_path = identity_root.display().to_string();

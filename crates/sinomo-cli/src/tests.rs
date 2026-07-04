@@ -25,9 +25,10 @@ use super::{
     cluster_invite_with_paths, cluster_join_with_paths, cluster_kv_state_authority_id,
     cluster_leave, cluster_leave_with_paths, cluster_migration_plan_with_paths,
     cluster_node_status_from_daemon_status, cluster_peer_members, cluster_rename,
-    daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_http_fetch,
-    daemon_package_version, data_dir_storage_contract_findings, default_dfs_file_system_id,
-    ensure_rollout_layout, expire_cluster_network_records_in_kv, format_rollout_progress_line,
+    daemon_advertised_endpoints_for_state, daemon_endpoint_advertisement_config_file,
+    daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
+    data_dir_storage_contract_findings, default_dfs_file_system_id, ensure_rollout_layout,
+    expire_cluster_network_records_in_kv, format_rollout_progress_line,
     handle_daemon_cluster_join_request, handle_daemon_cluster_kv_txn_request,
     handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
     load_tui_model_runtime_config, main_agent_config_tool_registry,
@@ -7488,6 +7489,60 @@ fn cluster_init_persists_local_cluster_state() {
         cluster_kv_state_authority_id(&paths, &state).expect("reelected state authority"),
         Some(NodeId::from_legacy_named("node_local").expect("node"))
     );
+}
+
+#[test]
+fn cluster_init_merges_manual_endpoint_config() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-init-manual-endpoint");
+    let config_path = daemon_endpoint_advertisement_config_file(&root);
+    fs::create_dir_all(config_path.parent().expect("config parent")).expect("config dir");
+    fs::write(
+        &config_path,
+        br#"{
+            "main": [
+                {
+                    "address": "tcp://129.146.106.76:21353",
+                    "scope": "internet-direct"
+                }
+            ],
+            "shadow": [
+                {
+                    "address": "tcp://129.146.106.76:21354",
+                    "scope": "internet-direct"
+                }
+            ]
+        }"#,
+    )
+    .expect("write endpoint config");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(
+                ClusterId::from_legacy_named("cluster_manual_endpoint").expect("cluster"),
+            ),
+            node_id: Some(NodeId::from_legacy_named("node_manual_endpoint").expect("node")),
+            name: "manual endpoint".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+
+    let state = read_cluster_state(&paths).expect("cluster state");
+    let member = state
+        .members
+        .iter()
+        .find(|member| member.node_id == state.local_node_id)
+        .expect("main daemon member");
+
+    assert!(member.endpoints.iter().any(|endpoint| {
+        endpoint.address == "129.146.106.76:21353"
+            && endpoint.privacy == ClusterEndpointPrivacy::InternetDirect
+    }));
+    assert!(member.endpoints.iter().any(|endpoint| {
+        endpoint.address == "129.146.106.76:21354"
+            && endpoint.privacy == ClusterEndpointPrivacy::InternetDirect
+    }));
 }
 
 #[test]
