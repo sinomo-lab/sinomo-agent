@@ -97,8 +97,9 @@ pub const DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF: Duration = Duration::from_secs
 /// window (relay routes need connectivity records, which need relayed
 /// publishes — only fast retry breaks the cycle once the bridge publishes).
 pub const DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const DAEMON_CLUSTER_FORMATION_CONTROL_PLANE_TIMEOUT: Duration = Duration::from_millis(1500);
+const DAEMON_CLUSTER_FORMATION_CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(8);
 const DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT: Duration = Duration::from_millis(750);
+const DAEMON_CLUSTER_FORMATION_IROH_COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 const DAEMON_CLUSTER_FORMATION_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(350);
 const DAEMON_CLUSTER_JOIN_CONNECTIVITY_RETRY_WINDOW: Duration = Duration::from_secs(8);
 const DAEMON_CLUSTER_JOIN_CONNECTIVITY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -6590,10 +6591,10 @@ fn cluster_formation_control_plane_timeouts() -> sinomo_core::cluster::ClusterCo
     timeouts.rpc_timeout = DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT;
     timeouts.membership_rpc_timeout = DAEMON_CLUSTER_FORMATION_CONTROL_PLANE_TIMEOUT;
     timeouts.tcp_command_timeout = DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT;
-    timeouts.iroh_command_timeout = DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT;
+    timeouts.iroh_command_timeout = DAEMON_CLUSTER_FORMATION_IROH_COMMAND_TIMEOUT;
     timeouts.tcp_foreground_attempt_timeout = DAEMON_CLUSTER_FORMATION_FOREGROUND_ATTEMPT_TIMEOUT;
     timeouts.public_foreground_attempt_timeout = DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT;
-    timeouts.iroh_foreground_attempt_timeout = DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT;
+    timeouts.iroh_foreground_attempt_timeout = DAEMON_CLUSTER_FORMATION_IROH_COMMAND_TIMEOUT;
     timeouts
 }
 
@@ -7746,6 +7747,32 @@ mod tests {
         );
         maintenance.record_publish_success();
         assert_eq!(maintenance.publish_failure_streak, 0);
+    }
+
+    #[test]
+    fn formation_timeouts_keep_tcp_short_but_allow_relay_publish() {
+        let timeouts = cluster_formation_control_plane_timeouts();
+
+        assert_eq!(
+            timeouts.tcp_command_timeout,
+            DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT
+        );
+        assert_eq!(
+            timeouts.tcp_foreground_attempt_timeout,
+            DAEMON_CLUSTER_FORMATION_FOREGROUND_ATTEMPT_TIMEOUT
+        );
+        assert_eq!(
+            timeouts.iroh_command_timeout,
+            DAEMON_CLUSTER_FORMATION_IROH_COMMAND_TIMEOUT
+        );
+        assert_eq!(
+            timeouts.iroh_foreground_attempt_timeout,
+            DAEMON_CLUSTER_FORMATION_IROH_COMMAND_TIMEOUT
+        );
+        assert!(
+            timeouts.raft_append_timeout >= DAEMON_CLUSTER_FORMATION_IROH_COMMAND_TIMEOUT,
+            "formation relay publishes need enough total budget for a high-latency Iroh write plus snapshot read"
+        );
     }
 
     #[test]
