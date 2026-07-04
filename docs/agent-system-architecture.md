@@ -492,6 +492,23 @@ retention, coding continuation after compaction, and live-cluster operations
 after compaction. Fixture mode validates harness structure without invoking a
 model. Live/model results are research and eval evidence; local readiness remains responsible only for deterministic projection and persistence invariants.
 
+## Skills
+
+Deterministic fake-model coverage in `sinomo-agent` verifies progressive
+disclosure from active catalog skills and `skill_update` writeback. Live/model
+quality is covered by the optional benchmark module:
+
+```sh
+python3 modules/benchmark/sinomo-benchmarks/agent/run_skill_eval.py --mode plan
+python3 modules/benchmark/sinomo-benchmarks/agent/run_skill_eval.py --mode fixture --summary-out benchmark-results/agent-skill/fixture-summary.json
+python3 modules/benchmark/sinomo-benchmarks/agent/run_skill_eval.py --mode run --provider codex --model gpt-5.5
+```
+
+The checked-in live scenarios seed benchmark-only active skills into a temporary
+`SINOMO_DATA_DIR`. One task can only be answered by reading hidden `SKILL.md`
+text through skill disclosure tools; another requires persisting a revealed
+shortcut with `skill_update` and then using it in a fresh follow-up run.
+
 ## Model and Local Runtime
 
 The local PyTorch bridge lives in `crates/sinomo-pytorch`. It owns the stable
