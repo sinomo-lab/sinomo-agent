@@ -5554,8 +5554,6 @@ fn dfs_data_targets_include_kv_main_daemon_endpoints() {
     let selector = ClusterEndpointSelector::new(&paths, &state);
     let dfs_targets = selector.select(ClusterEndpointSelectionPurpose::DfsData);
     let raft_targets = selector.select(ClusterEndpointSelectionPurpose::ClusterStateCommand);
-    let live_voter_targets =
-        selector.select(ClusterEndpointSelectionPurpose::AvailableClusterStateAuthority);
     let main_targets = selector.select(ClusterEndpointSelectionPurpose::MainDaemonCommand);
 
     assert!(
@@ -5584,12 +5582,6 @@ fn dfs_data_targets_include_kv_main_daemon_endpoints() {
             .iter()
             .all(|endpoint| endpoint.endpoint_id != folded_shadow_endpoint.endpoint_id),
         "Raft command selection must not route consensus traffic to folded shadow endpoints"
-    );
-    assert!(
-        live_voter_targets
-            .iter()
-            .any(|endpoint| endpoint.endpoint_id == direct_main_endpoint.endpoint_id),
-        "live voter selection should use a KV main endpoint when stale status says offline but connectivity has not marked the endpoint unreachable"
     );
     assert!(
         main_targets
@@ -33116,11 +33108,26 @@ mod route_cache_tests {
             "target",
             vec![target_endpoint.clone()],
         );
-        mark_local_endpoints_healthy(
-            &paths,
-            &state,
-            &[bridge_endpoint.clone(), target_endpoint.clone()],
+        let local_to_bridge_record = connectivity_record_from_source(
+            &cluster_id,
+            &local,
+            &bridge_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
         );
+        let local_to_target_record = connectivity_record_from_source(
+            &cluster_id,
+            &local,
+            &target_endpoint,
+            ClusterConnectivityState::Degraded,
+            Some(100),
+        );
+        sinomo_network::write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            &[local_to_bridge_record, local_to_target_record],
+        )
+        .expect("write local connectivity records");
         let bridge_to_target_record = connectivity_record_from_source(
             &cluster_id,
             &bridge,

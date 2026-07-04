@@ -337,6 +337,9 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .unwrap_or(DEFAULT_ROUNDTRIP_BASE)
         .trim_end_matches('/')
         .to_string();
+    let timeout = expect_timeout(ctx)?;
+    let started = Instant::now();
+    let deadline = started + timeout;
     let backend = open_backend(ctx)?;
     let node = backend.node_label();
     let nonce = probe_nonce();
@@ -347,9 +350,11 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("path", &path);
     ctx.record("renamed", &renamed);
 
-    backend
-        .write_file(&path, payload.as_bytes())
-        .map_err(SinomoTestError::failed)?;
+    retry_bulk_mutation(
+        deadline,
+        || backend.write_file(&path, payload.as_bytes()),
+        || format!("cannot write SIFS file {path}"),
+    )?;
     expect_payload_now(&backend, &path, payload.as_bytes(), "after write")?;
 
     backend
@@ -1069,21 +1074,27 @@ fn run_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let path = ctx.required_parameter("path")?.to_string();
     let payload = required_payload_bytes(ctx)?;
     let foreground_repair = optional_bool_parameter(ctx, "foreground-repair", false)?;
+    let timeout = expect_timeout(ctx)?;
+    let started = Instant::now();
+    let deadline = started + timeout;
     let backend = open_backend(ctx)?;
     let node = backend.node_label();
-    if foreground_repair {
-        backend
-            .write_file_with_foreground_replica_repair(&path, &payload)
-            .map_err(SinomoTestError::failed)?;
-    } else {
-        backend
-            .write_file(&path, &payload)
-            .map_err(SinomoTestError::failed)?;
-    }
+    retry_bulk_mutation(
+        deadline,
+        || {
+            if foreground_repair {
+                backend.write_file_with_foreground_replica_repair(&path, &payload)
+            } else {
+                backend.write_file(&path, &payload)
+            }
+        },
+        || format!("cannot write SIFS file {path}"),
+    )?;
     ctx.record("node", &node);
     ctx.record("path", &path);
     ctx.record("bytes", payload.len());
     ctx.record("foreground_repair", foreground_repair);
+    ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
     Ok(SinomoTestOutcome::passed(format!(
         "wrote {} bytes to {path} on node {node}",
         payload.len()
@@ -2860,7 +2871,10 @@ fn is_retryable_rename_error(error: &str) -> bool {
 }
 
 fn is_retryable_dfs_probe_error(error: &str) -> bool {
-    (error.contains("DFS error: network error") && error.contains("timed out"))
+    error.contains("metadata shard config incomplete")
+        || error.contains("authority redirects")
+        || error.contains("write did not commit yet")
+        || (error.contains("DFS error: network error") && error.contains("timed out"))
         || (error.contains("metadata serialization error")
             && (error.contains("invalid magic") || error.contains("unexpected end of input")))
 }

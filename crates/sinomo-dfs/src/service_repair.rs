@@ -1914,6 +1914,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub(crate) fn repair_retry_is_due(&self, intent_id: &str, replica_node_id: &NodeId) -> bool {
         if self
+            .pending_remote_write_responses
+            .get(intent_id)
+            .is_some_and(|pending| pending.foreground_replica_repair)
+        {
+            let Some(pending_write) = self.pending_writes.get(intent_id) else {
+                return false;
+            };
+            return pending_write
+                .repair_retries
+                .get(replica_node_id)
+                .is_none_or(|state| !repair_retry_state_is_suppressed(state) && !state.inflight);
+        }
+        if self
             .repair_attempt_records
             .get(&(intent_id.to_string(), replica_node_id.clone()))
             .is_some_and(|record| record.next_retry_unix_nanos > dfs_now_unix_nanos())

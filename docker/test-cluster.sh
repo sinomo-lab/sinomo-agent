@@ -282,12 +282,13 @@ wait_for_dfs_ready() {
 }
 
 wait_for_network_ready() {
-  local deadline node still
+  local deadline node pending still
   log "network-ready: waiting for relay/auth convergence (<=${NETWORK_READY_WAIT}s)"
   deadline=$(( $(date +%s) + NETWORK_READY_WAIT ))
+  pending="$NODES"
   while :; do
     still=""
-    for node in $NODES; do
+    for node in $pending; do
       if compose exec -T "$node" sinomo test run cluster.network.ping-benchmark \
           --require-cluster \
           --json \
@@ -307,10 +308,11 @@ wait_for_network_ready() {
         still="$still $node"
       fi
     done
-    [ -z "$still" ] && return 0
+    pending="${still# }"
+    [ -z "$pending" ] && return 0
     if [ "$(date +%s)" -ge "$deadline" ]; then
-      log "network-ready: nodes never became ready:$still"
-      for node in $still; do
+      log "network-ready: nodes never became ready: $pending"
+      for node in $pending; do
         log "  $node last probe output:"
         sed 's/^/      /' "$ARTIFACTS/network-ready-$node.last.json" | tail -12
       done

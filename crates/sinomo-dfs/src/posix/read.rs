@@ -13,6 +13,7 @@ use crate::namespace::next_version;
 use crate::posix_model::{
     DfsPosixError, DfsPosixFileRangeReadStream, DfsPosixFileReadStream, Result, read_conflict_error,
 };
+use crate::posix_path::normalize_posix_path;
 use crate::{
     DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest, DfsError, DfsMessageTransport,
     DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsReadData,
@@ -274,9 +275,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut grouped = BTreeMap::<NodeId, Vec<String>>::new();
         let mut seen = BTreeSet::<(NodeId, String)>::new();
         for input_path in paths {
-            let Ok(resolved) = self.resolve_existing_posix_path_distributed(input_path, true)
-            else {
-                continue;
+            let resolved = match self.resolve_existing_posix_path_distributed(input_path, true) {
+                Ok(resolved) => resolved,
+                Err(DfsPosixError::NotFound { .. }) => {
+                    let Ok(normalized) = normalize_posix_path(input_path) else {
+                        continue;
+                    };
+                    normalized
+                }
+                Err(_) => continue,
             };
             if self.lookup_sifs_path(&resolved).ok().flatten().is_some() {
                 continue;

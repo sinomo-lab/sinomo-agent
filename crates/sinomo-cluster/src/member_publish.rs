@@ -304,9 +304,6 @@ pub fn publish_local_members_to_quorum_if_needed_with_host(
         return Ok(None);
     }
     let already_published = cluster_member_publish_matches_kv(paths, &members).unwrap_or(false);
-    if already_published && !options.force_kv_snapshot_sync {
-        return Ok(None);
-    }
     if sinomo_kv::cluster_kv_raft_local_is_voter(state)
         && host.cluster_has_local_quorum(paths, state)
     {
@@ -321,6 +318,12 @@ pub fn publish_local_members_to_quorum_if_needed_with_host(
                 cluster_member_publish_txn_from_kv(paths, &members)?,
             )
             .map(Some);
+    }
+    if already_published
+        && !options.force_kv_snapshot_sync
+        && member_publish_targets_voter_first(paths, state).is_empty()
+    {
+        return Ok(None);
     }
     publish_local_members_via_voter_with_host(paths, state, options, host)?;
     Ok(None)
@@ -348,9 +351,6 @@ pub async fn publish_local_members_to_quorum_if_needed_async_with_host(
             operation: "cluster local member publish match".to_string(),
             detail: format!("member publish match task failed: {source}"),
         })?;
-    if already_published && !options.force_kv_snapshot_sync {
-        return Ok(None);
-    }
     if sinomo_kv::cluster_kv_raft_local_is_voter(state)
         && host.cluster_has_local_quorum_async(paths, state).await?
     {
@@ -373,6 +373,23 @@ pub async fn publish_local_members_to_quorum_if_needed_async_with_host(
             .commit_cluster_kv_txn_with_quorum_async(paths, &mut commit_state, txn)
             .await
             .map(Some);
+    }
+    if already_published && !options.force_kv_snapshot_sync {
+        let paths_for_targets = paths.clone();
+        let state_for_targets = state.clone();
+        let has_publish_targets = runtime
+            .spawn_blocking(move || {
+                !member_publish_targets_voter_first(&paths_for_targets, &state_for_targets)
+                    .is_empty()
+            })
+            .await
+            .map_err(|source| NetworkError::Io {
+                operation: "cluster local member publish target probe".to_string(),
+                detail: format!("member publish target probe task failed: {source}"),
+            })?;
+        if !has_publish_targets {
+            return Ok(None);
+        }
     }
     publish_local_members_via_voter_async_with_host(runtime, paths, state, options, host).await?;
     Ok(None)

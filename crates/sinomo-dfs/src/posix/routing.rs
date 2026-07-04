@@ -6,8 +6,11 @@
 //! operations should run locally or be sent to another shard primary.
 
 use super::{POSIX_READ_FRESHNESS_SYNC_TIMEOUT, POSIX_ROUTED_SYNC_RETRY_ROUNDS};
+use crate::namespace::{SIFS_SERVICES_PATH, SIFS_USERS_PATH};
 use crate::posix_model::{DfsPosixError, DfsStat, Result, posix_error_for_namespace_rejection};
-use crate::posix_path::{normalized_posix_path_key, parent_posix_path};
+use crate::posix_path::{
+    normalized_posix_path_key, parent_posix_path, posix_path_is_at_or_under_prefix,
+};
 use crate::{
     DfsControlPlaneStore, DfsError, DfsMessageTransport, DfsMetadataShardConfig,
     DfsMetadataShardId, DfsNamespaceJobKind, DfsNamespaceOperation, DfsNamespaceResult,
@@ -101,14 +104,50 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         shards: &[DfsMetadataShardConfig],
     ) -> Result<Option<DfsMetadataShardConfig>> {
-        Ok(
+        let selected =
             crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
                 &sifs_file_system_id(),
                 shards,
                 path,
             )
-            .map_err(DfsError::from)?,
-        )
+            .map_err(DfsError::from)?;
+        self.reject_stale_default_sifs_root_fallback(path, selected.as_ref())?;
+        Ok(selected)
+    }
+
+    fn reject_stale_default_sifs_root_fallback(
+        &self,
+        path: &str,
+        selected: Option<&DfsMetadataShardConfig>,
+    ) -> Result<()> {
+        let Some((expected_shard_id, expected_prefix)) = default_sifs_split_shard_for_path(path)
+        else {
+            return Ok(());
+        };
+        if selected.is_some_and(|shard| shard.shard_id == expected_shard_id) {
+            return Ok(());
+        }
+        let Some(metadata_backend) = self.metadata_backend.as_deref() else {
+            return Ok(());
+        };
+        let expected_file_system_id = sifs_file_system_id();
+        let local_has_expected_shard =
+            metadata_backend
+                .metadata_shard_statuses()?
+                .iter()
+                .any(|status| {
+                    status.shard_id.0.as_str() == expected_shard_id
+                        && status.file_system_id.as_ref() == Some(&expected_file_system_id)
+                });
+        if !local_has_expected_shard {
+            return Ok(());
+        }
+        Err(DfsError::Distributed {
+            message: format!(
+                "raft node is busy at metadata shard config incomplete for {path}: missing default {expected_shard_id} shard for {expected_prefix}"
+            ),
+        }
+        .into())
     }
 
     pub(super) fn routed_namespace_primary_for_path_from_snapshot(
@@ -634,6 +673,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(());
         }
         self.touch_directory_modified(&parent)
+    }
+}
+
+fn default_sifs_split_shard_for_path(path: &str) -> Option<(&'static str, &'static str)> {
+    if posix_path_is_at_or_under_prefix(path, SIFS_SERVICES_PATH) {
+        Some(("services", SIFS_SERVICES_PATH))
+    } else if posix_path_is_at_or_under_prefix(path, SIFS_USERS_PATH) {
+        Some(("users", SIFS_USERS_PATH))
+    } else {
+        None
     }
 }
 

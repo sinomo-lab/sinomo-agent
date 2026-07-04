@@ -23331,6 +23331,37 @@ fn sifs_posix_cluster_pump_until(
     }
 }
 
+fn sifs_cluster_blocking_distributed_read_with_pump(
+    reader: &mut NetworkedDfsService<sinomo_core::network::InProcessTransport>,
+    path: &str,
+    what: &str,
+    mut pump: impl FnMut(),
+) -> Vec<u8> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let distributed_read_path = path.to_string();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let result = reader.posix_read_file_distributed(&distributed_read_path);
+            tx.send(result).expect("send distributed read result");
+        });
+        let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+        loop {
+            pump();
+            match rx.try_recv() {
+                Ok(result) => return result.unwrap_or_else(|error| panic!("{what}: {error}")),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("distributed read worker disconnected while waiting for {what}")
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("blocking distributed read did not complete: {what}");
+            }
+            std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+        }
+    })
+}
+
 fn sifs_cluster_write_options(node_id: &NodeId) -> DfsWriteOptions {
     DfsWriteOptions {
         policy: DfsReplicationPolicy::new(1, 1).expect("cluster write policy"),
@@ -24974,10 +25005,18 @@ fn sifs_cluster_posix_contract_stale_cache_current_read_invalidation() {
             .posix_stat(path)
             .is_ok_and(|stat| stat.content_hash.as_deref() == Some(content_hash(&new).as_str()))
     });
-    let read = cluster
-        .writer
-        .posix_read_file_distributed(path)
-        .expect("current distributed read");
+    let read = {
+        let primary = &mut cluster.primary;
+        let writer = &mut cluster.writer;
+        sifs_cluster_blocking_distributed_read_with_pump(
+            writer,
+            path,
+            "current distributed read",
+            || {
+                primary.process_incoming().expect("primary pump");
+            },
+        )
+    };
     let stat = cluster
         .writer
         .posix_stat(path)
@@ -25077,10 +25116,18 @@ fn sifs_cluster_posix_contract_damaged_replica_under_concurrent_reads() {
             .posix_stat(path)
             .is_ok_and(|stat| stat.content_hash.as_deref() == Some(content_hash(&new).as_str()))
     });
-    let read = cluster
-        .writer
-        .posix_read_file_distributed(path)
-        .expect("read around damaged replica");
+    let read = {
+        let primary = &mut cluster.primary;
+        let writer = &mut cluster.writer;
+        sifs_cluster_blocking_distributed_read_with_pump(
+            writer,
+            path,
+            "read around damaged replica",
+            || {
+                primary.process_incoming().expect("primary pump");
+            },
+        )
+    };
     let stat = cluster.writer.posix_stat(path).expect("writer stat");
     record_posix_observation(
         &mut observations,
@@ -26328,24 +26375,18 @@ fn sifs_cluster_posix_blocking_write_and_read_with_live_peers() {
         std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
     }
 
-    // The blocking distributed read fetches content from the writer replica,
-    // which keeps serving frames on its own thread.
-    let stop_writer = Arc::new(AtomicBool::new(false));
-    let writer_stop = Arc::clone(&stop_writer);
-    let writer_thread = std::thread::spawn(move || {
-        let mut writer = writer;
-        while !writer_stop.load(Ordering::SeqCst) {
+    // The blocking distributed read consults the metadata primary and fetches
+    // content from the writer replica while both peers keep serving frames.
+    let read = sifs_cluster_blocking_distributed_read_with_pump(
+        &mut observer,
+        path,
+        "blocking distributed read",
+        || {
+            primary.process_incoming().expect("primary pump");
             writer.process_incoming().expect("writer pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        writer
-    });
-    let read = observer
-        .posix_read_file_distributed(path)
-        .expect("blocking distributed read");
+        },
+    );
     assert_eq!(read, bytes);
-    stop_writer.store(true, Ordering::SeqCst);
-    writer_thread.join().expect("writer thread");
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -27157,17 +27198,6 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
     let replica_thread =
         std::thread::spawn(move || pump_sifs_service_until_stop(replica, replica_thread_stop));
 
-    for (path, bytes) in &batch {
-        assert_eq!(
-            users_primary
-                .posix_stat_distributed(path)
-                .expect("remote-primary stat through primary")
-                .content_hash
-                .as_deref(),
-            Some(content_hash(bytes).as_str()),
-            "missing remote-primary bulk path {path}"
-        );
-    }
     let read_paths = batch
         .iter()
         .map(|(path, _)| path.clone())
@@ -27180,6 +27210,18 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
             result.expect("bulk remote read"),
             *bytes,
             "remote primary bulk read returned wrong bytes for {path}"
+        );
+    }
+
+    for (path, bytes) in &batch {
+        assert_eq!(
+            users_primary
+                .posix_stat_distributed(path)
+                .expect("remote-primary stat through primary")
+                .content_hash
+                .as_deref(),
+            Some(content_hash(bytes).as_str()),
+            "missing remote-primary bulk path {path}"
         );
     }
 
