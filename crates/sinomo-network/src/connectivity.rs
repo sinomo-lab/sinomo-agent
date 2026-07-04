@@ -956,10 +956,12 @@ pub fn cluster_connectivity_probe_due_with_graph(
     if record.state == ClusterConnectivityState::Healthy {
         return true;
     }
-    // When the target is already reachable through the current healthy-edge route graph,
+    // When the target is already reachable through a currently healthy route graph,
     // a failed direct endpoint is not load-bearing. Let the record refresh near expiry
     // instead of burning a probe every role interval and churning local connectivity state.
-    if crate::route::cluster_route_next_hop(graph, local_node_id, &endpoint.node_id).is_some() {
+    if crate::route::cluster_healthy_route_next_hop(graph, local_node_id, &endpoint.node_id)
+        .is_some()
+    {
         return false;
     }
     true
@@ -1197,14 +1199,23 @@ impl ClusterConnectivityGraph {
     }
 
     /// Node ids `source` has a CURRENTLY-HEALTHY connectivity record to (over any endpoint),
-    /// excluding `source`. Unlike [`reachable_targets`], `Degraded` does NOT count: a routing
-    /// first hop must be a link we can dial reliably *now*, so a never-reachable peer that is
-    /// merely mid-convergence (transiently `Degraded`) is not treated as a direct hop. This is
-    /// the adjacency multi-hop route discovery in [`crate::route`] walks.
+    /// excluding `source`. Unlike [`reachable_targets`], `Degraded` does NOT count. This is used
+    /// by probe scheduling when deciding whether an alternate path is reliable enough to defer
+    /// refreshing a failed direct endpoint.
     pub fn healthy_targets(&self, source: &NodeId) -> Vec<NodeId> {
         self.healthy_targets_by_source
             .try_cloned_targets(source, "clone healthy connectivity targets")
             .unwrap_or_default()
+    }
+
+    pub fn reachable_target_refs<'a>(
+        &'a self,
+        source: &NodeId,
+    ) -> impl Iterator<Item = &'a NodeId> + 'a {
+        self.reachable_targets_by_source
+            .get(source)
+            .into_iter()
+            .flat_map(|targets| targets.iter())
     }
 
     pub fn healthy_target_refs<'a>(

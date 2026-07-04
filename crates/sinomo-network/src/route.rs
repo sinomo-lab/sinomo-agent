@@ -253,12 +253,28 @@ pub fn cluster_route_next_hop(
         .flatten()
 }
 
+pub(crate) fn cluster_healthy_route_next_hop(
+    graph: &ClusterConnectivityGraph,
+    local: &NodeId,
+    target: &NodeId,
+) -> Option<ClusterRoute> {
+    cluster_route_next_hop_excluding(graph, local, target, &[], ClusterRouteAdjacency::Healthy)
+        .ok()
+        .flatten()
+}
+
 pub(crate) fn cluster_route_next_hop_fallible(
     graph: &ClusterConnectivityGraph,
     local: &NodeId,
     target: &NodeId,
 ) -> Result<Option<ClusterRoute>, NetworkError> {
-    cluster_route_next_hop_excluding(graph, local, target, &[])
+    cluster_route_next_hop_excluding(graph, local, target, &[], ClusterRouteAdjacency::Reachable)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClusterRouteAdjacency {
+    Reachable,
+    Healthy,
 }
 
 fn cluster_route_next_hop_excluding(
@@ -266,6 +282,7 @@ fn cluster_route_next_hop_excluding(
     local: &NodeId,
     target: &NodeId,
     excluded: &[NodeId],
+    adjacency: ClusterRouteAdjacency,
 ) -> Result<Option<ClusterRoute>, NetworkError> {
     if local == target {
         return Ok(None);
@@ -282,20 +299,62 @@ fn cluster_route_next_hop_excluding(
         .map_err(|_| crate::object::network_allocation_error("cluster route queue", 1))?;
     queue.push_back(try_clone_route_node_id(local, "cluster route queue")?);
     while let Some(current) = queue.pop_front() {
-        for next in graph.healthy_target_refs(&current) {
-            if !seen.try_insert_clone(next, "cluster route seen nodes")? {
-                continue;
+        match adjacency {
+            ClusterRouteAdjacency::Reachable => {
+                for next in graph.reachable_target_refs(&current) {
+                    if let Some(route) = cluster_route_visit_next(
+                        local,
+                        target,
+                        &current,
+                        next,
+                        &mut seen,
+                        &mut predecessor,
+                        &mut queue,
+                    )? {
+                        return Ok(Some(route));
+                    }
+                }
             }
-            predecessor.try_insert_clone(next, &current, "cluster route predecessors")?;
-            if next == target {
-                return route_from_predecessors(local, target, &predecessor);
+            ClusterRouteAdjacency::Healthy => {
+                for next in graph.healthy_target_refs(&current) {
+                    if let Some(route) = cluster_route_visit_next(
+                        local,
+                        target,
+                        &current,
+                        next,
+                        &mut seen,
+                        &mut predecessor,
+                        &mut queue,
+                    )? {
+                        return Ok(Some(route));
+                    }
+                }
             }
-            queue
-                .try_reserve(1)
-                .map_err(|_| crate::object::network_allocation_error("cluster route queue", 1))?;
-            queue.push_back(try_clone_route_node_id(next, "cluster route queue")?);
         }
     }
+    Ok(None)
+}
+
+fn cluster_route_visit_next(
+    local: &NodeId,
+    target: &NodeId,
+    current: &NodeId,
+    next: &NodeId,
+    seen: &mut RouteNodeSet,
+    predecessor: &mut RoutePredecessorIndex,
+    queue: &mut VecDeque<NodeId>,
+) -> Result<Option<ClusterRoute>, NetworkError> {
+    if !seen.try_insert_clone(next, "cluster route seen nodes")? {
+        return Ok(None);
+    }
+    predecessor.try_insert_clone(next, current, "cluster route predecessors")?;
+    if next == target {
+        return route_from_predecessors(local, target, predecessor);
+    }
+    queue
+        .try_reserve(1)
+        .map_err(|_| crate::object::network_allocation_error("cluster route queue", 1))?;
+    queue.push_back(try_clone_route_node_id(next, "cluster route queue")?);
     Ok(None)
 }
 
@@ -3562,6 +3621,82 @@ mod tests {
                 ObjectRpcResponse::encode_body("/test/relay-target", &"ok")
             })
         }
+    }
+
+    fn route_test_connectivity_record(
+        cluster_id: &ClusterId,
+        source: &NodeId,
+        target: &NodeId,
+        endpoint_name: &str,
+        address: &str,
+        state: ClusterConnectivityState,
+    ) -> ClusterConnectivityRecord {
+        let now = OffsetDateTime::now_utc();
+        let healthy = state == ClusterConnectivityState::Healthy;
+        ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: source.clone(),
+            target_node_id: target.clone(),
+            endpoint_id: ClusterEndpointId::from_legacy_named(endpoint_name).expect("endpoint"),
+            transport: ClusterTransportKind::LanTcp,
+            address: address.to_string(),
+            state,
+            latency_ms: if healthy { Some(4) } else { None },
+            consecutive_failures: if healthy { 0 } else { 1 },
+            last_success_at: if healthy {
+                Some("ok".to_string())
+            } else {
+                None
+            },
+            last_failure_at: if healthy {
+                None
+            } else {
+                Some("failed".to_string())
+            },
+            failure_reason: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(900),
+        }
+    }
+
+    #[test]
+    fn cluster_route_next_hop_uses_degraded_live_edges() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_route_degraded_edges").expect("cluster");
+        let local = NodeId::from_legacy_named("node_route_degraded_local").expect("local node");
+        let bridge = NodeId::from_legacy_named("node_route_degraded_bridge").expect("bridge node");
+        let target = NodeId::from_legacy_named("node_route_degraded_target").expect("target node");
+        let graph = ClusterConnectivityGraph::from_records(
+            local.clone(),
+            vec![
+                route_test_connectivity_record(
+                    &cluster_id,
+                    &local,
+                    &bridge,
+                    "endpoint_route_degraded_local_bridge",
+                    "10.90.1.2:21353",
+                    ClusterConnectivityState::Degraded,
+                ),
+                route_test_connectivity_record(
+                    &cluster_id,
+                    &bridge,
+                    &target,
+                    "endpoint_route_degraded_bridge_target",
+                    "10.90.1.3:21353",
+                    ClusterConnectivityState::Healthy,
+                ),
+            ],
+        );
+
+        let route = cluster_route_next_hop(&graph, &local, &target).expect("reachable route");
+
+        assert_eq!(route.next_hop, bridge);
+        assert_eq!(route.path, vec![local.clone(), bridge, target]);
+        assert!(
+            cluster_healthy_route_next_hop(&graph, &local, route.path.last().expect("target"))
+                .is_none(),
+            "probe suppression must still require a fully healthy alternate path"
+        );
     }
 
     #[test]

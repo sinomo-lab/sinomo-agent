@@ -19199,6 +19199,57 @@ fn cluster_doctor_accepts_bidirectional_authority_routes() {
     );
 }
 
+#[test]
+fn cluster_doctor_accepts_degraded_authority_route_as_routable() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_doctor_degraded_route").expect("cluster");
+    let first = NodeId::from_legacy_named("node_network_doctor_degraded_first").expect("first");
+    let second = NodeId::from_legacy_named("node_network_doctor_degraded_second").expect("second");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "doctor degraded route",
+        first.clone(),
+        "first",
+        "pk-first",
+        now,
+    );
+    state.members.push(ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        second.clone(),
+        "second",
+        "pk-second",
+        now,
+    ));
+    let records = vec![
+        doctor_connectivity_record(
+            &cluster_id,
+            &first,
+            &second,
+            "endpoint_network_doctor_degraded_first_second",
+            "172.25.0.2:21353",
+            ClusterConnectivityState::Degraded,
+        ),
+        doctor_connectivity_record(
+            &cluster_id,
+            &second,
+            &first,
+            "endpoint_network_doctor_degraded_second_first",
+            "172.25.0.1:21353",
+            ClusterConnectivityState::Healthy,
+        ),
+    ];
+
+    let findings = cluster_doctor_findings(&state, &records, &[]);
+
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.code != "authority-route-missing"),
+        "degraded but live authority routes should remain routable: {findings:?}"
+    );
+}
+
 #[derive(Default)]
 struct RecordingClusterNetworkInfoPublishHost {
     cache_matches: bool,

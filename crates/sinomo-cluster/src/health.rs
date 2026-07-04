@@ -620,7 +620,7 @@ pub fn cluster_doctor_findings(
                 findings.push(ClusterDoctorFinding::warning(
                     "authority-route-missing",
                     format!(
-                        "{} has no healthy route to state authority {}",
+                        "{} has no reachable route to state authority {}",
                         source.node_id, target.node_id
                     ),
                 ));
