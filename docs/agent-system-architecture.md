@@ -141,6 +141,30 @@ sinomo agent export [agent-id] [--output <path>]
 sinomo agent import <path> [--json]
 ```
 
+CLI skill commands:
+
+```sh
+sinomo skill list [--all] [--json]
+sinomo skill show <skill-id> [--version <version>] [--text|--json]
+sinomo skill import <path-or-dir> [--id <skill-id>] [--version <version>] [--no-activate] [--json]
+sinomo skill export <skill-id> [--version <version>] [--output <path>] [--json]
+sinomo skill activate <skill-id> [--version <version>] [--scope <scope>] [--json]
+```
+
+Community skill import treats the Markdown `SKILL.md` as the ground-truth body.
+Common frontmatter keys such as `name`, `description`, and
+`metadata.short-description` are used to seed Sinomo descriptors when present,
+but Sinomo-specific SOBJ metadata remains optional. Export preserves existing
+portable frontmatter or synthesizes `name` and `description` for plain
+Markdown bodies.
+
+Agent runtimes expose skill lookup through `skill_search` and `skill_describe`.
+When the host registry is configured with a local data directory, `skill_update`
+persists a prompt-based improvement as a new `evolution` source version, records
+the previous active content hash as `base_hash`, and activates the new version by
+default. This is the lightweight Hermes-style skill evolution path; broader
+mutation campaigns remain owned by `sinomo-evolution`.
+
 ## Prompts and Provider Rendering
 
 Package prompts are role-oriented. They do not hardcode runtime model facts,
@@ -467,6 +491,23 @@ The checked-in scenarios cover long-session resume, explicit constraint
 retention, coding continuation after compaction, and live-cluster operations
 after compaction. Fixture mode validates harness structure without invoking a
 model. Live/model results are research and eval evidence; local readiness remains responsible only for deterministic projection and persistence invariants.
+
+## Skills
+
+Deterministic fake-model coverage in `sinomo-agent` verifies progressive
+disclosure from active catalog skills and `skill_update` writeback. Live/model
+quality is covered by the optional benchmark module:
+
+```sh
+python3 modules/benchmark/sinomo-benchmarks/agent/run_skill_eval.py --mode plan
+python3 modules/benchmark/sinomo-benchmarks/agent/run_skill_eval.py --mode fixture --summary-out benchmark-results/agent-skill/fixture-summary.json
+python3 modules/benchmark/sinomo-benchmarks/agent/run_skill_eval.py --mode run --provider codex --model gpt-5.5
+```
+
+The checked-in live scenarios seed benchmark-only active skills into a temporary
+`SINOMO_DATA_DIR`. One task can only be answered by reading hidden `SKILL.md`
+text through skill disclosure tools; another requires persisting a revealed
+shortcut with `skill_update` and then using it in a fresh follow-up run.
 
 ## Model and Local Runtime
 

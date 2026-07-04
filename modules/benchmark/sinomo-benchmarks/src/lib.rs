@@ -60,6 +60,7 @@ pub enum BenchmarkFamily {
     Terminal,
     VisionAction,
     AgentDiscussion,
+    AgentSkill,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -174,9 +175,11 @@ pub fn benchmark_module_catalog() -> BenchmarkModuleCatalog {
         suites: vec![
             swebench_verified_10_descriptor(),
             agent_channel_discussion_descriptor(),
+            agent_skill_quality_descriptor(),
         ],
         plans: vec![
             swebench_verified_10_plan(),
+            agent_skill_quality_plan(),
             agent_compaction_quality_plan(),
             agent_memory_quality_plan(),
             agent_channel_discussion_plan(),
@@ -208,6 +211,7 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
             "benchmark.agent.compaction.plan".to_string(),
             "benchmark.agent.memory.plan".to_string(),
             "benchmark.agent.channel-discussion.plan".to_string(),
+            "benchmark.agent.skill.plan".to_string(),
             "benchmark.swebench.plan".to_string(),
             "benchmark.minestudio.plan".to_string(),
             "benchmark.terminalbench.plan".to_string(),
@@ -255,6 +259,50 @@ pub fn agent_channel_discussion_descriptor() -> BenchmarkSuiteDescriptor {
         split: Some("fixture-and-live-subset".to_string()),
         runner: benchmark_module_path("agent/run_channel_discussion_eval.py"),
         baseline: Some("single-role or official clembench backend baseline".to_string()),
+    }
+}
+
+pub fn agent_skill_quality_descriptor() -> BenchmarkSuiteDescriptor {
+    BenchmarkSuiteDescriptor {
+        name: "agent-skill-quality".to_string(),
+        family: BenchmarkFamily::AgentSkill,
+        task_count: 2,
+        dataset: Some("benchmark-only-active-skill-fixtures".to_string()),
+        split: Some("fixture-and-live-model".to_string()),
+        runner: benchmark_module_path("agent/run_skill_eval.py"),
+        baseline: Some("no-skill and no-update ablation".to_string()),
+    }
+}
+
+pub fn agent_skill_quality_plan() -> BenchmarkHarnessPlan {
+    BenchmarkHarnessPlan {
+        name: "agent-skill-quality".to_string(),
+        setup_commands: vec![
+            "cargo build -p sinomo".to_string(),
+            format!(
+                "python3 {} --mode plan",
+                benchmark_module_path("agent/run_skill_eval.py")
+            ),
+            format!(
+                "python3 {} --mode fixture --summary-out benchmark-results/agent-skill/fixture-summary.json",
+                benchmark_module_path("agent/run_skill_eval.py")
+            ),
+        ],
+        run_command: format!(
+            "python3 {} --mode run --provider codex --model gpt-5.5 --summary-out benchmark-results/agent-skill/summary.json --progress-out benchmark-results/agent-skill/progress.jsonl",
+            benchmark_module_path("agent/run_skill_eval.py")
+        ),
+        required_tools: vec![
+            AgentToolKind::SkillSearch,
+            AgentToolKind::SkillDescribe,
+            AgentToolKind::SkillUpdate,
+        ],
+        notes: vec![
+            "This is a live/model eval harness for progressive skill disclosure and skill evolution writeback, not a normal Rust unit test.".to_string(),
+            "The hidden-skill scenario requires reading active SKILL.md text through skill_search/skill_describe; the expected marker is absent from the user prompt.".to_string(),
+            "The update scenario requires skill_update to persist a revealed shortcut, then verifies a fresh follow-up run can use the updated skill.".to_string(),
+            "Run mode seeds benchmark-only skills into a temporary SINOMO_DATA_DIR and copies only local model provider configuration from the operator data dir.".to_string(),
+        ],
     }
 }
 
@@ -1236,6 +1284,40 @@ mod tests {
     }
 
     #[test]
+    fn agent_skill_quality_plan_is_live_eval_not_unit_gate() {
+        let plan = agent_skill_quality_plan();
+        assert_eq!(plan.name, "agent-skill-quality");
+        assert!(
+            plan.setup_commands
+                .iter()
+                .any(|command| command.contains("agent/run_skill_eval.py --mode plan"))
+        );
+        assert!(
+            plan.setup_commands
+                .iter()
+                .any(|command| command.contains("agent/run_skill_eval.py --mode fixture"))
+        );
+        assert!(
+            plan.run_command
+                .contains("agent/run_skill_eval.py --mode run")
+        );
+        assert!(plan.run_command.contains("--model gpt-5.5"));
+        assert!(plan.required_tools.contains(&AgentToolKind::SkillSearch));
+        assert!(plan.required_tools.contains(&AgentToolKind::SkillDescribe));
+        assert!(plan.required_tools.contains(&AgentToolKind::SkillUpdate));
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("progressive skill disclosure"))
+        );
+        let runner = include_str!("../agent/run_skill_eval.py");
+        assert!(runner.contains("hidden-skill-disclosure"));
+        assert!(runner.contains("skill-update-followup-shortcut"));
+        assert!(runner.contains("run_mode_verifies_skill_update_text"));
+        assert!(runner.contains("followup_uses_fresh_data_dir_except_provider_config"));
+    }
+
+    #[test]
     fn agent_memory_quality_plan_is_live_eval_not_unit_gate() {
         let plan = agent_memory_quality_plan();
         assert_eq!(plan.name, "agent-memory-quality");
@@ -1408,6 +1490,11 @@ mod tests {
                 .capabilities
                 .contains(&"benchmark.agent.channel-discussion.plan".to_string())
         );
+        assert!(
+            descriptor
+                .capabilities
+                .contains(&"benchmark.agent.skill.plan".to_string())
+        );
         assert!(descriptor.surfaces.object_rpc_routes.iter().any(|route| {
             route.route == SINOMO_BENCHMARKS_CANCEL_PROBE_ROUTE
                 && route.category == SINOMO_BENCHMARKS_RPC_CATEGORY
@@ -1426,14 +1513,21 @@ mod tests {
         let catalog = benchmark_module_catalog();
 
         assert_eq!(catalog.module_root, SINOMO_BENCHMARKS_MODULE_ROOT);
-        assert_eq!(catalog.suites.len(), 2);
+        assert_eq!(catalog.suites.len(), 3);
         assert_eq!(catalog.suites[0].name, "swebench-verified-10");
         assert_eq!(catalog.suites[1].name, "agent-channel-discussion");
+        assert_eq!(catalog.suites[2].name, "agent-skill-quality");
         assert!(
             catalog
                 .plans
                 .iter()
                 .any(|plan| plan.name == "swebench-verified-10")
+        );
+        assert!(
+            catalog
+                .plans
+                .iter()
+                .any(|plan| plan.name == "agent-skill-quality")
         );
         assert!(
             catalog

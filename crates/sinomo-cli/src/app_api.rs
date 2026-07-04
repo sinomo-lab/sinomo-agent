@@ -24,7 +24,9 @@ use sinomo_agent::{
     AgentSessionInterruptRequest, AgentSessionReattachState, AgentSessionResumeRequest,
     AgentSessionResumeResponse, AgentSessionSteerRequest, AgentTaskLifecycleStatus,
     AgentTaskSnapshot, AgentToolProgressEvent, ContextAssemblyReport, InteractionOutput,
-    InteractionSession, InteractionSurface, InteractionSurfaceKind, TaskId,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, SkillActivationScope,
+    SkillCatalogEntry, SkillCatalogSifsStore, SkillCatalogSource, SkillCatalogStore,
+    SkillCatalogWrite, TaskId, render_common_skill_markdown,
     safe_agent_channel_attachment_file_name,
 };
 use sinomo_lm::{
@@ -34,7 +36,7 @@ use sinomo_lm::{
 use sinomo_runtime::cluster::ClusterHealthRow;
 use sinomo_runtime::events::{InMemoryEventStore, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::{self, ClusterPaths, ObjectRpcRequest};
+use sinomo_runtime::network::{ClusterPaths, ObjectRpcRequest};
 use sinomo_runtime::node::NodeId;
 use std::collections::BTreeSet;
 use time::format_description::well_known::Rfc3339;
@@ -318,6 +320,75 @@ pub struct AgentSummary {
     pub name: String,
     pub description: String,
     pub tool_runtime: ChatToolRuntimeSelection,
+}
+
+/// A skill catalog entry exposed to the GUI.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SkillSummary {
+    pub id: String,
+    pub version: String,
+    pub description: String,
+    pub source_kind: String,
+    pub source_id: Option<String>,
+    pub source_version: Option<String>,
+    pub active: bool,
+    pub status: String,
+    pub sifs_path: String,
+    pub content_hash: String,
+}
+
+impl SkillSummary {
+    fn from_entry(entry: &SkillCatalogEntry, active: bool) -> Self {
+        Self {
+            id: entry.skill_id.clone(),
+            version: entry.version.clone(),
+            description: entry.description.clone(),
+            source_kind: entry.source.kind.as_str().to_string(),
+            source_id: entry.source.source_id.clone(),
+            source_version: entry.source.source_version.clone(),
+            active,
+            status: entry.status.as_str().to_string(),
+            sifs_path: entry.sifs_path.clone(),
+            content_hash: entry.content_hash.clone(),
+        }
+    }
+}
+
+/// A full skill detail exposed to management surfaces.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SkillDetail {
+    pub summary: SkillSummary,
+    pub manifest_path: String,
+    pub base_hash: Option<String>,
+    pub target_agents: Vec<String>,
+    pub model_families: Vec<String>,
+    pub activation_tags: Vec<String>,
+    pub required_capabilities: Vec<String>,
+    pub text: String,
+}
+
+impl SkillDetail {
+    fn from_entry(entry: &SkillCatalogEntry, active: bool, text: String) -> Self {
+        Self {
+            summary: SkillSummary::from_entry(entry, active),
+            manifest_path: entry.manifest_path.clone(),
+            base_hash: entry.base_hash.clone(),
+            target_agents: entry.target_agents.clone(),
+            model_families: entry.model_families.clone(),
+            activation_tags: entry.activation_tags.clone(),
+            required_capabilities: entry.required_capabilities.clone(),
+            text,
+        }
+    }
+}
+
+/// Result of importing, exporting, or activating a skill from the app.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SkillMutationResult {
+    pub status: String,
+    pub skill: SkillSummary,
+    pub path: Option<String>,
+    pub scope: Option<String>,
 }
 
 /// A selectable language-model provider with a small starter model list.
@@ -2586,6 +2657,189 @@ fn resolve_agent(data_dir: &SinomoDataDir, key: &str) -> Option<AgentDefinition>
     let catalog =
         AgentCatalog::load_from_data_dir(data_dir).unwrap_or_else(|_| AgentCatalog::built_ins());
     catalog.get(key).cloned()
+}
+
+/// List skills available to app management surfaces.
+pub fn skill_summaries(
+    data_dir: &SinomoDataDir,
+    include_all: bool,
+) -> Result<Vec<SkillSummary>, String> {
+    let store =
+        SkillCatalogSifsStore::open(Some(data_dir.root())).map_err(|error| error.to_string())?;
+    let catalog = store.load_catalog().map_err(|error| error.to_string())?;
+    let entries = if include_all {
+        catalog.entries.iter().collect::<Vec<_>>()
+    } else {
+        catalog.active_entries_for_scopes([SkillActivationScope::Cluster.as_str()])
+    };
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            SkillSummary::from_entry(entry, skill_entry_is_active_for_app(&catalog, entry))
+        })
+        .collect())
+}
+
+/// Read one skill descriptor plus its stored `SKILL.md` text.
+pub fn skill_detail(
+    data_dir: &SinomoDataDir,
+    skill_id: &str,
+    version: Option<&str>,
+) -> Result<SkillDetail, String> {
+    let store =
+        SkillCatalogSifsStore::open(Some(data_dir.root())).map_err(|error| error.to_string())?;
+    let catalog = store.load_catalog().map_err(|error| error.to_string())?;
+    let entry = select_skill_entry_for_app(&catalog, skill_id, version)?;
+    let text = store
+        .read_skill_text(&entry)
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
+    Ok(SkillDetail::from_entry(
+        &entry,
+        skill_entry_is_active_for_app(&catalog, &entry),
+        text,
+    ))
+}
+
+/// Import a community-style skill file or directory containing `SKILL.md`.
+pub fn import_skill(
+    data_dir: &SinomoDataDir,
+    path: &Path,
+    skill_id: Option<String>,
+    version: Option<String>,
+    activate: bool,
+) -> Result<SkillMutationResult, String> {
+    let version = version.unwrap_or_else(|| "1.0.0".to_string());
+    let path = if path.is_dir() {
+        path.join(sinomo_agent::SKILL_FILE_NAME)
+    } else {
+        path.to_path_buf()
+    };
+    let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let store =
+        SkillCatalogSifsStore::open(Some(data_dir.root())).map_err(|error| error.to_string())?;
+    let mut write = SkillCatalogWrite::from_markdown_skill(
+        skill_id,
+        version,
+        SkillCatalogSource::user("app-user"),
+        text,
+    )
+    .map_err(|error| error.to_string())?;
+    if activate {
+        write = write.activate_for_scope(
+            SkillActivationScope::Cluster.as_str(),
+            "app",
+            "skill import",
+        );
+    }
+    let entry = write.entry.clone();
+    store
+        .write_skill_version(write)
+        .map_err(|error| error.to_string())?;
+    Ok(SkillMutationResult {
+        status: "imported".to_string(),
+        skill: SkillSummary::from_entry(&entry, activate),
+        path: Some(path.display().to_string()),
+        scope: activate.then(|| SkillActivationScope::Cluster.as_str().to_string()),
+    })
+}
+
+/// Export a catalog skill as portable Markdown, optionally writing it to disk.
+pub fn export_skill(
+    data_dir: &SinomoDataDir,
+    skill_id: &str,
+    version: Option<&str>,
+    output: Option<&Path>,
+) -> Result<SkillMutationResult, String> {
+    let store =
+        SkillCatalogSifsStore::open(Some(data_dir.root())).map_err(|error| error.to_string())?;
+    let catalog = store.load_catalog().map_err(|error| error.to_string())?;
+    let entry = select_skill_entry_for_app(&catalog, skill_id, version)?;
+    let text = store
+        .read_skill_text(&entry)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("skill `{}` has no readable SKILL.md body", entry.skill_id))?;
+    let rendered = render_common_skill_markdown(&entry, &text);
+    let output_path = output.map(|path| {
+        if path.is_dir() {
+            path.join(sinomo_agent::SKILL_FILE_NAME)
+        } else {
+            path.to_path_buf()
+        }
+    });
+    if let Some(path) = output_path.as_deref() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        fs::write(path, rendered.as_bytes()).map_err(|error| error.to_string())?;
+    }
+    Ok(SkillMutationResult {
+        status: "exported".to_string(),
+        skill: SkillSummary::from_entry(&entry, skill_entry_is_active_for_app(&catalog, &entry)),
+        path: output_path.map(|path| path.display().to_string()),
+        scope: None,
+    })
+}
+
+/// Activate an existing skill version for the cluster scope.
+pub fn activate_skill(
+    data_dir: &SinomoDataDir,
+    skill_id: &str,
+    version: Option<&str>,
+) -> Result<SkillMutationResult, String> {
+    let store =
+        SkillCatalogSifsStore::open(Some(data_dir.root())).map_err(|error| error.to_string())?;
+    let catalog = store.load_catalog().map_err(|error| error.to_string())?;
+    let entry = select_skill_entry_for_app(&catalog, skill_id, version)?;
+    let scope = SkillActivationScope::Cluster.as_str();
+    store
+        .activate_skill_version(&entry, scope, "app", "skill activation")
+        .map_err(|error| error.to_string())?;
+    Ok(SkillMutationResult {
+        status: "activated".to_string(),
+        skill: SkillSummary::from_entry(&entry, true),
+        path: None,
+        scope: Some(scope.to_string()),
+    })
+}
+
+fn select_skill_entry_for_app(
+    catalog: &sinomo_agent::SkillCatalog,
+    skill_id: &str,
+    version: Option<&str>,
+) -> Result<SkillCatalogEntry, String> {
+    if let Some(version) = version {
+        return catalog
+            .entry(skill_id, version)
+            .cloned()
+            .ok_or_else(|| format!("unknown skill version {skill_id}@{version}"));
+    }
+    if let Some(active) =
+        catalog.active_entry_for_scope(SkillActivationScope::Cluster.as_str(), skill_id)
+    {
+        return Ok(active.clone());
+    }
+    let matches = catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.skill_id == skill_id)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [entry] => Ok((*entry).clone()),
+        [] => Err(format!("unknown skill `{skill_id}`")),
+        _ => Err(format!("skill `{skill_id}` has multiple versions")),
+    }
+}
+
+fn skill_entry_is_active_for_app(
+    catalog: &sinomo_agent::SkillCatalog,
+    entry: &SkillCatalogEntry,
+) -> bool {
+    catalog.activations.iter().any(|activation| {
+        activation.skill_id == entry.skill_id
+            && activation.version == entry.version
+            && activation.content_hash == entry.content_hash
+    })
 }
 
 /// Curated provider list with a small starter set of models each.

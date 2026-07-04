@@ -18,12 +18,14 @@ use super::{
     ProviderName, RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation,
     RolloutModuleNativeDylibOptions, RolloutOptions, RolloutProgressExpectation,
     RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
-    TestCliCommand, UninstallOptions, authenticate_daemon_control_request,
-    build_cluster_raft_append_request_from_next_index, cli_command_is_help,
-    cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
-    cli_invocation_force_local_mode, cluster_has_local_quorum, cluster_init_with_paths,
-    cluster_invite_with_paths, cluster_join_with_paths, cluster_kv_state_authority_id,
-    cluster_leave, cluster_leave_with_paths, cluster_migration_plan_with_paths,
+    SkillActivateOptions, SkillCliCommand, SkillExportOptions, SkillImportOptions,
+    SkillListOptions, SkillShowOptions, TestCliCommand, UninstallOptions,
+    authenticate_daemon_control_request, build_cluster_raft_append_request_from_next_index,
+    cli_command_is_help, cli_command_requires_cluster_state,
+    cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
+    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_with_paths,
+    cluster_join_with_paths, cluster_kv_state_authority_id, cluster_leave,
+    cluster_leave_with_paths, cluster_migration_plan_with_paths,
     cluster_node_status_from_daemon_status, cluster_peer_members, cluster_rename,
     daemon_advertised_endpoints_for_state, daemon_endpoint_advertisement_config_file,
     daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
@@ -752,6 +754,16 @@ fn top_level_cli_parser_routes_subcommands() {
     assert!(matches!(
         parse_cli_command(&["agent".to_string(), "help".to_string()]).expect("agent help"),
         CliCommand::Agent(AgentCliCommand::Help)
+    ));
+    assert!(matches!(
+        parse_cli_command(&["skill".to_string()]).expect("skill help"),
+        CliCommand::Skill(SkillCliCommand::Help)
+    ));
+    assert!(matches!(
+        parse_cli_command(&["skills".to_string(), "list".to_string(), "--all".to_string()])
+            .expect("skills list"),
+        CliCommand::Skill(SkillCliCommand::List(options))
+            if options == (SkillListOptions { all: true, json: false })
     ));
     assert!(matches!(
         parse_cli_command(&[
@@ -5632,6 +5644,93 @@ fn agent_readiness_parser_accepts_json() {
 }
 
 #[test]
+fn skill_parsers_accept_markdown_catalog_management_options() {
+    assert_eq!(
+        super::parse_skill_list_options(&["--all".to_string(), "--json".to_string()])
+            .expect("skill list"),
+        SkillListOptions {
+            all: true,
+            json: true,
+        }
+    );
+    assert_eq!(
+        super::parse_skill_show_options(&[
+            "rust-debug".to_string(),
+            "--version".to_string(),
+            "2.0.0".to_string(),
+            "--text".to_string(),
+        ])
+        .expect("skill show"),
+        SkillShowOptions {
+            skill_id: "rust-debug".to_string(),
+            version: Some("2.0.0".to_string()),
+            text: true,
+            json: false,
+        }
+    );
+    assert_eq!(
+        super::parse_skill_import_options(&[
+            "skills/rust-debug".to_string(),
+            "--id".to_string(),
+            "rust-debug".to_string(),
+            "--version".to_string(),
+            "1.2.3".to_string(),
+            "--source".to_string(),
+            "agent".to_string(),
+            "--source-id".to_string(),
+            "coding-agent".to_string(),
+            "--no-activate".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("skill import"),
+        SkillImportOptions {
+            path: PathBuf::from("skills/rust-debug"),
+            skill_id: Some("rust-debug".to_string()),
+            version: "1.2.3".to_string(),
+            source: sinomo_agent::SkillCatalogSourceKind::Agent,
+            source_id: "coding-agent".to_string(),
+            activate: false,
+            scope: "cluster".to_string(),
+            json: true,
+        }
+    );
+    assert_eq!(
+        super::parse_skill_export_options(&[
+            "rust-debug".to_string(),
+            "--output".to_string(),
+            "SKILL.md".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("skill export"),
+        SkillExportOptions {
+            skill_id: "rust-debug".to_string(),
+            version: None,
+            output: Some(PathBuf::from("SKILL.md")),
+            json: true,
+        }
+    );
+    assert_eq!(
+        super::parse_skill_activate_options(&[
+            "rust-debug".to_string(),
+            "--version".to_string(),
+            "1.2.3".to_string(),
+            "--scope".to_string(),
+            "cluster".to_string(),
+            "--reason".to_string(),
+            "ready".to_string(),
+        ])
+        .expect("skill activate"),
+        SkillActivateOptions {
+            skill_id: "rust-debug".to_string(),
+            version: Some("1.2.3".to_string()),
+            scope: "cluster".to_string(),
+            reason: "ready".to_string(),
+            json: false,
+        }
+    );
+}
+
+#[test]
 fn agent_session_parsers_accept_inspect_progress_results_and_control() {
     let session_id = SessionId::from_legacy_named("sess_agent_session_parser").expect("session");
     let task_id = sinomo_agent::TaskId::generate();
@@ -6745,6 +6844,9 @@ fn cluster_state_guard_applies_to_distributed_runtime_commands() {
     assert!(!cli_command_requires_cluster_state(&CliCommand::Providers(
         ProviderCliCommand::Help
     )));
+    assert!(!cli_command_requires_cluster_state(&CliCommand::Skill(
+        SkillCliCommand::Help
+    )));
     let observe = parse_cli_command(&["observe".to_string()]).expect("observe");
     assert!(!cli_command_requires_cluster_state(&observe));
 }
@@ -6789,6 +6891,18 @@ fn daemonless_cli_uses_degraded_local_mode_for_local_capable_commands() {
     assert!(!cli_invocation_force_local_mode(
         CliRuntimeOptions::default(),
         &dfs_cluster,
+        false,
+        None
+    ));
+
+    let skill = CliCommand::Skill(SkillCliCommand::List(SkillListOptions {
+        all: false,
+        json: false,
+    }));
+    assert!(cli_command_supports_degraded_local_mode(&skill));
+    assert!(cli_invocation_force_local_mode(
+        CliRuntimeOptions::default(),
+        &skill,
         false,
         None
     ));
@@ -13508,6 +13622,7 @@ fn main_agent_tool_registry_exposes_config_catalog_and_workspace_tools() {
         "config_search",
         "config_get",
         "config_set",
+        "skill_update",
         "read_file",
         "search",
         "changed_files",

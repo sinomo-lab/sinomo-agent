@@ -17,6 +17,7 @@ pub const SKILL_CATALOG_SIFS_ROOT: &str = "/services/sinomo/skills";
 pub const SKILL_CATALOG_FILE_NAME: &str = "catalog.sobj";
 pub const SKILL_FILE_NAME: &str = "SKILL.md";
 pub const SKILL_MANIFEST_FILE_NAME: &str = "skill.sobj";
+const SKILL_MARKDOWN_FRONTMATTER_DELIMITER: &str = "---";
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SkillCatalog {
@@ -259,6 +260,73 @@ pub enum SkillUpstreamUpdateDecision {
     Noop,
     AttemptThreeWayMerge { conflict: SkillConflictRecord },
     Conflict { conflict: SkillConflictRecord },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SkillMarkdownDocument {
+    pub has_frontmatter: bool,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub metadata_short_description: Option<String>,
+    pub body: String,
+}
+
+impl SkillMarkdownDocument {
+    pub fn summary_description(&self) -> Option<&str> {
+        self.description
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                self.metadata_short_description
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+            })
+    }
+}
+
+pub fn parse_skill_markdown(text: &str) -> SkillMarkdownDocument {
+    let Some((frontmatter, body)) = split_skill_markdown_frontmatter(text) else {
+        return SkillMarkdownDocument {
+            body: text.to_string(),
+            ..SkillMarkdownDocument::default()
+        };
+    };
+    let (name, description, metadata_short_description) =
+        parse_skill_markdown_frontmatter(frontmatter);
+    SkillMarkdownDocument {
+        has_frontmatter: true,
+        name,
+        description,
+        metadata_short_description,
+        body: body.to_string(),
+    }
+}
+
+pub fn render_common_skill_markdown(entry: &SkillCatalogEntry, text: &str) -> String {
+    let document = parse_skill_markdown(text);
+    if document.has_frontmatter
+        && document
+            .name
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && document.summary_description().is_some()
+    {
+        return text.to_string();
+    }
+    let body = if document.has_frontmatter {
+        document.body.as_str()
+    } else {
+        text
+    };
+    let description = document
+        .summary_description()
+        .unwrap_or(entry.description.as_str());
+    format!(
+        "---\nname: {}\ndescription: {}\n---\n\n{}",
+        yaml_string(&entry.skill_id),
+        yaml_string(description),
+        body.trim_start_matches(['\r', '\n'])
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -658,6 +726,27 @@ impl SkillCatalogWrite {
         }
     }
 
+    pub fn from_markdown_skill(
+        skill_id: Option<String>,
+        version: impl Into<String>,
+        source: SkillCatalogSource,
+        text: impl Into<String>,
+    ) -> Result<Self, SkillCatalogError> {
+        let text = text.into();
+        let document = parse_skill_markdown(&text);
+        let skill_id = skill_id.or_else(|| document.name.clone()).ok_or_else(|| {
+            SkillCatalogError::InvalidCatalog {
+                detail: "markdown skill import requires --id or SKILL.md frontmatter name"
+                    .to_string(),
+            }
+        })?;
+        let mut entry = SkillCatalogEntry::new(skill_id, version, source, &text);
+        if let Some(description) = document.summary_description() {
+            entry = entry.with_description(description.to_string());
+        }
+        Ok(Self::new(entry, text))
+    }
+
     pub fn from_module_resource(
         registration: &ModuleRegistration,
         resource: &ModuleDeclarativeResourceExport,
@@ -956,6 +1045,28 @@ pub fn load_reconciled_skill_catalog_from_sifs(
     store.load_catalog()
 }
 
+pub fn load_skill_catalog_texts_from_sifs(
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
+    catalog: &SkillCatalog,
+) -> Result<BTreeMap<String, String>, SkillCatalogError> {
+    let store = SkillCatalogSifsStore::open(Some(data_dir.root()))?;
+    let mut texts = BTreeMap::new();
+    for entry in &catalog.entries {
+        if let Some(text) = store.read_skill_text(entry)? {
+            texts.insert(skill_catalog_entry_text_key(entry), text);
+        }
+    }
+    Ok(texts)
+}
+
+pub fn skill_catalog_entry_text_key(entry: &SkillCatalogEntry) -> String {
+    skill_catalog_text_key(&entry.skill_id, &entry.version, &entry.content_hash)
+}
+
+pub fn skill_catalog_text_key(skill_id: &str, version: &str, content_hash: &str) -> String {
+    format!("{skill_id}@{version}#{content_hash}")
+}
+
 impl SkillCatalogReconcileReport {
     fn apply_outcome(&mut self, outcome: SkillCatalogReconcileOutcome) {
         match outcome {
@@ -1225,13 +1336,30 @@ pub trait SkillCatalogStore {
         )?;
         catalog.upsert_entry(write.entry.clone())?;
         if let Some(scope) = write.activate_scope {
-            catalog.set_activation(SkillActivationRecord::new(
-                scope,
-                &write.entry,
-                write.activated_by,
-                write.reason,
-            ))?;
+            let activation =
+                SkillActivationRecord::new(scope, &write.entry, write.activated_by, write.reason);
+            catalog.set_activation(activation.clone())?;
+            let path = skill_active_sifs_path(&activation.scope, &activation.skill_id);
+            self.write_file(&path, &encode_catalog_sobj(&path, &activation)?)?;
         }
+        self.save_catalog(&catalog)?;
+        Ok(catalog)
+    }
+
+    fn activate_skill_version(
+        &self,
+        entry: &SkillCatalogEntry,
+        scope: impl Into<String>,
+        activated_by: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<SkillCatalog, SkillCatalogError> {
+        entry.validate()?;
+        let activation =
+            SkillActivationRecord::new(scope.into(), entry, activated_by.into(), reason.into());
+        let mut catalog = self.load_catalog()?;
+        catalog.set_activation(activation.clone())?;
+        let path = skill_active_sifs_path(&activation.scope, &activation.skill_id);
+        self.write_file(&path, &encode_catalog_sobj(&path, &activation)?)?;
         self.save_catalog(&catalog)?;
         Ok(catalog)
     }
@@ -1364,6 +1492,119 @@ pub fn skill_conflict_id(current: &SkillCatalogEntry, incoming: &SkillCatalogEnt
         current.skill_id, current.content_hash, incoming.version, incoming.content_hash
     );
     format!("conflict_{}", blake3::hash(input.as_bytes()).to_hex())
+}
+
+fn split_skill_markdown_frontmatter(text: &str) -> Option<(&str, &str)> {
+    let first_line_end = text.find('\n').unwrap_or(text.len());
+    let first_line = text[..first_line_end].trim_end_matches('\r');
+    if first_line != SKILL_MARKDOWN_FRONTMATTER_DELIMITER {
+        return None;
+    }
+    if first_line_end == text.len() {
+        return None;
+    }
+    let frontmatter_start = first_line_end + 1;
+    let mut line_start = frontmatter_start;
+    while line_start <= text.len() {
+        let line_end = text[line_start..]
+            .find('\n')
+            .map(|offset| line_start + offset + 1)
+            .unwrap_or(text.len());
+        let line = text[line_start..line_end].trim_end_matches(['\r', '\n']);
+        if line == SKILL_MARKDOWN_FRONTMATTER_DELIMITER {
+            return Some((&text[frontmatter_start..line_start], &text[line_end..]));
+        }
+        if line_end == text.len() {
+            break;
+        }
+        line_start = line_end;
+    }
+    None
+}
+
+fn parse_skill_markdown_frontmatter(
+    frontmatter: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let mut name = None;
+    let mut description = None;
+    let mut metadata_short_description = None;
+    let mut in_metadata = false;
+    for raw_line in frontmatter.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indented = raw_line.starts_with(' ') || raw_line.starts_with('\t');
+        if !indented {
+            in_metadata = false;
+            let Some((key, value)) = yaml_key_value(trimmed) else {
+                continue;
+            };
+            match key {
+                "name" => name = non_empty_yaml_value(value),
+                "description" => description = non_empty_yaml_value(value),
+                "metadata" if value.trim().is_empty() => in_metadata = true,
+                _ => {}
+            }
+            continue;
+        }
+        if in_metadata {
+            let Some((key, value)) = yaml_key_value(trimmed) else {
+                continue;
+            };
+            if key == "short-description" {
+                metadata_short_description = non_empty_yaml_value(value);
+            }
+        }
+    }
+    (name, description, metadata_short_description)
+}
+
+fn yaml_key_value(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.split_once(':')?;
+    Some((key.trim(), value.trim()))
+}
+
+fn non_empty_yaml_value(value: &str) -> Option<String> {
+    let value = unquote_yaml_scalar(value).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn unquote_yaml_scalar(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        let inner = &value[1..value.len() - 1];
+        let mut output = String::new();
+        let mut chars = inner.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                match chars.next() {
+                    Some('"') => output.push('"'),
+                    Some('\\') => output.push('\\'),
+                    Some('n') => output.push('\n'),
+                    Some('r') => output.push('\r'),
+                    Some('t') => output.push('\t'),
+                    Some(other) => {
+                        output.push('\\');
+                        output.push(other);
+                    }
+                    None => output.push('\\'),
+                }
+            } else {
+                output.push(ch);
+            }
+        }
+        return output;
+    }
+    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        return value[1..value.len() - 1].replace("''", "'");
+    }
+    value.to_string()
+}
+
+fn yaml_string(value: &str) -> String {
+    serde_json::to_string(value).expect("string scalar serializes")
 }
 
 fn default_skill_catalog_schema_version() -> u32 {
@@ -1518,6 +1759,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn markdown_skill_frontmatter_drives_import_metadata_without_rewriting_text() {
+        let text = "---\nname: rust-debug\ndescription: \"Debug Rust failures.\"\nmetadata:\n  short-description: Rust debug\n---\n\n# Rust Debug\nRead the assertion first.\n";
+        let write = SkillCatalogWrite::from_markdown_skill(
+            None,
+            "1.0.0",
+            SkillCatalogSource::user("user.test"),
+            text,
+        )
+        .expect("markdown write");
+
+        assert_eq!(write.entry.skill_id, "rust-debug");
+        assert_eq!(write.entry.description, "Debug Rust failures.");
+        assert_eq!(write.text, text);
+        assert_eq!(write.entry.content_hash, skill_content_hash(text));
+        let document = parse_skill_markdown(text);
+        assert!(document.has_frontmatter);
+        assert_eq!(document.name.as_deref(), Some("rust-debug"));
+        assert_eq!(document.body, "\n# Rust Debug\nRead the assertion first.\n");
+    }
+
+    #[test]
+    fn markdown_skill_import_accepts_plain_markdown_when_id_is_explicit() {
+        let text = "# Plain Skill\nFollow plain markdown.";
+        let write = SkillCatalogWrite::from_markdown_skill(
+            Some("skill.plain".to_string()),
+            "1.0.0",
+            SkillCatalogSource::agent("agent.test"),
+            text,
+        )
+        .expect("plain markdown write");
+
+        assert_eq!(write.entry.skill_id, "skill.plain");
+        assert!(write.entry.description.is_empty());
+        assert_eq!(write.text, text);
+    }
+
+    #[test]
+    fn export_markdown_synthesizes_common_frontmatter_when_missing() {
+        let text = "# Plain Skill\nFollow plain markdown.";
+        let entry = SkillCatalogEntry::new(
+            "skill.plain",
+            "1.0.0",
+            SkillCatalogSource::agent("agent.test"),
+            text,
+        )
+        .with_description("Plain portable skill.");
+        let rendered = render_common_skill_markdown(&entry, text);
+
+        assert!(rendered.starts_with("---\nname: \"skill.plain\"\ndescription: \"Plain portable skill.\"\n---\n\n# Plain Skill"));
+    }
+
+    #[test]
     fn local_store_writes_catalog_skill_and_activation() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-skill-catalog-write");
         let store = LocalSkillCatalogStore::new(root.path());
@@ -1551,6 +1844,12 @@ mod tests {
             .expect("read skill")
             .expect("skill text");
         assert_eq!(read, text);
+        assert!(
+            store
+                .read_file(&skill_active_sifs_path("cluster", "skill.rust.debug"))
+                .expect("read active pointer")
+                .is_some()
+        );
     }
 
     #[test]

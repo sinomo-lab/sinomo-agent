@@ -15,11 +15,13 @@
 //! the one bespoke region — a live-reading [`StatusReflector`] widget.
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use serde_json::Value;
+use sinomo_cli::app_api::{SkillDetail, SkillMutationResult, SkillSummary};
 use sui::{
     Alignment, ArrangeCtx, Color, Constraints, DefaultTheme, Event, EventCtx, FieldGroup,
     FontWeight, FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx,
@@ -29,6 +31,7 @@ use sui::{
 };
 
 use sinomo_runtime::config::ConfigClient;
+use sinomo_runtime::local::SinomoDataDir;
 
 use crate::backend::Backend;
 use crate::backend::cluster::{AppClusterInvite, AppClusterStatus};
@@ -64,17 +67,19 @@ pub enum SettingsSection {
     Node,
     Cluster,
     Providers,
+    Skills,
     Configuration,
     About,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 7] = [
+    pub const ALL: [SettingsSection; 8] = [
         SettingsSection::Appearance,
         SettingsSection::Connection,
         SettingsSection::Node,
         SettingsSection::Cluster,
         SettingsSection::Providers,
+        SettingsSection::Skills,
         SettingsSection::Configuration,
         SettingsSection::About,
     ];
@@ -86,6 +91,7 @@ impl SettingsSection {
             SettingsSection::Node => "Node",
             SettingsSection::Cluster => "Cluster",
             SettingsSection::Providers => "Providers",
+            SettingsSection::Skills => "Skills",
             SettingsSection::Configuration => "Advanced",
             SettingsSection::About => "About",
         }
@@ -98,6 +104,7 @@ impl SettingsSection {
 
 /// State backing the settings tab.
 pub struct SettingsState {
+    pub data_dir: Arc<SinomoDataDir>,
     /// The config service the tab reads/writes through (no local config state).
     pub config: Arc<dyn ConfigClient>,
     pub config_items: Vec<ConfigItem>,
@@ -135,6 +142,15 @@ pub struct SettingsState {
     pub provider_add_error: Option<String>,
     pub provider_action_error: Option<String>,
     pub provider_action_status: Option<ProviderActionStatus>,
+    pub skills: Vec<SkillSummary>,
+    pub skill_detail: Option<SkillDetail>,
+    pub skill_selected: Option<(String, String)>,
+    pub skills_include_all: bool,
+    pub skill_import_path: String,
+    pub skill_export_path: String,
+    pub skill_action_error: Option<String>,
+    pub skill_action_status: Option<String>,
+    pub skill_text_expanded: bool,
     connection_detail_expanded: Vec<Tab>,
     node_detail_expanded: bool,
     advanced_detail_expanded: Vec<String>,
@@ -200,6 +216,10 @@ impl SettingsState {
             Err(error) => (Vec::new(), Some(error.to_string())),
         };
         let provider_forms = provider_forms(config.as_ref());
+        let data_dir = backend.data_dir.clone();
+        let skills_include_all = true;
+        let (skills, skill_selected, skill_detail, skill_action_error) =
+            load_initial_skill_state(data_dir.as_ref(), skills_include_all);
 
         let cluster_status = backend.app_cluster_status();
         let (clustered, cluster_summary) = if cluster_status.clustered {
@@ -222,6 +242,7 @@ impl SettingsState {
         };
 
         Self {
+            data_dir,
             config,
             config_items,
             config_error,
@@ -252,6 +273,15 @@ impl SettingsState {
             provider_add_error: None,
             provider_action_error: None,
             provider_action_status: None,
+            skills,
+            skill_detail,
+            skill_selected,
+            skills_include_all,
+            skill_import_path: String::new(),
+            skill_export_path: String::new(),
+            skill_action_error,
+            skill_action_status: None,
+            skill_text_expanded: false,
             connection_detail_expanded: Vec::new(),
             node_detail_expanded: false,
             advanced_detail_expanded: Vec::new(),
@@ -357,6 +387,172 @@ impl SettingsState {
 
     fn toggle_provider_storage_detail(&mut self) {
         self.provider_storage_detail_expanded = !self.provider_storage_detail_expanded;
+    }
+
+    fn selected_skill_index(&self) -> Option<usize> {
+        let (selected_id, selected_version) = self.skill_selected.as_ref()?;
+        self.skills
+            .iter()
+            .position(|skill| &skill.id == selected_id && &skill.version == selected_version)
+    }
+
+    fn select_skill_index(&mut self, index: usize) {
+        let Some(skill) = self.skills.get(index) else {
+            return;
+        };
+        self.skill_selected = Some((skill.id.clone(), skill.version.clone()));
+        self.skill_action_error = None;
+        self.skill_text_expanded = false;
+        self.refresh_selected_skill_detail();
+    }
+
+    fn set_skills_include_all(&mut self, include_all: bool) {
+        if self.skills_include_all == include_all {
+            return;
+        }
+        self.skills_include_all = include_all;
+        self.reload_skills();
+    }
+
+    fn set_skill_import_path(&mut self, value: String) {
+        self.skill_import_path = value;
+        self.skill_action_error = None;
+        self.skill_action_status = None;
+    }
+
+    fn set_skill_export_path(&mut self, value: String) {
+        self.skill_export_path = value;
+        self.skill_action_error = None;
+        self.skill_action_status = None;
+    }
+
+    fn toggle_skill_text(&mut self) {
+        self.skill_text_expanded = !self.skill_text_expanded;
+    }
+
+    fn reload_skills(&mut self) {
+        let previous = self.skill_selected.clone();
+        match sinomo_cli::app_api::skill_summaries(self.data_dir.as_ref(), self.skills_include_all)
+        {
+            Ok(skills) => {
+                self.skills = skills;
+                self.skill_selected = previous
+                    .filter(|(id, version)| {
+                        self.skills
+                            .iter()
+                            .any(|skill| &skill.id == id && &skill.version == version)
+                    })
+                    .or_else(|| {
+                        self.skills
+                            .first()
+                            .map(|skill| (skill.id.clone(), skill.version.clone()))
+                    });
+                self.refresh_selected_skill_detail();
+            }
+            Err(error) => {
+                self.skills.clear();
+                self.skill_selected = None;
+                self.skill_detail = None;
+                self.skill_action_error = Some(error);
+            }
+        }
+    }
+
+    fn refresh_selected_skill_detail(&mut self) {
+        let Some((skill_id, version)) = self.skill_selected.clone() else {
+            self.skill_detail = None;
+            return;
+        };
+        match sinomo_cli::app_api::skill_detail(self.data_dir.as_ref(), &skill_id, Some(&version)) {
+            Ok(detail) => {
+                self.skill_detail = Some(detail);
+            }
+            Err(error) => {
+                self.skill_detail = None;
+                self.skill_action_error = Some(error);
+            }
+        }
+    }
+
+    fn import_skill_from_path(&mut self) -> bool {
+        let path = self.skill_import_path.trim();
+        if path.is_empty() {
+            self.skill_action_error = Some("enter a skill file or directory path".to_string());
+            self.skill_action_status = None;
+            return false;
+        }
+        let path = PathBuf::from(path);
+        match sinomo_cli::app_api::import_skill(self.data_dir.as_ref(), &path, None, None, true) {
+            Ok(result) => {
+                self.skills_include_all = true;
+                self.skill_selected = Some((result.skill.id.clone(), result.skill.version.clone()));
+                self.skill_action_status = Some(skill_mutation_message(&result));
+                self.skill_action_error = None;
+                self.skill_text_expanded = false;
+                self.reload_skills();
+                true
+            }
+            Err(error) => {
+                self.skill_action_error = Some(error);
+                self.skill_action_status = None;
+                false
+            }
+        }
+    }
+
+    fn export_selected_skill(&mut self) -> bool {
+        let Some((skill_id, version)) = self.skill_selected.clone() else {
+            self.skill_action_error = Some("select a skill to export".to_string());
+            self.skill_action_status = None;
+            return false;
+        };
+        let output = self.skill_export_path.trim();
+        if output.is_empty() {
+            self.skill_action_error = Some("enter an export path".to_string());
+            self.skill_action_status = None;
+            return false;
+        }
+        let output = PathBuf::from(output);
+        match sinomo_cli::app_api::export_skill(
+            self.data_dir.as_ref(),
+            &skill_id,
+            Some(&version),
+            Some(&output),
+        ) {
+            Ok(result) => {
+                self.skill_action_status = Some(skill_mutation_message(&result));
+                self.skill_action_error = None;
+                true
+            }
+            Err(error) => {
+                self.skill_action_error = Some(error);
+                self.skill_action_status = None;
+                false
+            }
+        }
+    }
+
+    fn activate_selected_skill(&mut self) -> bool {
+        let Some((skill_id, version)) = self.skill_selected.clone() else {
+            self.skill_action_error = Some("select a skill to activate".to_string());
+            self.skill_action_status = None;
+            return false;
+        };
+        match sinomo_cli::app_api::activate_skill(self.data_dir.as_ref(), &skill_id, Some(&version))
+        {
+            Ok(result) => {
+                self.skill_selected = Some((result.skill.id.clone(), result.skill.version.clone()));
+                self.skill_action_status = Some(skill_mutation_message(&result));
+                self.skill_action_error = None;
+                self.reload_skills();
+                true
+            }
+            Err(error) => {
+                self.skill_action_error = Some(error);
+                self.skill_action_status = None;
+                false
+            }
+        }
     }
 
     fn confirm_provider_remove(&mut self, index: usize) {
@@ -796,6 +992,44 @@ impl SettingsState {
     }
 }
 
+fn load_initial_skill_state(
+    data_dir: &SinomoDataDir,
+    include_all: bool,
+) -> (
+    Vec<SkillSummary>,
+    Option<(String, String)>,
+    Option<SkillDetail>,
+    Option<String>,
+) {
+    let skills = match sinomo_cli::app_api::skill_summaries(data_dir, include_all) {
+        Ok(skills) => skills,
+        Err(error) => return (Vec::new(), None, None, Some(error)),
+    };
+    let selected = skills
+        .first()
+        .map(|skill| (skill.id.clone(), skill.version.clone()));
+    let detail = selected.as_ref().and_then(|(skill_id, version)| {
+        sinomo_cli::app_api::skill_detail(data_dir, skill_id, Some(version)).ok()
+    });
+    (skills, selected, detail, None)
+}
+
+fn skill_mutation_message(result: &SkillMutationResult) -> String {
+    let mut message = format!(
+        "{} {}@{}",
+        result.status, result.skill.id, result.skill.version
+    );
+    if let Some(scope) = &result.scope {
+        message.push_str(" for ");
+        message.push_str(scope);
+    }
+    if let Some(path) = &result.path {
+        message.push_str(" at ");
+        message.push_str(path);
+    }
+    message
+}
+
 /// Field-error map key for a raw config key (Advanced section).
 fn config_field_key(key: &str) -> String {
     format!("config:{key}")
@@ -872,6 +1106,42 @@ fn provider_sidebar_preview(forms: &[ProviderForm]) -> String {
     } else {
         "Disabled".to_string()
     }
+}
+
+fn skills_sidebar_preview(skills: &[SkillSummary]) -> String {
+    if skills.is_empty() {
+        return "No skills".to_string();
+    }
+    let active = skills.iter().filter(|skill| skill.active).count();
+    if active == 0 {
+        format!("{} versions", skills.len())
+    } else {
+        format!("{active} active")
+    }
+}
+
+fn skill_title(skill: &SkillSummary) -> String {
+    format!("{} @ {}", skill.id, skill.version)
+}
+
+fn skill_source_label(skill: &SkillSummary) -> String {
+    match (&skill.source_id, &skill.source_version) {
+        (Some(id), Some(version)) => {
+            format!("{}:{} ({})", skill.source_kind, id, version)
+        }
+        (Some(id), None) => format!("{}:{}", skill.source_kind, id),
+        (None, Some(version)) => format!("{} ({})", skill.source_kind, version),
+        (None, None) => skill.source_kind.clone(),
+    }
+}
+
+fn skill_list_item(skill: &SkillSummary) -> ListItem {
+    let state = if skill.active {
+        "active"
+    } else {
+        &skill.status
+    };
+    ListItem::new(skill_title(skill)).detail(format!("{} · {}", state, skill_source_label(skill)))
 }
 
 fn provider_model_label(form: &ProviderForm) -> String {
@@ -953,6 +1223,10 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
         SettingsSection::Providers => {
             let settings = shared.settings();
             provider_sidebar_preview(&settings.provider_forms)
+        }
+        SettingsSection::Skills => {
+            let settings = shared.settings();
+            skills_sidebar_preview(&settings.skills)
         }
         SettingsSection::Configuration => {
             let settings = shared.settings();
@@ -1169,6 +1443,36 @@ fn configuration_key(shared: &Shared) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("{item_key}\nexpanded:{expanded}")
+}
+
+fn skills_section_key(shared: &Shared) -> String {
+    let settings = shared.settings();
+    let skill_key = settings
+        .skills
+        .iter()
+        .map(|skill| {
+            format!(
+                "{}@{}:{}:{}:{}",
+                skill.id, skill.version, skill.active, skill.status, skill.content_hash
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "all:{};selected:{:?};detail:{:?};text:{};import:{};export:{};error:{:?};status:{:?}\n{}",
+        settings.skills_include_all,
+        settings.skill_selected,
+        settings
+            .skill_detail
+            .as_ref()
+            .map(|detail| detail.summary.content_hash.as_str()),
+        settings.skill_text_expanded,
+        settings.skill_import_path.len(),
+        settings.skill_export_path.len(),
+        settings.skill_action_error,
+        settings.skill_action_status,
+        skill_key
+    )
 }
 
 fn connection_issue_summary(issue: &ConnectionIssue) -> &'static str {
@@ -2636,6 +2940,322 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         .theme_when(clone_reader(reader))
 }
 
+fn section_skills(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || skills_section_key(&s)
+        },
+        move |_key| WidgetPod::new(section_skills_body(&s, &r)),
+    )
+}
+
+fn section_skills_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let (
+        skills,
+        include_all,
+        import_path,
+        export_path,
+        action_error,
+        action_status,
+        detail,
+        text_expanded,
+    ) = {
+        let settings = shared.settings();
+        (
+            settings.skills.clone(),
+            settings.skills_include_all,
+            settings.skill_import_path.clone(),
+            settings.skill_export_path.clone(),
+            settings.skill_action_error.clone(),
+            settings.skill_action_status.clone(),
+            settings.skill_detail.clone(),
+            settings.skill_text_expanded,
+        )
+    };
+
+    let mut summary_body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(value_row(
+            shared,
+            reader,
+            "Catalog",
+            skills_sidebar_preview(&skills),
+        ))
+        .with_child(switch_row(reader, "Show all versions", include_all, {
+            let s = shared.clone();
+            move |on| s.settings_mut().set_skills_include_all(on)
+        }))
+        .with_child(text_row(
+            reader,
+            "skill-import-path",
+            "Import path",
+            import_path,
+            "/path/to/SKILL.md",
+            {
+                let s = shared.clone();
+                move |value| s.settings_mut().set_skill_import_path(value)
+            },
+        ));
+    let import = {
+        let s = shared.clone();
+        sui::Button::new("Import skill")
+            .icon(sui::IconGlyph::Add)
+            .theme_when(clone_reader(reader))
+            .on_press(move || {
+                s.settings_mut().import_skill_from_path();
+            })
+    };
+    let refresh = {
+        let s = shared.clone();
+        sui::Button::new("Refresh")
+            .icon(sui::IconGlyph::Redo)
+            .theme_when(secondary_button_theme(reader))
+            .on_press(move || {
+                s.settings_mut().reload_skills();
+            })
+    };
+    summary_body = summary_body.with_child(
+        FormRow::new(
+            "Actions",
+            Stack::horizontal()
+                .spacing(8.0)
+                .alignment(Alignment::Start)
+                .with_child(import)
+                .with_child(refresh),
+        )
+        .inline()
+        .theme_when(clone_reader(reader)),
+    );
+    if let Some(error) = action_error {
+        summary_body = summary_body.with_child(value_row(shared, reader, "Error", error));
+    } else if let Some(status) = action_status {
+        summary_body = summary_body.with_child(value_row(shared, reader, "Status", status));
+    }
+
+    let summary = FormSection::new("Skills", summary_body)
+        .description("Manage imported and generated SKILL.md files used by agents.")
+        .theme_when(clone_reader(reader));
+
+    let catalog = if skills.is_empty() {
+        let body = FieldGroup::new()
+            .spacing(8.0)
+            .with_child(value_row(
+                shared,
+                reader,
+                "Status",
+                "No skills in the local catalog",
+            ))
+            .with_child(value_row(
+                shared,
+                reader,
+                "Import",
+                "Add a SKILL.md file to make it available to agents.",
+            ));
+        WidgetPod::new(FormSection::new("Catalog", body).theme_when(clone_reader(reader)))
+    } else {
+        let items = skills.iter().map(skill_list_item).collect::<Vec<_>>();
+        let list = {
+            let s = shared.clone();
+            ListView::new("skill-catalog")
+                .items(items)
+                .row_height(MENU_ROW_H)
+                .theme_when(clone_reader(reader))
+                .selected_when({
+                    let s = s.clone();
+                    move || s.settings().selected_skill_index()
+                })
+                .on_change(move |index, _| {
+                    s.settings_mut().select_skill_index(index);
+                })
+        };
+        WidgetPod::new(
+            FormSection::new("Catalog", list)
+                .description("Select a skill version to inspect, activate, or export.")
+                .theme_when(clone_reader(reader)),
+        )
+    };
+
+    let detail = detail
+        .map(|detail| {
+            WidgetPod::new(skill_detail_section(
+                shared,
+                reader,
+                detail,
+                export_path,
+                text_expanded,
+            ))
+        })
+        .unwrap_or_else(|| {
+            WidgetPod::new(
+                FormSection::new(
+                    "Selected skill",
+                    FieldGroup::new().with_child(value_row(
+                        shared,
+                        reader,
+                        "Status",
+                        "Select a skill to view details",
+                    )),
+                )
+                .theme_when(clone_reader(reader)),
+            )
+        });
+
+    Stack::vertical()
+        .spacing(14.0)
+        .alignment(Alignment::Stretch)
+        .with_child(summary)
+        .with_child(PodHost::new(catalog))
+        .with_child(PodHost::new(detail))
+}
+
+fn skill_detail_section(
+    shared: &Shared,
+    reader: &ThemeReader,
+    detail: SkillDetail,
+    export_path: String,
+    text_expanded: bool,
+) -> impl Widget + use<> {
+    let summary = detail.summary.clone();
+    let mut body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(value_row(
+            shared,
+            reader,
+            "Version",
+            summary.version.clone(),
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "State",
+            if summary.active {
+                "active"
+            } else {
+                &summary.status
+            },
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Source",
+            skill_source_label(&summary),
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "SIFS path",
+            short_one_line(&summary.sifs_path, 96),
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Content hash",
+            short(&summary.content_hash, 48),
+        ));
+    if let Some(base_hash) = detail.base_hash.as_ref() {
+        body = body.with_child(value_row(shared, reader, "Base hash", short(base_hash, 48)));
+    }
+    if !detail.activation_tags.is_empty() {
+        body = body.with_child(value_row(
+            shared,
+            reader,
+            "Tags",
+            detail.activation_tags.join(", "),
+        ));
+    }
+    if !detail.required_capabilities.is_empty() {
+        body = body.with_child(value_row(
+            shared,
+            reader,
+            "Capabilities",
+            detail.required_capabilities.join(", "),
+        ));
+    }
+
+    body = body.with_child(text_row(
+        reader,
+        "skill-export-path",
+        "Export path",
+        export_path,
+        "/path/to/SKILL.md",
+        {
+            let s = shared.clone();
+            move |value| s.settings_mut().set_skill_export_path(value)
+        },
+    ));
+
+    let activate = {
+        let s = shared.clone();
+        sui::Button::new("Activate")
+            .icon(sui::IconGlyph::Check)
+            .theme_when(clone_reader(reader))
+            .enabled(!summary.active)
+            .on_press(move || {
+                s.settings_mut().activate_selected_skill();
+            })
+    };
+    let export = {
+        let s = shared.clone();
+        sui::Button::new("Export skill")
+            .icon(sui::IconGlyph::Download)
+            .theme_when(secondary_button_theme(reader))
+            .on_press(move || {
+                s.settings_mut().export_selected_skill();
+            })
+    };
+    let text = {
+        let s = shared.clone();
+        sui::Button::new(if text_expanded {
+            "Hide SKILL.md"
+        } else {
+            "Show SKILL.md"
+        })
+        .icon(if text_expanded {
+            sui::IconGlyph::ChevronUp
+        } else {
+            sui::IconGlyph::ChevronDown
+        })
+        .theme_when(secondary_button_theme(reader))
+        .on_press(move || s.settings_mut().toggle_skill_text())
+    };
+    body = body.with_child(
+        FormRow::new(
+            "Actions",
+            Stack::horizontal()
+                .spacing(8.0)
+                .alignment(Alignment::Start)
+                .with_child(activate)
+                .with_child(export)
+                .with_child(text),
+        )
+        .inline()
+        .theme_when(clone_reader(reader)),
+    );
+
+    if text_expanded {
+        body = body.with_child(
+            FormRow::new(
+                "SKILL.md",
+                SizedBox::new().height(220.0).with_child(
+                    TextArea::new("skill-markdown")
+                        .value(detail.text)
+                        .read_only()
+                        .theme_when(clone_reader(reader)),
+                ),
+            )
+            .stacked()
+            .theme_when(clone_reader(reader)),
+        );
+    }
+
+    FormSection::new(skill_title(&summary), body)
+        .description(short_one_line(&summary.description, 160))
+        .theme_when(clone_reader(reader))
+}
+
 fn section_configuration(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
     let r = Rc::clone(reader);
@@ -3027,6 +3647,7 @@ fn section_body(
         .with_child(section_node(shared, reader))
         .with_child(section_cluster(shared, reader))
         .with_child(section_providers(shared, reader))
+        .with_child(section_skills(shared, reader))
         .with_child(section_configuration(shared, reader))
         .with_child(section_about(shared, reader))
         .selected_when({
@@ -3808,6 +4429,33 @@ mod tests {
         parts.join("\u{1f}")
     }
 
+    fn temp_skill_backend(label: &str) -> (Backend, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-app-settings-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let backend = Backend::local_fallback_for_data_dir(SinomoDataDir::new(root.clone()));
+        (backend, root)
+    }
+
+    fn write_skill_file(root: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        let path = root.join("skills").join(name).join("SKILL.md");
+        std::fs::create_dir_all(path.parent().expect("skill parent")).expect("skill dir");
+        std::fs::write(
+            &path,
+            format!(
+                "---\nname: {name}\ndescription: Skill for Settings tests.\n---\n\n# {name}\n\n{body}\n"
+            ),
+        )
+        .expect("skill file");
+        path
+    }
+
     #[test]
     fn set_value_with_invalid_input_errors_and_preserves_prior_value() {
         // A typed (Number/Json) key: writing garbage returns Err and the stored value is unchanged.
@@ -3884,6 +4532,143 @@ mod tests {
         let backend = Backend::local_fallback();
         let state = SettingsState::new(&backend);
         assert!(state.provider_add_api_key.is_empty());
+    }
+
+    #[test]
+    fn skills_state_imports_exports_and_activates_versions() {
+        let (backend, root) = temp_skill_backend("skills-state");
+        let first_path = write_skill_file(&root, "shortcut-skill", "The shortcut is alpha-lane.");
+        let second_path =
+            write_skill_file(&root, "shortcut-skill-v2", "The shortcut is beta-lane.");
+
+        let mut state = SettingsState::new(&backend);
+        assert!(state.skills.is_empty());
+
+        state.set_skill_import_path(first_path.display().to_string());
+        assert!(state.import_skill_from_path());
+        assert_eq!(state.skills.len(), 1);
+        assert_eq!(
+            state.skill_selected,
+            Some(("shortcut-skill".to_string(), "1.0.0".to_string()))
+        );
+        assert!(
+            state
+                .skill_detail
+                .as_ref()
+                .expect("skill detail")
+                .text
+                .contains("alpha-lane")
+        );
+
+        sinomo_cli::app_api::import_skill(
+            backend.data_dir.as_ref(),
+            &second_path,
+            Some("shortcut-skill".to_string()),
+            Some("2.0.0".to_string()),
+            false,
+        )
+        .expect("inactive skill version");
+        state.reload_skills();
+        let v2 = state
+            .skills
+            .iter()
+            .position(|skill| skill.id == "shortcut-skill" && skill.version == "2.0.0")
+            .expect("v2 skill");
+        state.select_skill_index(v2);
+        assert!(
+            !state
+                .skill_detail
+                .as_ref()
+                .expect("v2 detail")
+                .summary
+                .active
+        );
+        assert!(state.activate_selected_skill());
+        assert!(
+            state
+                .skill_detail
+                .as_ref()
+                .expect("activated detail")
+                .summary
+                .active
+        );
+
+        let export_path = root.join("exports").join("shortcut-skill.md");
+        state.set_skill_export_path(export_path.display().to_string());
+        assert!(state.export_selected_skill());
+        let exported = std::fs::read_to_string(&export_path).expect("exported skill");
+        assert!(exported.contains("name: shortcut-skill"));
+        assert!(exported.contains("beta-lane"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settings_skills_section_renders_management_controls() -> sui::Result<()> {
+        let (backend, root) = temp_skill_backend("skills-render");
+        let skill_path = write_skill_file(&root, "render-skill", "Rendered skill detail.");
+        sinomo_cli::app_api::import_skill(backend.data_dir.as_ref(), &skill_path, None, None, true)
+            .expect("import render skill");
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            app.ready
+                .as_mut()
+                .expect("ready state")
+                .settings
+                .open(SettingsSection::Skills);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings skills")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window.get_by_text("Skills").expect().to_be_visible()?;
+        window
+            .get_by_text("render-skill @ 1.0.0")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("skill-import-path")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("skill-export-path")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Import skill")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Export skill")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Show SKILL.md")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("skill-markdown")
+            .expect()
+            .to_have_value(
+                "---\nname: render-skill\ndescription: Skill for Settings tests.\n---\n\n# render-skill\n\nRendered skill detail.\n",
+            )?;
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]
