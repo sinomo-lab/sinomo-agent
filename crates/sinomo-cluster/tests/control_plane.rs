@@ -10878,6 +10878,66 @@ fn cluster_kv_txn_forward_driver_uses_node_rpc_for_known_state_authority() {
 }
 
 #[test]
+fn cluster_kv_txn_forward_driver_deduplicates_state_authority_endpoints() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-dedupe");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, _local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_kv_forward_dedupe",
+        "node_kv_forward_dedupe_local",
+        "node_kv_forward_dedupe_peer",
+    );
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .extend([
+            daemon_lan_endpoint(&peer_node_id, "10.0.0.84:21353".to_string(), 10),
+            daemon_lan_endpoint(&peer_node_id, "10.0.0.85:21353".to_string(), 20),
+        ]);
+    write_cluster_state(&paths, &state).expect("write state");
+    let snapshot = forward_test_snapshot("/forward/dedupe", b"dedupe");
+    let txn_response = forward_test_txn_response(snapshot.revision);
+    let mut host = RecordingKvTxnForwardHost {
+        known_authority: Some(peer_node_id.clone()),
+        snapshot: snapshot.clone(),
+        txn_response: txn_response.clone(),
+        node_rpcs: Vec::new(),
+    };
+
+    let result = forward_cluster_kv_txn_to_state_authority_with_host(
+        &paths,
+        &state,
+        &KvTxn {
+            compares: Vec::new(),
+            success: Vec::new(),
+            failure: Vec::new(),
+        },
+        ClusterKvTxnForwardOptions {
+            timeout: Duration::from_secs(5),
+            tcp_command_timeout: Duration::from_secs(5),
+            iroh_command_timeout: Duration::from_secs(3),
+        },
+        &mut host,
+    )
+    .expect("forward")
+    .expect("targeted voter");
+
+    assert_eq!(result.snapshot, snapshot);
+    assert_eq!(result.txn_response, Some(txn_response));
+    assert_eq!(
+        host.node_rpcs,
+        vec![
+            (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
+            (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
+        ]
+    );
+}
+
+#[test]
 fn cluster_node_blocks_leader_preference_when_local_probe_marks_member_unreachable() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-leader-preference-unreachable");
     let data_dir = SinomoDataDir::new(&root);

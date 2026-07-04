@@ -61,14 +61,20 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
     host: &mut impl ClusterKvTxnForwardHost,
 ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
     let mut targets = ClusterEndpointSelector::new(paths, state)
-        .select_internal(ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand);
+        .select_internal_unique_node_targets(
+            ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+        );
     if targets.is_empty() {
         return Ok(None);
     }
     if let Ok(Some(authority_id)) = host.known_kv_state_authority_id(paths, state)
         && !cluster_node_blocks_leader_preference(paths, state, &authority_id)
+        && let Some(position) = targets
+            .iter()
+            .position(|endpoint| endpoint.node_id == authority_id)
     {
-        prefer_cluster_kv_forward_authority_endpoints(&mut targets, &authority_id);
+        let authority = targets.remove(position);
+        targets.insert(0, authority);
     }
 
     let mut failures = Vec::new();
@@ -86,7 +92,7 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
         }
         match forward_cluster_kv_txn_to_state_authority_node_with_host(
             state,
-            target,
+            &target.node_id,
             txn,
             options.command_timeout(target, remaining),
             host,
@@ -110,7 +116,7 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
 
 fn forward_cluster_kv_txn_to_state_authority_node_with_host(
     state: &ClusterBootstrapState,
-    authority_endpoint: &ClusterEndpointRecord,
+    authority_node_id: &NodeId,
     txn: &KvTxn,
     timeout: Duration,
     host: &mut impl ClusterKvTxnForwardHost,
@@ -123,7 +129,7 @@ fn forward_cluster_kv_txn_to_state_authority_node_with_host(
         txn_payload.body,
     );
     let txn_response =
-        host.call_node_object_rpc(state, &authority_endpoint.node_id, &txn_request, timeout)?;
+        host.call_node_object_rpc(state, authority_node_id, &txn_request, timeout)?;
     txn_response.error_detail()?;
     let txn_response =
         sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body).map_err(kv_err)?;
@@ -139,7 +145,7 @@ fn forward_cluster_kv_txn_to_state_authority_node_with_host(
     );
     let snapshot_response = host.call_node_object_rpc(
         state,
-        &authority_endpoint.node_id,
+        authority_node_id,
         &snapshot_request,
         snapshot_timeout,
     )?;
@@ -163,7 +169,7 @@ pub async fn forward_cluster_kv_txn_to_state_authority_async_with_host<H>(
 where
     H: ClusterSignedEndpointRpcAsyncHost + Send,
 {
-    let mut targets = ClusterEndpointSelector::select_internal_async(
+    let mut targets = ClusterEndpointSelector::select_internal_unique_node_targets_async(
         runtime,
         paths,
         state,
@@ -176,8 +182,12 @@ where
     if let Ok(Some(authority_id)) = locked_kv_state_authority_id_async(runtime, paths, state).await
         && !cluster_node_blocks_leader_preference_async(runtime, paths, state, &authority_id)
             .await?
+        && let Some(position) = targets
+            .iter()
+            .position(|endpoint| endpoint.node_id == authority_id)
     {
-        prefer_cluster_kv_forward_authority_endpoints(&mut targets, &authority_id);
+        let authority = targets.remove(position);
+        targets.insert(0, authority);
     }
 
     let mut failures = Vec::new();
@@ -195,7 +205,7 @@ where
         }
         match forward_cluster_kv_txn_to_state_authority_node_async_with_host(
             state,
-            target,
+            &target.node_id,
             txn,
             options.command_timeout(target, remaining),
             runtime,
@@ -223,7 +233,7 @@ where
 
 async fn forward_cluster_kv_txn_to_state_authority_node_async_with_host<H>(
     state: &ClusterBootstrapState,
-    authority_endpoint: &ClusterEndpointRecord,
+    authority_node_id: &NodeId,
     txn: &KvTxn,
     timeout: Duration,
     runtime: &tokio::runtime::Handle,
@@ -244,7 +254,7 @@ where
     let txn_response = client
         .call_target(
             state,
-            &authority_endpoint.node_id,
+            authority_node_id,
             &txn_request,
             ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(timeout)),
         )
@@ -265,7 +275,7 @@ where
     let snapshot_response = client
         .call_target(
             state,
-            &authority_endpoint.node_id,
+            authority_node_id,
             &snapshot_request,
             ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(snapshot_timeout)),
         )
@@ -277,21 +287,4 @@ where
         snapshot,
         txn_response: Some(txn_response),
     })
-}
-
-fn prefer_cluster_kv_forward_authority_endpoints(
-    targets: &mut Vec<ClusterEndpointRecord>,
-    authority_id: &NodeId,
-) {
-    let mut preferred = Vec::new();
-    let mut rest = Vec::new();
-    for target in targets.drain(..) {
-        if target.node_id == *authority_id {
-            preferred.push(target);
-        } else {
-            rest.push(target);
-        }
-    }
-    preferred.extend(rest);
-    *targets = preferred;
 }
