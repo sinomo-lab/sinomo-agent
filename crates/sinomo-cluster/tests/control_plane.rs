@@ -2236,6 +2236,14 @@ fn interface_candidate_filter_rejects_common_local_only_bridges() {
         "veth1234",
         "169.254.147.92".parse().expect("link local")
     ));
+    assert!(!is_advertisable_interface_candidate(
+        "vEthernet (WSL)",
+        "172.26.176.1".parse().expect("wsl bridge")
+    ));
+    assert!(!is_advertisable_interface_candidate(
+        "vEthernet (Docker Desktop)",
+        "192.168.245.1".parse().expect("docker desktop bridge")
+    ));
     assert!(is_advertisable_interface_candidate("eth0", routable_lan));
 }
 
@@ -16081,6 +16089,50 @@ fn cluster_member_publish_txn_from_snapshot_diffs_endpoint_records() {
     let unchanged_key = cluster_endpoint_key(&node_id, &unchanged);
     let stale_key = cluster_endpoint_key(&node_id, &stale);
     let added_key = cluster_endpoint_key(&node_id, &added);
+    let source_node_id =
+        NodeId::from_legacy_named("node_member_publish_endpoint_diff_source").expect("source");
+    let stale_connectivity = ClusterConnectivityRecord {
+        cluster_id: member.cluster_id.clone(),
+        source_node_id: source_node_id.clone(),
+        target_node_id: node_id.clone(),
+        endpoint_id: stale.endpoint_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: stale.address.clone(),
+        state: ClusterConnectivityState::Healthy,
+        latency_ms: Some(4),
+        consecutive_failures: 0,
+        last_success_at: Some("ok".to_string()),
+        last_failure_at: None,
+        failure_reason: None,
+        observed_at: now,
+        expires_at: now + time::Duration::seconds(900),
+    };
+    let unchanged_connectivity = ClusterConnectivityRecord {
+        cluster_id: member.cluster_id.clone(),
+        source_node_id: source_node_id.clone(),
+        target_node_id: node_id.clone(),
+        endpoint_id: unchanged.endpoint_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: unchanged.address.clone(),
+        state: ClusterConnectivityState::Healthy,
+        latency_ms: Some(3),
+        consecutive_failures: 0,
+        last_success_at: Some("ok".to_string()),
+        last_failure_at: None,
+        failure_reason: None,
+        observed_at: now,
+        expires_at: now + time::Duration::seconds(900),
+    };
+    let stale_connectivity_key = cluster_connectivity_key(
+        &stale_connectivity.source_node_id,
+        &stale_connectivity.target_node_id,
+        &stale_connectivity.endpoint_id,
+    );
+    let unchanged_connectivity_key = cluster_connectivity_key(
+        &unchanged_connectivity.source_node_id,
+        &unchanged_connectivity.target_node_id,
+        &unchanged_connectivity.endpoint_id,
+    );
     let mut store = InProcessKvStore::new();
     store
         .put_serde(unchanged_key.clone(), &unchanged, None)
@@ -16088,6 +16140,16 @@ fn cluster_member_publish_txn_from_snapshot_diffs_endpoint_records() {
     store
         .put_serde(stale_key.clone(), &stale, None)
         .expect("stale endpoint");
+    store
+        .put_serde(stale_connectivity_key.clone(), &stale_connectivity, None)
+        .expect("stale connectivity");
+    store
+        .put_serde(
+            unchanged_connectivity_key.clone(),
+            &unchanged_connectivity,
+            None,
+        )
+        .expect("unchanged connectivity");
 
     let txn =
         cluster_member_publish_txn_from_snapshot(&store.snapshot().expect("snapshot"), &[member])
@@ -16105,6 +16167,18 @@ fn cluster_member_publish_txn_from_snapshot_diffs_endpoint_records() {
             .iter()
             .any(|op| matches!(op, KvOp::Delete { key } if key == &stale_key)),
         "stale endpoint should be deleted explicitly"
+    );
+    assert!(
+        txn.success
+            .iter()
+            .any(|op| matches!(op, KvOp::Delete { key } if key == &stale_connectivity_key)),
+        "connectivity for removed endpoint should be deleted explicitly"
+    );
+    assert!(
+        txn.success
+            .iter()
+            .all(|op| !matches!(op, KvOp::Delete { key } if key == &unchanged_connectivity_key)),
+        "connectivity for retained endpoint should not be deleted"
     );
     assert!(
         txn.success

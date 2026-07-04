@@ -297,8 +297,12 @@ fn discover_default_lan_ip_candidates_uncached() -> Vec<IpAddr> {
     let targets = ["8.8.8.8:80", "1.1.1.1:80", "192.0.2.1:80"]
         .into_iter()
         .filter_map(|target| target.parse::<SocketAddr>().ok());
-    let mut candidates = discover_local_ip_candidates_for_targets(targets);
-    for ip in discover_interface_ip_candidates() {
+    let interface_candidates = discover_interface_ip_candidates();
+    let mut candidates = discover_local_ip_candidates_for_targets_with_interface_filter(
+        targets,
+        &interface_candidates,
+    );
+    for ip in interface_candidates {
         if !candidates.contains(&ip) {
             candidates.push(ip);
         }
@@ -311,15 +315,17 @@ async fn discover_default_lan_ip_candidates_uncached_async() -> Vec<IpAddr> {
         .into_iter()
         .filter_map(|target| target.parse::<SocketAddr>().ok())
         .collect::<Vec<_>>();
-    let route_candidates = discover_local_ip_candidates_for_targets_async(targets);
-    let interface_candidates = tokio::task::spawn_blocking(discover_interface_ip_candidates);
-    let (mut candidates, interface_candidates) =
-        tokio::join!(route_candidates, interface_candidates);
-    if let Ok(interface_candidates) = interface_candidates {
-        for ip in interface_candidates {
-            if !candidates.contains(&ip) {
-                candidates.push(ip);
-            }
+    let interface_candidates = tokio::task::spawn_blocking(discover_interface_ip_candidates)
+        .await
+        .unwrap_or_default();
+    let mut candidates = discover_local_ip_candidates_for_targets_with_interface_filter_async(
+        targets,
+        &interface_candidates,
+    )
+    .await;
+    for ip in interface_candidates {
+        if !candidates.contains(&ip) {
+            candidates.push(ip);
         }
     }
     candidates
@@ -644,6 +650,18 @@ pub fn discover_local_ip_candidates_for_targets<I>(targets: I) -> Vec<IpAddr>
 where
     I: IntoIterator<Item = SocketAddr>,
 {
+    let interface_candidates = discover_interface_ip_candidates();
+    discover_local_ip_candidates_for_targets_with_interface_filter(targets, &interface_candidates)
+}
+
+fn discover_local_ip_candidates_for_targets_with_interface_filter<I>(
+    targets: I,
+    interface_candidates: &[IpAddr],
+) -> Vec<IpAddr>
+where
+    I: IntoIterator<Item = SocketAddr>,
+{
+    let require_advertisable_interface = !interface_candidates.is_empty();
     let mut candidates = Vec::new();
     for target in targets {
         let bind = if target.is_ipv4() {
@@ -661,7 +679,10 @@ where
             continue;
         };
         let ip = address.ip();
-        if is_invitable_ip(ip) && !candidates.contains(&ip) {
+        if is_invitable_ip(ip)
+            && (!require_advertisable_interface || interface_candidates.contains(&ip))
+            && !candidates.contains(&ip)
+        {
             candidates.push(ip);
         }
     }
@@ -672,6 +693,24 @@ pub async fn discover_local_ip_candidates_for_targets_async<I>(targets: I) -> Ve
 where
     I: IntoIterator<Item = SocketAddr>,
 {
+    let interface_candidates = tokio::task::spawn_blocking(discover_interface_ip_candidates)
+        .await
+        .unwrap_or_default();
+    discover_local_ip_candidates_for_targets_with_interface_filter_async(
+        targets,
+        &interface_candidates,
+    )
+    .await
+}
+
+async fn discover_local_ip_candidates_for_targets_with_interface_filter_async<I>(
+    targets: I,
+    interface_candidates: &[IpAddr],
+) -> Vec<IpAddr>
+where
+    I: IntoIterator<Item = SocketAddr>,
+{
+    let require_advertisable_interface = !interface_candidates.is_empty();
     let mut candidates = Vec::new();
     for target in targets {
         let bind = if target.is_ipv4() {
@@ -689,7 +728,10 @@ where
             continue;
         };
         let ip = address.ip();
-        if is_invitable_ip(ip) && !candidates.contains(&ip) {
+        if is_invitable_ip(ip)
+            && (!require_advertisable_interface || interface_candidates.contains(&ip))
+            && !candidates.contains(&ip)
+        {
             candidates.push(ip);
         }
     }
@@ -733,6 +775,11 @@ fn interface_name_is_local_only(name: &str) -> bool {
         || name.starts_with("nerdctl")
         || name.starts_with("vboxnet")
         || name.starts_with("vmnet")
+        || name.starts_with("vethernet")
+        || name.contains("docker")
+        || name.contains("wsl")
+        || name.contains("hyper-v")
+        || name.contains("default switch")
 }
 
 pub fn format_ip_port(ip: IpAddr, port: u16) -> String {

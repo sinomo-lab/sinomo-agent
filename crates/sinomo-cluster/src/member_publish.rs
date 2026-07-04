@@ -20,7 +20,9 @@ use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_network::cleanup_member_iroh_endpoints;
-use sinomo_network::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
+use sinomo_network::{
+    ClusterConnectivityRecord, ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector,
+};
 use sinomo_node::{
     ClusterCapabilityPolicyRecord, cluster_capability_policy_stable_eq,
     cluster_endpoint_list_stable_eq, cluster_endpoint_stable_eq, cluster_local_process_members,
@@ -775,12 +777,21 @@ fn push_cluster_member_endpoint_diff_ops(
         };
         desired_endpoints.insert(key, (value, endpoint.clone()));
     }
+    let mut removed_endpoint_ids = Vec::new();
 
     for entry in snapshot
         .range_prefix_limited(&endpoint_prefix, MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS)
         .map_err(kv_err)?
     {
         if !desired_endpoints.contains_key(&entry.key) {
+            if let Ok(endpoint) = entry.decode::<ClusterEndpointRecord>() {
+                sinomo_network::try_reserve_vec(
+                    &mut removed_endpoint_ids,
+                    1,
+                    "collect removed member endpoint ids",
+                )?;
+                removed_endpoint_ids.push(endpoint.endpoint_id);
+            }
             push_bounded_txn_success_op(
                 ops,
                 KvOp::Delete {
@@ -790,6 +801,13 @@ fn push_cluster_member_endpoint_diff_ops(
             .map_err(kv_err)?;
         }
     }
+
+    push_removed_member_endpoint_connectivity_delete_ops(
+        snapshot,
+        &member.node_id,
+        &removed_endpoint_ids,
+        ops,
+    )?;
 
     for (key, (value, endpoint)) in desired_endpoints {
         if snapshot.get(&key).is_none_or(|entry| {
@@ -812,6 +830,33 @@ fn push_cluster_member_endpoint_diff_ops(
         }
     }
 
+    Ok(())
+}
+
+fn push_removed_member_endpoint_connectivity_delete_ops(
+    snapshot: &KvSnapshot,
+    member_node_id: &NodeId,
+    removed_endpoint_ids: &[ClusterEndpointId],
+    ops: &mut Vec<KvOp>,
+) -> Result<(), NetworkError> {
+    if removed_endpoint_ids.is_empty() {
+        return Ok(());
+    }
+    for entry in snapshot.prefix_entries("/cluster/network/connectivity/") {
+        let record: ClusterConnectivityRecord = entry.decode().map_err(kv_err)?;
+        if record.target_node_id != *member_node_id
+            || !removed_endpoint_ids.contains(&record.endpoint_id)
+        {
+            continue;
+        }
+        push_bounded_txn_success_op(
+            ops,
+            KvOp::Delete {
+                key: entry.key.clone(),
+            },
+        )
+        .map_err(kv_err)?;
+    }
     Ok(())
 }
 
