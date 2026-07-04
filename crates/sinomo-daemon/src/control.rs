@@ -1086,19 +1086,25 @@ async fn try_handle_loopback_daemon_status_request_pre_auth(
         return Ok(false);
     }
     let _: () = request.decode_body().map_err(DaemonError::from)?;
-    let status = daemon_status_response_async(paths, None).await?;
+    let status = daemon_liveness_status_response_async(paths).await?;
     let response =
         sinomo_core::network::ObjectRpcResponse::encode_body(crate::DAEMON_STATUS_ROUTE, &status)
             .map_err(DaemonError::from)?;
-    write_daemon_rpc_response_frame_async_for_rpc_request(
-        stream,
-        stream_address,
-        paths,
-        request,
-        response,
-    )
-    .await?;
+    write_daemon_rpc_response_frame_async(stream, stream_address, response).await?;
     Ok(true)
+}
+
+async fn daemon_liveness_status_response_async(
+    paths: &DaemonPaths,
+) -> Result<crate::DaemonStatus, DaemonError> {
+    let read_paths = paths.clone();
+    let read_path = read_paths.root.display().to_string();
+    tokio::task::spawn_blocking(move || read_daemon_status(&read_paths))
+        .await
+        .map_err(|source| DaemonError::Io {
+            path: read_path,
+            detail: format!("daemon liveness status read task failed: {source}"),
+        })?
 }
 
 pub(crate) async fn dispatch_daemon_control_request_in_process_async(
