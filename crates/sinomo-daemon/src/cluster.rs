@@ -61,13 +61,12 @@ use sinomo_core::node::{
 };
 use sinomo_core::node::{load_or_create_main_node_identity, load_or_create_shadow_node_identity};
 use sinomo_core::{
-    ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRecord, ClusterNodeAvailability,
-    ClusterNodeRole, ClusterNodeRolloutStatus, ClusterNodeStatusRecord, ClusterTransportKind, Id,
+    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource,
+    ClusterMemberRecord, ClusterNodeAvailability, ClusterNodeRole, ClusterNodeRolloutStatus,
+    ClusterNodeStatusRecord, ClusterTransportKind, Id,
 };
 #[cfg(test)]
-use sinomo_core::{
-    ClusterEndpointPrivacy, ClusterJoinInvite, ClusterMemberRole, ClusterMemberState, TrustDomain,
-};
+use sinomo_core::{ClusterJoinInvite, ClusterMemberRole, ClusterMemberState, TrustDomain};
 use sinomo_rollout::{
     ClusterRolloutBuildRequest, SelfRolloutPaths, managed_source_status, read_rollout_status,
     source_heads_match,
@@ -2838,28 +2837,8 @@ async fn import_peer_connectivity_records_from_reachable_endpoints_async(
     };
     let mut visited = BTreeSet::new();
     let mut imported = 0_usize;
-    for record in records.iter().filter(|record| {
-        record.state == ClusterConnectivityState::Healthy
-            && record.source_node_id == state.local_node_id
-            && record.target_node_id != state.local_node_id
-    }) {
-        let Some(endpoint) = state
-            .members
-            .iter()
-            .find(|member| member.node_id == record.target_node_id)
-            .and_then(|member| {
-                member.endpoints.iter().find(|endpoint| {
-                    endpoint.endpoint_id == record.endpoint_id
-                        && endpoint.address == record.address
-                        && endpoint.transport == record.transport
-                        && endpoint.privacy != sinomo_core::ClusterEndpointPrivacy::LocalOnly
-                        && sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(
-                            endpoint,
-                        )
-                })
-            })
-            .cloned()
-        else {
+    for record in records {
+        let Some(endpoint) = peer_connectivity_import_endpoint_for_record(state, record) else {
             continue;
         };
         let key = format!("{}:{}", endpoint.node_id, endpoint.endpoint_id);
@@ -2933,6 +2912,50 @@ async fn import_peer_connectivity_records_from_reachable_endpoints_async(
         }
     }
     imported
+}
+
+fn peer_connectivity_import_endpoint_for_record(
+    state: &ClusterBootstrapState,
+    record: &ClusterConnectivityRecord,
+) -> Option<ClusterEndpointRecord> {
+    if record.cluster_id != state.cluster_id
+        || record.source_node_id != state.local_node_id
+        || record.target_node_id == state.local_node_id
+        || record.state == ClusterConnectivityState::Unreachable
+    {
+        return None;
+    }
+    let member = state
+        .members
+        .iter()
+        .find(|member| member.node_id == record.target_node_id)?;
+    if !member.state.is_authorized()
+        || !member
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == sinomo_core::node::DAEMON_MAIN_RUN_CAPABILITY)
+    {
+        return None;
+    }
+    if !matches!(
+        record.transport,
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback | ClusterTransportKind::Iroh
+    ) {
+        return None;
+    }
+    let endpoint = ClusterEndpointRecord {
+        endpoint_id: record.endpoint_id.clone(),
+        node_id: record.target_node_id.clone(),
+        transport: record.transport.clone(),
+        address: record.address.clone(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: record
+            .latency_ms
+            .map(|latency_ms| latency_ms.min(u64::from(u32::MAX)) as u32),
+    };
+    sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(&endpoint).then_some(endpoint)
 }
 
 async fn probe_connectivity_batch_async(
@@ -12334,6 +12357,142 @@ mod tests {
             endpoints.first().map(|endpoint| &endpoint.endpoint_id),
             Some(&healthy_public.endpoint_id),
             "direct health status should try the selector-ranked healthy endpoint before stale private fallbacks"
+        );
+    }
+
+    #[test]
+    fn peer_connectivity_import_uses_observed_reachable_main_endpoint() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_peer_connectivity_import").expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_peer_connectivity_import_local").expect("local node");
+        let remote_node =
+            NodeId::from_legacy_named("node_peer_connectivity_import_remote").expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "peer connectivity import",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let stale_static = sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "10.0.0.41:21353".to_string(),
+            10,
+        );
+        let observed_endpoint = ClusterEndpointRecord {
+            endpoint_id: sinomo_core::network::ClusterEndpointId::from_legacy_named(
+                "endpoint_peer_connectivity_import_observed",
+            )
+            .expect("endpoint id"),
+            node_id: remote_node.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "203.0.113.41:21353".to_string(),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 20,
+            last_observed_latency_ms: Some(42),
+        };
+        let mut remote_member =
+            ClusterMemberRecord::local_voter(cluster_id, remote_node, "remote", "pk-remote", now);
+        remote_member.capabilities =
+            sinomo_core::node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![stale_static];
+        state.members.push(remote_member);
+
+        let record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &observed_endpoint,
+            ClusterConnectivityState::Degraded,
+            Some(42),
+            1,
+            Some("ok".to_string()),
+            None,
+            now,
+            60,
+        );
+
+        let endpoint =
+            peer_connectivity_import_endpoint_for_record(&state, &record).expect("import endpoint");
+        assert_eq!(endpoint.endpoint_id, observed_endpoint.endpoint_id);
+        assert_eq!(endpoint.address, observed_endpoint.address);
+        assert_eq!(endpoint.source, ClusterEndpointSource::Observed);
+        assert_eq!(endpoint.privacy, ClusterEndpointPrivacy::Lan);
+        assert_eq!(endpoint.last_observed_latency_ms, Some(42));
+    }
+
+    #[test]
+    fn peer_connectivity_import_skips_shadow_and_unreachable_records() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_peer_connectivity_import_skip")
+            .expect("cluster id");
+        let local_node = NodeId::from_legacy_named("node_peer_connectivity_import_skip_local")
+            .expect("local node");
+        let remote_node = NodeId::from_legacy_named("node_peer_connectivity_import_skip_remote")
+            .expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "peer connectivity import skip",
+            local_node,
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut remote_member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote_node.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        remote_member.capabilities =
+            sinomo_core::node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        state.members.push(remote_member);
+
+        let shadow_endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "203.0.113.41:21354".to_string(),
+            10,
+        );
+        let shadow_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &shadow_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(12),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            60,
+        );
+        assert!(
+            peer_connectivity_import_endpoint_for_record(&state, &shadow_record).is_none(),
+            "shadow daemon endpoints must not be used for main-daemon peer connectivity import"
+        );
+
+        let main_endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "203.0.113.41:21353".to_string(),
+            10,
+        );
+        let unreachable_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &main_endpoint,
+            ClusterConnectivityState::Unreachable,
+            None,
+            3,
+            None,
+            Some("unreachable".to_string()),
+            now,
+            60,
+        );
+        assert!(
+            peer_connectivity_import_endpoint_for_record(&state, &unreachable_record).is_none(),
+            "unreachable records must not trigger peer connectivity import"
         );
     }
 
