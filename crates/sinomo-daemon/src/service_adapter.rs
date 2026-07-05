@@ -3234,6 +3234,8 @@ fn register_daemon_config_definitions(
     let builder =
         sinomo_dfs::register_dfs_config_definitions(builder).map_err(|error| error.to_string())?;
     let builder =
+        sinomo_module::register_config_definitions(builder).map_err(|error| error.to_string())?;
+    let builder =
         sinomo_rollout::register_config_definitions(builder).map_err(|error| error.to_string())?;
     sinomo_sandbox::register_config_definitions(builder).map_err(|error| error.to_string())
 }

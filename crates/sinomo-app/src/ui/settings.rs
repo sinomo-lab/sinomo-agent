@@ -43,10 +43,12 @@ use crate::backend::config::{
     set_provider_api_key, set_provider_base_url, set_provider_chat_default, set_provider_effort,
     set_provider_enabled, set_provider_model, set_value,
 };
+use crate::backend::modules::ModuleConfigSnapshot;
 use crate::rendering::AppRenderMode;
 use crate::state::{Shared, Tab};
 use crate::theme::{AppThemeMode, Palette};
 use crate::ui::widgets;
+use sinomo_runtime::module::{ModuleRuntimeConfigSource, resolve_module_runtime_config};
 
 /// Below this content width the tab collapses to a single drill-down column.
 const WIDE_THRESHOLD: f32 = 700.0;
@@ -67,18 +69,20 @@ pub enum SettingsSection {
     Node,
     Cluster,
     Providers,
+    Modules,
     Skills,
     Configuration,
     About,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 8] = [
+    pub const ALL: [SettingsSection; 9] = [
         SettingsSection::Appearance,
         SettingsSection::Connection,
         SettingsSection::Node,
         SettingsSection::Cluster,
         SettingsSection::Providers,
+        SettingsSection::Modules,
         SettingsSection::Skills,
         SettingsSection::Configuration,
         SettingsSection::About,
@@ -91,6 +95,7 @@ impl SettingsSection {
             SettingsSection::Node => "Node",
             SettingsSection::Cluster => "Cluster",
             SettingsSection::Providers => "Providers",
+            SettingsSection::Modules => "Modules",
             SettingsSection::Skills => "Skills",
             SettingsSection::Configuration => "Advanced",
             SettingsSection::About => "About",
@@ -142,6 +147,10 @@ pub struct SettingsState {
     pub provider_add_error: Option<String>,
     pub provider_action_error: Option<String>,
     pub provider_action_status: Option<ProviderActionStatus>,
+    pub module_snapshot: ModuleConfigSnapshot,
+    pub module_selected_node_id: Option<String>,
+    pub module_action_error: Option<String>,
+    pub module_action_status: Option<String>,
     pub skills: Vec<SkillSummary>,
     pub skill_detail: Option<SkillDetail>,
     pub skill_selected: Option<(String, String)>,
@@ -220,6 +229,11 @@ impl SettingsState {
         let skills_include_all = true;
         let (skills, skill_selected, skill_detail, skill_action_error) =
             load_initial_skill_state(data_dir.as_ref(), skills_include_all);
+        let module_snapshot = backend.module_config_snapshot(None);
+        let module_selected_node_id = module_snapshot
+            .selected_node
+            .as_ref()
+            .map(|node| node.summary.node_id.clone());
 
         let cluster_status = backend.app_cluster_status();
         let (clustered, cluster_summary) = if cluster_status.clustered {
@@ -273,6 +287,10 @@ impl SettingsState {
             provider_add_error: None,
             provider_action_error: None,
             provider_action_status: None,
+            module_snapshot,
+            module_selected_node_id,
+            module_action_error: None,
+            module_action_status: None,
             skills,
             skill_detail,
             skill_selected,
@@ -387,6 +405,93 @@ impl SettingsState {
 
     fn toggle_provider_storage_detail(&mut self) {
         self.provider_storage_detail_expanded = !self.provider_storage_detail_expanded;
+    }
+
+    fn selected_module_node_index(&self) -> Option<usize> {
+        let selected = self.module_selected_node_id.as_ref()?;
+        self.module_snapshot
+            .nodes
+            .iter()
+            .position(|node| &node.node_id == selected)
+    }
+
+    fn select_module_node_index(&mut self, backend: &Backend, index: usize) {
+        let Some(node) = self.module_snapshot.nodes.get(index) else {
+            return;
+        };
+        self.module_selected_node_id = Some(node.node_id.clone());
+        self.module_action_error = None;
+        self.module_action_status = None;
+        self.reload_modules(backend);
+    }
+
+    fn reload_modules(&mut self, backend: &Backend) {
+        self.module_snapshot =
+            backend.module_config_snapshot(self.module_selected_node_id.as_deref());
+        self.module_selected_node_id = self
+            .module_snapshot
+            .selected_node
+            .as_ref()
+            .map(|node| node.summary.node_id.clone());
+    }
+
+    fn set_cluster_module_default(
+        &mut self,
+        backend: &Backend,
+        module_id: &str,
+        enabled: bool,
+    ) -> bool {
+        match backend.set_cluster_module_default(module_id, enabled) {
+            Ok(()) => {
+                self.module_action_error = None;
+                self.module_action_status = Some(format!(
+                    "Cluster default saved for {}",
+                    module_display_id(module_id)
+                ));
+                self.reload_modules(backend);
+                true
+            }
+            Err(error) => {
+                self.module_action_error = Some(error);
+                self.module_action_status = None;
+                false
+            }
+        }
+    }
+
+    fn set_node_module_override(
+        &mut self,
+        backend: &Backend,
+        module_id: &str,
+        enabled: Option<bool>,
+    ) -> bool {
+        let Some(node_id) = self.module_selected_node_id.clone() else {
+            self.module_action_error = Some("select a node first".to_string());
+            self.module_action_status = None;
+            return false;
+        };
+        match backend.set_node_module_override(&node_id, module_id, enabled) {
+            Ok(()) => {
+                self.module_action_error = None;
+                self.module_action_status = Some(match enabled {
+                    Some(true) => {
+                        format!("Node override enabled for {}", module_display_id(module_id))
+                    }
+                    Some(false) => format!(
+                        "Node override disabled for {}",
+                        module_display_id(module_id)
+                    ),
+                    None => format!("Node override cleared for {}", module_display_id(module_id)),
+                });
+                self.reload_modules(backend);
+                true
+            }
+            Err(error) => {
+                self.module_action_error = Some(error);
+                self.module_action_status = None;
+                false
+            }
+        }
     }
 
     fn selected_skill_index(&self) -> Option<usize> {
@@ -1108,6 +1213,17 @@ fn provider_sidebar_preview(forms: &[ProviderForm]) -> String {
     }
 }
 
+fn module_sidebar_preview(snapshot: &ModuleConfigSnapshot) -> String {
+    if snapshot.modules.is_empty() {
+        return "No modules".to_string();
+    }
+    format!(
+        "{} modules · {} nodes",
+        snapshot.modules.len(),
+        snapshot.nodes.len()
+    )
+}
+
 fn skills_sidebar_preview(skills: &[SkillSummary]) -> String {
     if skills.is_empty() {
         return "No skills".to_string();
@@ -1223,6 +1339,10 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
         SettingsSection::Providers => {
             let settings = shared.settings();
             provider_sidebar_preview(&settings.provider_forms)
+        }
+        SettingsSection::Modules => {
+            let settings = shared.settings();
+            module_sidebar_preview(&settings.module_snapshot)
         }
         SettingsSection::Skills => {
             let settings = shared.settings();
@@ -2940,6 +3060,355 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         .theme_when(clone_reader(reader))
 }
 
+const MODULE_OVERRIDE_OPTIONS: &[&str] = &["Inherit", "Enable", "Disable"];
+
+fn section_modules(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || module_section_key(&s)
+        },
+        move |_key| WidgetPod::new(section_modules_body(&s, &r)),
+    )
+}
+
+fn module_section_key(shared: &Shared) -> String {
+    let settings = shared.settings();
+    let snapshot = &settings.module_snapshot;
+    let nodes = snapshot
+        .nodes
+        .iter()
+        .map(|node| {
+            format!(
+                "{}:{}:{}:{}",
+                node.node_id, node.display_name, node.availability, node.local
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let modules = snapshot
+        .modules
+        .iter()
+        .map(|module| {
+            format!(
+                "{}:{}:{}:{}",
+                module.module_id, module.label, module.backend, module.detail
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cluster = snapshot
+        .cluster_config
+        .modules
+        .iter()
+        .map(|(module_id, setting)| format!("{module_id}:{}", setting.enabled))
+        .collect::<Vec<_>>()
+        .join(",");
+    let selected = snapshot
+        .selected_node
+        .as_ref()
+        .map(|node| {
+            let config = node
+                .config
+                .modules
+                .iter()
+                .map(|(module_id, setting)| format!("{module_id}:{}", setting.enabled))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{}:{:?}:{}", node.summary.node_id, node.error, config)
+        })
+        .unwrap_or_default();
+    format!(
+        "selected:{:?};error:{:?};status:{:?};warnings:{:?}\n{nodes}\n{modules}\n{cluster}\n{selected}",
+        settings.module_selected_node_id,
+        settings.module_action_error,
+        settings.module_action_status,
+        snapshot.warnings
+    )
+}
+
+fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let (snapshot, action_error, action_status) = {
+        let settings = shared.settings();
+        (
+            settings.module_snapshot.clone(),
+            settings.module_action_error.clone(),
+            settings.module_action_status.clone(),
+        )
+    };
+
+    let node_options = snapshot
+        .nodes
+        .iter()
+        .map(module_node_option)
+        .collect::<Vec<_>>();
+    let node_select = {
+        let s = shared.clone();
+        Select::new("module-config-node")
+            .options(node_options)
+            .selected_when({
+                let s = s.clone();
+                move || s.settings().selected_module_node_index()
+            })
+            .theme_when(clone_reader(reader))
+            .on_change(move |index, _label| {
+                if let Some(backend) = ready_backend(&s) {
+                    s.settings_mut().select_module_node_index(&backend, index);
+                }
+            })
+    };
+    let refresh = {
+        let s = shared.clone();
+        sui::Button::new("Refresh")
+            .icon(sui::IconGlyph::Redo)
+            .theme_when(secondary_button_theme(reader))
+            .on_press(move || {
+                if let Some(backend) = ready_backend(&s) {
+                    s.settings_mut().reload_modules(&backend);
+                }
+            })
+    };
+
+    let mut summary_body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(value_row(
+            shared,
+            reader,
+            "Cluster defaults",
+            module_cluster_summary(&snapshot),
+        ))
+        .with_child(
+            FormRow::new("Node", node_select)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormRow::new(
+                "Actions",
+                Stack::horizontal()
+                    .spacing(8.0)
+                    .alignment(Alignment::Start)
+                    .with_child(refresh),
+            )
+            .inline()
+            .theme_when(clone_reader(reader)),
+        );
+    if let Some(node) = snapshot.selected_node.as_ref() {
+        summary_body = summary_body.with_child(value_row(
+            shared,
+            reader,
+            "Selected",
+            format!(
+                "{} · {}",
+                node.summary.display_name,
+                short(&node.summary.node_id, 16)
+            ),
+        ));
+        if let Some(error) = node.error.as_ref() {
+            summary_body =
+                summary_body.with_child(value_row(shared, reader, "Node config", error.clone()));
+        }
+    }
+    if !snapshot.warnings.is_empty() {
+        summary_body = summary_body.with_child(value_row(
+            shared,
+            reader,
+            "Warnings",
+            snapshot.warnings.join("; "),
+        ));
+    }
+    if let Some(error) = action_error {
+        summary_body = summary_body.with_child(value_row(shared, reader, "Error", error));
+    } else if let Some(status) = action_status {
+        summary_body = summary_body.with_child(value_row(shared, reader, "Status", status));
+    }
+
+    let mut stack = Stack::vertical()
+        .spacing(14.0)
+        .alignment(Alignment::Stretch)
+        .with_child(
+            FormSection::new("Modules", summary_body)
+                .description(
+                    "Configure cluster defaults and node-local overrides for runtime modules.",
+                )
+                .theme_when(clone_reader(reader)),
+        );
+    if snapshot.modules.is_empty() {
+        let empty = FieldGroup::new().spacing(8.0).with_child(value_row(
+            shared,
+            reader,
+            "Status",
+            "No installed or configured modules were found",
+        ));
+        return stack
+            .with_child(FormSection::new("Catalog", empty).theme_when(clone_reader(reader)));
+    }
+    for module in snapshot.modules {
+        stack = stack.with_child(module_config_section(shared, reader, module));
+    }
+    stack
+}
+
+fn module_config_section(
+    shared: &Shared,
+    reader: &ThemeReader,
+    module: crate::backend::modules::ModuleConfigModuleSummary,
+) -> impl Widget + use<> {
+    let module_id = module.module_id.clone();
+    let (cluster_enabled, effective, selected_node_label) = {
+        let settings = shared.settings();
+        let cluster_enabled = settings
+            .module_snapshot
+            .cluster_config
+            .setting(&module_id)
+            .map(|setting| setting.enabled)
+            .unwrap_or(false);
+        let effective = settings.module_snapshot.selected_node.as_ref().map(|node| {
+            resolve_module_runtime_config(
+                &node.config,
+                &settings.module_snapshot.cluster_config,
+                &module_id,
+            )
+        });
+        let selected_node_label = settings
+            .module_snapshot
+            .selected_node
+            .as_ref()
+            .map(|node| node.summary.display_name.clone())
+            .unwrap_or_else(|| "No node selected".to_string());
+        (cluster_enabled, effective, selected_node_label)
+    };
+
+    let cluster_switch = switch_row(reader, "Cluster default", cluster_enabled, {
+        let s = shared.clone();
+        let module_id = module_id.clone();
+        move |enabled| {
+            if let Some(backend) = ready_backend(&s) {
+                s.settings_mut()
+                    .set_cluster_module_default(&backend, &module_id, enabled);
+            }
+        }
+    });
+
+    let node_override = {
+        let s = shared.clone();
+        let selected_module_id = module_id.clone();
+        select_row(
+            reader,
+            &format!("module-override-{module_id}"),
+            "Node override",
+            MODULE_OVERRIDE_OPTIONS,
+            {
+                let s = s.clone();
+                let module_id = module_id.clone();
+                move || {
+                    let settings = s.settings();
+                    Some(
+                        settings
+                            .module_snapshot
+                            .selected_node
+                            .as_ref()
+                            .and_then(|node| node.config.setting(&module_id))
+                            .map(|setting| if setting.enabled { 1 } else { 2 })
+                            .unwrap_or(0),
+                    )
+                }
+            },
+            move |index, _label| {
+                let enabled = match index {
+                    1 => Some(true),
+                    2 => Some(false),
+                    _ => None,
+                };
+                if let Some(backend) = ready_backend(&s) {
+                    s.settings_mut().set_node_module_override(
+                        &backend,
+                        &selected_module_id,
+                        enabled,
+                    );
+                }
+            },
+        )
+    };
+
+    let mut body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(value_row(
+            shared,
+            reader,
+            "Module ID",
+            module_display_id(&module.module_id),
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Backend",
+            format!("{} · {}", module.backend, module.detail),
+        ))
+        .with_child(cluster_switch)
+        .with_child(node_override)
+        .with_child(value_row(
+            shared,
+            reader,
+            "Effective",
+            effective
+                .map(module_effective_label)
+                .unwrap_or(selected_node_label),
+        ));
+
+    if let Some(node) = shared.settings().module_snapshot.selected_node.as_ref()
+        && let Some(error) = node.error.as_ref()
+    {
+        body = body.with_child(value_row(shared, reader, "Node error", error.clone()));
+    }
+
+    FormSection::new(module.label.clone(), body).theme_when(clone_reader(reader))
+}
+
+fn module_node_option(node: &crate::backend::modules::ModuleConfigNodeSummary) -> String {
+    let suffix = if node.local { " · local" } else { "" };
+    format!(
+        "{} · {}{}",
+        node.display_name,
+        short(&node.node_id, 12),
+        suffix
+    )
+}
+
+fn module_cluster_summary(snapshot: &ModuleConfigSnapshot) -> String {
+    let enabled = snapshot
+        .cluster_config
+        .modules
+        .values()
+        .filter(|setting| setting.enabled)
+        .count();
+    let configured = snapshot.cluster_config.modules.len();
+    if configured == 0 {
+        "No cluster defaults".to_string()
+    } else {
+        format!("{enabled} enabled · {configured} configured")
+    }
+}
+
+fn module_effective_label(config: sinomo_runtime::module::ResolvedModuleRuntimeConfig) -> String {
+    let state = if config.enabled {
+        "Enabled"
+    } else {
+        "Disabled"
+    };
+    match config.source {
+        ModuleRuntimeConfigSource::Node => format!("{state} from node override"),
+        ModuleRuntimeConfigSource::Cluster => format!("{state} from cluster default"),
+        ModuleRuntimeConfigSource::DisabledDefault => "Disabled by default".to_string(),
+    }
+}
+
+fn module_display_id(module_id: &str) -> String {
+    short_one_line(module_id, 72)
+}
+
 fn section_skills(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
     let r = Rc::clone(reader);
@@ -3647,6 +4116,7 @@ fn section_body(
         .with_child(section_node(shared, reader))
         .with_child(section_cluster(shared, reader))
         .with_child(section_providers(shared, reader))
+        .with_child(section_modules(shared, reader))
         .with_child(section_skills(shared, reader))
         .with_child(section_configuration(shared, reader))
         .with_child(section_about(shared, reader))
@@ -4793,6 +5263,43 @@ mod tests {
         assert!(
             state.provider_add_can_submit(),
             "device-login providers collect credentials after the account is added"
+        );
+    }
+
+    #[test]
+    fn module_settings_load_catalog_and_save_local_override() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        assert!(
+            state.module_selected_node_id.is_some(),
+            "module settings should select the local node by default"
+        );
+        assert!(
+            state
+                .module_snapshot
+                .modules
+                .iter()
+                .any(|module| module.module_id
+                    == sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID),
+            "module settings should include built-in module targets"
+        );
+
+        assert!(state.set_node_module_override(
+            &backend,
+            sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID,
+            Some(true),
+        ));
+        let selected = state
+            .module_snapshot
+            .selected_node
+            .as_ref()
+            .expect("selected node");
+        assert_eq!(
+            selected
+                .config
+                .setting(sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID)
+                .map(|setting| setting.enabled),
+            Some(true)
         );
     }
 

@@ -12,6 +12,7 @@ pub mod chat_engine;
 pub mod cluster;
 pub mod config;
 pub mod evolution;
+pub mod modules;
 pub mod sessions;
 pub mod sifs;
 
@@ -435,6 +436,7 @@ fn agent_runtime_control_service_hook(
         sinomo_agent::register_services_with_runtime_control(builder, host)
     })
     .with_config_definitions(|builder| {
+        let builder = sinomo_runtime::module::register_config_definitions(builder)?;
         sinomo_lm::register_config_definitions(builder).map_err(|error| error.to_string())
     })
 }
@@ -487,6 +489,11 @@ mod tests {
         assert!(
             config_registry
                 .get(sinomo_lm::LM_PROVIDER_CONFIG_KEY)
+                .is_ok()
+        );
+        assert!(
+            config_registry
+                .get(sinomo_runtime::module::MODULE_CLUSTER_CONFIG_KEY)
                 .is_ok()
         );
 

@@ -68,6 +68,8 @@ pub fn build_config_store() -> Result<ConfigStore, String> {
     let builder = sinomo_runtime::config::ConfigRegistry::builder();
     let builder = sinomo_runtime::dfs::register_dfs_config_definitions(builder)
         .map_err(|e| format!("dfs config: {e:?}"))?;
+    let builder = sinomo_runtime::module::register_config_definitions(builder)
+        .map_err(|e| format!("module config: {e}"))?;
     let builder = sinomo_runtime::rollout::register_config_definitions(builder)
         .map_err(|e| format!("rollout config: {e:?}"))?;
     let builder = sinomo_runtime::sandbox::register_config_definitions(builder)

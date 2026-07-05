@@ -4016,6 +4016,8 @@ pub(crate) fn main_agent_configure_tool_registry_for_workspace(
 pub(crate) fn main_agent_config_store() -> Result<sinomo_runtime::config::ConfigStore, CliError> {
     let builder = sinomo_runtime::config::ConfigRegistry::builder();
     let builder = sinomo_runtime::dfs::register_dfs_config_definitions(builder)?;
+    let builder = sinomo_runtime::module::register_config_definitions(builder)
+        .map_err(|detail| CliError::Parse { detail })?;
     let builder =
         sinomo_runtime::rollout::register_config_definitions(builder).map_err(CliError::from)?;
     let builder = sinomo_runtime::sandbox::register_config_definitions(builder)?;
