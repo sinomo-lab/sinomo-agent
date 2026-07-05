@@ -293,6 +293,8 @@ pub const DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_ISSUES: usize = 64;
 pub const DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS: usize = 16;
 pub const DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB: usize = 1024;
 pub const DEFAULT_DFS_CONFLICT_MAINTENANCE_MAX_RECORDS: usize = 128;
+pub const DEFAULT_DFS_WRITE_INTENT_MAINTENANCE_MAX_RECORDS: usize = 256;
+pub const DEFAULT_DFS_STALE_WRITE_INTENT_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsAntiEntropyCursorRecord {
@@ -323,6 +325,15 @@ pub struct DfsConflictMaintenanceReport {
     pub scanned_open_conflict_count: usize,
     pub resolved_conflict_count: usize,
     pub superseded_conflict_count: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DfsWriteIntentMaintenanceReport {
+    pub scanned_active_intent_count: usize,
+    pub committed_visible_intent_count: usize,
+    pub aborted_missing_object_count: usize,
+    pub aborted_superseded_intent_count: usize,
+    pub skipped_fresh_stale_candidate_count: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -867,6 +878,8 @@ pub struct DfsMaintenanceTickOptions {
     pub namespace_job_max_jobs: usize,
     pub namespace_job_max_steps_per_job: usize,
     pub conflict_max_records: usize,
+    pub write_intent_max_records: usize,
+    pub stale_write_intent_min_age: Duration,
     pub repair_max_jobs: usize,
     pub lifecycle: DfsMaintenanceRunOptions,
     pub metadata_replication: DfsMetadataJournalReplicationOptions,
@@ -879,6 +892,8 @@ impl Default for DfsMaintenanceTickOptions {
             namespace_job_max_steps_per_job:
                 DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB,
             conflict_max_records: DEFAULT_DFS_CONFLICT_MAINTENANCE_MAX_RECORDS,
+            write_intent_max_records: DEFAULT_DFS_WRITE_INTENT_MAINTENANCE_MAX_RECORDS,
+            stale_write_intent_min_age: DEFAULT_DFS_STALE_WRITE_INTENT_MIN_AGE,
             repair_max_jobs: usize::MAX,
             lifecycle: DfsMaintenanceRunOptions::default(),
             metadata_replication: DfsMetadataJournalReplicationOptions::default(),
@@ -890,6 +905,7 @@ impl Default for DfsMaintenanceTickOptions {
 pub struct DfsMaintenanceTickReport {
     pub namespace_jobs: DfsNamespaceJobMaintenanceReport,
     pub conflicts: DfsConflictMaintenanceReport,
+    pub write_intents: DfsWriteIntentMaintenanceReport,
     pub lifecycle_reports: Vec<DfsLifecycleMaintenanceReport>,
     pub scheduled_repairs: Vec<DistributedRepairJob>,
     pub followup_events: Vec<NetworkedDfsServiceEvent>,
@@ -913,6 +929,9 @@ pub fn dfs_maintenance_tick_observations(
 ) -> DfsMaintenanceTickObservations {
     let mut notice_lines = dfs_namespace_job_maintenance_notice_lines(&report.namespace_jobs);
     notice_lines.extend(dfs_conflict_maintenance_notice_lines(&report.conflicts));
+    notice_lines.extend(dfs_write_intent_maintenance_notice_lines(
+        &report.write_intents,
+    ));
     notice_lines.extend(dfs_lifecycle_maintenance_notice_lines(
         &report.lifecycle_reports,
     ));
@@ -948,6 +967,26 @@ pub fn dfs_conflict_maintenance_notice_lines(report: &DfsConflictMaintenanceRepo
         report.scanned_open_conflict_count,
         report.resolved_conflict_count,
         report.superseded_conflict_count
+    )]
+}
+
+pub fn dfs_write_intent_maintenance_notice_lines(
+    report: &DfsWriteIntentMaintenanceReport,
+) -> Vec<String> {
+    if report.committed_visible_intent_count == 0
+        && report.aborted_missing_object_count == 0
+        && report.aborted_superseded_intent_count == 0
+        && report.skipped_fresh_stale_candidate_count == 0
+    {
+        return Vec::new();
+    }
+    vec![format!(
+        "DFS write intents: scanned_active={}, committed_visible={}, aborted_missing_object={}, aborted_superseded={}, skipped_fresh={}",
+        report.scanned_active_intent_count,
+        report.committed_visible_intent_count,
+        report.aborted_missing_object_count,
+        report.aborted_superseded_intent_count,
+        report.skipped_fresh_stale_candidate_count
     )]
 }
 
@@ -1178,6 +1217,10 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
             message: error.to_string(),
         })?;
     let conflicts = service.reconcile_stale_conflicts_bounded(options.conflict_max_records)?;
+    let write_intents = service.reconcile_stale_write_intents_bounded(
+        options.write_intent_max_records,
+        options.stale_write_intent_min_age,
+    )?;
     let lifecycle_reports =
         run_dfs_lifecycle_maintenance_with_host(service, maintenance_host, options.lifecycle)?;
     let repair_attempts_before = maintenance_host.load_repair_attempt_records()?;
@@ -1201,6 +1244,7 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     Ok(DfsMaintenanceTickReport {
         namespace_jobs,
         conflicts,
+        write_intents,
         lifecycle_reports,
         scheduled_repairs,
         followup_events,
@@ -1233,6 +1277,10 @@ where
             message: error.to_string(),
         })?;
     let conflicts = service.reconcile_stale_conflicts_bounded(options.conflict_max_records)?;
+    let write_intents = service.reconcile_stale_write_intents_bounded(
+        options.write_intent_max_records,
+        options.stale_write_intent_min_age,
+    )?;
     let lifecycle_reports =
         run_dfs_lifecycle_maintenance_with_host(service, maintenance_host, options.lifecycle)?;
     let repair_attempts_before = maintenance_host.load_repair_attempt_records()?;
@@ -1260,6 +1308,7 @@ where
     Ok(DfsMaintenanceTickReport {
         namespace_jobs,
         conflicts,
+        write_intents,
         lifecycle_reports,
         scheduled_repairs,
         followup_events,

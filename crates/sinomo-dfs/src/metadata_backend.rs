@@ -2721,6 +2721,67 @@ mod tests {
     }
 
     #[test]
+    fn sharded_backend_updates_existing_intent_without_object_shard_index() {
+        let root = temp_root("sharded_backend_updates_existing_orphan_intent");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let file_system = file_system();
+        let mut object = object(version("version_1"));
+        object.path = "/services/orphan-intent.txt".to_string();
+        let mut intent = DfsWriteIntentRecord {
+            intent_id: "dfs_intent_orphan_sharded".to_string(),
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            base_version: Some(object.version.clone()),
+            target_version: version("version_2"),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 0,
+            desired_replica_node_ids: vec![node("node_owner"), node("node_replica")],
+            policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
+            status: DfsWriteIntentStatus::ReceiptsPending,
+            content_hash: Some("blake3:orphan-intent".to_string()),
+            object_metadata: Some(object.clone()),
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: Some(OffsetDateTime::now_utc()),
+        };
+
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend
+            .put_intent_for_object(Some(&object), &intent)
+            .expect("intent");
+        std::fs::remove_file(backend.object_shard_index_path(&object.object_id))
+            .expect("remove shard index");
+
+        intent.status = DfsWriteIntentStatus::Aborted;
+        intent.updated_at = Some(OffsetDateTime::now_utc());
+        backend
+            .put_intent(&intent)
+            .expect("update existing intent without object shard index");
+
+        assert_eq!(
+            backend
+                .get_intent(&object.object_id, &intent.intent_id)
+                .expect("intent")
+                .expect("intent")
+                .status,
+            DfsWriteIntentStatus::Aborted
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn sharded_backend_moves_object_between_path_shards_without_scanning_on_read() {
         let root = temp_root("sharded_backend_moves_object_between_path_shards");
         let mut backend = LocalShardedMetadataBackend::new(

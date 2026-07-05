@@ -6,12 +6,21 @@
 //! through one bounded collector.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use sinomo_core::node::NodeId;
 use time::OffsetDateTime;
 
+use crate::intent::write_intent_status_is_active;
 use crate::metadata_pages::collect_metadata_pages;
 use crate::*;
+
+enum DfsWriteIntentMaintenanceAction {
+    CommitVisible,
+    AbortMissingObject,
+    AbortSuperseded,
+    SkipFresh,
+}
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Returns every known conflict for an object, merging transient in-memory
@@ -100,6 +109,163 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         Ok(report)
+    }
+
+    pub(crate) fn reconcile_stale_write_intents_bounded(
+        &mut self,
+        max_records: usize,
+        stale_min_age: Duration,
+    ) -> Result<DfsWriteIntentMaintenanceReport, DfsError> {
+        if max_records == 0 {
+            return Ok(DfsWriteIntentMaintenanceReport::default());
+        }
+        let intents = self.active_write_intent_maintenance_candidates(max_records)?;
+        let mut report = DfsWriteIntentMaintenanceReport {
+            scanned_active_intent_count: intents.len(),
+            ..DfsWriteIntentMaintenanceReport::default()
+        };
+        for intent in intents {
+            let Some(action) = self.reconciled_write_intent_action(&intent, stale_min_age)? else {
+                continue;
+            };
+            match action {
+                DfsWriteIntentMaintenanceAction::CommitVisible => {
+                    self.update_write_intent_terminal_status(
+                        &intent,
+                        DfsWriteIntentStatus::Committed,
+                    )?;
+                    report.committed_visible_intent_count =
+                        report.committed_visible_intent_count.saturating_add(1);
+                }
+                DfsWriteIntentMaintenanceAction::AbortMissingObject => {
+                    self.update_write_intent_terminal_status(
+                        &intent,
+                        DfsWriteIntentStatus::Aborted,
+                    )?;
+                    report.aborted_missing_object_count =
+                        report.aborted_missing_object_count.saturating_add(1);
+                }
+                DfsWriteIntentMaintenanceAction::AbortSuperseded => {
+                    self.update_write_intent_terminal_status(
+                        &intent,
+                        DfsWriteIntentStatus::Aborted,
+                    )?;
+                    report.aborted_superseded_intent_count =
+                        report.aborted_superseded_intent_count.saturating_add(1);
+                }
+                DfsWriteIntentMaintenanceAction::SkipFresh => {
+                    report.skipped_fresh_stale_candidate_count =
+                        report.skipped_fresh_stale_candidate_count.saturating_add(1);
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    fn active_write_intent_maintenance_candidates(
+        &self,
+        max_records: usize,
+    ) -> Result<Vec<DfsWriteIntentRecord>, DfsError> {
+        let mut candidates = Vec::new();
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(candidates);
+        };
+        let mut cursor = None;
+        while candidates.len() < max_records {
+            let remaining = max_records.saturating_sub(candidates.len());
+            let page = backend.write_intents_page(cursor.as_ref(), remaining)?;
+            for intent in page.intents {
+                if write_intent_status_is_active(&intent.status) {
+                    candidates.push(intent);
+                    if candidates.len() >= max_records {
+                        break;
+                    }
+                }
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(candidates)
+    }
+
+    fn reconciled_write_intent_action(
+        &self,
+        intent: &DfsWriteIntentRecord,
+        stale_min_age: Duration,
+    ) -> Result<Option<DfsWriteIntentMaintenanceAction>, DfsError> {
+        if !write_intent_status_is_active(&intent.status) {
+            return Ok(None);
+        }
+        let stale = write_intent_record_is_stale(intent, stale_min_age);
+        let object = match self.current_read_object_metadata(&intent.object_id) {
+            Ok(object) => object,
+            Err(DfsError::UnknownObject { .. }) if stale => {
+                return Ok(Some(DfsWriteIntentMaintenanceAction::AbortMissingObject));
+            }
+            Err(DfsError::UnknownObject { .. }) => {
+                return Ok(Some(DfsWriteIntentMaintenanceAction::SkipFresh));
+            }
+            Err(error) => return Err(error),
+        };
+
+        if object.file_system_id == intent.file_system_id
+            && object.version == intent.target_version
+            && intent.content_hash.as_ref().is_none_or(|content_hash| {
+                object.content_hash.as_deref() == Some(content_hash.as_str())
+            })
+        {
+            return Ok(Some(DfsWriteIntentMaintenanceAction::CommitVisible));
+        }
+
+        let base_is_current = intent
+            .base_version
+            .as_ref()
+            .is_some_and(|base_version| object.version == *base_version);
+        if stale && !base_is_current {
+            return Ok(Some(DfsWriteIntentMaintenanceAction::AbortSuperseded));
+        }
+        if !stale && !base_is_current {
+            return Ok(Some(DfsWriteIntentMaintenanceAction::SkipFresh));
+        }
+        Ok(None)
+    }
+
+    fn update_write_intent_terminal_status(
+        &mut self,
+        intent: &DfsWriteIntentRecord,
+        status: DfsWriteIntentStatus,
+    ) -> Result<(), DfsError> {
+        let mut updated = intent.clone();
+        updated.status = status.clone();
+        updated.updated_at = Some(OffsetDateTime::now_utc());
+        if let Some(backend) = self.metadata_backend.as_mut() {
+            backend.put_intent_for_object(updated.object_metadata.as_ref(), &updated)?;
+        }
+        match status {
+            DfsWriteIntentStatus::Committed => {
+                self.restore_visible_committed_object_location_receipts(&updated)?;
+            }
+            DfsWriteIntentStatus::Aborted => {
+                if self
+                    .coordinator
+                    .intent(&updated.intent_id)
+                    .is_some_and(|restored| {
+                        distributed_intent_matches_record(restored, intent)
+                            && matches!(restored.state, DfsWriteIntentState::AwaitingReceipts)
+                    })
+                {
+                    let _ = self.coordinator.abort_intent(&updated.intent_id);
+                }
+                self.remove_pending_write_state(&updated.intent_id);
+            }
+            DfsWriteIntentStatus::Staging
+            | DfsWriteIntentStatus::ReceiptsPending
+            | DfsWriteIntentStatus::Rejected
+            | DfsWriteIntentStatus::Conflict => {}
+        }
+        Ok(())
     }
 
     fn open_conflict_maintenance_candidates(
@@ -405,4 +571,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .get_version(object_id, version)?
             .is_some_and(|record| record.content_hash.as_deref() == Some(content_hash)))
     }
+}
+
+fn write_intent_record_is_stale(intent: &DfsWriteIntentRecord, stale_min_age: Duration) -> bool {
+    let Ok(stale_min_age) = time::Duration::try_from(stale_min_age) else {
+        return false;
+    };
+    OffsetDateTime::now_utc() - intent.created_at >= stale_min_age
 }

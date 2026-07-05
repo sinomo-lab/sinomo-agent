@@ -317,6 +317,32 @@ impl LocalShardedMetadataBackend {
             })
     }
 
+    fn shard_id_for_existing_intent(
+        &self,
+        object_id: &DfsObjectId,
+        intent_id: &str,
+    ) -> Result<Option<DfsMetadataShardId>> {
+        for (shard_id, backend) in &self.shards {
+            if backend.get_intent(object_id, intent_id)?.is_some() {
+                return Ok(Some(shard_id.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn shard_id_for_intent_write(
+        &self,
+        intent: &DfsWriteIntentRecord,
+    ) -> Result<DfsMetadataShardId> {
+        if let Some(shard_id) = self.shard_id_for_object(&intent.object_id)? {
+            return Ok(shard_id);
+        }
+        self.shard_id_for_existing_intent(&intent.object_id, &intent.intent_id)?
+            .ok_or_else(|| MetadataBackendError::UnknownObject {
+                object_id: intent.object_id.clone(),
+            })
+    }
+
     fn shard_id_for_pending_object_record(
         &self,
         object_id: &DfsObjectId,
@@ -1045,7 +1071,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn put_intent(&mut self, intent: &DfsWriteIntentRecord) -> Result<DfsMetadataJournalEntry> {
-        let shard_id = self.require_shard_id_for_object(&intent.object_id)?;
+        let shard_id = self.shard_id_for_intent_write(intent)?;
         self.shard_backend_mut(&shard_id)?.put_intent(intent)
     }
 

@@ -6456,6 +6456,13 @@ fn dfs_maintenance_tick_observations_summarize_actionable_report() {
             }],
         },
         conflicts: DfsConflictMaintenanceReport::default(),
+        write_intents: DfsWriteIntentMaintenanceReport {
+            scanned_active_intent_count: 3,
+            committed_visible_intent_count: 1,
+            aborted_missing_object_count: 1,
+            aborted_superseded_intent_count: 0,
+            skipped_fresh_stale_candidate_count: 0,
+        },
         lifecycle_reports: vec![DfsLifecycleMaintenanceReport {
             anti_entropy: Some(DfsAntiEntropyReport {
                 file_system_id: file_system_id.clone(),
@@ -6536,6 +6543,8 @@ fn dfs_maintenance_tick_observations_summarize_actionable_report() {
             "DFS namespace jobs: scanned=2, resumed=1, completed=1, failed=1, remaining=0"
                 .to_string(),
             "DFS namespace job job-observation (ClearDirectoryRecursive) failed: permission denied"
+                .to_string(),
+            "DFS write intents: scanned_active=3, committed_visible=1, aborted_missing_object=1, aborted_superseded=0, skipped_fresh=0"
                 .to_string(),
             format!(
                 "DFS anti-entropy {file_system_id}: scanned=4, checked_local=3, stale_local=1, repaired=1, issues=1, next_cursor=true"
@@ -16747,6 +16756,121 @@ fn stale_conflict_maintenance_marks_resolved_and_superseded_records() {
             .expect("superseded conflict")[0]
             .status,
         DfsConflictStatus::Superseded
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn stale_write_intent_maintenance_commits_visible_and_aborts_orphans() {
+    let root = temp_root("stale-write-intent-maintenance");
+    let node = NodeId::from_legacy_named("node_stale_write_intent_maintenance").expect("node");
+    let replica = NodeId::from_legacy_named("node_stale_write_intent_replica").expect("node");
+    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let base_version = DfsVersion::from_legacy_named("version_write_intent_base").expect("version");
+    let target_version =
+        DfsVersion::from_legacy_named("version_write_intent_target").expect("version");
+    let visible_object_id =
+        DfsObjectId::from_legacy_named("obj_write_intent_visible").expect("object");
+    let missing_old_object_id =
+        DfsObjectId::from_legacy_named("obj_write_intent_missing_old").expect("object");
+    let missing_fresh_object_id =
+        DfsObjectId::from_legacy_named("obj_write_intent_missing_fresh").expect("object");
+    let content_hash = "blake3:stale-write-intent-visible";
+    let stale_created_at = OffsetDateTime::now_utc() - time::Duration::days(2);
+    let fresh_created_at = OffsetDateTime::now_utc();
+
+    let mut visible_object = file_metadata(node.clone());
+    visible_object.object_id = visible_object_id.clone();
+    visible_object.path = "/services/stale-write-intent-visible.txt".to_string();
+    visible_object.version = target_version.clone();
+    visible_object.policy = DfsObjectPolicy::ReplicatedEventual;
+    visible_object.content_hash = Some(content_hash.to_string());
+    visible_object.current_locations = vec![node.clone()];
+    dfs.add_object_metadata(visible_object.clone())
+        .expect("visible object");
+
+    for (intent_id, object_id, created_at) in [
+        (
+            "dfs_intent_visible_stale",
+            visible_object_id.clone(),
+            stale_created_at,
+        ),
+        (
+            "dfs_intent_missing_old",
+            missing_old_object_id.clone(),
+            stale_created_at,
+        ),
+        (
+            "dfs_intent_missing_fresh",
+            missing_fresh_object_id.clone(),
+            fresh_created_at,
+        ),
+    ] {
+        dfs.metadata_backend
+            .as_mut()
+            .expect("metadata backend")
+            .put_intent(&DfsWriteIntentRecord {
+                intent_id: intent_id.to_string(),
+                file_system_id: sifs_file_system_id(),
+                object_id,
+                base_version: Some(base_version.clone()),
+                target_version: target_version.clone(),
+                coordinator_node_id: node.clone(),
+                owner_epoch: 0,
+                desired_replica_node_ids: vec![node.clone(), replica.clone()],
+                policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
+                status: DfsWriteIntentStatus::ReceiptsPending,
+                content_hash: Some(content_hash.to_string()),
+                object_metadata: None,
+                created_at,
+                updated_at: Some(created_at),
+            })
+            .expect("intent");
+    }
+
+    let report = dfs
+        .reconcile_stale_write_intents_bounded(10, Duration::from_secs(24 * 60 * 60))
+        .expect("reconcile stale write intents");
+
+    assert_eq!(report.scanned_active_intent_count, 3);
+    assert_eq!(report.committed_visible_intent_count, 1);
+    assert_eq!(report.aborted_missing_object_count, 1);
+    assert_eq!(report.aborted_superseded_intent_count, 0);
+    assert_eq!(report.skipped_fresh_stale_candidate_count, 1);
+
+    let backend = dfs.metadata_backend().expect("backend");
+    assert_eq!(
+        backend
+            .get_intent(&visible_object_id, "dfs_intent_visible_stale")
+            .expect("visible intent")
+            .expect("visible intent")
+            .status,
+        DfsWriteIntentStatus::Committed
+    );
+    assert_eq!(
+        backend
+            .get_intent(&missing_old_object_id, "dfs_intent_missing_old")
+            .expect("missing old intent")
+            .expect("missing old intent")
+            .status,
+        DfsWriteIntentStatus::Aborted
+    );
+    assert_eq!(
+        backend
+            .get_intent(&missing_fresh_object_id, "dfs_intent_missing_fresh")
+            .expect("missing fresh intent")
+            .expect("missing fresh intent")
+            .status,
+        DfsWriteIntentStatus::ReceiptsPending
+    );
+    assert_eq!(
+        DfsOperatorInspector::new(backend)
+            .status()
+            .expect("operator status")
+            .pending_write_count,
+        1,
+        "only the fresh missing-object intent should remain active"
     );
 
     std::fs::remove_dir_all(root).ok();
