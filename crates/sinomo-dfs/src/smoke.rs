@@ -20,7 +20,7 @@ use crate::{
     DfsWriteOptions, LocalDfsMetadataJournalPublisherHost, NetworkedDfsService,
     NetworkedDfsServiceEvent, SIFS_SERVICES_PATH, SIFS_USERS_PATH, cluster_dfs_data_endpoints,
     cluster_dfs_metadata_shards, content_services_prefix, distributed_sifs,
-    inspect_cluster_aware_dfs_status, open_cluster_dfs_service_with_message_sender,
+    inspect_cluster_aware_dfs_status, open_cluster_dfs_service_with_message_sender_lazy,
     publish_dfs_metadata_journal_with_host,
 };
 
@@ -158,7 +158,7 @@ pub(crate) fn run_cluster_dfs_smoke_with_message_sender(
     let metadata_shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
     let endpoints = cluster_dfs_data_endpoints(cluster_paths, &state);
     let routable_node_ids = dfs_smoke_routable_node_ids(cluster_paths, &state, &endpoints);
-    let mut service = open_cluster_dfs_service_with_message_sender(
+    let mut service = open_cluster_dfs_service_with_message_sender_lazy(
         data_dir,
         cluster_paths,
         local_node_id.clone(),
@@ -244,9 +244,11 @@ pub fn run_dfs_smoke_with_host<T: DfsMessageTransport>(
         vec![vec![local_node_id.clone()]]
     };
     let smoke_directory = dfs_smoke_directory(local_node_id, &metadata_shards);
+
     service
         .bootstrap_distributed_sifs()
         .map_err(dfs_posix_error)?;
+
     service
         .posix_mkdir_all(&smoke_directory)
         .map_err(dfs_posix_error)?;

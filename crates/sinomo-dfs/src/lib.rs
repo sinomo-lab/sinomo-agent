@@ -95,6 +95,7 @@ mod transfer;
 pub use cluster_service::cluster_dfs_data_endpoints;
 pub(crate) use cluster_service::{
     object_rpc_request_from_kv_payload, open_cluster_dfs_service_with_message_sender,
+    open_cluster_dfs_service_with_message_sender_lazy,
     open_cluster_dfs_service_with_peer_transports,
 };
 pub(crate) use content_store::content_hash;

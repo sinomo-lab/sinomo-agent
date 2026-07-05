@@ -2275,6 +2275,7 @@ fn run_local_dfs_smoke(
         sinomo_runtime::dfs::DfsDefaultClusterSmokeOptions {
             bootstrap: sinomo_runtime::dfs::DfsDefaultClusterBootstrapOptions {
                 publish_cluster_control: false,
+                materialize_local_metadata: false,
                 local_endpoint,
             },
             smoke: foreground_dfs_smoke_options(),
@@ -2545,54 +2546,25 @@ fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
         error: None,
     }];
     let remote_node_ids = dfs_cluster_status_remote_main_node_ids(&state);
-    let graph = sinomo_runtime::network::ClusterConnectivityGraph::try_read_for_local(
-        &cluster_paths,
-        &state,
-    )
-    .ok();
-    let routable_node_ids = sinomo_runtime::dfs::cluster_dfs_data_endpoints(&cluster_paths, &state)
-        .into_iter()
-        .filter(|endpoint| {
-            graph.as_ref().is_none_or(|graph| {
-                sinomo_runtime::network::cluster_healthy_route_next_hop(
-                    graph,
-                    &state.local_node_id,
-                    &endpoint.node_id,
-                )
-                .is_some()
-            })
-        })
-        .map(|endpoint| endpoint.node_id)
-        .collect::<std::collections::BTreeSet<_>>();
     trace_dfs_cluster_status(
         trace,
         started_at,
         format_args!(
-            "remote candidates={} routable={}",
+            "remote candidates={} bounded_probes={}",
             remote_node_ids.len(),
-            routable_node_ids.len()
+            remote_node_ids.len()
         ),
     );
     let remote_timeout = DFS_CLUSTER_STATUS_REMOTE_TIMEOUT;
     let mut probes = Vec::new();
     for node_id in remote_node_ids {
-        if routable_node_ids.contains(&node_id) {
-            probes.push(spawn_dfs_status_probe(
-                &cluster_paths,
-                &state,
-                &node_id,
-                remote_timeout,
-                trace,
-            )?);
-        } else {
-            nodes.push(DfsClusterNodeStatus {
-                node_id,
-                local: false,
-                endpoint: None,
-                status: None,
-                error: Some("no routable DFS data endpoint".to_string()),
-            });
-        }
+        probes.push(spawn_dfs_status_probe(
+            &cluster_paths,
+            &state,
+            &node_id,
+            remote_timeout,
+            trace,
+        )?);
     }
     for probe in probes {
         let node_id = probe.node_id.clone();

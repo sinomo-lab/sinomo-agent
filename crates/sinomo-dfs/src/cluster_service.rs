@@ -48,6 +48,31 @@ pub(crate) fn open_cluster_dfs_service_with_message_sender(
     service.with_boxed_metadata_backend(metadata)
 }
 
+pub(crate) fn open_cluster_dfs_service_with_message_sender_lazy(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: NodeId,
+    endpoints: Vec<ClusterEndpointRecord>,
+    message_sender: DfsMessageSender,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+) -> Result<NetworkedDfsService<DfsEndpointTransport>, DfsError> {
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let mut service = NetworkedDfsService::new(
+        DfsEndpointTransport::with_message_sender(
+            local_node_id,
+            endpoints,
+            DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+            message_sender,
+        ),
+        content,
+    );
+    if let Some(control_plane) = control_plane {
+        service = service.with_boxed_control_plane(control_plane);
+    }
+    let metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+    service.with_boxed_metadata_backend_lazy(metadata)
+}
+
 pub(crate) fn open_cluster_dfs_service_with_peer_transports(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,

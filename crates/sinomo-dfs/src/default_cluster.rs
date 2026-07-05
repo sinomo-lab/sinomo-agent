@@ -37,6 +37,7 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsDefaultClusterBootstrapOptions {
     pub publish_cluster_control: bool,
+    pub materialize_local_metadata: bool,
     pub local_endpoint: String,
 }
 
@@ -674,7 +675,7 @@ pub fn ensure_default_distributed_dfs_with_host(
         for shard in publishable_shards {
             host.put_metadata_shard(shard)?;
         }
-        if local_has_primary_metadata_shards {
+        if local_has_primary_metadata_shards && options.materialize_local_metadata {
             host.materialize_default_sifs_metadata_on_shards(
                 &file_system,
                 metadata_shards.clone(),
@@ -687,7 +688,10 @@ pub fn ensure_default_distributed_dfs_with_host(
     } else {
         default_cluster_sifs_owner(state) == state.local_node_id
     };
-    if local_has_primary_metadata_shards && !options.publish_cluster_control {
+    if local_has_primary_metadata_shards
+        && !options.publish_cluster_control
+        && options.materialize_local_metadata
+    {
         host.materialize_default_sifs_metadata(
             &file_system,
             stable_dfs_service_node_ids(state),
@@ -724,7 +728,7 @@ pub async fn ensure_default_distributed_dfs_with_async_host(
         for shard in publishable_shards {
             host.put_metadata_shard_async(shard.clone()).await?;
         }
-        if local_has_primary_metadata_shards {
+        if local_has_primary_metadata_shards && options.materialize_local_metadata {
             host.materialize_default_sifs_metadata_on_shards_async(
                 file_system.clone(),
                 metadata_shards.clone(),
@@ -739,7 +743,10 @@ pub async fn ensure_default_distributed_dfs_with_async_host(
     } else {
         default_cluster_sifs_owner(state) == state.local_node_id
     };
-    if local_has_primary_metadata_shards && !options.publish_cluster_control {
+    if local_has_primary_metadata_shards
+        && !options.publish_cluster_control
+        && options.materialize_local_metadata
+    {
         host.materialize_default_sifs_metadata_async(
             file_system.clone(),
             stable_dfs_service_node_ids(state),

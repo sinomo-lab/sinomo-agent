@@ -5193,6 +5193,7 @@ fn default_cluster_smoke_bootstraps_dfs_before_running_smoke() {
         DfsDefaultClusterSmokeOptions {
             bootstrap: DfsDefaultClusterBootstrapOptions {
                 publish_cluster_control: true,
+                materialize_local_metadata: true,
                 local_endpoint: "loopback://127.0.0.1:21353".to_string(),
             },
             smoke: DfsSmokeOptions {
@@ -5256,6 +5257,7 @@ fn default_cluster_dfs_helper_writes_default_records_to_cluster_kv() {
         Box::new(ClusterPathDfsControlPlaneKvClient::new(&cluster_paths)),
         DfsDefaultClusterBootstrapOptions {
             publish_cluster_control: true,
+            materialize_local_metadata: true,
             local_endpoint: "loopback://127.0.0.1:21353".to_string(),
         },
     )
@@ -5325,6 +5327,7 @@ fn control_plane_default_bootstrap_host_writes_default_dfs_records() {
         &mut host,
         DfsDefaultClusterBootstrapOptions {
             publish_cluster_control: true,
+            materialize_local_metadata: true,
             local_endpoint: "loopback://127.0.0.1:21353".to_string(),
         },
     )

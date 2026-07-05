@@ -921,6 +921,7 @@ pub(crate) async fn ensure_default_distributed_dfs_async_on_runtime(
         control_plane,
         DfsDefaultClusterBootstrapOptions {
             publish_cluster_control,
+            materialize_local_metadata: true,
             local_endpoint: format!("loopback://{}:{}", options.host, options.port),
         },
     )
@@ -1079,6 +1080,7 @@ async fn run_daemon_dfs_smoke_async(
             DfsDefaultClusterSmokeOptions {
                 bootstrap: DfsDefaultClusterBootstrapOptions {
                     publish_cluster_control: false,
+                    materialize_local_metadata: false,
                     local_endpoint,
                 },
                 smoke: daemon_dfs_smoke_options(),
