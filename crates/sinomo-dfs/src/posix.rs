@@ -226,6 +226,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_mkdir_all(&mut self, path: &str) -> Result<()> {
         let normalized = normalize_posix_path(path)?;
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
+            if self.posix_mkdir_all_chain_exists_locally(&normalized)? {
+                return Ok(());
+            }
             self.route_namespace_operation(
                 primary,
                 DfsNamespaceOperation::MkdirAll {
@@ -242,6 +245,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_mkdir_all_without_local_replay(&mut self, path: &str) -> Result<()> {
         let normalized = normalize_posix_path(path)?;
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
+            if self.posix_mkdir_all_chain_exists_locally(&normalized)? {
+                return Ok(());
+            }
             return self.route_namespace_operation_without_local_replay(
                 primary,
                 DfsNamespaceOperation::MkdirAll {
@@ -250,6 +256,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             );
         }
         self.posix_mkdir_all_local(path)
+    }
+
+    fn posix_mkdir_all_chain_exists_locally(&self, path: &str) -> Result<bool> {
+        let path = normalize_posix_path(path)?;
+        if path == "/" {
+            return Ok(true);
+        }
+        let mut current = String::new();
+        for part in path.trim_matches('/').split('/') {
+            current.push('/');
+            current.push_str(part);
+            match self.lookup_sifs_path(&current)? {
+                Some(object) if object.kind == DfsObjectKind::Directory => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) fn posix_mkdir_all_local(&mut self, path: &str) -> Result<()> {

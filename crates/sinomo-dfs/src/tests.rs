@@ -27181,6 +27181,61 @@ fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
 }
 
 #[test]
+fn sifs_cluster_posix_mkdir_all_remote_primary_skips_when_local_chain_exists() {
+    let root = temp_root("sifs-mkdir-all-local-chain");
+    let local_node =
+        NodeId::from_legacy_named("node_sifs_mkdir_all_local_chain_local").expect("local");
+    let remote_primary =
+        NodeId::from_legacy_named("node_sifs_mkdir_all_local_chain_remote").expect("remote");
+    let shards = sifs_two_primary_shard_configs(
+        &local_node,
+        &remote_primary,
+        1,
+        vec![remote_primary.clone()],
+        vec![local_node.clone()],
+    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                local_node.clone(),
+            )))
+            .expect("sifs filesystem config");
+        for shard in &shards {
+            control.put_metadata_shard(shard).expect("shard config");
+        }
+    });
+
+    let network = InProcessNetwork::new();
+    let mut local = NetworkedDfsService::new(
+        network.add_node(local_node.clone()),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_control_plane(shared_kv)
+    .with_metadata_backend(
+        open_local_sharded_metadata_backend(root.join("metadata"), shards)
+            .expect("sharded metadata"),
+    )
+    .expect("metadata backend");
+    local
+        .bootstrap_distributed_sifs()
+        .expect("bootstrap local mirror");
+    local
+        .posix_mkdir_all_local("/services/dfs-smoke")
+        .expect("local replicated chain");
+
+    local
+        .posix_mkdir_all("/services/dfs-smoke")
+        .expect("idempotent mkdir_all should not require remote primary");
+    local
+        .posix_mkdir_all_without_local_replay("/services/dfs-smoke")
+        .expect("idempotent mkdir_all without replay should not require remote primary");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn sifs_cluster_bulk_local_eventual_splits_mixed_primary_batch() {
     let mut cluster = sifs_two_primary_cluster("sifs-bulk-mixed-primary");
     let local_dir = "/users/bulk-mixed";
