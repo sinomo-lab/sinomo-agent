@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::ClusterPaths;
+use sinomo_core::network::{ClusterConnectivityGraph, ClusterPaths, cluster_route_next_hop};
 use sinomo_core::node::NodeId;
+use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord};
 use std::collections::BTreeSet;
 use time::OffsetDateTime;
 
@@ -143,10 +144,7 @@ pub(crate) fn run_cluster_dfs_smoke_with_message_sender(
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
     let endpoints = cluster_dfs_data_endpoints(cluster_paths, &state);
-    let routable_node_ids = endpoints
-        .iter()
-        .map(|endpoint| endpoint.node_id.clone())
-        .collect::<Vec<_>>();
+    let routable_node_ids = dfs_smoke_routable_node_ids(cluster_paths, &state, &endpoints);
     let mut service = open_cluster_dfs_service_with_message_sender(
         data_dir,
         cluster_paths,
@@ -356,6 +354,36 @@ pub(crate) fn dfs_smoke_replica_candidate_sets(
             .map(|remote_node_id| vec![local_node_id.clone(), remote_node_id])
             .collect()
     }
+}
+
+fn dfs_smoke_routable_node_ids(
+    cluster_paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    endpoints: &[ClusterEndpointRecord],
+) -> Vec<NodeId> {
+    let Ok(graph) = ClusterConnectivityGraph::try_read_for_local(cluster_paths, state) else {
+        return Vec::new();
+    };
+    dfs_smoke_routable_node_ids_with_graph(&state.local_node_id, endpoints, &graph)
+}
+
+pub(crate) fn dfs_smoke_routable_node_ids_with_graph(
+    local_node_id: &NodeId,
+    endpoints: &[ClusterEndpointRecord],
+    graph: &ClusterConnectivityGraph,
+) -> Vec<NodeId> {
+    let mut seen_remote_candidates = BTreeSet::new();
+    let mut node_ids = Vec::new();
+    for endpoint in endpoints {
+        if endpoint.node_id == *local_node_id
+            || !seen_remote_candidates.insert(endpoint.node_id.clone())
+            || cluster_route_next_hop(graph, local_node_id, &endpoint.node_id).is_none()
+        {
+            continue;
+        }
+        node_ids.push(endpoint.node_id.clone());
+    }
+    node_ids
 }
 
 fn dfs_event_summary(events: &[NetworkedDfsServiceEvent]) -> Vec<String> {

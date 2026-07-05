@@ -4923,6 +4923,92 @@ fn dfs_smoke_replica_candidates_preserve_routable_order() {
 }
 
 #[test]
+fn dfs_smoke_routable_nodes_follow_routes_and_skip_unreachable() {
+    let cluster_id =
+        sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_smoke_routable_nodes")
+            .expect("cluster");
+    let local = NodeId::from_legacy_named("node_dfs_smoke_routable_local").expect("local node");
+    let bridge = NodeId::from_legacy_named("node_dfs_smoke_routable_bridge").expect("bridge node");
+    let target = NodeId::from_legacy_named("node_dfs_smoke_routable_target").expect("target node");
+    let stale = NodeId::from_legacy_named("node_dfs_smoke_routable_stale").expect("stale node");
+    let now = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2);
+    let local_state = sinomo_core::ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "dfs smoke routable local",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let bridge_state = sinomo_core::ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "dfs smoke routable bridge",
+        bridge.clone(),
+        "bridge",
+        "pk-bridge",
+        now,
+    );
+    let bridge_endpoint = test_endpoint(&bridge, "10.78.0.2:21353");
+    let target_endpoint = test_endpoint(&target, "10.78.0.3:21353");
+    let stale_endpoint = test_endpoint(&stale, "10.78.0.4:21353");
+    let graph = sinomo_core::network::ClusterConnectivityGraph::from_records(
+        local.clone(),
+        vec![
+            sinomo_core::network::cluster_connectivity_record(
+                &local_state,
+                &bridge_endpoint,
+                sinomo_core::network::ClusterConnectivityState::Healthy,
+                Some(3),
+                0,
+                Some("1970-01-01T02:00:00Z".to_string()),
+                None,
+                now,
+                60,
+            ),
+            sinomo_core::network::cluster_connectivity_record(
+                &bridge_state,
+                &target_endpoint,
+                sinomo_core::network::ClusterConnectivityState::Healthy,
+                Some(4),
+                0,
+                Some("1970-01-01T02:00:00Z".to_string()),
+                None,
+                now,
+                60,
+            ),
+            sinomo_core::network::cluster_connectivity_record(
+                &local_state,
+                &stale_endpoint,
+                sinomo_core::network::ClusterConnectivityState::Unreachable,
+                None,
+                3,
+                None,
+                Some("1970-01-01T02:00:00Z".to_string()),
+                now,
+                60,
+            ),
+        ],
+    );
+
+    let routable = dfs_smoke_routable_node_ids_with_graph(
+        &local,
+        &[
+            stale_endpoint,
+            target_endpoint.clone(),
+            bridge_endpoint.clone(),
+            target_endpoint,
+        ],
+        &graph,
+    );
+
+    assert_eq!(
+        routable,
+        vec![target, bridge],
+        "DFS smoke should use active multi-hop routes and skip unreachable nodes"
+    );
+}
+
+#[test]
 fn dfs_smoke_content_nodes_prefer_fresh_remote_advertisements() {
     let local = NodeId::from_legacy_named("node_dfs_smoke_fresh_ads_local").expect("local node");
     let stale = NodeId::from_legacy_named("node_dfs_smoke_fresh_ads_stale").expect("stale node");

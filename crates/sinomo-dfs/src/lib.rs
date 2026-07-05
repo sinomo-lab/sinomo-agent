@@ -453,7 +453,8 @@ pub use smoke::{
 };
 #[cfg(test)]
 pub(crate) use smoke::{
-    dfs_smoke_content_node_ids, dfs_smoke_replica_candidate_sets, run_cluster_dfs_smoke,
+    dfs_smoke_content_node_ids, dfs_smoke_replica_candidate_sets,
+    dfs_smoke_routable_node_ids_with_graph, run_cluster_dfs_smoke,
 };
 #[cfg(test)]
 use transfer::{
