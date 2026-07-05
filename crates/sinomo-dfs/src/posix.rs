@@ -1203,6 +1203,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &mut reader,
                 plan.desired_replica_nodes,
                 options.policy.clone(),
+                options.foreground_replica_repair,
             )?
         {
             let outcome = if options.wait_for_commit {
@@ -1309,6 +1310,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 bytes,
                 plan.desired_replica_nodes.clone(),
                 options.policy.clone(),
+                options.foreground_replica_repair,
             )?
         {
             let outcome = if options.wait_for_commit {

@@ -232,6 +232,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
+        foreground_replica_repair: bool,
     ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
         if let Some(outcome) = self.write_self_only_eventual_patch_with_base(
             request.clone(),
@@ -398,8 +399,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             intent
         };
 
-        self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
-        self.stage_missing_desired_replicas_for_intent(&updated_intent.intent_id, object.clone())?;
+        self.try_apply_committed_intent_if_ready_with_repair_mode(
+            &updated_intent.intent_id,
+            foreground_replica_repair,
+        )?;
+
+        if self.should_stage_missing_replicas_after_write(
+            &updated_intent.intent_id,
+            foreground_replica_repair,
+        ) {
+            self.stage_missing_desired_replicas_for_intent(
+                &updated_intent.intent_id,
+                object.clone(),
+            )?;
+        }
 
         let outcome = self.write_outcome(&updated_intent.intent_id)?;
         self.cleanup_committed_pending_write_if_repaired(&updated_intent.intent_id);
@@ -415,6 +428,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         reader: &mut R,
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
+        foreground_replica_repair: bool,
     ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
         if let Some(outcome) = self.write_self_only_eventual_patch_from_reader_with_base(
             request.clone(),
@@ -575,8 +589,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             intent
         };
 
-        self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
-        self.stage_missing_desired_replicas_for_intent(&updated_intent.intent_id, object.clone())?;
+        self.try_apply_committed_intent_if_ready_with_repair_mode(
+            &updated_intent.intent_id,
+            foreground_replica_repair,
+        )?;
+
+        if self.should_stage_missing_replicas_after_write(
+            &updated_intent.intent_id,
+            foreground_replica_repair,
+        ) {
+            self.stage_missing_desired_replicas_for_intent(
+                &updated_intent.intent_id,
+                object.clone(),
+            )?;
+        }
 
         let outcome = self.write_outcome(&updated_intent.intent_id)?;
         self.cleanup_committed_pending_write_if_repaired(&updated_intent.intent_id);
