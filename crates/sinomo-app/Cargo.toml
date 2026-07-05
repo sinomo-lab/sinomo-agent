@@ -12,8 +12,10 @@ include = ["**/*.rs", "Cargo.toml", "assets/**/*"]
 ring = "application"
 
 [features]
-default = ["gui", "native-devices"]
+default = ["desktop", "native-devices"]
 gui = ["dep:sui"]
+desktop = ["gui", "sui/desktop", "sinomo-cli/sandbox", "sinomo-cli/dfs-fuse"]
+mobile = ["gui", "sui/mobile"]
 native-devices = [
     "sinomo-audio/native-devices",
     "sinomo-runtime/native-devices",
@@ -23,7 +25,7 @@ native-devices = [
 [[bin]]
 name = "sinomo-app"
 path = "src/main.rs"
-required-features = ["gui"]
+required-features = ["desktop"]
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
@@ -35,10 +37,10 @@ tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 # Graphical toolkit (separate workspace, referenced by path). Keep this behind
 # the app feature so daemon rollout builds can load the workspace without the
 # sibling SUI checkout when `sinomo-app` is not being built.
-sui = { path = "../../../sui/crates/sui", optional = true }
+sui = { path = "../../../sui/crates/sui", optional = true, default-features = false, features = ["wgpu"] }
 
 # Application/R2 service crates used directly (allowed by trust-ring rules).
-sinomo-cli = { path = "../sinomo-cli" }
+sinomo-cli = { path = "../sinomo-cli", default-features = false }
 sinomo-agent = { path = "../sinomo-agent" }
 sinomo-audio = { path = "../sinomo-audio" }
 sinomo-evolution = { path = "../sinomo-evolution" }

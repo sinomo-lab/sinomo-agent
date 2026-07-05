@@ -1,0 +1,64 @@
+[package]
+name = "sinomo-app-android"
+version.workspace = true
+description = "Android NativeActivity package wrapper for sinomo-app"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+publish = false
+
+[package.metadata.sinomo]
+ring = "application"
+
+[lib]
+name = "main"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.android]
+package = "net.sinomo.app"
+apk_name = "sinomo-app"
+build_targets = ["aarch64-linux-android", "x86_64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 35
+
+[package.metadata.android.application]
+label = "Sinomo"
+theme = "@android:style/Theme.DeviceDefault.NoActionBar"
+uses_cleartext_traffic = true
+
+[package.metadata.android.application.activity]
+label = "Sinomo"
+config_changes = "keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+exported = true
+orientation = "unspecified"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.CAMERA"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.RECORD_AUDIO"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_COARSE_LOCATION"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_FINE_LOCATION"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.POST_NOTIFICATIONS"
+
+[dependencies]
+sinomo-app = { path = "../sinomo-app", default-features = false, features = ["mobile"] }
+sui = { path = "../../../sui/crates/sui", default-features = false, features = ["mobile"] }
+tracing.workspace = true

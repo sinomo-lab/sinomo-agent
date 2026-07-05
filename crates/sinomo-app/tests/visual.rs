@@ -584,6 +584,48 @@ fn settings_narrow_click_navigates() {
     );
 }
 
+#[test]
+fn mobile_phone_layout_accepts_touch_navigation() {
+    use sui::{Event, SemanticsRole, Size, WindowEvent};
+
+    let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Sinomo, "mobile-phone");
+    let runtime = build_runtime(shared.clone()).expect("build runtime");
+    let app = TestApp::from_runtime_with_frame_budget(runtime, 8).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    let root = window.root();
+    app.pump_frames(2).expect("pump initial layout");
+    root.dispatch_event_now(Event::Window(WindowEvent::Resized(Size::new(390.0, 844.0))))
+        .expect("resize phone");
+    app.pump_frames(8).expect("pump phone layout");
+
+    let snapshot = window.snapshot_now().expect("snapshot phone shell");
+    let tab_bar = snapshot
+        .accessibility
+        .nodes
+        .iter()
+        .find(|node| {
+            node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
+        })
+        .expect("shell tab bar semantics");
+    touch_at(
+        &root,
+        tab_bar.bounds.max_x() - 22.0,
+        tab_bar.bounds.y() + tab_bar.bounds.height() / 2.0,
+    );
+    app.pump_frames(8).expect("pump touch tab switch");
+
+    assert_eq!(
+        shared.active_tab(),
+        Tab::Settings,
+        "touching the compact Settings tab switches the mobile shell content"
+    );
+
+    let shot = window
+        .capture_screenshot_now()
+        .expect("capture phone layout");
+    assert_eq!((shot.width(), shot.height()), (390, 844));
+}
+
 fn click_at(root: &sui_testing::Locator, x: f32, y: f32) {
     use sui::{Event, Point, PointerButton, PointerButtons, PointerEvent, PointerEventKind};
     let pos = Point::new(x, y);
@@ -599,6 +641,26 @@ fn click_at(root: &sui_testing::Locator, x: f32, y: f32) {
     let mut up = PointerEvent::new(PointerEventKind::Up, pos);
     up.button = Some(PointerButton::Primary);
     root.dispatch_event(Event::Pointer(up)).expect("up");
+}
+
+fn touch_at(root: &sui_testing::Locator, x: f32, y: f32) {
+    use sui::{
+        Event, Point, PointerButton, PointerButtons, PointerEvent, PointerEventKind, PointerKind,
+    };
+    let pos = Point::new(x, y);
+    let mut down = PointerEvent::new(PointerEventKind::Down, pos);
+    down.pointer_id = 1;
+    down.pointer_kind = PointerKind::Touch;
+    down.button = Some(PointerButton::Primary);
+    down.buttons = PointerButtons::new(1);
+    root.dispatch_event_now(Event::Pointer(down))
+        .expect("touch down");
+    let mut up = PointerEvent::new(PointerEventKind::Up, pos);
+    up.pointer_id = 1;
+    up.pointer_kind = PointerKind::Touch;
+    up.button = Some(PointerButton::Primary);
+    root.dispatch_event_now(Event::Pointer(up))
+        .expect("touch up");
 }
 
 fn seed_chat_providers(shared: &sinomo_app::state::Shared) {

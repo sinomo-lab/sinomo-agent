@@ -7650,6 +7650,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-app-android"
+version = "0.1.0"
+dependencies = [
+ "sinomo-app",
+ "sui",
+ "tracing",
+]
+
+[[package]]
 name = "sinomo-audio"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,38 @@
+FROM rust:1.90-bookworm
+
+ARG ANDROID_API=35
+ARG ANDROID_BUILD_TOOLS=35.0.0
+ARG ANDROID_NDK_VERSION=27.2.12479018
+ARG ANDROID_COMMANDLINE_TOOLS_URL=https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+
+ENV ANDROID_HOME=/opt/android-sdk
+ENV ANDROID_SDK_ROOT=/opt/android-sdk
+ENV ANDROID_NDK_HOME=/opt/android-sdk/ndk/${ANDROID_NDK_VERSION}
+ENV PATH=${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        openjdk-17-jdk-headless \
+        unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p ${ANDROID_HOME}/cmdline-tools \
+    && curl -fsSL "${ANDROID_COMMANDLINE_TOOLS_URL}" -o /tmp/android-commandline-tools.zip \
+    && unzip -q /tmp/android-commandline-tools.zip -d /tmp/android-commandline-tools \
+    && mv /tmp/android-commandline-tools/cmdline-tools ${ANDROID_HOME}/cmdline-tools/latest \
+    && rm -rf /tmp/android-commandline-tools /tmp/android-commandline-tools.zip
+
+RUN yes | sdkmanager --licenses >/dev/null \
+    && sdkmanager \
+        "platform-tools" \
+        "platforms;android-${ANDROID_API}" \
+        "build-tools;${ANDROID_BUILD_TOOLS}" \
+        "ndk;${ANDROID_NDK_VERSION}"
+
+RUN rustup target add aarch64-linux-android x86_64-linux-android \
+    && cargo install cargo-apk --version 0.10.0 --locked
+
+WORKDIR /workspace

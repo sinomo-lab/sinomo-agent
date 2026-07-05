@@ -15,7 +15,9 @@ pub mod ui;
 use sui::{App, Window, default_sui_logo_image};
 
 use crate::backend::Backend;
-use crate::state::{AppState, ConnectEvent, ReadyState, Shared, Tab};
+use crate::state::{AppState, Shared, Tab};
+#[cfg(any(feature = "desktop", all(target_os = "android", feature = "mobile")))]
+use crate::state::{ConnectEvent, ReadyState};
 use crate::ui::Shell;
 use crate::ui::shell::logo_image_handle;
 
@@ -56,11 +58,39 @@ pub fn build_runtime(shared: Shared) -> sui::Result<sui::Runtime> {
 /// The window opens immediately in a *connecting* state; the backend (daemon probe / starting an
 /// in-process daemon) resolves on a background thread, which wakes the UI as it progresses and
 /// once it's ready. This keeps launch responsive even when the in-process daemon takes a moment.
+#[cfg(feature = "desktop")]
 pub fn run() -> sui::Result<()> {
     let shared = Shared::new(AppState::connecting());
     let app = build_application(shared.clone())?;
     app.run_with_handle(move |ui| {
         // Stash a waker so background work (e.g. provider device-login) can refresh the UI.
+        shared.borrow_mut().waker = Some(ui.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        shared.borrow_mut().connect_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("sinomo-app-connect".to_string())
+            .spawn(move || {
+                let backend = Backend::connect(|status| {
+                    let _ = tx.send(ConnectEvent::Status(status.to_string()));
+                    ui.wake();
+                });
+                tracing::info!(mode = %backend.mode_label(), "sinomo-app connected");
+                let _ = tx.send(ConnectEvent::Status("Loading workspace…".to_string()));
+                ui.wake();
+                let ready = ReadyState::build_with_waker(backend, Some(ui.clone()));
+                let _ = tx.send(ConnectEvent::Connected(Box::new(ready)));
+                ui.wake();
+            })
+            .expect("spawn connect thread");
+    })
+}
+
+/// Build and run the Android application from the NativeActivity entrypoint.
+#[cfg(all(target_os = "android", feature = "mobile"))]
+pub fn run_android(android_app: sui::AndroidApp) -> sui::Result<()> {
+    let shared = Shared::new(AppState::connecting());
+    let app = build_application(shared.clone())?;
+    app.run_android_with_handle(android_app, move |ui| {
         shared.borrow_mut().waker = Some(ui.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         shared.borrow_mut().connect_rx = Some(rx);

@@ -1,0 +1,36 @@
+# Android APK builder for sinomo-app.
+#
+# Build the debug APK from the app checkout:
+#
+#   HOST_UID=$(id -u) HOST_GID=$(id -g) \
+#     docker compose -f docker/docker-compose.android.yml run --build --rm android-apk
+#
+# Extra cargo-apk args are passed after the service name:
+#
+#   docker compose -f docker/docker-compose.android.yml run --build --rm android-apk --release
+#
+# The sibling SUI checkout is mounted from ../sui by default. Override
+# SINOMO_REPO_ROOT or SINOMO_SUI_ROOT when building from a different layout.
+
+name: sinomo-android-build
+
+services:
+  android-apk:
+    image: ${SINOMO_ANDROID_IMAGE:-sinomo-android-dev:latest}
+    build:
+      context: ${SINOMO_REPO_ROOT:-..}
+      dockerfile: docker/Dockerfile.android
+    working_dir: /workspace
+    environment:
+      HOST_UID: ${HOST_UID:-1000}
+      HOST_GID: ${HOST_GID:-1000}
+    volumes:
+      - ${SINOMO_REPO_ROOT:-..}:/workspace
+      - ${SINOMO_SUI_ROOT:-../../sui}:/sui
+      - android-cargo-registry:/usr/local/cargo/registry
+      - android-cargo-git:/usr/local/cargo/git
+    entrypoint: ["/workspace/docker/android-apk-entrypoint.sh"]
+
+volumes:
+  android-cargo-registry:
+  android-cargo-git:

@@ -1,11 +1,9 @@
 use crate::DeviceProfile;
-#[cfg(feature = "native-devices")]
 use crate::{DeviceId, DeviceKind, DevicePermission};
 #[cfg(feature = "native-devices")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
-#[cfg(feature = "native-devices")]
 use sinomo_core::{CapabilityName, DeviceCapability};
 #[cfg(feature = "native-devices")]
 use std::collections::VecDeque;
@@ -32,6 +30,7 @@ const DEFAULT_CAMERA_HEIGHT: u32 = 480;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum NativeDeviceBackend {
+    Android,
     Cpal,
     V4l2,
 }
@@ -293,11 +292,22 @@ pub fn enumerate_native_devices(node_id: NodeId) -> NativeDeviceInventory {
         devices: Vec::new(),
         issues: Vec::new(),
     };
+    #[cfg(target_os = "android")]
+    {
+        enumerate_android_mobile_devices(&node_id, &mut inventory);
+    }
     #[cfg(not(feature = "native-devices"))]
     {
-        inventory
-            .issues
-            .push("native device backend is disabled in this build".to_string());
+        if inventory.devices.is_empty() {
+            inventory
+                .issues
+                .push("native device backend is disabled in this build".to_string());
+        } else {
+            inventory.issues.push(
+                "native capture bridge is not enabled; registered logical platform devices only"
+                    .to_string(),
+            );
+        }
         return inventory;
     }
     #[cfg(feature = "native-devices")]
@@ -305,6 +315,94 @@ pub fn enumerate_native_devices(node_id: NodeId) -> NativeDeviceInventory {
         enumerate_cpal_devices(&node_id, &mut inventory);
         enumerate_camera_devices(&node_id, &mut inventory);
         inventory
+    }
+}
+
+#[cfg(target_os = "android")]
+fn enumerate_android_mobile_devices(node_id: &NodeId, inventory: &mut NativeDeviceInventory) {
+    for descriptor in [
+        native_descriptor(
+            node_id,
+            "android:microphone:default".to_string(),
+            NativeDeviceBackend::Android,
+            "Android microphone".to_string(),
+            DeviceKind::Microphone,
+            true,
+            vec!["input.audio.capture", "input.audio.raw"],
+            vec![DevicePermission::Observe, DevicePermission::CaptureRaw],
+            Some("Android runtime permission required: RECORD_AUDIO".to_string()),
+        ),
+        native_descriptor(
+            node_id,
+            "android:speaker:default".to_string(),
+            NativeDeviceBackend::Android,
+            "Android speaker".to_string(),
+            DeviceKind::Speaker,
+            true,
+            vec!["output.audio.playback", "output.audio.raw"],
+            vec![DevicePermission::EmitOutput],
+            None,
+        ),
+        native_descriptor(
+            node_id,
+            "android:camera:default".to_string(),
+            NativeDeviceBackend::Android,
+            "Android camera".to_string(),
+            DeviceKind::Camera,
+            true,
+            vec!["input.video.capture", "input.video.raw"],
+            vec![DevicePermission::Observe, DevicePermission::CaptureRaw],
+            Some("Android runtime permission required: CAMERA".to_string()),
+        ),
+        native_descriptor(
+            node_id,
+            "android:location:fused".to_string(),
+            NativeDeviceBackend::Android,
+            "Android location".to_string(),
+            DeviceKind::Location,
+            true,
+            vec!["input.location.gps", "input.location.network"],
+            vec![DevicePermission::Observe],
+            Some(
+                "Android runtime permission required: ACCESS_COARSE_LOCATION or ACCESS_FINE_LOCATION"
+                    .to_string(),
+            ),
+        ),
+        native_descriptor(
+            node_id,
+            "android:touchscreen:primary".to_string(),
+            NativeDeviceBackend::Android,
+            "Android touchscreen".to_string(),
+            DeviceKind::Touchscreen,
+            true,
+            vec!["input.touch.primary", "input.gesture.pointer"],
+            vec![DevicePermission::Observe, DevicePermission::ExecuteAction],
+            None,
+        ),
+        native_descriptor(
+            node_id,
+            "android:notification:default".to_string(),
+            NativeDeviceBackend::Android,
+            "Android notifications".to_string(),
+            DeviceKind::NotificationSurface,
+            true,
+            vec!["output.notification.post"],
+            vec![DevicePermission::EmitOutput],
+            Some("Android runtime permission may be required: POST_NOTIFICATIONS".to_string()),
+        ),
+        native_descriptor(
+            node_id,
+            "android:haptic:default".to_string(),
+            NativeDeviceBackend::Android,
+            "Android haptics".to_string(),
+            DeviceKind::Haptic,
+            true,
+            vec!["output.haptic.vibrate"],
+            vec![DevicePermission::EmitOutput],
+            None,
+        ),
+    ] {
+        inventory.devices.push(descriptor);
     }
 }
 
@@ -553,7 +651,10 @@ fn enumerate_camera_devices(node_id: &NodeId, inventory: &mut NativeDeviceInvent
     }
 }
 
-#[cfg(feature = "native-devices")]
+#[cfg_attr(
+    not(any(feature = "native-devices", target_os = "android")),
+    allow(dead_code)
+)]
 fn native_descriptor(
     node_id: &NodeId,
     native_id: String,
