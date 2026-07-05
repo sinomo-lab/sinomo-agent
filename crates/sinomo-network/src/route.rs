@@ -37,6 +37,7 @@ pub const CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX: Duration = Duration::from_secs(5)
 const CLUSTER_DELIVERY_DEGRADED_LINK_COST: u64 = 50_000;
 const CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST: u64 = CLUSTER_DELIVERY_DEGRADED_LINK_COST / 2;
 const CLUSTER_DELIVERY_UNOBSERVED_NEIGHBOR_COST: u64 = 75_000;
+const CLUSTER_DELIVERY_UNREACHABLE_LINK_COST: u64 = 500_000;
 const MAX_CLUSTER_DELIVERY_ROUTING_TABLE_CACHE_ENTRIES: usize = 128;
 
 static CLUSTER_DELIVERY_ROUTING_TABLE_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
@@ -1501,13 +1502,8 @@ fn cluster_delivery_local_endpoint_cost(
     );
     let endpoint_priority = u64::from(endpoint.priority);
     match graph.record_for_endpoint(endpoint) {
-        Some(record) => cluster_delivery_connectivity_state_cost(
-            path_cost,
-            record.latency_ms,
-            record.consecutive_failures,
-            &record.state,
-        )
-        .map(|cost| cost + endpoint_priority),
+        Some(record) => cluster_delivery_connectivity_record_cost_with_path(record, path_cost)
+            .map(|cost| cost.saturating_add(endpoint_priority)),
         None if endpoint.node_id == *target_node_id => Some(
             cluster_delivery_unobserved_target_endpoint_cost(path_cost, endpoint_priority),
         ),
@@ -1528,6 +1524,16 @@ fn cluster_delivery_unobserved_target_endpoint_cost(path_cost: u64, endpoint_pri
 
 fn cluster_delivery_connectivity_record_cost(record: &ClusterConnectivityRecord) -> Option<u64> {
     let path_cost = cluster_delivery_record_path_cost(&record.transport, &record.address);
+    cluster_delivery_connectivity_record_cost_with_path(record, path_cost)
+}
+
+fn cluster_delivery_connectivity_record_cost_with_path(
+    record: &ClusterConnectivityRecord,
+    path_cost: u64,
+) -> Option<u64> {
+    if crate::connectivity::cluster_connectivity_failure_reason_is_identity_mismatch(record) {
+        return None;
+    }
     cluster_delivery_connectivity_state_cost(
         path_cost,
         record.latency_ms,
@@ -1549,7 +1555,11 @@ fn cluster_delivery_connectivity_state_cost(
                 + CLUSTER_DELIVERY_DEGRADED_LINK_COST
                 + u64::from(consecutive_failures) * 1_000,
         ),
-        ClusterConnectivityState::Unreachable => None,
+        ClusterConnectivityState::Unreachable => Some(
+            path_cost
+                .saturating_add(CLUSTER_DELIVERY_UNREACHABLE_LINK_COST)
+                .saturating_add(u64::from(consecutive_failures) * 10_000),
+        ),
     }
 }
 
@@ -3895,6 +3905,152 @@ mod tests {
     }
 
     #[test]
+    fn route_plan_retries_non_identity_unreachable_target_endpoint_as_fallback() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-route-unreachable-fallback");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_route_unreachable_fallback").expect("cluster");
+        let local_node =
+            NodeId::from_legacy_named("node_route_unreachable_fallback_local").expect("local");
+        let target_node =
+            NodeId::from_legacy_named("node_route_unreachable_fallback_target").expect("target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "route unreachable fallback",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut target_member = ClusterMemberRecord::local_voter(
+            state.cluster_id.clone(),
+            target_node.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        let stale_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "target:21353".to_string(),
+            0,
+        );
+        target_member.endpoints = vec![stale_endpoint.clone()];
+        state.members.push(target_member);
+
+        let stale_failure = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &stale_endpoint,
+            ClusterConnectivityState::Unreachable,
+            None,
+            3,
+            None,
+            Some(now.to_string()),
+            now,
+            7200,
+        );
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[stale_failure],
+        )
+        .expect("write local connectivity");
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local_node,
+            &target_node,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
+
+        assert_eq!(plan.next_hop, target_node);
+        assert_eq!(plan.endpoints.len(), 1);
+        assert_eq!(plan.endpoints[0].endpoint_id, stale_endpoint.endpoint_id);
+        assert_eq!(plan.endpoints[0].address, "target:21353");
+    }
+
+    #[test]
+    fn route_plan_excludes_identity_mismatch_unreachable_target_endpoint() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-route-identity-mismatch");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_route_identity_mismatch").expect("cluster");
+        let local_node =
+            NodeId::from_legacy_named("node_route_identity_mismatch_local").expect("local");
+        let target_node =
+            NodeId::from_legacy_named("node_route_identity_mismatch_target").expect("target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "route identity mismatch",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut target_member = ClusterMemberRecord::local_voter(
+            state.cluster_id.clone(),
+            target_node.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        let mismatched_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "target:21353".to_string(),
+            0,
+        );
+        target_member.endpoints = vec![mismatched_endpoint.clone()];
+        state.members.push(target_member);
+
+        let mut mismatch = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &mismatched_endpoint,
+            ClusterConnectivityState::Unreachable,
+            None,
+            3,
+            None,
+            Some(now.to_string()),
+            now,
+            7200,
+        );
+        mismatch.failure_reason = Some(crate::ClusterConnectivityFailureReason::IdentityMismatch);
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[mismatch],
+        )
+        .expect("write local connectivity");
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local_node,
+            &target_node,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        );
+
+        assert!(
+            plan.is_none(),
+            "identity mismatch must remain a hard routing exclusion"
+        );
+    }
+
+    #[test]
     fn relay_planned_target_endpoints_prefer_local_connectivity() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-relay-target-connectivity");
         let data_dir = SinomoDataDir::new(&root);
@@ -3972,12 +4128,14 @@ mod tests {
             &state,
             &local_node,
             &target_node,
-            &[unreachable_endpoint, healthy_endpoint.clone()],
+            &[unreachable_endpoint.clone(), healthy_endpoint.clone()],
         )
         .expect("planned target endpoints");
 
-        assert_eq!(planned.len(), 1);
+        assert_eq!(planned.len(), 2);
         assert_eq!(planned[0].endpoint_id, healthy_endpoint.endpoint_id);
         assert_eq!(planned[0].address, "target:21353");
+        assert_eq!(planned[1].endpoint_id, unreachable_endpoint.endpoint_id);
+        assert_eq!(planned[1].address, "10.0.0.2:21353");
     }
 }
