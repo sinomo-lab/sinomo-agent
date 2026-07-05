@@ -29,7 +29,8 @@ use sinomo_dfs::{
     DfsMessageCommand, DfsMessageProcessResult, DfsMessageResponse, DfsMetadataBackend,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataPublishScheduleOptions, DfsObjectRpcSendOptions, DfsPeerTransport,
-    DfsPeerTransportError, NetworkedDfsService,
+    DfsPeerTransportError, NetworkedDfsService, default_dfs_repair_attempt_snapshot_path,
+    read_dfs_repair_attempt_snapshot,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -37,7 +38,7 @@ use std::sync::{
     Arc, Mutex, OnceLock, TryLockError,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use time::OffsetDateTime;
 
@@ -124,6 +125,10 @@ impl Drop for DaemonDfsSmokeInFlightGuard {
 pub(crate) struct DaemonDfsPendingMaintenanceWork {
     pub pending_write_count: usize,
     pub pending_repair_count: usize,
+    pub repair_attempt_count: usize,
+    pub due_repair_attempt_count: usize,
+    pub unattempted_repair_count: usize,
+    pub next_repair_retry_unix_nanos: Option<u64>,
     pub pending_namespace_job_count: usize,
 }
 
@@ -136,11 +141,22 @@ impl DaemonDfsPendingMaintenanceWork {
     }
 
     pub(crate) fn should_trigger_background_maintenance(self) -> bool {
-        // Pending repairs can represent unreachable replicas and are expensive to
-        // rescan. Pending writes and namespace jobs are local durable work that
-        // maintenance can usually advance or reconcile cheaply.
-        self.pending_write_count > 0 || self.pending_namespace_job_count > 0
+        // Pending repairs can represent unreachable replicas and are expensive
+        // to rescan. Trigger the short loop only when a repair is due or has
+        // never been attempted; repair backoff snapshots keep unreachable
+        // replicas from hot-looping.
+        self.pending_write_count > 0
+            || self.pending_namespace_job_count > 0
+            || self.due_repair_attempt_count > 0
+            || self.unattempted_repair_count > 0
     }
+}
+
+fn daemon_dfs_now_unix_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 pub(crate) fn default_distributed_dfs_enabled() -> bool {
@@ -526,9 +542,36 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
     }
     let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
     let summary = metadata.metadata_summary()?;
+    let repair_attempt_records =
+        read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
+            .map(|snapshot| snapshot.records)
+            .unwrap_or_default();
+    let now = daemon_dfs_now_unix_nanos();
+    let due_repair_attempt_count = repair_attempt_records
+        .iter()
+        .filter(|record| {
+            !record.in_flight
+                && record.next_retry_unix_nanos != u64::MAX
+                && record.next_retry_unix_nanos <= now
+        })
+        .count();
+    let next_repair_retry_unix_nanos = repair_attempt_records
+        .iter()
+        .filter(|record| !record.in_flight && record.next_retry_unix_nanos != u64::MAX)
+        .filter_map(|record| {
+            (record.next_retry_unix_nanos > now).then_some(record.next_retry_unix_nanos)
+        })
+        .min();
+    let unattempted_repair_count = summary
+        .pending_repair_count
+        .saturating_sub(repair_attempt_records.len());
     Ok(DaemonDfsPendingMaintenanceWork {
         pending_write_count: summary.pending_write_count,
         pending_repair_count: summary.pending_repair_count,
+        repair_attempt_count: repair_attempt_records.len(),
+        due_repair_attempt_count,
+        unattempted_repair_count,
+        next_repair_retry_unix_nanos,
         pending_namespace_job_count: summary.pending_namespace_job_count,
     })
 }
@@ -1560,6 +1603,10 @@ mod tests {
         assert_eq!(pending.pending_write_count, 0);
         assert_eq!(pending.pending_namespace_job_count, 1);
         assert_eq!(pending.pending_repair_count, 0);
+        assert_eq!(pending.repair_attempt_count, 0);
+        assert_eq!(pending.due_repair_attempt_count, 0);
+        assert_eq!(pending.unattempted_repair_count, 0);
+        assert_eq!(pending.next_repair_retry_unix_nanos, None);
         assert!(pending.has_work());
         assert!(pending.should_trigger_background_maintenance());
 
@@ -1603,10 +1650,14 @@ mod tests {
     }
 
     #[test]
-    fn daemon_dfs_pending_repair_backlog_does_not_force_triggered_loop() {
+    fn daemon_dfs_pending_repair_backlog_in_backoff_does_not_force_triggered_loop() {
         let pending = DaemonDfsPendingMaintenanceWork {
             pending_write_count: 0,
             pending_repair_count: 8,
+            repair_attempt_count: 8,
+            due_repair_attempt_count: 0,
+            unattempted_repair_count: 0,
+            next_repair_retry_unix_nanos: Some(42),
             pending_namespace_job_count: 0,
         };
 
@@ -1615,10 +1666,46 @@ mod tests {
     }
 
     #[test]
+    fn daemon_dfs_due_repair_backlog_forces_triggered_loop() {
+        let pending = DaemonDfsPendingMaintenanceWork {
+            pending_write_count: 0,
+            pending_repair_count: 8,
+            repair_attempt_count: 8,
+            due_repair_attempt_count: 1,
+            unattempted_repair_count: 0,
+            next_repair_retry_unix_nanos: None,
+            pending_namespace_job_count: 0,
+        };
+
+        assert!(pending.has_work());
+        assert!(pending.should_trigger_background_maintenance());
+    }
+
+    #[test]
+    fn daemon_dfs_unattempted_repair_backlog_forces_triggered_loop() {
+        let pending = DaemonDfsPendingMaintenanceWork {
+            pending_write_count: 0,
+            pending_repair_count: 8,
+            repair_attempt_count: 4,
+            due_repair_attempt_count: 0,
+            unattempted_repair_count: 4,
+            next_repair_retry_unix_nanos: Some(42),
+            pending_namespace_job_count: 0,
+        };
+
+        assert!(pending.has_work());
+        assert!(pending.should_trigger_background_maintenance());
+    }
+
+    #[test]
     fn daemon_dfs_pending_writes_force_triggered_loop() {
         let pending = DaemonDfsPendingMaintenanceWork {
             pending_write_count: 8,
             pending_repair_count: 0,
+            repair_attempt_count: 0,
+            due_repair_attempt_count: 0,
+            unattempted_repair_count: 0,
+            next_repair_retry_unix_nanos: None,
             pending_namespace_job_count: 0,
         };
 
