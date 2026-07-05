@@ -71,20 +71,14 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
     host: &mut impl ClusterKvTxnForwardHost,
 ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
     let mut targets = ClusterEndpointSelector::new(paths, state)
-        .select_internal_unique_node_targets(
-            ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
-        );
+        .select_internal(ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand);
     if targets.is_empty() {
         return Ok(None);
     }
     if let Ok(Some(authority_id)) = host.known_kv_state_authority_id(paths, state)
         && !cluster_node_blocks_leader_preference(paths, state, &authority_id)
-        && let Some(position) = targets
-            .iter()
-            .position(|endpoint| endpoint.node_id == authority_id)
     {
-        let authority = targets.remove(position);
-        targets.insert(0, authority);
+        prefer_known_state_authority_endpoints(&mut targets, &authority_id);
     }
 
     let mut failures = Vec::new();
@@ -108,7 +102,10 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
             host,
         ) {
             Ok(response) => return Ok(Some(response)),
-            Err(error) => failures.push(format!("node {} failed: {error}", target.node_id)),
+            Err(error) => failures.push(format!(
+                "node {} endpoint {} failed: {error}",
+                target.node_id, target.address
+            )),
         }
     }
 
@@ -174,7 +171,7 @@ pub async fn forward_cluster_kv_txn_to_state_authority_async_with_host<H>(
 where
     H: ClusterSignedEndpointRpcAsyncHost + Send,
 {
-    let mut targets = ClusterEndpointSelector::select_internal_unique_node_targets_async(
+    let mut targets = ClusterEndpointSelector::select_internal_async(
         runtime,
         paths,
         state,
@@ -187,12 +184,8 @@ where
     if let Ok(Some(authority_id)) = locked_kv_state_authority_id_async(runtime, paths, state).await
         && !cluster_node_blocks_leader_preference_async(runtime, paths, state, &authority_id)
             .await?
-        && let Some(position) = targets
-            .iter()
-            .position(|endpoint| endpoint.node_id == authority_id)
     {
-        let authority = targets.remove(position);
-        targets.insert(0, authority);
+        prefer_known_state_authority_endpoints(&mut targets, &authority_id);
     }
 
     let mut failures = Vec::new();
@@ -217,7 +210,10 @@ where
         .await
         {
             Ok(response) => return Ok(Some(response)),
-            Err(error) => failures.push(format!("node {} failed: {error}", target.node_id)),
+            Err(error) => failures.push(format!(
+                "node {} endpoint {} failed: {error}",
+                target.node_id, target.address
+            )),
         }
     }
 
@@ -231,6 +227,29 @@ where
             }
         ),
     })
+}
+
+fn prefer_known_state_authority_endpoints(
+    targets: &mut Vec<ClusterEndpointRecord>,
+    authority_id: &NodeId,
+) {
+    if !targets
+        .iter()
+        .any(|endpoint| endpoint.node_id == *authority_id)
+    {
+        return;
+    }
+    let mut preferred = Vec::new();
+    let mut other = Vec::new();
+    for target in targets.drain(..) {
+        if target.node_id == *authority_id {
+            preferred.push(target);
+        } else {
+            other.push(target);
+        }
+    }
+    preferred.append(&mut other);
+    *targets = preferred;
 }
 
 async fn forward_cluster_kv_txn_to_state_authority_endpoint_async_with_host<H>(

@@ -9172,6 +9172,70 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
     }
 }
 
+struct AddressSensitiveKvTxnForwardHost {
+    known_authority: Option<NodeId>,
+    failing_address: String,
+    snapshot: KvSnapshot,
+    txn_response: KvTxnResponse,
+    endpoint_rpcs: Vec<(NodeId, String, String)>,
+}
+
+impl ClusterKvTxnForwardHost for AddressSensitiveKvTxnForwardHost {
+    fn known_kv_state_authority_id(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, NetworkError> {
+        Ok(self.known_authority.clone())
+    }
+
+    fn call_endpoint_object_rpc(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+        _timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        self.endpoint_rpcs.push((
+            endpoint.node_id.clone(),
+            endpoint.address.clone(),
+            request.route.clone(),
+        ));
+        if endpoint.address == self.failing_address {
+            return Err(NetworkError::Io {
+                operation: "test endpoint rpc".to_string(),
+                detail: format!("simulated stale endpoint {}", endpoint.address),
+            });
+        }
+        match request.route.as_str() {
+            CLUSTER_KV_TXN_ROUTE => {
+                let payload = sinomo_kv::cluster_kv_txn_response_rpc_payload(&self.txn_response)
+                    .map_err(kv_err)?;
+                Ok(object_rpc_response_from_kv_payload(payload))
+            }
+            CLUSTER_KV_SNAPSHOT_ROUTE => {
+                let payload = sinomo_kv::cluster_kv_snapshot_response_rpc_payload(&self.snapshot)
+                    .map_err(kv_err)?;
+                Ok(object_rpc_response_from_kv_payload(payload))
+            }
+            route => ObjectRpcResponse::encode_error(route, "unexpected route"),
+        }
+    }
+
+    fn call_node_object_rpc(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        _timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        panic!(
+            "KV forwarding must use selected endpoint RPC, not routed node RPC to {target_node_id} for {}",
+            request.route
+        )
+    }
+}
+
 impl ClusterSignedEndpointRpcAsyncHost for RecordingKvTxnForwardHost {
     fn sign_endpoint_rpc_request_async<'a>(
         &'a mut self,
@@ -11235,6 +11299,81 @@ fn cluster_kv_txn_forward_driver_deduplicates_state_authority_endpoints() {
         vec![
             (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
             (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
+        ]
+    );
+}
+
+#[test]
+fn cluster_kv_txn_forward_driver_retries_next_endpoint_for_same_state_authority() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-same-node-retry");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, _local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_kv_forward_same_node_retry",
+        "node_kv_forward_same_node_retry_local",
+        "node_kv_forward_same_node_retry_peer",
+    );
+    let private_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.41:21353".to_string(), 10);
+    let mut public_endpoint =
+        daemon_lan_endpoint(&peer_node_id, "129.146.106.76:21353".to_string(), 20);
+    public_endpoint.privacy = ClusterEndpointPrivacy::InternetDirect;
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .extend([private_endpoint.clone(), public_endpoint.clone()]);
+    write_cluster_state(&paths, &state).expect("write state");
+    let snapshot = forward_test_snapshot("/forward/same-node-retry", b"same-node-retry");
+    let txn_response = forward_test_txn_response(snapshot.revision);
+    let mut host = AddressSensitiveKvTxnForwardHost {
+        known_authority: Some(peer_node_id.clone()),
+        failing_address: private_endpoint.address.clone(),
+        snapshot: snapshot.clone(),
+        txn_response: txn_response.clone(),
+        endpoint_rpcs: Vec::new(),
+    };
+
+    let result = forward_cluster_kv_txn_to_state_authority_with_host(
+        &paths,
+        &state,
+        &KvTxn {
+            compares: Vec::new(),
+            success: Vec::new(),
+            failure: Vec::new(),
+        },
+        ClusterKvTxnForwardOptions {
+            timeout: Duration::from_secs(5),
+            tcp_command_timeout: Duration::from_secs(5),
+            iroh_command_timeout: Duration::from_secs(3),
+        },
+        &mut host,
+    )
+    .expect("forward")
+    .expect("targeted voter");
+
+    assert_eq!(result.snapshot, snapshot);
+    assert_eq!(result.txn_response, Some(txn_response));
+    assert_eq!(
+        host.endpoint_rpcs,
+        vec![
+            (
+                peer_node_id.clone(),
+                private_endpoint.address,
+                CLUSTER_KV_TXN_ROUTE.to_string()
+            ),
+            (
+                peer_node_id.clone(),
+                public_endpoint.address.clone(),
+                CLUSTER_KV_TXN_ROUTE.to_string()
+            ),
+            (
+                peer_node_id,
+                public_endpoint.address,
+                CLUSTER_KV_SNAPSHOT_ROUTE.to_string()
+            )
         ]
     );
 }
