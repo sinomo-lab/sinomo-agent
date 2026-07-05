@@ -15,7 +15,7 @@ use sinomo_core::node::NodeId;
 use sinomo_core::{ClusterEndpointRecord, ClusterTransportKind};
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -54,14 +54,9 @@ impl TcpTunnelRegistry {
         let Ok(mut peers) = self.peers.lock() else {
             return;
         };
-        if let Some(previous) = peers.insert(handle.peer_node_id.clone(), handle)
-            && previous
-                .tx
-                .try_send(ClusterTcpTunnelFrame::Close {
-                    detail: "replaced by newer tunnel".to_string(),
-                })
-                .is_err()
-        {}
+        if let Some(previous) = peers.insert(handle.peer_node_id.clone(), handle) {
+            previous.request_close("replaced by newer tunnel".to_string());
+        }
     }
 
     fn remove_if_same(&self, handle: &Arc<TcpTunnelHandle>) {
@@ -82,9 +77,15 @@ struct TcpTunnelHandle {
     tx: mpsc::Sender<ClusterTcpTunnelFrame>,
     pending: PendingTcpTunnelMap,
     next_request_id: AtomicU64,
+    clean_shutdown: AtomicBool,
 }
 
 impl TcpTunnelHandle {
+    fn request_close(&self, detail: String) {
+        self.clean_shutdown.store(true, Ordering::Relaxed);
+        let _ = self.tx.try_send(ClusterTcpTunnelFrame::Close { detail });
+    }
+
     async fn send(
         &self,
         request: ObjectRpcRequest,
@@ -274,12 +275,14 @@ async fn send_over_tcp_tunnel_handle(
     if let Err(error) = result.as_ref() {
         TCP_TUNNELS.remove_if_same(&handle);
         let detail = format!("tcp tunnel evicted after request failure: {error}");
-        let _ = handle.tx.try_send(ClusterTcpTunnelFrame::Close {
-            detail: detail.clone(),
-        });
+        handle.request_close(detail.clone());
         handle.fail_pending(detail).await;
     }
     result
+}
+
+fn tcp_tunnel_should_maintain_outbound(local_node_id: &NodeId, peer_node_id: &NodeId) -> bool {
+    local_node_id < peer_node_id
 }
 
 async fn maintain_tcp_tunnels_once(
@@ -294,6 +297,7 @@ async fn maintain_tcp_tunnels_once(
     for endpoint in endpoints {
         if endpoint.node_id == state.local_node_id
             || endpoint.transport != ClusterTransportKind::LanTcp
+            || !tcp_tunnel_should_maintain_outbound(&state.local_node_id, &endpoint.node_id)
             || TCP_TUNNELS.contains(&endpoint.node_id)
             || attempted.contains_key(&endpoint.node_id)
         {
@@ -405,6 +409,7 @@ fn spawn_tcp_tunnel(
         tx,
         pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         next_request_id: AtomicU64::new(1),
+        clean_shutdown: AtomicBool::new(false),
     });
     TCP_TUNNELS.insert(handle.clone());
     tokio::spawn(tcp_tunnel_writer_loop(handle.clone(), write_half, rx));
@@ -447,6 +452,7 @@ async fn tcp_tunnel_reader_loop(
     service_runtime: tokio::runtime::Handle,
     connectivity_endpoint: Option<ClusterEndpointRecord>,
 ) {
+    let mut mark_unreachable_on_exit = false;
     loop {
         let frame = read_object_frame_async::<_, ClusterTcpTunnelFrame>(
             &mut read_half,
@@ -458,6 +464,7 @@ async fn tcp_tunnel_reader_loop(
             Ok(frame) => frame,
             Err(error) => {
                 handle.fail_pending(error.to_string()).await;
+                mark_unreachable_on_exit = !handle.clean_shutdown.load(Ordering::Relaxed);
                 break;
             }
         };
@@ -501,13 +508,14 @@ async fn tcp_tunnel_reader_loop(
                 }
             }
             ClusterTcpTunnelFrame::Close { detail } => {
+                handle.clean_shutdown.store(true, Ordering::Relaxed);
                 handle.fail_pending(detail).await;
                 break;
             }
         }
     }
     TCP_TUNNELS.remove_if_same(&handle);
-    if let Some(endpoint) = connectivity_endpoint.as_ref() {
+    if mark_unreachable_on_exit && let Some(endpoint) = connectivity_endpoint.as_ref() {
         remember_tcp_tunnel_connectivity(
             &paths,
             endpoint,
@@ -588,6 +596,7 @@ mod tests {
             tx,
             pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             next_request_id: AtomicU64::new(1),
+            clean_shutdown: AtomicBool::new(false),
         })
     }
 
@@ -656,5 +665,16 @@ mod tests {
         assert!(result.is_err());
         assert!(TCP_TUNNELS.get(&node_id).is_none());
         assert!(handle.pending.lock().await.is_empty());
+        assert!(handle.clean_shutdown.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn tcp_tunnel_maintenance_uses_one_canonical_outbound_dialer() {
+        let low = NodeId::from_legacy_named("tcp_tunnel_maintenance_low").expect("low node id");
+        let high = NodeId::from_legacy_named("tcp_tunnel_maintenance_high").expect("high node id");
+        let (first, second) = if low < high { (low, high) } else { (high, low) };
+
+        assert!(tcp_tunnel_should_maintain_outbound(&first, &second));
+        assert!(!tcp_tunnel_should_maintain_outbound(&second, &first));
     }
 }
