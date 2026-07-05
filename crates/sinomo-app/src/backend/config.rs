@@ -16,7 +16,7 @@ use sinomo_lm::{
     normalize_model_provider, normalize_provider_account_name, upsert_provider_account_config,
 };
 use sinomo_runtime::config::{
-    ConfigClient, ConfigStore, ConfigValueSource, ConfigValueType, ConfigWriteTarget,
+    ConfigClient, ConfigSchema, ConfigStore, ConfigValueSource, ConfigValueType, ConfigWriteTarget,
 };
 
 /// How a config value is edited in the Advanced settings UI.
@@ -61,6 +61,19 @@ pub struct ConfigItem {
     pub edit_kind: ConfigEditKind,
     /// The full (non-elided) editable representation seeded into the inline editor.
     pub edit_value: String,
+    /// Full resolved value used by schema-driven editors that write one nested field at a time.
+    pub raw_value: Value,
+    /// Optional structured schema declared by the owner crate/module.
+    pub schema: Option<ConfigSchema>,
+}
+
+impl ConfigItem {
+    pub fn update_value(&mut self, value: Value) {
+        self.bool_value = value.as_bool();
+        self.edit_value = editable_repr(self.edit_kind, &value);
+        self.value = compact(&value);
+        self.raw_value = value;
+    }
 }
 
 /// Build the config registry/store the app knows about (mirrors the CLI wiring).
@@ -105,6 +118,8 @@ pub fn resolve_items(client: &dyn ConfigClient) -> Vec<ConfigItem> {
             bool_value,
             edit_kind,
             edit_value,
+            raw_value: value,
+            schema: def.schema.clone(),
         });
     }
     items
@@ -262,6 +277,23 @@ mod tests {
                 && summary.account == "personal"
                 && summary.name.contains("personal")
         }));
+    }
+
+    #[test]
+    fn resolved_config_items_include_declared_schema() {
+        let (client, _root) = test_client("schema-catalog");
+        let items = resolve_items(&client);
+        let item = items
+            .iter()
+            .find(|item| item.key == sinomo_runtime::module::MODULE_NODE_CONFIG_KEY)
+            .expect("module node config");
+        let schema = item.schema.as_ref().expect("module config schema");
+        assert_eq!(schema.name, "ModuleRuntimeConfig");
+        assert!(matches!(
+            &schema.value,
+            sinomo_runtime::config::ConfigSchemaValue::Object { fields, .. }
+                if fields.iter().any(|field| field.name == "modules")
+        ));
     }
 
     #[test]

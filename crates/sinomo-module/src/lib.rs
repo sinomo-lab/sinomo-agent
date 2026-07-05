@@ -259,6 +259,32 @@ pub fn resolve_module_runtime_config(
     }
 }
 
+pub fn module_runtime_config_schema() -> sinomo_config::ConfigSchema {
+    sinomo_config::ConfigSchema::object(
+        "ModuleRuntimeConfig",
+        "Runtime module enablement keyed by module id.",
+        vec![
+            sinomo_config::ConfigSchemaField::new(
+                "modules",
+                "Modules",
+                "Configured module runtime states. Missing module ids inherit the next config layer.",
+                sinomo_config::ConfigSchemaValue::map(
+                    sinomo_config::ConfigSchemaValue::object(vec![
+                        sinomo_config::ConfigSchemaField::new(
+                            "enabled",
+                            "Enabled",
+                            "Whether this module should run when this config layer applies.",
+                            sinomo_config::ConfigSchemaValue::bool(),
+                        ),
+                    ])
+                    .without_unknown_fields(),
+                ),
+            )
+            .optional(),
+        ],
+    )
+}
+
 pub fn module_cluster_config_definition() -> Result<sinomo_config::ConfigDefinition, String> {
     sinomo_config::ConfigDefinition::new(
         MODULE_CLUSTER_CONFIG_KEY,
@@ -271,6 +297,8 @@ pub fn module_cluster_config_definition() -> Result<sinomo_config::ConfigDefinit
     )
     .map_err(|error| error.to_string())?
     .with_default(&ModuleRuntimeConfig::default())
+    .map_err(|error| error.to_string())?
+    .with_schema(module_runtime_config_schema())
     .map_err(|error| error.to_string())
 }
 
@@ -286,6 +314,8 @@ pub fn module_node_config_definition() -> Result<sinomo_config::ConfigDefinition
     )
     .map_err(|error| error.to_string())?
     .with_default(&ModuleRuntimeConfig::default())
+    .map_err(|error| error.to_string())?
+    .with_schema(module_runtime_config_schema())
     .map_err(|error| error.to_string())
 }
 

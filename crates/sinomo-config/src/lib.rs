@@ -97,12 +97,224 @@ pub struct ConfigNumberRange {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ConfigSchema {
+    pub name: String,
+    pub description: String,
+    pub value: ConfigSchemaValue,
+}
+
+impl ConfigSchema {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        value: ConfigSchemaValue,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            value,
+        }
+    }
+
+    pub fn object(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        fields: Vec<ConfigSchemaField>,
+    ) -> Self {
+        Self::new(
+            name,
+            description,
+            ConfigSchemaValue::object(fields).without_unknown_fields(),
+        )
+    }
+
+    pub fn validate(&self, key: &ConfigKey, value: &Value) -> Result<(), ConfigError> {
+        validate_schema_value(key, &self.value, value, "$")
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ConfigSchemaField {
+    pub name: String,
+    pub label: String,
+    pub description: String,
+    pub value: ConfigSchemaValue,
+    #[serde(default = "default_schema_field_required")]
+    pub required: bool,
+}
+
+impl ConfigSchemaField {
+    pub fn new(
+        name: impl Into<String>,
+        label: impl Into<String>,
+        description: impl Into<String>,
+        value: ConfigSchemaValue,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            label: label.into(),
+            description: description.into(),
+            value,
+            required: true,
+        }
+    }
+
+    pub fn optional(mut self) -> Self {
+        self.required = false;
+        self
+    }
+}
+
+fn default_schema_field_required() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ConfigSchemaValue {
+    Bool,
+    I64 {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range: Option<ConfigNumberRange>,
+    },
+    U64 {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range: Option<ConfigNumberRange>,
+    },
+    F64 {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range: Option<ConfigNumberRange>,
+    },
+    String {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        choices: Vec<ConfigSchemaChoice>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        secret: bool,
+    },
+    StringList,
+    Object {
+        fields: Vec<ConfigSchemaField>,
+        #[serde(default = "default_allow_unknown_fields")]
+        allow_unknown_fields: bool,
+    },
+    Map {
+        value: Box<ConfigSchemaValue>,
+    },
+    List {
+        value: Box<ConfigSchemaValue>,
+    },
+    Json,
+}
+
+impl ConfigSchemaValue {
+    pub fn bool() -> Self {
+        Self::Bool
+    }
+
+    pub fn i64(range: Option<ConfigNumberRange>) -> Self {
+        Self::I64 { range }
+    }
+
+    pub fn u64(range: Option<ConfigNumberRange>) -> Self {
+        Self::U64 { range }
+    }
+
+    pub fn f64(range: Option<ConfigNumberRange>) -> Self {
+        Self::F64 { range }
+    }
+
+    pub fn string() -> Self {
+        Self::String {
+            choices: Vec::new(),
+            secret: false,
+        }
+    }
+
+    pub fn secret_string() -> Self {
+        Self::String {
+            choices: Vec::new(),
+            secret: true,
+        }
+    }
+
+    pub fn string_choices(choices: Vec<ConfigSchemaChoice>) -> Self {
+        Self::String {
+            choices,
+            secret: false,
+        }
+    }
+
+    pub fn object(fields: Vec<ConfigSchemaField>) -> Self {
+        Self::Object {
+            fields,
+            allow_unknown_fields: true,
+        }
+    }
+
+    pub fn map(value: ConfigSchemaValue) -> Self {
+        Self::Map {
+            value: Box::new(value),
+        }
+    }
+
+    pub fn list(value: ConfigSchemaValue) -> Self {
+        Self::List {
+            value: Box::new(value),
+        }
+    }
+
+    pub fn without_unknown_fields(mut self) -> Self {
+        if let Self::Object {
+            allow_unknown_fields,
+            ..
+        } = &mut self
+        {
+            *allow_unknown_fields = false;
+        }
+        self
+    }
+}
+
+fn default_allow_unknown_fields() -> bool {
+    true
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigSchemaChoice {
+    pub value: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+impl ConfigSchemaChoice {
+    pub fn new(value: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            label: label.into(),
+            description: String::new(),
+        }
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ConfigDefinition {
     pub key: ConfigKey,
     pub owner: String,
     pub value_type: ConfigValueType,
     pub description: String,
     pub cluster_mode: ConfigClusterMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<ConfigSchema>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_value: Option<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -125,6 +337,7 @@ impl ConfigDefinition {
             value_type,
             description: description.into(),
             cluster_mode,
+            schema: None,
             default_value: None,
             local_legacy_paths: Vec::new(),
             cluster_legacy_keys: Vec::new(),
@@ -151,6 +364,14 @@ impl ConfigDefinition {
         self
     }
 
+    pub fn with_schema(mut self, schema: ConfigSchema) -> Result<Self, ConfigError> {
+        if let Some(default_value) = &self.default_value {
+            schema.validate(&self.key, default_value)?;
+        }
+        self.schema = Some(schema);
+        Ok(self)
+    }
+
     pub fn cluster_key(&self) -> String {
         self.key.cluster_key()
     }
@@ -160,7 +381,11 @@ impl ConfigDefinition {
     }
 
     pub fn validate_value(&self, value: &Value) -> Result<(), ConfigError> {
-        validate_value_type(&self.key, &self.value_type, value)
+        validate_value_type(&self.key, &self.value_type, value)?;
+        if let Some(schema) = &self.schema {
+            schema.validate(&self.key, value)?;
+        }
+        Ok(())
     }
 }
 
@@ -1061,6 +1286,168 @@ fn validate_value_type(
     }
 }
 
+fn validate_schema_value(
+    key: &ConfigKey,
+    schema: &ConfigSchemaValue,
+    value: &Value,
+    path: &str,
+) -> Result<(), ConfigError> {
+    match schema {
+        ConfigSchemaValue::Bool if value.is_boolean() => Ok(()),
+        ConfigSchemaValue::Bool => invalid_schema_type(key, path, "bool"),
+        ConfigSchemaValue::I64 { range } => {
+            let Some(number) = value.as_i64() else {
+                return invalid_schema_type(key, path, "i64");
+            };
+            validate_schema_number_range(key, path, number as f64, range.as_ref())
+        }
+        ConfigSchemaValue::U64 { range } => {
+            let Some(number) = value.as_u64() else {
+                return invalid_schema_type(key, path, "u64");
+            };
+            validate_schema_number_range(key, path, number as f64, range.as_ref())
+        }
+        ConfigSchemaValue::F64 { range } => {
+            let Some(number) = value.as_f64() else {
+                return invalid_schema_type(key, path, "f64");
+            };
+            validate_schema_number_range(key, path, number, range.as_ref())
+        }
+        ConfigSchemaValue::String { choices, .. } => {
+            let Some(text) = value.as_str() else {
+                return invalid_schema_type(key, path, "string");
+            };
+            if !choices.is_empty() && !choices.iter().any(|choice| choice.value == text) {
+                return Err(ConfigError::InvalidValue {
+                    key: key.to_string(),
+                    detail: format!(
+                        "{path}: value `{text}` is not one of {}",
+                        choices
+                            .iter()
+                            .map(|choice| choice.value.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                });
+            }
+            Ok(())
+        }
+        ConfigSchemaValue::StringList => {
+            let Some(values) = value.as_array() else {
+                return invalid_schema_type(key, path, "string list");
+            };
+            if values.iter().all(Value::is_string) {
+                Ok(())
+            } else {
+                invalid_schema_type(key, path, "string list")
+            }
+        }
+        ConfigSchemaValue::Object {
+            fields,
+            allow_unknown_fields,
+        } => {
+            let Some(map) = value.as_object() else {
+                return invalid_schema_type(key, path, "object");
+            };
+            for field in fields {
+                let field_path = schema_child_path(path, &field.name);
+                match map.get(&field.name) {
+                    Some(value) if value.is_null() && !field.required => {}
+                    Some(value) => validate_schema_value(key, &field.value, value, &field_path)?,
+                    None if field.required => {
+                        return Err(ConfigError::InvalidValue {
+                            key: key.to_string(),
+                            detail: format!("{field_path}: required field is missing"),
+                        });
+                    }
+                    None => {}
+                }
+            }
+            if !allow_unknown_fields {
+                for present in map.keys() {
+                    if fields.iter().all(|field| field.name != *present) {
+                        return Err(ConfigError::InvalidValue {
+                            key: key.to_string(),
+                            detail: format!(
+                                "{}: unknown field `{present}`",
+                                schema_child_path(path, present)
+                            ),
+                        });
+                    }
+                }
+            }
+            Ok(())
+        }
+        ConfigSchemaValue::Map { value: item_schema } => {
+            let Some(map) = value.as_object() else {
+                return invalid_schema_type(key, path, "object map");
+            };
+            for (entry_key, entry_value) in map {
+                validate_schema_value(
+                    key,
+                    item_schema,
+                    entry_value,
+                    &schema_child_path(path, entry_key),
+                )?;
+            }
+            Ok(())
+        }
+        ConfigSchemaValue::List { value: item_schema } => {
+            let Some(values) = value.as_array() else {
+                return invalid_schema_type(key, path, "array");
+            };
+            for (index, item) in values.iter().enumerate() {
+                validate_schema_value(key, item_schema, item, &format!("{path}[{index}]"))?;
+            }
+            Ok(())
+        }
+        ConfigSchemaValue::Json => Ok(()),
+    }
+}
+
+fn validate_schema_number_range(
+    key: &ConfigKey,
+    path: &str,
+    value: f64,
+    range: Option<&ConfigNumberRange>,
+) -> Result<(), ConfigError> {
+    let Some(range) = range else {
+        return Ok(());
+    };
+    if let Some(min) = range.min
+        && value < min
+    {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_string(),
+            detail: format!("{path}: value {value} is below minimum {min}"),
+        });
+    }
+    if let Some(max) = range.max
+        && value > max
+    {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_string(),
+            detail: format!("{path}: value {value} is above maximum {max}"),
+        });
+    }
+    Ok(())
+}
+
+fn invalid_schema_type<T>(key: &ConfigKey, path: &str, expected: &str) -> Result<T, ConfigError> {
+    Err(ConfigError::InvalidValue {
+        key: key.to_string(),
+        detail: format!("{path}: expected {expected}"),
+    })
+}
+
+fn schema_child_path(parent: &str, child: &str) -> String {
+    if parent == "$" {
+        format!("$.{child}")
+    } else {
+        format!("{parent}.{child}")
+    }
+}
+
 fn validate_number_range(
     key: &ConfigKey,
     value: f64,
@@ -1163,11 +1550,85 @@ mod tests {
         .with_local_legacy_path("config/test-enabled.json")
     }
 
+    fn module_like_definition() -> ConfigDefinition {
+        ConfigDefinition::new(
+            "test.modules",
+            "test",
+            ConfigValueType::Object {
+                schema_name: "TestModules".to_string(),
+            },
+            "test module map",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_default(&serde_json::json!({ "modules": {} }))
+        .expect("default")
+        .with_schema(ConfigSchema::object(
+            "TestModules",
+            "test module map",
+            vec![ConfigSchemaField::new(
+                "modules",
+                "Modules",
+                "Module enablement keyed by module id.",
+                ConfigSchemaValue::map(
+                    ConfigSchemaValue::object(vec![ConfigSchemaField::new(
+                        "enabled",
+                        "Enabled",
+                        "Whether this module should run.",
+                        ConfigSchemaValue::bool(),
+                    )])
+                    .without_unknown_fields(),
+                ),
+            )],
+        ))
+        .expect("schema")
+    }
+
     fn registry() -> ConfigRegistry {
         ConfigRegistry::builder()
             .register(bool_definition())
             .expect("register")
             .build()
+    }
+
+    #[test]
+    fn schema_validates_nested_map_fields() {
+        let definition = module_like_definition();
+        definition
+            .validate_value(&serde_json::json!({
+                "modules": {
+                    "observe": { "enabled": true }
+                }
+            }))
+            .expect("valid nested object");
+
+        let error = definition
+            .validate_value(&serde_json::json!({
+                "modules": {
+                    "observe": { "enabled": "yes" }
+                }
+            }))
+            .expect_err("invalid nested value");
+        assert!(
+            error
+                .to_string()
+                .contains("$.modules.observe.enabled: expected bool"),
+            "{error}"
+        );
+
+        let error = definition
+            .validate_value(&serde_json::json!({
+                "modules": {
+                    "observe": { "enabled": true, "extra": true }
+                }
+            }))
+            .expect_err("unknown nested field");
+        assert!(
+            error
+                .to_string()
+                .contains("$.modules.observe.extra: unknown field"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -30,7 +30,9 @@ use sui::{
     WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
 };
 
-use sinomo_runtime::config::ConfigClient;
+use sinomo_runtime::config::{
+    ConfigClient, ConfigSchema, ConfigSchemaField, ConfigSchemaValue, ConfigWriteTarget,
+};
 use sinomo_runtime::local::SinomoDataDir;
 
 use crate::backend::Backend;
@@ -849,6 +851,56 @@ impl SettingsState {
         }
     }
 
+    fn set_config_schema_bool(&mut self, index: usize, path: Vec<String>, value: bool) {
+        self.set_config_schema_value(index, path, Value::Bool(value));
+    }
+
+    fn set_config_schema_text(
+        &mut self,
+        index: usize,
+        path: Vec<String>,
+        schema: ConfigSchemaValue,
+        raw: &str,
+    ) {
+        match parse_schema_editor_value(&schema, raw) {
+            Ok(value) => self.set_config_schema_value(index, path, value),
+            Err(error) => {
+                if let Some(item) = self.config_items.get(index) {
+                    self.field_errors
+                        .insert(config_schema_field_key(&item.key, &path), error);
+                }
+            }
+        }
+    }
+
+    fn set_config_schema_value(&mut self, index: usize, path: Vec<String>, value: Value) {
+        let Some(item) = self.config_items.get(index) else {
+            return;
+        };
+        let key = item.key.clone();
+        let mut next = item.raw_value.clone();
+        let error_key = config_schema_field_key(&key, &path);
+        if let Err(error) = set_json_path_value(&mut next, &path, value) {
+            self.field_errors.insert(error_key, error);
+            return;
+        }
+        match self
+            .config
+            .set(&key, next.clone(), ConfigWriteTarget::Auto)
+            .map_err(|error| error.to_string())
+        {
+            Ok(_) => {
+                if let Some(item) = self.config_items.get_mut(index) {
+                    item.update_value(next);
+                }
+                self.field_errors.remove(&error_key);
+            }
+            Err(error) => {
+                self.field_errors.insert(error_key, error);
+            }
+        }
+    }
+
     fn toggle_provider(&mut self, index: usize) -> bool {
         let Some(form) = self.provider_forms.get(index) else {
             return false;
@@ -1138,6 +1190,71 @@ fn skill_mutation_message(result: &SkillMutationResult) -> String {
 /// Field-error map key for a raw config key (Advanced section).
 fn config_field_key(key: &str) -> String {
     format!("config:{key}")
+}
+
+fn config_schema_field_key(key: &str, path: &[String]) -> String {
+    if path.is_empty() {
+        return format!("config-schema:{key}:$");
+    }
+    format!("config-schema:{key}:{}", path.join("."))
+}
+
+fn parse_schema_editor_value(schema: &ConfigSchemaValue, raw: &str) -> Result<Value, String> {
+    let trimmed = raw.trim();
+    match schema {
+        ConfigSchemaValue::Bool => Ok(Value::Bool(trimmed.eq_ignore_ascii_case("true"))),
+        ConfigSchemaValue::I64 { .. } => trimmed
+            .parse::<i64>()
+            .map(|value| Value::Number(value.into()))
+            .map_err(|error| format!("invalid i64: {error}")),
+        ConfigSchemaValue::U64 { .. } => trimmed
+            .parse::<u64>()
+            .map(|value| Value::Number(value.into()))
+            .map_err(|error| format!("invalid u64: {error}")),
+        ConfigSchemaValue::F64 { .. } => {
+            let value = trimmed
+                .parse::<f64>()
+                .map_err(|error| format!("invalid number: {error}"))?;
+            serde_json::Number::from_f64(value)
+                .map(Value::Number)
+                .ok_or_else(|| "invalid finite number".to_string())
+        }
+        ConfigSchemaValue::String { .. } => Ok(Value::String(raw.to_string())),
+        ConfigSchemaValue::StringList
+        | ConfigSchemaValue::Object { .. }
+        | ConfigSchemaValue::Map { .. }
+        | ConfigSchemaValue::List { .. }
+        | ConfigSchemaValue::Json => {
+            serde_json::from_str(trimmed).map_err(|error| format!("invalid JSON: {error}"))
+        }
+    }
+}
+
+fn set_json_path_value(root: &mut Value, path: &[String], value: Value) -> Result<(), String> {
+    if path.is_empty() {
+        *root = value;
+        return Ok(());
+    }
+    let mut current = root;
+    for segment in &path[..path.len() - 1] {
+        if !current.is_object() {
+            *current = Value::Object(serde_json::Map::new());
+        }
+        let map = current
+            .as_object_mut()
+            .ok_or_else(|| format!("{segment} is not an object"))?;
+        current = map
+            .entry(segment.clone())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    }
+    if !current.is_object() {
+        *current = Value::Object(serde_json::Map::new());
+    }
+    let map = current
+        .as_object_mut()
+        .ok_or_else(|| "parent value is not an object".to_string())?;
+    map.insert(path[path.len() - 1].clone(), value);
+    Ok(())
 }
 
 /// Field-error map key for a provider text field (Providers section).
@@ -3841,6 +3958,8 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
             "Hide value"
         } else if sensitive {
             "Show redacted detail"
+        } else if item.schema.is_some() {
+            "Edit fields"
         } else {
             "Edit raw value"
         };
@@ -3863,7 +3982,12 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
     }
     details = details.with_child(Stack::horizontal().with_child(disclosure));
     if expanded {
-        details = details.with_child(config_detail_editor(shared, reader, index, &item));
+        if let Some(schema) = &item.schema {
+            details =
+                details.with_child(config_schema_editor(shared, reader, index, &item, schema));
+        } else {
+            details = details.with_child(config_detail_editor(shared, reader, index, &item));
+        }
     }
     PodHost::new(WidgetPod::new(
         FormRow::new(display_key, details)
@@ -3904,6 +4028,483 @@ fn config_detail_editor(
         .with_child(SizedBox::new().height(112.0).with_child(editor))
 }
 
+fn config_schema_editor(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    item: &ConfigItem,
+    schema: &ConfigSchema,
+) -> impl Widget + use<> {
+    let mut stack = Stack::vertical().spacing(8.0).alignment(Alignment::Stretch);
+    if !schema.description.trim().is_empty() {
+        stack = stack.with_child(muted_label(shared, schema.description.clone()).font_size(11.0));
+    }
+    stack.with_child(PodHost::new(config_schema_value_editor(
+        shared,
+        reader,
+        index,
+        &item.raw_value,
+        &schema.value,
+        Vec::new(),
+        &schema.name,
+        "",
+    )))
+}
+
+fn config_schema_value_editor(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    value: &Value,
+    schema: &ConfigSchemaValue,
+    path: Vec<String>,
+    label: &str,
+    description: &str,
+) -> WidgetPod {
+    match schema {
+        ConfigSchemaValue::Object { fields, .. } => config_schema_object_editor(
+            shared,
+            reader,
+            index,
+            value,
+            fields,
+            path,
+            label,
+            description,
+        ),
+        ConfigSchemaValue::Map { value: item_schema } => config_schema_map_editor(
+            shared,
+            reader,
+            index,
+            value,
+            item_schema,
+            path,
+            label,
+            description,
+        ),
+        ConfigSchemaValue::List { .. }
+        | ConfigSchemaValue::StringList
+        | ConfigSchemaValue::Json => config_schema_json_row(
+            shared,
+            reader,
+            index,
+            value,
+            schema,
+            path,
+            label,
+            description,
+        ),
+        ConfigSchemaValue::Bool
+        | ConfigSchemaValue::I64 { .. }
+        | ConfigSchemaValue::U64 { .. }
+        | ConfigSchemaValue::F64 { .. }
+        | ConfigSchemaValue::String { .. } => config_schema_primitive_row(
+            shared,
+            reader,
+            index,
+            value,
+            schema,
+            path,
+            label,
+            description,
+        ),
+    }
+}
+
+fn config_schema_object_editor(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    value: &Value,
+    fields: &[ConfigSchemaField],
+    path: Vec<String>,
+    label: &str,
+    description: &str,
+) -> WidgetPod {
+    let mut group = FieldGroup::new().spacing(8.0);
+    if !description.trim().is_empty() {
+        group = group.with_child(value_row(shared, reader, label, description));
+    }
+    for field in fields {
+        let mut field_path = path.clone();
+        field_path.push(field.name.clone());
+        let field_value = value
+            .as_object()
+            .and_then(|map| map.get(&field.name))
+            .unwrap_or(&Value::Null);
+        group = group.with_child(PodHost::new(config_schema_value_editor(
+            shared,
+            reader,
+            index,
+            field_value,
+            &field.value,
+            field_path,
+            &field.label,
+            &field.description,
+        )));
+    }
+    WidgetPod::new(group)
+}
+
+fn config_schema_map_editor(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    value: &Value,
+    item_schema: &ConfigSchemaValue,
+    path: Vec<String>,
+    label: &str,
+    description: &str,
+) -> WidgetPod {
+    let mut group = FieldGroup::new().spacing(8.0);
+    let entries = value
+        .as_object()
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut summary_body = Stack::vertical()
+        .spacing(4.0)
+        .alignment(Alignment::Stretch)
+        .with_child(muted_label(shared, format!("{} entries", entries.len())).font_size(12.0));
+    if !description.trim().is_empty() {
+        summary_body =
+            summary_body.with_child(muted_label(shared, description.to_string()).font_size(11.0));
+    }
+    group = group.with_child(
+        FormRow::new(label, summary_body)
+            .stacked()
+            .theme_when(clone_reader(reader)),
+    );
+    for (entry_key, entry_value) in entries {
+        let mut entry_path = path.clone();
+        entry_path.push(entry_key.clone());
+        match item_schema {
+            ConfigSchemaValue::Object { fields, .. } => {
+                for field in fields {
+                    let mut field_path = entry_path.clone();
+                    field_path.push(field.name.clone());
+                    let field_value = entry_value
+                        .as_object()
+                        .and_then(|map| map.get(&field.name))
+                        .unwrap_or(&Value::Null);
+                    let field_label = format!(
+                        "{} {}",
+                        short_one_line(&entry_key, 42),
+                        field.label.to_ascii_lowercase()
+                    );
+                    group = group.with_child(PodHost::new(config_schema_value_editor(
+                        shared,
+                        reader,
+                        index,
+                        field_value,
+                        &field.value,
+                        field_path,
+                        &field_label,
+                        &field.description,
+                    )));
+                }
+            }
+            other => {
+                group = group.with_child(PodHost::new(config_schema_value_editor(
+                    shared,
+                    reader,
+                    index,
+                    &entry_value,
+                    other,
+                    entry_path,
+                    &entry_key,
+                    "",
+                )));
+            }
+        }
+    }
+    WidgetPod::new(group)
+}
+
+fn config_schema_primitive_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    value: &Value,
+    schema: &ConfigSchemaValue,
+    path: Vec<String>,
+    label: &str,
+    description: &str,
+) -> WidgetPod {
+    match schema {
+        ConfigSchemaValue::Bool => {
+            let current = value.as_bool().unwrap_or(false);
+            let row = switch_row(reader, label, current, {
+                let s = shared.clone();
+                let path = path.clone();
+                move |enabled| {
+                    s.settings_mut()
+                        .set_config_schema_bool(index, path.clone(), enabled);
+                }
+            });
+            WidgetPod::new(row)
+        }
+        ConfigSchemaValue::String { choices, secret } if !choices.is_empty() && !*secret => {
+            let options = choices
+                .iter()
+                .map(|choice| {
+                    if choice.label.trim().is_empty() {
+                        choice.value.clone()
+                    } else {
+                        choice.label.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let select = Select::new(schema_control_name(index, &path))
+                .options(options)
+                .selected_when({
+                    let s = shared.clone();
+                    let path = path.clone();
+                    let choices = choices.clone();
+                    move || {
+                        let item = s.settings().config_items.get(index)?.clone();
+                        let current = config_value_at_path(&item.raw_value, &path)?.as_str()?;
+                        choices.iter().position(|choice| choice.value == current)
+                    }
+                })
+                .theme_when(clone_reader(reader))
+                .on_change({
+                    let s = shared.clone();
+                    let path = path.clone();
+                    let choices = choices.clone();
+                    move |choice_index, _label| {
+                        if let Some(choice) = choices.get(choice_index) {
+                            s.settings_mut().set_config_schema_value(
+                                index,
+                                path.clone(),
+                                Value::String(choice.value.clone()),
+                            );
+                        }
+                    }
+                });
+            let mut body = Stack::vertical()
+                .spacing(4.0)
+                .alignment(Alignment::Stretch)
+                .with_child(select);
+            if !description.trim().is_empty() {
+                body =
+                    body.with_child(muted_label(shared, description.to_string()).font_size(11.0));
+            }
+            WidgetPod::new(
+                FormRow::new(label, body)
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            )
+        }
+        ConfigSchemaValue::String { secret, .. } if *secret => {
+            WidgetPod::new(value_row(shared, reader, label, "Configured secret"))
+        }
+        ConfigSchemaValue::String { .. }
+        | ConfigSchemaValue::I64 { .. }
+        | ConfigSchemaValue::U64 { .. }
+        | ConfigSchemaValue::F64 { .. } => {
+            let value_text = schema_scalar_edit_value(schema, value);
+            let mut body = Stack::vertical()
+                .spacing(4.0)
+                .alignment(Alignment::Stretch)
+                .with_child(
+                    TextInput::new(schema_control_name(index, &path))
+                        .value(value_text)
+                        .placeholder(schema_placeholder(schema))
+                        .theme_when(clone_reader(reader))
+                        .on_change({
+                            let s = shared.clone();
+                            let path = path.clone();
+                            let schema = schema.clone();
+                            move |raw| {
+                                s.settings_mut().set_config_schema_text(
+                                    index,
+                                    path.clone(),
+                                    schema.clone(),
+                                    &raw,
+                                );
+                            }
+                        }),
+                );
+            let error_key = {
+                let settings = shared.settings();
+                settings
+                    .config_items
+                    .get(index)
+                    .map(|item| config_schema_field_key(&item.key, &path))
+            };
+            let detail = error_key
+                .and_then(|key| shared.settings().field_errors.get(&key).cloned())
+                .unwrap_or_else(|| schema_field_detail(schema, description));
+            if !detail.trim().is_empty() {
+                body = body.with_child(muted_label(shared, detail).font_size(11.0));
+            }
+            WidgetPod::new(
+                FormRow::new(label, body)
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            )
+        }
+        _ => config_schema_json_row(
+            shared,
+            reader,
+            index,
+            value,
+            schema,
+            path,
+            label,
+            description,
+        ),
+    }
+}
+
+fn config_schema_json_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    value: &Value,
+    schema: &ConfigSchemaValue,
+    path: Vec<String>,
+    label: &str,
+    description: &str,
+) -> WidgetPod {
+    let value_text = if value.is_null() {
+        String::new()
+    } else {
+        serde_json::to_string_pretty(value).unwrap_or_default()
+    };
+    let mut body = Stack::vertical()
+        .spacing(4.0)
+        .alignment(Alignment::Stretch)
+        .with_child(
+            SizedBox::new().height(92.0).with_child(
+                TextArea::new(schema_control_name(index, &path))
+                    .value(value_text)
+                    .placeholder("JSON value")
+                    .theme_when(clone_reader(reader))
+                    .on_change({
+                        let s = shared.clone();
+                        let path = path.clone();
+                        let schema = schema.clone();
+                        move |raw| {
+                            s.settings_mut().set_config_schema_text(
+                                index,
+                                path.clone(),
+                                schema.clone(),
+                                &raw,
+                            );
+                        }
+                    }),
+            ),
+        );
+    let detail = schema_field_detail(schema, description);
+    if !detail.trim().is_empty() {
+        body = body.with_child(muted_label(shared, detail).font_size(11.0));
+    }
+    WidgetPod::new(
+        FormRow::new(label, body)
+            .stacked()
+            .theme_when(clone_reader(reader)),
+    )
+}
+
+fn config_value_at_path<'a>(value: &'a Value, path: &[String]) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in path {
+        current = current.as_object()?.get(segment)?;
+    }
+    Some(current)
+}
+
+fn schema_control_name(index: usize, path: &[String]) -> String {
+    if path.is_empty() {
+        return format!("config-{index}-schema-root");
+    }
+    let path = path
+        .iter()
+        .map(|segment| {
+            segment
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                        ch
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("-");
+    format!("config-{index}-schema-{path}")
+}
+
+fn schema_scalar_edit_value(schema: &ConfigSchemaValue, value: &Value) -> String {
+    match schema {
+        ConfigSchemaValue::String { .. } => value.as_str().unwrap_or_default().to_string(),
+        ConfigSchemaValue::I64 { .. }
+        | ConfigSchemaValue::U64 { .. }
+        | ConfigSchemaValue::F64 { .. } => {
+            if value.is_null() {
+                String::new()
+            } else {
+                value.to_string()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn schema_placeholder(schema: &ConfigSchemaValue) -> &'static str {
+    match schema {
+        ConfigSchemaValue::String { .. } => "Text",
+        ConfigSchemaValue::I64 { .. } => "Integer",
+        ConfigSchemaValue::U64 { .. } => "Unsigned integer",
+        ConfigSchemaValue::F64 { .. } => "Number",
+        _ => "Value",
+    }
+}
+
+fn schema_field_detail(schema: &ConfigSchemaValue, description: &str) -> String {
+    let mut details = Vec::new();
+    if !description.trim().is_empty() {
+        details.push(description.to_string());
+    }
+    if let Some(constraint) = schema_constraint_summary(schema) {
+        details.push(constraint);
+    }
+    details.join(" · ")
+}
+
+fn schema_constraint_summary(schema: &ConfigSchemaValue) -> Option<String> {
+    match schema {
+        ConfigSchemaValue::I64 { range }
+        | ConfigSchemaValue::U64 { range }
+        | ConfigSchemaValue::F64 { range } => range.as_ref().and_then(format_number_range),
+        ConfigSchemaValue::String { choices, .. } if !choices.is_empty() => Some(format!(
+            "Allowed: {}",
+            choices
+                .iter()
+                .map(|choice| choice.value.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        _ => None,
+    }
+}
+
+fn format_number_range(range: &sinomo_runtime::config::ConfigNumberRange) -> Option<String> {
+    match (range.min, range.max) {
+        (Some(min), Some(max)) => Some(format!("Range: {min} to {max}")),
+        (Some(min), None) => Some(format!("Minimum: {min}")),
+        (None, Some(max)) => Some(format!("Maximum: {max}")),
+        (None, None) => None,
+    }
+}
+
 fn config_metadata_line(item: &ConfigItem) -> String {
     let kind = match item.edit_kind {
         ConfigEditKind::Bool => "Boolean",
@@ -3912,14 +4513,26 @@ fn config_metadata_line(item: &ConfigItem) -> String {
         ConfigEditKind::Json => "JSON",
     };
     let owner = item.owner.trim();
+    let schema = item
+        .schema
+        .as_ref()
+        .map(|schema| schema.name.as_str())
+        .unwrap_or(kind);
     if owner.is_empty() {
-        format!("{} · {kind}", item.source)
+        format!("{} · {schema}", item.source)
     } else {
-        format!("{} · {owner} · {kind}", item.source)
+        format!("{} · {owner} · {schema}", item.source)
     }
 }
 
 fn config_value_summary(item: &ConfigItem) -> String {
+    if let Some(schema) = &item.schema {
+        let mut summary = config_schema_value_summary(&item.raw_value, &schema.value, &schema.name);
+        if schema_has_secret(&schema.value) || contains_sensitive_json_field(&item.raw_value) {
+            summary.push_str(" · sensitive fields redacted");
+        }
+        return summary;
+    }
     match item.edit_kind {
         ConfigEditKind::Bool => match item.bool_value {
             Some(true) => "Enabled".to_string(),
@@ -3943,6 +4556,79 @@ fn config_value_summary(item: &ConfigItem) -> String {
             }
         }
         ConfigEditKind::Json => config_json_summary(item),
+    }
+}
+
+fn config_schema_value_summary(value: &Value, schema: &ConfigSchemaValue, name: &str) -> String {
+    match schema {
+        ConfigSchemaValue::Object { fields, .. } => {
+            let Some(map) = value.as_object() else {
+                return format!("{name} · unset");
+            };
+            let mut parts = Vec::new();
+            for field in fields.iter().take(2) {
+                let value = map.get(&field.name).unwrap_or(&Value::Null);
+                parts.push(format!(
+                    "{}: {}",
+                    field.label,
+                    config_schema_inline_summary(value, &field.value)
+                ));
+            }
+            if parts.is_empty() {
+                format!("{name} · {} fields", map.len())
+            } else {
+                format!("{name} · {}", parts.join(" · "))
+            }
+        }
+        other => format!("{name} · {}", config_schema_inline_summary(value, other)),
+    }
+}
+
+fn config_schema_inline_summary(value: &Value, schema: &ConfigSchemaValue) -> String {
+    match schema {
+        ConfigSchemaValue::Bool => match value.as_bool() {
+            Some(true) => "enabled".to_string(),
+            Some(false) => "disabled".to_string(),
+            None => "unset".to_string(),
+        },
+        ConfigSchemaValue::I64 { .. }
+        | ConfigSchemaValue::U64 { .. }
+        | ConfigSchemaValue::F64 { .. } => {
+            if value.is_null() {
+                "unset".to_string()
+            } else {
+                value.to_string()
+            }
+        }
+        ConfigSchemaValue::String { secret, .. } if *secret => "configured secret".to_string(),
+        ConfigSchemaValue::String { .. } => value
+            .as_str()
+            .map(|text| short_one_line(text, 64))
+            .unwrap_or_else(|| "unset".to_string()),
+        ConfigSchemaValue::StringList | ConfigSchemaValue::List { .. } => value
+            .as_array()
+            .map(|items| format!("{} items", items.len()))
+            .unwrap_or_else(|| "0 items".to_string()),
+        ConfigSchemaValue::Map { .. } => value
+            .as_object()
+            .map(|items| format!("{} entries", items.len()))
+            .unwrap_or_else(|| "0 entries".to_string()),
+        ConfigSchemaValue::Object { .. } => value
+            .as_object()
+            .map(|items| format!("{} fields", items.len()))
+            .unwrap_or_else(|| "unset".to_string()),
+        ConfigSchemaValue::Json => config_json_value_summary(value),
+    }
+}
+
+fn config_json_value_summary(value: &Value) -> String {
+    match value {
+        Value::Null => "unset".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => short_one_line(value, 64),
+        Value::Array(items) => format!("{} items", items.len()),
+        Value::Object(map) => format!("{} fields", map.len()),
     }
 }
 
@@ -4024,12 +4710,32 @@ fn config_item_has_sensitive_detail(item: &ConfigItem) -> bool {
     if sensitive_field_name(&item.key) {
         return true;
     }
+    if item
+        .schema
+        .as_ref()
+        .is_some_and(|schema| schema_has_secret(&schema.value))
+    {
+        return true;
+    }
     if item.edit_kind != ConfigEditKind::Json {
         return false;
     }
     serde_json::from_str::<Value>(&item.edit_value)
         .map(|value| contains_sensitive_json_field(&value))
         .unwrap_or(false)
+}
+
+fn schema_has_secret(schema: &ConfigSchemaValue) -> bool {
+    match schema {
+        ConfigSchemaValue::String { secret, .. } => *secret,
+        ConfigSchemaValue::Object { fields, .. } => {
+            fields.iter().any(|field| schema_has_secret(&field.value))
+        }
+        ConfigSchemaValue::Map { value } | ConfigSchemaValue::List { value } => {
+            schema_has_secret(value)
+        }
+        _ => false,
+    }
 }
 
 fn contains_sensitive_json_field(value: &Value) -> bool {
@@ -4958,6 +5664,54 @@ mod tests {
     }
 
     #[test]
+    fn schema_config_edit_updates_nested_module_field() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        let idx = state
+            .config_items
+            .iter()
+            .position(|item| item.key == sinomo_runtime::module::MODULE_NODE_CONFIG_KEY)
+            .expect("module node config item");
+        assert_eq!(
+            state.config_items[idx]
+                .schema
+                .as_ref()
+                .map(|schema| schema.name.as_str()),
+            Some("ModuleRuntimeConfig")
+        );
+
+        let path = vec![
+            "modules".to_string(),
+            "observe".to_string(),
+            "enabled".to_string(),
+        ];
+        state.set_config_schema_bool(idx, path.clone(), true);
+        assert!(
+            !state.field_errors.contains_key(&config_schema_field_key(
+                sinomo_runtime::module::MODULE_NODE_CONFIG_KEY,
+                &path
+            )),
+            "valid nested schema write should not record an error"
+        );
+        assert_eq!(
+            config_value_at_path(&state.config_items[idx].raw_value, &path)
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let stored = state
+            .config
+            .get(sinomo_runtime::module::MODULE_NODE_CONFIG_KEY)
+            .expect("stored module config");
+        assert_eq!(
+            config_value_at_path(&stored.value, &path).and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(config_value_summary(&state.config_items[idx]).contains("ModuleRuntimeConfig"));
+        assert!(config_value_summary(&state.config_items[idx]).contains("1 entries"));
+    }
+
+    #[test]
     fn toggle_config_no_ops_on_a_non_bool_key() {
         let Some((mut state, idx)) = editable_state() else {
             return;
@@ -5758,6 +6512,8 @@ mod tests {
     }
 
     fn test_config_item(key: &str, kind: ConfigEditKind, raw: &str) -> ConfigItem {
+        let raw_value =
+            serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
         ConfigItem {
             key: key.to_string(),
             owner: "test".to_string(),
@@ -5767,6 +6523,8 @@ mod tests {
             bool_value: None,
             edit_kind: kind,
             edit_value: raw.to_string(),
+            raw_value,
+            schema: None,
         }
     }
 
