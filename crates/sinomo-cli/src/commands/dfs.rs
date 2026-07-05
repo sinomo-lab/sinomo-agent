@@ -2277,13 +2277,23 @@ fn run_local_dfs_smoke(
                 publish_cluster_control: true,
                 local_endpoint,
             },
-            smoke: sinomo_runtime::dfs::DfsSmokeOptions::default(),
+            smoke: foreground_dfs_smoke_options(),
         },
     )?
     else {
         return Err(CliError::ClusterOrphan);
     };
     Ok(report)
+}
+
+fn foreground_dfs_smoke_options() -> sinomo_runtime::dfs::DfsSmokeOptions {
+    sinomo_runtime::dfs::DfsSmokeOptions {
+        metadata_replication: sinomo_runtime::dfs::DfsMetadataJournalReplicationOptions {
+            max_batches_per_target: 0,
+            ..sinomo_runtime::dfs::DfsMetadataJournalReplicationOptions::default()
+        },
+        ..sinomo_runtime::dfs::DfsSmokeOptions::default()
+    }
 }
 
 fn cli_dfs_peer_transport() -> std::sync::Arc<dyn sinomo_runtime::dfs::DfsPeerTransport> {

@@ -2533,6 +2533,17 @@ pub fn replicate_dfs_metadata_shard_to_target(
             });
             break;
         }
+        if sent_batches >= options.max_batches_per_target {
+            push_dfs_metadata_backlog_if_remaining(
+                backend,
+                target_node_id,
+                shard_id,
+                after_sequence,
+                options,
+                &mut outcomes,
+            )?;
+            break;
+        }
 
         let command = dfs_metadata_journal_batch_command(local_node_id, target_node_id, batch);
         let attempt_timeout = options.attempt_timeout.min(options.target_timeout);

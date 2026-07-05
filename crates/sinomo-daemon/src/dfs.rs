@@ -996,6 +996,16 @@ fn daemon_dfs_metadata_replication_options() -> DfsMetadataJournalReplicationOpt
     }
 }
 
+fn daemon_dfs_smoke_options() -> sinomo_dfs::DfsSmokeOptions {
+    sinomo_dfs::DfsSmokeOptions {
+        metadata_replication: DfsMetadataJournalReplicationOptions {
+            max_batches_per_target: 0,
+            ..daemon_dfs_metadata_replication_options()
+        },
+        ..sinomo_dfs::DfsSmokeOptions::default()
+    }
+}
+
 fn daemon_dfs_metadata_publish_schedule_options() -> DfsMetadataPublishScheduleOptions {
     DfsMetadataPublishScheduleOptions {
         max_retry_rounds: DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS,
@@ -1066,7 +1076,7 @@ async fn run_daemon_dfs_smoke_async(
                     publish_cluster_control: true,
                     local_endpoint,
                 },
-                smoke: sinomo_dfs::DfsSmokeOptions::default(),
+                smoke: daemon_dfs_smoke_options(),
             },
         )
     });
