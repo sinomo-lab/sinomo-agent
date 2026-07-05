@@ -772,17 +772,21 @@ pub fn run_shadow_daemon_supervision_loop(
             pending_activation_shutdown_started_at = None;
         }
         if pending_rollout.is_none()
-            && matches!(main_probe_status, DaemonProbeStatus::Running(_))
+            && pending_main_activation_stop_target(&main_probe_status)
             && pending_main_activation
             && pending_main_activation_ready_for_shutdown(&rollout_paths)
             && Instant::now() >= next_pending_activation_shutdown_nudge
         {
             let shutdown_started_at =
                 *pending_activation_shutdown_started_at.get_or_insert_with(Instant::now);
-            if let DaemonProbeStatus::Running(status) =
-                probe_daemon_status(&main_paths, probe_timeout)
-            {
-                let _ = send_daemon_shutdown_request(&status.address, probe_timeout);
+            match probe_daemon_status(&main_paths, probe_timeout) {
+                DaemonProbeStatus::Running(status)
+                | DaemonProbeStatus::Locked {
+                    status: Some(status),
+                } => {
+                    let _ = send_daemon_shutdown_request(&status.address, probe_timeout);
+                }
+                DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {}
             }
             if shutdown_started_at.elapsed() >= PENDING_MAIN_ACTIVATION_FORCE_TERMINATE_AFTER {
                 match terminate_pending_main_activation(
@@ -1260,6 +1264,13 @@ fn shadow_main_probe_interval(pending_rollout: bool) -> Duration {
 
 fn should_shadow_start_main(main_restart_suppressed: bool, pending_main_activation: bool) -> bool {
     pending_main_activation || !main_restart_suppressed
+}
+
+fn pending_main_activation_stop_target(status: &DaemonProbeStatus) -> bool {
+    matches!(
+        status,
+        DaemonProbeStatus::Running(_) | DaemonProbeStatus::Locked { status: Some(_) }
+    )
 }
 
 fn pending_rollout_probe_matches_candidate(
@@ -3685,6 +3696,28 @@ mod tests {
         assert!(!pending_main_activation_ready_for_shutdown(&rollout_paths));
         std::thread::sleep(MAIN_ACTIVATION_SHUTDOWN_GRACE + Duration::from_millis(100));
         assert!(pending_main_activation_ready_for_shutdown(&rollout_paths));
+    }
+
+    #[test]
+    fn pending_main_activation_treats_locked_main_as_stop_target() {
+        let root = temp_rollout_test_root("activation-locked-main");
+        let paths = DaemonPaths::with_root(root.join("daemon"));
+        let status = DaemonStatus::new(&crate::DaemonRunOptions::default(), &paths, None);
+
+        assert!(pending_main_activation_stop_target(
+            &DaemonProbeStatus::Running(status.clone())
+        ));
+        assert!(pending_main_activation_stop_target(
+            &DaemonProbeStatus::Locked {
+                status: Some(status)
+            }
+        ));
+        assert!(!pending_main_activation_stop_target(
+            &DaemonProbeStatus::Locked { status: None }
+        ));
+        assert!(!pending_main_activation_stop_target(
+            &DaemonProbeStatus::NotRunning
+        ));
     }
 
     #[test]
