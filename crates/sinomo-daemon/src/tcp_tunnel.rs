@@ -322,8 +322,10 @@ async fn maintain_tcp_tunnels_once(
 ) -> Result<(), DaemonError> {
     let cluster_paths = crate::cluster::cluster_paths_from_daemon_paths(paths)?;
     let state = read_cluster_state_without_kv(&cluster_paths).map_err(DaemonError::from)?;
-    let endpoints = sinomo_core::network::ClusterEndpointSelector::new(&cluster_paths, &state)
-        .select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates);
+    let selector = sinomo_core::network::ClusterEndpointSelector::new(&cluster_paths, &state);
+    let mut endpoints =
+        selector.select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates);
+    endpoints.extend(selector.select(ClusterEndpointSelectionPurpose::NetworkProbe));
     for endpoint in tcp_tunnel_maintenance_candidate_endpoints(&state.local_node_id, endpoints) {
         if TCP_TUNNELS.contains(&endpoint.node_id) {
             continue;
@@ -342,6 +344,7 @@ fn tcp_tunnel_maintenance_candidate_endpoints(
         .filter(|endpoint| {
             endpoint.node_id != *local_node_id
                 && endpoint.transport == ClusterTransportKind::LanTcp
+                && sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
                 && tcp_tunnel_should_maintain_outbound(local_node_id, &endpoint.node_id)
         })
         .collect()
@@ -573,11 +576,15 @@ fn tcp_tunnel_connectivity_endpoint_for_peer(
 ) -> Option<ClusterEndpointRecord> {
     let cluster_paths = crate::cluster::cluster_paths_from_daemon_paths(paths).ok()?;
     let state = read_cluster_state_without_kv(&cluster_paths).ok()?;
-    sinomo_core::network::ClusterEndpointSelector::new(&cluster_paths, &state)
+    let selector = sinomo_core::network::ClusterEndpointSelector::new(&cluster_paths, &state);
+    selector
         .select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates)
         .into_iter()
+        .chain(selector.select(ClusterEndpointSelectionPurpose::NetworkProbe))
         .find(|endpoint| {
-            endpoint.node_id == *peer_node_id && endpoint.transport == ClusterTransportKind::LanTcp
+            endpoint.node_id == *peer_node_id
+                && endpoint.transport == ClusterTransportKind::LanTcp
+                && sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
         })
 }
 
@@ -797,6 +804,12 @@ mod tests {
                 ClusterTransportKind::Loopback,
             ),
             test_endpoint(
+                "tcp_tunnel_maintenance_shadow",
+                &peer,
+                "10.0.0.41:21354",
+                ClusterTransportKind::LanTcp,
+            ),
+            test_endpoint(
                 "tcp_tunnel_maintenance_self",
                 &local,
                 "10.14.1.11:21353",
@@ -813,6 +826,83 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["10.0.0.41:21353", "129.146.106.76:21353"]
         );
+    }
+
+    #[test]
+    fn tcp_tunnel_peer_endpoint_falls_back_to_probe_candidate() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-tcp-tunnel-probe-fallback");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let daemon_paths = DaemonPaths::new(&data_dir);
+        daemon_paths.ensure().expect("daemon paths");
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let now = time::OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_tcp_tunnel_probe_fallback")
+                .expect("cluster id");
+        let local = NodeId::from_legacy_named("node_tcp_tunnel_probe_fallback_local")
+            .expect("local node id");
+        let peer =
+            NodeId::from_legacy_named("node_tcp_tunnel_probe_fallback_peer").expect("peer node id");
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "tcp tunnel probe fallback",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut peer_member = sinomo_core::ClusterMemberRecord::local_voter(
+            cluster_id,
+            peer.clone(),
+            "peer",
+            "pk-peer",
+            now,
+        );
+        peer_member.capabilities = sinomo_core::node::main_daemon_capabilities(&peer_member.role);
+        peer_member.allowed_capabilities = peer_member.capabilities.clone();
+        let endpoint = test_endpoint(
+            "tcp_tunnel_probe_fallback_endpoint",
+            &peer,
+            "10.14.1.11:21353",
+            ClusterTransportKind::LanTcp,
+        );
+        peer_member.endpoints = vec![endpoint.clone()];
+        state.members.push(peer_member);
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+        let record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            sinomo_core::network::ClusterConnectivityState::Unreachable,
+            None,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
+            None,
+            Some(now.to_string()),
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
+        );
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &cluster_paths,
+            &local,
+            &[record],
+        )
+        .expect("write connectivity");
+        let command_candidates =
+            sinomo_core::network::ClusterEndpointSelector::new(&cluster_paths, &state)
+                .select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates);
+        assert!(
+            command_candidates
+                .iter()
+                .all(|candidate| candidate.endpoint_id != endpoint.endpoint_id),
+            "the setup should model a peer endpoint suppressed by command selection"
+        );
+
+        let selected = tcp_tunnel_connectivity_endpoint_for_peer(&daemon_paths, &peer)
+            .expect("probe fallback endpoint");
+
+        assert_eq!(selected.endpoint_id, endpoint.endpoint_id);
+        assert_eq!(selected.address, endpoint.address);
     }
 
     #[test]
