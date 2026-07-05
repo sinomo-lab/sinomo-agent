@@ -3429,9 +3429,28 @@ fn daemon_internal_module_registry(
             .register(sinomo_observe::observe_module_registration())
             .map_err(module_error_to_network_error)?;
     }
-    for registration in sinomo_module::active_native_dylib_module_registrations(data_dir_root)
-        .map_err(module_error_to_network_error)?
-    {
+    let native_dylib_states =
+        match sinomo_module::read_native_dylib_module_loader_states(data_dir_root) {
+            Ok(states) => states,
+            Err(error) => {
+                tracing::warn!("daemon native-dylib module loader states unreadable: {error}");
+                Vec::new()
+            }
+        };
+    for state in native_dylib_states {
+        let registration = match sinomo_module::native_dylib_module_registration_from_loader_state(
+            data_dir_root,
+            &state,
+        ) {
+            Ok(registration) => registration,
+            Err(error) => {
+                tracing::warn!(
+                    "daemon native-dylib module {} registration skipped: {error}",
+                    state.module_id
+                );
+                continue;
+            }
+        };
         builder = builder
             .register(registration)
             .map_err(module_error_to_network_error)?;
@@ -4852,6 +4871,55 @@ mod tests {
             cancel_response
                 .detail
                 .contains("native dylib module operation is not active")
+        );
+    }
+
+    #[test]
+    fn daemon_service_registry_skips_broken_active_native_dylib_state() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-broken-native-dylib-state");
+        let module_id =
+            sinomo_module::ModuleId::from_legacy_named("module.dfs.cloud-files").expect("module");
+        let content_hash =
+            "blake3:0000000000000000000000000000000000000000000000000000000000000000";
+        let state = sinomo_module::NativeDylibModuleLoaderState {
+            module_id: module_id.clone(),
+            artifact_id: None,
+            content_hash: content_hash.to_string(),
+            cache_key: "module/dfs/cloud-files".to_string(),
+            library_name: "sinomo_dfs_cloud_files.dll".to_string(),
+            platform_triple: "x86_64-pc-windows-msvc".to_string(),
+            native_abi_version: 1,
+            interface_version: sinomo_module::SINOMO_MODULE_V1_INTERFACE_VERSION.to_string(),
+            activated_at: sinomo_module::module_loader_applied_at_now(),
+            source: "test".to_string(),
+        };
+        sinomo_module::write_native_dylib_module_loader_state(&root, &state)
+            .expect("write native dylib state");
+        let cache_path = sinomo_module::native_module_cache_path(
+            &root,
+            &state.cache_key,
+            &state.content_hash,
+            &state.library_name,
+        );
+        std::fs::create_dir_all(cache_path.parent().expect("cache path parent"))
+            .expect("cache dir");
+        std::fs::write(&cache_path, b"wrong native module bytes").expect("cache bytes");
+
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let registry = daemon_service_registry(&paths, None, &[]);
+        let host = DaemonServiceRegistryHost::from_registry_for_paths(registry, &paths)
+            .expect("service host");
+        let catalog = host.active_route_snapshot().catalog().clone();
+        assert!(
+            catalog.routes.contains_key(DAEMON_STATUS_ROUTE),
+            "built-in daemon routes should still be available"
+        );
+        assert!(
+            catalog
+                .routes
+                .contains_key(MODULE_NATIVE_DYLIB_CANCEL_ROUTE),
+            "module control routes should still be available"
         );
     }
 
