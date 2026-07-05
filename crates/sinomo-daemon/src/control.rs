@@ -45,6 +45,7 @@ pub const DAEMON_COMMAND_MAX_BYTES: usize =
 pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
 pub const DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 pub const DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
+pub const DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_ROLLOUT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(60);
 pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
     DAEMON_CLUSTER_PUBLISH_INTERVAL;
@@ -616,26 +617,6 @@ async fn run_daemon_background_maintenance_loop(
             continue;
         }
 
-        match cluster_network
-            .tick_async(&paths, &options, runtime.clone())
-            .await
-        {
-            Ok(pending_work) => {
-                if let Some(pending_work) = pending_work {
-                    cluster_network
-                        .run_pending_work_async(pending_work, runtime.clone())
-                        .await;
-                }
-            }
-            Err(error) => {
-                tracing::warn!("sinomo {label} cluster network tick failed: {error}");
-            }
-        }
-
-        if daemon_shutdown_requested(&shutdown_rx) {
-            break;
-        }
-
         if dfs_maintenance_enabled
             && label == "daemon"
             && !dfs_triggered_maintenance_requested
@@ -706,6 +687,41 @@ async fn run_daemon_background_maintenance_loop(
                 }
             }
             last_dfs_maintenance = std::time::Instant::now();
+        }
+
+        if daemon_shutdown_requested(&shutdown_rx) {
+            break;
+        }
+
+        let cluster_network_phase = async {
+            match cluster_network
+                .tick_async(&paths, &options, runtime.clone())
+                .await
+            {
+                Ok(pending_work) => {
+                    if let Some(pending_work) = pending_work {
+                        cluster_network
+                            .run_pending_work_async(pending_work, runtime.clone())
+                            .await;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("sinomo {label} cluster network tick failed: {error}");
+                }
+            }
+        };
+        if tokio::time::timeout(
+            DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT,
+            cluster_network_phase,
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                "sinomo {label} cluster network maintenance timed out after {}ms",
+                DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT.as_millis()
+            );
+            cluster_network.request_network_environment_refresh(Instant::now());
         }
 
         if daemon_shutdown_requested(&shutdown_rx) {
