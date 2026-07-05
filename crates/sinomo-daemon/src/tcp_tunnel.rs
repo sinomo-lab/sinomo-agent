@@ -324,22 +324,27 @@ async fn maintain_tcp_tunnels_once(
     let state = read_cluster_state_without_kv(&cluster_paths).map_err(DaemonError::from)?;
     let endpoints = sinomo_core::network::ClusterEndpointSelector::new(&cluster_paths, &state)
         .select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates);
-    let mut attempted = BTreeMap::<NodeId, ClusterEndpointRecord>::new();
-    for endpoint in endpoints {
-        if endpoint.node_id == state.local_node_id
-            || endpoint.transport != ClusterTransportKind::LanTcp
-            || !tcp_tunnel_should_maintain_outbound(&state.local_node_id, &endpoint.node_id)
-            || TCP_TUNNELS.contains(&endpoint.node_id)
-            || attempted.contains_key(&endpoint.node_id)
-        {
+    for endpoint in tcp_tunnel_maintenance_candidate_endpoints(&state.local_node_id, endpoints) {
+        if TCP_TUNNELS.contains(&endpoint.node_id) {
             continue;
         }
-        attempted.insert(endpoint.node_id.clone(), endpoint);
-    }
-    for endpoint in attempted.into_values() {
         let _ = connect_tcp_tunnel_to_endpoint(&endpoint, runtime, Some(paths)).await;
     }
     Ok(())
+}
+
+fn tcp_tunnel_maintenance_candidate_endpoints(
+    local_node_id: &NodeId,
+    endpoints: Vec<ClusterEndpointRecord>,
+) -> Vec<ClusterEndpointRecord> {
+    endpoints
+        .into_iter()
+        .filter(|endpoint| {
+            endpoint.node_id != *local_node_id
+                && endpoint.transport == ClusterTransportKind::LanTcp
+                && tcp_tunnel_should_maintain_outbound(local_node_id, &endpoint.node_id)
+        })
+        .collect()
 }
 
 async fn connect_tcp_tunnel_to_endpoint(
@@ -622,6 +627,7 @@ fn tcp_tunnel_timeout_error(operation: &str, timeout: Duration) -> NetworkError 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_core::{ClusterEndpointPrivacy, ClusterEndpointSource};
 
     fn test_tunnel_handle(
         node_name: &str,
@@ -638,6 +644,25 @@ mod tests {
 
     fn test_rpc_request() -> ObjectRpcRequest {
         ObjectRpcRequest::encode_body("/test/tcp-tunnel", "test", &()).expect("test request")
+    }
+
+    fn test_endpoint(
+        endpoint_name: &str,
+        node_id: &NodeId,
+        address: &str,
+        transport: ClusterTransportKind,
+    ) -> ClusterEndpointRecord {
+        ClusterEndpointRecord {
+            endpoint_id: sinomo_core::network::ClusterEndpointId::from_legacy_named(endpoint_name)
+                .expect("endpoint id"),
+            node_id: node_id.clone(),
+            transport,
+            address: address.to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 10,
+            last_observed_latency_ms: None,
+        }
     }
 
     #[tokio::test]
@@ -712,6 +737,51 @@ mod tests {
 
         assert!(tcp_tunnel_should_maintain_outbound(&first, &second));
         assert!(!tcp_tunnel_should_maintain_outbound(&second, &first));
+    }
+
+    #[test]
+    fn tcp_tunnel_maintenance_keeps_all_peer_endpoints_until_connected() {
+        let low =
+            NodeId::from_legacy_named("tcp_tunnel_maintenance_multi_low").expect("low node id");
+        let high =
+            NodeId::from_legacy_named("tcp_tunnel_maintenance_multi_high").expect("high node id");
+        let (local, peer) = if low < high { (low, high) } else { (high, low) };
+        let endpoints = vec![
+            test_endpoint(
+                "tcp_tunnel_maintenance_dead_private",
+                &peer,
+                "10.0.0.41:21353",
+                ClusterTransportKind::LanTcp,
+            ),
+            test_endpoint(
+                "tcp_tunnel_maintenance_public",
+                &peer,
+                "129.146.106.76:21353",
+                ClusterTransportKind::LanTcp,
+            ),
+            test_endpoint(
+                "tcp_tunnel_maintenance_loopback",
+                &peer,
+                "127.0.0.1:21353",
+                ClusterTransportKind::Loopback,
+            ),
+            test_endpoint(
+                "tcp_tunnel_maintenance_self",
+                &local,
+                "10.14.1.11:21353",
+                ClusterTransportKind::LanTcp,
+            ),
+        ];
+
+        let candidates = tcp_tunnel_maintenance_candidate_endpoints(&local, endpoints);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|endpoint| endpoint.address.as_str())
+                .collect::<Vec<_>>(),
+            vec!["10.0.0.41:21353", "129.146.106.76:21353"]
+        );
     }
 
     #[test]
