@@ -2173,8 +2173,15 @@ where
                 let endpoints_left = route_endpoint_count.saturating_sub(endpoint_index).max(1);
                 let endpoint_attempt_budget =
                     cluster_target_endpoint_attempt_budget(remaining, endpoints_left);
-                let hop_timeouts =
-                    cluster_relay_hop_transport_timeouts(options.timeouts, endpoint_attempt_budget);
+                let hop_timeouts = if final_hop {
+                    cluster_target_final_hop_transport_timeouts(
+                        options.timeouts,
+                        endpoint_attempt_budget,
+                        remaining,
+                    )
+                } else {
+                    cluster_relay_hop_transport_timeouts(options.timeouts, endpoint_attempt_budget)
+                };
                 let (outer_build_us, outer_sign_us, send_us, response) = if final_hop {
                     let send_started_at = Instant::now();
                     let response = self
@@ -2502,6 +2509,27 @@ fn cluster_relay_hop_transport_timeouts(
         return shaped;
     };
     shaped.with_idle_timeout(Some(idle_timeout.min(CLUSTER_RELAY_MIN_RESPONSE_BUDGET)))
+}
+
+fn cluster_target_final_hop_transport_timeouts(
+    timeouts: DaemonRpcTimeouts,
+    connect_budget: Option<Duration>,
+    remaining_route_budget: Option<Duration>,
+) -> DaemonRpcTimeouts {
+    let connect_timeout = match (timeouts.connect_timeout, connect_budget) {
+        (Some(connect_timeout), Some(remaining)) => Some(connect_timeout.min(remaining)),
+        (Some(connect_timeout), None) => Some(connect_timeout),
+        (None, Some(remaining)) => Some(remaining),
+        (None, None) => None,
+    };
+    let idle_timeout = match (timeouts.idle_timeout, remaining_route_budget) {
+        (Some(idle_timeout), Some(remaining)) => Some(idle_timeout.min(remaining)),
+        (Some(idle_timeout), None) => Some(idle_timeout),
+        (None, _) => None,
+    };
+    timeouts
+        .with_connect_timeout(connect_timeout)
+        .with_idle_timeout(idle_timeout)
 }
 
 fn cluster_target_endpoint_attempt_budget(
@@ -3640,6 +3668,28 @@ mod tests {
                 ObjectRpcResponse::encode_body("/test/relay-target", &"ok")
             })
         }
+    }
+
+    #[test]
+    fn cluster_target_final_hop_transport_timeouts_keep_response_budget() {
+        let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(15));
+        let shaped = cluster_target_final_hop_transport_timeouts(
+            base,
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(12)),
+        );
+
+        assert_eq!(shaped.connect_timeout, Some(Duration::from_secs(2)));
+        assert_eq!(shaped.idle_timeout, Some(Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn cluster_relay_hop_transport_timeouts_cap_response_budget() {
+        let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(15));
+        let shaped = cluster_relay_hop_transport_timeouts(base, Some(Duration::from_secs(12)));
+
+        assert_eq!(shaped.connect_timeout, Some(Duration::from_secs(12)));
+        assert_eq!(shaped.idle_timeout, Some(CLUSTER_RELAY_MIN_RESPONSE_BUDGET));
     }
 
     fn route_test_connectivity_record(

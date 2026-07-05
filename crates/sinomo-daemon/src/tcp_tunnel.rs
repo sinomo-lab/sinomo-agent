@@ -266,11 +266,11 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
             Ok(response) => Some(Ok(response)),
             Err(error) => {
                 tracing::debug!(
-                    "tcp tunnel send to {} ({}) failed, falling back to direct endpoint rpc: {error}",
+                    "tcp tunnel send to {} ({}) failed after request acceptance: {error}",
                     endpoint.node_id,
                     endpoint.address
                 );
-                None
+                Some(Err(error))
             }
         };
     }
@@ -279,11 +279,11 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
             Ok(response) => Some(Ok(response)),
             Err(error) => {
                 tracing::debug!(
-                    "tcp tunnel send to {} ({}) failed after open, falling back to direct endpoint rpc: {error}",
+                    "tcp tunnel send to {} ({}) failed after tunnel open: {error}",
                     endpoint.node_id,
                     endpoint.address
                 );
-                None
+                Some(Err(error))
             }
         },
         Err(error) => {
@@ -724,6 +724,37 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+        assert!(TCP_TUNNELS.get(&node_id).is_none());
+        assert!(handle.pending.lock().await.is_empty());
+        assert!(handle.clean_shutdown.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_existing_request_failure_is_route_error() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let node_name = "tcp_tunnel_route_error_on_existing_failure";
+        let node_id = NodeId::from_legacy_named(node_name).expect("test node id");
+        let handle = test_tunnel_handle(node_name, tx);
+        TCP_TUNNELS.insert(handle.clone());
+        let endpoint = test_endpoint(
+            "tcp_tunnel_route_error_endpoint",
+            &node_id,
+            "10.0.0.2:21353",
+            ClusterTransportKind::LanTcp,
+        );
+
+        let result = send_signed_endpoint_rpc_via_tcp_tunnel(
+            &endpoint,
+            b"auth",
+            &test_rpc_request(),
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(5)),
+            &tokio::runtime::Handle::current(),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Some(Err(_))));
         assert!(TCP_TUNNELS.get(&node_id).is_none());
         assert!(handle.pending.lock().await.is_empty());
         assert!(handle.clean_shutdown.load(Ordering::Relaxed));
