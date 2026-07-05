@@ -122,6 +122,7 @@ impl Drop for DaemonDfsSmokeInFlightGuard {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DaemonDfsPendingMaintenanceWork {
+    pub pending_write_count: usize,
     pub pending_repair_count: usize,
     pub pending_namespace_job_count: usize,
 }
@@ -129,13 +130,16 @@ pub(crate) struct DaemonDfsPendingMaintenanceWork {
 impl DaemonDfsPendingMaintenanceWork {
     #[cfg(test)]
     pub(crate) fn has_work(self) -> bool {
-        self.pending_repair_count > 0 || self.pending_namespace_job_count > 0
+        self.pending_write_count > 0
+            || self.pending_repair_count > 0
+            || self.pending_namespace_job_count > 0
     }
 
     pub(crate) fn should_trigger_background_maintenance(self) -> bool {
         // Pending repairs can represent unreachable replicas and are expensive to
-        // rescan. Namespace jobs are local durable work and should keep waking.
-        self.pending_namespace_job_count > 0
+        // rescan. Pending writes and namespace jobs are local durable work that
+        // maintenance can usually advance or reconcile cheaply.
+        self.pending_write_count > 0 || self.pending_namespace_job_count > 0
     }
 }
 
@@ -523,6 +527,7 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
     let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
     let summary = metadata.metadata_summary()?;
     Ok(DaemonDfsPendingMaintenanceWork {
+        pending_write_count: summary.pending_write_count,
         pending_repair_count: summary.pending_repair_count,
         pending_namespace_job_count: summary.pending_namespace_job_count,
     })
@@ -1552,6 +1557,7 @@ mod tests {
             .expect("status before maintenance");
         assert_eq!(status.pending_namespace_job_count, 1);
         let pending = daemon_dfs_pending_maintenance_work(&paths).expect("pending maintenance");
+        assert_eq!(pending.pending_write_count, 0);
         assert_eq!(pending.pending_namespace_job_count, 1);
         assert_eq!(pending.pending_repair_count, 0);
         assert!(pending.has_work());
@@ -1599,12 +1605,25 @@ mod tests {
     #[test]
     fn daemon_dfs_pending_repair_backlog_does_not_force_triggered_loop() {
         let pending = DaemonDfsPendingMaintenanceWork {
+            pending_write_count: 0,
             pending_repair_count: 8,
             pending_namespace_job_count: 0,
         };
 
         assert!(pending.has_work());
         assert!(!pending.should_trigger_background_maintenance());
+    }
+
+    #[test]
+    fn daemon_dfs_pending_writes_force_triggered_loop() {
+        let pending = DaemonDfsPendingMaintenanceWork {
+            pending_write_count: 8,
+            pending_repair_count: 0,
+            pending_namespace_job_count: 0,
+        };
+
+        assert!(pending.has_work());
+        assert!(pending.should_trigger_background_maintenance());
     }
 
     #[test]
