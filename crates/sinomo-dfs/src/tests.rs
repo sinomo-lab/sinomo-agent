@@ -4932,7 +4932,7 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
     assert_eq!(report.pending_repair_count, 0);
     assert_eq!(report.attempts.len(), 1);
     assert!(report.attempts[0].committed);
-    assert!(report.path.starts_with("/services/dfs-smoke/24680-"));
+    assert!(report.path.starts_with("/dfs-smoke/24680-"));
     let sent = sent.lock().expect("sent lock");
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].0, replica.to_string());
@@ -5177,7 +5177,7 @@ fn default_cluster_smoke_bootstraps_dfs_before_running_smoke() {
 
     assert_eq!(report.requested_replica_node_ids, vec![local.clone()]);
     assert_eq!(report.committed_replica_node_ids, vec![local.clone()]);
-    assert!(report.path.starts_with("/services/dfs-smoke/13579-"));
+    assert!(report.path.starts_with("/dfs-smoke/13579-"));
     assert!(
         !sinomo_core::kv::read_cluster_kv_prefix_entries(
             &cluster_paths.kv_paths(),
@@ -5381,7 +5381,7 @@ fn smoke_driver_commits_local_candidate_and_publishes_metadata() {
     assert_eq!(report.pending_repair_count, 0);
     assert_eq!(report.attempts.len(), 1);
     assert!(report.attempts[0].committed);
-    assert!(report.path.starts_with("/services/dfs-smoke/12345-"));
+    assert!(report.path.starts_with("/dfs-smoke/12345-"));
     assert_eq!(publisher_host.opened_shards, vec![shard_id.clone()]);
     assert_eq!(
         publisher_host.cursor_requests,

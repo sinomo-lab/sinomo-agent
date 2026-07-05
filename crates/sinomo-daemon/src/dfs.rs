@@ -3758,7 +3758,7 @@ mod tests {
             report.attempts[0].replica_node_ids,
             report.requested_replica_node_ids
         );
-        assert!(report.path.starts_with("/services/dfs-smoke/"));
+        assert!(report.path.starts_with("/dfs-smoke/"));
         assert!(
             !report
                 .metadata_replication

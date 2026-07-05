@@ -15,12 +15,13 @@ use crate::{
     DfsControlPlaneKvClient, DfsError, DfsFileSystemId, DfsMessageSender,
     DfsMetadataEndpointTransport, DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
-    DfsMetadataJournalReplicationTransport, DfsMetadataShardConfig,
+    DfsMetadataJournalReplicationTransport, DfsMetadataShardAssignment, DfsMetadataShardConfig,
     DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement, DfsObjectId, DfsPosixError, DfsVersion,
     DfsWriteOptions, LocalDfsMetadataJournalPublisherHost, NetworkedDfsService,
-    NetworkedDfsServiceEvent, cluster_dfs_data_endpoints, cluster_dfs_metadata_shards,
-    content_services_prefix, distributed_sifs, inspect_cluster_aware_dfs_status,
-    open_cluster_dfs_service_with_message_sender, publish_dfs_metadata_journal_with_host,
+    NetworkedDfsServiceEvent, SIFS_SERVICES_PATH, SIFS_USERS_PATH, cluster_dfs_data_endpoints,
+    cluster_dfs_metadata_shards, content_services_prefix, distributed_sifs,
+    inspect_cluster_aware_dfs_status, open_cluster_dfs_service_with_message_sender,
+    publish_dfs_metadata_journal_with_host,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -229,11 +230,12 @@ pub fn run_dfs_smoke_with_host<T: DfsMessageTransport>(
 ) -> Result<DfsSmokeReport, DfsError> {
     let replica_candidate_sets =
         dfs_smoke_replica_candidate_sets(local_node_id, content_node_ids, routable_node_ids);
+    let smoke_directory = dfs_smoke_directory(local_node_id, &metadata_shards);
     service
         .bootstrap_distributed_sifs()
         .map_err(dfs_posix_error)?;
     service
-        .posix_mkdir_all("/services/dfs-smoke")
+        .posix_mkdir_all(&smoke_directory)
         .map_err(dfs_posix_error)?;
 
     let nonce = options
@@ -247,7 +249,7 @@ pub fn run_dfs_smoke_with_host<T: DfsMessageTransport>(
             .map(|node_id| node_id.to_string())
             .collect::<Vec<_>>()
             .join("-");
-        let path = format!("/services/dfs-smoke/{nonce}-{target_label}.txt");
+        let path = format!("{smoke_directory}/{nonce}-{target_label}.txt");
         let body = format!("sinomo dfs smoke {nonce} {target_label}\n");
         match service
             .posix_write_file(
@@ -327,6 +329,34 @@ pub fn run_dfs_smoke_with_host<T: DfsMessageTransport>(
         metadata_replication,
         attempts,
     })
+}
+
+fn dfs_smoke_directory(
+    local_node_id: &NodeId,
+    metadata_shards: &[DfsMetadataShardConfig],
+) -> String {
+    metadata_shards
+        .iter()
+        .filter(|shard| shard.primary_node_id == *local_node_id)
+        .filter_map(|shard| dfs_smoke_directory_for_assignment(&shard.assignment))
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, directory)| directory)
+        .unwrap_or_else(|| format!("{SIFS_SERVICES_PATH}/dfs-smoke"))
+}
+
+fn dfs_smoke_directory_for_assignment(
+    assignment: &DfsMetadataShardAssignment,
+) -> Option<(u8, String)> {
+    match assignment {
+        DfsMetadataShardAssignment::Root => Some((0, "/dfs-smoke".to_string())),
+        DfsMetadataShardAssignment::PathPrefix { prefix } if prefix == SIFS_USERS_PATH => {
+            Some((1, format!("{SIFS_USERS_PATH}/dfs-smoke")))
+        }
+        DfsMetadataShardAssignment::PathPrefix { prefix } if prefix == SIFS_SERVICES_PATH => {
+            Some((2, format!("{SIFS_SERVICES_PATH}/dfs-smoke")))
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn dfs_smoke_replica_candidate_sets(
