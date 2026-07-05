@@ -57,6 +57,7 @@ const SHADOW_RUNTIME_TASK_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const SHADOW_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const PENDING_MAIN_ACTIVATION_FORCE_TERMINATE_AFTER: Duration = Duration::from_secs(10);
 const PENDING_MAIN_ACTIVATION_TERMINATE_WAIT: Duration = Duration::from_secs(5);
+const ROLLOUT_DAEMON_TERMINATE_WAIT: Duration = Duration::from_secs(5);
 
 #[allow(clippy::too_many_arguments)]
 fn write_cluster_rollout_progress(
@@ -1293,7 +1294,7 @@ fn terminate_pending_main_activation(
         Ok(status) if status_is_main_daemon(&status) => status,
         _ => return Ok(None),
     };
-    terminate_process_for_pending_main_activation(status.pid)?;
+    terminate_process_for_rollout_stop(status.pid)?;
     let deadline = Instant::now() + wait_timeout;
     while Instant::now() < deadline {
         if matches!(
@@ -1315,7 +1316,7 @@ fn status_is_main_daemon(status: &DaemonStatus) -> bool {
 }
 
 #[cfg(unix)]
-fn terminate_process_for_pending_main_activation(pid: u32) -> Result<(), DaemonError> {
+fn terminate_process_for_rollout_stop(pid: u32) -> Result<(), DaemonError> {
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
@@ -1331,7 +1332,7 @@ fn terminate_process_for_pending_main_activation(pid: u32) -> Result<(), DaemonE
 }
 
 #[cfg(windows)]
-fn terminate_process_for_pending_main_activation(pid: u32) -> Result<(), DaemonError> {
+fn terminate_process_for_rollout_stop(pid: u32) -> Result<(), DaemonError> {
     let output = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .output()
@@ -1351,7 +1352,7 @@ fn terminate_process_for_pending_main_activation(pid: u32) -> Result<(), DaemonE
 }
 
 #[cfg(not(any(unix, windows)))]
-fn terminate_process_for_pending_main_activation(_pid: u32) -> Result<(), DaemonError> {
+fn terminate_process_for_rollout_stop(_pid: u32) -> Result<(), DaemonError> {
     Ok(())
 }
 
@@ -2318,9 +2319,11 @@ fn stop_daemon_for_rollout(
 ) -> Result<(), DaemonError> {
     let deadline = Instant::now() + timeout;
     let mut next_shutdown_nudge = Instant::now();
+    let mut last_status: Option<DaemonStatus> = None;
     loop {
         match probe_daemon_status(daemon_paths, probe_timeout) {
             DaemonProbeStatus::Running(status) => {
+                last_status = Some(status.clone());
                 if Instant::now() >= next_shutdown_nudge {
                     let _ = send_daemon_shutdown_request(&status.address, probe_timeout);
                     next_shutdown_nudge = Instant::now() + Duration::from_secs(1);
@@ -2329,6 +2332,7 @@ fn stop_daemon_for_rollout(
             DaemonProbeStatus::Locked {
                 status: Some(status),
             } => {
+                last_status = Some(status.clone());
                 if Instant::now() >= next_shutdown_nudge {
                     let _ = send_daemon_shutdown_request(&status.address, probe_timeout);
                     next_shutdown_nudge = Instant::now() + Duration::from_secs(1);
@@ -2346,6 +2350,28 @@ fn stop_daemon_for_rollout(
             }
         }
         if Instant::now() >= deadline {
+            if let Some(status) = last_status.as_ref() {
+                tracing::warn!(
+                    "sinomo rollout terminating unresponsive {label} pid {} after {}ms graceful stop window",
+                    status.pid,
+                    timeout.as_millis()
+                );
+                terminate_process_for_rollout_stop(status.pid)?;
+                let terminate_deadline = Instant::now() + ROLLOUT_DAEMON_TERMINATE_WAIT;
+                while Instant::now() < terminate_deadline {
+                    match probe_daemon_status(daemon_paths, probe_timeout) {
+                        DaemonProbeStatus::Running(_)
+                        | DaemonProbeStatus::Locked { status: Some(_) } => {}
+                        DaemonProbeStatus::Locked { status: None }
+                        | DaemonProbeStatus::NotRunning => {
+                            if daemon_control_port_released(host, port) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
             return Err(DaemonError::Network {
                 address: daemon_connect_address(host, port),
                 detail: format!("{label} did not release control listener for rollout"),
@@ -3659,6 +3685,13 @@ mod tests {
         assert!(!pending_main_activation_ready_for_shutdown(&rollout_paths));
         std::thread::sleep(MAIN_ACTIVATION_SHUTDOWN_GRACE + Duration::from_millis(100));
         assert!(pending_main_activation_ready_for_shutdown(&rollout_paths));
+    }
+
+    #[test]
+    fn rollout_stop_force_termination_wait_is_bounded() {
+        assert!(PENDING_MAIN_ACTIVATION_FORCE_TERMINATE_AFTER <= Duration::from_secs(10));
+        assert!(PENDING_MAIN_ACTIVATION_TERMINATE_WAIT <= Duration::from_secs(5));
+        assert!(ROLLOUT_DAEMON_TERMINATE_WAIT <= Duration::from_secs(5));
     }
 
     #[test]
