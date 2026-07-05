@@ -5,7 +5,9 @@
 
 use serde::Serialize;
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::ClusterPaths;
+use sinomo_core::network::{
+    ClusterConnectivityGraph, ClusterPaths, cluster_healthy_route_next_hop,
+};
 use sinomo_core::node::NodeId;
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
@@ -52,6 +54,15 @@ pub struct DfsDefaultClusterBootstrapReport {
 }
 
 pub trait DfsDefaultClusterBootstrapHost {
+    fn metadata_service_node_ids(
+        &self,
+        state: &ClusterBootstrapState,
+        service_node_ids: Vec<NodeId>,
+    ) -> Vec<NodeId> {
+        let _ = state;
+        service_node_ids
+    }
+
     fn current_metadata_shard(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -99,6 +110,15 @@ pub type DfsDefaultClusterBootstrapFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, DfsError>> + Send + 'a>>;
 
 pub trait DfsDefaultClusterAsyncBootstrapHost: Send {
+    fn metadata_service_node_ids(
+        &self,
+        state: &ClusterBootstrapState,
+        service_node_ids: Vec<NodeId>,
+    ) -> Vec<NodeId> {
+        let _ = state;
+        service_node_ids
+    }
+
     fn current_metadata_shard_async<'a>(
         &'a mut self,
         file_system_id: DfsFileSystemId,
@@ -230,6 +250,14 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
 }
 
 impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHost {
+    fn metadata_service_node_ids(
+        &self,
+        state: &ClusterBootstrapState,
+        service_node_ids: Vec<NodeId>,
+    ) -> Vec<NodeId> {
+        active_metadata_service_node_ids(&self.cluster_paths, state, service_node_ids)
+    }
+
     fn current_metadata_shard(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -251,7 +279,22 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
         current: &DfsMetadataShardConfig,
         target_primary_node_id: &NodeId,
     ) -> Result<bool, DfsError> {
-        metadata_shard_primary_transfer_ready_from_local_backend(
+        if metadata_shard_primary_transfer_ready_from_local_backend(
+            &self.data_dir,
+            &self.local_node_id,
+            current,
+            target_primary_node_id,
+        )? {
+            return Ok(true);
+        }
+        if !metadata_shard_primary_route_unhealthy(
+            &self.cluster_paths,
+            &self.local_node_id,
+            &current.primary_node_id,
+        ) {
+            return Ok(false);
+        }
+        metadata_shard_local_replica_failover_ready_from_local_backend(
             &self.data_dir,
             &self.local_node_id,
             current,
@@ -331,6 +374,14 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
 }
 
 impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncBootstrapHost {
+    fn metadata_service_node_ids(
+        &self,
+        state: &ClusterBootstrapState,
+        service_node_ids: Vec<NodeId>,
+    ) -> Vec<NodeId> {
+        active_metadata_service_node_ids(&self.cluster_paths, state, service_node_ids)
+    }
+
     fn current_metadata_shard_async<'a>(
         &'a mut self,
         file_system_id: DfsFileSystemId,
@@ -356,7 +407,22 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
         target_primary_node_id: NodeId,
     ) -> DfsDefaultClusterBootstrapFuture<'a, bool> {
         Box::pin(async move {
-            metadata_shard_primary_transfer_ready_from_local_backend(
+            if metadata_shard_primary_transfer_ready_from_local_backend(
+                &self.data_dir,
+                &self.local_node_id,
+                &current,
+                &target_primary_node_id,
+            )? {
+                return Ok(true);
+            }
+            if !metadata_shard_primary_route_unhealthy(
+                &self.cluster_paths,
+                &self.local_node_id,
+                &current.primary_node_id,
+            ) {
+                return Ok(false);
+            }
+            metadata_shard_local_replica_failover_ready_from_local_backend(
                 &self.data_dir,
                 &self.local_node_id,
                 &current,
@@ -485,6 +551,77 @@ pub fn metadata_shard_primary_transfer_ready_from_local_backend(
     let target_replayed_through =
         backend.metadata_replication_cursor(target_primary_node_id, &shard_id)?;
     Ok(target_replayed_through >= journal_last_sequence)
+}
+
+fn metadata_shard_local_replica_failover_ready_from_local_backend(
+    data_dir: &SinomoDataDir,
+    local_node_id: &NodeId,
+    current: &DfsMetadataShardConfig,
+    target_primary_node_id: &NodeId,
+) -> Result<bool, DfsError> {
+    if target_primary_node_id != local_node_id {
+        return Ok(false);
+    }
+    if !current
+        .replica_node_ids
+        .iter()
+        .any(|node_id| node_id == target_primary_node_id)
+    {
+        return Ok(false);
+    }
+    let shard_id = DfsMetadataShardId::new(current.shard_id.clone());
+    let backend = open_local_metadata_shard_backend(data_dir, shard_id.clone())?;
+    Ok(backend
+        .metadata_shard_statuses()?
+        .into_iter()
+        .any(|status| status.shard_id == shard_id))
+}
+
+fn metadata_shard_primary_route_unhealthy(
+    cluster_paths: &ClusterPaths,
+    local_node_id: &NodeId,
+    primary_node_id: &NodeId,
+) -> bool {
+    if primary_node_id == local_node_id {
+        return false;
+    }
+    let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths) else {
+        return false;
+    };
+    let Ok(graph) = ClusterConnectivityGraph::try_read_for_local(cluster_paths, &state) else {
+        return false;
+    };
+    cluster_healthy_route_next_hop(&graph, local_node_id, primary_node_id).is_none()
+}
+
+fn active_metadata_service_node_ids(
+    cluster_paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    mut service_node_ids: Vec<NodeId>,
+) -> Vec<NodeId> {
+    if service_node_ids.len() <= 1 {
+        return service_node_ids;
+    }
+    let Ok(graph) = ClusterConnectivityGraph::try_read_for_local(cluster_paths, state) else {
+        return service_node_ids;
+    };
+    let mut active = service_node_ids
+        .iter()
+        .filter(|node_id| {
+            **node_id == state.local_node_id
+                || cluster_healthy_route_next_hop(&graph, &state.local_node_id, node_id).is_some()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    active.sort();
+    active.dedup();
+    if active.is_empty() {
+        service_node_ids.sort();
+        service_node_ids.dedup();
+        service_node_ids
+    } else {
+        active
+    }
 }
 
 pub fn ensure_default_distributed_dfs_with_host(
@@ -849,7 +986,8 @@ pub fn default_cluster_metadata_shard_with_host(
     assignment: DfsMetadataShardAssignment,
     primary_offset: usize,
 ) -> Result<DfsMetadataShardConfig, DfsError> {
-    let service_node_ids = stable_dfs_service_node_ids(state);
+    let service_node_ids =
+        host.metadata_service_node_ids(state, stable_dfs_service_node_ids(state));
     let bootstrap_primary_node_id = default_cluster_sifs_owner(state);
     let target_primary_node_id = default_metadata_shard_primary_node_id(
         &service_node_ids,
@@ -901,7 +1039,8 @@ pub async fn default_cluster_metadata_shard_with_async_host(
     assignment: DfsMetadataShardAssignment,
     primary_offset: usize,
 ) -> Result<DfsMetadataShardConfig, DfsError> {
-    let service_node_ids = stable_dfs_service_node_ids(state);
+    let service_node_ids =
+        host.metadata_service_node_ids(state, stable_dfs_service_node_ids(state));
     let bootstrap_primary_node_id = default_cluster_sifs_owner(state);
     let target_primary_node_id = default_metadata_shard_primary_node_id(
         &service_node_ids,
