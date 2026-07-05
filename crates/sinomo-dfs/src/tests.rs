@@ -4930,6 +4930,8 @@ fn dfs_smoke_routable_nodes_follow_routes_and_skip_unreachable() {
     let local = NodeId::from_legacy_named("node_dfs_smoke_routable_local").expect("local node");
     let bridge = NodeId::from_legacy_named("node_dfs_smoke_routable_bridge").expect("bridge node");
     let target = NodeId::from_legacy_named("node_dfs_smoke_routable_target").expect("target node");
+    let degraded =
+        NodeId::from_legacy_named("node_dfs_smoke_routable_degraded").expect("degraded node");
     let stale = NodeId::from_legacy_named("node_dfs_smoke_routable_stale").expect("stale node");
     let now = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2);
     let local_state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -4950,6 +4952,7 @@ fn dfs_smoke_routable_nodes_follow_routes_and_skip_unreachable() {
     );
     let bridge_endpoint = test_endpoint(&bridge, "10.78.0.2:21353");
     let target_endpoint = test_endpoint(&target, "10.78.0.3:21353");
+    let degraded_endpoint = test_endpoint(&degraded, "10.78.0.5:21353");
     let stale_endpoint = test_endpoint(&stale, "10.78.0.4:21353");
     let graph = sinomo_core::network::ClusterConnectivityGraph::from_records(
         local.clone(),
@@ -4987,6 +4990,17 @@ fn dfs_smoke_routable_nodes_follow_routes_and_skip_unreachable() {
                 now,
                 60,
             ),
+            sinomo_core::network::cluster_connectivity_record(
+                &bridge_state,
+                &degraded_endpoint,
+                sinomo_core::network::ClusterConnectivityState::Degraded,
+                Some(5),
+                2,
+                Some("1970-01-01T02:00:00Z".to_string()),
+                Some("1970-01-01T02:00:00Z".to_string()),
+                now,
+                60,
+            ),
         ],
     );
 
@@ -4995,6 +5009,7 @@ fn dfs_smoke_routable_nodes_follow_routes_and_skip_unreachable() {
         &[
             stale_endpoint,
             target_endpoint.clone(),
+            degraded_endpoint,
             bridge_endpoint.clone(),
             target_endpoint,
         ],

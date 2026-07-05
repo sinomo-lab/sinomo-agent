@@ -171,6 +171,7 @@ pub use object_file_store::{
     read_object_file, read_optional_object_file, write_object_file,
     write_object_file_with_semantic_skip,
 };
+pub use route::cluster_healthy_route_next_hop;
 pub use route::cluster_route_next_hop;
 pub use route::invalidate_cluster_delivery_routing_table_cache;
 pub use route_graph_read_model::invalidate_cluster_route_graph_cache;

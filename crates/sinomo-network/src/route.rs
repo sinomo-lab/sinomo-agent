@@ -254,7 +254,7 @@ pub fn cluster_route_next_hop(
         .flatten()
 }
 
-pub(crate) fn cluster_healthy_route_next_hop(
+pub fn cluster_healthy_route_next_hop(
     graph: &ClusterConnectivityGraph,
     local: &NodeId,
     target: &NodeId,

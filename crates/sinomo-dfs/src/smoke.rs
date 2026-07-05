@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::{ClusterConnectivityGraph, ClusterPaths, cluster_route_next_hop};
+use sinomo_core::network::{
+    ClusterConnectivityGraph, ClusterPaths, cluster_healthy_route_next_hop,
+};
 use sinomo_core::node::NodeId;
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord};
 use std::collections::BTreeSet;
@@ -377,7 +379,7 @@ pub(crate) fn dfs_smoke_routable_node_ids_with_graph(
     for endpoint in endpoints {
         if endpoint.node_id == *local_node_id
             || !seen_remote_candidates.insert(endpoint.node_id.clone())
-            || cluster_route_next_hop(graph, local_node_id, &endpoint.node_id).is_none()
+            || cluster_healthy_route_next_hop(graph, local_node_id, &endpoint.node_id).is_none()
         {
             continue;
         }
