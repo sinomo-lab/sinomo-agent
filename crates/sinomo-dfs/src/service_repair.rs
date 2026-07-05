@@ -1159,19 +1159,50 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_scheduled: usize,
         repair_attempts: &[DfsRepairAttemptRecord],
     ) -> Result<Vec<DistributedRepairJob>, DfsError> {
+        self.retry_pending_repairs_scoped_bounded_with_attempts(
+            max_scheduled,
+            repair_attempts,
+            None,
+        )
+    }
+
+    pub(crate) fn retry_pending_repairs_for_intents_bounded(
+        &mut self,
+        intent_ids: &BTreeSet<String>,
+        max_scheduled: usize,
+    ) -> Result<Vec<DistributedRepairJob>, DfsError> {
+        self.retry_pending_repairs_scoped_bounded_with_attempts(
+            max_scheduled,
+            &[],
+            Some(intent_ids),
+        )
+    }
+
+    fn retry_pending_repairs_scoped_bounded_with_attempts(
+        &mut self,
+        max_scheduled: usize,
+        repair_attempts: &[DfsRepairAttemptRecord],
+        intent_filter: Option<&BTreeSet<String>>,
+    ) -> Result<Vec<DistributedRepairJob>, DfsError> {
         self.prune_idle_chunk_transfers();
         self.restore_pending_writes_for_repair_jobs()?;
         self.restore_repair_attempt_records(repair_attempts);
-        if self.pending_writes.is_empty() || max_scheduled == 0 {
+        if self.pending_writes.is_empty()
+            || max_scheduled == 0
+            || intent_filter.is_some_and(BTreeSet::is_empty)
+        {
             return Ok(Vec::new());
         }
         self.repair_retry_tick = self.repair_retry_tick.saturating_add(1);
         self.expire_stale_fetch_requests();
-        self.retry_pending_stages()?;
+        self.retry_pending_stages_scoped(intent_filter)?;
         let repair_jobs = self.coordinator.repair_jobs().to_vec();
         let mut scheduled = Vec::new();
 
         for job in repair_jobs {
+            if intent_filter.is_some_and(|intent_ids| !intent_ids.contains(&job.intent_id)) {
+                continue;
+            }
             let Some(pending) = self.pending_writes.get(&job.intent_id).cloned() else {
                 continue;
             };
@@ -1313,9 +1344,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.remove_pending_write_state(intent_id);
     }
 
-    fn retry_pending_stages(&mut self) -> Result<(), DfsError> {
+    fn retry_pending_stages_scoped(
+        &mut self,
+        intent_filter: Option<&BTreeSet<String>>,
+    ) -> Result<(), DfsError> {
         let pending_intent_ids = self.pending_writes.keys().cloned().collect::<Vec<_>>();
         for intent_id in pending_intent_ids {
+            if intent_filter.is_some_and(|intent_ids| !intent_ids.contains(&intent_id)) {
+                continue;
+            }
             let Some(intent) = self.coordinator.intent(&intent_id).cloned() else {
                 continue;
             };

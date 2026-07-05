@@ -3127,6 +3127,149 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
 }
 
 #[test]
+fn served_foreground_write_retries_only_current_request_repairs() {
+    let root = temp_root("served-foreground-write-scopes-repair-retries");
+    let requester = NodeId::from_legacy_named("node_served_scoped_requester").expect("requester");
+    let primary = NodeId::from_legacy_named("node_served_scoped_primary").expect("primary");
+    let replica = NodeId::from_legacy_named("node_served_scoped_replica").expect("replica");
+    let backlog_object =
+        DfsObjectId::from_legacy_named("obj_served_scoped_backlog").expect("object");
+    let routed_object = DfsObjectId::from_legacy_named("obj_served_scoped_routed").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_served_scoped_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_served_scoped_2").expect("version");
+    let transfer_objects = Arc::new(Mutex::new(Vec::<DfsObjectId>::new()));
+    let transfer_objects_for_sender = Arc::clone(&transfer_objects);
+    let replica_for_sender = replica.clone();
+    let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
+        assert_eq!(endpoint, &replica_for_sender);
+        match &command.routed_message.message {
+            DfsNetworkMessage::RepairReplica(command) => transfer_objects_for_sender
+                .lock()
+                .expect("transfer objects")
+                .push(command.object_id.clone()),
+            DfsNetworkMessage::RepairReplicaChunk(command) => transfer_objects_for_sender
+                .lock()
+                .expect("transfer objects")
+                .push(command.object_id.clone()),
+            DfsNetworkMessage::StageBlob(command) => transfer_objects_for_sender
+                .lock()
+                .expect("transfer objects")
+                .push(command.object_id.clone()),
+            DfsNetworkMessage::StageBlobChunk(command) => transfer_objects_for_sender
+                .lock()
+                .expect("transfer objects")
+                .push(command.object_id.clone()),
+            _ => {}
+        }
+        Ok(DfsMessageResponse {
+            request_id: command.request_id.clone(),
+            outbound_messages: Vec::new(),
+        })
+    });
+    let transport = DfsEndpointServedMessageTransport::new_with_message_sender(
+        primary.clone(),
+        vec![test_endpoint(&replica, "192.0.2.23:21353")],
+        sender,
+        Duration::from_millis(1),
+    );
+    let content = LocalContentStore::new(root.join("content")).expect("content store");
+    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(transport, content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+
+    let mut backlog_metadata = file_metadata(primary.clone());
+    backlog_metadata.object_id = backlog_object.clone();
+    backlog_metadata.path = "/services/served-frame/scoped-backlog.bin".to_string();
+    backlog_metadata.version = version_1.clone();
+    backlog_metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    backlog_metadata.current_locations = vec![primary.clone()];
+    dfs.add_object_metadata(backlog_metadata)
+        .expect("backlog object metadata");
+    let backlog_write = dfs
+        .write_distributed_eventual_from_reader_with_candidates_and_parent_touch(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: backlog_object.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: primary.clone(),
+            },
+            std::io::Cursor::new(b"unrelated repair backlog bytes".to_vec()),
+            vec![primary.clone(), replica.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+            true,
+            false,
+        )
+        .expect("backlog write");
+    assert!(matches!(
+        backlog_write,
+        NetworkedDfsWriteOutcome::Committed { repair_jobs, .. }
+            if repair_jobs.len() == 1 && repair_jobs[0].missing_replica_node_id == replica
+    ));
+    transfer_objects.lock().expect("transfer objects").clear();
+
+    let mut routed_metadata = file_metadata(primary.clone());
+    routed_metadata.object_id = routed_object.clone();
+    routed_metadata.path = "/services/served-frame/scoped-routed.bin".to_string();
+    routed_metadata.version = version_1.clone();
+    routed_metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    routed_metadata.current_locations = vec![requester.clone()];
+    dfs.add_object_metadata(routed_metadata)
+        .expect("routed object metadata");
+
+    let request_id = "dfs_net_req_served_scoped".to_string();
+    let command = DfsDistributedWriteCommand {
+        request_id: request_id.clone(),
+        request: DfsWriteRequest {
+            file_system_id: sifs_file_system_id(),
+            object_id: routed_object.clone(),
+            target_version: version_2,
+            requesting_node_id: requester.clone(),
+        },
+        expected_base_version: Some(version_1),
+        metadata_journal_after_sequence: None,
+        bytes: b"served scoped foreground bytes".to_vec(),
+        content_hash: None,
+        content_size_bytes: None,
+        desired_replica_nodes: vec![requester.clone(), replica.clone()],
+        policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+        object_metadata: None,
+        touch_parent_on_create: false,
+        foreground_replica_repair: true,
+    };
+    let routed_message = build_dfs_routed_message(
+        &requester,
+        &primary,
+        14,
+        15,
+        DfsNetworkMessage::DistributedWriteRequest(command),
+    );
+
+    dfs.process_message_command(test_dfs_message_command(
+        "dfs_served_scoped_message_rpc",
+        routed_message,
+    ))
+    .expect("process DFS message");
+
+    let transfer_objects = transfer_objects.lock().expect("transfer objects");
+    assert!(
+        transfer_objects
+            .iter()
+            .all(|object_id| object_id != &backlog_object),
+        "foreground served message must not retry unrelated backlog repairs: {transfer_objects:?}"
+    );
+    assert!(
+        transfer_objects
+            .iter()
+            .any(|object_id| object_id == &routed_object),
+        "foreground served message should still advance its own repair/stage work"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn served_message_reports_repair_retry_failure_without_failing_request() {
     let root = temp_root("served-message-repair-retry-best-effort");
     let requester =
@@ -16184,6 +16327,15 @@ fn repair_attempt_restore_preserves_lost_authority_suppression() {
     );
 
     std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn stale_repair_base_rejection_suppresses_retry() {
+    let reason = "stale DFS repair base for obj_stale: expected version_2, current version_1, command version_3";
+    assert!(
+        repair_rejection_indicates_lost_authority(reason),
+        "stale repair-base rejections mean the repair command no longer targets the authoritative visible version"
+    );
 }
 
 #[test]

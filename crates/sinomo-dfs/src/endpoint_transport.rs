@@ -1,6 +1,6 @@
 //! Endpoint-backed DFS data-plane transport and served-message processing.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -35,6 +35,7 @@ use crate::{
 };
 
 pub const DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const DFS_SERVED_MESSAGE_REPAIR_MAX_JOBS: usize = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsPeerTransportError {
@@ -1174,6 +1175,8 @@ impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
         let request_id = command.request_id;
         let allow_write_repair_progress =
             dfs_network_message_allows_write_repair_progress(&command.routed_message.message);
+        let foreground_write_request_id =
+            served_message_foreground_write_request_id(&command.routed_message.message);
         self.transport
             .begin_message(&command.routed_message)
             .map_err(DfsError::from_network)?;
@@ -1218,7 +1221,19 @@ impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
                 events.extend(batch);
             }
             let scheduled = if allow_write_repair_progress {
-                let (scheduled, repair_events) = self.retry_pending_repairs_best_effort();
+                let (scheduled, repair_events) =
+                    if let Some(request_id) = foreground_write_request_id.as_deref() {
+                        let intent_ids =
+                            self.foreground_remote_write_intent_ids_for_request(request_id);
+                        self.retry_pending_repairs_for_intents_best_effort(
+                            &intent_ids,
+                            DFS_SERVED_MESSAGE_REPAIR_MAX_JOBS,
+                        )
+                    } else {
+                        self.retry_pending_repairs_best_effort_bounded(
+                            DFS_SERVED_MESSAGE_REPAIR_MAX_JOBS,
+                        )
+                    };
                 events.extend(repair_events);
                 scheduled
             } else {
@@ -1268,13 +1283,30 @@ impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
         self.last_events = retained_networked_dfs_service_events(&events);
         Ok(events)
     }
+
+    fn foreground_remote_write_intent_ids_for_request(&self, request_id: &str) -> BTreeSet<String> {
+        self.pending_remote_write_responses
+            .iter()
+            .filter(|(_, pending)| {
+                pending.foreground_replica_repair && pending.request_id == request_id
+            })
+            .map(|(intent_id, _)| intent_id.clone())
+            .collect()
+    }
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn retry_pending_repairs_best_effort(
         &mut self,
     ) -> (Vec<DistributedRepairJob>, Vec<NetworkedDfsServiceEvent>) {
-        match self.retry_pending_repairs_bounded(usize::MAX) {
+        self.retry_pending_repairs_best_effort_bounded(usize::MAX)
+    }
+
+    pub(crate) fn retry_pending_repairs_best_effort_bounded(
+        &mut self,
+        max_scheduled: usize,
+    ) -> (Vec<DistributedRepairJob>, Vec<NetworkedDfsServiceEvent>) {
+        match self.retry_pending_repairs_bounded(max_scheduled) {
             Ok(scheduled) => (scheduled, Vec::new()),
             Err(error) => (
                 Vec::new(),
@@ -1283,6 +1315,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }],
             ),
         }
+    }
+
+    pub(crate) fn retry_pending_repairs_for_intents_best_effort(
+        &mut self,
+        intent_ids: &BTreeSet<String>,
+        max_scheduled: usize,
+    ) -> (Vec<DistributedRepairJob>, Vec<NetworkedDfsServiceEvent>) {
+        match self.retry_pending_repairs_for_intents_bounded(intent_ids, max_scheduled) {
+            Ok(scheduled) => (scheduled, Vec::new()),
+            Err(error) => (
+                Vec::new(),
+                vec![NetworkedDfsServiceEvent::RepairRetryFailed {
+                    reason: error.to_string(),
+                }],
+            ),
+        }
+    }
+}
+
+fn served_message_foreground_write_request_id(message: &DfsNetworkMessage) -> Option<String> {
+    match message {
+        DfsNetworkMessage::DistributedWriteRequest(command)
+            if command.foreground_replica_repair =>
+        {
+            Some(command.request_id.clone())
+        }
+        _ => None,
     }
 }
 
