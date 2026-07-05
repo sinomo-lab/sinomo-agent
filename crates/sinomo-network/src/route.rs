@@ -1249,23 +1249,21 @@ fn cluster_delivery_route_graph_with_members(
         {
             continue;
         }
-        let Some(endpoint) =
-            local_connectivity.best_reachable_endpoint(local_node_id, &member.node_id)
-        else {
-            continue;
-        };
-        if !cluster_delivery_local_endpoint_is_usable(local_node_id, &endpoint) {
-            continue;
+        for endpoint in local_connectivity.reachable_endpoints_matching(
+            local_node_id,
+            &member.node_id,
+            |endpoint| cluster_delivery_local_endpoint_is_usable(local_node_id, endpoint),
+        ) {
+            let Some(cost) = cluster_delivery_local_endpoint_cost(
+                &local_connectivity,
+                &endpoint,
+                target_node_id,
+                &local_private_prefixes,
+            ) else {
+                continue;
+            };
+            graph.push_edge_clone(local_node_id, &member.node_id, Some(&endpoint), cost)?;
         }
-        let Some(cost) = cluster_delivery_local_endpoint_cost(
-            &local_connectivity,
-            &endpoint,
-            target_node_id,
-            &local_private_prefixes,
-        ) else {
-            continue;
-        };
-        graph.push_edge_clone(local_node_id, &member.node_id, Some(&endpoint), cost)?;
     }
 
     for record in
@@ -3447,35 +3445,35 @@ fn cluster_relay_planned_target_endpoints(
             try_clone_route_endpoint(endpoint, "cluster relay planned endpoints")?,
         ));
     }
-    if let Some(endpoint) =
-        local_connectivity.best_reachable_endpoint(local_node_id, target_node_id)
+    for endpoint in
+        local_connectivity.reachable_endpoints_matching(local_node_id, target_node_id, |endpoint| {
+            cluster_delivery_local_endpoint_is_usable(local_node_id, endpoint)
+        })
     {
-        if cluster_delivery_local_endpoint_is_usable(local_node_id, &endpoint) {
-            if let Some(cost) = cluster_delivery_local_endpoint_cost(
-                &local_connectivity,
-                &endpoint,
-                target_node_id,
-                &local_private_prefixes,
+        if let Some(cost) = cluster_delivery_local_endpoint_cost(
+            &local_connectivity,
+            &endpoint,
+            target_node_id,
+            &local_private_prefixes,
+        ) {
+            if !candidates.iter().any(
+                |(_, _, _, _, retained): &(u64, u16, u8, String, ClusterEndpointRecord)| {
+                    retained.endpoint_id == endpoint.endpoint_id
+                        && retained.address == endpoint.address
+                },
             ) {
-                if !candidates.iter().any(
-                    |(_, _, _, _, retained): &(u64, u16, u8, String, ClusterEndpointRecord)| {
-                        retained.endpoint_id == endpoint.endpoint_id
-                            && retained.address == endpoint.address
-                    },
-                ) {
-                    crate::object::try_reserve_vec(
-                        &mut candidates,
-                        1,
-                        "cluster relay planned endpoints",
-                    )?;
-                    candidates.push((
-                        cost,
-                        endpoint.priority,
-                        cluster_delivery_transport_sort_rank(&endpoint.transport),
-                        endpoint.address.clone(),
-                        endpoint,
-                    ));
-                }
+                crate::object::try_reserve_vec(
+                    &mut candidates,
+                    1,
+                    "cluster relay planned endpoints",
+                )?;
+                candidates.push((
+                    cost,
+                    endpoint.priority,
+                    cluster_delivery_transport_sort_rank(&endpoint.transport),
+                    endpoint.address.clone(),
+                    endpoint,
+                ));
             }
         }
     }
@@ -3532,33 +3530,35 @@ fn cluster_relay_planned_next_hop_endpoints(
             try_clone_route_endpoint(endpoint, "cluster relay planned endpoints")?,
         ));
     }
-    if let Some(endpoint) = local_connectivity.best_reachable_endpoint(local_node_id, next_hop) {
-        if cluster_delivery_local_endpoint_is_usable(local_node_id, &endpoint) {
-            if let Some(cost) = cluster_delivery_local_endpoint_cost(
-                &local_connectivity,
-                &endpoint,
-                next_hop,
-                &local_private_prefixes,
+    for endpoint in
+        local_connectivity.reachable_endpoints_matching(local_node_id, next_hop, |endpoint| {
+            cluster_delivery_local_endpoint_is_usable(local_node_id, endpoint)
+        })
+    {
+        if let Some(cost) = cluster_delivery_local_endpoint_cost(
+            &local_connectivity,
+            &endpoint,
+            next_hop,
+            &local_private_prefixes,
+        ) {
+            if !candidates.iter().any(
+                |(_, _, _, _, retained): &(u64, u16, u8, String, ClusterEndpointRecord)| {
+                    retained.endpoint_id == endpoint.endpoint_id
+                        && retained.address == endpoint.address
+                },
             ) {
-                if !candidates.iter().any(
-                    |(_, _, _, _, retained): &(u64, u16, u8, String, ClusterEndpointRecord)| {
-                        retained.endpoint_id == endpoint.endpoint_id
-                            && retained.address == endpoint.address
-                    },
-                ) {
-                    crate::object::try_reserve_vec(
-                        &mut candidates,
-                        1,
-                        "cluster relay planned endpoints",
-                    )?;
-                    candidates.push((
-                        cost,
-                        endpoint.priority,
-                        cluster_delivery_transport_sort_rank(&endpoint.transport),
-                        endpoint.address.clone(),
-                        endpoint,
-                    ));
-                }
+                crate::object::try_reserve_vec(
+                    &mut candidates,
+                    1,
+                    "cluster relay planned endpoints",
+                )?;
+                candidates.push((
+                    cost,
+                    endpoint.priority,
+                    cluster_delivery_transport_sort_rank(&endpoint.transport),
+                    endpoint.address.clone(),
+                    endpoint,
+                ));
             }
         }
     }
@@ -3902,6 +3902,115 @@ mod tests {
             planned_relay_endpoints[0].endpoint_id,
             observed_endpoint.endpoint_id
         );
+    }
+
+    #[test]
+    fn route_plan_keeps_all_observed_main_endpoints_when_shadow_is_fastest() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-route-observed-main-endpoints");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_route_observed_main_endpoints")
+            .expect("cluster id");
+        let local_node = NodeId::from_legacy_named("node_route_observed_main_endpoints_local")
+            .expect("local node");
+        let target_node = NodeId::from_legacy_named("node_route_observed_main_endpoints_target")
+            .expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "route observed main endpoints",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut target_member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            target_node.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        state.members.push(target_member);
+
+        let shadow_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "target.example:21354".to_string(),
+            0,
+        );
+        let private_main_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "10.0.0.41:21353".to_string(),
+            0,
+        );
+        let public_main_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "129.146.106.76:21353".to_string(),
+            0,
+        );
+        let records = [
+            crate::connectivity::cluster_connectivity_record(
+                &state,
+                &shadow_endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(1),
+                0,
+                Some(now.to_string()),
+                None,
+                now,
+                60,
+            ),
+            crate::connectivity::cluster_connectivity_record(
+                &state,
+                &private_main_endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(2),
+                0,
+                Some(now.to_string()),
+                None,
+                now,
+                60,
+            ),
+            crate::connectivity::cluster_connectivity_record(
+                &state,
+                &public_main_endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(3),
+                0,
+                Some(now.to_string()),
+                None,
+                now,
+                60,
+            ),
+        ];
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &records,
+        )
+        .expect("write local connectivity");
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local_node,
+            &target_node,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
+
+        assert_eq!(plan.next_hop, target_node);
+        let addresses = plan
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.address.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(addresses, vec!["10.0.0.41:21353", "129.146.106.76:21353"]);
     }
 
     #[test]

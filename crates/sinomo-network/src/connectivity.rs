@@ -1284,6 +1284,34 @@ impl ClusterConnectivityGraph {
             .find(|endpoint| predicate(endpoint))
     }
 
+    pub(crate) fn reachable_endpoints_matching(
+        &self,
+        source: &NodeId,
+        target: &NodeId,
+        mut predicate: impl FnMut(&ClusterEndpointRecord) -> bool,
+    ) -> Vec<ClusterEndpointRecord> {
+        let mut endpoints: Vec<ClusterEndpointRecord> = Vec::new();
+        for endpoint in self
+            .reachable_records_by_pair
+            .get(source, target)
+            .into_iter()
+            .flat_map(|records| records.iter())
+            .filter_map(|(_, _, endpoint_id)| self.records.get(source, target, endpoint_id))
+            .map(cluster_endpoint_record_for_connectivity_record)
+        {
+            if !predicate(&endpoint) {
+                continue;
+            }
+            if endpoints.iter().any(|retained| {
+                retained.endpoint_id == endpoint.endpoint_id && retained.address == endpoint.address
+            }) {
+                continue;
+            }
+            endpoints.push(endpoint);
+        }
+        endpoints
+    }
+
     pub(crate) fn earliest_expires_at(&self) -> Option<OffsetDateTime> {
         self.records.iter().map(|record| record.expires_at).min()
     }
