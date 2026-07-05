@@ -11036,6 +11036,83 @@ mod tests {
     }
 
     #[test]
+    fn connectivity_probe_retries_identity_mismatch_even_with_alternate_route() {
+        let now = OffsetDateTime::now_utc();
+        let due_at =
+            now + time::Duration::seconds(DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL.as_secs() as i64);
+        let refresh_deadline =
+            due_at + time::Duration::seconds(CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS);
+        let cluster_id = ClusterId::from_legacy_named("cluster_daemon_rerouted_identity_probe")
+            .expect("cluster id");
+        let local = NodeId::from_legacy_named("node_daemon_identity_probe_local").expect("local");
+        let bridge =
+            NodeId::from_legacy_named("node_daemon_identity_probe_bridge").expect("bridge");
+        let target =
+            NodeId::from_legacy_named("node_daemon_identity_probe_target").expect("target");
+        let target_endpoint =
+            sinomo_core::network::daemon_lan_endpoint(&target, "10.0.0.67:21353".to_string(), 10);
+        let mut identity_mismatch = doctor_connectivity_record(
+            &cluster_id,
+            &local,
+            &target,
+            "endpoint_daemon_identity_mismatch_direct",
+            &target_endpoint.address,
+            sinomo_core::network::ClusterConnectivityState::Unreachable,
+        );
+        identity_mismatch.observed_at = now;
+        identity_mismatch.expires_at = now + time::Duration::hours(1);
+        identity_mismatch.failure_reason =
+            Some(sinomo_core::network::ClusterConnectivityFailureReason::IdentityMismatch);
+        let local_to_bridge = doctor_connectivity_record(
+            &cluster_id,
+            &local,
+            &bridge,
+            "endpoint_daemon_identity_probe_local_bridge",
+            "10.0.0.68:21353",
+            sinomo_core::network::ClusterConnectivityState::Healthy,
+        );
+        let bridge_to_target = doctor_connectivity_record(
+            &cluster_id,
+            &bridge,
+            &target,
+            "endpoint_daemon_identity_probe_bridge_target",
+            "10.0.0.69:21353",
+            sinomo_core::network::ClusterConnectivityState::Healthy,
+        );
+        let graph = sinomo_core::network::ClusterConnectivityGraph::from_records(
+            local.clone(),
+            vec![identity_mismatch.clone(), local_to_bridge, bridge_to_target],
+        );
+
+        assert!(
+            !sinomo_core::network::cluster_connectivity_probe_due_with_graph(
+                &identity_mismatch,
+                &target_endpoint,
+                now,
+                now + time::Duration::seconds(CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS),
+                &ClusterNodeRole::Workstation,
+                &graph,
+                &local,
+                false,
+            ),
+            "fresh identity mismatches should not churn immediately"
+        );
+        assert!(
+            sinomo_core::network::cluster_connectivity_probe_due_with_graph(
+                &identity_mismatch,
+                &target_endpoint,
+                due_at,
+                refresh_deadline,
+                &ClusterNodeRole::Workstation,
+                &graph,
+                &local,
+                false,
+            ),
+            "identity mismatches are hard route exclusions, so alternate routes must not defer their recovery probe until expiry"
+        );
+    }
+
+    #[test]
     fn connectivity_probe_retries_unreachable_endpoint_without_route() {
         let now = OffsetDateTime::now_utc();
         let due_at =

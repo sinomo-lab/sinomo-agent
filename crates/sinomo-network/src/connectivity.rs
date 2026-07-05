@@ -894,8 +894,11 @@ pub fn cluster_connectivity_probe_due_with_startup_settle(
     local_node_role: &ClusterNodeRole,
     startup_settle_active: bool,
 ) -> bool {
+    let retry_interval = cluster_network_probe_interval_for_role(local_node_role);
+    let retry_seconds = retry_interval.as_secs().min(i64::MAX as u64) as i64;
+    let retry_due = record.observed_at + time::Duration::seconds(retry_seconds) <= now;
     if cluster_connectivity_failure_reason_is_identity_mismatch(record) {
-        return record.expires_at <= refresh_deadline;
+        return startup_settle_active || record.expires_at <= refresh_deadline || retry_due;
     }
     if startup_settle_active && record.state != ClusterConnectivityState::Healthy {
         return true;
@@ -903,9 +906,6 @@ pub fn cluster_connectivity_probe_due_with_startup_settle(
     if record.expires_at <= refresh_deadline {
         return true;
     }
-    let retry_interval = cluster_network_probe_interval_for_role(local_node_role);
-    let retry_seconds = retry_interval.as_secs().min(i64::MAX as u64) as i64;
-    let retry_due = record.observed_at + time::Duration::seconds(retry_seconds) <= now;
     if record.state == ClusterConnectivityState::Unreachable {
         return retry_due;
     }
@@ -954,6 +954,9 @@ pub fn cluster_connectivity_probe_due_with_graph(
         return true;
     }
     if record.state == ClusterConnectivityState::Healthy {
+        return true;
+    }
+    if cluster_connectivity_failure_reason_is_identity_mismatch(record) {
         return true;
     }
     // When the target is already reachable through a currently healthy route graph,
