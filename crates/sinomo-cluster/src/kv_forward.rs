@@ -44,6 +44,16 @@ pub trait ClusterKvTxnForwardHost {
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError>;
 
+    fn call_endpoint_object_rpc(
+        &mut self,
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        self.call_node_object_rpc(state, &endpoint.node_id, request, timeout)
+    }
+
     fn call_node_object_rpc(
         &mut self,
         state: &ClusterBootstrapState,
@@ -90,9 +100,9 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
             ));
             break;
         }
-        match forward_cluster_kv_txn_to_state_authority_node_with_host(
+        match forward_cluster_kv_txn_to_state_authority_endpoint_with_host(
             state,
-            &target.node_id,
+            target,
             txn,
             options.command_timeout(target, remaining),
             host,
@@ -114,9 +124,9 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
     })
 }
 
-fn forward_cluster_kv_txn_to_state_authority_node_with_host(
+fn forward_cluster_kv_txn_to_state_authority_endpoint_with_host(
     state: &ClusterBootstrapState,
-    authority_node_id: &NodeId,
+    endpoint: &ClusterEndpointRecord,
     txn: &KvTxn,
     timeout: Duration,
     host: &mut impl ClusterKvTxnForwardHost,
@@ -128,8 +138,7 @@ fn forward_cluster_kv_txn_to_state_authority_node_with_host(
         txn_payload.category,
         txn_payload.body,
     );
-    let txn_response =
-        host.call_node_object_rpc(state, authority_node_id, &txn_request, timeout)?;
+    let txn_response = host.call_endpoint_object_rpc(state, endpoint, &txn_request, timeout)?;
     txn_response.error_detail()?;
     let txn_response =
         sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body).map_err(kv_err)?;
@@ -143,12 +152,8 @@ fn forward_cluster_kv_txn_to_state_authority_node_with_host(
         snapshot_payload.category,
         snapshot_payload.body,
     );
-    let snapshot_response = host.call_node_object_rpc(
-        state,
-        authority_node_id,
-        &snapshot_request,
-        snapshot_timeout,
-    )?;
+    let snapshot_response =
+        host.call_endpoint_object_rpc(state, endpoint, &snapshot_request, snapshot_timeout)?;
     snapshot_response.error_detail()?;
     let snapshot =
         sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&snapshot_response.body).map_err(kv_err)?;
@@ -203,13 +208,10 @@ where
             ));
             break;
         }
-        match forward_cluster_kv_txn_to_state_authority_node_async_with_host(
-            state,
-            &target.node_id,
+        match forward_cluster_kv_txn_to_state_authority_endpoint_async_with_host(
+            target,
             txn,
             options.command_timeout(target, remaining),
-            runtime,
-            paths,
             host,
         )
         .await
@@ -231,13 +233,10 @@ where
     })
 }
 
-async fn forward_cluster_kv_txn_to_state_authority_node_async_with_host<H>(
-    state: &ClusterBootstrapState,
-    authority_node_id: &NodeId,
+async fn forward_cluster_kv_txn_to_state_authority_endpoint_async_with_host<H>(
+    endpoint: &ClusterEndpointRecord,
     txn: &KvTxn,
     timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
     host: &mut H,
 ) -> Result<ClusterKvTxnCommitResult, NetworkError>
 where
@@ -250,11 +249,10 @@ where
         txn_payload.category,
         txn_payload.body,
     );
-    let mut client = ClusterObjectRpcClient::routed(host, runtime, paths);
+    let mut client = ClusterObjectRpcClient::endpoint_only(host);
     let txn_response = client
-        .call_target(
-            state,
-            authority_node_id,
+        .call_endpoint(
+            endpoint,
             &txn_request,
             ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(timeout)),
         )
@@ -273,9 +271,8 @@ where
         snapshot_payload.body,
     );
     let snapshot_response = client
-        .call_target(
-            state,
-            authority_node_id,
+        .call_endpoint(
+            endpoint,
             &snapshot_request,
             ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(snapshot_timeout)),
         )

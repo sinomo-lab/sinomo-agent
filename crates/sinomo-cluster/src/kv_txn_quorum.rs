@@ -60,6 +60,16 @@ pub trait ClusterKvTxnQuorumHost {
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError>;
 
+    fn call_endpoint_object_rpc(
+        &mut self,
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        self.call_node_object_rpc(state, &endpoint.node_id, request, timeout)
+    }
+
     fn call_node_object_rpc(
         &mut self,
         state: &ClusterBootstrapState,
@@ -138,6 +148,16 @@ where
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError> {
         ClusterKvTxnQuorumHost::known_kv_state_authority_id(self, paths, state)
+    }
+
+    fn call_endpoint_object_rpc(
+        &mut self,
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        ClusterKvTxnQuorumHost::call_endpoint_object_rpc(self, state, endpoint, request, timeout)
     }
 
     fn call_node_object_rpc(
@@ -230,6 +250,17 @@ where
     ) -> Result<ObjectRpcResponse, NetworkError> {
         self.transport
             .call_node_object_rpc(state, target_node_id, request, timeout)
+    }
+
+    fn call_endpoint_object_rpc(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        self.transport
+            .call_endpoint_object_rpc(endpoint, request, timeout)
     }
 
     fn request_kv_state_authority_vote(

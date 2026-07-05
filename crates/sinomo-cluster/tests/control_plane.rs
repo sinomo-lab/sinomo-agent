@@ -9122,7 +9122,7 @@ struct RecordingKvTxnForwardHost {
     known_authority: Option<NodeId>,
     snapshot: KvSnapshot,
     txn_response: KvTxnResponse,
-    node_rpcs: Vec<(NodeId, String)>,
+    endpoint_rpcs: Vec<(NodeId, String)>,
 }
 
 impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
@@ -9134,15 +9134,15 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
         Ok(self.known_authority.clone())
     }
 
-    fn call_node_object_rpc(
+    fn call_endpoint_object_rpc(
         &mut self,
         _state: &ClusterBootstrapState,
-        target_node_id: &NodeId,
+        endpoint: &ClusterEndpointRecord,
         request: &ObjectRpcRequest,
         _timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        self.node_rpcs
-            .push((target_node_id.clone(), request.route.clone()));
+        self.endpoint_rpcs
+            .push((endpoint.node_id.clone(), request.route.clone()));
         match request.route.as_str() {
             CLUSTER_KV_TXN_ROUTE => {
                 let payload = sinomo_kv::cluster_kv_txn_response_rpc_payload(&self.txn_response)
@@ -9156,6 +9156,19 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
             }
             route => ObjectRpcResponse::encode_error(route, "unexpected route"),
         }
+    }
+
+    fn call_node_object_rpc(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        _timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        panic!(
+            "KV forwarding must use selected endpoint RPC, not routed node RPC to {target_node_id} for {}",
+            request.route
+        )
     }
 }
 
@@ -9174,7 +9187,7 @@ impl ClusterSignedEndpointRpcAsyncHost for RecordingKvTxnForwardHost {
         request: &'a ObjectRpcRequest,
         _timeouts: DaemonRpcTimeouts,
     ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
-        self.node_rpcs
+        self.endpoint_rpcs
             .push((endpoint.node_id.clone(), request.route.clone()));
         let response: Result<ObjectRpcResponse, NetworkError> = match request.route.as_str() {
             CLUSTER_KV_TXN_ROUTE => {
@@ -11106,7 +11119,7 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
 }
 
 #[test]
-fn cluster_kv_txn_forward_driver_uses_node_rpc_for_known_state_authority() {
+fn cluster_kv_txn_forward_driver_uses_endpoint_rpc_for_known_state_authority() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-direct");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -11134,7 +11147,7 @@ fn cluster_kv_txn_forward_driver_uses_node_rpc_for_known_state_authority() {
         known_authority: Some(peer_node_id.clone()),
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
-        node_rpcs: Vec::new(),
+        endpoint_rpcs: Vec::new(),
     };
 
     let result = forward_cluster_kv_txn_to_state_authority_with_host(
@@ -11158,7 +11171,7 @@ fn cluster_kv_txn_forward_driver_uses_node_rpc_for_known_state_authority() {
     assert_eq!(result.snapshot, snapshot);
     assert_eq!(result.txn_response, Some(txn_response));
     assert_eq!(
-        host.node_rpcs,
+        host.endpoint_rpcs,
         vec![
             (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
             (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
@@ -11194,7 +11207,7 @@ fn cluster_kv_txn_forward_driver_deduplicates_state_authority_endpoints() {
         known_authority: Some(peer_node_id.clone()),
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
-        node_rpcs: Vec::new(),
+        endpoint_rpcs: Vec::new(),
     };
 
     let result = forward_cluster_kv_txn_to_state_authority_with_host(
@@ -11218,7 +11231,7 @@ fn cluster_kv_txn_forward_driver_deduplicates_state_authority_endpoints() {
     assert_eq!(result.snapshot, snapshot);
     assert_eq!(result.txn_response, Some(txn_response));
     assert_eq!(
-        host.node_rpcs,
+        host.endpoint_rpcs,
         vec![
             (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
             (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
@@ -11285,7 +11298,7 @@ fn cluster_node_blocks_leader_preference_when_local_probe_marks_member_unreachab
 }
 
 #[test]
-fn cluster_kv_txn_forward_driver_uses_node_rpc_without_known_state_authority() {
+fn cluster_kv_txn_forward_driver_uses_endpoint_rpc_without_known_state_authority() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-node-rpc");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -11313,7 +11326,7 @@ fn cluster_kv_txn_forward_driver_uses_node_rpc_without_known_state_authority() {
         known_authority: None,
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
-        node_rpcs: Vec::new(),
+        endpoint_rpcs: Vec::new(),
     };
 
     let result = forward_cluster_kv_txn_to_state_authority_with_host(
@@ -11337,7 +11350,7 @@ fn cluster_kv_txn_forward_driver_uses_node_rpc_without_known_state_authority() {
     assert_eq!(result.snapshot, snapshot);
     assert_eq!(result.txn_response, Some(txn_response));
     assert_eq!(
-        host.node_rpcs,
+        host.endpoint_rpcs,
         vec![
             (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
             (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
@@ -11346,7 +11359,7 @@ fn cluster_kv_txn_forward_driver_uses_node_rpc_without_known_state_authority() {
 }
 
 #[test]
-fn cluster_kv_txn_async_forward_driver_uses_object_rpc_client() {
+fn cluster_kv_txn_async_forward_driver_uses_endpoint_rpc_client() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-async-forward-node-rpc");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -11393,7 +11406,7 @@ fn cluster_kv_txn_async_forward_driver_uses_object_rpc_client() {
         known_authority: None,
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
-        node_rpcs: Vec::new(),
+        endpoint_rpcs: Vec::new(),
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -11425,7 +11438,7 @@ fn cluster_kv_txn_async_forward_driver_uses_object_rpc_client() {
     assert_eq!(result.snapshot, snapshot);
     assert_eq!(result.txn_response, Some(txn_response));
     assert_eq!(
-        host.node_rpcs,
+        host.endpoint_rpcs,
         vec![
             (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
             (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
