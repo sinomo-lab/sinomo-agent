@@ -251,10 +251,30 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
     let mut signed = request.clone();
     signed.auth = Some(auth.to_vec());
     if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
-        return Some(send_over_tcp_tunnel_handle(handle, signed, timeouts).await);
+        return match send_over_tcp_tunnel_handle(handle, signed, timeouts).await {
+            Ok(response) => Some(Ok(response)),
+            Err(error) => {
+                tracing::debug!(
+                    "tcp tunnel send to {} ({}) failed, falling back to direct endpoint rpc: {error}",
+                    endpoint.node_id,
+                    endpoint.address
+                );
+                None
+            }
+        };
     }
     match connect_tcp_tunnel_to_endpoint(endpoint, runtime, paths).await {
-        Ok(handle) => Some(send_over_tcp_tunnel_handle(handle, signed, timeouts).await),
+        Ok(handle) => match send_over_tcp_tunnel_handle(handle, signed, timeouts).await {
+            Ok(response) => Some(Ok(response)),
+            Err(error) => {
+                tracing::debug!(
+                    "tcp tunnel send to {} ({}) failed after open, falling back to direct endpoint rpc: {error}",
+                    endpoint.node_id,
+                    endpoint.address
+                );
+                None
+            }
+        },
         Err(error) => {
             tracing::debug!(
                 "tcp tunnel open to {} ({}) failed: {error}",
