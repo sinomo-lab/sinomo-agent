@@ -55,6 +55,8 @@ const SHADOW_IROH_PROXY_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 const SHADOW_STATUS_PUBLISHER_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 const SHADOW_RUNTIME_TASK_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const SHADOW_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const PENDING_MAIN_ACTIVATION_FORCE_TERMINATE_AFTER: Duration = Duration::from_secs(10);
+const PENDING_MAIN_ACTIVATION_TERMINATE_WAIT: Duration = Duration::from_secs(5);
 
 #[allow(clippy::too_many_arguments)]
 fn write_cluster_rollout_progress(
@@ -683,6 +685,7 @@ pub fn run_shadow_daemon_supervision_loop(
     let shadow_idle_interval = Duration::from_millis(100);
     let mut last_main_probe = Instant::now() - shadow_main_probe_interval(false);
     let mut next_pending_activation_shutdown_nudge = Instant::now();
+    let mut pending_activation_shutdown_started_at: Option<Instant> = None;
     let mut main_probe_status = DaemonProbeStatus::NotRunning;
     let (control_loop_tx, control_loop_rx) = std::sync::mpsc::channel::<Result<(), DaemonError>>();
     let control_paths = shadow_paths.clone();
@@ -764,16 +767,64 @@ pub fn run_shadow_daemon_supervision_loop(
         }
 
         let pending_main_activation = rollout_main_activation_path(&rollout_paths).exists();
+        if !pending_main_activation {
+            pending_activation_shutdown_started_at = None;
+        }
         if pending_rollout.is_none()
             && matches!(main_probe_status, DaemonProbeStatus::Running(_))
             && pending_main_activation
             && pending_main_activation_ready_for_shutdown(&rollout_paths)
             && Instant::now() >= next_pending_activation_shutdown_nudge
         {
+            let shutdown_started_at =
+                *pending_activation_shutdown_started_at.get_or_insert_with(Instant::now);
             if let DaemonProbeStatus::Running(status) =
                 probe_daemon_status(&main_paths, probe_timeout)
             {
                 let _ = send_daemon_shutdown_request(&status.address, probe_timeout);
+            }
+            if shutdown_started_at.elapsed() >= PENDING_MAIN_ACTIVATION_FORCE_TERMINATE_AFTER {
+                match terminate_pending_main_activation(
+                    &main_paths,
+                    PENDING_MAIN_ACTIVATION_TERMINATE_WAIT,
+                    probe_timeout,
+                ) {
+                    Ok(Some(pid)) => {
+                        main_probe_status = DaemonProbeStatus::NotRunning;
+                        last_main_probe = Instant::now();
+                        pending_activation_shutdown_started_at = None;
+                        crate::append_operational_event_best_effort(
+                            &shadow_paths,
+                            crate::OperationalSeverity::Warn,
+                            "shadow-daemon",
+                            "rollout.stage.main_terminated",
+                            "shadow daemon terminated unresponsive main for pending rollout activation",
+                            None,
+                            serde_json::json!({
+                                "pid": pid,
+                                "phase": "main-staged",
+                            }),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            "sinomo shadow daemon could not terminate unresponsive main for pending activation: {error}"
+                        );
+                        crate::append_operational_event_best_effort(
+                            &shadow_paths,
+                            crate::OperationalSeverity::Warn,
+                            "shadow-daemon",
+                            "rollout.stage.main_terminate_failed",
+                            "shadow daemon could not terminate unresponsive main for pending rollout activation",
+                            None,
+                            serde_json::json!({
+                                "error": error.to_string(),
+                                "phase": "main-staged",
+                            }),
+                        );
+                    }
+                }
             }
             next_pending_activation_shutdown_nudge = Instant::now() + Duration::from_secs(2);
         }
@@ -1231,6 +1282,77 @@ fn pending_main_activation_ready_for_shutdown(rollout_paths: &SelfRolloutPaths) 
     modified_at
         .elapsed()
         .is_ok_and(|age| age >= MAIN_ACTIVATION_SHUTDOWN_GRACE)
+}
+
+fn terminate_pending_main_activation(
+    main_paths: &DaemonPaths,
+    wait_timeout: Duration,
+    probe_timeout: Duration,
+) -> Result<Option<u32>, DaemonError> {
+    let status = match read_daemon_status(main_paths) {
+        Ok(status) if status_is_main_daemon(&status) => status,
+        _ => return Ok(None),
+    };
+    terminate_process_for_pending_main_activation(status.pid)?;
+    let deadline = Instant::now() + wait_timeout;
+    while Instant::now() < deadline {
+        if matches!(
+            probe_daemon_status(main_paths, probe_timeout),
+            DaemonProbeStatus::NotRunning
+        ) {
+            return Ok(Some(status.pid));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(None)
+}
+
+fn status_is_main_daemon(status: &DaemonStatus) -> bool {
+    status
+        .cluster
+        .as_ref()
+        .is_none_or(|cluster| cluster.process == sinomo_core::node::DAEMON_MAIN_CLUSTER_ROLE)
+}
+
+#[cfg(unix)]
+fn terminate_process_for_pending_main_activation(pid: u32) -> Result<(), DaemonError> {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const SIGTERM: i32 = 15;
+    let result = unsafe { kill(pid as i32, SIGTERM) };
+    if result == -1 {
+        return Err(DaemonError::Io {
+            path: format!("pid {pid}"),
+            detail: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn terminate_process_for_pending_main_activation(pid: u32) -> Result<(), DaemonError> {
+    let output = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output()
+        .map_err(|source| DaemonError::Io {
+            path: "taskkill".to_string(),
+            detail: source.to_string(),
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Err(DaemonError::Io {
+        path: format!("pid {pid}"),
+        detail: if stderr.is_empty() { stdout } else { stderr },
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_process_for_pending_main_activation(_pid: u32) -> Result<(), DaemonError> {
+    Ok(())
 }
 
 pub fn handle_daemon_rollout_binary_request(
