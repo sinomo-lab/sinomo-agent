@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use sinomo_core::node::NodeId;
 
 use crate::control_plane::{DfsMetadataShardConfig, select_metadata_shard_config_for_path};
+use crate::intent::write_intent_status_is_active;
 use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_backend::LocalSobjMetadataBackend;
 use crate::metadata_error::{MetadataBackendError, Result};
@@ -292,6 +293,9 @@ impl LocalShardedMetadataBackend {
         backend: &LocalSobjMetadataBackend,
         shard_id: &DfsMetadataShardId,
     ) -> Result<bool> {
+        if write_intent_status_is_active(&intent.status) {
+            return Ok(true);
+        }
         if let Some(object) = backend.get_object(&intent.object_id)? {
             return self.object_is_listable_from_shard(&object, shard_id);
         }
@@ -334,13 +338,16 @@ impl LocalShardedMetadataBackend {
         &self,
         intent: &DfsWriteIntentRecord,
     ) -> Result<DfsMetadataShardId> {
-        if let Some(shard_id) = self.shard_id_for_object(&intent.object_id)? {
+        if let Some(shard_id) =
+            self.shard_id_for_existing_intent(&intent.object_id, &intent.intent_id)?
+        {
             return Ok(shard_id);
         }
-        self.shard_id_for_existing_intent(&intent.object_id, &intent.intent_id)?
-            .ok_or_else(|| MetadataBackendError::UnknownObject {
+        self.shard_id_for_object(&intent.object_id)?.ok_or_else(|| {
+            MetadataBackendError::UnknownObject {
                 object_id: intent.object_id.clone(),
-            })
+            }
+        })
     }
 
     fn shard_id_for_pending_object_record(
@@ -1080,6 +1087,11 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         object: Option<&DfsObjectMetadata>,
         intent: &DfsWriteIntentRecord,
     ) -> Result<DfsMetadataJournalEntry> {
+        if let Some(shard_id) =
+            self.shard_id_for_existing_intent(&intent.object_id, &intent.intent_id)?
+        {
+            return self.shard_backend_mut(&shard_id)?.put_intent(intent);
+        }
         let shard_id = self.shard_id_for_pending_object_record(
             &intent.object_id,
             &intent.file_system_id,
@@ -1098,6 +1110,13 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         intent: &DfsWriteIntentRecord,
         receipts: &[DfsReplicaReceiptRecord],
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        if let Some(shard_id) =
+            self.shard_id_for_existing_intent(&intent.object_id, &intent.intent_id)?
+        {
+            return self
+                .shard_backend_mut(&shard_id)?
+                .put_intent_and_receipts_for_object(object, intent, receipts);
+        }
         let shard_id = self.shard_id_for_pending_object_record(
             &intent.object_id,
             &intent.file_system_id,

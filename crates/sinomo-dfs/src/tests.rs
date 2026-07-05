@@ -8112,6 +8112,124 @@ fn metadata_journal_missing_namespace_transaction_record_fails_without_full_scan
 }
 
 #[test]
+fn sharded_backend_updates_active_intent_on_original_shard_after_object_moves() {
+    let root = temp_root("sharded-active-intent-original-shard-update");
+    let owner = NodeId::from_legacy_named("node_sharded_active_intent_owner").expect("owner");
+    let file_system = file_system(owner.clone());
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_sharded_active_intent_move").expect("object");
+    let version_1 =
+        DfsVersion::from_legacy_named("version_sharded_active_intent_1").expect("version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_sharded_active_intent_2").expect("version");
+    let shard_configs = vec![
+        DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        },
+        DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "services".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        },
+        DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "users".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/users".to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        },
+    ];
+    let mut backend =
+        open_local_sharded_metadata_backend(root.join("metadata"), shard_configs).expect("backend");
+    backend.put_file_system(&file_system).expect("filesystem");
+
+    let mut original_object = file_metadata(owner.clone());
+    original_object.object_id = object_id.clone();
+    original_object.file_system_id = file_system.file_system_id.clone();
+    original_object.path = "/services/original.txt".to_string();
+    original_object.version = version_1.clone();
+    original_object.policy = DfsObjectPolicy::ReplicatedEventual;
+    backend
+        .put_object(&original_object)
+        .expect("original object");
+
+    let intent_id = "dfs_intent_sharded_active_intent_move".to_string();
+    let mut intent = DfsWriteIntentRecord {
+        intent_id: intent_id.clone(),
+        file_system_id: file_system.file_system_id.clone(),
+        object_id: object_id.clone(),
+        base_version: Some(version_1.clone()),
+        target_version: version_2.clone(),
+        coordinator_node_id: owner.clone(),
+        owner_epoch: 1,
+        desired_replica_node_ids: vec![owner.clone()],
+        policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+        status: DfsWriteIntentStatus::ReceiptsPending,
+        content_hash: Some("blake3:sharded-active-intent".to_string()),
+        object_metadata: Some(original_object.clone()),
+        created_at: OffsetDateTime::UNIX_EPOCH,
+        updated_at: None,
+    };
+    backend
+        .put_intent_for_object(Some(&original_object), &intent)
+        .expect("active intent on original shard");
+
+    let mut moved_object = original_object.clone();
+    moved_object.path = "/users/relocated.txt".to_string();
+    backend.put_object(&moved_object).expect("moved object");
+
+    let active_page = backend
+        .write_intents_page(None, 8)
+        .expect("active intent scan");
+    assert!(
+        active_page
+            .intents
+            .iter()
+            .any(|candidate| candidate.intent_id == intent_id
+                && candidate.status == DfsWriteIntentStatus::ReceiptsPending),
+        "active intents on stale shards must remain visible to maintenance scans"
+    );
+    assert_eq!(
+        backend
+            .metadata_summary()
+            .expect("summary before terminal update")
+            .pending_write_count,
+        1
+    );
+
+    intent.status = DfsWriteIntentStatus::Committed;
+    intent.object_metadata = Some(moved_object.clone());
+    backend
+        .put_intent_for_object(Some(&moved_object), &intent)
+        .expect("terminal update stays on original shard");
+    assert_eq!(
+        backend
+            .metadata_summary()
+            .expect("summary after terminal update")
+            .pending_write_count,
+        0
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn distributed_write_uses_path_selected_metadata_shard_epoch() {
     let root = temp_root("distributed-write-path-shard-epoch");
     let owner = NodeId::from_legacy_named("node_path_shard_owner").expect("owner");
