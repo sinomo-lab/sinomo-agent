@@ -51,6 +51,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.write_distributed_eventual(request, bytes, plan.desired_replica_nodes, policy)
     }
 
+    pub(crate) fn write_distributed_eventual_with_candidates_and_repair_mode(
+        &mut self,
+        request: DfsWriteRequest,
+        bytes: Vec<u8>,
+        candidate_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        foreground_replica_repair: bool,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let plan =
+            self.plan_distributed_eventual_replicas(&request, candidate_nodes, policy.clone())?;
+        self.write_distributed_eventual_with_repair_mode(
+            request,
+            bytes,
+            plan.desired_replica_nodes,
+            policy,
+            foreground_replica_repair,
+        )
+    }
+
     pub fn write_distributed_eventual_from_reader_with_candidates<R: Read>(
         &mut self,
         request: DfsWriteRequest,
@@ -175,13 +194,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        self.write_distributed_eventual_with_repair_mode(
+            request,
+            bytes,
+            desired_replica_nodes,
+            policy,
+            true,
+        )
+    }
+
+    pub(crate) fn write_distributed_eventual_with_repair_mode(
+        &mut self,
+        request: DfsWriteRequest,
+        bytes: Vec<u8>,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        foreground_replica_repair: bool,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let object = self.current_object_for_write(&request.object_id)?;
-        self.write_distributed_eventual_with_base(
+        self.write_distributed_eventual_with_base_and_repair_mode(
             request,
             Some(object.version),
             bytes,
             desired_replica_nodes,
             policy,
+            foreground_replica_repair,
         )
     }
 

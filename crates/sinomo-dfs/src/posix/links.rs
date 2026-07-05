@@ -59,7 +59,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let target_version = next_version(&object.version);
         let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
-        let outcome = self.write_distributed_eventual_with_candidates(
+        let outcome = self.write_distributed_eventual_with_candidates_and_repair_mode(
             DfsWriteRequest {
                 file_system_id: object.file_system_id.clone(),
                 object_id: object.object_id.clone(),
@@ -69,6 +69,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             target.as_bytes().to_vec(),
             candidates,
             options.policy,
+            options.foreground_replica_repair,
         );
         let outcome = match outcome {
             Ok(outcome) => outcome,
@@ -78,7 +79,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         };
         let outcome = if options.wait_for_commit {
-            match self.settle_ready_write_outcome(outcome) {
+            match self.settle_ready_write_outcome(outcome, options.foreground_replica_repair) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     self.remove_transient_object_metadata(&object.object_id);

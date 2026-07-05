@@ -80,6 +80,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn settle_ready_write_outcome(
         &mut self,
         outcome: NetworkedDfsWriteOutcome,
+        foreground_replica_repair: bool,
     ) -> std::result::Result<NetworkedDfsWriteOutcome, DfsError> {
         let NetworkedDfsWriteOutcome::Pending { intent_id, .. } = &outcome else {
             return Ok(outcome);
@@ -98,14 +99,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 intent_id = next_intent_id.clone();
             }
             if !matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }) {
-                let (_, repair_events) = self.retry_pending_repairs_best_effort();
-                if !repair_events.is_empty() {
-                    events.extend(repair_events);
-                    self.last_events = events;
+                if foreground_replica_repair {
+                    let (_, repair_events) = self.retry_pending_repairs_best_effort();
+                    if !repair_events.is_empty() {
+                        events.extend(repair_events);
+                        self.last_events = events;
+                    }
                 }
                 return Ok(outcome);
             }
-            let (scheduled, repair_events) = self.retry_pending_repairs_best_effort();
+            let (scheduled, repair_events) = if foreground_replica_repair {
+                self.retry_pending_repairs_best_effort()
+            } else {
+                (Vec::new(), Vec::new())
+            };
             if !repair_events.is_empty() {
                 events.extend(repair_events);
                 self.last_events = events.clone();
@@ -786,7 +793,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         };
         let outcome = if options.wait_for_commit {
-            match self.settle_ready_write_outcome(outcome) {
+            match self.settle_ready_write_outcome(outcome, options.foreground_replica_repair) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     if transient_create {
@@ -1018,7 +1025,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         };
         let outcome = if options.wait_for_commit {
-            match self.settle_ready_write_outcome(outcome) {
+            match self.settle_ready_write_outcome(outcome, options.foreground_replica_repair) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     if transient_create {
@@ -1207,7 +1214,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )?
         {
             let outcome = if options.wait_for_commit {
-                self.settle_ready_write_outcome(outcome)?
+                self.settle_ready_write_outcome(outcome, options.foreground_replica_repair)?
             } else {
                 outcome
             };
@@ -1314,7 +1321,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )?
         {
             let outcome = if options.wait_for_commit {
-                self.settle_ready_write_outcome(outcome)?
+                self.settle_ready_write_outcome(outcome, options.foreground_replica_repair)?
             } else {
                 outcome
             };
@@ -1386,15 +1393,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         current[start..end].copy_from_slice(bytes);
         let result_size = current.len() as u64;
-        let outcome = self.write_distributed_eventual_with_base(
+        let outcome = self.write_distributed_eventual_with_base_and_repair_mode(
             request,
             Some(base_version),
             current,
             plan.desired_replica_nodes,
             options.policy,
+            options.foreground_replica_repair,
         )?;
         let outcome = if options.wait_for_commit {
-            self.settle_ready_write_outcome(outcome)?
+            self.settle_ready_write_outcome(outcome, options.foreground_replica_repair)?
         } else {
             outcome
         };
@@ -1493,15 +1501,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let plan =
             self.plan_distributed_eventual_replicas(&request, candidates, options.policy.clone())?;
-        let outcome = self.write_distributed_eventual_with_base(
+        let outcome = self.write_distributed_eventual_with_base_and_repair_mode(
             request,
             Some(base_version),
             current,
             plan.desired_replica_nodes,
             options.policy,
+            options.foreground_replica_repair,
         )?;
         let outcome = if options.wait_for_commit {
-            self.settle_ready_write_outcome(outcome)?
+            self.settle_ready_write_outcome(outcome, options.foreground_replica_repair)?
         } else {
             outcome
         };
