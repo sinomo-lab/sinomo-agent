@@ -958,6 +958,35 @@ impl DfsMessageTransport for FailingSendTransport {
     }
 }
 
+struct CountingFailingSendTransport {
+    local_node_id: NodeId,
+    send_count: Arc<AtomicUsize>,
+}
+
+impl DfsTransportIdentity for CountingFailingSendTransport {
+    fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+}
+
+impl DfsMessageTransport for CountingFailingSendTransport {
+    fn send_routed_message(
+        &mut self,
+        _target_node_id: &NodeId,
+        _message: DfsRoutedMessage,
+    ) -> Result<(), NetworkError> {
+        self.send_count.fetch_add(1, Ordering::Relaxed);
+        Err(NetworkError::Io {
+            operation: "test send".to_string(),
+            detail: "unreachable".to_string(),
+        })
+    }
+
+    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+        Ok(Vec::new())
+    }
+}
+
 struct DroppingSendTransport {
     local_node_id: NodeId,
 }
@@ -5457,6 +5486,64 @@ fn smoke_driver_reports_local_commit_when_remote_replica_is_pending() {
     ));
     assert!(publisher_host.opened_shards.is_empty());
     assert_eq!(transport.batches, 0);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn smoke_driver_can_skip_foreground_remote_replica_repair() {
+    let root = temp_root("smoke-driver-skip-foreground-repair");
+    let local = NodeId::from_legacy_named("node_smoke_driver_skip_repair_local").expect("local");
+    let replica =
+        NodeId::from_legacy_named("node_smoke_driver_skip_repair_replica").expect("replica");
+    let metadata =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("metadata backend");
+    let content = LocalContentStore::new(root.join("content")).expect("content store");
+    let send_count = Arc::new(AtomicUsize::new(0));
+    let mut dfs = NetworkedDfsService::new(
+        CountingFailingSendTransport {
+            local_node_id: local.clone(),
+            send_count: send_count.clone(),
+        },
+        content,
+    )
+    .with_metadata_backend(metadata)
+    .expect("metadata backend");
+    let mut smoke_host = FixedSmokeHost {
+        pending_repair_count: 1,
+    };
+    let mut publisher_host = RecordingMetadataJournalPublisherHost::new(root.join("journal"));
+    let mut transport = ApplyingMetadataJournalTransport::new(replica.clone());
+    let file_system = distributed_sifs(local.clone());
+
+    let report = run_dfs_smoke_with_host(
+        &mut dfs,
+        &local,
+        vec![local.clone(), replica.clone()],
+        vec![replica.clone()],
+        &mut smoke_host,
+        file_system.file_system_id,
+        Vec::new(),
+        &mut publisher_host,
+        &mut transport,
+        DfsSmokeOptions {
+            nonce: Some(112233),
+            foreground_replica_repair: false,
+            ..DfsSmokeOptions::default()
+        },
+    )
+    .expect("smoke");
+
+    assert_eq!(
+        report.requested_replica_node_ids,
+        vec![local.clone(), replica]
+    );
+    assert_eq!(report.committed_replica_node_ids, vec![local]);
+    assert_eq!(report.pending_repair_count, 1);
+    assert_eq!(send_count.load(Ordering::Relaxed), 0);
+    assert!(report.path.starts_with("/services/dfs-smoke/112233-"));
+    assert!(report.attempts[0].committed);
 
     std::fs::remove_dir_all(root).ok();
 }

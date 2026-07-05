@@ -50,6 +50,7 @@ pub struct DfsSmokeAttempt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsSmokeOptions {
     pub nonce: Option<i128>,
+    pub foreground_replica_repair: bool,
     pub metadata_replication: DfsMetadataJournalReplicationOptions,
 }
 
@@ -57,6 +58,7 @@ impl Default for DfsSmokeOptions {
     fn default() -> Self {
         Self {
             nonce: None,
+            foreground_replica_repair: true,
             metadata_replication: DfsMetadataJournalReplicationOptions::default(),
         }
     }
@@ -251,12 +253,10 @@ pub fn run_dfs_smoke_with_host<T: DfsMessageTransport>(
             .join("-");
         let path = format!("{smoke_directory}/{nonce}-{target_label}.txt");
         let body = format!("sinomo dfs smoke {nonce} {target_label}\n");
+        let mut write_options = DfsWriteOptions::replicated_eventual(replica_candidates.clone());
+        write_options.foreground_replica_repair = options.foreground_replica_repair;
         match service
-            .posix_write_file(
-                &path,
-                body.as_bytes(),
-                DfsWriteOptions::replicated_eventual(replica_candidates.clone()),
-            )
+            .posix_write_file(&path, body.as_bytes(), write_options)
             .map_err(dfs_posix_error)
         {
             Ok(stat) => {
