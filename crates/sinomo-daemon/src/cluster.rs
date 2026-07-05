@@ -9837,21 +9837,21 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_cluster_kv_txn_does_not_start_local_election() {
-        let root = unique_cluster_test_root("sinomo-daemon-forwarded-kv-no-election");
+    fn forwarded_cluster_kv_txn_can_recover_local_leadership() {
+        let root = unique_cluster_test_root("sinomo-daemon-forwarded-kv-local-election");
         let data_dir = SinomoDataDir::new(root.join("data"));
         data_dir.ensure_root_layout().expect("data dir");
         let paths = ClusterPaths::new(&data_dir);
         paths.ensure().expect("cluster paths");
         let now = OffsetDateTime::now_utc();
-        let cluster_id = ClusterId::from_legacy_named("cluster_daemon_forwarded_kv_no_election")
+        let cluster_id = ClusterId::from_legacy_named("cluster_daemon_forwarded_kv_local_election")
             .expect("cluster");
         let local =
-            NodeId::from_legacy_named("node_daemon_forwarded_kv_no_election").expect("node");
+            NodeId::from_legacy_named("node_daemon_forwarded_kv_local_election").expect("node");
         let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id,
-            "forwarded kv no election",
-            local,
+            "forwarded kv local election",
+            local.clone(),
             "local",
             "pk-local",
             now,
@@ -9869,25 +9869,30 @@ mod tests {
             None
         );
 
-        let error = commit_cluster_kv_txn_with_quorum_response_with_forwarding(
+        let key = "/test/forwarded-local-election".to_string();
+        let (snapshot, response) = commit_cluster_kv_txn_with_quorum_response_with_forwarding(
             &paths,
             &mut state,
             KvTxn {
                 compares: Vec::new(),
                 success: vec![KvOp::Put {
-                    key: "/test/forwarded-no-election".to_string(),
-                    value: b"blocked".to_vec(),
+                    key: key.clone(),
+                    value: b"committed".to_vec(),
                     lease_id: None,
                 }],
                 failure: Vec::new(),
             },
             false,
         )
-        .expect_err("forwarded non-leader must reject instead of electing");
-        assert!(error.to_string().contains("non-leader voter"));
+        .expect("forwarded non-leader voter should recover local leadership");
+        assert_eq!(
+            snapshot.get(&key).expect("committed key").value,
+            b"committed".to_vec()
+        );
+        assert_eq!(response.expect("txn response").revision, snapshot.revision);
         assert_eq!(
             daemon_cluster_kv_state_authority_id(&paths, &state).expect("known state authority"),
-            None
+            Some(local)
         );
     }
 

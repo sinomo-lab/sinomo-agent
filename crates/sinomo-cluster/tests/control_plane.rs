@@ -9237,6 +9237,7 @@ impl ClusterKvSnapshotRefreshHost for RecordingKvSnapshotRefreshHost {
 
 #[derive(Default)]
 struct RecordingKvTxnQuorumHost {
+    leader: bool,
     leader_checks: usize,
     elect_calls: usize,
     commit_calls: usize,
@@ -9267,7 +9268,7 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
         _state: &ClusterBootstrapState,
     ) -> Result<bool, NetworkError> {
         self.leader_checks += 1;
-        Ok(false)
+        Ok(self.leader)
     }
 
     fn request_kv_state_authority_vote(
@@ -9286,6 +9287,7 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
         _options: ClusterKvTxnQuorumOptions,
     ) -> Result<bool, NetworkError> {
         self.elect_calls += 1;
+        self.leader = true;
         Ok(true)
     }
 
@@ -9302,11 +9304,27 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
         &mut self,
         _paths: &ClusterPaths,
         _state: &mut ClusterBootstrapState,
-        _command: KvCommand,
+        command: KvCommand,
         _options: ClusterKvRaftQuorumCommitOptions,
     ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
         self.commit_calls += 1;
-        panic!("forwarded non-leader requests must not commit locally")
+        let mut store = InProcessKvStore::new();
+        let txn_response = match command {
+            KvCommand::Txn(txn) => Some(store.txn(txn).expect("test txn commit")),
+            KvCommand::Op(op) => Some(
+                store
+                    .txn(KvTxn {
+                        compares: Vec::new(),
+                        success: vec![op],
+                        failure: Vec::new(),
+                    })
+                    .expect("test op commit"),
+            ),
+        };
+        Ok(ClusterKvRaftQuorumCommitResult {
+            snapshot: store.snapshot().expect("test snapshot"),
+            txn_response,
+        })
     }
 }
 
@@ -10356,19 +10374,19 @@ fn cluster_kv_snapshot_refresh_local_driver_owns_local_raft_storage() {
 }
 
 #[test]
-fn forwarded_cluster_kv_txn_driver_does_not_start_local_election() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-forwarded-kv-no-election");
+fn forwarded_cluster_kv_txn_driver_can_elect_without_reforwarding() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-forwarded-kv-local-election");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
     let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_network_forwarded_kv_no_election").expect("cluster");
+    let cluster_id = ClusterId::from_legacy_named("cluster_network_forwarded_kv_local_election")
+        .expect("cluster");
     let local =
-        NodeId::from_legacy_named("node_network_forwarded_kv_no_election").expect("local node");
+        NodeId::from_legacy_named("node_network_forwarded_kv_local_election").expect("local node");
     let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id,
-        "forwarded kv no election",
+        "forwarded kv local election",
         local,
         "local",
         "pk-local",
@@ -10377,14 +10395,14 @@ fn forwarded_cluster_kv_txn_driver_does_not_start_local_election() {
     mark_test_member_as_voter(&mut state.members[0]);
     let mut host = RecordingKvTxnQuorumHost::default();
 
-    let error = commit_cluster_kv_txn_with_quorum_response_with_host(
+    let result = commit_cluster_kv_txn_with_quorum_response_with_host(
         &paths,
         &mut state,
         KvTxn {
             compares: Vec::new(),
             success: vec![KvOp::Put {
-                key: "/test/forwarded-no-election".to_string(),
-                value: b"blocked".to_vec(),
+                key: "/test/forwarded-local-election".to_string(),
+                value: b"committed".to_vec(),
                 lease_id: None,
             }],
             failure: Vec::new(),
@@ -10392,12 +10410,19 @@ fn forwarded_cluster_kv_txn_driver_does_not_start_local_election() {
         kv_txn_quorum_test_options(false),
         &mut host,
     )
-    .expect_err("forwarded non-leader must reject instead of electing");
+    .expect("forwarded non-leader voter may recover local leadership");
 
-    assert!(matches!(error, NetworkError::ClusterReadOnly { .. }));
-    assert_eq!(host.leader_checks, 1);
-    assert_eq!(host.elect_calls, 0);
-    assert_eq!(host.commit_calls, 0);
+    assert_eq!(
+        result
+            .snapshot
+            .get("/test/forwarded-local-election")
+            .expect("committed key")
+            .value,
+        b"committed".to_vec()
+    );
+    assert_eq!(host.leader_checks, 2);
+    assert_eq!(host.elect_calls, 1);
+    assert_eq!(host.commit_calls, 1);
 }
 
 #[test]

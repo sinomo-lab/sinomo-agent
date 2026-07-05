@@ -6352,6 +6352,46 @@ mod tests {
         assert!(!host.elected);
     }
 
+    #[test]
+    fn kv_txn_quorum_driver_forwarded_voter_can_elect_locally() {
+        let local = NodeId::from_legacy_named("node_txn_driver_forwarded_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_txn_driver_forwarded_remote").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let mut host = TxnQuorumDriverTestHost {
+            reachable_voters: 2,
+            ..TxnQuorumDriverTestHost::default()
+        };
+
+        let result = commit_cluster_kv_txn_with_quorum_with_host(
+            &mut state,
+            KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::Put {
+                    key: "/kv/txn-driver/forwarded-local-election".to_string(),
+                    value: b"committed".to_vec(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            },
+            ClusterKvTxnQuorumDriverOptions {
+                allow_forwarding: false,
+            },
+            &mut host,
+        )
+        .expect("forwarded voter should be able to recover local leadership");
+
+        assert!(host.elected);
+        assert_eq!(host.committed_txns, 1);
+        assert_eq!(
+            result
+                .snapshot
+                .get("/kv/txn-driver/forwarded-local-election")
+                .expect("committed key")
+                .value,
+            b"committed".to_vec()
+        );
+    }
+
     struct AppendReplicationTestHost {
         last_index: u64,
         requested_next_indices: Vec<u64>,

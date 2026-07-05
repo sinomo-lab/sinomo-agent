@@ -1519,19 +1519,16 @@ where
             } else {
                 None
             };
-            if !options.allow_forwarding {
-                return Err(host.cluster_read_only_error(
-                    "forwarded cluster KV transaction reached a non-leader voter".to_string(),
-                ));
-            }
             if !host.elect_cluster_raft_leader(state)? {
                 let mut detail = if let Some(forwarding_failure) = forwarding_failure {
                     format!(
                         "local node is not the Raft leader and could not win quorum; forwarding also failed: {}",
                         forwarding_failure.to_string()
                     )
-                } else {
+                } else if options.allow_forwarding {
                     "local node is not the Raft leader and could not win quorum".to_string()
+                } else {
+                    "forwarded cluster KV transaction reached a non-leader voter and it could not win quorum".to_string()
                 };
                 if let Some(error) = previous_commit_failure.as_ref() {
                     detail.push_str("; previous local commit failed: ");
@@ -1618,19 +1615,16 @@ where
             } else {
                 None
             };
-            if !options.allow_forwarding {
-                return Err(host.cluster_read_only_error(
-                    "forwarded cluster KV transaction reached a non-leader voter".to_string(),
-                ));
-            }
             if !host.elect_cluster_raft_leader_async(state).await? {
                 let mut detail = if let Some(forwarding_failure) = forwarding_failure {
                     format!(
                         "local node is not the Raft leader and could not win quorum; forwarding also failed: {}",
                         forwarding_failure.to_string()
                     )
-                } else {
+                } else if options.allow_forwarding {
                     "local node is not the Raft leader and could not win quorum".to_string()
+                } else {
+                    "forwarded cluster KV transaction reached a non-leader voter and it could not win quorum".to_string()
                 };
                 if let Some(error) = previous_commit_failure.as_ref() {
                     detail.push_str("; previous local commit failed: ");
