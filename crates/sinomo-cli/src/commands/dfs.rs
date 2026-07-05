@@ -6,7 +6,7 @@ use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 
 const DFS_CLUSTER_STATUS_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
-const DFS_SMOKE_DAEMON_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+const DFS_SMOKE_DAEMON_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(9_500);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum DfsCliCommand {

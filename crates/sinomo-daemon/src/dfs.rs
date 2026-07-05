@@ -55,7 +55,7 @@ const DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT: Duration =
 const DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT: Duration =
     sinomo_dfs::DEFAULT_DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT;
 const DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS: usize = 3;
-const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_secs(8);
+const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_millis(9_500);
 
 type DaemonDfsMessageService = NetworkedDfsService<DfsEndpointServedMessageTransport>;
 
