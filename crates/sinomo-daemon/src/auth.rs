@@ -261,6 +261,9 @@ pub fn authorize_authenticated_daemon_command(
         route if route == crate::DAEMON_SHUTDOWN_ROUTE => {
             authenticated.signer.can_run_local_command()
         }
+        route if route == crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE => {
+            authenticated.signer.can_run_local_command()
+        }
         route if route == ROLLOUT_FINALIZE_SHADOW_ROUTE => {
             authenticated.signer.can_run_local_command()
         }
@@ -1573,6 +1576,27 @@ mod tests {
                 let authenticated = authenticated_command((*route).to_string(), signer);
                 assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn daemon_dfs_object_rpc_forward_authorizes_only_local_signer() {
+        authorize_authenticated_daemon_command(&authenticated_command(
+            crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE.to_string(),
+            DaemonSignerAuthority::Local,
+        ))
+        .expect("local operators must be able to forward DFS object RPCs through the daemon");
+        for signer in [
+            DaemonSignerAuthority::Voter,
+            DaemonSignerAuthority::Member,
+            DaemonSignerAuthority::JoinCandidate,
+            DaemonSignerAuthority::StatusProbe,
+        ] {
+            let authenticated = authenticated_command(
+                crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE.to_string(),
+                signer,
+            );
+            assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
         }
     }
 

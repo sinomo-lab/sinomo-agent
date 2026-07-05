@@ -20,6 +20,7 @@ pub const DAEMON_RPC_CATEGORY: &str = "daemon";
 pub const DAEMON_STATUS_ROUTE: &str = "/daemon/status";
 pub const DAEMON_SHUTDOWN_ROUTE: &str = "/daemon/shutdown";
 pub const DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE: &str = "/daemon/cluster/maintenance-refresh";
+pub const DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE: &str = "/daemon/dfs/object-rpc/forward";
 pub const DAEMON_DFS_BROWSER_STATUS_ROUTE: &str = "/daemon/dfs/browser/status";
 pub const DAEMON_DFS_BROWSER_STAT_ROUTE: &str = "/daemon/dfs/browser/stat";
 pub const DAEMON_DFS_BROWSER_LIST_ROUTE: &str = "/daemon/dfs/browser/list";
@@ -64,6 +65,15 @@ pub(crate) fn cluster_join_trace(args: std::fmt::Arguments<'_>) {
     if enabled {
         eprintln!("[sinomo cluster join] {args}");
     }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsObjectRpcForwardRequest {
+    pub target_node_id: sinomo_core::node::NodeId,
+    pub request: sinomo_core::network::ObjectRpcRequest,
+    pub connect_timeout_millis: u64,
+    #[serde(default)]
+    pub observe_connectivity: bool,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, Eq, PartialEq)]

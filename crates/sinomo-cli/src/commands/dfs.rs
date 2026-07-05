@@ -2319,7 +2319,7 @@ impl sinomo_runtime::dfs::DfsPeerTransport for CliDfsPeerTransport {
         sinomo_runtime::network::ObjectRpcResponse,
         sinomo_runtime::dfs::DfsPeerTransportError,
     > {
-        sinomo_runtime::daemon::send_dfs_object_rpc_to_target(
+        daemon_dfs_object_rpc_to_target(
             target_node_id,
             request,
             options.connect_timeout,
@@ -2327,6 +2327,21 @@ impl sinomo_runtime::dfs::DfsPeerTransport for CliDfsPeerTransport {
         )
         .map_err(|error| sinomo_runtime::dfs::DfsPeerTransportError::new(error.to_string()))
     }
+}
+
+fn daemon_dfs_object_rpc_to_target(
+    target_node_id: &sinomo_runtime::node::NodeId,
+    request: &sinomo_runtime::network::ObjectRpcRequest,
+    timeout: std::time::Duration,
+    observe_connectivity: bool,
+) -> Result<sinomo_runtime::network::ObjectRpcResponse, CliError> {
+    let status = default_main_daemon_status()?.ok_or_else(|| CliError::Network {
+        address: target_node_id.to_string(),
+        detail: "DFS cluster object RPC requires the local daemon to be running".to_string(),
+    })?;
+    DaemonApiClient::at_address(status.address)
+        .dfs_object_rpc_to_target(target_node_id, request, timeout, observe_connectivity)
+        .map_err(CliError::from)
 }
 
 fn publish_dfs_metadata_journal_from_data_dir(
@@ -2728,8 +2743,8 @@ fn trace_dfs_cluster_status(
 }
 
 fn fetch_dfs_status_from_node_blocking(
-    cluster_paths: &ClusterPaths,
-    state: &sinomo_runtime::core::ClusterBootstrapState,
+    _cluster_paths: &ClusterPaths,
+    _state: &sinomo_runtime::core::ClusterBootstrapState,
     node_id: &NodeId,
     timeout: std::time::Duration,
 ) -> Result<sinomo_runtime::dfs::DfsOperatorStatus, CliError> {
@@ -2742,33 +2757,13 @@ fn fetch_dfs_status_from_node_blocking(
             started_at.elapsed().as_millis()
         );
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| CliError::Network {
-            address: format!("cluster dfs status {node_id}"),
-            detail: source.to_string(),
-        })?;
     if trace {
         eprintln!(
-            "sinomo dfs cluster status node={node_id} +{}ms: runtime ready",
+            "sinomo dfs cluster status node={node_id} +{}ms: daemon send ready",
             started_at.elapsed().as_millis()
         );
     }
-    let mut host = CliSignedEndpointRpcHost::new(
-        Some(state.cluster_id.clone()),
-        "dfs status object rpc signing",
-    );
-    let mut client =
-        network::ClusterObjectRpcClient::routed(&mut host, runtime.handle(), cluster_paths);
-    let response = runtime.block_on(client.call_target(
-        state,
-        node_id,
-        &rpc_request,
-        network::ClusterObjectRpcOptions::new(network::DaemonRpcTimeouts::connect_and_idle(
-            timeout,
-        )),
-    ));
+    let response = daemon_dfs_object_rpc_to_target(node_id, &rpc_request, timeout, true);
     if trace {
         let outcome = if response.is_ok() { "ok" } else { "error" };
         eprintln!(
@@ -2776,7 +2771,6 @@ fn fetch_dfs_status_from_node_blocking(
             started_at.elapsed().as_millis()
         );
     }
-    runtime.shutdown_timeout(std::time::Duration::from_millis(250));
     let response = response.map_err(CliError::from)?;
     let decoded =
         sinomo_runtime::dfs::decode_dfs_status_rpc_response(&response).map_err(Into::into);

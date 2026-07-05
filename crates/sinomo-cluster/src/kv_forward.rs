@@ -89,10 +89,23 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
     if targets.is_empty() {
         return Ok(None);
     }
-    if let Ok(Some(authority_id)) = host.known_kv_state_authority_id(paths, state)
-        && !cluster_node_blocks_leader_preference(paths, state, &authority_id)
-    {
-        prefer_known_state_authority_endpoints(&mut targets, &authority_id);
+    let known_authority_id = host
+        .known_kv_state_authority_id(paths, state)
+        .ok()
+        .flatten();
+    match known_authority_id {
+        Some(authority_id)
+            if !cluster_node_blocks_leader_preference(paths, state, &authority_id) =>
+        {
+            if authority_id == state.local_node_id {
+                return Ok(None);
+            }
+            prefer_known_state_authority_endpoints(&mut targets, &authority_id);
+        }
+        _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => {
+            return Ok(None);
+        }
+        _ => {}
     }
 
     let mut failures = Vec::new();
@@ -195,11 +208,29 @@ where
     if targets.is_empty() {
         return Ok(None);
     }
-    if let Ok(Some(authority_id)) = locked_kv_state_authority_id_async(runtime, paths, state).await
-        && !cluster_node_blocks_leader_preference_async(runtime, paths, state, &authority_id)
-            .await?
-    {
-        prefer_known_state_authority_endpoints(&mut targets, &authority_id);
+    let known_authority_id = locked_kv_state_authority_id_async(runtime, paths, state)
+        .await
+        .ok()
+        .flatten();
+    match known_authority_id {
+        Some(authority_id)
+            if !cluster_node_blocks_leader_preference_async(
+                runtime,
+                paths,
+                state,
+                &authority_id,
+            )
+            .await? =>
+        {
+            if authority_id == state.local_node_id {
+                return Ok(None);
+            }
+            prefer_known_state_authority_endpoints(&mut targets, &authority_id);
+        }
+        _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => {
+            return Ok(None);
+        }
+        _ => {}
     }
 
     let mut failures = Vec::new();
@@ -317,4 +348,155 @@ where
         snapshot,
         txn_response: Some(txn_response),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_base::{CapabilityName, ClusterMemberRecord, ClusterMemberState};
+    use sinomo_node::{ClusterId, DAEMON_MAIN_RUN_CAPABILITY};
+    use time::OffsetDateTime;
+
+    struct RecordingForwardHost {
+        known_authority: Option<NodeId>,
+        calls: usize,
+    }
+
+    impl ClusterKvTxnForwardHost for RecordingForwardHost {
+        fn known_kv_state_authority_id(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+        ) -> Result<Option<NodeId>, NetworkError> {
+            Ok(self.known_authority.clone())
+        }
+
+        fn call_node_object_rpc(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            _target_node_id: &NodeId,
+            _request: &ObjectRpcRequest,
+            _timeout: Duration,
+        ) -> Result<ObjectRpcResponse, NetworkError> {
+            self.calls = self.calls.saturating_add(1);
+            Err(NetworkError::Io {
+                operation: "test forward".to_string(),
+                detail: "forward attempted".to_string(),
+            })
+        }
+    }
+
+    fn forward_test_state(
+        local_is_voter: bool,
+    ) -> (sinomo_testdir::TestDir, ClusterBootstrapState) {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-kv-forward");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_kv_forward").expect("cluster id");
+        let local = NodeId::from_legacy_named("node_kv_forward_local").expect("local node");
+        let remote = NodeId::from_legacy_named("node_kv_forward_remote").expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "kv forward",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        if !local_is_voter {
+            state.members[0] = ClusterMemberRecord::local_non_voting(
+                cluster_id.clone(),
+                local,
+                "local",
+                "pk-local",
+                now,
+            );
+        }
+        state.members[0].capabilities =
+            vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("main daemon capability")];
+        state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+        let mut remote_member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        remote_member.capabilities =
+            vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("main daemon capability")];
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![sinomo_network::daemon_lan_endpoint(
+            &remote,
+            "10.0.0.2:21353".to_string(),
+            0,
+        )];
+        state.members.push(remote_member);
+        (root, state)
+    }
+
+    fn test_txn() -> KvTxn {
+        KvTxn {
+            compares: Vec::new(),
+            success: Vec::new(),
+            failure: Vec::new(),
+        }
+    }
+
+    fn forward_options() -> ClusterKvTxnForwardOptions {
+        ClusterKvTxnForwardOptions {
+            timeout: Duration::from_secs(1),
+            tcp_command_timeout: Duration::from_secs(1),
+            iroh_command_timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn voter_without_known_authority_does_not_forward_to_arbitrary_voter() {
+        let (root, state) = forward_test_state(true);
+        let data_dir = sinomo_local::SinomoDataDir::new(root.path());
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let mut host = RecordingForwardHost {
+            known_authority: None,
+            calls: 0,
+        };
+
+        let forwarded = forward_cluster_kv_txn_to_state_authority_with_host(
+            &paths,
+            &state,
+            &test_txn(),
+            forward_options(),
+            &mut host,
+        )
+        .expect("forward decision");
+
+        assert!(forwarded.is_none());
+        assert_eq!(host.calls, 0);
+    }
+
+    #[test]
+    fn non_voter_without_known_authority_can_forward_to_voter() {
+        let (root, mut state) = forward_test_state(false);
+        state.members[0].state = ClusterMemberState::NonVoting;
+        let data_dir = sinomo_local::SinomoDataDir::new(root.path());
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let mut host = RecordingForwardHost {
+            known_authority: None,
+            calls: 0,
+        };
+
+        let forwarded = forward_cluster_kv_txn_to_state_authority_with_host(
+            &paths,
+            &state,
+            &test_txn(),
+            forward_options(),
+            &mut host,
+        );
+
+        assert!(matches!(
+            forwarded,
+            Err(NetworkError::ClusterReadOnly { .. })
+        ));
+        assert_eq!(host.calls, 1);
+    }
 }
