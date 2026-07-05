@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 
-const DFS_CLUSTER_STATUS_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const DFS_CLUSTER_STATUS_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+const DFS_SMOKE_DAEMON_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum DfsCliCommand {
@@ -1496,10 +1497,7 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             let data_dir = SinomoDataDir::from_env_or_home()?;
             data_dir.ensure_root_layout()?;
             let report = if let Some(status) = default_main_daemon_status()? {
-                run_dfs_smoke_via_daemon_address(
-                    &status.address,
-                    std::time::Duration::from_secs(120),
-                )?
+                run_dfs_smoke_via_daemon_address(&status.address, DFS_SMOKE_DAEMON_RPC_TIMEOUT)?
             } else {
                 run_local_dfs_smoke(&data_dir)?
             };
@@ -2531,33 +2529,55 @@ fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
         status: Some(local_status),
         error: None,
     }];
-    let remote_node_ids = state
-        .members
-        .iter()
-        .filter(|member| {
-            member.node_id != state.local_node_id
-                && member.state.is_authorized()
-                && member.capabilities.iter().any(|capability| {
-                    capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY
-                })
+    let remote_node_ids = dfs_cluster_status_remote_main_node_ids(&state);
+    let graph = sinomo_runtime::network::ClusterConnectivityGraph::try_read_for_local(
+        &cluster_paths,
+        &state,
+    )
+    .ok();
+    let routable_node_ids = sinomo_runtime::dfs::cluster_dfs_data_endpoints(&cluster_paths, &state)
+        .into_iter()
+        .filter(|endpoint| {
+            graph.as_ref().is_none_or(|graph| {
+                sinomo_runtime::network::cluster_healthy_route_next_hop(
+                    graph,
+                    &state.local_node_id,
+                    &endpoint.node_id,
+                )
+                .is_some()
+            })
         })
-        .map(|member| member.node_id.clone())
+        .map(|endpoint| endpoint.node_id)
         .collect::<std::collections::BTreeSet<_>>();
     trace_dfs_cluster_status(
         trace,
         started_at,
-        format_args!("remote probes={}", remote_node_ids.len()),
+        format_args!(
+            "remote candidates={} routable={}",
+            remote_node_ids.len(),
+            routable_node_ids.len()
+        ),
     );
     let remote_timeout = DFS_CLUSTER_STATUS_REMOTE_TIMEOUT;
     let mut probes = Vec::new();
     for node_id in remote_node_ids {
-        probes.push(spawn_dfs_status_probe(
-            &cluster_paths,
-            &state,
-            &node_id,
-            remote_timeout,
-            trace,
-        )?);
+        if routable_node_ids.contains(&node_id) {
+            probes.push(spawn_dfs_status_probe(
+                &cluster_paths,
+                &state,
+                &node_id,
+                remote_timeout,
+                trace,
+            )?);
+        } else {
+            nodes.push(DfsClusterNodeStatus {
+                node_id,
+                local: false,
+                endpoint: None,
+                status: None,
+                error: Some("no routable DFS data endpoint".to_string()),
+            });
+        }
     }
     for probe in probes {
         let node_id = probe.node_id.clone();
@@ -2584,6 +2604,23 @@ fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
         format_args!("complete nodes={}", nodes.len()),
     );
     Ok(DfsClusterStatusReport { nodes })
+}
+
+fn dfs_cluster_status_remote_main_node_ids(
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+) -> std::collections::BTreeSet<NodeId> {
+    state
+        .members
+        .iter()
+        .filter(|member| {
+            member.node_id != state.local_node_id
+                && member.state.is_authorized()
+                && member.capabilities.iter().any(|capability| {
+                    capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY
+                })
+        })
+        .map(|member| member.node_id.clone())
+        .collect()
 }
 
 struct DfsStatusProbe {

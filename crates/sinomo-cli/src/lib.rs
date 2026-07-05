@@ -4130,7 +4130,7 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 const DAEMON_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(60);
 const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
-const DAEMON_CLUSTER_KV_TXN_TIMEOUT: Duration = Duration::from_secs(15);
+const DAEMON_CLUSTER_KV_TXN_TIMEOUT: Duration = Duration::from_secs(8);
 const IROH_DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT: Duration = Duration::from_millis(1500);

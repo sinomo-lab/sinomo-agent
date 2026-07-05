@@ -33,7 +33,10 @@ use sinomo_dfs::{
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock, TryLockError};
+use std::sync::{
+    Arc, Mutex, OnceLock, TryLockError,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 #[cfg(test)]
 use time::OffsetDateTime;
@@ -52,6 +55,7 @@ const DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT: Duration =
 const DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT: Duration =
     sinomo_dfs::DEFAULT_DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT;
 const DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS: usize = 3;
+const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_secs(8);
 
 type DaemonDfsMessageService = NetworkedDfsService<DfsEndpointServedMessageTransport>;
 
@@ -93,6 +97,28 @@ static DAEMON_DFS_MESSAGE_SERVICE_CACHE: OnceLock<
     Mutex<BTreeMap<PathBuf, DaemonDfsMessageServiceCacheEntry>>,
 > = OnceLock::new();
 static DAEMON_DFS_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
+static DAEMON_DFS_SMOKE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug)]
+struct DaemonDfsSmokeInFlightGuard;
+
+impl DaemonDfsSmokeInFlightGuard {
+    fn acquire() -> Result<Self, DaemonError> {
+        DAEMON_DFS_SMOKE_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self)
+            .map_err(|_| DaemonError::Network {
+                address: "DFS smoke".to_string(),
+                detail: "DFS smoke is already running".to_string(),
+            })
+    }
+}
+
+impl Drop for DaemonDfsSmokeInFlightGuard {
+    fn drop(&mut self) {
+        DAEMON_DFS_SMOKE_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DaemonDfsPendingMaintenanceWork {
@@ -1017,13 +1043,15 @@ async fn run_daemon_dfs_smoke_async(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_dfs::DfsSmokeReport, DaemonError> {
+    let smoke_guard = DaemonDfsSmokeInFlightGuard::acquire()?;
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
     let options = DaemonRunOptions::default();
     let local_endpoint = format!("loopback://{}:{}", options.host, options.port);
     let runtime = runtime.clone();
-    let Some(report) = tokio::task::spawn_blocking(move || {
+    let smoke_task = tokio::task::spawn_blocking(move || {
+        let _smoke_guard = smoke_guard;
         sinomo_dfs::run_default_cluster_dfs_smoke_with_peer_transport(
             &data_dir,
             &cluster_paths,
@@ -1041,12 +1069,20 @@ async fn run_daemon_dfs_smoke_async(
                 smoke: sinomo_dfs::DfsSmokeOptions::default(),
             },
         )
-    })
-    .await
-    .map_err(|source| DaemonError::Network {
-        address: "DFS smoke".to_string(),
-        detail: format!("DFS smoke task failed: {source}"),
-    })??
+    });
+    let Some(report) = tokio::time::timeout(DAEMON_DFS_SMOKE_TIMEOUT, smoke_task)
+        .await
+        .map_err(|_| DaemonError::Network {
+            address: "DFS smoke".to_string(),
+            detail: format!(
+                "DFS smoke did not finish within {}ms",
+                DAEMON_DFS_SMOKE_TIMEOUT.as_millis()
+            ),
+        })?
+        .map_err(|source| DaemonError::Network {
+            address: "DFS smoke".to_string(),
+            detail: format!("DFS smoke task failed: {source}"),
+        })??
     else {
         return Err(DaemonError::ClusterOrphan);
     };
