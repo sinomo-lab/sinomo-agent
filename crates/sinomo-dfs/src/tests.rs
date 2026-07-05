@@ -10351,6 +10351,59 @@ fn remote_manifest_write_defers_failed_post_commit_fetch() {
 }
 
 #[test]
+fn remote_manifest_write_deferred_foreground_repair_skips_post_commit_fetch() {
+    let root = temp_root("remote-manifest-deferred-foreground-fetch");
+    let primary =
+        NodeId::from_legacy_named("node_remote_manifest_deferred_primary").expect("primary node");
+    let requester = NodeId::from_legacy_named("node_remote_manifest_deferred_requester")
+        .expect("requester node");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_remote_manifest_deferred_fetch").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(
+        FailingSendTransport {
+            local_node_id: primary.clone(),
+        },
+        content,
+    )
+    .with_metadata_backend(metadata)
+    .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let mut metadata = file_metadata(primary.clone());
+    metadata.object_id = object_id.clone();
+    metadata.version = version_1.clone();
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    dfs.add_object_metadata(metadata).expect("object");
+
+    let write = dfs
+        .write_distributed_eventual_from_remote_manifest_with_base(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id,
+                target_version: version_2,
+                requesting_node_id: requester.clone(),
+            },
+            Some(version_1),
+            content_hash(b"remote manifest deferred bytes"),
+            30,
+            vec![primary.clone(), requester],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+            false,
+        )
+        .expect("deferred foreground repair must not synchronously fetch a missing local copy");
+
+    let NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } = write else {
+        panic!("expected committed write with deferred repair, got {write:?}");
+    };
+    assert_eq!(repair_jobs.len(), 1);
+    assert_eq!(repair_jobs[0].missing_replica_node_id, primary);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn reader_write_can_defer_post_commit_replica_repair() {
     let root = temp_root("reader-write-defer-repair");
     let owner = NodeId::from_legacy_named("node_defer_repair_owner").expect("owner node");
