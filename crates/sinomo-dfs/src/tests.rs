@@ -5491,11 +5491,12 @@ fn smoke_driver_reports_local_commit_when_remote_replica_is_pending() {
 }
 
 #[test]
-fn smoke_driver_can_skip_foreground_remote_replica_repair() {
-    let root = temp_root("smoke-driver-skip-foreground-repair");
-    let local = NodeId::from_legacy_named("node_smoke_driver_skip_repair_local").expect("local");
+fn smoke_driver_can_use_local_only_foreground_profile() {
+    let root = temp_root("smoke-driver-local-only-foreground");
+    let local =
+        NodeId::from_legacy_named("node_smoke_driver_local_foreground_local").expect("local");
     let replica =
-        NodeId::from_legacy_named("node_smoke_driver_skip_repair_replica").expect("replica");
+        NodeId::from_legacy_named("node_smoke_driver_local_foreground_replica").expect("replica");
     let metadata =
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
             .expect("metadata backend");
@@ -5529,6 +5530,7 @@ fn smoke_driver_can_skip_foreground_remote_replica_repair() {
         &mut transport,
         DfsSmokeOptions {
             nonce: Some(112233),
+            remote_replica_candidates: false,
             foreground_replica_repair: false,
             publish_metadata: false,
             ..DfsSmokeOptions::default()
@@ -5536,11 +5538,8 @@ fn smoke_driver_can_skip_foreground_remote_replica_repair() {
     )
     .expect("smoke");
 
-    assert_eq!(
-        report.requested_replica_node_ids,
-        vec![local.clone(), replica]
-    );
-    assert_eq!(report.committed_replica_node_ids, vec![local]);
+    assert_eq!(report.requested_replica_node_ids, vec![local.clone()]);
+    assert_eq!(report.committed_replica_node_ids, vec![local.clone()]);
     assert_eq!(report.pending_repair_count, 1);
     assert_eq!(send_count.load(Ordering::Relaxed), 0);
     assert!(report.path.starts_with("/services/dfs-smoke/112233-"));

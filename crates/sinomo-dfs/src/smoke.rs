@@ -50,6 +50,7 @@ pub struct DfsSmokeAttempt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsSmokeOptions {
     pub nonce: Option<i128>,
+    pub remote_replica_candidates: bool,
     pub foreground_replica_repair: bool,
     pub publish_metadata: bool,
     pub metadata_replication: DfsMetadataJournalReplicationOptions,
@@ -59,6 +60,7 @@ impl Default for DfsSmokeOptions {
     fn default() -> Self {
         Self {
             nonce: None,
+            remote_replica_candidates: true,
             foreground_replica_repair: true,
             publish_metadata: true,
             metadata_replication: DfsMetadataJournalReplicationOptions::default(),
@@ -232,8 +234,11 @@ pub fn run_dfs_smoke_with_host<T: DfsMessageTransport>(
     metadata_transport: &mut dyn DfsMetadataJournalReplicationTransport,
     options: DfsSmokeOptions,
 ) -> Result<DfsSmokeReport, DfsError> {
-    let replica_candidate_sets =
-        dfs_smoke_replica_candidate_sets(local_node_id, content_node_ids, routable_node_ids);
+    let replica_candidate_sets = if options.remote_replica_candidates {
+        dfs_smoke_replica_candidate_sets(local_node_id, content_node_ids, routable_node_ids)
+    } else {
+        vec![vec![local_node_id.clone()]]
+    };
     let smoke_directory = dfs_smoke_directory(local_node_id, &metadata_shards);
     service
         .bootstrap_distributed_sifs()
