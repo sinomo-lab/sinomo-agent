@@ -680,8 +680,31 @@ pub(crate) fn try_cluster_raft_command_targets_impl(
         .node_statuses()
         .unwrap_or_default();
     let mut endpoints_by_node = EndpointByNodeIndex::default();
-    let mut command_targets =
-        try_cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)?;
+    let mut command_targets = Vec::new();
+    let main_daemon_node_ids = collect_remote_main_daemon_node_ids(state)?;
+    for node_id in graph.healthy_targets(&state.local_node_id) {
+        if !main_daemon_node_ids.contains(&node_id) {
+            continue;
+        }
+        let Some(endpoint) =
+            graph.best_healthy_endpoint_matching(&state.local_node_id, &node_id, |endpoint| {
+                cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
+            })
+        else {
+            continue;
+        };
+        crate::object::try_reserve_vec(
+            &mut command_targets,
+            1,
+            "collect healthy raft endpoint targets",
+        )?;
+        command_targets.push(endpoint);
+    }
+    command_targets.extend(try_cluster_sync_targets_with_connectivity_context(
+        state,
+        &graph,
+        &node_statuses,
+    )?);
     append_cluster_kv_main_daemon_endpoints(paths, state, &mut command_targets)?;
     for endpoint in command_targets {
         if !cluster_endpoint_can_carry_main_daemon_rpc(&endpoint) {
@@ -1967,6 +1990,78 @@ mod tests {
                 .iter()
                 .any(|endpoint| endpoint.address == "129.146.106.76:21353"),
             "the static public endpoint remains available as a fallback"
+        );
+    }
+
+    #[test]
+    fn raft_targets_seed_healthy_observed_public_endpoint_before_unobserved_lan() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-raft-healthy-public-endpoint");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_raft_healthy_public_endpoint")
+            .expect("cluster id");
+        let local =
+            NodeId::from_legacy_named("node_raft_healthy_public_local").expect("local node");
+        let remote =
+            NodeId::from_legacy_named("node_raft_healthy_public_remote").expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "raft healthy public endpoint",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let lan_endpoint =
+            selector_test_endpoint(&remote, "10.0.0.41:21353", ClusterEndpointPrivacy::Lan, 0);
+        let public_endpoint = selector_test_endpoint(
+            &remote,
+            "129.146.106.76:21353",
+            ClusterEndpointPrivacy::InternetDirect,
+            10,
+        );
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
+        member.endpoints = vec![lan_endpoint];
+        state.members.push(member);
+        let connectivity = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &public_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(50),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            60,
+        );
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            &[connectivity],
+        )
+        .expect("write local connectivity");
+
+        let targets =
+            try_cluster_raft_member_replication_targets_impl(&paths, &state).expect("raft targets");
+
+        assert_eq!(
+            targets.first().map(|endpoint| endpoint.address.as_str()),
+            Some("129.146.106.76:21353")
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|endpoint| endpoint.address == "10.0.0.41:21353"),
+            "the static LAN endpoint remains available as a fallback"
         );
     }
 }

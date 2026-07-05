@@ -1,6 +1,6 @@
 use crate::connectivity::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityRecordQuery,
-    cluster_network_record_live,
+    ClusterConnectivityState, cluster_network_record_live,
 };
 use crate::connectivity_store::{
     local_cluster_connectivity_content_generation, read_local_cluster_connectivity_records,
@@ -365,9 +365,10 @@ where
         .filter(|record| {
             cluster_id.is_none_or(|cluster_id| record.cluster_id == *cluster_id)
                 && cluster_network_record_live(record.expires_at, now)
-                && live_endpoint_index
-                    .as_ref()
-                    .is_none_or(|index| index.record_targets_live_endpoint(record))
+                && (record.state != ClusterConnectivityState::Unreachable
+                    || live_endpoint_index
+                        .as_ref()
+                        .is_none_or(|index| index.record_targets_live_endpoint(record)))
         })
     {
         crate::object::try_reserve_vec(&mut local_records, 1, "collect local route graph records")?;
