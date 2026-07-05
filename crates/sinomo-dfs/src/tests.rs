@@ -1851,7 +1851,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     assert_eq!(message_request.category, DFS_RPC_CATEGORY);
     assert_eq!(
         sinomo_core::network::object_rpc_request_stream_mode(&message_request),
-        sinomo_core::network::ObjectRpcRequestStreamMode::ReuseDaemonStream
+        sinomo_core::network::ObjectRpcRequestStreamMode::Buffered
     );
     assert_eq!(
         message_request

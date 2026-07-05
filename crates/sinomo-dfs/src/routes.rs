@@ -369,10 +369,6 @@ pub fn dfs_message_rpc_request(
     let mut request =
         ObjectRpcRequest::encode_body(dfs_message_route(command), DFS_RPC_CATEGORY, command)?;
     request.ensure_trace_context();
-    sinomo_core::network::set_object_rpc_request_stream_mode(
-        &mut request,
-        sinomo_core::network::ObjectRpcRequestStreamMode::ReuseDaemonStream,
-    );
     Ok(request)
 }
 
