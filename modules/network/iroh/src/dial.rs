@@ -9,158 +9,239 @@
 //! whose response read failed on a peer close.
 
 use crate::frames::{IrohProxyByteBudget, read_proxy_frame_async, write_all_frame_async};
-use crate::proxy::{IROH_ROAMING_PROTOCOL, IrohEndpointCloseGuard, sinomo_iroh_endpoint_builder};
+use crate::proxy::{IROH_ROAMING_PROTOCOL, sinomo_iroh_endpoint_builder};
 use sinomo_core::network::{
     CLUSTER_HEALTH_ROUTE, DaemonControlRequest, DaemonRpcTimeouts, IROH_DAEMON_COMMAND_MAX_BYTES,
     IrohEndpointRecord, NetworkError, decode_single_object_frame_from_slice,
     iroh_endpoint_record_from_address,
 };
 use sinomo_core::node::{ClusterId, NodeId};
+use std::collections::HashMap;
 use std::time::Duration;
 
 const IROH_DAEMON_RPC_MAX_ATTEMPTS: usize = 3;
 const IROH_DAEMON_RPC_RETRY_INITIAL: Duration = Duration::from_millis(40);
 const IROH_DAEMON_RPC_RETRY_MAX: Duration = Duration::from_millis(250);
 
+/// Long-lived client side of the Iroh daemon transport.
+///
+/// One module instance owns one Iroh endpoint and one cached connection per
+/// remote endpoint public key. Each daemon RPC gets its own bidirectional
+/// stream on the cached connection; broken connections are evicted so normal
+/// retry/recovery can reconnect.
+#[derive(Default)]
+pub struct IrohDaemonDialer {
+    endpoint: tokio::sync::Mutex<Option<iroh::Endpoint>>,
+    connections: tokio::sync::Mutex<HashMap<String, CachedIrohConnection>>,
+}
+
+struct CachedIrohConnection {
+    connection: iroh::endpoint::Connection,
+}
+
+impl IrohDaemonDialer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn dial_daemon_control_frame_async(
+        &self,
+        address: &str,
+        request_frame: &[u8],
+        timeouts: DaemonRpcTimeouts,
+    ) -> Result<Vec<u8>, NetworkError> {
+        let record = iroh_endpoint_record_from_address(
+            address,
+            &ClusterId::from_legacy_named("cluster_iroh_dial_placeholder")
+                .expect("static cluster id"),
+            &NodeId::from_legacy_named("node_iroh_dial_placeholder").expect("static node id"),
+        )?;
+        let remote_addr = iroh_endpoint_addr_from_record(&record)?;
+        let cache_key = iroh_daemon_connection_cache_key(&record);
+        // Retry-safety needs the typed route; an undecodable frame is treated as
+        // not retry-safe after the request may have been accepted.
+        let request: Option<DaemonControlRequest> =
+            decode_single_object_frame_from_slice(request_frame, IROH_DAEMON_COMMAND_MAX_BYTES)
+                .ok();
+        let mut attempt = 0_usize;
+        loop {
+            attempt += 1;
+            match dial_iroh_daemon_control_frame_attempt_async(
+                self,
+                &cache_key,
+                address,
+                remote_addr.clone(),
+                request_frame,
+                timeouts,
+            )
+            .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    let retry =
+                        iroh_daemon_control_attempt_should_retry(request.as_ref(), &error, attempt);
+                    let error = error.into_network_error();
+                    if !retry {
+                        return Err(error);
+                    }
+                    let Some(delay) =
+                        iroh_daemon_rpc_retry_delay_with_budget(attempt, timeouts.connect_timeout)
+                    else {
+                        return Err(error);
+                    };
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        let connections = {
+            let mut guard = self.connections.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        for cached in connections.into_values() {
+            cached.connection.close(0_u8.into(), b"module shutdown");
+        }
+        if let Some(endpoint) = self.endpoint.lock().await.take() {
+            endpoint.close().await;
+        }
+    }
+
+    async fn endpoint(&self, timeouts: DaemonRpcTimeouts) -> Result<iroh::Endpoint, NetworkError> {
+        let mut guard = self.endpoint.lock().await;
+        if let Some(endpoint) = guard.as_ref()
+            && !endpoint.is_closed()
+        {
+            return Ok(endpoint.clone());
+        }
+        let bind = async {
+            sinomo_iroh_endpoint_builder()
+                .map_err(|source| source.to_string())?
+                .bind()
+                .await
+                .map_err(|source| source.to_string())
+        };
+        let endpoint = if let Some(connect_timeout) = timeouts.connect_timeout {
+            match tokio::time::timeout(connect_timeout, bind).await {
+                Ok(Ok(endpoint)) => endpoint,
+                Ok(Err(source)) => {
+                    return Err(NetworkError::Io {
+                        operation: "bind iroh client endpoint".to_string(),
+                        detail: source.to_string(),
+                    });
+                }
+                Err(_) => return Err(iroh_daemon_command_timeout_error(connect_timeout)),
+            }
+        } else {
+            match bind.await {
+                Ok(endpoint) => endpoint,
+                Err(source) => {
+                    return Err(NetworkError::Io {
+                        operation: "bind iroh client endpoint".to_string(),
+                        detail: source.to_string(),
+                    });
+                }
+            }
+        };
+        if let Some(connect_timeout) = timeouts.connect_timeout {
+            let online_timeout = connect_timeout.min(Duration::from_millis(1000));
+            let _ = tokio::time::timeout(online_timeout, endpoint.online()).await;
+        }
+        *guard = Some(endpoint.clone());
+        Ok(endpoint)
+    }
+
+    async fn connection(
+        &self,
+        cache_key: &str,
+        _address: &str,
+        remote_addr: iroh::EndpointAddr,
+        timeouts: DaemonRpcTimeouts,
+    ) -> Result<iroh::endpoint::Connection, NetworkError> {
+        let mut connections = self.connections.lock().await;
+        if let Some(cached) = connections.get(cache_key) {
+            return Ok(cached.connection.clone());
+        }
+
+        let endpoint = self.endpoint(timeouts).await?;
+        let connect = endpoint.connect(remote_addr, IROH_ROAMING_PROTOCOL.as_bytes());
+        let connection = if let Some(connect_timeout) = timeouts.connect_timeout {
+            match tokio::time::timeout(connect_timeout, connect).await {
+                Ok(Ok(connection)) => connection,
+                Ok(Err(source)) => {
+                    return Err(NetworkError::Io {
+                        operation: "connect iroh endpoint".to_string(),
+                        detail: source.to_string(),
+                    });
+                }
+                Err(_) => return Err(iroh_daemon_command_timeout_error(connect_timeout)),
+            }
+        } else {
+            match connect.await {
+                Ok(connection) => connection,
+                Err(source) => {
+                    return Err(NetworkError::Io {
+                        operation: "connect iroh endpoint".to_string(),
+                        detail: source.to_string(),
+                    });
+                }
+            }
+        };
+        connections.insert(
+            cache_key.to_string(),
+            CachedIrohConnection {
+                connection: connection.clone(),
+            },
+        );
+        Ok(connection)
+    }
+
+    async fn evict_connection(&self, cache_key: &str, reason: &'static [u8]) {
+        let removed = self.connections.lock().await.remove(cache_key);
+        if let Some(cached) = removed {
+            cached.connection.close(0_u8.into(), reason);
+        }
+    }
+}
+
 /// Dials one daemon control request frame to an `iroh://` address and returns
 /// the raw response frame bytes.
+#[cfg(test)]
 pub async fn dial_iroh_daemon_control_frame_async(
     address: &str,
     request_frame: &[u8],
     timeouts: DaemonRpcTimeouts,
 ) -> Result<Vec<u8>, NetworkError> {
-    let record = iroh_endpoint_record_from_address(
-        address,
-        &ClusterId::from_legacy_named("cluster_iroh_dial_placeholder").expect("static cluster id"),
-        &NodeId::from_legacy_named("node_iroh_dial_placeholder").expect("static node id"),
-    )?;
-    let remote_addr = iroh_endpoint_addr_from_record(&record)?;
-    // Retry-safety needs the typed route; an undecodable frame is treated as
-    // not retry-safe after the request may have been accepted.
-    let request: Option<DaemonControlRequest> =
-        decode_single_object_frame_from_slice(request_frame, IROH_DAEMON_COMMAND_MAX_BYTES).ok();
-    let mut attempt = 0_usize;
-    loop {
-        attempt += 1;
-        match dial_iroh_daemon_control_frame_attempt_async(
-            remote_addr.clone(),
-            request_frame,
-            timeouts,
-        )
-        .await
-        {
-            Ok(response) => return Ok(response),
-            Err(error) => {
-                let retry =
-                    iroh_daemon_control_attempt_should_retry(request.as_ref(), &error, attempt);
-                let error = error.into_network_error();
-                if !retry {
-                    return Err(error);
-                }
-                let Some(delay) =
-                    iroh_daemon_rpc_retry_delay_with_budget(attempt, timeouts.connect_timeout)
-                else {
-                    return Err(error);
-                };
-                tokio::time::sleep(delay).await;
-            }
-        }
-    }
+    let dialer = IrohDaemonDialer::new();
+    let result = dialer
+        .dial_daemon_control_frame_async(address, request_frame, timeouts)
+        .await;
+    dialer.shutdown().await;
+    result
 }
 
 async fn dial_iroh_daemon_control_frame_attempt_async(
+    dialer: &IrohDaemonDialer,
+    cache_key: &str,
+    address: &str,
     remote_addr: iroh::EndpointAddr,
     request_frame: &[u8],
     timeouts: DaemonRpcTimeouts,
 ) -> Result<Vec<u8>, IrohDaemonControlAttemptError> {
-    let bind = async {
-        sinomo_iroh_endpoint_builder()
-            .map_err(|source| source.to_string())?
-            .bind()
-            .await
-            .map_err(|source| source.to_string())
-    };
-    let endpoint = if let Some(connect_timeout) = timeouts.connect_timeout {
-        match tokio::time::timeout(connect_timeout, bind).await {
-            Ok(Ok(endpoint)) => endpoint,
-            Ok(Err(source)) => {
-                return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
-                    NetworkError::Io {
-                        operation: "bind iroh client endpoint".to_string(),
-                        detail: source.to_string(),
-                    },
-                ));
-            }
-            Err(_) => {
-                return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
-                    iroh_daemon_command_timeout_error(connect_timeout),
-                ));
-            }
-        }
-    } else {
-        match bind.await {
-            Ok(endpoint) => endpoint,
-            Err(source) => {
-                return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
-                    NetworkError::Io {
-                        operation: "bind iroh client endpoint".to_string(),
-                        detail: source.to_string(),
-                    },
-                ));
-            }
-        }
-    };
-    let endpoint = IrohEndpointCloseGuard::new(tokio::runtime::Handle::current(), endpoint);
-    if let Some(connect_timeout) = timeouts.connect_timeout {
-        let online_timeout = connect_timeout.min(Duration::from_millis(1000));
-        let _ = tokio::time::timeout(online_timeout, endpoint.endpoint().online()).await;
-    }
-
-    let connect = endpoint
-        .endpoint()
-        .connect(remote_addr, IROH_ROAMING_PROTOCOL.as_bytes());
-    let connection = if let Some(connect_timeout) = timeouts.connect_timeout {
-        match tokio::time::timeout(connect_timeout, connect).await {
-            Ok(Ok(connection)) => connection,
-            Ok(Err(source)) => {
-                endpoint.close().await;
-                return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
-                    NetworkError::Io {
-                        operation: "connect iroh endpoint".to_string(),
-                        detail: source.to_string(),
-                    },
-                ));
-            }
-            Err(_) => {
-                endpoint.close().await;
-                return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
-                    iroh_daemon_command_timeout_error(connect_timeout),
-                ));
-            }
-        }
-    } else {
-        match connect.await {
-            Ok(connection) => connection,
-            Err(source) => {
-                endpoint.close().await;
-                return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
-                    NetworkError::Io {
-                        operation: "connect iroh endpoint".to_string(),
-                        detail: source.to_string(),
-                    },
-                ));
-            }
-        }
-    };
+    let connection = dialer
+        .connection(cache_key, address, remote_addr, timeouts)
+        .await
+        .map_err(IrohDaemonControlAttemptError::BeforeRequestAccepted)?;
 
     let open = connection.open_bi();
     let (mut send, mut recv) = if let Some(connect_timeout) = timeouts.connect_timeout {
         match tokio::time::timeout(connect_timeout, open).await {
             Ok(Ok(streams)) => streams,
             Ok(Err(source)) => {
-                connection.close(0_u8.into(), b"open stream failed");
-                drop(connection);
-                endpoint.close().await;
+                dialer
+                    .evict_connection(cache_key, b"open stream failed")
+                    .await;
                 return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
                     NetworkError::Io {
                         operation: "open iroh daemon stream".to_string(),
@@ -169,9 +250,9 @@ async fn dial_iroh_daemon_control_frame_attempt_async(
                 ));
             }
             Err(_) => {
-                connection.close(0_u8.into(), b"open stream timed out");
-                drop(connection);
-                endpoint.close().await;
+                dialer
+                    .evict_connection(cache_key, b"open stream timed out")
+                    .await;
                 return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
                     iroh_daemon_command_timeout_error(connect_timeout),
                 ));
@@ -181,9 +262,9 @@ async fn dial_iroh_daemon_control_frame_attempt_async(
         match open.await {
             Ok(streams) => streams,
             Err(source) => {
-                connection.close(0_u8.into(), b"open stream failed");
-                drop(connection);
-                endpoint.close().await;
+                dialer
+                    .evict_connection(cache_key, b"open stream failed")
+                    .await;
                 return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
                     NetworkError::Io {
                         operation: "open iroh daemon stream".to_string(),
@@ -202,19 +283,15 @@ async fn dial_iroh_daemon_control_frame_attempt_async(
     )
     .await;
     if let Err(source) = write_result {
-        connection.close(0_u8.into(), b"write failed");
+        dialer.evict_connection(cache_key, b"write failed").await;
         drop(send);
         drop(recv);
-        drop(connection);
-        endpoint.close().await;
         return Err(IrohDaemonControlAttemptError::AfterRequestAccepted(source));
     }
     if let Err(source) = send.finish() {
-        connection.close(0_u8.into(), b"finish failed");
+        dialer.evict_connection(cache_key, b"finish failed").await;
         drop(send);
         drop(recv);
-        drop(connection);
-        endpoint.close().await;
         return Err(IrohDaemonControlAttemptError::AfterRequestAccepted(
             NetworkError::Io {
                 operation: "finish iroh daemon command".to_string(),
@@ -236,20 +313,19 @@ async fn dial_iroh_daemon_control_frame_attempt_async(
     {
         Ok((frame, _permit)) => frame,
         Err(error) => {
-            connection.close(0_u8.into(), b"read failed");
+            dialer.evict_connection(cache_key, b"read failed").await;
             drop(recv);
-            drop(connection);
-            endpoint.close().await;
             return Err(IrohDaemonControlAttemptError::AfterRequestAccepted(
                 iroh_daemon_response_frame_error(error),
             ));
         }
     };
-    connection.close(0_u8.into(), b"done");
     drop(recv);
-    drop(connection);
-    endpoint.close().await;
     Ok(response)
+}
+
+fn iroh_daemon_connection_cache_key(record: &IrohEndpointRecord) -> String {
+    record.endpoint_public_key.clone()
 }
 
 #[derive(Debug)]

@@ -255,11 +255,9 @@ fn deprioritize_endpoints_without_dialable_transport(endpoints: &mut [ClusterEnd
 /// module dialer.
 ///
 /// `module_transports` is `None` when no module registry is installed in
-/// this process (non-daemon tools reading routing state, unit tests). Iroh
-/// stays rankable there: the process is not the one dialing — a daemon with
-/// the module loaded is — so starving iroh paths would misrank evidence.
-/// Every daemon installs a registry before serving, so daemons always get
-/// the registry's answer.
+/// this process. That means module-owned transports are not dialable by this
+/// process; callers that only inspect routing evidence should use the raw
+/// connectivity graph instead of command endpoint candidates.
 fn cluster_endpoint_transport_is_dialable(
     transport: &ClusterTransportKind,
     module_transports: Option<&[ClusterTransportKind]>,
@@ -267,7 +265,7 @@ fn cluster_endpoint_transport_is_dialable(
     match transport {
         ClusterTransportKind::Loopback | ClusterTransportKind::LanTcp => true,
         ClusterTransportKind::Iroh => {
-            module_transports.is_none_or(|transports| transports.contains(transport))
+            module_transports.is_some_and(|transports| transports.contains(transport))
         }
         other => module_transports.is_some_and(|transports| transports.contains(other)),
     }

@@ -37,6 +37,7 @@ mod route;
 mod route_graph_read_model;
 mod rpc;
 mod rpc_future;
+mod tcp_tunnel;
 
 pub use connectivity::cluster_network_record_live;
 pub use connectivity::{
@@ -183,7 +184,6 @@ pub use rpc::{
 // Unconditional since stage C: dylib network modules reuse the object frame
 // codec through the sinomo-core facade.
 pub use object::read_object_frame_async;
-#[cfg(any(test, feature = "test-support"))]
 pub use object::write_object_frame_async;
 pub use object::{
     AsyncDaemonControlListener, AsyncDaemonControlStream, DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
@@ -214,7 +214,6 @@ pub use peer::{
 };
 pub use roaming::iroh_endpoint_record_from_address;
 pub use roaming::read_iroh_endpoint_record_async;
-#[cfg(any(test, feature = "test-support"))]
 pub use roaming::send_daemon_rpc_to_cluster_endpoint_async;
 pub use roaming::stable_iroh_endpoint_id;
 pub use roaming::{IROH_DAEMON_COMMAND_MAX_BYTES, IrohEndpointRecord, IrohRelayMode};
@@ -247,6 +246,11 @@ pub use rpc::{call_object_rpc_frame_async, serve_object_rpc_frame_async};
 pub use rpc_future::ClusterMembershipRpcFuture;
 #[cfg(any(test, feature = "test-support"))]
 pub use sinomo_node::upsert_member_record;
+pub use tcp_tunnel::{
+    CLUSTER_TCP_TUNNEL_OPEN_ROUTE, CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
+    CLUSTER_TCP_TUNNEL_RPC_CATEGORY, ClusterTcpTunnelFrame, ClusterTcpTunnelOpenRequest,
+    ClusterTcpTunnelOpenResponse,
+};
 
 pub type ClusterEndpointId = sinomo_base::Id;
 

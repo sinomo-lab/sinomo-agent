@@ -14,6 +14,7 @@ pub mod registry;
 mod rollout;
 mod service_adapter;
 mod status;
+mod tcp_tunnel;
 
 pub const DAEMON_RPC_CATEGORY: &str = "daemon";
 pub const DAEMON_STATUS_ROUTE: &str = "/daemon/status";

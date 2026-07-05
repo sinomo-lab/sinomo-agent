@@ -6,7 +6,6 @@
 
 use sinomo_runtime::cluster;
 use sinomo_runtime::core::{ClusterBootstrapState, ClusterMemberRecord};
-use sinomo_runtime::daemon::sign_daemon_rpc_request_for_local_node;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
@@ -144,8 +143,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                         nonce,
                         request,
                         runtime: runtime_handle.clone(),
-                        paths: cluster_paths.clone(),
-                        state: cluster_state.clone(),
                     });
                 }
             }
@@ -421,8 +418,6 @@ struct NetworkPingJob {
     response_payload_bytes: usize,
     request: network::ObjectRpcRequest,
     runtime: tokio::runtime::Handle,
-    paths: ClusterPaths,
-    state: Arc<ClusterBootstrapState>,
 }
 
 #[derive(Debug)]
@@ -452,18 +447,14 @@ async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
 }
 
 async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome {
-    let mut host = NetworkPingEndpointRpcHost;
-    let mut client = network::ClusterObjectRpcClient::routed(&mut host, &job.runtime, &job.paths);
-    let response = match client
-        .call_target(
-            &job.state,
-            &job.target_node_id,
-            &job.request,
-            network::ClusterObjectRpcOptions::new(network::DaemonRpcTimeouts::connect_and_idle(
-                job.timeout,
-            )),
-        )
-        .await
+    let response = match sinomo_runtime::daemon::send_dfs_object_rpc_to_target_async(
+        &job.target_node_id,
+        &job.request,
+        job.timeout,
+        &job.runtime,
+        true,
+    )
+    .await
     {
         Ok(response) => response,
         Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
@@ -498,28 +489,6 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
         ));
     }
     NetworkPingOutcome::Success
-}
-
-struct NetworkPingEndpointRpcHost;
-
-impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
-    fn sign_endpoint_rpc_request_async<'a>(
-        &'a mut self,
-        request: &'a network::ObjectRpcRequest,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
-        let request = request.clone();
-        Box::pin(async move {
-            sign_daemon_rpc_request_for_local_node(&request)
-                .map_err(|error| network_ping_network_error("cluster endpoint signing", error))
-        })
-    }
-}
-
-fn network_ping_network_error(operation: &str, error: impl ToString) -> network::NetworkError {
-    network::NetworkError::Io {
-        operation: operation.to_string(),
-        detail: error.to_string(),
-    }
 }
 
 fn optional_usize_parameter(

@@ -389,6 +389,10 @@ impl AsyncDaemonControlStream {
         Self { stream }
     }
 
+    pub fn into_inner(self) -> tokio::net::TcpStream {
+        self.stream
+    }
+
     pub fn peer_addr(&self) -> Result<SocketAddr, NetworkError> {
         self.stream.peer_addr().map_err(|source| NetworkError::Io {
             operation: "read async daemon control peer address".to_string(),

@@ -414,6 +414,12 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
+        route if route == sinomo_core::network::CLUSTER_TCP_TUNNEL_OPEN_ROUTE => matches!(
+            authenticated.signer,
+            DaemonSignerAuthority::Local
+                | DaemonSignerAuthority::Voter
+                | DaemonSignerAuthority::Member
+        ),
         _ => false,
     };
     if allowed {

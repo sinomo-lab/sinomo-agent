@@ -226,6 +226,7 @@ pub fn iroh_network_module_descriptor() -> NetworkModuleDescriptor {
 struct IrohNetworkModuleInstance {
     runtime: OnceLock<tokio::runtime::Runtime>,
     proxy: Mutex<Option<proxy::IrohDaemonProxy>>,
+    dialer: dial::IrohDaemonDialer,
 }
 
 impl IrohNetworkModuleInstance {
@@ -233,6 +234,7 @@ impl IrohNetworkModuleInstance {
         Self {
             runtime: OnceLock::new(),
             proxy: Mutex::new(None),
+            dialer: dial::IrohDaemonDialer::new(),
         }
     }
 
@@ -292,10 +294,11 @@ impl IrohNetworkModuleInstance {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
+        let runtime = self.runtime()?;
         if let Some(proxy) = proxy {
-            let runtime = self.runtime()?;
             runtime.block_on(proxy.shutdown());
         }
+        runtime.block_on(self.dialer.shutdown());
         Ok(())
     }
 
@@ -306,7 +309,7 @@ impl IrohNetworkModuleInstance {
         timeouts: DaemonRpcTimeouts,
     ) -> Result<Vec<u8>, NetworkError> {
         let runtime = self.runtime()?;
-        runtime.block_on(dial::dial_iroh_daemon_control_frame_async(
+        runtime.block_on(self.dialer.dial_daemon_control_frame_async(
             address,
             request_frame,
             timeouts,

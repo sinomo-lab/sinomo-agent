@@ -394,6 +394,16 @@ pub fn run_daemon_control_loop_with_services(
         runtime_tasks.push(("network module context", task));
     }
 
+    runtime_tasks.push((
+        "tcp tunnel maintenance",
+        crate::tcp_tunnel::start_tcp_tunnel_maintenance_task(
+            paths.clone(),
+            daemon_runtime_handle.clone(),
+            shutdown_rx.clone(),
+            label.to_string(),
+        ),
+    ));
+
     if label == "daemon" && crate::dfs::default_distributed_dfs_enabled() {
         let bootstrap_paths = paths.clone();
         let bootstrap_options = options.clone();
@@ -967,6 +977,18 @@ pub(crate) async fn handle_daemon_connection_async(
 
         if let Some(key) = replay_key.as_ref() {
             begin_daemon_dfs_message_replay(&paths, key);
+        }
+        if request.route == sinomo_core::network::CLUSTER_TCP_TUNNEL_OPEN_ROUTE {
+            crate::tcp_tunnel::accept_tcp_tunnel_connection_async(
+                stream,
+                paths,
+                service_runtime,
+                stream_address.clone(),
+                authenticated,
+                request,
+            )
+            .await?;
+            return Ok(false);
         }
         let rpc_request = Some(request);
         if let Some(request) = rpc_request.as_ref()

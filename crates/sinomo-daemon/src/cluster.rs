@@ -1456,7 +1456,8 @@ impl<'a> DaemonClusterJoinRegistrationHost<'a> {
         let runtime = runtime.clone();
         Self {
             runtime: runtime.clone(),
-            endpoint_rpc_host: DaemonSignedEndpointRpcAsyncHost::new(&runtime, true),
+            endpoint_rpc_host: DaemonSignedEndpointRpcAsyncHost::new(&runtime, true)
+                .with_paths(daemon_paths),
             driver: sinomo_core::cluster::ClusterJoinRegistrationDriver::new(
                 daemon_cluster_control_plane_driver_with_mode(DaemonClusterRpcMode::new(
                     runtime.clone(),
@@ -1834,7 +1835,7 @@ fn call_node_object_rpc_on_runtime(
         address: target_node_id.to_string(),
         detail: "cluster paths are unavailable for node object RPC".to_string(),
     })?;
-    let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, true);
+    let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, true).with_cluster_paths(&paths);
     let mut client =
         sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, &paths);
     block_on_cluster_network_future_on_owner_runtime(
@@ -3762,7 +3763,7 @@ async fn call_member_object_rpc_target_async(
     runtime: &tokio::runtime::Handle,
     operation: &str,
 ) -> Result<Option<sinomo_core::network::ObjectRpcResponse>, DaemonError> {
-    let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, true);
+    let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, true).with_cluster_paths(paths);
     let mut client =
         sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, paths);
     match client

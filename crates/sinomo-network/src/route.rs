@@ -1385,6 +1385,15 @@ fn cluster_delivery_local_endpoint_is_usable(
         return false;
     }
     cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
+        && cluster_delivery_endpoint_transport_is_dialable(&endpoint.transport)
+}
+
+fn cluster_delivery_endpoint_transport_is_dialable(transport: &ClusterTransportKind) -> bool {
+    match transport {
+        ClusterTransportKind::Loopback | ClusterTransportKind::LanTcp => true,
+        other => crate::network_module::network_module_registry()
+            .is_some_and(|registry| registry.enabled_dialer_transports().contains(other)),
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]

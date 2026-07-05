@@ -1,5 +1,5 @@
 use crate::{
-    DaemonError, DaemonStatus, daemon_rpc_body_sha256,
+    DaemonError, DaemonPaths, DaemonStatus, daemon_rpc_body_sha256,
     sign_daemon_rpc_request_digest_for_local_node, sign_daemon_rpc_request_for_local_node,
 };
 use sinomo_config::{
@@ -389,7 +389,8 @@ async fn send_daemon_rpc_to_target_async_with_connectivity_observation(
         detail: "cluster target RPC requires a local Sinomo data directory".to_string(),
     })?;
     let state = sinomo_core::cluster::read_cluster_state(&paths).map_err(DaemonError::from)?;
-    let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, observe_connectivity);
+    let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, observe_connectivity)
+        .with_cluster_paths(&paths);
     let mut client =
         sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, &paths);
     client
@@ -480,6 +481,7 @@ where
 pub(crate) struct DaemonSignedEndpointRpcAsyncHost {
     runtime: tokio::runtime::Handle,
     observe_connectivity: bool,
+    paths: Option<DaemonPaths>,
 }
 
 impl DaemonSignedEndpointRpcAsyncHost {
@@ -487,6 +489,7 @@ impl DaemonSignedEndpointRpcAsyncHost {
         Self {
             runtime: runtime.clone(),
             observe_connectivity,
+            paths: None,
         }
     }
 
@@ -494,7 +497,18 @@ impl DaemonSignedEndpointRpcAsyncHost {
         Self {
             runtime: runtime.clone(),
             observe_connectivity: false,
+            paths: None,
         }
+    }
+
+    pub(crate) fn with_paths(mut self, paths: &DaemonPaths) -> Self {
+        self.paths = Some(paths.clone());
+        self
+    }
+
+    pub(crate) fn with_cluster_paths(mut self, paths: &sinomo_core::network::ClusterPaths) -> Self {
+        self.paths = daemon_paths_from_cluster_paths(paths);
+        self
     }
 }
 
@@ -730,11 +744,16 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEnd
             return Box::pin(async { Ok(()) });
         }
         let runtime = self.runtime.clone();
+        let paths = self
+            .paths
+            .as_ref()
+            .and_then(|paths| crate::cluster::cluster_paths_from_daemon_paths(paths).ok());
         Box::pin(async move {
             let (connectivity_state, latency_ms, bypass_failure_grace) =
                 daemon_rpc_connectivity_observation(observation);
-            remember_endpoint_command_connectivity_from_env_async(
+            remember_endpoint_command_connectivity_async(
                 runtime,
+                paths,
                 endpoint.clone(),
                 connectivity_state,
                 latency_ms,
@@ -744,6 +763,49 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEnd
             Ok(())
         })
     }
+
+    fn send_signed_endpoint_rpc_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        auth: &'a [u8],
+        request: &'a ObjectRpcRequest,
+        timeouts: sinomo_core::network::DaemonRpcTimeouts,
+    ) -> sinomo_core::network::ClusterSignedEndpointRpcFuture<
+        'a,
+        sinomo_core::network::ObjectRpcResponse,
+    > {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            if let Some(result) = crate::tcp_tunnel::send_signed_endpoint_rpc_via_tcp_tunnel(
+                endpoint,
+                auth,
+                request,
+                timeouts,
+                &runtime,
+                self.paths.as_ref(),
+            )
+            .await
+            {
+                return result;
+            }
+            sinomo_core::network::send_daemon_rpc_to_cluster_endpoint_async(
+                endpoint,
+                Some(auth),
+                request,
+                timeouts,
+            )
+            .await
+        })
+    }
+}
+
+fn daemon_paths_from_cluster_paths(
+    paths: &sinomo_core::network::ClusterPaths,
+) -> Option<DaemonPaths> {
+    let data_dir = paths.root.parent()?;
+    Some(DaemonPaths::new(&sinomo_core::local::SinomoDataDir::new(
+        data_dir,
+    )))
 }
 
 fn daemon_rpc_connectivity_observation(
@@ -780,14 +842,15 @@ fn daemon_rpc_connectivity_observation(
     }
 }
 
-async fn remember_endpoint_command_connectivity_from_env_async(
+async fn remember_endpoint_command_connectivity_async(
     runtime: tokio::runtime::Handle,
+    paths: Option<sinomo_core::network::ClusterPaths>,
     endpoint: ClusterEndpointRecord,
     connectivity_state: sinomo_core::network::ClusterConnectivityState,
     latency_ms: Option<u64>,
     bypass_failure_grace: bool,
 ) {
-    let Some(paths) = cluster_paths_from_env() else {
+    let Some(paths) = paths.or_else(cluster_paths_from_env) else {
         return;
     };
     let _ = runtime
