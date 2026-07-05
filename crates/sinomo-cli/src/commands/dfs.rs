@@ -2274,7 +2274,7 @@ fn run_local_dfs_smoke(
         control_plane,
         sinomo_runtime::dfs::DfsDefaultClusterSmokeOptions {
             bootstrap: sinomo_runtime::dfs::DfsDefaultClusterBootstrapOptions {
-                publish_cluster_control: true,
+                publish_cluster_control: false,
                 local_endpoint,
             },
             smoke: foreground_dfs_smoke_options(),

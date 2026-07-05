@@ -1075,7 +1075,7 @@ async fn run_daemon_dfs_smoke_async(
             daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(&runtime)),
             DfsDefaultClusterSmokeOptions {
                 bootstrap: DfsDefaultClusterBootstrapOptions {
-                    publish_cluster_control: true,
+                    publish_cluster_control: false,
                     local_endpoint,
                 },
                 smoke: daemon_dfs_smoke_options(),
