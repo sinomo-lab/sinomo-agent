@@ -935,16 +935,36 @@ pub(crate) fn try_cluster_dfs_data_targets_impl(
     let node_statuses = cluster_directory_for(paths)
         .node_statuses()
         .unwrap_or_default();
-    let mut targets =
-        try_cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)?;
     let main_daemon_node_ids = collect_remote_main_daemon_node_ids(state)?;
-    append_cluster_kv_main_daemon_endpoints(paths, state, &mut targets)?;
-    targets.retain(|endpoint| {
+    let mut targets = Vec::new();
+    let mut seen = EndpointRouteKeySet::default();
+
+    for node_id in graph.healthy_targets(&state.local_node_id) {
+        if !main_daemon_node_ids.contains(&node_id) {
+            continue;
+        }
+        let Some(endpoint) =
+            graph.best_healthy_endpoint_matching(&state.local_node_id, &node_id, |endpoint| {
+                dfs_data_endpoint_is_usable_for_main_daemon(&main_daemon_node_ids, endpoint)
+            })
+        else {
+            continue;
+        };
+        push_unique_cluster_endpoint(&mut targets, &mut seen, &endpoint)?;
+    }
+
+    let mut fallback_targets =
+        try_cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)?;
+    append_cluster_kv_main_daemon_endpoints(paths, state, &mut fallback_targets)?;
+    fallback_targets.retain(|endpoint| {
         dfs_data_endpoint_is_usable_for_main_daemon(&main_daemon_node_ids, endpoint)
     });
-    targets.sort_by(|left, right| {
+    fallback_targets.sort_by(|left, right| {
         cluster_sync_targets_with_connectivity_cmp(&graph, &node_statuses, left, right)
     });
+    for endpoint in fallback_targets {
+        push_unique_cluster_endpoint(&mut targets, &mut seen, &endpoint)?;
+    }
     try_prefer_bounded_daemon_command_targets(targets)
 }
 
@@ -1848,4 +1868,105 @@ fn cluster_sync_endpoint_cmp(
             right.priority,
             right.address.as_str(),
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ClusterEndpointId;
+    use sinomo_base::ClusterEndpointSource;
+    use sinomo_local::SinomoDataDir;
+    use sinomo_node::ClusterId;
+    use time::OffsetDateTime;
+
+    fn selector_test_endpoint(
+        node_id: &NodeId,
+        address: &str,
+        privacy: ClusterEndpointPrivacy,
+        priority: u16,
+    ) -> ClusterEndpointRecord {
+        ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::derived(
+                "sinomo.selector.test.endpoint",
+                format!("selector_test_{}\0{address}", node_id.as_str()),
+            ),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: address.to_string(),
+            source: ClusterEndpointSource::Observed,
+            privacy,
+            priority,
+            last_observed_latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn dfs_data_targets_seed_healthy_observed_endpoint_before_public_fallback() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-dfs-data-healthy-endpoint");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_dfs_data_healthy_endpoint").expect("cluster id");
+        let local = NodeId::from_legacy_named("node_dfs_data_healthy_local").expect("local node");
+        let remote =
+            NodeId::from_legacy_named("node_dfs_data_healthy_remote").expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "dfs data healthy endpoint",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let public_endpoint = selector_test_endpoint(
+            &remote,
+            "129.146.106.76:21353",
+            ClusterEndpointPrivacy::InternetDirect,
+            0,
+        );
+        let lan_endpoint =
+            selector_test_endpoint(&remote, "10.0.0.41:21353", ClusterEndpointPrivacy::Lan, 10);
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
+        member.endpoints = vec![public_endpoint, lan_endpoint.clone()];
+        state.members.push(member);
+        let connectivity = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &lan_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(3),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            60,
+        );
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            &[connectivity],
+        )
+        .expect("write local connectivity");
+
+        let targets = try_cluster_dfs_data_targets_impl(&paths, &state).expect("dfs data targets");
+
+        assert_eq!(
+            targets.first().map(|endpoint| endpoint.address.as_str()),
+            Some("10.0.0.41:21353")
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|endpoint| endpoint.address == "129.146.106.76:21353"),
+            "the static public endpoint remains available as a fallback"
+        );
+    }
 }

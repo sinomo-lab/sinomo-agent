@@ -1324,6 +1324,62 @@ fn dfs_service_endpoint_for_member_ignores_shadow_daemon_endpoints() {
 }
 
 #[test]
+fn dfs_service_endpoint_for_member_prefers_healthy_lan_endpoint_over_public() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_service_endpoint_healthy_lan")
+            .expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_dfs_service_endpoint_healthy_lan_local").expect("local");
+    let remote =
+        NodeId::from_legacy_named("node_dfs_service_endpoint_healthy_lan_remote").expect("remote");
+    let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "dfs service endpoint healthy lan",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let mut public_endpoint = test_endpoint(&remote, "129.146.106.76:21353");
+    public_endpoint.privacy = ClusterEndpointPrivacy::InternetDirect;
+    public_endpoint.priority = 0;
+    let lan_endpoint = test_endpoint(&remote, "10.0.0.41:21353");
+    let mut member = sinomo_core::ClusterMemberRecord::local_voter(
+        cluster_id,
+        remote,
+        "remote",
+        "pk-remote",
+        now,
+    );
+    member.endpoints = vec![public_endpoint, lan_endpoint.clone()];
+    state.members.push(member.clone());
+    let graph = sinomo_core::network::ClusterConnectivityGraph::from_records(
+        local,
+        vec![sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &lan_endpoint,
+            sinomo_core::network::ClusterConnectivityState::Healthy,
+            Some(3),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            60,
+        )],
+    );
+
+    let endpoint = crate::default_cluster::dfs_service_endpoint_for_member_with_graph(
+        &state,
+        &member,
+        "loopback://127.0.0.1:21353",
+        Some(&graph),
+    );
+
+    assert_eq!(endpoint, "10.0.0.41:21353");
+}
+
+#[test]
 fn adaptive_chunk_window_scales_by_profile_and_object_size() {
     let large_object = 64 * 1024 * 1024;
     let byte_budget_window =

@@ -54,6 +54,14 @@ pub struct DfsDefaultClusterBootstrapReport {
 }
 
 pub trait DfsDefaultClusterBootstrapHost {
+    fn connectivity_graph(
+        &self,
+        state: &ClusterBootstrapState,
+    ) -> Option<ClusterConnectivityGraph> {
+        let _ = state;
+        None
+    }
+
     fn metadata_service_node_ids(
         &self,
         state: &ClusterBootstrapState,
@@ -110,6 +118,14 @@ pub type DfsDefaultClusterBootstrapFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, DfsError>> + Send + 'a>>;
 
 pub trait DfsDefaultClusterAsyncBootstrapHost: Send {
+    fn connectivity_graph(
+        &self,
+        state: &ClusterBootstrapState,
+    ) -> Option<ClusterConnectivityGraph> {
+        let _ = state;
+        None
+    }
+
     fn metadata_service_node_ids(
         &self,
         state: &ClusterBootstrapState,
@@ -250,6 +266,13 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
 }
 
 impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHost {
+    fn connectivity_graph(
+        &self,
+        state: &ClusterBootstrapState,
+    ) -> Option<ClusterConnectivityGraph> {
+        ClusterConnectivityGraph::try_read_for_local(&self.cluster_paths, state).ok()
+    }
+
     fn metadata_service_node_ids(
         &self,
         state: &ClusterBootstrapState,
@@ -374,6 +397,13 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
 }
 
 impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncBootstrapHost {
+    fn connectivity_graph(
+        &self,
+        state: &ClusterBootstrapState,
+    ) -> Option<ClusterConnectivityGraph> {
+        ClusterConnectivityGraph::try_read_for_local(&self.cluster_paths, state).ok()
+    }
+
     fn metadata_service_node_ids(
         &self,
         state: &ClusterBootstrapState,
@@ -1169,6 +1199,15 @@ pub fn dfs_service_endpoint_for_member(
     member: &ClusterMemberRecord,
     local_endpoint: &str,
 ) -> String {
+    dfs_service_endpoint_for_member_with_graph(state, member, local_endpoint, None)
+}
+
+pub(crate) fn dfs_service_endpoint_for_member_with_graph(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    local_endpoint: &str,
+    graph: Option<&ClusterConnectivityGraph>,
+) -> String {
     if member.node_id == state.local_node_id {
         return local_endpoint.to_string();
     }
@@ -1179,7 +1218,7 @@ pub fn dfs_service_endpoint_for_member(
         .filter(|endpoint| {
             sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
         })
-        .min_by_key(|endpoint| dfs_service_endpoint_rank(endpoint))
+        .min_by_key(|endpoint| dfs_service_endpoint_route_rank(graph, endpoint))
         .or_else(|| {
             member
                 .endpoints
@@ -1187,10 +1226,24 @@ pub fn dfs_service_endpoint_for_member(
                 .filter(|endpoint| {
                     sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
                 })
-                .min_by_key(|endpoint| dfs_service_endpoint_rank(endpoint))
+                .min_by_key(|endpoint| dfs_service_endpoint_route_rank(graph, endpoint))
         })
         .map(|endpoint| endpoint.address.clone())
         .unwrap_or_else(|| format!("cluster-member://{}", member.node_id))
+}
+
+fn dfs_service_endpoint_route_rank(
+    graph: Option<&ClusterConnectivityGraph>,
+    endpoint: &ClusterEndpointRecord,
+) -> (u8, u8, u16, String) {
+    let connectivity_rank = match graph.and_then(|graph| graph.state_for_endpoint(endpoint)) {
+        Some(sinomo_core::network::ClusterConnectivityState::Healthy) => 0,
+        Some(sinomo_core::network::ClusterConnectivityState::Degraded) => 1,
+        None => 2,
+        Some(sinomo_core::network::ClusterConnectivityState::Unreachable) => 3,
+    };
+    let (privacy_rank, priority, address) = dfs_service_endpoint_rank(endpoint);
+    (connectivity_rank, privacy_rank, priority, address)
 }
 
 pub fn dfs_service_endpoint_rank(endpoint: &ClusterEndpointRecord) -> (u8, u16, String) {
@@ -1208,8 +1261,14 @@ fn publish_dfs_service_advertisements_with_host(
     state: &ClusterBootstrapState,
     local_endpoint: &str,
 ) -> Result<(), DfsError> {
+    let graph = host.connectivity_graph(state);
     for member in dfs_service_members(state) {
-        let endpoint = dfs_service_endpoint_for_member(state, member, local_endpoint);
+        let endpoint = dfs_service_endpoint_for_member_with_graph(
+            state,
+            member,
+            local_endpoint,
+            graph.as_ref(),
+        );
         let metadata_key = metadata_service_key(&member.node_id);
         let content_key = content_service_key(&member.node_id);
         let metadata = stable_dfs_advertisement(
@@ -1233,8 +1292,14 @@ async fn publish_dfs_service_advertisements_with_async_host(
     state: &ClusterBootstrapState,
     local_endpoint: &str,
 ) -> Result<(), DfsError> {
+    let graph = host.connectivity_graph(state);
     for member in dfs_service_members(state) {
-        let endpoint = dfs_service_endpoint_for_member(state, member, local_endpoint);
+        let endpoint = dfs_service_endpoint_for_member_with_graph(
+            state,
+            member,
+            local_endpoint,
+            graph.as_ref(),
+        );
         let metadata_key = metadata_service_key(&member.node_id);
         let content_key = content_service_key(&member.node_id);
         let metadata = stable_dfs_advertisement_async(
