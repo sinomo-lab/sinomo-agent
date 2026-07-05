@@ -1,6 +1,7 @@
 # Android APK builder for sinomo-app.
 #
-# Build the debug APK from the app checkout:
+# Build the small debug APK from the app checkout. The default build uses the
+# android-debug-small profile and the aarch64 Android ABI.
 #
 #   HOST_UID=$(id -u) HOST_GID=$(id -g) \
 #     docker compose -f docker/docker-compose.android.yml run --build --rm android-apk

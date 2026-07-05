@@ -73,6 +73,11 @@ opt-level = 2
 [profile.dev.package."*"]
 opt-level = 2
 
+[profile.android-debug-small]
+inherits = "dev"
+debug = 0
+strip = "debuginfo"
+
 [patch.crates-io]
 virtual-fs = { path = "modules/sandbox/wasix/vendor/virtual-fs" }
 wasmer-compiler = { path = "modules/sandbox/wasix/vendor/wasmer-compiler" }
