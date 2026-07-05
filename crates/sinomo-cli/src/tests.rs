@@ -12241,6 +12241,86 @@ fn daemon_rollout_build_imports_source_bundle_before_building() {
 }
 
 #[test]
+fn daemon_rollout_build_skips_bundle_import_when_source_head_matches() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-build-bundle-skip");
+    let rollout_paths = SelfRolloutPaths::new(&root);
+    let source_repo = rollout_paths.source_repo.clone();
+    std::fs::create_dir_all(&source_repo).expect("source repo dir");
+    assert!(
+        Command::new("git")
+            .arg("init")
+            .current_dir(&source_repo)
+            .status()
+            .expect("git init")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["config", "user.email", "test@example.invalid"])
+            .current_dir(&source_repo)
+            .status()
+            .expect("git config email")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["config", "user.name", "Sinomo Test"])
+            .current_dir(&source_repo)
+            .status()
+            .expect("git config name")
+            .success()
+    );
+    std::fs::write(source_repo.join("README.md"), "already imported\n").expect("readme");
+    assert!(
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&source_repo)
+            .status()
+            .expect("git add")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["commit", "-m", "managed-source"])
+            .current_dir(&source_repo)
+            .status()
+            .expect("git commit")
+            .success()
+    );
+    let expected_head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&source_repo)
+        .output()
+        .expect("git rev-parse");
+    assert!(expected_head.status.success());
+    let expected_head = String::from_utf8_lossy(&expected_head.stdout)
+        .trim()
+        .to_string();
+
+    let request = ClusterRolloutBuildRequest {
+        source: "test".to_string(),
+        remote_repo: None,
+        source_bundle: Some(b"not a git bundle".to_vec()),
+        source_head: Some(expected_head),
+        force_source_overwrite: false,
+        host: "127.0.0.1".to_string(),
+        port: 21_353,
+        shadow_port: 21_354,
+        requested_at: "now".to_string(),
+    };
+    let response =
+        handle_daemon_rollout_build_request(&DaemonPaths::with_root(root.join("daemon")), request)
+            .expect("build response");
+
+    assert_eq!(response.status, "rejected");
+    assert!(
+        response
+            .detail
+            .contains("remote source repo is not initialized")
+    );
+}
+
+#[test]
 fn rollout_main_activation_without_shadow_requires_staged_binary() {
     let root =
         sinomo_testdir::TestDir::new("sinomo-cli-rollout-main-shadow-bootstrap-staged-required");

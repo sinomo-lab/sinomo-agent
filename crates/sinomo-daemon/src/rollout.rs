@@ -3049,7 +3049,28 @@ pub fn handle_daemon_rollout_build_request(
         1,
         "remote build request received",
     )?;
-    let repo = if let Some(bundle_bytes) = request.source_bundle.as_deref() {
+    let repo = if let Some(expected_head) = request.source_head.as_deref()
+        && request.source_bundle.is_some()
+        && managed_source_status(&rollout_paths)
+            .ok()
+            .and_then(|status| status.head)
+            .as_deref()
+            .is_some_and(|current_head| source_heads_match(Some(current_head), expected_head))
+    {
+        write_cluster_rollout_progress(
+            paths,
+            &rollout_paths,
+            "in-progress",
+            "cluster-remote-build",
+            Some("managed source already matches requested head".to_string()),
+            &source,
+            &requested_at,
+            "preparing-source",
+            1,
+            "managed source already matches requested head",
+        )?;
+        rollout_paths.source_repo.clone()
+    } else if let Some(bundle_bytes) = request.source_bundle.as_deref() {
         write_cluster_rollout_progress(
             paths,
             &rollout_paths,
