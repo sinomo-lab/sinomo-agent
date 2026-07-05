@@ -35,6 +35,20 @@ impl ClusterKvTxnForwardOptions {
             _ => remaining.min(self.tcp_command_timeout),
         }
     }
+
+    pub(crate) fn attempt_timeout(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        remaining: Duration,
+        remaining_targets: usize,
+    ) -> Duration {
+        let target_count = remaining_targets.max(1).min(u32::MAX as usize) as u32;
+        let fair_share = remaining
+            .checked_div(target_count)
+            .unwrap_or(remaining)
+            .max(Duration::from_millis(1));
+        self.command_timeout(endpoint, remaining).min(fair_share)
+    }
 }
 
 pub trait ClusterKvTxnForwardHost {
@@ -83,7 +97,7 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + options.timeout;
-    for target in &targets {
+    for (index, target) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
@@ -98,7 +112,7 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
             state,
             target,
             txn,
-            options.command_timeout(target, remaining),
+            options.attempt_timeout(target, remaining, targets.len() - index),
             host,
         ) {
             Ok(response) => return Ok(Some(response)),
@@ -190,7 +204,7 @@ where
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + options.timeout;
-    for target in &targets {
+    for (index, target) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
@@ -204,7 +218,7 @@ where
         match forward_cluster_kv_txn_to_state_authority_endpoint_async_with_host(
             target,
             txn,
-            options.command_timeout(target, remaining),
+            options.attempt_timeout(target, remaining, targets.len() - index),
             host,
         )
         .await

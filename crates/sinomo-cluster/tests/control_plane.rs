@@ -9174,10 +9174,11 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
 
 struct AddressSensitiveKvTxnForwardHost {
     known_authority: Option<NodeId>,
-    failing_address: String,
+    failing_addresses: BTreeSet<String>,
     snapshot: KvSnapshot,
     txn_response: KvTxnResponse,
     endpoint_rpcs: Vec<(NodeId, String, String)>,
+    endpoint_timeouts: Vec<(String, String, Duration)>,
 }
 
 impl ClusterKvTxnForwardHost for AddressSensitiveKvTxnForwardHost {
@@ -9201,7 +9202,9 @@ impl ClusterKvTxnForwardHost for AddressSensitiveKvTxnForwardHost {
             endpoint.address.clone(),
             request.route.clone(),
         ));
-        if endpoint.address == self.failing_address {
+        self.endpoint_timeouts
+            .push((endpoint.address.clone(), request.route.clone(), _timeout));
+        if self.failing_addresses.contains(&endpoint.address) {
             return Err(NetworkError::Io {
                 operation: "test endpoint rpc".to_string(),
                 detail: format!("simulated stale endpoint {}", endpoint.address),
@@ -11330,10 +11333,11 @@ fn cluster_kv_txn_forward_driver_retries_next_endpoint_for_same_state_authority(
     let txn_response = forward_test_txn_response(snapshot.revision);
     let mut host = AddressSensitiveKvTxnForwardHost {
         known_authority: Some(peer_node_id.clone()),
-        failing_address: private_endpoint.address.clone(),
+        failing_addresses: BTreeSet::from([private_endpoint.address.clone()]),
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
         endpoint_rpcs: Vec::new(),
+        endpoint_timeouts: Vec::new(),
     };
 
     let result = forward_cluster_kv_txn_to_state_authority_with_host(
@@ -11375,6 +11379,86 @@ fn cluster_kv_txn_forward_driver_retries_next_endpoint_for_same_state_authority(
                 CLUSTER_KV_SNAPSHOT_ROUTE.to_string()
             )
         ]
+    );
+}
+
+#[test]
+fn cluster_kv_txn_forward_driver_bounds_attempt_budget_so_later_endpoints_run() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-fair-budget");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, _local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_kv_forward_fair_budget",
+        "node_kv_forward_fair_budget_local",
+        "node_kv_forward_fair_budget_peer",
+    );
+    let private_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.41:21353".to_string(), 10);
+    let stale_lan_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.42:21353".to_string(), 20);
+    let mut public_endpoint =
+        daemon_lan_endpoint(&peer_node_id, "129.146.106.76:21353".to_string(), 30);
+    public_endpoint.privacy = ClusterEndpointPrivacy::InternetDirect;
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .extend([
+            private_endpoint.clone(),
+            stale_lan_endpoint.clone(),
+            public_endpoint.clone(),
+        ]);
+    write_cluster_state(&paths, &state).expect("write state");
+    let snapshot = forward_test_snapshot("/forward/fair-budget", b"fair-budget");
+    let txn_response = forward_test_txn_response(snapshot.revision);
+    let mut host = AddressSensitiveKvTxnForwardHost {
+        known_authority: Some(peer_node_id.clone()),
+        failing_addresses: BTreeSet::from([
+            private_endpoint.address.clone(),
+            stale_lan_endpoint.address.clone(),
+        ]),
+        snapshot: snapshot.clone(),
+        txn_response: txn_response.clone(),
+        endpoint_rpcs: Vec::new(),
+        endpoint_timeouts: Vec::new(),
+    };
+
+    let result = forward_cluster_kv_txn_to_state_authority_with_host(
+        &paths,
+        &state,
+        &KvTxn {
+            compares: Vec::new(),
+            success: Vec::new(),
+            failure: Vec::new(),
+        },
+        ClusterKvTxnForwardOptions {
+            timeout: Duration::from_secs(8),
+            tcp_command_timeout: Duration::from_secs(8),
+            iroh_command_timeout: Duration::from_secs(8),
+        },
+        &mut host,
+    )
+    .expect("forward")
+    .expect("targeted voter");
+
+    assert_eq!(result.snapshot, snapshot);
+    assert_eq!(result.txn_response, Some(txn_response));
+    assert!(
+        host.endpoint_rpcs.iter().any(|(_, address, route)| {
+            address == &public_endpoint.address && route == CLUSTER_KV_TXN_ROUTE
+        }),
+        "public endpoint should still be attempted after stale endpoints"
+    );
+    assert!(
+        host.endpoint_timeouts
+            .iter()
+            .any(|(address, route, timeout)| {
+                address == &stale_lan_endpoint.address
+                    && route == CLUSTER_KV_TXN_ROUTE
+                    && *timeout <= Duration::from_secs(4)
+            }),
+        "a stale endpoint must not consume the whole command budget"
     );
 }
 
