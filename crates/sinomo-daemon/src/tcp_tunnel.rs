@@ -33,6 +33,7 @@ static TCP_TUNNELS: LazyLock<TcpTunnelRegistry> = LazyLock::new(TcpTunnelRegistr
 #[derive(Default)]
 struct TcpTunnelRegistry {
     peers: Mutex<BTreeMap<NodeId, Arc<TcpTunnelHandle>>>,
+    connect_locks: Mutex<BTreeMap<NodeId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl TcpTunnelRegistry {
@@ -48,6 +49,16 @@ impl TcpTunnelRegistry {
             .lock()
             .map(|peers| peers.contains_key(node_id))
             .unwrap_or(false)
+    }
+
+    fn connect_lock(&self, node_id: &NodeId) -> Arc<tokio::sync::Mutex<()>> {
+        let Ok(mut connect_locks) = self.connect_locks.lock() else {
+            return Arc::new(tokio::sync::Mutex::new(()));
+        };
+        connect_locks
+            .entry(node_id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     fn insert(&self, handle: Arc<TcpTunnelHandle>) {
@@ -336,6 +347,11 @@ async fn connect_tcp_tunnel_to_endpoint(
     runtime: &tokio::runtime::Handle,
     paths: Option<&DaemonPaths>,
 ) -> Result<Arc<TcpTunnelHandle>, NetworkError> {
+    if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
+        return Ok(handle);
+    }
+    let connect_lock = TCP_TUNNELS.connect_lock(&endpoint.node_id);
+    let _connect_guard = connect_lock.lock().await;
     if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
         return Ok(handle);
     }
@@ -696,5 +712,16 @@ mod tests {
 
         assert!(tcp_tunnel_should_maintain_outbound(&first, &second));
         assert!(!tcp_tunnel_should_maintain_outbound(&second, &first));
+    }
+
+    #[test]
+    fn tcp_tunnel_connect_lock_is_stable_per_peer() {
+        let registry = TcpTunnelRegistry::default();
+        let peer = NodeId::from_legacy_named("tcp_tunnel_connect_lock_peer").expect("test node id");
+
+        let first = registry.connect_lock(&peer);
+        let second = registry.connect_lock(&peer);
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }
