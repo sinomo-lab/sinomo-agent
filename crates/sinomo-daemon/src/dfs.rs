@@ -1000,6 +1000,7 @@ fn daemon_dfs_smoke_options() -> sinomo_dfs::DfsSmokeOptions {
     sinomo_dfs::DfsSmokeOptions {
         remote_replica_candidates: false,
         foreground_replica_repair: false,
+        inspect_pending_repairs: false,
         publish_metadata: false,
         metadata_replication: DfsMetadataJournalReplicationOptions {
             max_batches_per_target: 0,

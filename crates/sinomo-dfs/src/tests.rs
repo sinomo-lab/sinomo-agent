@@ -5532,6 +5532,7 @@ fn smoke_driver_can_use_local_only_foreground_profile() {
             nonce: Some(112233),
             remote_replica_candidates: false,
             foreground_replica_repair: false,
+            inspect_pending_repairs: false,
             publish_metadata: false,
             ..DfsSmokeOptions::default()
         },
@@ -5540,7 +5541,7 @@ fn smoke_driver_can_use_local_only_foreground_profile() {
 
     assert_eq!(report.requested_replica_node_ids, vec![local.clone()]);
     assert_eq!(report.committed_replica_node_ids, vec![local.clone()]);
-    assert_eq!(report.pending_repair_count, 1);
+    assert_eq!(report.pending_repair_count, 0);
     assert_eq!(send_count.load(Ordering::Relaxed), 0);
     assert!(report.path.starts_with("/services/dfs-smoke/112233-"));
     assert!(report.attempts[0].committed);

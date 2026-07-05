@@ -2290,6 +2290,7 @@ fn foreground_dfs_smoke_options() -> sinomo_runtime::dfs::DfsSmokeOptions {
     sinomo_runtime::dfs::DfsSmokeOptions {
         remote_replica_candidates: false,
         foreground_replica_repair: false,
+        inspect_pending_repairs: false,
         publish_metadata: false,
         metadata_replication: sinomo_runtime::dfs::DfsMetadataJournalReplicationOptions {
             max_batches_per_target: 0,
