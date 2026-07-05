@@ -534,6 +534,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 Some(&response.replica_node_id),
                                 false,
                             );
+                        } else if repair_rejection_indicates_stale_replica_base(reason) {
+                            self.record_repair_retry_scheduled(
+                                &response.intent_id,
+                                &response.replica_node_id,
+                            );
                         } else if repair_rejection_indicates_stale_chunk_resume(reason) {
                             self.record_repair_resume_reset(
                                 &response.intent_id,
@@ -1966,7 +1971,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self
             .repair_attempt_records
             .get(&(intent_id.to_string(), replica_node_id.clone()))
-            .is_some_and(|record| record.next_retry_unix_nanos > dfs_now_unix_nanos())
+            .is_some_and(|record| {
+                record.next_retry_unix_nanos > dfs_now_unix_nanos()
+                    && (record.next_retry_unix_nanos != u64::MAX
+                        || repair_attempt_record_indicates_lost_authority(record))
+            })
         {
             return false;
         }
@@ -1991,42 +2000,51 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 continue;
             }
+            let mut restored_record = record.clone();
+            if restored_record.next_retry_unix_nanos == u64::MAX
+                && !repair_attempt_record_indicates_lost_authority(&restored_record)
+            {
+                restored_record.in_flight = false;
+                restored_record.next_retry_unix_nanos = dfs_now_unix_nanos();
+                restored_record.next_chunk_index = None;
+            }
             self.repair_attempt_records.insert(
                 (
-                    record.intent_id.clone(),
-                    record.missing_replica_node_id.clone(),
+                    restored_record.intent_id.clone(),
+                    restored_record.missing_replica_node_id.clone(),
                 ),
-                record.clone(),
+                restored_record.clone(),
             );
             let state = pending
                 .repair_retries
-                .entry(record.missing_replica_node_id.clone())
+                .entry(restored_record.missing_replica_node_id.clone())
                 .or_default();
-            state.attempts = state.attempts.max(record.attempts);
-            if repair_attempt_record_indicates_lost_authority(record) {
+            state.attempts = state.attempts.max(restored_record.attempts);
+            if repair_attempt_record_indicates_lost_authority(&restored_record) {
                 state.attempts = state.attempts.max(1);
                 state.inflight = false;
                 state.next_retry_tick = DFS_REPAIR_RETRY_SUPPRESSED_TICK;
                 pending
                     .repair_inflight_request_ids
-                    .remove(&record.missing_replica_node_id);
+                    .remove(&restored_record.missing_replica_node_id);
                 pending
                     .repair_next_chunk_indexes
-                    .remove(&record.missing_replica_node_id);
+                    .remove(&restored_record.missing_replica_node_id);
                 continue;
             }
-            state.inflight =
-                record.in_flight && record.next_retry_unix_nanos > dfs_now_unix_nanos();
+            state.inflight = restored_record.in_flight
+                && restored_record.next_retry_unix_nanos > dfs_now_unix_nanos();
             if state.inflight
-                && let Some(next_chunk_index) = record.next_chunk_index
+                && let Some(next_chunk_index) = restored_record.next_chunk_index
             {
-                pending
-                    .repair_next_chunk_indexes
-                    .insert(record.missing_replica_node_id.clone(), next_chunk_index);
+                pending.repair_next_chunk_indexes.insert(
+                    restored_record.missing_replica_node_id.clone(),
+                    next_chunk_index,
+                );
             } else {
                 pending
                     .repair_next_chunk_indexes
-                    .remove(&record.missing_replica_node_id);
+                    .remove(&restored_record.missing_replica_node_id);
             }
         }
     }

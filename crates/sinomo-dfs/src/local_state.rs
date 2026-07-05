@@ -24,6 +24,8 @@ use crate::{
     use_dfs_conflict_version,
 };
 
+const DFS_STATUS_REPAIR_ATTEMPT_SAMPLE_LIMIT: usize = 32;
+
 /// Metadata backend root for the legacy single-shard local store.
 pub fn default_dfs_metadata_root(data_dir: &SinomoDataDir) -> PathBuf {
     data_dir.dfs_dir().join("metadata").join("root")
@@ -312,10 +314,13 @@ fn attach_cluster_aware_dfs_maintenance_observations(
     status: &mut DfsOperatorStatus,
     data_dir: &SinomoDataDir,
 ) -> Result<(), DfsError> {
-    status.repair_attempts =
+    let mut records =
         read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(data_dir))?
             .map(|snapshot| snapshot.records)
             .unwrap_or_default();
+    status.repair_attempt_count = records.len();
+    records.truncate(DFS_STATUS_REPAIR_ATTEMPT_SAMPLE_LIMIT);
+    status.repair_attempts = records;
     Ok(())
 }
 

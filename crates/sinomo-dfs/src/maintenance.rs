@@ -292,6 +292,7 @@ pub const DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_OBJECTS: usize = 1024;
 pub const DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_ISSUES: usize = 64;
 pub const DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS: usize = 16;
 pub const DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB: usize = 1024;
+pub const DEFAULT_DFS_CONFLICT_MAINTENANCE_MAX_RECORDS: usize = 128;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsAntiEntropyCursorRecord {
@@ -315,6 +316,13 @@ pub struct DfsRepairAttemptRecord {
     pub next_chunk_index: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DfsConflictMaintenanceReport {
+    pub scanned_open_conflict_count: usize,
+    pub resolved_conflict_count: usize,
+    pub superseded_conflict_count: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -858,6 +866,7 @@ pub fn run_dfs_lifecycle_maintenance_with_host<T: DfsMessageTransport>(
 pub struct DfsMaintenanceTickOptions {
     pub namespace_job_max_jobs: usize,
     pub namespace_job_max_steps_per_job: usize,
+    pub conflict_max_records: usize,
     pub repair_max_jobs: usize,
     pub lifecycle: DfsMaintenanceRunOptions,
     pub metadata_replication: DfsMetadataJournalReplicationOptions,
@@ -869,6 +878,7 @@ impl Default for DfsMaintenanceTickOptions {
             namespace_job_max_jobs: DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS,
             namespace_job_max_steps_per_job:
                 DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB,
+            conflict_max_records: DEFAULT_DFS_CONFLICT_MAINTENANCE_MAX_RECORDS,
             repair_max_jobs: usize::MAX,
             lifecycle: DfsMaintenanceRunOptions::default(),
             metadata_replication: DfsMetadataJournalReplicationOptions::default(),
@@ -879,6 +889,7 @@ impl Default for DfsMaintenanceTickOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsMaintenanceTickReport {
     pub namespace_jobs: DfsNamespaceJobMaintenanceReport,
+    pub conflicts: DfsConflictMaintenanceReport,
     pub lifecycle_reports: Vec<DfsLifecycleMaintenanceReport>,
     pub scheduled_repairs: Vec<DistributedRepairJob>,
     pub followup_events: Vec<NetworkedDfsServiceEvent>,
@@ -901,6 +912,7 @@ pub fn dfs_maintenance_tick_observations(
     report: &DfsMaintenanceTickReport,
 ) -> DfsMaintenanceTickObservations {
     let mut notice_lines = dfs_namespace_job_maintenance_notice_lines(&report.namespace_jobs);
+    notice_lines.extend(dfs_conflict_maintenance_notice_lines(&report.conflicts));
     notice_lines.extend(dfs_lifecycle_maintenance_notice_lines(
         &report.lifecycle_reports,
     ));
@@ -925,6 +937,18 @@ pub fn dfs_maintenance_tick_observations(
         repair_attempt_suppressed_count: repair_attempt_summary.suppressed,
         notice_lines,
     }
+}
+
+pub fn dfs_conflict_maintenance_notice_lines(report: &DfsConflictMaintenanceReport) -> Vec<String> {
+    if report.resolved_conflict_count == 0 && report.superseded_conflict_count == 0 {
+        return Vec::new();
+    }
+    vec![format!(
+        "DFS conflicts: scanned_open={}, resolved={}, superseded={}",
+        report.scanned_open_conflict_count,
+        report.resolved_conflict_count,
+        report.superseded_conflict_count
+    )]
 }
 
 pub fn dfs_namespace_job_maintenance_notice_lines(
@@ -1153,6 +1177,7 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
         .map_err(|error| DfsError::Metadata {
             message: error.to_string(),
         })?;
+    let conflicts = service.reconcile_stale_conflicts_bounded(options.conflict_max_records)?;
     let lifecycle_reports =
         run_dfs_lifecycle_maintenance_with_host(service, maintenance_host, options.lifecycle)?;
     let repair_attempts_before = maintenance_host.load_repair_attempt_records()?;
@@ -1175,6 +1200,7 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
 
     Ok(DfsMaintenanceTickReport {
         namespace_jobs,
+        conflicts,
         lifecycle_reports,
         scheduled_repairs,
         followup_events,
@@ -1206,6 +1232,7 @@ where
         .map_err(|error| DfsError::Metadata {
             message: error.to_string(),
         })?;
+    let conflicts = service.reconcile_stale_conflicts_bounded(options.conflict_max_records)?;
     let lifecycle_reports =
         run_dfs_lifecycle_maintenance_with_host(service, maintenance_host, options.lifecycle)?;
     let repair_attempts_before = maintenance_host.load_repair_attempt_records()?;
@@ -1232,6 +1259,7 @@ where
 
     Ok(DfsMaintenanceTickReport {
         namespace_jobs,
+        conflicts,
         lifecycle_reports,
         scheduled_repairs,
         followup_events,

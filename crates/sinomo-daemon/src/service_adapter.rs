@@ -2582,7 +2582,9 @@ fn daemon_dfs_browser_health_summary(
         pending_namespace_job_count: status.pending_namespace_job_count,
         failed_namespace_job_count: status.failed_namespace_job_count,
         metadata_shard_count: status.metadata_shards.len(),
-        repair_attempt_count: status.repair_attempts.len(),
+        repair_attempt_count: status
+            .repair_attempt_count
+            .max(status.repair_attempts.len()),
     }
 }
 

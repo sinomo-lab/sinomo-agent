@@ -123,6 +123,8 @@ pub struct DfsOperatorStatus {
     pub open_conflict_count: usize,
     pub pending_repair_count: usize,
     #[serde(default)]
+    pub repair_attempt_count: usize,
+    #[serde(default)]
     pub pending_namespace_job_count: usize,
     #[serde(default)]
     pub failed_namespace_job_count: usize,
@@ -295,6 +297,7 @@ impl<'a> DfsOperatorInspector<'a> {
             pending_write_count: summary.pending_write_count,
             open_conflict_count: summary.open_conflict_count,
             pending_repair_count: summary.pending_repair_count,
+            repair_attempt_count: 0,
             pending_namespace_job_count: summary.pending_namespace_job_count,
             failed_namespace_job_count: summary.failed_namespace_job_count,
             metadata_shards: self.backend.metadata_shard_statuses()?,

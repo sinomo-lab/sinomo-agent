@@ -66,6 +66,109 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(updated)
     }
 
+    pub(crate) fn reconcile_stale_conflicts_bounded(
+        &mut self,
+        max_records: usize,
+    ) -> Result<DfsConflictMaintenanceReport, DfsError> {
+        if max_records == 0 {
+            return Ok(DfsConflictMaintenanceReport::default());
+        }
+        let conflicts = self.open_conflict_maintenance_candidates(max_records)?;
+        let mut report = DfsConflictMaintenanceReport {
+            scanned_open_conflict_count: conflicts.len(),
+            ..DfsConflictMaintenanceReport::default()
+        };
+        for conflict in conflicts {
+            let Some(status) = self.reconciled_conflict_status(&conflict)? else {
+                continue;
+            };
+            let Some(updated) =
+                self.update_conflict_status(&conflict.object_id, &conflict.conflict_id, status)?
+            else {
+                continue;
+            };
+            match updated.status {
+                DfsConflictStatus::Resolved => {
+                    report.resolved_conflict_count =
+                        report.resolved_conflict_count.saturating_add(1);
+                }
+                DfsConflictStatus::Superseded => {
+                    report.superseded_conflict_count =
+                        report.superseded_conflict_count.saturating_add(1);
+                }
+                DfsConflictStatus::Open => {}
+            }
+        }
+        Ok(report)
+    }
+
+    fn open_conflict_maintenance_candidates(
+        &self,
+        max_records: usize,
+    ) -> Result<Vec<DfsConflictRecord>, DfsError> {
+        let mut candidates = Vec::new();
+        if let Some(backend) = self.metadata_backend.as_ref() {
+            let mut cursor = None;
+            while candidates.len() < max_records {
+                let remaining = max_records.saturating_sub(candidates.len());
+                let page = backend.conflict_records_page(cursor.as_ref(), remaining)?;
+                for conflict in page.conflicts {
+                    if conflict.status == DfsConflictStatus::Open {
+                        candidates.push(conflict);
+                        if candidates.len() >= max_records {
+                            break;
+                        }
+                    }
+                }
+                let Some(next_cursor) = page.next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
+            return Ok(candidates);
+        }
+
+        for conflicts in self.metadata.conflicts.values() {
+            for conflict in conflicts.values() {
+                if conflict.status != DfsConflictStatus::Open {
+                    continue;
+                }
+                candidates.push(conflict.clone());
+                if candidates.len() >= max_records {
+                    return Ok(candidates);
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn reconciled_conflict_status(
+        &self,
+        conflict: &DfsConflictRecord,
+    ) -> Result<Option<DfsConflictStatus>, DfsError> {
+        if conflict.status != DfsConflictStatus::Open {
+            return Ok(None);
+        }
+        let object = match self.current_read_object_metadata(&conflict.object_id) {
+            Ok(object) => object,
+            Err(DfsError::UnknownObject { .. }) => {
+                return Ok(Some(DfsConflictStatus::Superseded));
+            }
+            Err(error) => return Err(error),
+        };
+        if object.version == conflict.local_version || object.version == conflict.remote_version {
+            return Ok(Some(DfsConflictStatus::Resolved));
+        }
+        if conflict
+            .base_version
+            .as_ref()
+            .is_some_and(|base_version| object.version == *base_version)
+        {
+            return Ok(None);
+        }
+        Ok(Some(DfsConflictStatus::Superseded))
+    }
+
     /// Reconciles locally stored manifests for an object after reconnect.
     ///
     /// Matching current-version content refreshes local replica receipts. Local

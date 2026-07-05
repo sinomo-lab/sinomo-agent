@@ -1763,6 +1763,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         pending_write_count: 6,
         open_conflict_count: 7,
         pending_repair_count: 8,
+        repair_attempt_count: 0,
         pending_namespace_job_count: 9,
         failed_namespace_job_count: 10,
         metadata_shards: Vec::new(),
@@ -6454,6 +6455,7 @@ fn dfs_maintenance_tick_observations_summarize_actionable_report() {
                 reason: "permission denied".to_string(),
             }],
         },
+        conflicts: DfsConflictMaintenanceReport::default(),
         lifecycle_reports: vec![DfsLifecycleMaintenanceReport {
             anti_entropy: Some(DfsAntiEntropyReport {
                 file_system_id: file_system_id.clone(),
@@ -16656,12 +16658,202 @@ fn repair_attempt_restore_preserves_lost_authority_suppression() {
 }
 
 #[test]
-fn stale_repair_base_rejection_suppresses_retry() {
+fn stale_repair_base_rejection_is_retryable() {
     let reason = "stale DFS repair base for obj_stale: expected version_2, current version_1, command version_3";
     assert!(
-        repair_rejection_indicates_lost_authority(reason),
-        "stale repair-base rejections mean the repair command no longer targets the authoritative visible version"
+        !repair_rejection_indicates_lost_authority(reason),
+        "stale repair-base rejections are replica sequencing failures, not permanent authority loss"
     );
+    assert!(
+        repair_rejection_indicates_stale_replica_base(reason),
+        "stale repair-base rejections should stay separately recognizable for diagnostics"
+    );
+}
+
+#[test]
+fn stale_conflict_maintenance_marks_resolved_and_superseded_records() {
+    let root = temp_root("stale-conflict-maintenance");
+    let node = NodeId::from_legacy_named("node_stale_conflict_maintenance").expect("node");
+    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let base_version = DfsVersion::from_legacy_named("version_conflict_base").expect("version");
+    let remote_version = DfsVersion::from_legacy_named("version_conflict_remote").expect("version");
+    let local_version = DfsVersion::from_legacy_named("version_conflict_local").expect("version");
+    let newer_version = DfsVersion::from_legacy_named("version_conflict_newer").expect("version");
+    let active_object_id = DfsObjectId::from_legacy_named("obj_conflict_active").expect("object");
+    let resolved_object_id =
+        DfsObjectId::from_legacy_named("obj_conflict_resolved").expect("object");
+    let superseded_object_id =
+        DfsObjectId::from_legacy_named("obj_conflict_superseded").expect("object");
+
+    for (object_id, version) in [
+        (&resolved_object_id, &remote_version),
+        (&active_object_id, &base_version),
+        (&superseded_object_id, &newer_version),
+    ] {
+        let mut object = file_metadata(node.clone());
+        object.object_id = object_id.clone();
+        object.version = version.clone();
+        object.path = format!("/services/{}.json", object_id.as_str());
+        object.policy = DfsObjectPolicy::ReplicatedEventual;
+        dfs.add_object_metadata(object).expect("object");
+    }
+
+    for object_id in [
+        resolved_object_id.clone(),
+        active_object_id.clone(),
+        superseded_object_id.clone(),
+    ] {
+        dfs.put_conflict_record(&DfsConflictRecord {
+            conflict_id: format!("conflict_{}", object_id.as_str()),
+            file_system_id: sifs_file_system_id(),
+            object_id: object_id.clone(),
+            path: format!("/services/{}.json", object_id.as_str()),
+            base_version: Some(base_version.clone()),
+            local_version: local_version.clone(),
+            remote_version: remote_version.clone(),
+            detected_by_node_id: node.clone(),
+            reason: "test stale conflict".to_string(),
+            local_content_hash: Some("blake3:local".to_string()),
+            remote_content_hash: Some("blake3:remote".to_string()),
+            created_by_intent_id: None,
+            strategy: Some("branch".to_string()),
+            status: DfsConflictStatus::Open,
+            detected_at: OffsetDateTime::UNIX_EPOCH,
+        })
+        .expect("conflict");
+    }
+
+    let report = dfs
+        .reconcile_stale_conflicts_bounded(10)
+        .expect("reconcile conflicts");
+
+    assert_eq!(report.scanned_open_conflict_count, 3);
+    assert_eq!(report.resolved_conflict_count, 1);
+    assert_eq!(report.superseded_conflict_count, 1);
+    assert_eq!(
+        dfs.conflicts_for_object(&resolved_object_id)
+            .expect("resolved conflict")[0]
+            .status,
+        DfsConflictStatus::Resolved
+    );
+    assert_eq!(
+        dfs.conflicts_for_object(&active_object_id)
+            .expect("active conflict")[0]
+            .status,
+        DfsConflictStatus::Open
+    );
+    assert_eq!(
+        dfs.conflicts_for_object(&superseded_object_id)
+            .expect("superseded conflict")[0]
+            .status,
+        DfsConflictStatus::Superseded
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn repair_attempt_restore_retries_stale_base_suppression_records() {
+    let root = temp_root("repair-attempt-restore-stale-base");
+    let owner = NodeId::from_legacy_named("node_repair_restore_stale_base_owner").expect("node");
+    let replica =
+        NodeId::from_legacy_named("node_repair_restore_stale_base_replica").expect("node");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_repair_restore_stale_base").expect("object");
+    let version_1 =
+        DfsVersion::from_legacy_named("version_repair_restore_stale_base_1").expect("version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_repair_restore_stale_base_2").expect("version");
+    let network = InProcessNetwork::new();
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(owner.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let mut replica_mailbox = network.add_node(replica.clone());
+    let mut object = file_metadata(owner.clone());
+    object.object_id = object_id.clone();
+    object.version = version_1;
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![owner.clone()];
+    dfs.add_object_metadata(object).expect("object");
+
+    let write = dfs
+        .write_distributed_eventual(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: owner.clone(),
+            },
+            b"retry stale repair base after restore".to_vec(),
+            vec![owner, replica.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+        )
+        .expect("write commits locally with pending repair");
+    let (intent_id, content_hash) = match write {
+        NetworkedDfsWriteOutcome::Committed {
+            intent_id,
+            content_hash,
+            repair_jobs,
+            ..
+        } => {
+            assert_eq!(repair_jobs.len(), 1);
+            assert_eq!(repair_jobs[0].missing_replica_node_id, replica);
+            (intent_id, content_hash)
+        }
+        other => panic!("expected committed write with repair job, got {other:?}"),
+    };
+    let _ = drain_dfs_messages(&mut replica_mailbox);
+
+    let records = vec![DfsRepairAttemptRecord {
+        intent_id: intent_id.clone(),
+        object_id,
+        version: version_2,
+        content_hash,
+        missing_replica_node_id: replica.clone(),
+        attempts: 2,
+        in_flight: false,
+        last_attempt_unix_nanos: dfs_now_unix_nanos(),
+        next_retry_unix_nanos: u64::MAX,
+        next_chunk_index: Some(7),
+        last_error: Some(
+            "stale DFS repair base for obj_repair_restore_stale_base: expected version_1, current version_0, command version_2"
+                .to_string(),
+        ),
+    }];
+    let pending = dfs
+        .pending_writes
+        .get_mut(&intent_id)
+        .expect("pending write");
+    pending.repair_retries.clear();
+    pending.repair_inflight_request_ids.clear();
+    pending.repair_next_chunk_indexes.clear();
+    dfs.repair_attempt_records.clear();
+
+    let scheduled = dfs
+        .retry_pending_repairs_bounded_with_attempts(1, &records)
+        .expect("retry stale-base repair");
+    assert_eq!(scheduled.len(), 1);
+    assert_eq!(scheduled[0].missing_replica_node_id, replica);
+    let repair_messages = drain_dfs_messages(&mut replica_mailbox)
+        .into_iter()
+        .filter(|message| {
+            matches!(
+                message,
+                DfsNetworkMessage::RepairReplica(_) | DfsNetworkMessage::RepairReplicaChunk(_)
+            )
+        })
+        .count();
+    assert_eq!(repair_messages, 1);
+    assert_ne!(
+        dfs.active_repair_attempt_records()[0].next_retry_unix_nanos,
+        u64::MAX,
+        "restored stale-base attempts must not remain durably suppressed"
+    );
+
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]

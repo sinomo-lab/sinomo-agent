@@ -209,11 +209,11 @@ pub use local_state::{
 };
 pub(crate) use maintenance::record_anti_entropy_issue;
 pub use maintenance::{
-    DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_ISSUES,
+    DEFAULT_DFS_CONFLICT_MAINTENANCE_MAX_RECORDS, DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_ISSUES,
     DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_OBJECTS,
     DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS,
     DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB, DfsAntiEntropyCursorRecord,
-    DfsAntiEntropyIssue, DfsAntiEntropyOptions, DfsAntiEntropyReport,
+    DfsAntiEntropyIssue, DfsAntiEntropyOptions, DfsAntiEntropyReport, DfsConflictMaintenanceReport,
     DfsLifecycleMaintenanceOptions, DfsLifecycleMaintenanceReport, DfsMaintenanceHost,
     DfsMaintenanceRunOptions, DfsMaintenanceTickObservations, DfsMaintenanceTickOptions,
     DfsMaintenanceTickReport, DfsMetadataReplicationSuppressionRecord,
@@ -372,7 +372,7 @@ pub use protocol::{
 };
 pub(crate) use repair::{
     repair_attempt_record_indicates_lost_authority, repair_rejection_indicates_lost_authority,
-    repair_rejection_indicates_stale_chunk_resume,
+    repair_rejection_indicates_stale_chunk_resume, repair_rejection_indicates_stale_replica_base,
 };
 pub use routes::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_BULK_READ_RESPONSE_ROUTE, DFS_DATA_BULK_READ_ROUTE,

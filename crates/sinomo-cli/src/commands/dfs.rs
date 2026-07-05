@@ -2860,7 +2860,10 @@ fn print_dfs_cluster_status(report: &DfsClusterStatusReport) {
 }
 
 fn print_dfs_repair_attempt_summary(indent: &str, status: &sinomo_runtime::dfs::DfsOperatorStatus) {
-    if status.repair_attempts.is_empty() {
+    let total = status
+        .repair_attempt_count
+        .max(status.repair_attempts.len());
+    if total == 0 {
         return;
     }
     let in_flight = status
@@ -2878,13 +2881,19 @@ fn print_dfs_repair_attempt_summary(indent: &str, status: &sinomo_runtime::dfs::
         .len()
         .saturating_sub(in_flight)
         .saturating_sub(suppressed);
-    println!(
-        "{indent}repair attempts: {} (in_flight={}, retry_waiting={}, suppressed={})",
-        status.repair_attempts.len(),
-        in_flight,
-        retry_waiting,
-        suppressed
-    );
+    if status.repair_attempts.len() == total {
+        println!(
+            "{indent}repair attempts: {total} (in_flight={in_flight}, retry_waiting={retry_waiting}, suppressed={suppressed})"
+        );
+    } else {
+        println!(
+            "{indent}repair attempts: {total} (sample={}, in_flight={}, retry_waiting={}, suppressed={})",
+            status.repair_attempts.len(),
+            in_flight,
+            retry_waiting,
+            suppressed
+        );
+    }
 }
 
 fn print_dfs_object_view(object: &sinomo_runtime::dfs::DfsOperatorObjectView) {
