@@ -155,21 +155,22 @@ use sinomo_kv::{
     CLUSTER_RAFT_RPC_CATEGORY, CLUSTER_RAFT_VOTE_ROUTE, ClusterKvRaftAppendReplicationOutcome,
     ClusterKvRaftCommandStorage, ClusterKvRaftLeaderElectionOptions,
     ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult,
-    ClusterKvRaftUncommittedAppend, ClusterKvWatchAllocatorState, ClusterKvWatchCancelRequest,
-    ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest, ClusterKvWatchEventsRequest,
-    ClusterKvWatchEventsResponse, ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration,
-    ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
-    ClusterRaftVoteResponse, InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEventKind,
-    KvOp, KvOpResponse, KvRevision, KvSnapshot, KvTxn, LeaseId, MAX_CLUSTER_KV_ACTIVE_WATCHES,
-    MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS, MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES,
-    MAX_CLUSTER_KV_WATCH_EVENTS, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
-    RaftRequestVoteRequest, RaftSnapshot, WatchId, append_cluster_kv_watch_events,
-    append_cluster_kv_watch_events_for_active_watches, cached_cluster_kv_watch_events_contain_all,
-    cached_cluster_kv_watch_events_for_test, cached_cluster_kv_watch_registration_for_test,
-    cancel_cluster_kv_watch, cluster_kv_watch_allocator_trust_contains_for_test,
-    cluster_kv_watch_dir_scans_for_test, cluster_kv_watch_drain_once_calls_for_test,
-    cluster_kv_watch_drain_read_passes_for_test, cluster_kv_watch_event_cache_capacity_for_test,
-    cluster_kv_watch_event_cache_contains_for_test, cluster_kv_watch_event_log_read_bytes_for_test,
+    ClusterKvRaftUncommittedAppend, ClusterKvTxnCommitResult, ClusterKvWatchAllocatorState,
+    ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest,
+    ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, ClusterKvWatchPrefixRequest,
+    ClusterKvWatchRegistration, ClusterRaftAppendRequest, ClusterRaftAppendResponse,
+    ClusterRaftVoteRequest, ClusterRaftVoteResponse, InProcessKvStore, KvCommand, KvCompare,
+    KvEntry, KvError, KvEventKind, KvOp, KvOpResponse, KvRevision, KvSnapshot, KvTxn, LeaseId,
+    MAX_CLUSTER_KV_ACTIVE_WATCHES, MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+    MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES, MAX_CLUSTER_KV_WATCH_EVENTS, RaftAppendEntriesRequest,
+    RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftSnapshot, WatchId,
+    append_cluster_kv_watch_events, append_cluster_kv_watch_events_for_active_watches,
+    cached_cluster_kv_watch_events_contain_all, cached_cluster_kv_watch_events_for_test,
+    cached_cluster_kv_watch_registration_for_test, cancel_cluster_kv_watch,
+    cluster_kv_watch_allocator_trust_contains_for_test, cluster_kv_watch_dir_scans_for_test,
+    cluster_kv_watch_drain_once_calls_for_test, cluster_kv_watch_drain_read_passes_for_test,
+    cluster_kv_watch_event_cache_capacity_for_test, cluster_kv_watch_event_cache_contains_for_test,
+    cluster_kv_watch_event_log_read_bytes_for_test,
     cluster_kv_watch_event_log_write_bytes_for_test, cluster_kv_watch_events,
     cluster_kv_watch_generation, cluster_kv_watch_notifier_capacity_for_test,
     cluster_kv_watch_notifier_has_key_for_test, cluster_kv_watch_notifier_has_raw_key_for_test,
@@ -9309,6 +9310,113 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
     }
 }
 
+struct RetryableCommitFailureKvTxnQuorumHost {
+    leader: bool,
+    leader_checks: usize,
+    elect_calls: usize,
+    commit_calls: usize,
+}
+
+impl Default for RetryableCommitFailureKvTxnQuorumHost {
+    fn default() -> Self {
+        Self {
+            leader: true,
+            leader_checks: 0,
+            elect_calls: 0,
+            commit_calls: 0,
+        }
+    }
+}
+
+impl ClusterKvTxnQuorumHost for RetryableCommitFailureKvTxnQuorumHost {
+    fn known_kv_state_authority_id(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, NetworkError> {
+        Ok(None)
+    }
+
+    fn call_node_object_rpc(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        _target_node_id: &NodeId,
+        _request: &ObjectRpcRequest,
+        _timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        panic!("retry test overrides forwarding and must not send object RPCs")
+    }
+
+    fn local_is_kv_state_authority(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+    ) -> Result<bool, NetworkError> {
+        self.leader_checks += 1;
+        Ok(self.leader)
+    }
+
+    fn request_kv_state_authority_vote(
+        &mut self,
+        _endpoint: &ClusterEndpointRecord,
+        _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
+        _timeout: Duration,
+    ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
+        panic!("retry test overrides election and must not send raft votes")
+    }
+
+    fn forward_cluster_kv_txn_to_state_authority(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+        _txn: &KvTxn,
+        _options: ClusterKvTxnQuorumOptions,
+    ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
+        Ok(None)
+    }
+
+    fn elect_kv_state_authority(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+        _options: ClusterKvTxnQuorumOptions,
+    ) -> Result<bool, NetworkError> {
+        self.elect_calls += 1;
+        self.leader = true;
+        Ok(true)
+    }
+
+    fn reachable_cluster_state_authority_count(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+        _options: ClusterStateAuthorityReachabilityOptions,
+    ) -> usize {
+        2
+    }
+
+    fn commit_cluster_kv_command_with_quorum(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &mut ClusterBootstrapState,
+        _command: KvCommand,
+        _options: ClusterKvRaftQuorumCommitOptions,
+    ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
+        self.commit_calls += 1;
+        if self.commit_calls == 1 {
+            self.leader = false;
+            return Err(NetworkError::ClusterReadOnly {
+                detail: "raft append rejected by local log with higher term".to_string(),
+            });
+        }
+        let snapshot = forward_test_snapshot("/test/retry-after-commit-failure", b"committed");
+        Ok(ClusterKvRaftQuorumCommitResult {
+            txn_response: Some(forward_test_txn_response(snapshot.revision)),
+            snapshot,
+        })
+    }
+}
+
 fn forward_test_snapshot(key: &str, value: &[u8]) -> KvSnapshot {
     let mut store = InProcessKvStore::new();
     store.put(key, value.to_vec(), None).expect("seed snapshot");
@@ -10293,6 +10401,60 @@ fn forwarded_cluster_kv_txn_driver_does_not_start_local_election() {
 }
 
 #[test]
+fn cluster_kv_txn_driver_retries_after_retryable_local_commit_failure() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-txn-retry-after-commit");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_kv_txn_retry_after_commit").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_network_kv_txn_retry_after_commit").expect("local node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "retry after commit failure",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    mark_test_member_as_voter(&mut state.members[0]);
+    let mut host = RetryableCommitFailureKvTxnQuorumHost::default();
+
+    let result = commit_cluster_kv_txn_with_quorum_response_with_host(
+        &paths,
+        &mut state,
+        KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key: "/test/retry-after-commit-failure".to_string(),
+                value: b"committed".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        },
+        kv_txn_quorum_test_options(true),
+        &mut host,
+    )
+    .expect("retryable commit failure should re-elect and retry");
+
+    assert!(
+        result
+            .snapshot
+            .get("/test/retry-after-commit-failure")
+            .is_some(),
+        "second commit result should be returned"
+    );
+    assert_eq!(host.commit_calls, 2);
+    assert_eq!(host.elect_calls, 1);
+    assert!(
+        host.leader_checks >= 3,
+        "the retry must re-check leadership after the failed commit"
+    );
+}
+
+#[test]
 fn cluster_kv_txn_request_driver_reports_read_only_without_cluster_state() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-txn-request-orphan");
     let data_dir = SinomoDataDir::new(&root);
@@ -10638,6 +10800,108 @@ fn cluster_raft_quorum_commit_driver_commits_after_remote_voter_ack() {
     );
     assert_eq!(host.fanout_targets, vec![peer_node_id]);
     assert_eq!(host.fanout_events, 1);
+}
+
+#[test]
+fn cluster_raft_quorum_commit_deduplicates_remote_voter_endpoints() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-quorum-dedupe");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_raft_quorum_commit_dedupe",
+        "node_raft_quorum_dedupe_local",
+        "node_raft_quorum_dedupe_peer",
+    );
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .extend([
+            daemon_lan_endpoint(&peer_node_id, "10.0.0.83:21353".to_string(), 10),
+            daemon_lan_endpoint(&peer_node_id, "10.0.0.84:21353".to_string(), 20),
+        ]);
+    write_cluster_state(&paths, &state).expect("write state");
+    let mut host = RecordingQuorumCommitHost::new(paths.clone(), local_node_id);
+
+    commit_cluster_raft_command_with_quorum_driver(
+        &paths,
+        &mut state,
+        KvCommand::Op(KvOp::Put {
+            key: "/quorum/dedupe".to_string(),
+            value: b"dedupe".to_vec(),
+            lease_id: None,
+        }),
+        ClusterKvRaftQuorumCommitOptions {
+            timeout: Duration::from_secs(5),
+        },
+        &mut host,
+    )
+    .expect("commit");
+
+    assert_eq!(host.replicated_nodes, vec![peer_node_id.clone()]);
+    assert_eq!(host.fanout_targets, vec![peer_node_id]);
+}
+
+#[test]
+fn cluster_raft_quorum_commit_observes_higher_rejected_append_term() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-quorum-observe-rejected-term");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_raft_quorum_observe_rejected_term",
+        "node_raft_quorum_observe_term_local",
+        "node_raft_quorum_observe_term_peer",
+    );
+    let peer_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.85:21353".to_string(), 10);
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .push(peer_endpoint);
+    write_cluster_state(&paths, &state).expect("write state");
+    let observed_term = 977;
+    let response_state = state.clone();
+
+    let error = commit_cluster_raft_command_with_local_storage_and_transport(
+        &paths,
+        &mut state,
+        KvCommand::Op(KvOp::Put {
+            key: "/quorum/rejected-term".to_string(),
+            value: b"rejected".to_vec(),
+            lease_id: None,
+        }),
+        ClusterKvRaftQuorumCommitOptions {
+            timeout: Duration::from_secs(5),
+        },
+        ClusterControlPlaneTimeouts::default_daemon_transport(),
+        move |_, _, _| {
+            Ok(ClusterRaftAppendResponse {
+                accepted: false,
+                detail: "higher term".to_string(),
+                state: response_state.clone(),
+                append: sinomo_kv::RaftAppendEntriesResponse {
+                    term: observed_term,
+                    success: false,
+                    match_index: 0,
+                },
+            })
+        },
+        |_, _, _, _, _| {},
+        |_, _, _, _| {},
+        || {},
+    )
+    .expect_err("commit must fail without remote ack");
+
+    assert!(matches!(error, NetworkError::ClusterReadOnly { .. }));
+    let node = open_cluster_raft_kv_node(&paths, &local_node_id).expect("open raft");
+    assert_eq!(node.hard_state().current_term, observed_term);
+    assert_eq!(node.hard_state().leader_id, None);
 }
 
 #[test]

@@ -754,6 +754,10 @@ impl<'a> LocalClusterRaftCommandStorage<'a> {
         Ok(snapshot)
     }
 
+    pub(crate) fn observe_term(&mut self, term: u64) -> Result<(), NetworkError> {
+        self.inner.observe_term(term).map_err(kv_err)
+    }
+
     pub(crate) fn commit_index_with_events(
         &mut self,
         index: u64,
@@ -782,6 +786,14 @@ impl sinomo_kv::ClusterKvRaftCommandStorage for LocalClusterRaftCommandStorage<'
         &mut self,
     ) -> Result<(), NetworkError> {
         self.discard_uncommitted_tail_and_clear_leader().map(|_| ())
+    }
+
+    fn observe_cluster_raft_term(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        term: u64,
+    ) -> Result<(), NetworkError> {
+        self.observe_term(term)
     }
 
     fn commit_cluster_raft_index_with_events(

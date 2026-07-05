@@ -188,6 +188,18 @@ impl<S, R, F, O> sinomo_kv::ClusterKvRaftCommandStorage
         )
     }
 
+    fn observe_cluster_raft_term(
+        &mut self,
+        state: &ClusterBootstrapState,
+        term: u64,
+    ) -> Result<(), NetworkError> {
+        sinomo_kv::ClusterKvRaftCommandStorage::observe_cluster_raft_term(
+            &mut self.storage,
+            state,
+            term,
+        )
+    }
+
     fn commit_cluster_raft_index_with_events(
         &mut self,
         index: u64,
@@ -382,6 +394,18 @@ impl<T> sinomo_kv::ClusterKvRaftCommandStorage for DriverRaftQuorumCommitHost<'_
         )
     }
 
+    fn observe_cluster_raft_term(
+        &mut self,
+        state: &ClusterBootstrapState,
+        term: u64,
+    ) -> Result<(), NetworkError> {
+        sinomo_kv::ClusterKvRaftCommandStorage::observe_cluster_raft_term(
+            &mut self.storage,
+            state,
+            term,
+        )
+    }
+
     fn commit_cluster_raft_index_with_events(
         &mut self,
         index: u64,
@@ -506,6 +530,14 @@ where
             .discard_cluster_raft_uncommitted_tail_and_clear_leader()
     }
 
+    fn observe_cluster_raft_term(
+        &mut self,
+        state: &ClusterBootstrapState,
+        term: u64,
+    ) -> Result<(), NetworkError> {
+        self.host.observe_cluster_raft_term(state, term)
+    }
+
     fn commit_cluster_raft_index_with_events(
         &mut self,
         index: u64,
@@ -525,7 +557,7 @@ where
         state: &ClusterBootstrapState,
     ) -> Result<Vec<Self::Target>, NetworkError> {
         Ok(
-            ClusterEndpointSelector::new(self.paths, state).select_internal(
+            ClusterEndpointSelector::new(self.paths, state).select_internal_unique_node_targets(
                 ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
             ),
         )
@@ -718,7 +750,7 @@ where
         let runtime = self.runtime;
         let paths = self.paths;
         Box::pin(async move {
-            ClusterEndpointSelector::select_internal_async(
+            ClusterEndpointSelector::select_internal_unique_node_targets_async(
                 runtime,
                 paths,
                 state,
@@ -799,6 +831,31 @@ where
         Box::pin(async move {
             merge_cluster_state_from_peer(state, peer_state);
             Ok(())
+        })
+    }
+
+    fn observe_cluster_raft_term_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+        term: u64,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), NetworkError> {
+        let paths = self.paths.clone();
+        let node_id = state.local_node_id.clone();
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime
+                .spawn_blocking(move || {
+                    paths
+                        .kv_paths()
+                        .locked_observe_raft_term_and_write_snapshot_if_changed(&node_id, term)
+                })
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "cluster raft term observation".to_string(),
+                    detail: format!("term observation task failed: {source}"),
+                })?
+                .map(|_| ())
+                .map_err(kv_err)
         })
     }
 

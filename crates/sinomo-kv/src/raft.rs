@@ -701,6 +701,14 @@ pub trait ClusterKvRaftCommandStorage {
     fn discard_cluster_raft_uncommitted_tail_and_clear_leader(&mut self)
     -> Result<(), Self::Error>;
 
+    fn observe_cluster_raft_term(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        _term: u64,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     fn commit_cluster_raft_index_with_events(
         &mut self,
         index: u64,
@@ -1047,6 +1055,14 @@ pub trait ClusterKvRaftQuorumCommitAsyncHost {
         &'a mut self,
     ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error>;
 
+    fn observe_cluster_raft_term_async<'a>(
+        &'a mut self,
+        _state: &'a ClusterBootstrapState,
+        _term: u64,
+    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn commit_cluster_raft_index_with_events_async<'a>(
         &'a mut self,
         index: u64,
@@ -1163,6 +1179,7 @@ where
                 host.observe_accepted_append_state(state, target, response.state)?;
             }
             Ok(response) => {
+                host.observe_cluster_raft_term(state, response.append.term)?;
                 host.record_target_replication_status(
                     state,
                     target,
@@ -1288,6 +1305,8 @@ where
                     .await?;
             }
             Ok(response) => {
+                host.observe_cluster_raft_term_async(state, response.append.term)
+                    .await?;
                 host.record_target_replication_status_async(
                     state,
                     target,
@@ -1357,6 +1376,8 @@ pub struct ClusterKvTxnQuorumDriverOptions {
     pub allow_forwarding: bool,
 }
 
+const CLUSTER_KV_TXN_QUORUM_COMMIT_MAX_ATTEMPTS: usize = 2;
+
 pub trait ClusterKvTxnQuorumHost {
     type Error: ToString;
 
@@ -1400,6 +1421,10 @@ pub trait ClusterKvTxnQuorumHost {
         state: &mut ClusterBootstrapState,
         txn: KvTxn,
     ) -> Result<ClusterKvRaftQuorumCommitResult, Self::Error>;
+
+    fn cluster_quorum_commit_error_allows_retry(&mut self, _error: &Self::Error) -> bool {
+        false
+    }
 
     fn cluster_read_only_error(&mut self, detail: String) -> Self::Error;
 }
@@ -1451,6 +1476,10 @@ pub trait ClusterKvTxnQuorumAsyncHost {
         txn: KvTxn,
     ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftQuorumCommitResult, Self::Error>;
 
+    fn cluster_quorum_commit_error_allows_retry(&mut self, _error: &Self::Error) -> bool {
+        false
+    }
+
     fn cluster_read_only_error(&mut self, detail: String) -> Self::Error;
 }
 
@@ -1478,46 +1507,77 @@ where
         )));
     }
 
-    if !host.local_is_raft_leader(state)? {
-        let forwarding_failure = if options.allow_forwarding {
-            match host.forward_cluster_kv_txn_to_voter(state, &txn) {
-                Ok(Some(response)) => return Ok(response),
-                Ok(None) => None,
-                Err(error) => Some(error),
-            }
-        } else {
-            None
-        };
-        if !options.allow_forwarding {
-            return Err(host.cluster_read_only_error(
-                "forwarded cluster KV transaction reached a non-leader voter".to_string(),
-            ));
-        }
-        if !host.elect_cluster_raft_leader(state)? {
-            let detail = if let Some(forwarding_failure) = forwarding_failure {
-                format!(
-                    "local node is not the Raft leader and could not win quorum; forwarding also failed: {}",
-                    forwarding_failure.to_string()
-                )
+    let mut previous_commit_failure: Option<H::Error> = None;
+    for attempt in 0..CLUSTER_KV_TXN_QUORUM_COMMIT_MAX_ATTEMPTS {
+        if !host.local_is_raft_leader(state)? {
+            let forwarding_failure = if options.allow_forwarding {
+                match host.forward_cluster_kv_txn_to_voter(state, &txn) {
+                    Ok(Some(response)) => return Ok(response),
+                    Ok(None) => None,
+                    Err(error) => Some(error),
+                }
             } else {
-                "local node is not the Raft leader and could not win quorum".to_string()
+                None
             };
+            if !options.allow_forwarding {
+                return Err(host.cluster_read_only_error(
+                    "forwarded cluster KV transaction reached a non-leader voter".to_string(),
+                ));
+            }
+            if !host.elect_cluster_raft_leader(state)? {
+                let mut detail = if let Some(forwarding_failure) = forwarding_failure {
+                    format!(
+                        "local node is not the Raft leader and could not win quorum; forwarding also failed: {}",
+                        forwarding_failure.to_string()
+                    )
+                } else {
+                    "local node is not the Raft leader and could not win quorum".to_string()
+                };
+                if let Some(error) = previous_commit_failure.as_ref() {
+                    detail.push_str("; previous local commit failed: ");
+                    detail.push_str(&error.to_string());
+                }
+                return Err(host.cluster_read_only_error(detail));
+            }
+        }
+        if !host.local_is_raft_leader(state)? {
+            let mut detail = "local node is not the Raft leader and could not win quorum".to_string();
+            if let Some(error) = previous_commit_failure.as_ref() {
+                detail.push_str("; previous local commit failed: ");
+                detail.push_str(&error.to_string());
+            }
             return Err(host.cluster_read_only_error(detail));
         }
+        if let Some(response) = host.semantic_txn_no_effect_response(&txn)? {
+            return Ok(response);
+        }
+        match host.commit_cluster_raft_txn_with_quorum(state, txn.clone()) {
+            Ok(commit) => {
+                return Ok(ClusterKvTxnCommitResult {
+                    snapshot: commit.snapshot,
+                    txn_response: commit.txn_response,
+                });
+            }
+            Err(error)
+                if attempt + 1 < CLUSTER_KV_TXN_QUORUM_COMMIT_MAX_ATTEMPTS
+                    && options.allow_forwarding
+                    && host.cluster_quorum_commit_error_allows_retry(&error) =>
+            {
+                previous_commit_failure = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
     }
-    if !host.local_is_raft_leader(state)? {
-        return Err(host.cluster_read_only_error(
-            "local node is not the Raft leader and could not win quorum".to_string(),
-        ));
-    }
-    if let Some(response) = host.semantic_txn_no_effect_response(&txn)? {
-        return Ok(response);
-    }
-    let commit = host.commit_cluster_raft_txn_with_quorum(state, txn)?;
-    Ok(ClusterKvTxnCommitResult {
-        snapshot: commit.snapshot,
-        txn_response: commit.txn_response,
-    })
+    let detail = previous_commit_failure
+        .as_ref()
+        .map(|error| {
+            format!(
+                "local node could not commit after retrying Raft leadership: {}",
+                error.to_string()
+            )
+        })
+        .unwrap_or_else(|| "local node could not commit after retrying Raft leadership".to_string());
+    Err(host.cluster_read_only_error(detail))
 }
 
 pub async fn commit_cluster_kv_txn_with_quorum_async_with_host<H>(
@@ -1546,51 +1606,81 @@ where
         )));
     }
 
-    if !host.local_is_raft_leader_async(state).await? {
-        let forwarding_failure = if options.allow_forwarding {
-            match host
-                .forward_cluster_kv_txn_to_voter_async(state, &txn)
-                .await
-            {
-                Ok(Some(response)) => return Ok(response),
-                Ok(None) => None,
-                Err(error) => Some(error),
-            }
-        } else {
-            None
-        };
-        if !options.allow_forwarding {
-            return Err(host.cluster_read_only_error(
-                "forwarded cluster KV transaction reached a non-leader voter".to_string(),
-            ));
-        }
-        if !host.elect_cluster_raft_leader_async(state).await? {
-            let detail = if let Some(forwarding_failure) = forwarding_failure {
-                format!(
-                    "local node is not the Raft leader and could not win quorum; forwarding also failed: {}",
-                    forwarding_failure.to_string()
-                )
+    let mut previous_commit_failure: Option<H::Error> = None;
+    for attempt in 0..CLUSTER_KV_TXN_QUORUM_COMMIT_MAX_ATTEMPTS {
+        if !host.local_is_raft_leader_async(state).await? {
+            let forwarding_failure = if options.allow_forwarding {
+                match host.forward_cluster_kv_txn_to_voter_async(state, &txn).await {
+                    Ok(Some(response)) => return Ok(response),
+                    Ok(None) => None,
+                    Err(error) => Some(error),
+                }
             } else {
-                "local node is not the Raft leader and could not win quorum".to_string()
+                None
             };
+            if !options.allow_forwarding {
+                return Err(host.cluster_read_only_error(
+                    "forwarded cluster KV transaction reached a non-leader voter".to_string(),
+                ));
+            }
+            if !host.elect_cluster_raft_leader_async(state).await? {
+                let mut detail = if let Some(forwarding_failure) = forwarding_failure {
+                    format!(
+                        "local node is not the Raft leader and could not win quorum; forwarding also failed: {}",
+                        forwarding_failure.to_string()
+                    )
+                } else {
+                    "local node is not the Raft leader and could not win quorum".to_string()
+                };
+                if let Some(error) = previous_commit_failure.as_ref() {
+                    detail.push_str("; previous local commit failed: ");
+                    detail.push_str(&error.to_string());
+                }
+                return Err(host.cluster_read_only_error(detail));
+            }
+        }
+        if !host.local_is_raft_leader_async(state).await? {
+            let mut detail =
+                "local node is not the Raft leader and could not win quorum".to_string();
+            if let Some(error) = previous_commit_failure.as_ref() {
+                detail.push_str("; previous local commit failed: ");
+                detail.push_str(&error.to_string());
+            }
             return Err(host.cluster_read_only_error(detail));
         }
+        if let Some(response) = host.semantic_txn_no_effect_response_async(&txn).await? {
+            return Ok(response);
+        }
+        match host
+            .commit_cluster_raft_txn_with_quorum_async(state, txn.clone())
+            .await
+        {
+            Ok(commit) => {
+                return Ok(ClusterKvTxnCommitResult {
+                    snapshot: commit.snapshot,
+                    txn_response: commit.txn_response,
+                });
+            }
+            Err(error)
+                if attempt + 1 < CLUSTER_KV_TXN_QUORUM_COMMIT_MAX_ATTEMPTS
+                    && options.allow_forwarding
+                    && host.cluster_quorum_commit_error_allows_retry(&error) =>
+            {
+                previous_commit_failure = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
     }
-    if !host.local_is_raft_leader_async(state).await? {
-        return Err(host.cluster_read_only_error(
-            "local node is not the Raft leader and could not win quorum".to_string(),
-        ));
-    }
-    if let Some(response) = host.semantic_txn_no_effect_response_async(&txn).await? {
-        return Ok(response);
-    }
-    let commit = host
-        .commit_cluster_raft_txn_with_quorum_async(state, txn)
-        .await?;
-    Ok(ClusterKvTxnCommitResult {
-        snapshot: commit.snapshot,
-        txn_response: commit.txn_response,
-    })
+    let detail = previous_commit_failure
+        .as_ref()
+        .map(|error| {
+            format!(
+                "local node could not commit after retrying Raft leadership: {}",
+                error.to_string()
+            )
+        })
+        .unwrap_or_else(|| "local node could not commit after retrying Raft leadership".to_string());
+    Err(host.cluster_read_only_error(detail))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2520,6 +2610,13 @@ where
         Ok(snapshot)
     }
 
+    pub fn observe_term(&mut self, term: u64) -> Result<(), KvError> {
+        self.last_snapshot_publish_wrote = None;
+        self.store
+            .locked_observe_term_and_write_snapshot_if_changed(&self.node_id, term)
+            .map(|_| ())
+    }
+
     pub fn commit_index_with_events(
         &mut self,
         index: u64,
@@ -2558,6 +2655,14 @@ where
         &mut self,
     ) -> Result<(), Self::Error> {
         self.discard_uncommitted_tail_and_clear_leader().map(|_| ())
+    }
+
+    fn observe_cluster_raft_term(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        term: u64,
+    ) -> Result<(), Self::Error> {
+        self.observe_term(term)
     }
 
     fn commit_cluster_raft_index_with_events(

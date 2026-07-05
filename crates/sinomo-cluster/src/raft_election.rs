@@ -377,7 +377,9 @@ pub fn elect_cluster_raft_leader_with_host(
     let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
     let mut remote_vote_targets = Vec::new();
     for endpoint in ClusterEndpointSelector::new(paths, state)
-        .select_internal(ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand)
+        .select_internal_unique_node_targets(
+            ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+        )
         .into_iter()
         .filter(|endpoint| {
             endpoint.node_id != state.local_node_id && voter_ids.contains(&endpoint.node_id)
@@ -427,7 +429,7 @@ pub(crate) async fn elect_cluster_raft_leader_async_with_host(
 ) -> Result<bool, NetworkError> {
     let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
     let mut remote_vote_targets = Vec::new();
-    for endpoint in ClusterEndpointSelector::select_internal_async(
+    for endpoint in ClusterEndpointSelector::select_internal_unique_node_targets_async(
         runtime,
         paths,
         state,

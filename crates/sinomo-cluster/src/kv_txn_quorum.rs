@@ -356,6 +356,10 @@ where
         )
     }
 
+    fn cluster_quorum_commit_error_allows_retry(&mut self, error: &Self::Error) -> bool {
+        matches!(error, NetworkError::ClusterReadOnly { .. })
+    }
+
     fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
         NetworkError::ClusterReadOnly { detail }
     }
@@ -595,6 +599,10 @@ where
             )
             .await
         })
+    }
+
+    fn cluster_quorum_commit_error_allows_retry(&mut self, error: &Self::Error) -> bool {
+        matches!(error, NetworkError::ClusterReadOnly { .. })
     }
 
     fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
