@@ -557,7 +557,7 @@ where
         state: &ClusterBootstrapState,
     ) -> Result<Vec<Self::Target>, NetworkError> {
         Ok(
-            ClusterEndpointSelector::new(self.paths, state).select_internal_unique_node_targets(
+            ClusterEndpointSelector::new(self.paths, state).select_internal(
                 ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
             ),
         )
@@ -750,7 +750,7 @@ where
         let runtime = self.runtime;
         let paths = self.paths;
         Box::pin(async move {
-            ClusterEndpointSelector::select_internal_unique_node_targets_async(
+            ClusterEndpointSelector::select_internal_async(
                 runtime,
                 paths,
                 state,

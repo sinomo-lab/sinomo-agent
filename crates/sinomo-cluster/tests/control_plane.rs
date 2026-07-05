@@ -8876,7 +8876,9 @@ impl ClusterRaftAppendReplicationHost for RecordingRaftAppendHost {
 struct RecordingQuorumCommitHost {
     paths: Option<ClusterPaths>,
     local_node_id: Option<NodeId>,
+    failing_addresses: BTreeSet<String>,
     replicated_nodes: Vec<NodeId>,
+    replicated_endpoints: Vec<String>,
     connectivity: Vec<(NodeId, ClusterConnectivityState, bool)>,
     committed_indices: Vec<u64>,
     fanout_targets: Vec<NodeId>,
@@ -8952,6 +8954,13 @@ impl ClusterRaftQuorumTransportHost for RecordingQuorumCommitHost {
         _timeout: Duration,
     ) -> Result<ClusterRaftAppendResponse, NetworkError> {
         self.replicated_nodes.push(endpoint.node_id.clone());
+        self.replicated_endpoints.push(endpoint.address.clone());
+        if self.failing_addresses.contains(&endpoint.address) {
+            return Err(NetworkError::Io {
+                operation: "cluster raft append".to_string(),
+                detail: format!("scripted failure for {}", endpoint.address),
+            });
+        }
         Ok(ClusterRaftAppendResponse {
             accepted: true,
             detail: "accepted".to_string(),
@@ -9106,6 +9115,43 @@ impl ClusterRaftVoteTransportHost for RecordingLeaderElectionHost {
     ) -> Result<ClusterRaftVoteResponse, NetworkError> {
         self.sent_votes
             .push((endpoint.node_id.clone(), request.vote.term, timeout));
+        Ok(ClusterRaftVoteResponse {
+            accepted: true,
+            detail: "granted".to_string(),
+            state: request.state.clone(),
+            vote: sinomo_kv::RaftRequestVoteResponse {
+                term: request.vote.term,
+                vote_granted: true,
+            },
+        })
+    }
+}
+
+#[derive(Default)]
+struct AddressSensitiveLeaderElectionHost {
+    failing_addresses: BTreeSet<String>,
+    sent_votes: Vec<(NodeId, String, u64, Duration)>,
+}
+
+impl ClusterRaftVoteTransportHost for AddressSensitiveLeaderElectionHost {
+    fn send_raft_vote(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterRaftVoteRequest,
+        timeout: Duration,
+    ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+        self.sent_votes.push((
+            endpoint.node_id.clone(),
+            endpoint.address.clone(),
+            request.vote.term,
+            timeout,
+        ));
+        if self.failing_addresses.contains(&endpoint.address) {
+            return Err(NetworkError::Io {
+                operation: "cluster raft vote".to_string(),
+                detail: format!("scripted failure for {}", endpoint.address),
+            });
+        }
         Ok(ClusterRaftVoteResponse {
             accepted: true,
             detail: "granted".to_string(),
@@ -10951,6 +10997,71 @@ fn cluster_raft_quorum_commit_deduplicates_remote_voter_endpoints() {
 }
 
 #[test]
+fn cluster_raft_quorum_commit_retries_next_endpoint_for_same_remote_voter() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-quorum-same-voter-retry");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_raft_quorum_same_voter_retry",
+        "node_raft_quorum_same_voter_retry_local",
+        "node_raft_quorum_same_voter_retry_peer",
+    );
+    let private_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.41:21353".to_string(), 10);
+    let mut public_endpoint =
+        daemon_lan_endpoint(&peer_node_id, "129.146.106.76:21353".to_string(), 20);
+    public_endpoint.privacy = ClusterEndpointPrivacy::InternetDirect;
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .extend([private_endpoint.clone(), public_endpoint.clone()]);
+    write_cluster_state(&paths, &state).expect("write state");
+    let mut host = RecordingQuorumCommitHost::new(paths.clone(), local_node_id);
+    host.failing_addresses
+        .insert(private_endpoint.address.clone());
+
+    commit_cluster_raft_command_with_quorum_driver(
+        &paths,
+        &mut state,
+        KvCommand::Op(KvOp::Put {
+            key: "/quorum/same-voter-retry".to_string(),
+            value: b"retry".to_vec(),
+            lease_id: None,
+        }),
+        ClusterKvRaftQuorumCommitOptions {
+            timeout: Duration::from_secs(5),
+        },
+        &mut host,
+    )
+    .expect("commit");
+
+    assert_eq!(
+        host.replicated_endpoints,
+        vec![private_endpoint.address, public_endpoint.address]
+    );
+    assert_eq!(
+        host.connectivity,
+        vec![
+            (
+                peer_node_id.clone(),
+                ClusterConnectivityState::Degraded,
+                false
+            ),
+            (
+                peer_node_id.clone(),
+                ClusterConnectivityState::Healthy,
+                true
+            )
+        ]
+    );
+    assert_eq!(host.fanout_targets, vec![peer_node_id]);
+    assert!(!host.discarded);
+}
+
+#[test]
 fn cluster_raft_quorum_commit_observes_higher_rejected_append_term() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-raft-quorum-observe-rejected-term");
     let data_dir = SinomoDataDir::new(&root);
@@ -11182,6 +11293,80 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
     assert_eq!(
         host.sent_votes,
         vec![(peer_node_id, expected_term, Duration::from_secs(1))]
+    );
+}
+
+#[test]
+fn cluster_raft_leader_election_retries_next_endpoint_for_same_remote_voter() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-leader-same-voter-retry");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_raft_leader_same_voter_retry",
+        "node_raft_leader_same_voter_retry_local",
+        "node_raft_leader_same_voter_retry_peer",
+    );
+    let private_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.41:21353".to_string(), 10);
+    let mut public_endpoint =
+        daemon_lan_endpoint(&peer_node_id, "129.146.106.76:21353".to_string(), 20);
+    public_endpoint.privacy = ClusterEndpointPrivacy::InternetDirect;
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .extend([private_endpoint.clone(), public_endpoint.clone()]);
+    write_cluster_state(&paths, &state).expect("write state");
+    let mut host = AddressSensitiveLeaderElectionHost {
+        failing_addresses: BTreeSet::from([private_endpoint.address.clone()]),
+        ..Default::default()
+    };
+
+    let elected = elect_cluster_raft_leader_with_host(
+        &paths,
+        &state,
+        ClusterRaftLeaderElectionOptions {
+            kv: ClusterKvRaftLeaderElectionOptions {
+                max_attempts: sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,
+            },
+            timeout: Duration::from_secs(5),
+            tcp_command_timeout: Duration::from_secs(5),
+            iroh_command_timeout: Duration::from_secs(3),
+            tcp_foreground_attempt_timeout: Duration::from_secs(1),
+            public_foreground_attempt_timeout: Duration::from_secs(4),
+            iroh_foreground_attempt_timeout: Duration::from_millis(1500),
+        },
+        &mut host,
+    )
+    .expect("elect leader");
+
+    assert!(elected);
+    assert_eq!(
+        paths
+            .kv_paths()
+            .known_raft_voter_leader_id(&state)
+            .expect("known state authority"),
+        Some(local_node_id)
+    );
+    let expected_term = sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP + 1;
+    assert_eq!(
+        host.sent_votes,
+        vec![
+            (
+                peer_node_id.clone(),
+                private_endpoint.address,
+                expected_term,
+                Duration::from_secs(1)
+            ),
+            (
+                peer_node_id,
+                public_endpoint.address,
+                expected_term,
+                Duration::from_secs(4)
+            )
+        ]
     );
 }
 

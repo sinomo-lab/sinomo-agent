@@ -514,6 +514,9 @@ where
             if granted.len() >= quorum_size {
                 break;
             }
+            if granted.contains(voter_id) {
+                continue;
+            }
             if !host.should_request_more_remote_votes() {
                 break;
             }
@@ -644,6 +647,9 @@ where
         for (target_index, voter_id) in remote_vote_targets.iter().enumerate() {
             if granted.len() >= quorum_size {
                 break;
+            }
+            if granted.contains(voter_id) {
+                continue;
             }
             if !host.should_request_more_remote_votes() {
                 break;
@@ -1142,6 +1148,8 @@ where
     };
 
     let mut voter_acks = RaftNodeIdSet::default();
+    let mut fanout_node_ids = RaftNodeIdSet::default();
+    let mut fanout_targets = Vec::new();
     if cluster_kv_raft_local_is_voter(state) {
         voter_acks.try_insert_clone(&state.local_node_id, "record local raft commit ack").map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?;
     }
@@ -1152,6 +1160,9 @@ where
     for target in &targets {
         if voter_acks.len() >= quorum_size {
             break;
+        }
+        if voter_acks.contains(host.target_node_id(target)) {
+            continue;
         }
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -1177,6 +1188,17 @@ where
                     "record remote raft commit ack",
                 ).map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?;
                 host.observe_accepted_append_state(state, target, response.state)?;
+                if fanout_node_ids.try_insert_clone(
+                    host.target_node_id(target),
+                    "record accepted raft fanout target",
+                ).map_err(<H as ClusterKvRaftCommandStorage>::kv_error)? {
+                    try_reserve_kv_items(
+                        &mut fanout_targets,
+                        1,
+                        "record accepted raft fanout target",
+                    ).map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?;
+                    fanout_targets.push(target.clone());
+                }
             }
             Ok(response) => {
                 host.observe_cluster_raft_term(state, response.append.term)?;
@@ -1226,10 +1248,24 @@ where
     }
 
     let commit = host.commit_cluster_raft_index_with_events(entry.index)?;
+    for target in targets {
+        if fanout_node_ids.try_insert_clone(
+            host.target_node_id(&target),
+            "dedupe committed raft fanout target",
+        ).map_err(<H as ClusterKvRaftCommandStorage>::kv_error)? {
+            try_reserve_kv_items(&mut fanout_targets, 1, "dedupe committed raft fanout target")
+                .map_err(<H as ClusterKvRaftCommandStorage>::kv_error)?;
+            fanout_targets.push(target);
+        }
+    }
     // The fan-out replicates the committed history to every member (learners
     // included — they converge event-driven on commit), so it runs even when
     // there are no REMOTE VOTER targets (single-voter clusters).
-    host.fan_out_committed_cluster_raft_command(state.clone(), commit.events.clone(), targets)?;
+    host.fan_out_committed_cluster_raft_command(
+        state.clone(),
+        commit.events.clone(),
+        fanout_targets,
+    )?;
     Ok(ClusterKvRaftQuorumCommitResult {
         snapshot: commit.snapshot,
         txn_response: commit.txn_response,
@@ -1263,6 +1299,8 @@ where
     };
 
     let mut voter_acks = RaftNodeIdSet::default();
+    let mut fanout_node_ids = RaftNodeIdSet::default();
+    let mut fanout_targets = Vec::new();
     if cluster_kv_raft_local_is_voter(state) {
         voter_acks.try_insert_clone(&state.local_node_id, "record local async raft commit ack").map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
     }
@@ -1273,6 +1311,9 @@ where
     for target in &targets {
         if voter_acks.len() >= quorum_size {
             break;
+        }
+        if voter_acks.contains(host.target_node_id(target)) {
+            continue;
         }
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -1303,6 +1344,17 @@ where
                 ).map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
                 host.observe_accepted_append_state_async(state, target, response.state)
                     .await?;
+                if fanout_node_ids.try_insert_clone(
+                    host.target_node_id(target),
+                    "record accepted async raft fanout target",
+                ).map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)? {
+                    try_reserve_kv_items(
+                        &mut fanout_targets,
+                        1,
+                        "record accepted async raft fanout target",
+                    ).map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
+                    fanout_targets.push(target.clone());
+                }
             }
             Ok(response) => {
                 host.observe_cluster_raft_term_async(state, response.append.term)
@@ -1359,10 +1411,23 @@ where
     let commit = host
         .commit_cluster_raft_index_with_events_async(entry.index)
         .await?;
+    for target in targets {
+        if fanout_node_ids.try_insert_clone(
+            host.target_node_id(&target),
+            "dedupe committed async raft fanout target",
+        ).map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)? {
+            try_reserve_kv_items(
+                &mut fanout_targets,
+                1,
+                "dedupe committed async raft fanout target",
+            ).map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
+            fanout_targets.push(target);
+        }
+    }
     host.fan_out_committed_cluster_raft_command_async(
         state.clone(),
         commit.events.clone(),
-        targets,
+        fanout_targets,
     )
     .await?;
     Ok(ClusterKvRaftQuorumCommitResult {
