@@ -1224,7 +1224,11 @@ impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
                 };
                 events.extend(batch);
             }
-            let scheduled = if allow_write_repair_progress {
+            let defer_foreground_replica_repair = foreground_write_request_id.is_some()
+                && self
+                    .transport
+                    .can_return_committed_foreground_response_before_replica_repair();
+            let scheduled = if allow_write_repair_progress && !defer_foreground_replica_repair {
                 let (scheduled, repair_events) =
                     if let Some(request_id) = foreground_write_request_id.as_deref() {
                         let intent_ids =

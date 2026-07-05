@@ -3255,10 +3255,8 @@ fn served_foreground_write_returns_committed_response_before_replica_repair_comp
 
     let transfer_objects = transfer_objects.lock().expect("transfer objects");
     assert!(
-        transfer_objects
-            .iter()
-            .all(|object_id| object_id != &backlog_object),
-        "foreground served message must not retry unrelated backlog repairs: {transfer_objects:?}"
+        transfer_objects.is_empty(),
+        "foreground served message must return before inline repair retries: {transfer_objects:?}"
     );
     assert!(
         result

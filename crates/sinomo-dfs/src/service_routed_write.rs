@@ -134,6 +134,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsDistributedWriteResult::Outcome { outcome }
         } else {
             self.rebase_routed_path_write_if_current(&mut command)?;
+            let write_foreground_replica_repair = command.foreground_replica_repair
+                && !self
+                    .transport
+                    .can_return_committed_foreground_response_before_replica_repair();
             match self
                 .ensure_routed_write_object_metadata(
                     &command.request,
@@ -166,7 +170,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             content_size_bytes,
                             command.desired_replica_nodes,
                             command.policy,
-                            command.foreground_replica_repair,
+                            write_foreground_replica_repair,
                         )
                     } else {
                         self.write_distributed_eventual_with_base_and_repair_mode(
@@ -175,7 +179,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             command.bytes,
                             command.desired_replica_nodes,
                             command.policy,
-                            command.foreground_replica_repair,
+                            write_foreground_replica_repair,
                         )
                     }
                 }) {
