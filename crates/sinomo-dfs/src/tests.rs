@@ -5530,6 +5530,7 @@ fn smoke_driver_can_skip_foreground_remote_replica_repair() {
         DfsSmokeOptions {
             nonce: Some(112233),
             foreground_replica_repair: false,
+            publish_metadata: false,
             ..DfsSmokeOptions::default()
         },
     )
@@ -5544,6 +5545,9 @@ fn smoke_driver_can_skip_foreground_remote_replica_repair() {
     assert_eq!(send_count.load(Ordering::Relaxed), 0);
     assert!(report.path.starts_with("/services/dfs-smoke/112233-"));
     assert!(report.attempts[0].committed);
+    assert!(publisher_host.opened_shards.is_empty());
+    assert_eq!(transport.batches, 0);
+    assert!(report.metadata_replication.outcomes.is_empty());
 
     std::fs::remove_dir_all(root).ok();
 }

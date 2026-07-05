@@ -51,6 +51,7 @@ pub struct DfsSmokeAttempt {
 pub struct DfsSmokeOptions {
     pub nonce: Option<i128>,
     pub foreground_replica_repair: bool,
+    pub publish_metadata: bool,
     pub metadata_replication: DfsMetadataJournalReplicationOptions,
 }
 
@@ -59,6 +60,7 @@ impl Default for DfsSmokeOptions {
         Self {
             nonce: None,
             foreground_replica_repair: true,
+            publish_metadata: true,
             metadata_replication: DfsMetadataJournalReplicationOptions::default(),
         }
     }
@@ -307,14 +309,20 @@ pub fn run_dfs_smoke_with_host<T: DfsMessageTransport>(
         });
     };
     let pending_repair_count = smoke_host.pending_repair_count()?;
-    let metadata_replication = publish_dfs_metadata_journal_with_host(
-        file_system_id,
-        local_node_id,
-        metadata_shards,
-        metadata_publisher_host,
-        metadata_transport,
-        options.metadata_replication,
-    )?;
+    let metadata_replication = if options.publish_metadata {
+        publish_dfs_metadata_journal_with_host(
+            file_system_id,
+            local_node_id,
+            metadata_shards,
+            metadata_publisher_host,
+            metadata_transport,
+            options.metadata_replication,
+        )?
+    } else {
+        DfsMetadataJournalReplicationReport {
+            outcomes: Vec::new(),
+        }
+    };
 
     Ok(DfsSmokeReport {
         path: stat.path,

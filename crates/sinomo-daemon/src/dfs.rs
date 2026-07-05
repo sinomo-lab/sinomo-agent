@@ -999,6 +999,7 @@ fn daemon_dfs_metadata_replication_options() -> DfsMetadataJournalReplicationOpt
 fn daemon_dfs_smoke_options() -> sinomo_dfs::DfsSmokeOptions {
     sinomo_dfs::DfsSmokeOptions {
         foreground_replica_repair: false,
+        publish_metadata: false,
         metadata_replication: DfsMetadataJournalReplicationOptions {
             max_batches_per_target: 0,
             ..daemon_dfs_metadata_replication_options()
