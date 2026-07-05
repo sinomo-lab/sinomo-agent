@@ -998,6 +998,7 @@ fn daemon_dfs_metadata_replication_options() -> DfsMetadataJournalReplicationOpt
 
 fn daemon_dfs_smoke_options() -> sinomo_dfs::DfsSmokeOptions {
     sinomo_dfs::DfsSmokeOptions {
+        stable_path: true,
         remote_replica_candidates: false,
         foreground_replica_repair: false,
         inspect_pending_repairs: false,

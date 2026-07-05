@@ -50,6 +50,7 @@ pub struct DfsSmokeAttempt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsSmokeOptions {
     pub nonce: Option<i128>,
+    pub stable_path: bool,
     pub remote_replica_candidates: bool,
     pub foreground_replica_repair: bool,
     pub inspect_pending_repairs: bool,
@@ -61,6 +62,7 @@ impl Default for DfsSmokeOptions {
     fn default() -> Self {
         Self {
             nonce: None,
+            stable_path: false,
             remote_replica_candidates: true,
             foreground_replica_repair: true,
             inspect_pending_repairs: true,
@@ -260,7 +262,12 @@ pub fn run_dfs_smoke_with_host<T: DfsMessageTransport>(
             .map(|node_id| node_id.to_string())
             .collect::<Vec<_>>()
             .join("-");
-        let path = format!("{smoke_directory}/{nonce}-{target_label}.txt");
+        let path_name = if options.stable_path {
+            format!("current-{target_label}.txt")
+        } else {
+            format!("{nonce}-{target_label}.txt")
+        };
+        let path = format!("{smoke_directory}/{path_name}");
         let body = format!("sinomo dfs smoke {nonce} {target_label}\n");
         let mut write_options = DfsWriteOptions::replicated_eventual(replica_candidates.clone());
         write_options.foreground_replica_repair = options.foreground_replica_repair;
