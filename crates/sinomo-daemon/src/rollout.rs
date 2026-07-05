@@ -72,6 +72,63 @@ fn write_cluster_rollout_progress(
     progress_current: u32,
     progress_message: impl Into<String>,
 ) -> Result<(), DaemonError> {
+    write_cluster_rollout_progress_inner(
+        daemon_paths,
+        rollout_paths,
+        status,
+        mode,
+        detail,
+        source,
+        requested_at,
+        phase,
+        progress_current,
+        progress_message,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_cluster_rollout_progress_local(
+    daemon_paths: &DaemonPaths,
+    rollout_paths: &SelfRolloutPaths,
+    status: &str,
+    mode: &str,
+    detail: Option<String>,
+    source: &str,
+    requested_at: &str,
+    phase: &str,
+    progress_current: u32,
+    progress_message: impl Into<String>,
+) -> Result<(), DaemonError> {
+    write_cluster_rollout_progress_inner(
+        daemon_paths,
+        rollout_paths,
+        status,
+        mode,
+        detail,
+        source,
+        requested_at,
+        phase,
+        progress_current,
+        progress_message,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_cluster_rollout_progress_inner(
+    daemon_paths: &DaemonPaths,
+    rollout_paths: &SelfRolloutPaths,
+    status: &str,
+    mode: &str,
+    detail: Option<String>,
+    source: &str,
+    requested_at: &str,
+    phase: &str,
+    progress_current: u32,
+    progress_message: impl Into<String>,
+    publish_to_cluster: bool,
+) -> Result<(), DaemonError> {
     let progress_message = progress_message.into();
     let status = cluster_rollout_progress_status(ClusterRolloutProgressUpdate::new(
         status,
@@ -114,7 +171,9 @@ fn write_cluster_rollout_progress(
             "progress_total": CLUSTER_ROLLOUT_PROGRESS_TOTAL,
         }),
     );
-    publish_rollout_progress_to_cluster(daemon_paths);
+    if publish_to_cluster {
+        publish_rollout_progress_to_cluster(daemon_paths);
+    }
     Ok(())
 }
 
@@ -151,8 +210,16 @@ fn rejected_cluster_rollout_response(
 }
 
 fn publish_rollout_progress_to_cluster(daemon_paths: &DaemonPaths) {
-    if let Err(error) = crate::cluster::refresh_daemon_node_status_in_kv(daemon_paths) {
-        tracing::warn!("sinomo daemon rollout progress publish failed: {error}");
+    let daemon_paths = daemon_paths.clone();
+    if let Err(error) = thread::Builder::new()
+        .name("sinomo-rollout-progress-publish".to_string())
+        .spawn(move || {
+            if let Err(error) = crate::cluster::refresh_daemon_node_status_in_kv(&daemon_paths) {
+                tracing::warn!("sinomo daemon rollout progress publish failed: {error}");
+            }
+        })
+    {
+        tracing::warn!("sinomo daemon rollout progress publish spawn failed: {error}");
     }
 }
 
@@ -175,7 +242,7 @@ fn start_cluster_rollout_build_heartbeat(
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
             let elapsed = started.elapsed().as_secs();
-            let _ = write_cluster_rollout_progress(
+            let _ = write_cluster_rollout_progress_local(
                 &daemon_paths,
                 &rollout_paths,
                 "in-progress",
