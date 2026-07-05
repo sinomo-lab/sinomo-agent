@@ -1150,6 +1150,10 @@ impl DfsMessageTransport for DfsEndpointServedMessageTransport {
         Ok(Some(self.inbound_messages.len().saturating_add(nested)))
     }
 
+    fn can_return_committed_foreground_response_before_replica_repair(&self) -> bool {
+        true
+    }
+
     fn transfer_profile(&self, target_node_id: &NodeId) -> DfsTransferProfile {
         if target_node_id == &self.local_node_id {
             return DfsTransferProfile::Local;

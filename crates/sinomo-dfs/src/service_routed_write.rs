@@ -618,17 +618,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                 }
             };
-            if self
+            let committed_foreground_with_repairs = self
                 .pending_remote_write_responses
                 .get(&intent_id)
                 .is_some_and(|pending| pending.foreground_replica_repair)
-                && let DfsDistributedWriteResult::Outcome {
-                    outcome: NetworkedDfsWriteOutcome::Committed { repair_jobs, .. },
-                } = &result
-                && !repair_jobs.is_empty()
+                && matches!(
+                    &result,
+                    DfsDistributedWriteResult::Outcome {
+                        outcome: NetworkedDfsWriteOutcome::Committed { repair_jobs, .. },
+                    } if !repair_jobs.is_empty()
+                );
+            if committed_foreground_with_repairs
+                && !self
+                    .transport
+                    .can_return_committed_foreground_response_before_replica_repair()
             {
                 continue;
             }
+            // Endpoint-served DFS RPCs can return once the metadata primary has
+            // committed the intent. Remaining repair jobs stay in the normal
+            // repair backlog so a slow desired replica does not consume the
+            // caller's data-plane deadline after the write is durable.
             let Some(pending) = self.pending_remote_write_responses.remove(&intent_id) else {
                 continue;
             };

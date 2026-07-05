@@ -74,6 +74,10 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         true
     }
 
+    fn can_return_committed_foreground_response_before_replica_repair(&self) -> bool {
+        false
+    }
+
     fn transfer_profile(&self, _target_node_id: &NodeId) -> DfsTransferProfile {
         DfsTransferProfile::Conservative
     }

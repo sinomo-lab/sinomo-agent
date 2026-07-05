@@ -3127,8 +3127,8 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
 }
 
 #[test]
-fn served_foreground_write_retries_only_current_request_repairs() {
-    let root = temp_root("served-foreground-write-scopes-repair-retries");
+fn served_foreground_write_returns_committed_response_before_replica_repair_completes() {
+    let root = temp_root("served-foreground-write-commits-before-repair");
     let requester = NodeId::from_legacy_named("node_served_scoped_requester").expect("requester");
     let primary = NodeId::from_legacy_named("node_served_scoped_primary").expect("primary");
     let replica = NodeId::from_legacy_named("node_served_scoped_replica").expect("replica");
@@ -3246,11 +3246,12 @@ fn served_foreground_write_retries_only_current_request_repairs() {
         DfsNetworkMessage::DistributedWriteRequest(command),
     );
 
-    dfs.process_message_command(test_dfs_message_command(
-        "dfs_served_scoped_message_rpc",
-        routed_message,
-    ))
-    .expect("process DFS message");
+    let result = dfs
+        .process_message_command(test_dfs_message_command(
+            "dfs_served_scoped_message_rpc",
+            routed_message,
+        ))
+        .expect("process DFS message");
 
     let transfer_objects = transfer_objects.lock().expect("transfer objects");
     assert!(
@@ -3260,10 +3261,31 @@ fn served_foreground_write_retries_only_current_request_repairs() {
         "foreground served message must not retry unrelated backlog repairs: {transfer_objects:?}"
     );
     assert!(
-        transfer_objects
+        result
+            .response
+            .outbound_messages
             .iter()
-            .any(|object_id| object_id == &routed_object),
-        "foreground served message should still advance its own repair/stage work"
+            .any(|message| matches!(
+                &message.message,
+                DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
+                    request_id: response_request_id,
+                    result:
+                        DfsDistributedWriteResult::Outcome {
+                            outcome:
+                                NetworkedDfsWriteOutcome::Committed {
+                                    intent_id,
+                                    repair_jobs,
+                                    ..
+                                },
+                        },
+                    ..
+                }) if response_request_id == &request_id
+                    && repair_jobs.len() == 1
+                    && repair_jobs[0].intent_id == *intent_id
+                    && repair_jobs[0].object_id == routed_object
+                    && repair_jobs[0].missing_replica_node_id == replica
+            )),
+        "foreground served message should return the committed outcome with pending repair jobs"
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -9649,7 +9671,8 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
         matches!(
             &committed,
             NetworkedDfsWriteOutcome::Committed { version, repair_jobs, .. }
-                if version == &version_2 && repair_jobs.is_empty()
+                if version == &version_2
+                    && repair_jobs.iter().all(|job| job.missing_replica_node_id == replica)
         ),
         "unexpected served routed write outcome: {committed:?}; trace={:?}; primary_metrics={:?}",
         trace.lock().expect("trace"),
