@@ -482,6 +482,7 @@ pub(crate) struct DaemonSignedEndpointRpcAsyncHost {
     runtime: tokio::runtime::Handle,
     observe_connectivity: bool,
     paths: Option<DaemonPaths>,
+    use_tcp_tunnel: bool,
 }
 
 impl DaemonSignedEndpointRpcAsyncHost {
@@ -490,6 +491,7 @@ impl DaemonSignedEndpointRpcAsyncHost {
             runtime: runtime.clone(),
             observe_connectivity,
             paths: None,
+            use_tcp_tunnel: true,
         }
     }
 
@@ -498,6 +500,7 @@ impl DaemonSignedEndpointRpcAsyncHost {
             runtime: runtime.clone(),
             observe_connectivity: false,
             paths: None,
+            use_tcp_tunnel: false,
         }
     }
 
@@ -776,15 +779,16 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEnd
     > {
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            if let Some(result) = crate::tcp_tunnel::send_signed_endpoint_rpc_via_tcp_tunnel(
-                endpoint,
-                auth,
-                request,
-                timeouts,
-                &runtime,
-                self.paths.as_ref(),
-            )
-            .await
+            if self.use_tcp_tunnel
+                && let Some(result) = crate::tcp_tunnel::send_signed_endpoint_rpc_via_tcp_tunnel(
+                    endpoint,
+                    auth,
+                    request,
+                    timeouts,
+                    &runtime,
+                    self.paths.as_ref(),
+                )
+                .await
             {
                 return result;
             }
@@ -1567,6 +1571,22 @@ mod tests {
             }
             error => panic!("unexpected error: {error}"),
         }
+    }
+
+    #[test]
+    fn daemon_endpoint_host_direct_only_disables_tcp_tunnel() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let direct = super::DaemonSignedEndpointRpcAsyncHost::direct_only(runtime.handle());
+        assert!(!direct.observe_connectivity);
+        assert!(!direct.use_tcp_tunnel);
+
+        let routed = super::DaemonSignedEndpointRpcAsyncHost::new(runtime.handle(), true);
+        assert!(routed.observe_connectivity);
+        assert!(routed.use_tcp_tunnel);
     }
 
     #[test]

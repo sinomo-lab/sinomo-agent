@@ -228,22 +228,15 @@ pub(crate) async fn accept_tcp_tunnel_connection_async(
         .write_response(&stream_address, &response, ObjectFrameIoOptions::none())
         .await
         .map_err(DaemonError::from)?;
-    let endpoint = tcp_tunnel_connectivity_endpoint_for_peer(&paths, &peer_node_id);
-    if let Some(endpoint) = endpoint.as_ref() {
-        remember_tcp_tunnel_connectivity(
-            &paths,
-            endpoint,
-            sinomo_core::network::ClusterConnectivityState::Healthy,
-            Some(&service_runtime),
-        )
-        .await;
-    }
+    // An inbound tunnel proves only that the peer can dial this node. Do not
+    // publish peer endpoint health from it; that would make private endpoints
+    // look directly reachable to independent CLI/app processes.
     spawn_tcp_tunnel(
         peer_node_id,
         stream.into_inner(),
         paths,
         service_runtime,
-        endpoint,
+        None,
     );
     Ok(())
 }
@@ -570,6 +563,7 @@ async fn tcp_tunnel_reader_loop(
     }
 }
 
+#[cfg(test)]
 fn tcp_tunnel_connectivity_endpoint_for_peer(
     paths: &DaemonPaths,
     peer_node_id: &NodeId,
