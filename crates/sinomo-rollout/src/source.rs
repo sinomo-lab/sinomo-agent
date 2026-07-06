@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const ROLLOUT_BUILD_EXCLUDED_WORKSPACE_MEMBER: &str = "crates/sinomo-app";
 const MANAGED_SIBLING_SOURCE_REPOS: &[&str] = &["sui"];
 const ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV: &str = "SINOMO_ROLLOUT_BUILD_COMMIT_OVERRIDE";
+const ROLLOUT_NATIVE_DYLIB_TARGET_DIR: &str = "rollout-native-dylib";
 
 #[cfg(windows)]
 fn rollout_child_command(program: &str) -> Command {
@@ -129,11 +130,14 @@ pub fn rollout_build_dev_artifacts(
     repo: &Path,
     build_log: &Path,
 ) -> Result<RolloutBuiltArtifacts, RolloutError> {
-    let modules = discover_default_native_dylib_module_builds(repo)?;
+    let modules = rollout_native_dylib_modules_for_build(
+        repo,
+        discover_default_native_dylib_module_builds(repo)?,
+    );
     let _source_guards = prepare_rollout_build_source(repo)?;
 
     let binary_build_args = rollout_binary_build_args();
-    let (binary_command, binary_build) = run_rollout_cargo_build(repo, &binary_build_args)?;
+    let (binary_command, binary_build) = run_rollout_cargo_build(repo, &binary_build_args, None)?;
     let mut log = rollout_build_log_section(repo, &binary_command, &binary_build);
     if !binary_build.status.success() {
         fs::write(build_log, &log).map_err(|source| RolloutError::Io {
@@ -145,7 +149,9 @@ pub fn rollout_build_dev_artifacts(
 
     if !modules.is_empty() {
         let module_build_args = rollout_module_build_args(&modules);
-        let (module_command, module_build) = run_rollout_cargo_build(repo, &module_build_args)?;
+        let module_target_dir = rollout_native_dylib_target_dir(repo);
+        let (module_command, module_build) =
+            run_rollout_cargo_build(repo, &module_build_args, Some(&module_target_dir))?;
         log.push_str("\n---\n\n");
         log.push_str(&rollout_build_log_section(
             repo,
@@ -191,16 +197,20 @@ fn rollout_build_dev_native_dylib_modules(
     repo: &Path,
     build_log: &Path,
 ) -> Result<Vec<LocalRolloutNativeDylibModuleArtifact>, RolloutError> {
-    let modules = discover_default_native_dylib_module_builds(repo)?;
+    let modules = rollout_native_dylib_modules_for_build(
+        repo,
+        discover_default_native_dylib_module_builds(repo)?,
+    );
     let build_args = rollout_module_build_args(&modules);
     let _source_guards = prepare_rollout_build_source(repo)?;
-    let build = rollout_cargo_build_command(repo, &build_args)?
+    let module_target_dir = rollout_native_dylib_target_dir(repo);
+    let build = rollout_cargo_build_command(repo, &build_args, Some(&module_target_dir))?
         .output()
         .map_err(|source| RolloutError::Io {
             path: format!("cargo {}", build_args.join(" ")),
             detail: source.to_string(),
         })?;
-    let command = format!("cargo {}", build_args.join(" "));
+    let command = rollout_cargo_build_log_command(&build_args, Some(&module_target_dir));
     let log = format!(
         "command: {command}\nrepo: {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
         repo.display(),
@@ -258,15 +268,17 @@ pub fn rollout_build_dev_native_dylib_module(
             });
         }
     };
+    let module = rollout_native_dylib_module_for_build(repo, module);
     let build_args = rollout_single_module_build_args(&module);
     let _source_guards = prepare_rollout_build_source(repo)?;
-    let build = rollout_cargo_build_command(repo, &build_args)?
+    let module_target_dir = rollout_native_dylib_target_dir(repo);
+    let build = rollout_cargo_build_command(repo, &build_args, Some(&module_target_dir))?
         .output()
         .map_err(|source| RolloutError::Io {
             path: format!("cargo {}", build_args.join(" ")),
             detail: source.to_string(),
         })?;
-    let command = format!("cargo {}", build_args.join(" "));
+    let command = rollout_cargo_build_log_command(&build_args, Some(&module_target_dir));
     let log = format!(
         "command: {command}\nrepo: {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
         repo.display(),
@@ -346,28 +358,71 @@ fn rollout_build_commit_override(repo: &Path) -> Result<String, RolloutError> {
 fn rollout_cargo_build_command(
     repo: &Path,
     build_args: &[String],
+    target_dir: Option<&Path>,
 ) -> Result<Command, RolloutError> {
     let commit = rollout_build_commit_override(repo)?;
     let mut command = rollout_child_command("cargo");
     command
         .args(build_args)
         .current_dir(repo)
+        .env("CARGO_INCREMENTAL", "0")
         .env(ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV, commit);
+    if let Some(target_dir) = target_dir {
+        command.env("CARGO_TARGET_DIR", target_dir);
+    }
     Ok(command)
 }
 
 fn run_rollout_cargo_build(
     repo: &Path,
     build_args: &[String],
+    target_dir: Option<&Path>,
 ) -> Result<(String, std::process::Output), RolloutError> {
-    let command = format!("cargo {}", build_args.join(" "));
-    let build = rollout_cargo_build_command(repo, build_args)?
+    let command = rollout_cargo_build_log_command(build_args, target_dir);
+    let build = rollout_cargo_build_command(repo, build_args, target_dir)?
         .output()
         .map_err(|source| RolloutError::Io {
             path: command.clone(),
             detail: source.to_string(),
         })?;
     Ok((command, build))
+}
+
+fn rollout_cargo_build_log_command(build_args: &[String], target_dir: Option<&Path>) -> String {
+    let command = format!("cargo {}", build_args.join(" "));
+    match target_dir {
+        Some(target_dir) => format!(
+            "CARGO_INCREMENTAL=0 CARGO_TARGET_DIR={} {command}",
+            target_dir.display()
+        ),
+        None => format!("CARGO_INCREMENTAL=0 {command}"),
+    }
+}
+
+fn rollout_native_dylib_target_dir(repo: &Path) -> PathBuf {
+    repo.join("target").join(ROLLOUT_NATIVE_DYLIB_TARGET_DIR)
+}
+
+fn rollout_native_dylib_artifact_dir(repo: &Path) -> PathBuf {
+    rollout_native_dylib_target_dir(repo).join("debug")
+}
+
+fn rollout_native_dylib_modules_for_build(
+    repo: &Path,
+    modules: Vec<SelfRolloutNativeDylibModuleBuild>,
+) -> Vec<SelfRolloutNativeDylibModuleBuild> {
+    modules
+        .into_iter()
+        .map(|module| rollout_native_dylib_module_for_build(repo, module))
+        .collect()
+}
+
+fn rollout_native_dylib_module_for_build(
+    repo: &Path,
+    mut module: SelfRolloutNativeDylibModuleBuild,
+) -> SelfRolloutNativeDylibModuleBuild {
+    module.built_library = rollout_native_dylib_artifact_dir(repo).join(&module.library_name);
+    module
 }
 
 fn rollout_build_log_section(repo: &Path, command: &str, build: &std::process::Output) -> String {
@@ -1380,6 +1435,74 @@ mod tests {
                 "--features",
                 "sinomo-test-module/test-feature",
             ]
+        );
+    }
+
+    #[test]
+    fn rollout_native_dylib_modules_build_in_isolated_target_dir() {
+        let repo = Path::new("/tmp/sinomo-source");
+        let module = SelfRolloutNativeDylibModuleBuild {
+            package: "sinomo-test-module".to_string(),
+            features: Vec::new(),
+            module_id: "module.test".to_string(),
+            interface_version: "test.v1".to_string(),
+            cache_key: "module/test".to_string(),
+            library_name: "libsinomo_test_module.so".to_string(),
+            built_library: repo
+                .join("target")
+                .join("debug")
+                .join("libsinomo_test_module.so"),
+            source: "test".to_string(),
+        };
+
+        let retargeted = rollout_native_dylib_module_for_build(repo, module.clone());
+
+        assert_eq!(retargeted.package, module.package);
+        assert_eq!(retargeted.module_id, module.module_id);
+        assert_eq!(
+            retargeted.built_library,
+            repo.join("target")
+                .join(ROLLOUT_NATIVE_DYLIB_TARGET_DIR)
+                .join("debug")
+                .join("libsinomo_test_module.so")
+        );
+    }
+
+    #[test]
+    fn rollout_cargo_build_command_disables_incremental_and_sets_optional_target_dir() {
+        let root = unique_temp("sinomo-rollout-build-command");
+        run_git_for_test(&root, &["init"]);
+        run_git_for_test(&root, &["config", "user.email", "test@example.com"]);
+        run_git_for_test(&root, &["config", "user.name", "Sinomo Test"]);
+        fs::write(root.join("README.md"), "test\n").expect("readme");
+        run_git_for_test(&root, &["add", "README.md"]);
+        run_git_for_test(&root, &["commit", "-m", "init"]);
+
+        let args = vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
+        let target_dir = root.join("target").join(ROLLOUT_NATIVE_DYLIB_TARGET_DIR);
+        let command =
+            rollout_cargo_build_command(&root, &args, Some(&target_dir)).expect("command");
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|value| value.to_string_lossy().to_string()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(envs.get("CARGO_INCREMENTAL"), Some(&Some("0".to_string())));
+        assert_eq!(
+            envs.get("CARGO_TARGET_DIR"),
+            Some(&Some(target_dir.display().to_string()))
+        );
+        assert_eq!(
+            rollout_cargo_build_log_command(&args, Some(&target_dir)),
+            format!(
+                "CARGO_INCREMENTAL=0 CARGO_TARGET_DIR={} cargo build -p sinomo",
+                target_dir.display()
+            )
         );
     }
 
