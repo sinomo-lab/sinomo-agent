@@ -1071,37 +1071,6 @@ pub(crate) fn object_rpc_transfer_timeouts(
         .with_idle_timeout(Some(OBJECT_RPC_TRANSFER_IDLE_TIMEOUT))
 }
 
-pub fn send_dfs_object_rpc_to_target(
-    target_node_id: &NodeId,
-    request: &ObjectRpcRequest,
-    connect_timeout: Duration,
-    observe_connectivity: bool,
-) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
-    send_object_rpc_to_target(
-        target_node_id,
-        request,
-        connect_timeout,
-        observe_connectivity,
-    )
-}
-
-pub async fn send_dfs_object_rpc_to_target_async(
-    target_node_id: &NodeId,
-    request: &ObjectRpcRequest,
-    connect_timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-    observe_connectivity: bool,
-) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
-    send_object_rpc_to_target_async(
-        target_node_id,
-        request,
-        connect_timeout,
-        runtime,
-        observe_connectivity,
-    )
-    .await
-}
-
 pub fn fetch_daemon_status_from_address(
     address: &str,
     timeout: Duration,

@@ -28,6 +28,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const SIFS_ENDPOINT_TARGET_REFRESH_TTL: Duration = Duration::from_secs(1);
+const SIFS_FOREGROUND_METADATA_PUBLISH_MAX_BATCHES_PER_TARGET: usize = 1;
+const SIFS_FOREGROUND_METADATA_PUBLISH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+const SIFS_FOREGROUND_METADATA_PUBLISH_TARGET_TIMEOUT: Duration = Duration::from_secs(2);
+const SIFS_MAINTENANCE_REFRESH_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[derive(Debug)]
 pub(crate) struct SifsFileManagerBackend {
@@ -59,7 +63,7 @@ pub(crate) struct SifsMetadataPrimaryTransferReport {
 impl SifsFileManagerBackend {
     pub(crate) fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
         let rpc_runtime = SifsRpcRuntime::new()?;
-        let service = open_sifs_service(data_dir, &rpc_runtime)?;
+        let service = open_sifs_service_with_hydration(data_dir, &rpc_runtime, false)?;
         Self::from_service(data_dir, rpc_runtime, service)
     }
 
@@ -143,9 +147,10 @@ impl SifsFileManagerBackend {
                 return;
             }
             let _ = service.flush_detached_transport_sends();
-            let _ = service.process_incoming();
+            let _ = service.process_incoming_without_deferred_parent_touches();
         }
         let _ = publish_sifs_metadata_journal_from_data_dir(&self.data_dir, &self.rpc_runtime);
+        request_sifs_daemon_maintenance_refresh();
     }
 
     /// The node id objects written here are placed on (the local SIFS node).
@@ -312,7 +317,11 @@ impl SifsFileManagerBackend {
                 .posix_mkdir_all(&parent)
                 .map_err(|error| format!("cannot create SIFS directory {parent}: {error}"))?;
         }
-        let mut options = sifs_write_options(&service, &self.replica_candidates);
+        let mut options = if foreground_replica_repair {
+            sifs_write_options(&service, &self.replica_candidates)
+        } else {
+            sifs_deferred_publish_write_options(&service, &self.replica_candidates)
+        };
         options.foreground_replica_repair = foreground_replica_repair;
         service
             .posix_write_file(&path, bytes, options)
@@ -771,7 +780,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
         self.refresh_service_endpoint_targets(&mut service);
-        let options = sifs_write_options(&service, &self.replica_candidates);
+        let options = sifs_deferred_publish_write_options(&service, &self.replica_candidates);
         service
             .posix_write_file(&path, &[], options)
             .map(|_| ())
@@ -902,13 +911,6 @@ fn sifs_parallel_read_worker_count_for(
         .max(1)
         .min(requested_workers)
         .min(batch_limited_workers)
-}
-
-fn open_sifs_service(
-    data_dir: &SinomoDataDir,
-    rpc_runtime: &SifsRpcRuntime,
-) -> Result<NetworkedDfsService<DfsEndpointTransport>, String> {
-    open_sifs_service_with_hydration(data_dir, rpc_runtime, true)
 }
 
 fn open_sifs_service_read_only(
@@ -1323,9 +1325,28 @@ fn publish_sifs_metadata_journal_from_data_dir(
         data_dir,
         &cluster_paths,
         peer_transport,
-        DfsMetadataJournalReplicationOptions::default(),
+        sifs_foreground_metadata_publish_options(),
     )?;
     Ok(())
+}
+
+fn sifs_foreground_metadata_publish_options() -> DfsMetadataJournalReplicationOptions {
+    DfsMetadataJournalReplicationOptions {
+        max_batches_per_target: SIFS_FOREGROUND_METADATA_PUBLISH_MAX_BATCHES_PER_TARGET,
+        attempt_timeout: SIFS_FOREGROUND_METADATA_PUBLISH_ATTEMPT_TIMEOUT,
+        target_timeout: SIFS_FOREGROUND_METADATA_PUBLISH_TARGET_TIMEOUT,
+        ..DfsMetadataJournalReplicationOptions::default()
+    }
+}
+
+fn request_sifs_daemon_maintenance_refresh() {
+    let Ok(client) = sinomo_runtime::daemon::DaemonApiClient::connect() else {
+        return;
+    };
+    let _ = sinomo_runtime::daemon::send_daemon_cluster_maintenance_refresh(
+        client.address(),
+        SIFS_MAINTENANCE_REFRESH_TIMEOUT,
+    );
 }
 
 fn sifs_write_options(
@@ -1573,6 +1594,15 @@ mod tests {
             !options.foreground_replica_repair,
             "deferred publish writes should not block on the async replica repair path"
         );
+    }
+
+    #[test]
+    fn sifs_foreground_metadata_publish_is_bounded() {
+        let options = sifs_foreground_metadata_publish_options();
+
+        assert_eq!(options.max_batches_per_target, 1);
+        assert_eq!(options.attempt_timeout, Duration::from_secs(2));
+        assert_eq!(options.target_timeout, Duration::from_secs(2));
     }
 
     fn healthy_connectivity_record(

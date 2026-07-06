@@ -130,9 +130,8 @@ use crate::{
     DAEMON_DFS_BROWSER_RENAME_ROUTE, DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE,
     DAEMON_DFS_BROWSER_STATUS_ROUTE, DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
     DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
-    DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
-    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
-    DAEMON_STATUS_ROUTE,
+    DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
+    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
 };
 
 static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
@@ -465,16 +464,13 @@ impl Service for DaemonControlService {
             DAEMON_SHUTDOWN_ROUTE,
             DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
             DAEMON_OBJECT_RPC_FORWARD_ROUTE,
-            DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
         ]
     }
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
         let mut routes = service_route_categories(self.routes(), DAEMON_RPC_CATEGORY);
         for route in &mut routes {
-            if route.route == DAEMON_OBJECT_RPC_FORWARD_ROUTE
-                || route.route == DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
-            {
+            if route.route == DAEMON_OBJECT_RPC_FORWARD_ROUTE {
                 route.auth_scope = Some("local-command".to_string());
             }
         }
@@ -529,7 +525,7 @@ impl Service for DaemonControlService {
                         ServiceDisposition::Continue,
                     )
                 }
-                DAEMON_OBJECT_RPC_FORWARD_ROUTE | DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE => {
+                DAEMON_OBJECT_RPC_FORWARD_ROUTE => {
                     let payload: crate::DaemonObjectRpcForwardRequest = request.decode_body()?;
                     let runtime =
                         require_service_runtime(runtime.as_ref(), "daemon object RPC forward")?

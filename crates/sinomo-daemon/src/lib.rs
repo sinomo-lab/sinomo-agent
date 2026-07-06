@@ -21,7 +21,6 @@ pub const DAEMON_STATUS_ROUTE: &str = "/daemon/status";
 pub const DAEMON_SHUTDOWN_ROUTE: &str = "/daemon/shutdown";
 pub const DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE: &str = "/daemon/cluster/maintenance-refresh";
 pub const DAEMON_OBJECT_RPC_FORWARD_ROUTE: &str = "/daemon/object-rpc/forward";
-pub const DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE: &str = "/daemon/dfs/object-rpc/forward";
 pub const DAEMON_DFS_BROWSER_STATUS_ROUTE: &str = "/daemon/dfs/browser/status";
 pub const DAEMON_DFS_BROWSER_STAT_ROUTE: &str = "/daemon/dfs/browser/stat";
 pub const DAEMON_DFS_BROWSER_LIST_ROUTE: &str = "/daemon/dfs/browser/list";
@@ -76,8 +75,6 @@ pub struct DaemonObjectRpcForwardRequest {
     #[serde(default)]
     pub observe_connectivity: bool,
 }
-
-pub type DaemonDfsObjectRpcForwardRequest = DaemonObjectRpcForwardRequest;
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserStatusRequest {
@@ -514,8 +511,7 @@ pub use client::{
     send_daemon_rpc_to_endpoint_async, send_daemon_rpc_to_endpoint_with_timeouts,
     send_daemon_rpc_with_timeouts, send_daemon_shutdown_request,
     send_dfs_metadata_journal_batch_to_endpoint_async,
-    send_dfs_metadata_snapshot_install_to_endpoint_async, send_dfs_object_rpc_to_target,
-    send_dfs_object_rpc_to_target_async, send_object_rpc_to_target,
+    send_dfs_metadata_snapshot_install_to_endpoint_async, send_object_rpc_to_target,
     send_object_rpc_to_target_async,
 };
 pub use cluster::commit_cluster_kv_txn_with_quorum;

@@ -16,6 +16,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.process_incoming_with_options(true)
     }
 
+    pub fn process_incoming_without_deferred_parent_touches(
+        &mut self,
+    ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
+        self.process_incoming_with_options(false)
+    }
+
     pub(crate) fn process_incoming_until_quiescent(
         &mut self,
     ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
