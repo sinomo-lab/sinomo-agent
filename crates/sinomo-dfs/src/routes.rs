@@ -3,8 +3,8 @@
 use crate::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMessageCommand, DfsMessageResponse,
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
-    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsNamespaceCommand,
-    DfsNamespaceOperation, DfsNetworkMessage, DfsOperatorStatus, DfsRoutedMessage, DfsSmokeReport,
+    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsNetworkMessage,
+    DfsOperatorStatus, DfsRoutedMessage, DfsSmokeReport,
 };
 use sinomo_core::network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::node::NodeId;
@@ -285,10 +285,6 @@ pub(crate) fn dfs_network_message_allows_write_repair_progress(
 ) -> bool {
     match message {
         DfsNetworkMessage::DistributedWriteRequest(command) => command.foreground_replica_repair,
-        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
-            operation: DfsNamespaceOperation::SyncPath { .. },
-            ..
-        }) => true,
         _ => false,
     }
 }
