@@ -15,7 +15,7 @@ use sinomo_core::node::NodeId;
 use sinomo_core::{
     ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterTransportKind,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -83,6 +83,13 @@ impl TcpTunnelRegistry {
         {
             peers.remove(&handle.peer_node_id);
         }
+    }
+
+    fn remove(&self, node_id: &NodeId) -> Option<Arc<TcpTunnelHandle>> {
+        self.peers
+            .lock()
+            .ok()
+            .and_then(|mut peers| peers.remove(node_id))
     }
 }
 
@@ -281,6 +288,15 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
         };
     }
     if tcp_tunnel_is_synthetic_endpoint(endpoint) {
+        if let Some(paths) = paths {
+            remember_tcp_tunnel_connectivity(
+                paths,
+                endpoint,
+                sinomo_core::network::ClusterConnectivityState::Unreachable,
+                Some(runtime),
+            )
+            .await;
+        }
         return Some(Err(NetworkError::Io {
             operation: "send tcp tunnel request".to_string(),
             detail: format!(
@@ -352,6 +368,63 @@ fn tcp_tunnel_is_synthetic_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
             .starts_with(TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
 }
 
+fn tcp_tunnel_connectivity_record_is_synthetic(
+    record: &sinomo_core::network::ClusterConnectivityRecord,
+) -> bool {
+    record.transport == ClusterTransportKind::LanTcp
+        && record
+            .address
+            .starts_with(TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
+}
+
+async fn ping_tcp_tunnel_peer(
+    local_node_id: &NodeId,
+    peer_node_id: &NodeId,
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+) -> Result<(), NetworkError> {
+    let endpoint = tcp_tunnel_synthetic_endpoint(local_node_id, peer_node_id);
+    let request = sinomo_core::cluster::cluster_network_ping_rpc_request(
+        format!("tcp-tunnel-maintenance-{peer_node_id}"),
+        0,
+    )?;
+    let auth = sign_object_rpc_request_for_local_node(&request, runtime).await?;
+    let response = send_signed_endpoint_rpc_via_tcp_tunnel(
+        &endpoint,
+        &auth,
+        &request,
+        DaemonRpcTimeouts::connect_and_idle(TCP_TUNNEL_CONNECT_TIMEOUT),
+        runtime,
+        Some(paths),
+    )
+    .await
+    .unwrap_or_else(|| {
+        Err(NetworkError::Io {
+            operation: "tcp tunnel maintenance ping".to_string(),
+            detail: "tcp tunnel send was not handled by tunnel transport".to_string(),
+        })
+    })?;
+    response.error_detail()?;
+    let ping = sinomo_core::cluster::decode_cluster_network_ping_rpc_response(&response)?;
+    if ping.responder_node_id != *peer_node_id {
+        return Err(NetworkError::Io {
+            operation: "tcp tunnel maintenance ping".to_string(),
+            detail: format!(
+                "responder mismatch: expected {}, got {}",
+                peer_node_id, ping.responder_node_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+async fn evict_tcp_tunnel_peer(peer_node_id: &NodeId, detail: String) {
+    if let Some(handle) = TCP_TUNNELS.remove(peer_node_id) {
+        handle.request_close(detail.clone());
+        handle.fail_pending(detail).await;
+    }
+}
+
 async fn send_over_tcp_tunnel_handle(
     handle: Arc<TcpTunnelHandle>,
     request: ObjectRpcRequest,
@@ -377,15 +450,79 @@ async fn maintain_tcp_tunnels_once(
 ) -> Result<(), DaemonError> {
     let cluster_paths = crate::cluster::cluster_paths_from_daemon_paths(paths)?;
     let state = read_cluster_state_without_kv(&cluster_paths).map_err(DaemonError::from)?;
+    prune_stale_tcp_tunnel_connectivity(paths, runtime).await?;
     let selector = sinomo_core::network::ClusterEndpointSelector::new(&cluster_paths, &state);
     let mut endpoints =
         selector.select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates);
     endpoints.extend(selector.select(ClusterEndpointSelectionPurpose::NetworkProbe));
+    let mut live_peers = BTreeSet::new();
     for endpoint in tcp_tunnel_maintenance_candidate_endpoints(&state.local_node_id, endpoints) {
-        if TCP_TUNNELS.contains(&endpoint.node_id) {
+        if live_peers.contains(&endpoint.node_id) {
             continue;
         }
-        let _ = connect_tcp_tunnel_to_endpoint(&endpoint, runtime, Some(paths)).await;
+        if TCP_TUNNELS.contains(&endpoint.node_id) {
+            match ping_tcp_tunnel_peer(&state.local_node_id, &endpoint.node_id, paths, runtime)
+                .await
+            {
+                Ok(()) => {
+                    live_peers.insert(endpoint.node_id.clone());
+                    continue;
+                }
+                Err(error) => {
+                    evict_tcp_tunnel_peer(
+                        &endpoint.node_id,
+                        format!("maintenance ping failed: {error}"),
+                    )
+                    .await;
+                    let synthetic =
+                        tcp_tunnel_synthetic_endpoint(&state.local_node_id, &endpoint.node_id);
+                    remember_tcp_tunnel_connectivity(
+                        paths,
+                        &synthetic,
+                        sinomo_core::network::ClusterConnectivityState::Unreachable,
+                        Some(runtime),
+                    )
+                    .await;
+                }
+            }
+        }
+        if connect_tcp_tunnel_to_endpoint(&endpoint, runtime, Some(paths))
+            .await
+            .is_ok()
+        {
+            live_peers.insert(endpoint.node_id.clone());
+        }
+    }
+    prune_stale_tcp_tunnel_connectivity(paths, runtime).await?;
+    Ok(())
+}
+
+async fn prune_stale_tcp_tunnel_connectivity(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+) -> Result<(), DaemonError> {
+    let cluster_paths = crate::cluster::cluster_paths_from_daemon_paths(paths)?;
+    let state = read_cluster_state_without_kv(&cluster_paths).map_err(DaemonError::from)?;
+    let records = sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+        &cluster_paths,
+        &state.local_node_id,
+    )?;
+    let retained = records
+        .iter()
+        .filter(|record| {
+            !tcp_tunnel_connectivity_record_is_synthetic(record)
+                || TCP_TUNNELS.contains(&record.target_node_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if retained.len() != records.len() {
+        sinomo_core::network::write_local_cluster_connectivity_record_set_async(
+            runtime,
+            &cluster_paths,
+            &state.local_node_id,
+            &retained,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -474,24 +611,30 @@ async fn signed_tcp_tunnel_open_request(
         CLUSTER_TCP_TUNNEL_RPC_CATEGORY,
         &ClusterTcpTunnelOpenRequest::default(),
     )?;
+    request.auth = Some(sign_object_rpc_request_for_local_node(&request, runtime).await?);
+    Ok(request)
+}
+
+async fn sign_object_rpc_request_for_local_node(
+    request: &ObjectRpcRequest,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Vec<u8>, NetworkError> {
     let route = request.route.clone();
     let category = request.category.clone();
     let body_sha256 = daemon_rpc_body_sha256(&request);
-    let signed = runtime
+    Ok(runtime
         .spawn_blocking(move || {
             sign_daemon_rpc_request_digest_for_local_node(&route, &category, body_sha256)
         })
         .await
         .map_err(|source| NetworkError::Io {
-            operation: "sign tcp tunnel open request".to_string(),
+            operation: "sign tcp tunnel request".to_string(),
             detail: format!("signing task failed: {source}"),
         })?
         .map_err(|error| NetworkError::Io {
-            operation: "sign tcp tunnel open request".to_string(),
+            operation: "sign tcp tunnel request".to_string(),
             detail: error.to_string(),
-        })?;
-    request.auth = Some(signed);
-    Ok(request)
+        })?)
 }
 
 fn spawn_tcp_tunnel(
@@ -968,6 +1111,81 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["10.0.0.41:21353", "129.146.106.76:21353"]
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_maintenance_prunes_synthetic_record_without_handle() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-tcp-tunnel-prune-stale");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let daemon_paths = DaemonPaths::new(&data_dir);
+        daemon_paths.ensure().expect("daemon paths");
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let now = time::OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_tcp_tunnel_prune")
+                .expect("cluster id");
+        let local =
+            NodeId::from_legacy_named("node_tcp_tunnel_prune_local").expect("local node id");
+        let peer = NodeId::from_legacy_named("node_tcp_tunnel_prune_peer").expect("peer node id");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "tcp tunnel prune",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+        let synthetic = tcp_tunnel_synthetic_endpoint(&local, &peer);
+        let direct = test_endpoint(
+            "tcp_tunnel_prune_direct",
+            &peer,
+            "10.14.1.11:21353",
+            ClusterTransportKind::LanTcp,
+        );
+        let synthetic_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &synthetic,
+            sinomo_core::network::ClusterConnectivityState::Healthy,
+            Some(0),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let direct_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &direct,
+            sinomo_core::network::ClusterConnectivityState::Healthy,
+            Some(7),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &cluster_paths,
+            &local,
+            &[synthetic_record, direct_record.clone()],
+        )
+        .expect("write connectivity");
+
+        prune_stale_tcp_tunnel_connectivity(&daemon_paths, &tokio::runtime::Handle::current())
+            .await
+            .expect("prune stale synthetic tunnel record");
+
+        let records = sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+            &cluster_paths,
+            &local,
+        )
+        .expect("connectivity records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].endpoint_id, direct_record.endpoint_id);
+        assert_eq!(records[0].address, direct_record.address);
     }
 
     #[test]
