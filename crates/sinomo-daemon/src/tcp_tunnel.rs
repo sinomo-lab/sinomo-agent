@@ -16,6 +16,7 @@ use sinomo_core::{
     ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterTransportKind,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Read;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -28,8 +29,17 @@ const TCP_TUNNEL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15);
 const TCP_TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 const TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX: &str = "tcp-tunnel://";
 
-type PendingTcpTunnelMap =
-    Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Result<ObjectRpcResponse, NetworkError>>>>>;
+type PendingTcpTunnelMap = Arc<tokio::sync::Mutex<HashMap<u64, PendingTcpTunnelRequest>>>;
+
+struct PendingTcpTunnelRequest {
+    tx: oneshot::Sender<Result<ObjectRpcResponse, NetworkError>>,
+    stream: Option<PendingTcpTunnelStreamResponse>,
+}
+
+struct PendingTcpTunnelStreamResponse {
+    response: ObjectRpcResponse,
+    body: Vec<u8>,
+}
 
 static TCP_TUNNELS: LazyLock<TcpTunnelRegistry> = LazyLock::new(TcpTunnelRegistry::default);
 
@@ -114,7 +124,10 @@ impl TcpTunnelHandle {
     ) -> Result<ObjectRpcResponse, NetworkError> {
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
+        self.pending
+            .lock()
+            .await
+            .insert(id, PendingTcpTunnelRequest { tx, stream: None });
         let frame = ClusterTcpTunnelFrame::Request { id, request };
         let send = self.tx.send(frame);
         let send_result = if let Some(timeout) = timeouts.connect_timeout {
@@ -168,7 +181,7 @@ impl TcpTunnelHandle {
             std::mem::take(&mut *guard)
         };
         for sender in pending.into_values() {
-            let _ = sender.send(Err(NetworkError::Io {
+            let _ = sender.tx.send(Err(NetworkError::Io {
                 operation: "tcp tunnel request".to_string(),
                 detail: detail.clone(),
             }));
@@ -438,6 +451,70 @@ async fn send_over_tcp_tunnel_handle(
         handle.fail_pending(detail).await;
     }
     result
+}
+
+async fn send_tcp_tunnel_stream_response(
+    id: u64,
+    stream_response: sinomo_core::service::ServiceStreamResponse,
+    tx: mpsc::Sender<ClusterTcpTunnelFrame>,
+) {
+    let _ = tx
+        .send(ClusterTcpTunnelFrame::Response {
+            id,
+            response: stream_response.response,
+        })
+        .await;
+    if let Some(reader) = stream_response.reader {
+        let chunk_bytes = stream_response
+            .chunk_bytes
+            .clamp(1, sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES);
+        let tx_for_reader = tx.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            send_tcp_tunnel_stream_chunks_blocking(id, reader, chunk_bytes, tx_for_reader)
+        })
+        .await;
+        match read {
+            Ok(Ok(())) => {}
+            Ok(Err(detail)) => {
+                let _ = tx
+                    .send(ClusterTcpTunnelFrame::StreamError { id, detail })
+                    .await;
+                return;
+            }
+            Err(source) => {
+                let _ = tx
+                    .send(ClusterTcpTunnelFrame::StreamError {
+                        id,
+                        detail: format!("tcp tunnel stream reader task failed: {source}"),
+                    })
+                    .await;
+                return;
+            }
+        }
+    }
+    let _ = tx.send(ClusterTcpTunnelFrame::StreamEnd { id }).await;
+}
+
+fn send_tcp_tunnel_stream_chunks_blocking(
+    id: u64,
+    mut reader: Box<dyn Read + Send>,
+    chunk_bytes: usize,
+    tx: mpsc::Sender<ClusterTcpTunnelFrame>,
+) -> Result<(), String> {
+    let mut buffer = vec![0_u8; chunk_bytes];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|source| source.to_string())?;
+        if read == 0 {
+            return Ok(());
+        }
+        tx.blocking_send(ClusterTcpTunnelFrame::StreamChunk {
+            id,
+            bytes: buffer[..read].to_vec(),
+        })
+        .map_err(|source| source.to_string())?;
+    }
 }
 
 fn tcp_tunnel_should_maintain_outbound(local_node_id: &NodeId, peer_node_id: &NodeId) -> bool {
@@ -716,6 +793,47 @@ async fn tcp_tunnel_reader_loop(
                 let paths = paths.clone();
                 let service_runtime = service_runtime.clone();
                 tokio::spawn(async move {
+                    if sinomo_core::network::object_rpc_request_stream_mode(&request)
+                        .expects_raw_streamed_response()
+                    {
+                        let stream_result = if request.route
+                            == sinomo_core::network::CLUSTER_RELAY_ROUTE
+                        {
+                            crate::cluster::handle_daemon_cluster_relay_stream_collect_on_runtime(
+                                paths.clone(),
+                                request.clone(),
+                                service_runtime,
+                            )
+                            .await
+                        } else {
+                            crate::service_adapter::dispatch_stream_rpc_in_process_async(
+                                paths.clone(),
+                                service_runtime,
+                                request.clone(),
+                            )
+                            .await
+                        };
+                        match stream_result {
+                            Ok(stream_response) => {
+                                send_tcp_tunnel_stream_response(id, stream_response, tx).await;
+                            }
+                            Err(error) => {
+                                let response = ObjectRpcResponse::encode_error(
+                                    request.route.clone(),
+                                    error.to_string(),
+                                )
+                                .unwrap_or_else(|_| ObjectRpcResponse {
+                                    route: request.route,
+                                    body: Vec::new(),
+                                    metadata: BTreeMap::new(),
+                                });
+                                let _ = tx
+                                    .send(ClusterTcpTunnelFrame::Response { id, response })
+                                    .await;
+                            }
+                        }
+                        return;
+                    }
                     let mut response =
                         match crate::control::dispatch_daemon_control_request_in_process_async(
                             paths.clone(),
@@ -745,8 +863,68 @@ async fn tcp_tunnel_reader_loop(
                 });
             }
             ClusterTcpTunnelFrame::Response { id, response } => {
-                if let Some(sender) = handle.pending.lock().await.remove(&id) {
-                    let _ = sender.send(Ok(response));
+                if sinomo_core::network::object_rpc_response_stream_mode(&response)
+                    == sinomo_core::network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
+                {
+                    if let Some(pending) = handle.pending.lock().await.get_mut(&id) {
+                        pending.stream = Some(PendingTcpTunnelStreamResponse {
+                            response,
+                            body: Vec::new(),
+                        });
+                    }
+                } else if let Some(pending) = handle.pending.lock().await.remove(&id) {
+                    let _ = pending.tx.send(Ok(response));
+                }
+            }
+            ClusterTcpTunnelFrame::StreamChunk { id, bytes } => {
+                let mut pending = handle.pending.lock().await;
+                let mut failure = None;
+                if let Some(request) = pending.get_mut(&id) {
+                    if let Some(stream) = request.stream.as_mut() {
+                        if stream.body.try_reserve(bytes.len()).is_ok() {
+                            stream.body.extend_from_slice(&bytes);
+                        } else {
+                            failure =
+                                Some("tcp tunnel streamed response exhausted memory".to_string());
+                        }
+                    } else {
+                        failure = Some(
+                            "tcp tunnel received stream chunk before streamed response frame"
+                                .to_string(),
+                        );
+                    }
+                }
+                if let Some(detail) = failure
+                    && let Some(request) = pending.remove(&id)
+                {
+                    let _ = request.tx.send(Err(NetworkError::Io {
+                        operation: "read tcp tunnel stream".to_string(),
+                        detail,
+                    }));
+                }
+            }
+            ClusterTcpTunnelFrame::StreamEnd { id } => {
+                if let Some(mut pending) = handle.pending.lock().await.remove(&id) {
+                    let result = match pending.stream.take() {
+                        Some(mut stream) => {
+                            stream.response.body = stream.body;
+                            Ok(stream.response)
+                        }
+                        None => Err(NetworkError::Io {
+                            operation: "read tcp tunnel stream".to_string(),
+                            detail: "tcp tunnel received stream end before streamed response frame"
+                                .to_string(),
+                        }),
+                    };
+                    let _ = pending.tx.send(result);
+                }
+            }
+            ClusterTcpTunnelFrame::StreamError { id, detail } => {
+                if let Some(pending) = handle.pending.lock().await.remove(&id) {
+                    let _ = pending.tx.send(Err(NetworkError::Io {
+                        operation: "read tcp tunnel stream".to_string(),
+                        detail,
+                    }));
                 }
             }
             ClusterTcpTunnelFrame::Close { detail } => {
@@ -1079,7 +1257,7 @@ mod tests {
             test_endpoint(
                 "tcp_tunnel_maintenance_public",
                 &peer,
-                "129.146.106.76:21353",
+                "198.51.100.76:21353",
                 ClusterTransportKind::LanTcp,
             ),
             test_endpoint(
@@ -1109,7 +1287,7 @@ mod tests {
                 .iter()
                 .map(|endpoint| endpoint.address.as_str())
                 .collect::<Vec<_>>(),
-            vec!["10.0.0.41:21353", "129.146.106.76:21353"]
+            vec!["10.0.0.41:21353", "198.51.100.76:21353"]
         );
     }
 

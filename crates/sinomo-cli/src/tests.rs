@@ -7615,13 +7615,13 @@ fn cluster_init_merges_manual_endpoint_config() {
         br#"{
             "main": [
                 {
-                    "address": "tcp://129.146.106.76:21353",
+                    "address": "tcp://198.51.100.76:21353",
                     "scope": "internet-direct"
                 }
             ],
             "shadow": [
                 {
-                    "address": "tcp://129.146.106.76:21354",
+                    "address": "tcp://198.51.100.76:21354",
                     "scope": "internet-direct"
                 }
             ]
@@ -7650,11 +7650,11 @@ fn cluster_init_merges_manual_endpoint_config() {
         .expect("main daemon member");
 
     assert!(member.endpoints.iter().any(|endpoint| {
-        endpoint.address == "129.146.106.76:21353"
+        endpoint.address == "198.51.100.76:21353"
             && endpoint.privacy == ClusterEndpointPrivacy::InternetDirect
     }));
     assert!(member.endpoints.iter().any(|endpoint| {
-        endpoint.address == "129.146.106.76:21354"
+        endpoint.address == "198.51.100.76:21354"
             && endpoint.privacy == ClusterEndpointPrivacy::InternetDirect
     }));
 }

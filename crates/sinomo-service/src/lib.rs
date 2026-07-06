@@ -27,6 +27,7 @@ pub use discovery::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::io::Read;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -144,6 +145,17 @@ impl ServiceContext {
 pub type ServiceFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ServiceDisposition, ServiceError>> + Send + 'a>>;
 
+pub struct ServiceStreamResponse {
+    pub response: ObjectRpcResponse,
+    pub reader: Option<Box<dyn Read + Send>>,
+    pub chunk_bytes: usize,
+}
+
+/// The future returned by [`Service::handle_stream`] and
+/// [`ServiceRegistry::dispatch_stream_direct`].
+pub type ServiceStreamFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ServiceStreamResponse, ServiceError>> + Send + 'a>>;
+
 /// A host-agnostic control-plane service: owns object-RPC routes and serves requests
 /// asynchronously. Implementors return `Box::pin(async move { … })`.
 pub trait Service: Send + Sync {
@@ -165,6 +177,16 @@ pub trait Service: Send + Sync {
     /// Serve a request whose route this service owns, writing the reply via `ctx.sink`,
     /// and report whether the host should keep running.
     fn handle(&self, ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_>;
+
+    /// Serve a request whose response body should be transferred as a byte stream.
+    /// Services that do not own streamed responses leave this as `None`.
+    fn handle_stream(
+        &self,
+        _ctx: ServiceContext,
+        _request: ObjectRpcRequest,
+    ) -> Option<ServiceStreamFuture<'_>> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -299,6 +321,47 @@ impl ServiceRegistry {
                 })
             }
             None => Box::pin(async move { Err(ServiceError::UnknownRoute(request.route)) }),
+        }
+    }
+
+    pub fn dispatch_stream_direct(
+        &self,
+        ctx: ServiceContext,
+        request: ObjectRpcRequest,
+    ) -> Option<ServiceStreamFuture<'static>> {
+        match self.by_route.get(request.route.as_str()) {
+            Some(owner) if request.category == owner.category => {
+                let service = Arc::clone(&self.services[owner.service_index]);
+                let route = request.route.clone();
+                Some(Box::pin(async move {
+                    let Some(future) = service.handle_stream(ctx, request) else {
+                        return Err(ServiceError::Network(NetworkError::Serialization {
+                            detail: format!(
+                                "service route {route} does not support streamed object-RPC responses"
+                            ),
+                        }));
+                    };
+                    future.await
+                }))
+            }
+            Some(owner) => {
+                let route = request.route.clone();
+                let expected = owner.category.to_string();
+                let actual = request.category;
+                Some(Box::pin(async move {
+                    Err(ServiceError::Network(NetworkError::Serialization {
+                        detail: format!(
+                            "service route {route} expected category {expected}, got {actual}"
+                        ),
+                    }))
+                }))
+            }
+            None => {
+                let route = request.route.clone();
+                Some(Box::pin(
+                    async move { Err(ServiceError::UnknownRoute(route)) },
+                ))
+            }
         }
     }
 
@@ -650,6 +713,80 @@ mod tests {
             frames.lock().expect("frames").is_empty(),
             "handler should not emit a response when route category validation fails"
         );
+    }
+
+    #[tokio::test]
+    async fn registry_dispatches_streamed_response_without_sink_frames() {
+        struct StreamService;
+
+        impl Service for StreamService {
+            fn name(&self) -> &'static str {
+                "stream"
+            }
+
+            fn routes(&self) -> &'static [&'static str] {
+                &["/test/stream"]
+            }
+
+            fn handle(
+                &self,
+                mut ctx: ServiceContext,
+                _request: ObjectRpcRequest,
+            ) -> ServiceFuture<'_> {
+                Box::pin(async move {
+                    ctx.respond(ObjectRpcResponse::encode_body(
+                        "/test/stream",
+                        &"ordinary".to_string(),
+                    )?)?;
+                    Ok(ServiceDisposition::Continue)
+                })
+            }
+
+            fn handle_stream(
+                &self,
+                _ctx: ServiceContext,
+                _request: ObjectRpcRequest,
+            ) -> Option<ServiceStreamFuture<'_>> {
+                Some(Box::pin(async move {
+                    Ok(ServiceStreamResponse {
+                        response: ObjectRpcResponse::encode_body(
+                            "/test/stream",
+                            &"metadata".to_string(),
+                        )?,
+                        reader: Some(Box::new(std::io::Cursor::new(b"stream-body".to_vec()))),
+                        chunk_bytes: 3,
+                    })
+                }))
+            }
+        }
+
+        let registry = ServiceRegistry::builder().register(StreamService).build();
+        let sink = CollectingSink::default();
+        let frames = Arc::clone(&sink.frames);
+        let request = ObjectRpcRequest::encode_body("/test/stream", "stream", &()).expect("encode");
+        let mut stream_response = registry
+            .dispatch_stream_direct(local_context(sink), request)
+            .expect("stream future")
+            .await
+            .expect("stream response");
+
+        assert_eq!(
+            stream_response
+                .response
+                .decode_body::<String>()
+                .expect("metadata"),
+            "metadata"
+        );
+        let mut body = Vec::new();
+        stream_response
+            .reader
+            .take()
+            .expect("reader")
+            .read_to_end(&mut body)
+            .expect("read body");
+        assert_eq!(body, b"stream-body");
+        assert_eq!(stream_response.chunk_bytes, 3);
+        assert!(frames.lock().expect("frames").is_empty());
     }
 
     #[tokio::test]

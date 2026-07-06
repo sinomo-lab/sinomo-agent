@@ -16,6 +16,7 @@
 #   PUBLISH_INVITE      invite file to (re)publish with PUBLISH_INTRODUCER (seed + bridges)
 #   PUBLISH_INTRODUCER  introducer host:port to advertise in the published invite
 #   SINOMO_DISABLE_IROH "1" => run on direct LAN transports only (default here)
+#   SINOMO_MANUAL_ENDPOINTS_JSON optional raw configs/cluster/endpoints.json content
 #   WAIT_FOR_INTRODUCER_READY "1" => wait for /shared/<introducer-host>.joined (dev harness)
 #   WAIT_FOR_JOIN_READY_NODES optional space-separated node names to wait for before joining
 set -uo pipefail   # NOTE: not -e; cross-segment join failures are expected and handled.
@@ -40,6 +41,19 @@ export SINOMO_DISABLE_IROH="${SINOMO_DISABLE_IROH:-1}"
 export SINOMO_DAEMON_ADVERTISE_HOST="${SINOMO_DAEMON_ADVERTISE_HOST:-$NODE_NAME}"
 
 log() { echo "[entrypoint $(hostname)] $*"; }
+
+write_manual_endpoint_config() {
+  [ -n "${SINOMO_MANUAL_ENDPOINTS_JSON:-}" ] || return 0
+  local config_dir="$DATA/configs/cluster"
+  mkdir -p "$config_dir" || return 1
+  printf '%s\n' "$SINOMO_MANUAL_ENDPOINTS_JSON" > "$config_dir/endpoints.json" || return 1
+  log "wrote manual endpoint advertisement config"
+}
+
+if ! write_manual_endpoint_config; then
+  log "FATAL: failed to write manual endpoint advertisement config"
+  exit 1
+fi
 
 # If Docker restarts the container after a rollout stops shadow-as-PID1, finish the
 # file-install part of shadow finalization before launching the next supervisor.

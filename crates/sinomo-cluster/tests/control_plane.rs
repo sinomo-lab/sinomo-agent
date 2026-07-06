@@ -2230,7 +2230,7 @@ fn lan_ip_filter_rejects_non_invitable_addresses() {
 #[test]
 fn interface_ip_filter_keeps_routable_lan_addresses() {
     assert!(is_advertisable_interface_ip(
-        "10.14.5.15".parse().expect("wireguard lan")
+        "192.0.2.15".parse().expect("wireguard lan")
     ));
     assert!(is_advertisable_interface_ip(
         "192.168.1.154".parse().expect("ethernet lan")
@@ -2247,7 +2247,7 @@ fn interface_ip_filter_keeps_routable_lan_addresses() {
 fn interface_candidate_filter_rejects_common_local_only_bridges() {
     let docker_bridge = "172.17.0.1".parse().expect("docker bridge");
     let docker_network = "172.18.0.1".parse().expect("docker network");
-    let routable_lan = "10.14.5.15".parse().expect("routable lan");
+    let routable_lan = "192.0.2.15".parse().expect("routable lan");
 
     assert!(!is_advertisable_interface_candidate(
         "docker0",
@@ -11009,7 +11009,7 @@ fn cluster_raft_quorum_commit_retries_next_endpoint_for_same_remote_voter() {
     );
     let private_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.41:21353".to_string(), 10);
     let mut public_endpoint =
-        daemon_lan_endpoint(&peer_node_id, "129.146.106.76:21353".to_string(), 20);
+        daemon_lan_endpoint(&peer_node_id, "198.51.100.76:21353".to_string(), 20);
     public_endpoint.privacy = ClusterEndpointPrivacy::InternetDirect;
     state
         .members
@@ -11309,7 +11309,7 @@ fn cluster_raft_leader_election_retries_next_endpoint_for_same_remote_voter() {
     );
     let private_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.41:21353".to_string(), 10);
     let mut public_endpoint =
-        daemon_lan_endpoint(&peer_node_id, "129.146.106.76:21353".to_string(), 20);
+        daemon_lan_endpoint(&peer_node_id, "198.51.100.76:21353".to_string(), 20);
     public_endpoint.privacy = ClusterEndpointPrivacy::InternetDirect;
     state
         .members
@@ -11504,7 +11504,7 @@ fn cluster_kv_txn_forward_driver_retries_next_endpoint_for_same_state_authority(
     );
     let private_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.41:21353".to_string(), 10);
     let mut public_endpoint =
-        daemon_lan_endpoint(&peer_node_id, "129.146.106.76:21353".to_string(), 20);
+        daemon_lan_endpoint(&peer_node_id, "198.51.100.76:21353".to_string(), 20);
     public_endpoint.privacy = ClusterEndpointPrivacy::InternetDirect;
     state
         .members
@@ -11581,7 +11581,7 @@ fn cluster_kv_txn_forward_driver_bounds_attempt_budget_so_later_endpoints_run() 
     let private_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.41:21353".to_string(), 10);
     let stale_lan_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.42:21353".to_string(), 20);
     let mut public_endpoint =
-        daemon_lan_endpoint(&peer_node_id, "129.146.106.76:21353".to_string(), 30);
+        daemon_lan_endpoint(&peer_node_id, "198.51.100.76:21353".to_string(), 30);
     public_endpoint.privacy = ClusterEndpointPrivacy::InternetDirect;
     state
         .members

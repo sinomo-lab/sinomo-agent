@@ -1918,12 +1918,16 @@ mod tests {
         );
         let public_endpoint = selector_test_endpoint(
             &remote,
-            "129.146.106.76:21353",
+            "198.51.100.76:21353",
             ClusterEndpointPrivacy::InternetDirect,
             0,
         );
-        let lan_endpoint =
-            selector_test_endpoint(&remote, "10.0.0.41:21353", ClusterEndpointPrivacy::Lan, 10);
+        let lan_endpoint = selector_test_endpoint(
+            &remote,
+            "lan-remote.test:21353",
+            ClusterEndpointPrivacy::Lan,
+            10,
+        );
         let mut member = ClusterMemberRecord::local_voter(
             cluster_id,
             remote.clone(),
@@ -1956,12 +1960,12 @@ mod tests {
 
         assert_eq!(
             targets.first().map(|endpoint| endpoint.address.as_str()),
-            Some("10.0.0.41:21353")
+            Some("lan-remote.test:21353")
         );
         assert!(
             targets
                 .iter()
-                .any(|endpoint| endpoint.address == "129.146.106.76:21353"),
+                .any(|endpoint| endpoint.address == "198.51.100.76:21353"),
             "the static public endpoint remains available as a fallback"
         );
     }
@@ -1987,11 +1991,15 @@ mod tests {
             "pk-local",
             now,
         );
-        let lan_endpoint =
-            selector_test_endpoint(&remote, "10.0.0.41:21353", ClusterEndpointPrivacy::Lan, 0);
+        let lan_endpoint = selector_test_endpoint(
+            &remote,
+            "lan-remote.test:21353",
+            ClusterEndpointPrivacy::Lan,
+            0,
+        );
         let public_endpoint = selector_test_endpoint(
             &remote,
-            "129.146.106.76:21353",
+            "198.51.100.76:21353",
             ClusterEndpointPrivacy::InternetDirect,
             10,
         );
@@ -2028,12 +2036,12 @@ mod tests {
 
         assert_eq!(
             targets.first().map(|endpoint| endpoint.address.as_str()),
-            Some("129.146.106.76:21353")
+            Some("198.51.100.76:21353")
         );
         assert!(
             targets
                 .iter()
-                .any(|endpoint| endpoint.address == "10.0.0.41:21353"),
+                .any(|endpoint| endpoint.address == "lan-remote.test:21353"),
             "the static LAN endpoint remains available as a fallback"
         );
     }

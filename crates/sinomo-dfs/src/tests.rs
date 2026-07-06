@@ -1412,7 +1412,7 @@ fn dfs_service_endpoint_for_member_prefers_healthy_lan_endpoint_over_public() {
         "pk-local",
         now,
     );
-    let mut public_endpoint = test_endpoint(&remote, "129.146.106.76:21353");
+    let mut public_endpoint = test_endpoint(&remote, "198.51.100.76:21353");
     public_endpoint.privacy = ClusterEndpointPrivacy::InternetDirect;
     public_endpoint.priority = 0;
     let lan_endpoint = test_endpoint(&remote, "10.0.0.41:21353");

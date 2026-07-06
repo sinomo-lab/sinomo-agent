@@ -50,7 +50,7 @@ use sinomo_core::network::{
 use sinomo_core::service::{
     ClusterAccess, ResponseSink, Service, ServiceContext, ServiceDisposition, ServiceError,
     ServiceFuture, ServiceRegistry, ServiceRegistryBuilder, ServiceRegistrySnapshot,
-    ServiceRegistrySnapshotStore, ServiceRoute, ServiceSigner,
+    ServiceRegistrySnapshotStore, ServiceRoute, ServiceSigner, ServiceStreamResponse,
 };
 use sinomo_dfs::register_services as register_dfs_services;
 use sinomo_module::{MODULE_NATIVE_DYLIB_CANCEL_ROUTE, MODULE_RPC_CATEGORY};
@@ -138,9 +138,9 @@ static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
     Mutex<HashMap<PathBuf, sinomo_core::node::NodeId>>,
 > = OnceLock::new();
 
-const DFS_DIRECT_READ_STREAM_BUFFER_DEPTH: usize = 4;
-const DFS_DIRECT_READ_LARGE_STREAM_BUFFER_DEPTH: usize = 2;
-const DFS_DIRECT_READ_SMALL_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+const OBJECT_RPC_STREAM_BUFFER_DEPTH: usize = 4;
+const OBJECT_RPC_LARGE_STREAM_BUFFER_DEPTH: usize = 2;
+const OBJECT_RPC_SMALL_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 fn daemon_error(error: DaemonError) -> ServiceError {
     ServiceError::Service(error.to_string())
@@ -3688,6 +3688,46 @@ async fn dispatch_service_registry_request(
     }
 }
 
+async fn dispatch_service_registry_stream_request(
+    registry: Arc<ServiceRegistry>,
+    data_dir: Arc<SinomoDataDir>,
+    cluster: Option<Arc<dyn ClusterAccess>>,
+    signer: ServiceSigner,
+    request: ObjectRpcRequest,
+) -> Result<ServiceStreamResponse, NetworkError> {
+    let route = request.route.clone();
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let ctx = ServiceContext {
+        data_dir,
+        cluster,
+        signer,
+        sink: Box::new(BufferSink {
+            frames: Arc::clone(&frames),
+        }),
+    };
+    let Some(future) = registry.dispatch_stream_direct(ctx, request) else {
+        return Err(NetworkError::Serialization {
+            detail: format!("service route {route} does not support streamed object-RPC responses"),
+        });
+    };
+    let response = future.await.map_err(service_error_to_network_error)?;
+    let emitted = frames
+        .lock()
+        .map_err(|_| NetworkError::Io {
+            operation: format!("drain streamed service response frames for {route}"),
+            detail: "service response sink lock poisoned".to_string(),
+        })?
+        .len();
+    if emitted != 0 {
+        return Err(NetworkError::Serialization {
+            detail: format!(
+                "streamed service route {route} emitted {emitted} ordinary response frames"
+            ),
+        });
+    }
+    Ok(response)
+}
+
 fn register_native_dylib_operation_cancellation(
     active_operations: &Arc<Mutex<BTreeMap<String, DaemonOperationCancellationToken>>>,
     operation_id: Option<&str>,
@@ -4318,9 +4358,10 @@ pub(crate) async fn try_dispatch_via_registry_async(
     {
         return None;
     }
-    if sinomo_dfs::dfs_direct_read_rpc_request_accepts_streamed_response(request) {
+    if sinomo_core::network::object_rpc_request_stream_mode(request).expects_raw_streamed_response()
+    {
         return Some(
-            dispatch_dfs_direct_read_stream_via_registry_async(
+            dispatch_stream_via_registry_async(
                 service_host,
                 authenticated,
                 request.clone(),
@@ -4346,7 +4387,7 @@ pub(crate) async fn try_dispatch_via_registry_async(
     )
 }
 
-async fn dispatch_dfs_direct_read_stream_via_registry_async(
+async fn dispatch_stream_via_registry_async(
     service_host: &DaemonServiceRegistryHost,
     authenticated: &AuthenticatedDaemonCommand,
     request: ObjectRpcRequest,
@@ -4355,29 +4396,19 @@ async fn dispatch_dfs_direct_read_stream_via_registry_async(
     paths: &DaemonPaths,
     replay_key: Option<Vec<u8>>,
 ) -> Result<bool, DaemonError> {
-    if let Some(descriptor) = service_host.object_rpc_route_descriptor(&request.route) {
-        if let Some(auth_scope) = descriptor.auth_scope.as_deref()
-            && !daemon_signer_authorizes_route_scope(&authenticated.signer, auth_scope)
-        {
-            return Err(DaemonError::AuthDenied);
-        }
-    } else {
-        return Err(DaemonError::Network {
-            address: request.route,
-            detail: "DFS direct-read stream route is not registered".to_string(),
-        });
-    }
-    let data_dir_path = daemon_data_dir_path(paths)?;
-    let mut stream_response = tokio::task::spawn_blocking(move || {
-        let data_dir = SinomoDataDir::new(data_dir_path);
-        sinomo_dfs::handle_dfs_direct_read_stream_rpc_request(&data_dir, request)
-    })
+    let stream_response = dispatch_rpc_via_registry_to_stream_response_async(
+        service_host,
+        authenticated,
+        request,
+        paths,
+        replay_key.clone(),
+    )
     .await
-    .map_err(|source| DaemonError::Network {
-        address: stream_address.to_string(),
-        detail: format!("DFS direct-read stream task failed: {source}"),
-    })??;
-    mark_daemon_rpc_response_responder(paths, &mut stream_response.response);
+    .inspect_err(|_| {
+        if let Some(key) = replay_key.as_ref() {
+            crate::control::abandon_daemon_dfs_message_replay(paths, key);
+        }
+    })?;
     stream
         .write_rpc_response(
             stream_address,
@@ -4387,8 +4418,13 @@ async fn dispatch_dfs_direct_read_stream_via_registry_async(
         .await
         .map_err(DaemonError::from)?;
     if let Some(reader) = stream_response.reader {
-        if let Err(error) =
-            write_dfs_direct_read_stream_chunks(stream, stream_address, reader).await
+        if let Err(error) = write_object_rpc_stream_chunks(
+            stream,
+            stream_address,
+            reader,
+            stream_response.chunk_bytes,
+        )
+        .await
         {
             if let Some(key) = replay_key.as_ref() {
                 crate::control::abandon_daemon_dfs_message_replay(paths, key);
@@ -4403,17 +4439,18 @@ async fn dispatch_dfs_direct_read_stream_via_registry_async(
     Ok(false)
 }
 
-async fn write_dfs_direct_read_stream_chunks(
+async fn write_object_rpc_stream_chunks(
     stream: &mut AsyncDaemonControlStream,
     stream_address: &str,
-    mut reader: sinomo_dfs::BlobReader,
+    mut reader: Box<dyn std::io::Read + Send>,
+    requested_chunk_bytes: usize,
 ) -> Result<u64, DaemonError> {
     struct Chunk {
         buffer: Vec<u8>,
         read: usize,
     }
 
-    let (chunk_bytes, buffer_depth) = dfs_direct_read_stream_buffer_plan(reader.size_bytes());
+    let (chunk_bytes, buffer_depth) = object_rpc_stream_buffer_plan(requested_chunk_bytes);
     let (filled_tx, mut filled_rx) =
         tokio::sync::mpsc::channel::<Result<Chunk, String>>(buffer_depth);
     let (empty_tx, mut empty_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(buffer_depth);
@@ -4422,7 +4459,7 @@ async fn write_dfs_direct_read_stream_chunks(
             .try_send(vec![0_u8; chunk_bytes])
             .map_err(|source| DaemonError::Network {
                 address: stream_address.to_string(),
-                detail: format!("DFS direct-read stream buffer seed failed: {source}"),
+                detail: format!("object-RPC stream buffer seed failed: {source}"),
             })?;
     }
 
@@ -4467,13 +4504,13 @@ async fn write_dfs_direct_read_stream_chunks(
                 .checked_add(chunk.read as u64)
                 .ok_or_else(|| DaemonError::Network {
                     address: stream_address.to_string(),
-                    detail: "DFS direct-read stream byte count overflowed".to_string(),
+                    detail: "object-RPC stream byte count overflowed".to_string(),
                 })?;
             let _ = empty_tx.send(chunk.buffer).await;
         }
         Err(DaemonError::Network {
             address: stream_address.to_string(),
-            detail: "DFS direct-read stream ended before terminator chunk".to_string(),
+            detail: "object-RPC stream ended before terminator chunk".to_string(),
         })
     }
     .await;
@@ -4482,28 +4519,21 @@ async fn write_dfs_direct_read_stream_chunks(
     drop(filled_rx);
     producer.await.map_err(|source| DaemonError::Network {
         address: producer_stream_address,
-        detail: format!("DFS direct-read stream producer task failed: {source}"),
+        detail: format!("object-RPC stream producer task failed: {source}"),
     })?;
     write_result
 }
 
-fn dfs_direct_read_stream_buffer_plan(size_bytes: u64) -> (usize, usize) {
+fn object_rpc_stream_buffer_plan(requested_chunk_bytes: usize) -> (usize, usize) {
     let max_chunk = sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES;
-    if size_bytes >= max_chunk as u64 {
-        return (max_chunk, DFS_DIRECT_READ_LARGE_STREAM_BUFFER_DEPTH);
+    let chunk_bytes = requested_chunk_bytes.clamp(1, max_chunk);
+    if chunk_bytes >= max_chunk {
+        return (max_chunk, OBJECT_RPC_LARGE_STREAM_BUFFER_DEPTH);
     }
-    if size_bytes >= DFS_DIRECT_READ_SMALL_STREAM_CHUNK_BYTES as u64 {
-        return (
-            sinomo_dfs::DFS_DIRECT_READ_STREAM_CHUNK_BYTES.min(max_chunk),
-            DFS_DIRECT_READ_STREAM_BUFFER_DEPTH,
-        );
+    if chunk_bytes >= OBJECT_RPC_SMALL_STREAM_CHUNK_BYTES {
+        return (chunk_bytes, OBJECT_RPC_STREAM_BUFFER_DEPTH);
     }
-    let chunk_bytes = usize::try_from(size_bytes)
-        .ok()
-        .filter(|size| *size > 0)
-        .unwrap_or(1)
-        .min(DFS_DIRECT_READ_SMALL_STREAM_CHUNK_BYTES);
-    (chunk_bytes, DFS_DIRECT_READ_STREAM_BUFFER_DEPTH)
+    (chunk_bytes, OBJECT_RPC_STREAM_BUFFER_DEPTH)
 }
 
 async fn dispatch_via_registry_async(
@@ -4568,6 +4598,89 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
         crate::control::complete_daemon_dfs_message_replay(paths, key, &response);
     }
     Ok((response, stop))
+}
+
+pub(crate) async fn dispatch_rpc_via_registry_to_stream_response_async(
+    service_host: &DaemonServiceRegistryHost,
+    authenticated: &AuthenticatedDaemonCommand,
+    mut request: ObjectRpcRequest,
+    paths: &DaemonPaths,
+    replay_key: Option<Vec<u8>>,
+) -> Result<ServiceStreamResponse, DaemonError> {
+    if let Some(descriptor) = service_host.object_rpc_route_descriptor(&request.route) {
+        if let Some(auth_scope) = descriptor.auth_scope.as_deref()
+            && !daemon_signer_authorizes_route_scope(&authenticated.signer, auth_scope)
+        {
+            return Err(DaemonError::AuthDenied);
+        }
+    } else {
+        return Err(DaemonError::Network {
+            address: request.route,
+            detail: "streamed object-RPC route is not registered".to_string(),
+        });
+    }
+
+    annotate_daemon_service_request(&mut request, authenticated);
+    let registry = service_host
+        .service_registry_snapshot_store()
+        .active_snapshot()
+        .registry_arc();
+    let signer = daemon_service_signer_from_request_metadata(&request)?;
+    let route = request.route.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let paths_for_context = paths.clone();
+    let (data_dir, cluster) = tokio::task::spawn_blocking(move || {
+        let data_dir = Arc::new(SinomoDataDir::new(
+            daemon_data_dir_path(&paths_for_context).map_err(daemon_error_to_network_error)?,
+        ));
+        let cluster: Option<Arc<dyn ClusterAccess>> =
+            if ClusterPaths::new(data_dir.as_ref()).state.exists() {
+                Some(Arc::new(DaemonClusterAccess::new(
+                    paths_for_context.clone(),
+                    data_dir.as_ref(),
+                    Some(&runtime),
+                )))
+            } else {
+                None
+            };
+        Ok::<_, NetworkError>((data_dir, cluster))
+    })
+    .await
+    .map_err(|source| DaemonError::Network {
+        address: route.clone(),
+        detail: format!("streamed service context task failed: {source}"),
+    })?
+    .map_err(DaemonError::from)?;
+
+    let mut stream_response =
+        dispatch_service_registry_stream_request(registry, data_dir, cluster, signer, request)
+            .await
+            .inspect_err(|_| {
+                if let Some(key) = replay_key.as_ref() {
+                    crate::control::abandon_daemon_dfs_message_replay(paths, key);
+                }
+            })
+            .map_err(DaemonError::from)?;
+    mark_daemon_rpc_response_responder(paths, &mut stream_response.response);
+    Ok(stream_response)
+}
+
+pub(crate) async fn dispatch_stream_rpc_in_process_async(
+    paths: DaemonPaths,
+    service_runtime: tokio::runtime::Handle,
+    request: ObjectRpcRequest,
+) -> Result<ServiceStreamResponse, DaemonError> {
+    let service_host =
+        DaemonServiceRegistryHost::new_on_runtime(paths.clone(), service_runtime).await?;
+    let authenticated = crate::auth::authenticate_daemon_control_request(&paths, &request)?;
+    dispatch_rpc_via_registry_to_stream_response_async(
+        &service_host,
+        &authenticated,
+        request,
+        &paths,
+        None,
+    )
+    .await
 }
 
 async fn write_async_daemon_rpc_response_frame(
@@ -5698,29 +5811,27 @@ mod tests {
     }
 
     #[test]
-    fn dfs_direct_read_stream_buffer_plan_scales_with_blob_size() {
+    fn object_rpc_stream_buffer_plan_scales_with_requested_chunk_size() {
         assert_eq!(
-            dfs_direct_read_stream_buffer_plan(0),
-            (1, DFS_DIRECT_READ_STREAM_BUFFER_DEPTH)
+            object_rpc_stream_buffer_plan(0),
+            (1, OBJECT_RPC_STREAM_BUFFER_DEPTH)
         );
         assert_eq!(
-            dfs_direct_read_stream_buffer_plan(32),
-            (32, DFS_DIRECT_READ_STREAM_BUFFER_DEPTH)
+            object_rpc_stream_buffer_plan(32),
+            (32, OBJECT_RPC_STREAM_BUFFER_DEPTH)
         );
         assert_eq!(
-            dfs_direct_read_stream_buffer_plan(DFS_DIRECT_READ_SMALL_STREAM_CHUNK_BYTES as u64),
+            object_rpc_stream_buffer_plan(OBJECT_RPC_SMALL_STREAM_CHUNK_BYTES),
             (
-                sinomo_dfs::DFS_DIRECT_READ_STREAM_CHUNK_BYTES,
-                DFS_DIRECT_READ_STREAM_BUFFER_DEPTH
+                OBJECT_RPC_SMALL_STREAM_CHUNK_BYTES,
+                OBJECT_RPC_STREAM_BUFFER_DEPTH
             )
         );
         assert_eq!(
-            dfs_direct_read_stream_buffer_plan(
-                sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES as u64
-            ),
+            object_rpc_stream_buffer_plan(sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES),
             (
                 sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES,
-                DFS_DIRECT_READ_LARGE_STREAM_BUFFER_DEPTH
+                OBJECT_RPC_LARGE_STREAM_BUFFER_DEPTH
             )
         );
     }

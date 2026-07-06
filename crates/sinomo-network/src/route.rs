@@ -2275,8 +2275,10 @@ where
                             "cluster object rpc relay returned routing error"
                         );
                         failures.push(format!(
-                            "{} ({:?}) returned routing error",
-                            endpoint.address, endpoint.transport
+                            "{} ({:?}) returned routing error: {}",
+                            endpoint.address,
+                            endpoint.transport,
+                            relay_response_routing_error_detail(&response)
                         ));
                         break;
                     }
@@ -3231,11 +3233,7 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
                             "{} ({:?}) returned routing error: {}",
                             endpoint.address,
                             endpoint.transport,
-                            response
-                                .metadata
-                                .get(crate::OBJECT_RPC_ERROR_DETAIL_METADATA_KEY)
-                                .cloned()
-                                .unwrap_or_else(|| "routing error".to_string())
+                            relay_response_routing_error_detail(&response)
                         ),
                     );
                     break;
@@ -3640,6 +3638,14 @@ pub fn relay_response_is_routing_error(response: &ObjectRpcResponse) -> bool {
     response.route == CLUSTER_RELAY_ROUTE && response.error_detail().is_err()
 }
 
+fn relay_response_routing_error_detail(response: &ObjectRpcResponse) -> String {
+    response
+        .metadata
+        .get(crate::OBJECT_RPC_ERROR_DETAIL_METADATA_KEY)
+        .cloned()
+        .unwrap_or_else(|| "routing error".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3777,12 +3783,12 @@ mod tests {
         target_member.endpoints = vec![
             crate::endpoint_advertisement::daemon_lan_endpoint(
                 &target_node,
-                "10.0.0.41:21353".to_string(),
+                "lan-target.test:21353".to_string(),
                 0,
             ),
             crate::endpoint_advertisement::daemon_lan_endpoint(
                 &target_node,
-                "129.146.106.76:21353".to_string(),
+                "198.51.100.76:21353".to_string(),
                 10,
             ),
         ];
@@ -3812,8 +3818,8 @@ mod tests {
             .expect("second endpoint should be attempted");
 
         assert_eq!(host.target_sends.len(), 2);
-        assert_eq!(host.target_sends[0].0.address, "10.0.0.41:21353");
-        assert_eq!(host.target_sends[1].0.address, "129.146.106.76:21353");
+        assert_eq!(host.target_sends[0].0.address, "lan-target.test:21353");
+        assert_eq!(host.target_sends[1].0.address, "198.51.100.76:21353");
         for (_, _, timeouts) in &host.target_sends {
             assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(5)));
             assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(5)));
@@ -4131,12 +4137,12 @@ mod tests {
         );
         let private_main_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
             &target_node,
-            "10.0.0.41:21353".to_string(),
+            "lan-main.test:21353".to_string(),
             0,
         );
         let public_main_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
             &target_node,
-            "129.146.106.76:21353".to_string(),
+            "198.51.100.76:21353".to_string(),
             0,
         );
         let records = [
@@ -4197,7 +4203,10 @@ mod tests {
             .iter()
             .map(|endpoint| endpoint.address.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(addresses, vec!["10.0.0.41:21353", "129.146.106.76:21353"]);
+        assert_eq!(
+            addresses,
+            vec!["lan-main.test:21353", "198.51.100.76:21353"]
+        );
     }
 
     #[test]
@@ -4379,7 +4388,7 @@ mod tests {
         target_member.allowed_capabilities = target_member.capabilities.clone();
         let unreachable_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
             &target_node,
-            "10.0.0.2:21353".to_string(),
+            "unreachable-target.test:21353".to_string(),
             0,
         );
         let healthy_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
@@ -4432,6 +4441,6 @@ mod tests {
         assert_eq!(planned[0].endpoint_id, healthy_endpoint.endpoint_id);
         assert_eq!(planned[0].address, "target:21353");
         assert_eq!(planned[1].endpoint_id, unreachable_endpoint.endpoint_id);
-        assert_eq!(planned[1].address, "10.0.0.2:21353");
+        assert_eq!(planned[1].address, "unreachable-target.test:21353");
     }
 }
