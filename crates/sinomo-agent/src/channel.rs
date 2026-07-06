@@ -2,6 +2,7 @@ use crate::{
     AgentDefinition, AgentItem, AgentRole, AgentSession, AgentStoragePaths,
     AgentToolRuntimeDefinition, InteractionModel, TaskId,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{
     LanguageModelError, LanguageModelMessage, LanguageModelRequest, LanguageModelResponseFormat,
@@ -15,6 +16,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub const AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub const AGENT_CHANNEL_APP_USER_ID: &str = "user.app.local";
+pub const AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT: usize = 400;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentChannel {
@@ -209,6 +211,7 @@ impl AgentChannel {
             attachments,
         );
         self.transcript.push(message.clone());
+        self.trim_transcript_to_recent(AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT);
         self.touch();
         message
     }
@@ -232,6 +235,7 @@ impl AgentChannel {
             Vec::new(),
         );
         self.transcript.push(message.clone());
+        self.trim_transcript_to_recent(AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT);
         self.touch();
         message
     }
@@ -266,8 +270,26 @@ impl AgentChannel {
             Vec::new(),
         );
         self.transcript.push(message.clone());
+        self.trim_transcript_to_recent(AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT);
         self.touch();
         message
+    }
+
+    pub fn trim_transcript_to_recent(&mut self, limit: usize) {
+        if limit == 0 {
+            self.transcript.clear();
+            return;
+        }
+        let excess = self.transcript.len().saturating_sub(limit);
+        if excess > 0 {
+            self.transcript.drain(0..excess);
+        }
+    }
+
+    pub fn recent_transcript_snapshot(&self, limit: usize) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.trim_transcript_to_recent(limit);
+        snapshot
     }
 
     fn next_message(
@@ -659,6 +681,20 @@ impl FileAgentChannelStore {
             .map_err(|source| channel_vfs_error(path, source))
     }
 
+    fn load_recent_messages(
+        &self,
+        channel_id: &SessionId,
+        limit: usize,
+    ) -> Result<Vec<AgentChannelMessage>, AgentChannelStoreError> {
+        let path = self.paths.channel_messages_path_for_channel(channel_id);
+        let Some(bytes) = self.read_optional_bytes(&path)? else {
+            return Ok(Vec::new());
+        };
+        let mut messages = parse_json_lines::<AgentChannelMessage>(&bytes)?;
+        trim_vec_to_recent(&mut messages, limit);
+        Ok(messages)
+    }
+
     fn vfs_path_for(&self, path: &Path) -> Result<String, AgentChannelStoreError> {
         relative_vfs_path(&self.paths.root, path)
     }
@@ -666,9 +702,10 @@ impl FileAgentChannelStore {
 
 impl AgentChannelStore for FileAgentChannelStore {
     fn save_channel(&self, channel: &AgentChannel) -> Result<(), AgentChannelStoreError> {
+        let channel = channel.recent_transcript_snapshot(AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT);
         let snapshot = AgentChannelSnapshot {
             schema_version: AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION,
-            channel,
+            channel: &channel,
         };
         let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|source| {
             AgentChannelStoreError::Serialization {
@@ -703,7 +740,13 @@ impl AgentChannelStore for FileAgentChannelStore {
                 ),
             });
         }
-        Ok(Some(snapshot.channel))
+        let mut channel = snapshot.channel;
+        let recent =
+            self.load_recent_messages(channel_id, AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT)?;
+        if !recent.is_empty() {
+            channel.transcript = recent;
+        }
+        Ok(Some(channel))
     }
 
     fn list_channels(&self) -> Result<Vec<AgentChannel>, AgentChannelStoreError> {
@@ -832,6 +875,35 @@ fn relative_vfs_path(root: &Path, path: &Path) -> Result<String, AgentChannelSto
 
 fn vfs_parent_path(path: &str) -> Option<&str> {
     path.rsplit_once('/').map(|(parent, _)| parent)
+}
+
+fn parse_json_lines<T: DeserializeOwned>(bytes: &[u8]) -> Result<Vec<T>, AgentChannelStoreError> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|source| AgentChannelStoreError::Serialization {
+            detail: source.to_string(),
+        })?;
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::from_str::<T>(line).map_err(|source| {
+                AgentChannelStoreError::Serialization {
+                    detail: format!("line {}: {source}", index + 1),
+                }
+            })
+        })
+        .collect()
+}
+
+fn trim_vec_to_recent<T>(items: &mut Vec<T>, limit: usize) {
+    if limit == 0 {
+        items.clear();
+        return;
+    }
+    let excess = items.len().saturating_sub(limit);
+    if excess > 0 {
+        items.drain(0..excess);
+    }
 }
 
 fn channel_vfs_error(path: &Path, source: VfsError) -> AgentChannelStoreError {
@@ -2148,6 +2220,47 @@ mod tests {
         deleted.tombstone();
         store.save_channel(&deleted).expect("save tombstone");
         assert!(store.list_channels().expect("list hidden").is_empty());
+    }
+
+    #[test]
+    fn file_channel_store_loads_recent_messages_from_durable_log() {
+        let data_dir = temp_data_dir("agent-channel-long-log");
+        let store = FileAgentChannelStore::for_data_dir(&data_dir);
+        let mut channel = AgentChannel::new(SessionId::generate(), "Long log");
+        let total = AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT + 25;
+        for index in 0..total {
+            let message = channel.append_system_info(
+                format!("message {index}"),
+                AgentChannelSource::system(serde_json::json!({})),
+            );
+            store
+                .append_message(&channel.channel_id, &message)
+                .expect("append message");
+        }
+        store.save_channel(&channel).expect("save channel");
+
+        let loaded = store
+            .load_channel(&channel.channel_id)
+            .expect("load channel")
+            .expect("channel exists");
+        assert_eq!(
+            loaded.transcript.len(),
+            AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT
+        );
+        assert_eq!(
+            loaded
+                .transcript
+                .first()
+                .map(|message| message.content.as_str()),
+            Some("message 25")
+        );
+        assert_eq!(
+            loaded
+                .transcript
+                .last()
+                .map(|message| message.content.as_str()),
+            Some("message 424")
+        );
     }
 
     #[test]

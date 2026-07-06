@@ -5,6 +5,7 @@
 //! crate-internal handler types. Everything here returns plain data so the app
 //! never depends on `tui` internals.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::cluster;
 use std::fs;
@@ -12,21 +13,23 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use sinomo_agent::AgentChannelUser;
 use sinomo_agent::{
-    AGENT_CHANNEL_APP_USER_ID, AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION, AgentCatalog, AgentChannel,
-    AgentChannelAttachment, AgentChannelAuthor, AgentChannelExecutorError, AgentChannelKind,
-    AgentChannelLoopConfig, AgentChannelMessage, AgentChannelMessageKind, AgentChannelParticipant,
-    AgentChannelRuntime, AgentChannelRuntimeEvent, AgentChannelSource, AgentChannelSpeakDecision,
-    AgentChannelStore, AgentChannelStoreError, AgentChannelTurn, AgentChannelTurnExecutor,
-    AgentChannelUser, AgentContextAttachment, AgentDefinition, AgentItem, AgentModelEvent,
-    AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentRuntimeEvent,
-    AgentRuntimeEventPayload, AgentSession, AgentSessionControlResult, AgentSessionFollowUpRequest,
-    AgentSessionInterruptRequest, AgentSessionReattachState, AgentSessionResumeRequest,
-    AgentSessionResumeResponse, AgentSessionSteerRequest, AgentTaskLifecycleStatus,
-    AgentTaskSnapshot, AgentToolProgressEvent, ContextAssemblyReport, InteractionOutput,
-    InteractionSession, InteractionSurface, InteractionSurfaceKind, SkillActivationScope,
-    SkillCatalogEntry, SkillCatalogSifsStore, SkillCatalogSource, SkillCatalogStore,
-    SkillCatalogWrite, TaskId, render_common_skill_markdown,
+    AGENT_CHANNEL_APP_USER_ID, AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT,
+    AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION, AgentCatalog, AgentChannel, AgentChannelAttachment,
+    AgentChannelAuthor, AgentChannelExecutorError, AgentChannelKind, AgentChannelLoopConfig,
+    AgentChannelMessage, AgentChannelMessageKind, AgentChannelParticipant, AgentChannelRuntime,
+    AgentChannelRuntimeEvent, AgentChannelSource, AgentChannelSpeakDecision, AgentChannelStore,
+    AgentChannelStoreError, AgentChannelTurn, AgentChannelTurnExecutor, AgentContextAttachment,
+    AgentDefinition, AgentItem, AgentModelEvent, AgentRuntimeControlHost,
+    AgentRuntimeControlRegistry, AgentRuntimeEvent, AgentRuntimeEventPayload, AgentSession,
+    AgentSessionControlResult, AgentSessionFollowUpRequest, AgentSessionInterruptRequest,
+    AgentSessionReattachState, AgentSessionResumeRequest, AgentSessionResumeResponse,
+    AgentSessionSteerRequest, AgentTaskLifecycleStatus, AgentTaskSnapshot, AgentToolProgressEvent,
+    ContextAssemblyReport, InteractionOutput, InteractionSession, InteractionSurface,
+    InteractionSurfaceKind, SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore,
+    SkillCatalogSource, SkillCatalogStore, SkillCatalogWrite, TaskId, render_common_skill_markdown,
     safe_agent_channel_attachment_file_name,
 };
 use sinomo_lm::{
@@ -57,6 +60,25 @@ const APP_CHAT_RUNTIME_START_TIMEOUT: Duration = Duration::from_secs(5);
 const APP_CHAT_RUNTIME_SILENCE_TIMEOUT: Duration = Duration::from_secs(45);
 const APP_CHAT_ATTACHMENT_TEXT_EXCERPT_BYTES: usize = 24 * 1024;
 pub const SIFS_AGENT_CHANNELS_ROOT: &str = "/services/sinomo-agent/channels";
+const SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE: u64 = 128;
+const SIFS_AGENT_CHANNEL_LOG_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SifsChunkedLogIndex {
+    schema_version: u32,
+    entry_count: u64,
+    updated_unix: i64,
+}
+
+impl Default for SifsChunkedLogIndex {
+    fn default() -> Self {
+        Self {
+            schema_version: SIFS_AGENT_CHANNEL_LOG_SCHEMA_VERSION,
+            entry_count: 0,
+            updated_unix: 0,
+        }
+    }
+}
 
 /// Lightweight channel metadata for list views.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -471,12 +493,30 @@ impl SifsAgentChannelStore {
         format!("{}/snapshot.json", Self::channel_dir(channel_id))
     }
 
-    fn messages_path(channel_id: &SessionId) -> String {
-        format!("{}/messages.jsonl", Self::channel_dir(channel_id))
+    fn message_chunks_dir(channel_id: &SessionId) -> String {
+        format!("{}/messages", Self::channel_dir(channel_id))
     }
 
-    fn turns_path(channel_id: &SessionId) -> String {
-        format!("{}/events.jsonl", Self::channel_dir(channel_id))
+    fn message_index_path(channel_id: &SessionId) -> String {
+        format!("{}/index.json", Self::message_chunks_dir(channel_id))
+    }
+
+    fn message_chunk_path(channel_id: &SessionId, sequence: u64) -> String {
+        let chunk = sequence.saturating_sub(1) / SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE;
+        format!("{}/{chunk:08}.jsonl", Self::message_chunks_dir(channel_id))
+    }
+
+    fn turn_chunks_dir(channel_id: &SessionId) -> String {
+        format!("{}/turns", Self::channel_dir(channel_id))
+    }
+
+    fn turn_index_path(channel_id: &SessionId) -> String {
+        format!("{}/index.json", Self::turn_chunks_dir(channel_id))
+    }
+
+    fn turn_chunk_path(channel_id: &SessionId, sequence: u64) -> String {
+        let chunk = sequence / SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE;
+        format!("{}/{chunk:08}.jsonl", Self::turn_chunks_dir(channel_id))
     }
 
     fn attachment_path(channel_id: &SessionId, attachment_id: &TaskId, file_name: &str) -> String {
@@ -536,6 +576,136 @@ impl SifsAgentChannelStore {
         bytes.extend_from_slice(line.as_bytes());
         bytes.push(b'\n');
         self.write_file(path, &bytes)
+    }
+
+    fn append_message_chunk(
+        &self,
+        channel_id: &SessionId,
+        message: &AgentChannelMessage,
+    ) -> Result<(), AgentChannelStoreError> {
+        let sequence = message.sequence.max(1);
+        self.append_json_line(&Self::message_chunk_path(channel_id, sequence), message)?;
+        self.update_chunked_log_index_count(&Self::message_index_path(channel_id), sequence)
+    }
+
+    fn append_indexed_chunk<T: Serialize>(
+        &self,
+        index_path: &str,
+        chunk_path: impl FnOnce(u64) -> String,
+        value: &T,
+    ) -> Result<(), AgentChannelStoreError> {
+        let mut index = self.read_chunked_log_index(index_path)?;
+        let sequence = index.entry_count;
+        self.append_json_line(&chunk_path(sequence), value)?;
+        index.entry_count = index.entry_count.saturating_add(1);
+        index.updated_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+        self.write_file(
+            index_path,
+            &serde_json::to_vec_pretty(&index).map_err(|source| {
+                AgentChannelStoreError::Serialization {
+                    detail: source.to_string(),
+                }
+            })?,
+        )
+    }
+
+    fn update_chunked_log_index_count(
+        &self,
+        index_path: &str,
+        entry_count: u64,
+    ) -> Result<(), AgentChannelStoreError> {
+        let mut index = self.read_chunked_log_index(index_path)?;
+        if index.entry_count >= entry_count {
+            return Ok(());
+        }
+        index.entry_count = entry_count;
+        index.updated_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+        self.write_file(
+            index_path,
+            &serde_json::to_vec_pretty(&index).map_err(|source| {
+                AgentChannelStoreError::Serialization {
+                    detail: source.to_string(),
+                }
+            })?,
+        )
+    }
+
+    fn read_chunked_log_index(
+        &self,
+        index_path: &str,
+    ) -> Result<SifsChunkedLogIndex, AgentChannelStoreError> {
+        let bytes = match self.browser.read_file(index_path) {
+            Ok(bytes) => bytes,
+            Err(detail) if sifs_error_is_not_found(&detail) => {
+                return Ok(SifsChunkedLogIndex::default());
+            }
+            Err(detail) => return Err(channel_store_io(index_path, detail)),
+        };
+        let index = serde_json::from_slice::<SifsChunkedLogIndex>(&bytes).map_err(|source| {
+            AgentChannelStoreError::Serialization {
+                detail: source.to_string(),
+            }
+        })?;
+        if index.schema_version != SIFS_AGENT_CHANNEL_LOG_SCHEMA_VERSION {
+            return Err(AgentChannelStoreError::Serialization {
+                detail: format!(
+                    "unsupported channel log schema version {}",
+                    index.schema_version
+                ),
+            });
+        }
+        Ok(index)
+    }
+
+    pub fn load_recent_messages(
+        &self,
+        channel_id: &SessionId,
+        limit: usize,
+    ) -> Result<Vec<AgentChannelMessage>, AgentChannelStoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let index = self.read_chunked_log_index(&Self::message_index_path(channel_id))?;
+        if index.entry_count == 0 {
+            return Ok(Vec::new());
+        }
+        self.load_recent_indexed_message_chunks(channel_id, limit, index.entry_count)
+    }
+
+    fn load_recent_indexed_message_chunks(
+        &self,
+        channel_id: &SessionId,
+        limit: usize,
+        entry_count: u64,
+    ) -> Result<Vec<AgentChannelMessage>, AgentChannelStoreError> {
+        let first_sequence = entry_count.saturating_sub(limit as u64).saturating_add(1);
+        let first_chunk = first_sequence.saturating_sub(1) / SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE;
+        let last_chunk = entry_count.saturating_sub(1) / SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE;
+        let mut collected = Vec::new();
+        for chunk in (first_chunk..=last_chunk).rev() {
+            let path = format!("{}/{chunk:08}.jsonl", Self::message_chunks_dir(channel_id));
+            let bytes = match self.browser.read_file(&path) {
+                Ok(bytes) => bytes,
+                Err(detail) if sifs_error_is_not_found(&detail) => continue,
+                Err(detail) => return Err(channel_store_io(&path, detail)),
+            };
+            let mut messages = parse_json_lines::<AgentChannelMessage>(&bytes)?;
+            messages.reverse();
+            for message in messages {
+                if message.sequence < first_sequence || message.sequence > entry_count {
+                    continue;
+                }
+                collected.push(message);
+                if collected.len() >= limit {
+                    break;
+                }
+            }
+            if collected.len() >= limit {
+                break;
+            }
+        }
+        collected.reverse();
+        Ok(collected)
     }
 
     fn channel_ids_from_sifs(&self) -> Result<BTreeSet<SessionId>, AgentChannelStoreError> {
@@ -599,9 +769,10 @@ impl SifsAgentChannelStore {
 
 impl AgentChannelStore for SifsAgentChannelStore {
     fn save_channel(&self, channel: &AgentChannel) -> Result<(), AgentChannelStoreError> {
+        let channel = channel.recent_transcript_snapshot(AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT);
         let snapshot = SifsAgentChannelSnapshot {
             schema_version: AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION,
-            channel,
+            channel: &channel,
         };
         let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|source| {
             AgentChannelStoreError::Serialization {
@@ -635,7 +806,13 @@ impl AgentChannelStore for SifsAgentChannelStore {
                 ),
             });
         }
-        Ok(Some(snapshot.channel))
+        let mut channel = snapshot.channel;
+        let recent =
+            self.load_recent_messages(channel_id, AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT)?;
+        if !recent.is_empty() {
+            channel.transcript = recent;
+        }
+        Ok(Some(channel))
     }
 
     fn list_channels(&self) -> Result<Vec<AgentChannel>, AgentChannelStoreError> {
@@ -656,7 +833,7 @@ impl AgentChannelStore for SifsAgentChannelStore {
         channel_id: &SessionId,
         message: &AgentChannelMessage,
     ) -> Result<(), AgentChannelStoreError> {
-        self.append_json_line(&Self::messages_path(channel_id), message)
+        self.append_message_chunk(channel_id, message)
     }
 
     fn append_turn(
@@ -664,7 +841,12 @@ impl AgentChannelStore for SifsAgentChannelStore {
         channel_id: &SessionId,
         turn: &AgentChannelTurn,
     ) -> Result<(), AgentChannelStoreError> {
-        self.append_json_line(&Self::turns_path(channel_id), turn)
+        let index_path = Self::turn_index_path(channel_id);
+        self.append_indexed_chunk(
+            &index_path,
+            |sequence| Self::turn_chunk_path(channel_id, sequence),
+            turn,
+        )
     }
 
     fn save_attachment(
@@ -697,6 +879,24 @@ fn channel_store_io(path: &str, detail: String) -> AgentChannelStoreError {
         path: path.to_string(),
         detail,
     }
+}
+
+fn parse_json_lines<T: DeserializeOwned>(bytes: &[u8]) -> Result<Vec<T>, AgentChannelStoreError> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|source| AgentChannelStoreError::Serialization {
+            detail: source.to_string(),
+        })?;
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::from_str::<T>(line).map_err(|source| {
+                AgentChannelStoreError::Serialization {
+                    detail: format!("line {}: {source}", index + 1),
+                }
+            })
+        })
+        .collect()
 }
 
 /// One running chat conversation backed by the main-agent runtime.
@@ -807,8 +1007,8 @@ impl AgentChat {
         set_participant_tool_runtime(&mut self.channel, &participant_id, &tool_runtime);
     }
 
-    /// Adopt an existing channel id for continued turns (fresh in-memory context;
-    /// legacy visible transcripts are imported as one-user/one-agent channels).
+    /// Adopt an existing channel id for continued turns, using the backend channel
+    /// store as the only source of durable timeline state.
     pub fn resume_session(
         &mut self,
         session_id: &str,
@@ -820,8 +1020,8 @@ impl AgentChat {
             match self.channel_store.load_channel(&session.session_id) {
                 Ok(Some(channel)) => (channel, true, true),
                 Ok(None) => (
-                    legacy_channel_from_history(session.session_id.clone(), history, &info),
-                    !history.is_empty(),
+                    AgentChannel::with_default_title(session.session_id.clone()),
+                    false,
                     false,
                 ),
                 Err(error) => {
@@ -852,7 +1052,7 @@ impl AgentChat {
             .replace_agent_session(&session, agent_transcript_from_channel(&channel, history))?;
         self.channel = channel;
         if should_save_after_resume {
-            self.save_channel_best_effort();
+            self.save_channel()?;
         }
         Ok(())
     }
@@ -976,7 +1176,7 @@ impl AgentChat {
         attachments: &[ChatAttachmentInput],
         on_event: &mut dyn FnMut(ChatStreamEvent),
     ) -> Result<(), CliError> {
-        self.reload_current_channel_best_effort();
+        self.reload_current_channel()?;
         if self.channel.channel_kind == AgentChannelKind::Channel {
             return self.send_channel_with_attachments(text, attachments, on_event);
         }
@@ -998,10 +1198,10 @@ impl AgentChat {
             source,
             attachments,
         );
-        let _ = self
-            .channel_store
-            .append_message(&self.channel.channel_id, &user_message);
-        self.save_channel_best_effort();
+        self.channel_store
+            .append_message(&self.channel.channel_id, &user_message)
+            .map_err(|source| agent_channel_store_cli_error("append chat user message", source))?;
+        self.save_channel()?;
 
         let mut streamed_answer = String::new();
         let mut wrapped_event = |event: ChatStreamEvent| match event {
@@ -1049,9 +1249,11 @@ impl AgentChat {
                         AgentChannelSource::app(),
                     );
                     response_message_ids.push(message.message_id.clone());
-                    let _ = self
-                        .channel_store
-                        .append_message(&self.channel.channel_id, &message);
+                    self.channel_store
+                        .append_message(&self.channel.channel_id, &message)
+                        .map_err(|source| {
+                            agent_channel_store_cli_error("append chat agent message", source)
+                        })?;
                 } else {
                     let message = self.channel.append_system_info(
                         "No agent responded.",
@@ -1061,17 +1263,19 @@ impl AgentChat {
                         })),
                     );
                     system_message_ids.push(message.message_id.clone());
-                    let _ = self
-                        .channel_store
-                        .append_message(&self.channel.channel_id, &message);
+                    self.channel_store
+                        .append_message(&self.channel.channel_id, &message)
+                        .map_err(|source| {
+                            agent_channel_store_cli_error("append chat system message", source)
+                        })?;
                     emit_channel_system(&message, &self.channel.channel_id, on_event);
                 }
                 self.append_channel_turn(
                     user_message.message_id,
                     response_message_ids,
                     system_message_ids,
-                );
-                self.save_channel_best_effort();
+                )?;
+                self.save_channel()?;
             }
             Err(error) => {
                 let message = self.channel.append_system_error(
@@ -1084,16 +1288,18 @@ impl AgentChat {
                         "error_type": "agent_turn"
                     })),
                 );
-                let _ = self
-                    .channel_store
-                    .append_message(&self.channel.channel_id, &message);
+                self.channel_store
+                    .append_message(&self.channel.channel_id, &message)
+                    .map_err(|source| {
+                        agent_channel_store_cli_error("append chat error message", source)
+                    })?;
                 emit_channel_system(&message, &self.channel.channel_id, on_event);
                 self.append_channel_turn(
                     user_message.message_id,
                     Vec::new(),
                     vec![message.message_id.clone()],
-                );
-                self.save_channel_best_effort();
+                )?;
+                self.save_channel()?;
             }
         }
         Ok(())
@@ -1256,7 +1462,7 @@ impl AgentChat {
             let tool_runtime = self.tool_runtime.clone();
             set_participant_tool_runtime(&mut self.channel, &participant_id, &tool_runtime);
         }
-        self.save_channel_best_effort();
+        self.save_channel()?;
         Ok(info)
     }
 
@@ -1290,7 +1496,7 @@ impl AgentChat {
         trigger_message_id: TaskId,
         response_message_ids: Vec<TaskId>,
         system_message_ids: Vec<TaskId>,
-    ) {
+    ) -> Result<(), CliError> {
         let turn = AgentChannelTurn {
             turn_id: TaskId::generate(),
             channel_id: self.channel.channel_id.clone(),
@@ -1300,19 +1506,32 @@ impl AgentChat {
             system_message_ids,
             created_at: time::OffsetDateTime::now_utc(),
         };
-        let _ = self
-            .channel_store
-            .append_turn(&self.channel.channel_id, &turn);
+        self.channel_store
+            .append_turn(&self.channel.channel_id, &turn)
+            .map_err(|source| agent_channel_store_cli_error("append chat turn", source))
     }
 
-    fn save_channel_best_effort(&self) {
-        let _ = self.channel_store.save_channel(&self.channel);
+    fn save_channel(&self) -> Result<(), CliError> {
+        self.channel_store
+            .save_channel(&self.channel)
+            .map_err(|source| agent_channel_store_cli_error("save chat channel", source))
     }
 
-    fn reload_current_channel_best_effort(&mut self) {
-        if let Ok(Some(channel)) = self.channel_store.load_channel(&self.channel.channel_id) {
-            self.channel = channel;
+    fn reload_current_channel(&mut self) -> Result<(), CliError> {
+        match self.channel_store.load_channel(&self.channel.channel_id) {
+            Ok(Some(channel)) => {
+                self.channel = channel;
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(source) => Err(agent_channel_store_cli_error("load chat channel", source)),
         }
+    }
+}
+
+fn agent_channel_store_cli_error(action: &str, source: AgentChannelStoreError) -> CliError {
+    CliError::Parse {
+        detail: format!("{action} failed: {source}"),
     }
 }
 
@@ -1930,51 +2149,6 @@ fn attachment_file_name(path: &Path) -> String {
         .filter(|name| !name.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(|| "attachment".to_string())
-}
-
-fn legacy_channel_from_history(
-    channel_id: SessionId,
-    history: &[ChatHistoryMessage],
-    info: &ChatRuntimeInfo,
-) -> AgentChannel {
-    let mut channel = AgentChannel::with_default_title(channel_id);
-    channel.ensure_user(AgentChannelUser::app_local());
-    ensure_primary_participant(&mut channel, info, true);
-    let participant = channel.participants.first().cloned();
-    for message in history {
-        if message.text.trim().is_empty() {
-            continue;
-        }
-        match message.role.as_str() {
-            "user" => {
-                channel.append_user_message(
-                    AGENT_CHANNEL_APP_USER_ID,
-                    "User",
-                    message.text.clone(),
-                    AgentChannelSource::app(),
-                );
-            }
-            "agent" | "assistant" => {
-                if let Some(participant) = participant.as_ref() {
-                    channel.append_agent_message(
-                        participant,
-                        message.text.clone(),
-                        AgentChannelSource::app(),
-                    );
-                }
-            }
-            "system" => {
-                channel.append_system_info(
-                    message.text.clone(),
-                    AgentChannelSource::system(serde_json::json!({
-                        "imported_from": "legacy_app_session"
-                    })),
-                );
-            }
-            _ => {}
-        }
-    }
-    channel
 }
 
 fn ensure_primary_participant(
@@ -4821,6 +4995,105 @@ mod tests {
         assert!(
             summaries.is_empty(),
             "partial channel directories without snapshots should be ignored"
+        );
+    }
+
+    #[test]
+    fn sifs_channel_messages_are_chunked_and_recent_snapshot_is_bounded() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-chunked-log");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Long running channel");
+        channel.ensure_user(AgentChannelUser::app_local());
+
+        let total = AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT + 25;
+        for index in 0..total {
+            let message = channel.append_user_message(
+                AGENT_CHANNEL_APP_USER_ID,
+                "User",
+                format!("message {index}"),
+                AgentChannelSource::app(),
+            );
+            store
+                .append_message(&channel.channel_id, &message)
+                .expect("append message");
+        }
+        let turn = AgentChannelTurn {
+            turn_id: TaskId::generate(),
+            channel_id: channel.channel_id.clone(),
+            trigger_message_id: channel
+                .transcript
+                .last()
+                .expect("recent message")
+                .message_id
+                .clone(),
+            decisions: Vec::new(),
+            response_message_ids: Vec::new(),
+            system_message_ids: Vec::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        store
+            .append_turn(&channel.channel_id, &turn)
+            .expect("append turn");
+        store.save_channel(&channel).expect("save channel");
+
+        let snapshot_bytes = SifsBrowser::open(&data_dir)
+            .expect("open SIFS")
+            .read_file(&SifsAgentChannelStore::snapshot_path(&channel_id))
+            .expect("snapshot");
+        let snapshot = serde_json::from_slice::<OwnedSifsAgentChannelSnapshot>(&snapshot_bytes)
+            .expect("snapshot json");
+        assert_eq!(
+            snapshot.channel.transcript.len(),
+            AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT
+        );
+
+        let first_chunk = SifsBrowser::open(&data_dir)
+            .expect("open SIFS")
+            .read_file(&SifsAgentChannelStore::message_chunk_path(&channel_id, 1))
+            .expect("first chunk");
+        assert!(
+            String::from_utf8_lossy(&first_chunk).contains("message 0"),
+            "first chunk should retain the beginning of the durable timeline"
+        );
+        let message_index = SifsBrowser::open(&data_dir)
+            .expect("open SIFS")
+            .read_file(&SifsAgentChannelStore::message_index_path(&channel_id))
+            .expect("message index");
+        let message_index = serde_json::from_slice::<SifsChunkedLogIndex>(&message_index)
+            .expect("message index json");
+        assert_eq!(message_index.entry_count, total as u64);
+
+        let turn_index = SifsBrowser::open(&data_dir)
+            .expect("open SIFS")
+            .read_file(&SifsAgentChannelStore::turn_index_path(&channel_id))
+            .expect("turn index");
+        let turn_index =
+            serde_json::from_slice::<SifsChunkedLogIndex>(&turn_index).expect("turn index json");
+        assert_eq!(turn_index.entry_count, 1);
+
+        let loaded = store
+            .load_channel(&channel_id)
+            .expect("load channel")
+            .expect("channel exists");
+        assert_eq!(
+            loaded.transcript.len(),
+            AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT
+        );
+        assert_eq!(
+            loaded
+                .transcript
+                .first()
+                .map(|message| message.content.as_str()),
+            Some("message 25")
+        );
+        assert_eq!(
+            loaded
+                .transcript
+                .last()
+                .map(|message| message.content.as_str()),
+            Some("message 424")
         );
     }
 

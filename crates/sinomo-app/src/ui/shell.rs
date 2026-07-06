@@ -859,11 +859,14 @@ fn shell_status(shared: &Shared) -> ShellStatus {
 mod tests {
     use super::*;
     use crate::backend::Backend;
-    use crate::backend::sessions::{self, StoredMessage};
     use crate::state::AppState;
     use crate::ui::chat::{ActivityTone, ChatActivityEntry};
     use crate::ui::settings::SettingsSection;
-    use sinomo_runtime::local::SinomoDataDir;
+    use sinomo_agent::{
+        AGENT_CHANNEL_APP_USER_ID, AgentChannel, AgentChannelSource, AgentChannelStore,
+    };
+    use sinomo_cli::app_api::SifsAgentChannelStore;
+    use sinomo_runtime::{events::SessionId, local::SinomoDataDir};
     use std::fs;
 
     #[test]
@@ -881,14 +884,22 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         let data_dir = SinomoDataDir::new(&root);
-        let session_id = "01hxy6qa9k0t9vr4g9n8d3q6a0";
-        sessions::save(
-            &data_dir,
-            session_id,
-            "Ready shell history",
-            &[StoredMessage::new("user", "hello", "user", "message")],
-        )
-        .expect("save SIFS session");
+        let channel_id = "01hxy6qa9k0t9vr4g9n8d3q6a0"
+            .parse::<SessionId>()
+            .expect("session id");
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let mut channel = AgentChannel::new(channel_id.clone(), "Ready shell history");
+        let message = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "User",
+            "hello",
+            AgentChannelSource::app(),
+        );
+        store
+            .append_message(&channel.channel_id, &message)
+            .expect("append backend message");
+        store.save_channel(&channel).expect("save backend chat");
+        let session_id = channel_id.to_string();
 
         let backend = Backend::local_fallback_for_data_dir(data_dir);
         let state = AppState::ready(backend);

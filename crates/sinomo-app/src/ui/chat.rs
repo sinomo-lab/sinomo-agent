@@ -52,8 +52,11 @@ use sui::{
     Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, draw_glyph,
 };
 
+#[cfg(test)]
+use sinomo_agent::{AGENT_CHANNEL_APP_USER_ID, AgentChannelSource};
 use sinomo_agent::{
-    AgentChannel, AgentChannelAuthor, AgentChannelKind, AgentChannelMessageKind, AgentChannelStore,
+    AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT, AgentChannel, AgentChannelAuthor, AgentChannelKind,
+    AgentChannelMessageKind, AgentChannelStore,
 };
 use sinomo_cli::app_api::{
     AgentChatSifsStorage, AgentSummary, ChatAttachmentInput, ChatContextSnapshot,
@@ -67,7 +70,7 @@ use crate::backend::Backend;
 use crate::backend::chat_engine::{
     ChatCommand, ChatEvent, ChatEventWake, ChatHandle, ChatRole, RuntimeInfo,
 };
-use crate::backend::sessions::{self, StoredMessage};
+use crate::backend::sifs::SifsDaemonAccess;
 use crate::state::{Shared, Tab};
 use crate::theme::Palette;
 use crate::ui::chat_render::{self, ChatCodeBlock, ChatRenderBlock};
@@ -107,6 +110,7 @@ const TRANSCRIPT_LOAD_UI_TIMEOUT: Duration = Duration::from_secs(8);
 const TOOL_CHAIN_COLLAPSE_AFTER: usize = 1;
 const TOOL_DETAIL_COLLAPSE_CHARS: usize = 420;
 const TOOL_DETAIL_PREVIEW_CHARS: usize = 220;
+const VISIBLE_TRANSCRIPT_RECENT_LIMIT: usize = AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT;
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as the other tabs.)
@@ -179,38 +183,6 @@ impl ChatMessage {
         }
     }
 
-    fn from_stored(message: StoredMessage) -> Self {
-        let role = if message.role == "user" {
-            ChatRole::User
-        } else {
-            ChatRole::Agent
-        };
-        let source = ChatMessageSource::from_stored(message.source.as_deref(), &message.role);
-        let kind = ChatMessageKind::from_stored(message.kind.as_deref(), source);
-        Self {
-            role,
-            text: message.text,
-            source,
-            kind,
-        }
-    }
-
-    fn to_stored(&self) -> StoredMessage {
-        StoredMessage {
-            role: self.stored_role().to_string(),
-            text: self.text.clone(),
-            source: Some(self.source.stored().to_string()),
-            kind: Some(self.kind.stored().to_string()),
-        }
-    }
-
-    fn stored_role(&self) -> &'static str {
-        match self.role {
-            ChatRole::User => "user",
-            ChatRole::Agent => "agent",
-        }
-    }
-
     fn history_role(&self) -> &'static str {
         match self.source {
             ChatMessageSource::User => "user",
@@ -223,47 +195,6 @@ impl ChatMessage {
         self.role == ChatRole::Agent
             && self.source == ChatMessageSource::Model
             && self.text.trim().is_empty()
-    }
-}
-
-impl ChatMessageSource {
-    fn stored(self) -> &'static str {
-        match self {
-            ChatMessageSource::User => "user",
-            ChatMessageSource::Model => "model",
-            ChatMessageSource::System => "system",
-        }
-    }
-
-    fn from_stored(source: Option<&str>, role: &str) -> Self {
-        match source {
-            Some("user") => ChatMessageSource::User,
-            Some("model") => ChatMessageSource::Model,
-            Some("system") => ChatMessageSource::System,
-            _ if role == "user" => ChatMessageSource::User,
-            _ if role == "system" => ChatMessageSource::System,
-            _ => ChatMessageSource::Model,
-        }
-    }
-}
-
-impl ChatMessageKind {
-    fn stored(self) -> &'static str {
-        match self {
-            ChatMessageKind::Message => "message",
-            ChatMessageKind::Info => "info",
-            ChatMessageKind::Error => "error",
-        }
-    }
-
-    fn from_stored(kind: Option<&str>, source: ChatMessageSource) -> Self {
-        match kind {
-            Some("error") => ChatMessageKind::Error,
-            Some("info") => ChatMessageKind::Info,
-            Some("message") => ChatMessageKind::Message,
-            _ if source == ChatMessageSource::System => ChatMessageKind::Info,
-            _ => ChatMessageKind::Message,
-        }
     }
 }
 
@@ -707,7 +638,7 @@ enum ComposerPopup {
 /// State backing the chat tab.
 pub struct ChatState {
     pub data_dir: Arc<SinomoDataDir>,
-    sifs_daemon: Option<sessions::SifsDaemonAccess>,
+    sifs_daemon: Option<SifsDaemonAccess>,
     ui_waker: Option<sui::UiHandle>,
     pub handle: ChatHandle,
     pub session_id: String,
@@ -753,7 +684,6 @@ pub struct ChatState {
     session_title_draft: String,
     session_delete_confirm_id: Option<String>,
     pending_delete_id: Option<String>,
-    save_rxs: Vec<Receiver<SaveWorkerResult>>,
     delete_rx: Option<Receiver<DeleteWorkerResult>>,
     channel_create_rx: Option<Receiver<ChannelCreateWorkerResult>>,
     transcript_load_rx: Option<Receiver<TranscriptLoadWorkerResult>>,
@@ -770,14 +700,6 @@ pub struct ChatState {
 struct DeleteWorkerResult {
     session: SessionRef,
     kind: ConversationKind,
-    result: Result<(), String>,
-}
-
-struct SaveWorkerResult {
-    session_id: String,
-    title: String,
-    messages: Vec<ChatMessage>,
-    report_visible_failures: bool,
     result: Result<(), String>,
 }
 
@@ -825,7 +747,7 @@ impl ChatState {
         let efforts = reasoning_efforts();
         let effort_idx = efforts.iter().position(|e| e == "medium").unwrap_or(0);
         let sifs_daemon = daemon_address
-            .map(|address| sessions::SifsDaemonAccess::new(address, backend.app_runtime.handle()));
+            .map(|address| SifsDaemonAccess::new(address, backend.app_runtime.handle()));
         let (sessions, session_list_error) = if sifs_daemon.is_some() {
             (Vec::new(), None)
         } else {
@@ -879,7 +801,6 @@ impl ChatState {
             session_title_draft: String::new(),
             session_delete_confirm_id: None,
             pending_delete_id: None,
-            save_rxs: Vec::new(),
             delete_rx: None,
             channel_create_rx: None,
             transcript_load_rx: None,
@@ -919,145 +840,34 @@ impl ChatState {
             .unwrap_or_else(|| "New chat".to_string())
     }
 
-    /// Persist the current chat and update the sidebar row after SIFS confirms the write.
+    /// Update the local sidebar row after backend-owned chat state changes.
     fn persist(&mut self) {
         if self.transcript_load_pending() {
             return;
         }
         let session_id = self.session_id.clone();
         let messages = self.messages.clone();
-        self.persist_messages(&session_id, &messages, true);
+        let title = Self::title_from_messages(&messages);
+        self.upsert_session_ref_from_messages(&session_id, &title, &messages);
     }
 
-    fn persist_messages(
+    fn upsert_session_ref_from_messages(
         &mut self,
         session_id: &str,
+        fallback_title: &str,
         messages: &[ChatMessage],
-        report_visible_failures: bool,
     ) {
         if session_id.is_empty() || messages.is_empty() {
             return;
         }
-        let title = Self::title_from_messages(messages);
-        let stored: Vec<StoredMessage> = messages.iter().map(ChatMessage::to_stored).collect();
-        if let Some(sifs_daemon) = self.sifs_daemon.clone() {
-            let (tx, rx) = mpsc::channel();
-            let data_dir = self.data_dir.clone();
-            let session_id = session_id.to_string();
-            let title = title.clone();
-            let messages = messages.to_vec();
-            let ui_waker = self.ui_waker.clone();
-            let spawn_result = thread::Builder::new()
-                .name("sinomo-app-chat-save".to_string())
-                .spawn(move || {
-                    let result = sessions::save_with_report_via_daemon(
-                        &data_dir,
-                        Some(&sifs_daemon),
-                        &session_id,
-                        &title,
-                        &stored,
-                    )
-                    .map_err(|error| error.to_string());
-                    let _ = tx.send(SaveWorkerResult {
-                        session_id,
-                        title,
-                        messages,
-                        report_visible_failures,
-                        result,
-                    });
-                    if let Some(waker) = ui_waker {
-                        waker.wake();
-                    }
-                });
-            match spawn_result {
-                Ok(_) => {
-                    self.save_rxs.push(rx);
-                }
-                Err(error) if report_visible_failures => {
-                    let detail = error.to_string();
-                    self.notice = Some(format!("chat save failed: {detail}"));
-                    self.push_activity("chat save", detail, ActivityTone::Warn);
-                }
-                Err(_) => {}
-            }
-            return;
-        }
-        match self.save_chat_record(session_id, &title, &stored) {
-            Ok(_) => {
-                if let Some(session) =
-                    self.session_ref_after_chat_save(session_id, &title, messages)
-                {
-                    self.upsert_session_ref(session);
-                }
-            }
-            Err(error) if report_visible_failures => {
-                let detail = error.to_string();
-                self.notice = Some(format!("chat save failed: {detail}"));
-                self.push_activity("chat save", detail, ActivityTone::Warn);
-            }
-            Err(_) => {}
+        if let Some(session) =
+            self.session_ref_after_backend_update(session_id, fallback_title, messages)
+        {
+            self.upsert_session_ref(session);
         }
     }
 
-    pub fn chat_save_pending(&self) -> bool {
-        !self.save_rxs.is_empty()
-    }
-
-    pub fn pump_chat_saves(&mut self) -> bool {
-        let mut changed = false;
-        let mut index = 0;
-        while index < self.save_rxs.len() {
-            match self.save_rxs[index].try_recv() {
-                Ok(result) => {
-                    self.save_rxs.swap_remove(index);
-                    self.apply_save_result(result);
-                    changed = true;
-                }
-                Err(TryRecvError::Empty) => {
-                    index += 1;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    self.save_rxs.swap_remove(index);
-                    self.notice = Some("chat save failed: worker stopped".to_string());
-                    self.push_activity(
-                        "chat save",
-                        "worker stopped before saving the chat to SIFS".to_string(),
-                        ActivityTone::Warn,
-                    );
-                    changed = true;
-                }
-            }
-        }
-        changed
-    }
-
-    fn apply_save_result(&mut self, result: SaveWorkerResult) {
-        match result.result {
-            Ok(()) => {
-                if let Some(session) = self.session_ref_after_chat_save(
-                    &result.session_id,
-                    &result.title,
-                    &result.messages,
-                ) {
-                    self.upsert_session_ref(session);
-                }
-                if self
-                    .notice
-                    .as_deref()
-                    .is_some_and(|notice| notice.starts_with("chat save failed:"))
-                {
-                    self.notice = None;
-                }
-            }
-            Err(detail) if result.report_visible_failures => {
-                self.notice = Some(format!("chat save failed: {detail}"));
-                self.push_activity("chat save", detail, ActivityTone::Warn);
-            }
-            Err(_) => {}
-        }
-    }
-
-    fn session_ref_after_chat_save(
+    fn session_ref_after_backend_update(
         &self,
         session_id: &str,
         fallback_title: &str,
@@ -1293,58 +1103,8 @@ impl ChatState {
         self.start_session_list_load(waker);
     }
 
-    fn save_chat_record(
-        &self,
-        session_id: &str,
-        title: &str,
-        stored: &[StoredMessage],
-    ) -> std::io::Result<()> {
-        #[cfg(test)]
-        if self.sifs_daemon.is_none() {
-            return sessions::save_with_report(&self.data_dir, session_id, title, stored);
-        }
-        sessions::save_with_report_via_daemon(
-            &self.data_dir,
-            self.sifs_daemon.as_ref(),
-            session_id,
-            title,
-            stored,
-        )
-    }
-
-    fn load_chat_transcript(&self, session_id: &str) -> Option<sessions::StoredTranscript> {
-        #[cfg(test)]
-        if self.sifs_daemon.is_none() {
-            return sessions::load_transcript(&self.data_dir, session_id);
-        }
-        sessions::load_transcript_via_daemon(&self.data_dir, self.sifs_daemon.as_ref(), session_id)
-    }
-
     fn rename_chat_record(&self, session_id: &str, title: &str) -> std::io::Result<()> {
-        #[cfg(test)]
-        let sifs_result = if self.sifs_daemon.is_none() {
-            sessions::rename(&self.data_dir, session_id, title)
-        } else {
-            sessions::rename_via_daemon(
-                &self.data_dir,
-                self.sifs_daemon.as_ref(),
-                session_id,
-                title,
-            )
-        };
-        #[cfg(not(test))]
-        let sifs_result = sessions::rename_via_daemon(
-            &self.data_dir,
-            self.sifs_daemon.as_ref(),
-            session_id,
-            title,
-        );
-        let channel_result =
-            rename_chat_channel(&self.data_dir, self.sifs_daemon.as_ref(), session_id, title);
-        match (sifs_result, channel_result) {
-            (Ok(()), _) | (_, Ok(())) => Ok(()),
-            (Err(error), Err(_)) => Err(error),
-        }
+        rename_chat_channel(&self.data_dir, self.sifs_daemon.as_ref(), session_id, title)
     }
 
     fn agent_channel_store(&self) -> std::io::Result<SifsAgentChannelStore> {
@@ -1961,43 +1721,8 @@ impl ChatState {
             return false;
         }
 
-        let show_speaker = self.session_is_channel(session_id);
-        let mut transcript = self.load_chat_transcript(session_id).unwrap_or_default();
-        let mut messages: Vec<ChatMessage> = transcript
-            .messages
-            .drain(..)
-            .map(ChatMessage::from_stored)
-            .collect();
-        let changed = match event {
-            ChatEvent::Token { text, .. } => {
-                Self::append_model_token(&mut messages, &text);
-                true
-            }
-            ChatEvent::AgentToken { speaker, text, .. } => {
-                if show_speaker {
-                    Self::append_model_token_from_speaker(
-                        &mut messages,
-                        &speaker.agent_name,
-                        &text,
-                    );
-                } else {
-                    Self::append_model_token(&mut messages, &text);
-                }
-                true
-            }
-            ChatEvent::SystemMessage { kind, text, .. } => {
-                Self::apply_system_message(&mut messages, &kind, &text);
-                true
-            }
-            ChatEvent::TurnDone { .. } => Self::finish_turn_messages(&mut messages),
-            ChatEvent::Error { error, .. } => {
-                Self::apply_error_message(&mut messages, &error);
-                true
-            }
-            _ => false,
-        };
-        if changed {
-            self.persist_messages(session_id, &messages, false);
+        if matches!(event, ChatEvent::TurnDone { .. } | ChatEvent::Error { .. }) {
+            self.refresh_sessions();
         }
         true
     }
@@ -2048,6 +1773,17 @@ impl ChatState {
             return true;
         }
         false
+    }
+
+    fn trim_messages_to_recent_window(messages: &mut Vec<ChatMessage>) -> bool {
+        let excess = messages
+            .len()
+            .saturating_sub(VISIBLE_TRANSCRIPT_RECENT_LIMIT);
+        if excess == 0 {
+            return false;
+        }
+        messages.drain(0..excess);
+        true
     }
 
     fn apply_system_message(messages: &mut Vec<ChatMessage>, kind: &str, text: &str) {
@@ -3221,6 +2957,7 @@ impl ChatState {
                 self.notice = None;
                 Self::finish_turn_messages(&mut self.messages);
                 self.persist();
+                Self::trim_messages_to_recent_window(&mut self.messages);
             }
             ChatEvent::ControlStatus(status) => {
                 self.control.active_turn = status.active_turn;
@@ -3334,6 +3071,7 @@ impl ChatState {
                     self.scroll = f32::MAX;
                 }
                 self.persist();
+                Self::trim_messages_to_recent_window(&mut self.messages);
             }
         }
         true
@@ -4059,7 +3797,7 @@ impl ChatState {
 
 fn list_conversations_with_error(
     data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+    sifs_daemon: Option<&SifsDaemonAccess>,
 ) -> (Vec<SessionRef>, Option<String>) {
     let (mut conversations, chat_error) = list_chat_conversations_with_error(data_dir, sifs_daemon);
     let (channel_sessions, channel_error) =
@@ -4074,32 +3812,14 @@ fn list_conversations_with_error(
 
 fn list_chat_conversations_with_error(
     data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+    sifs_daemon: Option<&SifsDaemonAccess>,
 ) -> (Vec<SessionRef>, Option<String>) {
-    let (chat_metas, chat_error) = list_chat_metas_with_error(data_dir, sifs_daemon);
-    let conversations = chat_metas_to_session_refs(chat_metas);
-    (conversations, chat_error)
-}
-
-fn chat_metas_to_session_refs(chat_metas: Vec<sessions::SessionMeta>) -> Vec<SessionRef> {
-    let mut conversations = chat_metas
-        .into_iter()
-        .map(|meta| SessionRef {
-            id: meta.id,
-            title: meta.title,
-            kind: ConversationKind::Chat,
-            updated_unix: meta.updated_unix,
-            participant_count: 1,
-            participant_names: Vec::new(),
-        })
-        .collect::<Vec<_>>();
-    sort_conversations(&mut conversations);
-    conversations
+    list_agent_chat_conversations_with_error(data_dir, sifs_daemon)
 }
 
 fn list_channel_conversations_with_error(
     data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+    sifs_daemon: Option<&SifsDaemonAccess>,
 ) -> (Vec<SessionRef>, Option<String>) {
     let channel_result = open_agent_channel_store(data_dir, sifs_daemon).and_then(|store| {
         store
@@ -4128,6 +3848,48 @@ fn list_channel_conversations_with_error(
                     kind: ConversationKind::Channel,
                     updated_unix: channel.updated_at.unix_timestamp(),
                     participant_count: channel.enabled_participant_count,
+                    participant_names: channel.participant_names,
+                });
+            }
+            None
+        }
+        Err(error) => Some(error.to_string()),
+    };
+    sort_conversations(&mut conversations);
+    (conversations, error)
+}
+
+fn list_agent_chat_conversations_with_error(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&SifsDaemonAccess>,
+) -> (Vec<SessionRef>, Option<String>) {
+    let result = open_agent_channel_store(data_dir, sifs_daemon).and_then(|store| {
+        store
+            .list_channel_summaries()
+            .map_err(channel_store_io_error)
+    });
+    let mut conversations = Vec::new();
+    let error = match result {
+        Ok(channels) => {
+            let mut seen = BTreeSet::new();
+            for channel in channels {
+                if channel.channel_kind != AgentChannelKind::Chat {
+                    continue;
+                }
+                let id = channel.channel_id.to_string();
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                conversations.push(SessionRef {
+                    id,
+                    title: if channel.title.trim().is_empty() {
+                        "New chat".to_string()
+                    } else {
+                        channel.title
+                    },
+                    kind: ConversationKind::Chat,
+                    updated_unix: channel.updated_at.unix_timestamp(),
+                    participant_count: channel.enabled_participant_count.max(1),
                     participant_names: channel.participant_names,
                 });
             }
@@ -4177,20 +3939,6 @@ fn session_ref_for_channel(channel: &AgentChannel) -> SessionRef {
     }
 }
 
-fn list_chat_metas_with_error(
-    data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
-) -> (Vec<sessions::SessionMeta>, Option<String>) {
-    #[cfg(test)]
-    if sifs_daemon.is_none() {
-        return (sessions::list(data_dir), None);
-    }
-    match sessions::list_with_report_via_daemon(data_dir, sifs_daemon) {
-        Ok(metas) => (metas, None),
-        Err(error) => (Vec::new(), Some(error)),
-    }
-}
-
 fn sort_conversations(conversations: &mut [SessionRef]) {
     conversations.sort_by(|left, right| {
         right
@@ -4202,42 +3950,24 @@ fn sort_conversations(conversations: &mut [SessionRef]) {
 
 fn delete_conversation_records(
     data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+    sifs_daemon: Option<&SifsDaemonAccess>,
     id: &str,
     kind: ConversationKind,
 ) -> std::io::Result<()> {
-    match kind {
-        ConversationKind::Chat => {
-            let chat_result = delete_chat_record(data_dir, sifs_daemon, id);
-            let channel_result = tombstone_channel_record_in(data_dir, sifs_daemon, id);
-            match (chat_result, channel_result) {
-                (Ok(()), _) | (_, Ok(true)) => Ok(()),
-                (Err(error), Ok(false)) | (Err(error), Err(_)) => Err(error),
-            }
-        }
-        ConversationKind::Channel => {
-            let result = tombstone_channel_record_in(data_dir, sifs_daemon, id).map(|_| ());
-            let _ = delete_chat_record(data_dir, sifs_daemon, id);
-            result
-        }
+    let tombstoned = tombstone_channel_record_in(data_dir, sifs_daemon, id)?;
+    if tombstoned || kind == ConversationKind::Chat {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "channel not found",
+        ))
     }
-}
-
-fn delete_chat_record(
-    data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
-    id: &str,
-) -> std::io::Result<()> {
-    #[cfg(test)]
-    if sifs_daemon.is_none() {
-        return sessions::delete(data_dir, id);
-    }
-    sessions::delete_via_daemon(data_dir, sifs_daemon, id)
 }
 
 fn tombstone_channel_record_in(
     data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+    sifs_daemon: Option<&SifsDaemonAccess>,
     id: &str,
 ) -> std::io::Result<bool> {
     let channel_id = parse_channel_id(id)?;
@@ -4258,7 +3988,7 @@ fn tombstone_channel_record_in(
 
 fn rename_chat_channel(
     data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+    sifs_daemon: Option<&SifsDaemonAccess>,
     id: &str,
     title: &str,
 ) -> std::io::Result<()> {
@@ -4311,49 +4041,21 @@ fn channel_messages(channel: &AgentChannel) -> Vec<ChatMessage> {
 
 fn load_conversation_messages(
     data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+    sifs_daemon: Option<&SifsDaemonAccess>,
     id: &str,
     kind: ConversationKind,
 ) -> Result<Vec<ChatMessage>, String> {
-    match kind {
-        ConversationKind::Chat => Ok(load_chat_messages_from_sifs(data_dir, sifs_daemon, id)),
-        ConversationKind::Channel => {
-            match load_channel_messages_from_sifs(data_dir, sifs_daemon, id) {
-                Ok(Some(messages)) => Ok(messages),
-                Ok(None) => Ok(load_chat_messages_from_sifs(data_dir, sifs_daemon, id)),
-                Err(error) => {
-                    let fallback = load_chat_messages_from_sifs(data_dir, sifs_daemon, id);
-                    if fallback.is_empty() {
-                        Err(error)
-                    } else {
-                        Ok(fallback)
-                    }
-                }
-            }
-        }
+    let messages = load_channel_messages_from_sifs(data_dir, sifs_daemon, id)?;
+    match (messages, kind) {
+        (Some(messages), _) => Ok(messages),
+        (None, ConversationKind::Chat) => Ok(Vec::new()),
+        (None, ConversationKind::Channel) => Err("channel not found".to_string()),
     }
-}
-
-fn load_chat_messages_from_sifs(
-    data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
-    id: &str,
-) -> Vec<ChatMessage> {
-    let transcript = match sifs_daemon {
-        Some(_) => sessions::load_transcript_via_daemon(data_dir, sifs_daemon, id),
-        None => sessions::load_transcript(data_dir, id),
-    };
-    transcript
-        .unwrap_or_default()
-        .messages
-        .into_iter()
-        .map(ChatMessage::from_stored)
-        .collect()
 }
 
 fn load_channel_messages_from_sifs(
     data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+    sifs_daemon: Option<&SifsDaemonAccess>,
     id: &str,
 ) -> Result<Option<Vec<ChatMessage>>, String> {
     let channel_id = parse_channel_id(id).map_err(|error| error.to_string())?;
@@ -4563,7 +4265,7 @@ fn normalize_attachment_path(value: &str) -> Option<String> {
 
 fn open_agent_channel_store(
     data_dir: &SinomoDataDir,
-    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+    sifs_daemon: Option<&SifsDaemonAccess>,
 ) -> std::io::Result<SifsAgentChannelStore> {
     match sifs_daemon {
         Some(daemon) => daemon
@@ -12307,14 +12009,12 @@ impl ChatView {
         let changed = {
             let mut chat = self.shared.chat_mut();
             let worker_changed = chat.pump_worker_events();
-            let save_changed = chat.pump_chat_saves();
             let list_changed = chat.pump_session_list();
             let transcript_changed = chat.pump_transcript_load();
             let delete_changed = chat.pump_delete();
             let channel_create_changed = chat.pump_channel_create();
             let media_changed = chat.pump_media_call_runtime();
             worker_changed
-                || save_changed
                 || list_changed
                 || transcript_changed
                 || delete_changed
@@ -12323,7 +12023,6 @@ impl ChatView {
         };
         let streaming = self.shared.chat().streaming;
         let media_call_active = self.shared.chat().media_call.active;
-        let save_pending = self.shared.chat().chat_save_pending();
         let transcript_pending = self.shared.chat().transcript_load_pending();
 
         // Recompute the coarse signature each tick: a worker event (RuntimeInfo / Models / TurnDone,
@@ -12348,7 +12047,6 @@ impl ChatView {
         }
         if streaming
             || media_call_active
-            || save_pending
             || transcript_pending
             || self.idle_frames.get() < PUMP_IDLE_BUDGET
         {
@@ -13877,6 +13575,60 @@ mod tests {
         (backend, state)
     }
 
+    fn seed_backend_chat(
+        data_dir: &SinomoDataDir,
+        channel_id: &SessionId,
+        title: &str,
+        messages: &[ChatMessage],
+    ) -> AgentChannel {
+        let store = SifsAgentChannelStore::open(data_dir).expect("open channel store");
+        let mut channel = AgentChannel::new(channel_id.clone(), title);
+        let participant_id = channel.ensure_participant("main-agent", "main-agent");
+        let participant = channel
+            .participant(&participant_id)
+            .expect("participant")
+            .clone();
+        for message in messages {
+            let channel_message = match (message.source, message.kind) {
+                (ChatMessageSource::User, _) => channel.append_user_message(
+                    AGENT_CHANNEL_APP_USER_ID,
+                    "User",
+                    message.text.clone(),
+                    AgentChannelSource::app(),
+                ),
+                (ChatMessageSource::System, ChatMessageKind::Error) => {
+                    channel.append_system_error(message.text.clone(), AgentChannelSource::app())
+                }
+                (ChatMessageSource::System, _) => {
+                    channel.append_system_info(message.text.clone(), AgentChannelSource::app())
+                }
+                (ChatMessageSource::Model, _) => channel.append_agent_message(
+                    &participant,
+                    message.text.clone(),
+                    AgentChannelSource::app(),
+                ),
+            };
+            store
+                .append_message(&channel.channel_id, &channel_message)
+                .expect("append backend message");
+        }
+        store.save_channel(&channel).expect("save backend chat");
+        channel
+    }
+
+    fn load_backend_chat_messages(
+        data_dir: &SinomoDataDir,
+        channel_id: &SessionId,
+    ) -> Vec<ChatMessage> {
+        load_conversation_messages(
+            data_dir,
+            None,
+            &channel_id.to_string(),
+            ConversationKind::Chat,
+        )
+        .expect("load backend chat")
+    }
+
     #[test]
     fn typing_draft_does_not_rebuild_focused_composer() {
         let (_backend, mut state) = isolated_chat_state("typing-draft");
@@ -13897,17 +13649,17 @@ mod tests {
     fn open_session_loads_transcript_asynchronously() {
         let (_backend, mut state) = isolated_chat_state("open-session-async");
         seed_default_provider(&mut state);
-        let session_id = SessionId::generate().to_string();
-        sessions::save_with_report(
+        let channel_id = SessionId::generate();
+        seed_backend_chat(
             &state.data_dir,
-            &session_id,
+            &channel_id,
             "Saved plan",
             &[
-                StoredMessage::legacy("user", "original prompt"),
-                StoredMessage::legacy("agent", "original answer"),
+                ChatMessage::user("original prompt"),
+                ChatMessage::model("original answer"),
             ],
-        )
-        .expect("save transcript");
+        );
+        let session_id = channel_id.to_string();
         state.sessions = vec![SessionRef {
             id: session_id.clone(),
             title: "Saved plan".to_string(),
@@ -13945,7 +13697,7 @@ mod tests {
         });
 
         assert_eq!(state.messages[0].text, "original prompt");
-        assert_eq!(state.messages[1].text, "original answer");
+        assert_eq!(state.messages[1].text, "main-agent: original answer");
         assert_eq!(state.notice, None);
         assert!(
             state.can_send(),
@@ -14055,10 +13807,6 @@ mod tests {
             !session_id.is_empty(),
             "submitting before Ready must still create a visible session id"
         );
-        let transcript =
-            sessions::load_transcript(&state.data_dir, &session_id).expect("transcript saved");
-        assert_eq!(transcript.messages.len(), 2);
-        assert_eq!(transcript.messages[0].text, "persist me before ready");
         assert!(
             state
                 .sessions
@@ -14250,12 +13998,19 @@ mod tests {
     #[test]
     fn session_rename_updates_sidebar_metadata_and_preserves_title() {
         let (_backend, mut state) = isolated_chat_state("rename");
-        let session_id = SessionId::generate().to_string();
+        let channel_id = SessionId::generate();
+        let session_id = channel_id.to_string();
         state.session_id = session_id.clone();
         state.messages = vec![
             ChatMessage::user("original prompt"),
             ChatMessage::model("original answer"),
         ];
+        seed_backend_chat(
+            &state.data_dir,
+            &channel_id,
+            "original prompt",
+            &state.messages,
+        );
         state.persist();
 
         state.begin_edit_current_session();
@@ -14273,29 +14028,43 @@ mod tests {
                 .map(|session| session.title.as_str()),
             Some("Renamed chat")
         );
-        let transcript =
-            sessions::load_transcript(&state.data_dir, &session_id).expect("transcript preserved");
-        assert_eq!(transcript.messages[0].text, "original prompt");
-        assert_eq!(transcript.messages[1].text, "original answer");
+        let store = SifsAgentChannelStore::open(&state.data_dir).expect("open channel store");
+        let channel = store
+            .load_channel(&channel_id)
+            .expect("load backend chat")
+            .expect("backend chat");
+        assert_eq!(channel.title, "Renamed chat");
+        let transcript = load_backend_chat_messages(&state.data_dir, &channel_id);
+        assert_eq!(transcript[0].text, "original prompt");
+        assert_eq!(transcript[1].text, "main-agent: original answer");
 
         state.persist();
-        let meta = sessions::list(&state.data_dir)
-            .into_iter()
-            .find(|meta| meta.id == session_id)
-            .expect("renamed session listed");
-        assert_eq!(meta.title, "Renamed chat");
-        assert_eq!(meta.title_source.as_deref(), Some("user"));
+        assert_eq!(
+            state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .map(|session| session.title.as_str()),
+            Some("Renamed chat")
+        );
     }
 
     #[test]
     fn session_delete_hides_session_and_resets_visible_chat() {
         let (_backend, mut state) = isolated_chat_state("delete");
-        let session_id = SessionId::generate().to_string();
+        let channel_id = SessionId::generate();
+        let session_id = channel_id.to_string();
         state.session_id = session_id.clone();
         state.messages = vec![
             ChatMessage::user("delete this prompt"),
             ChatMessage::model("delete this answer"),
         ];
+        seed_backend_chat(
+            &state.data_dir,
+            &channel_id,
+            "delete this prompt",
+            &state.messages,
+        );
         state.persist();
 
         state.request_delete_session(&session_id);
@@ -14327,10 +14096,12 @@ mod tests {
         wait_for(&mut state, Duration::from_secs(20), |state| {
             state.pending_delete_id.is_none()
         });
-        assert!(
-            sessions::load_transcript(&state.data_dir, &session_id).is_none(),
-            "deleted sessions cannot be reopened"
-        );
+        let store = SifsAgentChannelStore::open(&state.data_dir).expect("open channel store");
+        let channel = store
+            .load_channel(&channel_id)
+            .expect("load backend chat")
+            .expect("backend chat");
+        assert!(channel.deleted_at.is_some(), "deleted chats are tombstoned");
     }
 
     #[test]
@@ -16096,11 +15867,18 @@ mod tests {
         let old_session_id = SessionId::from_legacy_named("sess_old_chat")
             .expect("session id")
             .to_string();
+        let old_channel_id = old_session_id.parse::<SessionId>().expect("old channel id");
         state.session_id = old_session_id.clone();
         state.messages = vec![
             ChatMessage::user("old question"),
             ChatMessage::model("partial answer"),
         ];
+        seed_backend_chat(
+            &state.data_dir,
+            &old_channel_id,
+            "old question",
+            &state.messages,
+        );
         state.input = "draft".to_string();
         state.cursor = state.input.len();
         state.streaming = true;
@@ -16133,15 +15911,13 @@ mod tests {
             state.messages.is_empty(),
             "stale errors from the abandoned turn must not repopulate the new chat"
         );
-        let old_transcript = sessions::load_transcript(&state.data_dir, &old_session_id)
-            .expect("old transcript remains persisted");
-        let old_error = old_transcript
-            .messages
-            .last()
-            .expect("old error message persisted");
-        assert_eq!(old_error.source.as_deref(), Some("system"));
-        assert_eq!(old_error.kind.as_deref(), Some("error"));
-        assert!(old_error.text.contains("old provider failed"));
+        let old_transcript = load_backend_chat_messages(&state.data_dir, &old_channel_id);
+        assert!(
+            old_transcript
+                .iter()
+                .all(|message| !message.text.contains("old provider failed")),
+            "background events must not be persisted by the app reducer"
+        );
 
         state.set_draft("new question".to_string());
         state.submit();
@@ -16196,7 +15972,7 @@ mod tests {
     }
 
     #[test]
-    fn session_scoped_events_update_background_transcript_without_visible_mutation() {
+    fn session_scoped_events_do_not_mutate_visible_or_backend_timeline() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
         seed_default_provider(&mut state);
@@ -16206,6 +15982,9 @@ mod tests {
         let background_session_id = SessionId::from_legacy_named("sess_background_chat")
             .expect("background session id")
             .to_string();
+        let background_channel_id = background_session_id
+            .parse::<SessionId>()
+            .expect("background channel id");
         state.session_id = visible_session_id.clone();
         state.messages = vec![
             ChatMessage::user("visible question"),
@@ -16214,11 +15993,12 @@ mod tests {
         state.streaming = true;
         state.control.active_turn = true;
 
-        let background_messages = vec![
-            ChatMessage::user("background question"),
-            ChatMessage::model(String::new()),
-        ];
-        state.persist_messages(&background_session_id, &background_messages, false);
+        seed_backend_chat(
+            &state.data_dir,
+            &background_channel_id,
+            "background question",
+            &[ChatMessage::user("background question")],
+        );
 
         state.apply_event(ChatEvent::Token {
             session_id: background_session_id.clone(),
@@ -16240,28 +16020,45 @@ mod tests {
             state.messages[1].text, "",
             "background tokens must not append to the visible placeholder"
         );
-        let background = sessions::load_transcript(&state.data_dir, &background_session_id)
-            .expect("background transcript saved");
-        assert_eq!(background.messages.len(), 2);
-        assert_eq!(background.messages[1].text, "background answer");
-        assert_eq!(background.messages[1].source.as_deref(), Some("model"));
-        assert_eq!(background.messages[1].kind.as_deref(), Some("message"));
+        let background = load_backend_chat_messages(&state.data_dir, &background_channel_id);
+        assert_eq!(background.len(), 1);
+        assert_eq!(background[0].text, "background question");
     }
 
     #[test]
-    fn chat_save_upserts_visible_row_without_relisting_sifs() {
+    fn visible_transcript_trims_to_recent_window_after_turn_done() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
-        let other_session_id = SessionId::from_legacy_named("sess_saved_elsewhere")
-            .expect("other session id")
+        state.session_id = SessionId::from_legacy_named("sess_long_visible_chat")
+            .expect("session id")
             .to_string();
-        sessions::save(
+        state.messages = (0..(VISIBLE_TRANSCRIPT_RECENT_LIMIT + 5))
+            .map(|index| ChatMessage::user(format!("message {index}")))
+            .collect();
+        state.streaming = true;
+
+        state.apply_event(ChatEvent::TurnDone {
+            session_id: state.session_id.clone(),
+        });
+
+        assert_eq!(state.messages.len(), VISIBLE_TRANSCRIPT_RECENT_LIMIT);
+        assert_eq!(state.messages[0].text, "message 5");
+        assert!(!state.streaming);
+    }
+
+    #[test]
+    fn backend_update_upserts_visible_row_without_relisting_sifs() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let other_channel_id =
+            SessionId::from_legacy_named("sess_saved_elsewhere").expect("other session id");
+        let other_session_id = other_channel_id.to_string();
+        seed_backend_chat(
             &state.data_dir,
-            &other_session_id,
+            &other_channel_id,
             "Saved elsewhere",
-            &[StoredMessage::new("user", "other", "user", "message")],
-        )
-        .expect("save unrelated SIFS chat");
+            &[ChatMessage::user("other")],
+        );
         state.sessions.clear();
 
         let visible_session_id = SessionId::from_legacy_named("sess_visible_save")
@@ -16273,7 +16070,11 @@ mod tests {
             ChatMessage::model("visible saved answer"),
         ];
 
-        state.persist_messages(&visible_session_id, &messages, true);
+        state.upsert_session_ref_from_messages(
+            &visible_session_id,
+            &ChatState::title_from_messages(&messages),
+            &messages,
+        );
 
         assert!(
             state
@@ -16289,16 +16090,106 @@ mod tests {
                 .sessions
                 .iter()
                 .all(|session| session.id != other_session_id),
-            "saving one chat should not synchronously relist unrelated SIFS records"
-        );
-        assert!(
-            sessions::load_transcript(&state.data_dir, &visible_session_id).is_some(),
-            "the upsert happens only after SIFS confirms the transcript"
+            "updating one chat should not synchronously relist unrelated SIFS records"
         );
     }
 
     #[test]
-    fn chat_save_preserves_existing_channel_sidebar_row() {
+    fn direct_chat_loads_structured_channel_timeline() {
+        let backend = Backend::local_fallback();
+        let state = ChatState::new(&backend);
+        let channel_id = SessionId::from_legacy_named("sess_structured_chat").expect("channel id");
+
+        let store = SifsAgentChannelStore::open(&state.data_dir).expect("open channel store");
+        let mut channel = AgentChannel::new(channel_id.clone(), "structured chat");
+        let participant_id = channel.ensure_participant("main-agent", "main-agent");
+        let participant = channel
+            .participant(&participant_id)
+            .expect("participant")
+            .clone();
+        let user = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "User",
+            "structured question",
+            AgentChannelSource::app(),
+        );
+        store
+            .append_message(&channel.channel_id, &user)
+            .expect("append user");
+        let agent = channel.append_agent_message(
+            &participant,
+            "structured answer",
+            AgentChannelSource::app(),
+        );
+        store
+            .append_message(&channel.channel_id, &agent)
+            .expect("append agent");
+        store.save_channel(&channel).expect("save channel");
+
+        let messages = load_conversation_messages(
+            &state.data_dir,
+            None,
+            &channel_id.to_string(),
+            ConversationKind::Chat,
+        )
+        .expect("load chat messages");
+        assert_eq!(messages[0].text, "structured question");
+        assert!(messages[1].text.contains("structured answer"));
+
+        let (sessions, error) = list_chat_conversations_with_error(&state.data_dir, None);
+        assert!(error.is_none());
+        let session = sessions
+            .iter()
+            .find(|session| session.id == channel_id.to_string())
+            .expect("structured chat listed");
+        assert_eq!(session.title, "structured chat");
+    }
+
+    #[test]
+    fn backend_update_does_not_write_timeline() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let channel_id =
+            SessionId::from_legacy_named("sess_backend_owned_chat").expect("channel id");
+        let mut channel = AgentChannel::new(channel_id.clone(), "backend owned");
+        let user = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "User",
+            "backend question",
+            AgentChannelSource::app(),
+        );
+        let store = SifsAgentChannelStore::open(&state.data_dir).expect("open channel store");
+        store
+            .append_message(&channel.channel_id, &user)
+            .expect("append user");
+        store.save_channel(&channel).expect("save channel");
+
+        state.session_id = channel_id.to_string();
+        state.upsert_session_ref_from_messages(
+            &channel_id.to_string(),
+            "visible app copy",
+            &[ChatMessage::user("visible app copy")],
+        );
+
+        let loaded = load_backend_chat_messages(&state.data_dir, &channel_id);
+        assert!(
+            loaded
+                .iter()
+                .all(|message| message.text != "visible app copy"),
+            "UI sidebar updates must not write timeline content"
+        );
+        assert!(
+            state
+                .sessions
+                .iter()
+                .any(|session| session.id == channel_id.to_string()
+                    && session.kind == ConversationKind::Chat),
+            "the sidebar can still update from the save result"
+        );
+    }
+
+    #[test]
+    fn backend_update_preserves_existing_channel_sidebar_row() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
         let channel_id = SessionId::from_legacy_named("sess_channel_save")
@@ -16315,7 +16206,11 @@ mod tests {
         }];
         let messages = vec![ChatMessage::user("channel prompt")];
 
-        state.persist_messages(&channel_id, &messages, true);
+        state.upsert_session_ref_from_messages(
+            &channel_id,
+            &ChatState::title_from_messages(&messages),
+            &messages,
+        );
 
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(state.sessions[0].id, channel_id);
@@ -16427,18 +16322,16 @@ mod tests {
     }
 
     #[test]
-    fn stored_message_metadata_distinguishes_system_errors_from_model_text() {
-        let stored = ChatMessage::system_error("Error: provider unavailable").to_stored();
+    fn channel_message_metadata_distinguishes_system_errors_from_model_text() {
+        let mut channel = AgentChannel::new(SessionId::generate(), "errors");
+        channel.append_system_error("Error: provider unavailable", AgentChannelSource::app());
 
-        assert_eq!(stored.role, "agent");
-        assert_eq!(stored.source.as_deref(), Some("system"));
-        assert_eq!(stored.kind.as_deref(), Some("error"));
-
-        let restored = ChatMessage::from_stored(stored);
-        assert_eq!(restored.role, ChatRole::Agent);
-        assert_eq!(restored.source, ChatMessageSource::System);
-        assert_eq!(restored.kind, ChatMessageKind::Error);
-        assert_eq!(restored.history_role(), "system");
+        let restored = channel_messages(&channel);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].role, ChatRole::Agent);
+        assert_eq!(restored[0].source, ChatMessageSource::System);
+        assert_eq!(restored[0].kind, ChatMessageKind::Error);
+        assert_eq!(restored[0].history_role(), "system");
     }
 
     #[test]
@@ -16774,14 +16667,16 @@ mod tests {
             std::env::temp_dir().join(format!("sinomo-app-chat-list-retry-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let data_dir = SinomoDataDir::new(&root);
-        let session_id = "01hxy6qa9k0t9vr4g9n8d3q6b1";
-        sessions::save(
+        let channel_id = "01hxy6qa9k0t9vr4g9n8d3q6b1"
+            .parse::<SessionId>()
+            .expect("session id");
+        seed_backend_chat(
             &data_dir,
-            session_id,
+            &channel_id,
             "Recovered by retry",
-            &[StoredMessage::new("user", "hello", "user", "message")],
-        )
-        .expect("save persisted chat");
+            &[ChatMessage::user("hello")],
+        );
+        let session_id = channel_id.to_string();
         let backend = Backend::local_fallback_for_data_dir(data_dir);
         let mut state = ChatState::new(&backend);
         state.sessions.clear();
@@ -19163,7 +19058,7 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn live_app_chat_streams_and_persists_session_locally() {
+    fn live_app_chat_streams_and_persists_backend_session() {
         if std::env::var_os("SINOMO_LIVE_APP_CHAT_SMOKE").is_none() {
             return;
         }
@@ -19200,35 +19095,26 @@ mod tests {
         let session_id = state.session_id.clone();
         assert!(!session_id.is_empty(), "session id is assigned");
 
-        let reloaded =
-            sessions::load_transcript(&state.data_dir, &session_id).expect("reload session");
+        let reloaded = load_conversation_messages(
+            &state.data_dir,
+            state.sifs_daemon.as_ref(),
+            &session_id,
+            ConversationKind::Chat,
+        )
+        .expect("reload backend session");
         assert!(
             reloaded
-                .messages
                 .iter()
-                .any(|message| message.role == "user" && message.text == prompt),
+                .any(|message| message.role == ChatRole::User && message.text == prompt),
             "user prompt persisted"
         );
         assert!(
             reloaded
-                .messages
                 .iter()
-                .any(|message| message.role == "agent"
+                .any(|message| message.role == ChatRole::Agent
                     && message.text.contains("sinomo-app-live-ok")),
             "agent response persisted"
         );
-
-        if let Some(notice) = state.notice.as_deref()
-            && notice.contains("chat save failed")
-        {
-            assert!(
-                state
-                    .activity
-                    .iter()
-                    .any(|entry| entry.title == "chat save" && entry.tone == ActivityTone::Warn),
-                "SIFS save failures should be visible as degraded app-layer activity"
-            );
-        }
     }
 
     fn wait_for(state: &mut ChatState, timeout: Duration, predicate: impl Fn(&ChatState) -> bool) {

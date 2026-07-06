@@ -11093,14 +11093,14 @@ mod tests {
     fn crumb_label_compacts_long_non_node_segments() {
         assert_eq!(crumb_label("services", None), "services");
         assert_eq!(
-            crumb_label("sinomo-app-chat-session-01ktsg9dw850xkprvhkn0kfr8t", None),
-            "sinomo-app…rvhkn0kfr8t"
+            crumb_label("sinomo-agent-channel-01ktsg9dw850xkprvhkn0kfr8t", None),
+            "sinomo-age…rvhkn0kfr8t"
         );
     }
 
     #[test]
     fn display_name_for_width_keeps_generated_file_names_readable() {
-        let name = "sinomo-app-chat-session-01ktsg9dw850xkprvhkn0kfr8t.json";
+        let name = "sinomo-agent-channel-01ktsg9dw850xkprvhkn0kfr8t.json";
 
         assert_eq!(
             display_name_for_width("artifact.txt", 320.0, 7.1),
@@ -11108,7 +11108,7 @@ mod tests {
         );
         assert_eq!(
             display_name_for_width(name, 180.0, 8.8),
-            "sinomo-ap…kfr8t.json"
+            "sinomo-ag…kfr8t.json"
         );
         assert_eq!(display_name_for_width(name, 40.0, 8.8), "s…on");
         assert_eq!(display_name_for_width(name, 0.0, 8.8), "");
@@ -13179,11 +13179,11 @@ mod tests {
 
     #[test]
     fn middle_short_keeps_long_sifs_names_single_line() {
-        let name = "sinomo-app-chat-session-01ktsg9dw850xkprvhkn0kfr8t.json";
+        let name = "sinomo-agent-channel-01ktsg9dw850xkprvhkn0kfr8t.json";
         let compact = middle_short(name, 36);
 
         assert_eq!(compact.chars().count(), 36);
-        assert!(compact.starts_with("sinomo-app-chat"));
+        assert!(compact.starts_with("sinomo-agent"));
         assert!(compact.ends_with("hkn0kfr8t.json"));
         assert!(compact.contains('…'));
     }
@@ -16050,9 +16050,8 @@ mod tests {
             files.node_id = "node-a".to_string();
             files.clustered = true;
             files.entries = vec![SifsEntry {
-                name: "sinomo-app-chat-session-01ktsg9dv850xkpryhkn0kfr8t.json".to_string(),
-                path: "/services/sinomo-app-chat-session-01ktsg9dv850xkpryhkn0kfr8t.json"
-                    .to_string(),
+                name: "sinomo-agent-channel-01ktsg9dv850xkpryhkn0kfr8t.json".to_string(),
+                path: "/services/sinomo-agent/channels/01ktsg9dv850xkpryhkn0kfr8t.json".to_string(),
                 is_dir: false,
                 is_link: false,
                 size: Some(4096),
@@ -16062,8 +16061,7 @@ mod tests {
             files.selected_details = Some(SifsObjectDetails {
                 file_system_id: "sifs-primary".to_string(),
                 object_id: "object-01ktsg9dv850xkpryhkn0kfr8t".to_string(),
-                path: "/services/sinomo-app-chat-session-01ktsg9dv850xkpryhkn0kfr8t.json"
-                    .to_string(),
+                path: "/services/sinomo-agent/channels/01ktsg9dv850xkpryhkn0kfr8t.json".to_string(),
                 kind: "file".to_string(),
                 version: "version-01ktsga2xj2yz8dh05ncdvph1q".to_string(),
                 content_hash: Some(

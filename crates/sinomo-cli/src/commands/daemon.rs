@@ -1,6 +1,8 @@
 use super::*;
 #[allow(unused_imports)]
 use sinomo_runtime::cluster;
+#[allow(unused_imports)]
+use sinomo_runtime::cluster::ClusterKvPathsExt;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DaemonCliCommand {

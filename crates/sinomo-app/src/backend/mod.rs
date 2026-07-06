@@ -14,7 +14,6 @@ pub mod cluster;
 pub mod config;
 pub mod evolution;
 pub mod modules;
-pub mod sessions;
 pub mod sifs;
 
 #[cfg(test)]
