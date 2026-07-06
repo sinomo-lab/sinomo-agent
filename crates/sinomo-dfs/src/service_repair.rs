@@ -24,6 +24,16 @@ pub(crate) const DFS_CHUNK_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs
 /// How long a primary keeps an unanswered routed-write response obligation
 /// before assuming the requester gave up.
 const DFS_REMOTE_WRITE_RESPONSE_TTL: Duration = Duration::from_secs(60);
+const DFS_TRANSIENT_ROUTE_REPAIR_RETRY_MAX_TICKS: u64 = 6;
+
+fn repair_retry_delay_ticks_for_error(attempts: u32, last_error: Option<&str>) -> u64 {
+    let delay_ticks = repair_retry_delay_ticks(attempts);
+    if last_error.is_some_and(repair_error_indicates_transient_route_failure) {
+        delay_ticks.min(DFS_TRANSIENT_ROUTE_REPAIR_RETRY_MAX_TICKS)
+    } else {
+        delay_ticks
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DfsRepairBlobRequestOutcome {
@@ -2029,11 +2039,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 continue;
             }
             let mut restored_record = record.clone();
+            let now = dfs_now_unix_nanos();
             if restored_record.next_retry_unix_nanos == u64::MAX
                 && !repair_attempt_record_indicates_lost_authority(&restored_record)
             {
                 restored_record.in_flight = false;
-                restored_record.next_retry_unix_nanos = dfs_now_unix_nanos();
+                restored_record.next_retry_unix_nanos = now;
+                restored_record.next_chunk_index = None;
+            } else if repair_attempt_record_indicates_transient_route_failure(&restored_record)
+                && restored_record.next_retry_unix_nanos > now
+            {
+                restored_record.in_flight = false;
+                restored_record.next_retry_unix_nanos = now;
                 restored_record.next_chunk_index = None;
             }
             self.repair_attempt_records.insert(
@@ -2369,7 +2386,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 state.attempts = state.attempts.saturating_add(1);
             }
             state.inflight = false;
-            state.next_retry_tick = tick.saturating_add(repair_retry_delay_ticks(state.attempts));
+            let delay_ticks =
+                repair_retry_delay_ticks_for_error(state.attempts, last_error.as_deref());
+            state.next_retry_tick = tick.saturating_add(delay_ticks);
             pending.repair_inflight_request_ids.remove(replica_node_id);
             pending.repair_next_chunk_indexes.remove(replica_node_id);
             if let Some(last_error) = last_error {

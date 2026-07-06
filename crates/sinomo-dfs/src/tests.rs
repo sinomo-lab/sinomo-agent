@@ -10920,6 +10920,105 @@ fn persisted_repair_attempts_prevent_duplicate_retry_after_reopen() {
 }
 
 #[test]
+fn transient_route_repair_attempts_retry_promptly_after_restore() {
+    let root = temp_root("transient-route-repair-attempts-retry-after-restore");
+    let owner = NodeId::from_legacy_named("node_route_restore_owner").expect("owner node");
+    let replica = NodeId::from_legacy_named("node_route_restore_replica").expect("replica");
+    let object_id = DfsObjectId::from_legacy_named("obj_route_restore").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_route_restore_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_route_restore_2").expect("version");
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        open_root_local_metadata_backend(root.join("metadata")).expect("metadata"),
+    )
+    .expect("metadata backend");
+    let mut replica_transport = network.add_node(replica.clone());
+    owner_dfs
+        .add_file_system(file_system(owner.clone()))
+        .expect("filesystem");
+    let mut metadata = file_metadata(owner.clone());
+    metadata.object_id = object_id.clone();
+    metadata.version = version_1;
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    owner_dfs.add_object_metadata(metadata).expect("object");
+
+    let write = owner_dfs
+        .write_distributed_eventual_from_reader_with_candidates_and_parent_touch(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id,
+                target_version: version_2,
+                requesting_node_id: owner.clone(),
+            },
+            std::io::Cursor::new(b"transient route repair retry body".to_vec()),
+            vec![owner, replica.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+            true,
+            false,
+        )
+        .expect("write should commit");
+    let NetworkedDfsWriteOutcome::Committed {
+        intent_id,
+        content_hash,
+        repair_jobs,
+        ..
+    } = write
+    else {
+        panic!("expected committed write, got {write:?}");
+    };
+    assert_eq!(repair_jobs.len(), 1);
+    let repair_job = repair_jobs[0].clone();
+    let now = dfs_now_unix_nanos();
+    let repair_attempts = vec![DfsRepairAttemptRecord {
+        intent_id: intent_id.clone(),
+        object_id: repair_job.object_id.clone(),
+        version: repair_job.version.clone(),
+        content_hash,
+        missing_replica_node_id: repair_job.missing_replica_node_id.clone(),
+        attempts: 50,
+        in_flight: false,
+        last_attempt_unix_nanos: now,
+        next_retry_unix_nanos: now.saturating_add(300_000_000_000),
+        next_chunk_index: Some(9),
+        last_error: Some(
+            "network error at cluster target rpc: timed out routing to node_route_restore_replica after 15000ms"
+                .to_string(),
+        ),
+    }];
+    let _ = drain_dfs_messages(&mut replica_transport);
+    let pending = owner_dfs
+        .pending_writes
+        .get_mut(&intent_id)
+        .expect("pending write");
+    pending.repair_retries.clear();
+    pending.repair_inflight_request_ids.clear();
+    pending.repair_next_chunk_indexes.clear();
+    owner_dfs.repair_attempt_records.clear();
+
+    let scheduled = owner_dfs
+        .retry_pending_repairs_bounded_with_attempts(1, &repair_attempts)
+        .expect("retry after route restore");
+    assert_eq!(scheduled.len(), 1);
+    assert_eq!(scheduled[0].missing_replica_node_id, replica);
+    let replica_messages = drain_dfs_messages(&mut replica_transport)
+        .into_iter()
+        .filter(|message| {
+            matches!(
+                message,
+                DfsNetworkMessage::RepairReplica(_) | DfsNetworkMessage::RepairReplicaChunk(_)
+            )
+        })
+        .count();
+    assert_eq!(replica_messages, 1);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn persisted_repair_attempts_prevent_duplicate_fetch_after_reopen() {
     let root = temp_root("persisted-repair-attempts-prevent-duplicate-fetch");
     let primary = NodeId::from_legacy_named("node_persisted_fetch_primary").expect("primary");
@@ -16612,6 +16711,41 @@ fn repair_retry_schedule_preserves_network_error_diagnostics() {
             .as_deref()
             .is_some_and(|error| error.contains("no usable endpoint"))
     );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn repair_retry_schedule_caps_transient_route_backoff() {
+    let root = temp_root("repair-retry-caps-transient-route-backoff");
+    let owner = NodeId::from_legacy_named("node_retry_cap_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_retry_cap_replica").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_retry_cap").expect("object");
+    let version = DfsVersion::from_legacy_named("version_retry_cap").expect("version");
+    let mut dfs = networked_sifs_with_backend(&root, owner);
+    let intent_id = "dfs_intent_retry_cap";
+    dfs.pending_writes.insert(
+        intent_id.to_string(),
+        PendingNetworkedWrite::new(object_id, version, "blake3:retry-cap".to_string(), 64),
+    );
+
+    dfs.repair_retry_tick = 12;
+    for _ in 0..8 {
+        dfs.record_repair_retry_scheduled_with_error(
+            intent_id,
+            &replica,
+            Some("network I/O error during send DFS message: timed out routing".to_string()),
+        );
+    }
+
+    let pending = dfs.pending_writes.get(intent_id).expect("pending write");
+    let state = pending
+        .repair_retries
+        .get(&replica)
+        .expect("repair retry state");
+    assert_eq!(state.attempts, 8);
+    assert_eq!(state.next_retry_tick, 18);
+    assert!(!state.inflight);
 
     std::fs::remove_dir_all(root).ok();
 }
