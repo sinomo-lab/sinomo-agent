@@ -1352,7 +1352,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 } else {
                     let _ = self.request_stage_blob_from_alternate(&updated_intent, &pending)?;
                 }
-            } else if foreground_replica_repair && local_desired_copy_missing {
+            } else if local_desired_copy_missing {
                 let _ = self.request_stage_blob_from_alternate(&updated_intent, &pending)?;
             }
         }

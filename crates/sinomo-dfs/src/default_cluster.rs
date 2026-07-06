@@ -274,14 +274,6 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
         ClusterConnectivityGraph::try_read_for_local(&self.cluster_paths, state).ok()
     }
 
-    fn metadata_service_node_ids(
-        &self,
-        state: &ClusterBootstrapState,
-        service_node_ids: Vec<NodeId>,
-    ) -> Vec<NodeId> {
-        active_metadata_service_node_ids(&self.cluster_paths, state, service_node_ids)
-    }
-
     fn current_metadata_shard(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -403,14 +395,6 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
         state: &ClusterBootstrapState,
     ) -> Option<ClusterConnectivityGraph> {
         ClusterConnectivityGraph::try_read_for_local(&self.cluster_paths, state).ok()
-    }
-
-    fn metadata_service_node_ids(
-        &self,
-        state: &ClusterBootstrapState,
-        service_node_ids: Vec<NodeId>,
-    ) -> Vec<NodeId> {
-        active_metadata_service_node_ids(&self.cluster_paths, state, service_node_ids)
     }
 
     fn current_metadata_shard_async<'a>(
@@ -623,36 +607,6 @@ fn metadata_shard_primary_route_unhealthy(
         return false;
     };
     cluster_healthy_route_next_hop(&graph, local_node_id, primary_node_id).is_none()
-}
-
-fn active_metadata_service_node_ids(
-    cluster_paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    mut service_node_ids: Vec<NodeId>,
-) -> Vec<NodeId> {
-    if service_node_ids.len() <= 1 {
-        return service_node_ids;
-    }
-    let Ok(graph) = ClusterConnectivityGraph::try_read_for_local(cluster_paths, state) else {
-        return service_node_ids;
-    };
-    let mut active = service_node_ids
-        .iter()
-        .filter(|node_id| {
-            **node_id == state.local_node_id
-                || cluster_healthy_route_next_hop(&graph, &state.local_node_id, node_id).is_some()
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    active.sort();
-    active.dedup();
-    if active.is_empty() {
-        service_node_ids.sort();
-        service_node_ids.dedup();
-        service_node_ids
-    } else {
-        active
-    }
 }
 
 pub fn ensure_default_distributed_dfs_with_host(

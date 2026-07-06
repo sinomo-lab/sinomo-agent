@@ -294,7 +294,7 @@ impl LocalShardedMetadataBackend {
         shard_id: &DfsMetadataShardId,
     ) -> Result<bool> {
         if write_intent_status_is_active(&intent.status) {
-            return Ok(true);
+            return self.active_intent_is_listable_from_shard(intent, shard_id);
         }
         if let Some(object) = backend.get_object(&intent.object_id)? {
             return self.object_is_listable_from_shard(&object, shard_id);
@@ -312,6 +312,31 @@ impl LocalShardedMetadataBackend {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    fn active_intent_is_listable_from_shard(
+        &self,
+        intent: &DfsWriteIntentRecord,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<bool> {
+        let Some(index) = self.read_object_shard_index(&intent.object_id)? else {
+            return Ok(true);
+        };
+        if !self.shards.contains_key(&index.shard_id) || index.shard_id == *shard_id {
+            return Ok(true);
+        }
+        let Some(current_object) = self.shard_backend(&index.shard_id)?.get_object(&intent.object_id)?
+        else {
+            return Ok(true);
+        };
+        if current_object.kind == DfsObjectKind::Tombstone {
+            return Ok(true);
+        }
+        Ok(intent
+            .base_version
+            .as_ref()
+            .is_some_and(|base_version| *base_version == current_object.version)
+            || intent.target_version == current_object.version)
     }
 
     fn require_shard_id_for_object(&self, object_id: &DfsObjectId) -> Result<DfsMetadataShardId> {
