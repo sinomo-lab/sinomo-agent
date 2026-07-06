@@ -1095,7 +1095,7 @@ fn open_sifs_service(
         .as_ref()
         .map(|state| {
             network::ClusterEndpointSelector::new(&cluster_paths, state)
-                .select(network::ClusterEndpointSelectionPurpose::DfsData)
+                .select(network::ClusterEndpointSelectionPurpose::MainDaemonDataPlane)
         })
         .unwrap_or_default();
     let content =
