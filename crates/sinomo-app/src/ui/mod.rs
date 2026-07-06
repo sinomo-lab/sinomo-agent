@@ -1,5 +1,7 @@
 //! All widgets and per-tab views.
 
+mod chat_render;
+
 pub mod chat;
 pub mod cluster;
 pub mod evolution;

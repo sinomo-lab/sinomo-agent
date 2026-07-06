@@ -70,6 +70,7 @@ use crate::backend::chat_engine::{
 use crate::backend::sessions::{self, StoredMessage};
 use crate::state::{Shared, Tab};
 use crate::theme::Palette;
+use crate::ui::chat_render::{self, ChatCodeBlock, ChatRenderBlock};
 use crate::ui::settings::SettingsSection;
 use crate::ui::widgets;
 
@@ -103,6 +104,9 @@ const COMPOSER_INPUT_MAX_H: f32 = 400.0;
 const COMPOSER_INPUT_PAD_Y: f32 = 18.0;
 const SESSION_LIST_UI_TIMEOUT: Duration = Duration::from_secs(8);
 const TRANSCRIPT_LOAD_UI_TIMEOUT: Duration = Duration::from_secs(8);
+const TOOL_CHAIN_COLLAPSE_AFTER: usize = 1;
+const TOOL_DETAIL_COLLAPSE_CHARS: usize = 420;
+const TOOL_DETAIL_PREVIEW_CHARS: usize = 220;
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as the other tabs.)
@@ -581,8 +585,21 @@ pub struct ChatToolActivity {
     pub call_index: Option<usize>,
     pub call_id: Option<String>,
     pub tool: String,
+    pub input: String,
     pub input_preview: String,
     pub status: String,
+    pub process_command: Option<String>,
+    pub process_status: Option<String>,
+    pub exit_code: Option<i32>,
+    pub elapsed_ms: Option<u64>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ToolDetailSection {
+    Input,
+    Output,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -709,6 +726,8 @@ pub struct ChatState {
     pub usage: Option<ChatUsageSnapshot>,
     pub activity: Vec<ChatActivityEntry>,
     pub tool_calls: Vec<ChatToolActivity>,
+    tool_chain_expanded: bool,
+    expanded_tool_details: BTreeSet<String>,
     pub control: ChatControlOverview,
     pub media_call: ChatMediaCallState,
     media_call_runtime: Option<ChatNativeMediaRuntime>,
@@ -834,6 +853,8 @@ impl ChatState {
             usage: None,
             activity: Vec::new(),
             tool_calls: Vec::new(),
+            tool_chain_expanded: false,
+            expanded_tool_details: BTreeSet::new(),
             control: ChatControlOverview::default(),
             media_call: ChatMediaCallState::default(),
             media_call_runtime: None,
@@ -1444,7 +1465,16 @@ impl ChatState {
     }
 
     fn upsert_tool_activity_from_snapshot(&mut self, call: ChatToolCallSnapshot, status: &str) {
-        let input_preview = call.input_preview.unwrap_or_default();
+        let input = call
+            .input
+            .clone()
+            .or_else(|| call.input_preview.clone())
+            .unwrap_or_default();
+        let input_preview = call
+            .input_preview
+            .clone()
+            .filter(|preview| !preview.trim().is_empty())
+            .unwrap_or_else(|| compact_line(&input, TOOL_DETAIL_PREVIEW_CHARS));
         if let Some(existing) = self.tool_calls.iter_mut().find(|existing| {
             tool_activity_matches(
                 existing,
@@ -1458,6 +1488,9 @@ impl ChatState {
             if !input_preview.trim().is_empty() {
                 existing.input_preview = compact_line(&input_preview, 120);
             }
+            if !input.trim().is_empty() {
+                existing.input = input;
+            }
             existing.status = status.to_string();
             return;
         }
@@ -1467,12 +1500,20 @@ impl ChatState {
             call_index: call.call_index,
             call_id: call.call_id,
             tool: call.tool,
+            input,
             input_preview: compact_line(&input_preview, 120),
             status: status.to_string(),
+            process_command: None,
+            process_status: None,
+            exit_code: None,
+            elapsed_ms: None,
+            stdout: String::new(),
+            stderr: String::new(),
         });
         let excess = self.tool_calls.len().saturating_sub(8);
         if excess > 0 {
             self.tool_calls.drain(0..excess);
+            self.prune_tool_detail_expanders();
         }
     }
 
@@ -1498,10 +1539,8 @@ impl ChatState {
             existing.tool = tool;
         }
         if !arguments_delta.trim().is_empty() {
-            existing.input_preview = compact_line(
-                &format!("{}{}", existing.input_preview, arguments_delta),
-                120,
-            );
+            existing.input.push_str(arguments_delta);
+            existing.input_preview = compact_line(&existing.input, 120);
         }
         existing.status = "streaming".to_string();
     }
@@ -1524,7 +1563,73 @@ impl ChatState {
             detail.push_str(" · stdout ");
             detail.push_str(process.stdout_tail.trim());
         }
+        self.attach_process_to_tool(&process);
         self.push_activity(process.command, detail, tone);
+    }
+
+    fn attach_process_to_tool(&mut self, process: &ChatProcessSnapshot) {
+        let index = self
+            .tool_calls
+            .iter()
+            .rposition(|call| tool_process_matches(call, process))
+            .or_else(|| self.tool_calls.len().checked_sub(1));
+        let Some(index) = index else {
+            return;
+        };
+        let call = &mut self.tool_calls[index];
+        call.process_command = Some(process.command.clone());
+        call.process_status = Some(process.status.clone());
+        call.exit_code = process.exit_code;
+        call.elapsed_ms = Some(process.elapsed_ms);
+        call.stdout = if process.stdout.is_empty() {
+            process.stdout_tail.clone()
+        } else {
+            process.stdout.clone()
+        };
+        call.stderr = if process.stderr.is_empty() {
+            process.stderr_tail.clone()
+        } else {
+            process.stderr.clone()
+        };
+    }
+
+    fn tool_chain_collapsible(&self) -> bool {
+        self.tool_calls.len() > TOOL_CHAIN_COLLAPSE_AFTER
+    }
+
+    fn tool_chain_expanded(&self) -> bool {
+        !self.tool_chain_collapsible() || self.tool_chain_expanded
+    }
+
+    fn toggle_tool_chain_expanded(&mut self) {
+        if self.tool_chain_collapsible() {
+            self.tool_chain_expanded = !self.tool_chain_expanded;
+        }
+    }
+
+    fn tool_detail_expanded(&self, key: &str) -> bool {
+        self.expanded_tool_details.contains(key)
+    }
+
+    fn toggle_tool_detail(&mut self, key: String) {
+        if !self.expanded_tool_details.remove(&key) {
+            self.expanded_tool_details.insert(key);
+        }
+    }
+
+    fn prune_tool_detail_expanders(&mut self) {
+        let live: BTreeSet<String> = self
+            .tool_calls
+            .iter()
+            .flat_map(|call| {
+                [
+                    tool_detail_key(call, ToolDetailSection::Input),
+                    tool_detail_key(call, ToolDetailSection::Output),
+                ]
+            })
+            .collect();
+        self.expanded_tool_details
+            .retain(|key| live.contains(key.as_str()));
     }
 
     fn runtime_health(&self) -> RuntimeHealth {
@@ -2015,6 +2120,8 @@ impl ChatState {
         self.usage = None;
         self.activity = preserved_activity;
         self.tool_calls.clear();
+        self.tool_chain_expanded = false;
+        self.expanded_tool_details.clear();
         self.control = ChatControlOverview::default();
         self.media_call = ChatMediaCallState::default();
         self.media_call_runtime = None;
@@ -2518,6 +2625,8 @@ impl ChatState {
         self.usage = None;
         self.activity.clear();
         self.tool_calls.clear();
+        self.tool_chain_expanded = false;
+        self.expanded_tool_details.clear();
         self.control = ChatControlOverview::default();
         self.media_call = ChatMediaCallState::default();
         self.media_call_runtime = None;
@@ -3178,6 +3287,8 @@ impl ChatState {
                 self.usage = None;
                 self.activity.clear();
                 self.tool_calls.clear();
+                self.tool_chain_expanded = false;
+                self.expanded_tool_details.clear();
                 self.control = ChatControlOverview::default();
                 self.scroll = 0.0;
             }
@@ -3319,6 +3430,8 @@ impl ChatState {
         self.usage = None;
         self.activity.clear();
         self.tool_calls.clear();
+        self.tool_chain_expanded = false;
+        self.expanded_tool_details.clear();
         self.control.active_turn = true;
         self.input.clear();
         self.cursor = 0;
@@ -5018,6 +5131,76 @@ fn compact_line(text: &str, max_chars: usize) -> String {
     format!("{head}...")
 }
 
+fn preview_multiline(text: &str, max_chars: usize, max_lines: usize) -> String {
+    let mut out = String::new();
+    let mut chars = 0;
+    for (index, line) in text.lines().enumerate() {
+        if index >= max_lines || chars >= max_chars {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let remaining = max_chars.saturating_sub(chars);
+        let line_chars = line.chars().count();
+        if line_chars > remaining {
+            out.extend(line.chars().take(remaining.saturating_sub(3)));
+            out.push_str("...");
+            break;
+        }
+        out.push_str(line);
+        chars += line_chars;
+    }
+    if out.is_empty() {
+        compact_line(text, max_chars)
+    } else if text.lines().count() > max_lines || text.chars().count() > max_chars {
+        format!("{out}\n...")
+    } else {
+        out
+    }
+}
+
+fn tool_call_summary(call: &ChatToolActivity) -> String {
+    let mut parts = vec![format!("{} · step {}", call.status, call.step_index)];
+    if let Some(call_index) = call.call_index {
+        parts.push(format!("call {}", call_index + 1));
+    }
+    if let Some(command) = &call.process_command {
+        parts.push(compact_line(command, 46));
+    } else if !call.input_preview.trim().is_empty() {
+        parts.push(compact_line(&call.input_preview, 46));
+    }
+    if let Some(code) = call.exit_code {
+        parts.push(format!("exit {code}"));
+    }
+    parts.join(" · ")
+}
+
+fn tool_display_name(tool: &str) -> String {
+    tool.rsplit('.').next().unwrap_or(tool).replace('_', " ")
+}
+
+fn color_from_rgb(rgb: [u8; 3]) -> Color {
+    Color::rgba(
+        rgb[0] as f32 / 255.0,
+        rgb[1] as f32 / 255.0,
+        rgb[2] as f32 / 255.0,
+        1.0,
+    )
+}
+
+fn diff_line_color(line: &str, pal: &Palette) -> Color {
+    if line.starts_with('+') && !line.starts_with("+++") {
+        pal.good
+    } else if line.starts_with('-') && !line.starts_with("---") {
+        pal.bad
+    } else if line.starts_with("@@") {
+        pal.accent
+    } else {
+        pal.text
+    }
+}
+
 fn tone_color(pal: &Palette, tone: ActivityTone) -> sui::Color {
     match tone {
         ActivityTone::Neutral => pal.text_faint,
@@ -5066,6 +5249,55 @@ fn tool_activity_matches(
         return existing.tool == tool;
     }
     false
+}
+
+fn tool_process_matches(call: &ChatToolActivity, process: &ChatProcessSnapshot) -> bool {
+    let command = process.command.trim();
+    if command.is_empty() {
+        return false;
+    }
+    call.input.contains(command)
+        || call.input_preview.contains(command)
+        || call
+            .process_command
+            .as_deref()
+            .is_some_and(|existing| existing == command)
+}
+
+fn tool_call_key(call: &ChatToolActivity) -> String {
+    if let Some(call_id) = &call.call_id {
+        return format!("id:{call_id}");
+    }
+    if let Some(call_index) = call.call_index {
+        return format!("step:{}:call:{call_index}", call.step_index);
+    }
+    format!("step:{}:tool:{}", call.step_index, call.tool)
+}
+
+fn tool_detail_key(call: &ChatToolActivity, section: ToolDetailSection) -> String {
+    let suffix = match section {
+        ToolDetailSection::Input => "input",
+        ToolDetailSection::Output => "output",
+    };
+    format!("{}:{suffix}", tool_call_key(call))
+}
+
+fn runtime_action_label(action: &RuntimeTranscriptAction) -> &'static str {
+    match action {
+        RuntimeTranscriptAction::ToggleToolChain => "Toggle tool activity",
+        RuntimeTranscriptAction::ToggleToolDetail(_) => "Toggle tool detail",
+    }
+}
+
+fn tool_output_text(call: &ChatToolActivity) -> String {
+    let stdout = call.stdout.trim();
+    let stderr = call.stderr.trim();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.to_string(),
+        (true, false) => stderr.to_string(),
+        (false, false) => format!("stdout:\n{stdout}\n\nstderr:\n{stderr}"),
+    }
 }
 
 fn text_mentions_runtime_problem(text: &str) -> bool {
@@ -8858,6 +9090,76 @@ fn draw_activity_event_card(
 // math is the same the hand-painted UI used.
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscriptTextStyleKind {
+    Body,
+    Heading(u8),
+    Muted,
+}
+
+#[derive(Clone, Debug)]
+enum TranscriptLaidBlock {
+    Text {
+        kind: TranscriptTextStyleKind,
+        lines: Vec<String>,
+        height: f32,
+    },
+    Code {
+        code: ChatCodeBlock,
+        height: f32,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct TranscriptLaidMessage {
+    is_user: bool,
+    kind: ChatMessageKind,
+    blocks: Vec<TranscriptLaidBlock>,
+    bubble_w: f32,
+    bubble_h: f32,
+    action: Option<RecoveryCardAction>,
+}
+
+#[derive(Clone, Debug)]
+enum TranscriptLaidTool {
+    ChainCollapsed {
+        call_count: usize,
+        latest: String,
+        bubble_w: f32,
+        bubble_h: f32,
+    },
+    ChainHeader {
+        call_count: usize,
+        bubble_w: f32,
+        bubble_h: f32,
+    },
+    Call {
+        call: ChatToolActivity,
+        input_block: Option<TranscriptLaidToolDetail>,
+        output_block: Option<TranscriptLaidToolDetail>,
+        bubble_w: f32,
+        bubble_h: f32,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct TranscriptLaidToolDetail {
+    section: ToolDetailSection,
+    title: String,
+    key: String,
+    expanded: bool,
+    collapsible: bool,
+    code: Option<ChatCodeBlock>,
+    lines: Vec<String>,
+    height: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RuntimeTranscriptAction {
+    ToggleToolChain,
+    ToggleToolDetail(String),
+}
+
 struct TranscriptView {
     shared: Shared,
     content_height: Cell<f32>,
@@ -8867,7 +9169,10 @@ struct TranscriptView {
     pressed_recovery_action: Cell<Option<RecoveryCardAction>>,
     hovered_quick_action: Cell<Option<ChatQuickAction>>,
     pressed_quick_action: Cell<Option<ChatQuickAction>>,
+    hovered_runtime_action: RefCell<Option<RuntimeTranscriptAction>>,
+    pressed_runtime_action: RefCell<Option<RuntimeTranscriptAction>>,
     transcript_recovery_actions: RefCell<Vec<(RecoveryCardAction, Rect)>>,
+    runtime_actions: RefCell<Vec<(RuntimeTranscriptAction, Rect)>>,
 }
 
 impl TranscriptView {
@@ -8881,7 +9186,10 @@ impl TranscriptView {
             pressed_recovery_action: Cell::new(None),
             hovered_quick_action: Cell::new(None),
             pressed_quick_action: Cell::new(None),
+            hovered_runtime_action: RefCell::new(None),
+            pressed_runtime_action: RefCell::new(None),
             transcript_recovery_actions: RefCell::new(Vec::new()),
+            runtime_actions: RefCell::new(Vec::new()),
         }
     }
 
@@ -9141,6 +9449,13 @@ impl TranscriptView {
             .find_map(|(action, rect)| rect.contains(position).then_some(*action))
     }
 
+    fn runtime_action_at(&self, position: Point) -> Option<RuntimeTranscriptAction> {
+        self.runtime_actions
+            .borrow()
+            .iter()
+            .find_map(|(action, rect)| rect.contains(position).then(|| action.clone()))
+    }
+
     fn quick_action_at(&self, bounds: Rect, position: Point) -> Option<ChatQuickAction> {
         {
             let chat = self.shared.chat();
@@ -9177,6 +9492,17 @@ impl TranscriptView {
         }
     }
 
+    fn activate_runtime_action(&self, action: RuntimeTranscriptAction) {
+        match action {
+            RuntimeTranscriptAction::ToggleToolChain => {
+                self.shared.chat_mut().toggle_tool_chain_expanded();
+            }
+            RuntimeTranscriptAction::ToggleToolDetail(key) => {
+                self.shared.chat_mut().toggle_tool_detail(key);
+            }
+        }
+    }
+
     fn recovery_action_widget_id(parent: sui::WidgetId, slot: usize) -> sui::WidgetId {
         sui::WidgetId::new(
             parent
@@ -9195,6 +9521,15 @@ impl TranscriptView {
         )
     }
 
+    fn runtime_action_widget_id(parent: sui::WidgetId, slot: usize) -> sui::WidgetId {
+        sui::WidgetId::new(
+            parent
+                .get()
+                .wrapping_mul(47)
+                .wrapping_add(9_801 + slot as u64),
+        )
+    }
+
     fn empty_text_widget_id(parent: sui::WidgetId, slot: usize) -> sui::WidgetId {
         sui::WidgetId::new(
             parent
@@ -9202,6 +9537,748 @@ impl TranscriptView {
                 .wrapping_mul(43)
                 .wrapping_add(9_501 + slot as u64),
         )
+    }
+
+    fn transcript_text_style(
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+        kind: TranscriptTextStyleKind,
+        color: Color,
+    ) -> sui::TextStyle {
+        match kind {
+            TranscriptTextStyleKind::Body => pal.text_style(theme, 14.0, FontWeight::NORMAL, color),
+            TranscriptTextStyleKind::Heading(level) => {
+                let (size, weight) = match level {
+                    1 => (17.0, FontWeight::BOLD),
+                    2 => (15.5, FontWeight::BOLD),
+                    _ => (14.5, FontWeight::SEMIBOLD),
+                };
+                pal.text_style(theme, size, weight, color)
+            }
+            TranscriptTextStyleKind::Muted => {
+                pal.text_style(theme, 12.0, FontWeight::NORMAL, color)
+            }
+        }
+    }
+
+    fn measure_text_width(ctx: &mut PaintCtx, text: &str, style: sui::TextStyle) -> f32 {
+        ctx.measure_text(text, style)
+            .map(|measurement| measurement.width)
+            .unwrap_or(0.0)
+    }
+
+    fn message_render_blocks(message: &ChatMessage) -> Vec<ChatRenderBlock> {
+        if message.kind == ChatMessageKind::Error {
+            return vec![ChatRenderBlock::Paragraph(transcript_message_display_text(
+                message,
+            ))];
+        }
+
+        if message.source == ChatMessageSource::Model {
+            let text = visible_model_message_text(&message.text);
+            if text.trim().is_empty() {
+                return vec![ChatRenderBlock::Paragraph("…".to_string())];
+            }
+            return chat_render::markdown_blocks(&text);
+        }
+
+        let text = if message.text.is_empty() {
+            "…".to_string()
+        } else {
+            message.text.clone()
+        };
+        vec![ChatRenderBlock::Paragraph(text)]
+    }
+
+    fn layout_message(
+        ctx: &mut PaintCtx,
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+        message: &ChatMessage,
+        inner_w: f32,
+    ) -> TranscriptLaidMessage {
+        let is_user = message.role == ChatRole::User;
+        let text_color = if is_user { pal.on_accent } else { pal.text };
+        let mut blocks = Vec::new();
+        let mut widest = 0.0_f32;
+        let mut height = 0.0_f32;
+
+        for block in Self::message_render_blocks(message) {
+            match block {
+                ChatRenderBlock::Paragraph(text) => {
+                    let kind = TranscriptTextStyleKind::Body;
+                    let style = Self::transcript_text_style(pal, theme, kind, text_color);
+                    let line_h = style.line_height;
+                    let measure_style = style.clone();
+                    let lines = widgets::wrap_lines(&text, inner_w, |s| {
+                        ctx.measure_text(s, measure_style.clone())
+                            .map(|m| m.width)
+                            .unwrap_or(0.0)
+                    });
+                    let width = lines
+                        .iter()
+                        .map(|line| Self::measure_text_width(ctx, line, style.clone()))
+                        .fold(0.0_f32, f32::max);
+                    let block_h = lines.len().max(1) as f32 * line_h + 5.0;
+                    widest = widest.max(width);
+                    height += block_h;
+                    blocks.push(TranscriptLaidBlock::Text {
+                        kind,
+                        lines,
+                        height: block_h,
+                    });
+                }
+                ChatRenderBlock::Heading { level, text } => {
+                    let kind = TranscriptTextStyleKind::Heading(level);
+                    let style = Self::transcript_text_style(pal, theme, kind, text_color);
+                    let line_h = style.line_height;
+                    let measure_style = style.clone();
+                    let lines = widgets::wrap_lines(&text, inner_w, |s| {
+                        ctx.measure_text(s, measure_style.clone())
+                            .map(|m| m.width)
+                            .unwrap_or(0.0)
+                    });
+                    let width = lines
+                        .iter()
+                        .map(|line| Self::measure_text_width(ctx, line, style.clone()))
+                        .fold(0.0_f32, f32::max);
+                    let block_h = lines.len().max(1) as f32 * line_h + 7.0;
+                    widest = widest.max(width);
+                    height += block_h;
+                    blocks.push(TranscriptLaidBlock::Text {
+                        kind,
+                        lines,
+                        height: block_h,
+                    });
+                }
+                ChatRenderBlock::ListItem { marker, text } => {
+                    let kind = TranscriptTextStyleKind::Body;
+                    let text = format!("{marker} {text}");
+                    let style = Self::transcript_text_style(pal, theme, kind, text_color);
+                    let line_h = style.line_height;
+                    let measure_style = style.clone();
+                    let lines = widgets::wrap_lines(&text, inner_w, |s| {
+                        ctx.measure_text(s, measure_style.clone())
+                            .map(|m| m.width)
+                            .unwrap_or(0.0)
+                    });
+                    let width = lines
+                        .iter()
+                        .map(|line| Self::measure_text_width(ctx, line, style.clone()))
+                        .fold(0.0_f32, f32::max);
+                    let block_h = lines.len().max(1) as f32 * line_h + 3.0;
+                    widest = widest.max(width);
+                    height += block_h;
+                    blocks.push(TranscriptLaidBlock::Text {
+                        kind,
+                        lines,
+                        height: block_h,
+                    });
+                }
+                ChatRenderBlock::Code(code) => {
+                    let code_h = Self::code_block_height(&code);
+                    widest = widest.max(inner_w);
+                    height += code_h + 6.0;
+                    blocks.push(TranscriptLaidBlock::Code {
+                        code,
+                        height: code_h,
+                    });
+                }
+            }
+        }
+
+        let action = transcript_message_recovery_action(message);
+        let action_w = action
+            .map(Self::recovery_card_action_width)
+            .unwrap_or_default();
+        let action_h = if action.is_some() { 38.0 } else { 0.0 };
+        let bubble_w = widest.min(inner_w).max(action_w).max(64.0) + 24.0;
+        let bubble_h = height.max(18.0) + 20.0 + action_h;
+        TranscriptLaidMessage {
+            is_user,
+            kind: message.kind,
+            blocks,
+            bubble_w,
+            bubble_h,
+            action,
+        }
+    }
+
+    fn code_block_height(code: &ChatCodeBlock) -> f32 {
+        let line_count = code.text.lines().count().max(1) as f32;
+        30.0 + line_count * 17.0 + 12.0
+    }
+
+    fn tool_trace_layout(
+        ctx: &mut PaintCtx,
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+        chat: &ChatState,
+        inner_w: f32,
+        max_bubble: f32,
+    ) -> Vec<TranscriptLaidTool> {
+        if chat.tool_calls.is_empty() {
+            return Vec::new();
+        }
+
+        let bubble_w = max_bubble.max(260.0);
+        if !chat.tool_chain_expanded() {
+            let latest = chat
+                .tool_calls
+                .last()
+                .map(tool_call_summary)
+                .unwrap_or_default();
+            return vec![TranscriptLaidTool::ChainCollapsed {
+                call_count: chat.tool_calls.len(),
+                latest,
+                bubble_w,
+                bubble_h: 64.0,
+            }];
+        }
+
+        let mut items = vec![TranscriptLaidTool::ChainHeader {
+            call_count: chat.tool_calls.len(),
+            bubble_w,
+            bubble_h: 42.0,
+        }];
+        for call in &chat.tool_calls {
+            items.push(Self::layout_tool_call(
+                ctx, pal, theme, chat, call, inner_w, bubble_w,
+            ));
+        }
+        items
+    }
+
+    fn layout_tool_call(
+        ctx: &mut PaintCtx,
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+        chat: &ChatState,
+        call: &ChatToolActivity,
+        inner_w: f32,
+        bubble_w: f32,
+    ) -> TranscriptLaidTool {
+        let input_block = Self::layout_tool_input(ctx, pal, theme, chat, call, inner_w);
+        let output_block = Self::layout_tool_output(ctx, pal, theme, chat, call, inner_w);
+        let detail_h = input_block
+            .as_ref()
+            .map(|block| block.height)
+            .unwrap_or(0.0)
+            + output_block
+                .as_ref()
+                .map(|block| block.height)
+                .unwrap_or(0.0);
+        TranscriptLaidTool::Call {
+            call: call.clone(),
+            input_block,
+            output_block,
+            bubble_w,
+            bubble_h: 50.0 + detail_h,
+        }
+    }
+
+    fn layout_tool_input(
+        ctx: &mut PaintCtx,
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+        chat: &ChatState,
+        call: &ChatToolActivity,
+        inner_w: f32,
+    ) -> Option<TranscriptLaidToolDetail> {
+        if call.input.trim().is_empty() {
+            return None;
+        }
+        let key = tool_detail_key(call, ToolDetailSection::Input);
+        let expanded = chat.tool_detail_expanded(&key);
+        let edit = chat_render::file_edit_render(&call.tool, &call.input);
+        let (title, code, raw) = if let Some(edit) = edit {
+            (edit.title, Some(edit.code.clone()), edit.code.text)
+        } else {
+            (
+                "Input".to_string(),
+                Some(ChatCodeBlock {
+                    language: Some("json".to_string()),
+                    text: call.input.clone(),
+                    is_diff: false,
+                }),
+                call.input.clone(),
+            )
+        };
+        Some(Self::layout_tool_detail(
+            ctx,
+            pal,
+            theme,
+            ToolDetailSection::Input,
+            title,
+            key,
+            raw,
+            code,
+            expanded,
+            inner_w,
+        ))
+    }
+
+    fn layout_tool_output(
+        ctx: &mut PaintCtx,
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+        chat: &ChatState,
+        call: &ChatToolActivity,
+        inner_w: f32,
+    ) -> Option<TranscriptLaidToolDetail> {
+        let output = tool_output_text(call);
+        if output.trim().is_empty() {
+            return None;
+        }
+        let key = tool_detail_key(call, ToolDetailSection::Output);
+        let expanded = chat.tool_detail_expanded(&key);
+        let is_diff = output
+            .lines()
+            .take(24)
+            .filter(|line| line.starts_with('+') || line.starts_with('-') || line.starts_with("@@"))
+            .count()
+            >= 2;
+        let code = Some(ChatCodeBlock {
+            language: if is_diff {
+                Some("diff".to_string())
+            } else {
+                None
+            },
+            text: output.clone(),
+            is_diff,
+        });
+        Some(Self::layout_tool_detail(
+            ctx,
+            pal,
+            theme,
+            ToolDetailSection::Output,
+            "Output".to_string(),
+            key,
+            output,
+            code,
+            expanded,
+            inner_w,
+        ))
+    }
+
+    fn layout_tool_detail(
+        ctx: &mut PaintCtx,
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+        section: ToolDetailSection,
+        title: String,
+        key: String,
+        raw: String,
+        code: Option<ChatCodeBlock>,
+        expanded: bool,
+        inner_w: f32,
+    ) -> TranscriptLaidToolDetail {
+        let raw_chars = raw.chars().count();
+        let raw_lines = raw.lines().count();
+        let collapsible = raw_chars > TOOL_DETAIL_COLLAPSE_CHARS || raw_lines > 12;
+        let visible_text = if collapsible && !expanded {
+            preview_multiline(&raw, TOOL_DETAIL_PREVIEW_CHARS, 8)
+        } else {
+            raw.clone()
+        };
+        let visible_code = code.as_ref().map(|code| ChatCodeBlock {
+            text: visible_text.clone(),
+            ..code.clone()
+        });
+        let content_h = if let Some(code) = &visible_code {
+            Self::code_block_height(code)
+        } else {
+            let style =
+                Self::transcript_text_style(pal, theme, TranscriptTextStyleKind::Muted, pal.text);
+            let measure_style = style.clone();
+            let lines = widgets::wrap_lines(&visible_text, inner_w, |s| {
+                ctx.measure_text(s, measure_style.clone())
+                    .map(|m| m.width)
+                    .unwrap_or(0.0)
+            });
+            lines.len().max(1) as f32 * style.line_height + 8.0
+        };
+        let button_h = if collapsible { 30.0 } else { 0.0 };
+        TranscriptLaidToolDetail {
+            section,
+            title,
+            key,
+            expanded,
+            collapsible,
+            code: visible_code,
+            lines: if code.is_none() {
+                widgets::wrap_lines(&visible_text, inner_w, |s| {
+                    ctx.measure_text(
+                        s,
+                        Self::transcript_text_style(
+                            pal,
+                            theme,
+                            TranscriptTextStyleKind::Muted,
+                            pal.text,
+                        ),
+                    )
+                    .map(|m| m.width)
+                    .unwrap_or(0.0)
+                })
+            } else {
+                Vec::new()
+            },
+            height: 22.0 + content_h + button_h + 8.0,
+        }
+    }
+
+    fn paint_laid_message(
+        &self,
+        ctx: &mut PaintCtx,
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+        area: Rect,
+        item: &TranscriptLaidMessage,
+        y: f32,
+        action_rects: &mut Vec<(RecoveryCardAction, Rect)>,
+    ) {
+        let is_error = item.kind == ChatMessageKind::Error;
+        let (bx, bubble_color, text_color, border) = if item.is_user {
+            (
+                area.x() + area.width() - PAD - item.bubble_w,
+                pal.accent,
+                pal.on_accent,
+                None,
+            )
+        } else if is_error {
+            (area.x() + PAD, pal.panel, pal.text, Some(pal.bad))
+        } else {
+            (area.x() + PAD, pal.panel, pal.text, Some(pal.border))
+        };
+        let bubble = Rect::new(bx, y, item.bubble_w, item.bubble_h);
+        sui::paint_theme_shadow(ctx, bubble, [12.0; 4], &theme.shadows.box_shadow.xs);
+        match border {
+            Some(bc) => widgets::round_panel(ctx, bubble, bubble_color, bc, 12.0),
+            None => widgets::fill_round_rect(ctx, bubble, bubble_color, 12.0),
+        }
+
+        let dark = widgets::theme_is_dark(&self.shared);
+        let mut ty = y + 10.0;
+        for block in &item.blocks {
+            match block {
+                TranscriptLaidBlock::Text {
+                    kind,
+                    lines,
+                    height,
+                    ..
+                } => {
+                    let color = match kind {
+                        TranscriptTextStyleKind::Muted => pal.text_faint,
+                        _ => text_color,
+                    };
+                    let style = Self::transcript_text_style(pal, theme, *kind, color);
+                    for line in lines {
+                        ctx.draw_text(
+                            Rect::new(bx + 12.0, ty, item.bubble_w - 24.0, style.line_height + 2.0),
+                            line,
+                            style.clone(),
+                        );
+                        ty += style.line_height;
+                    }
+                    ty = (ty + 4.0).max(y + 10.0 + height);
+                }
+                TranscriptLaidBlock::Code { code, height, .. } => {
+                    let rect = Rect::new(bx + 8.0, ty, item.bubble_w - 16.0, *height);
+                    Self::paint_code_block(ctx, pal, theme, rect, code, dark);
+                    ty += *height + 6.0;
+                }
+            }
+        }
+
+        if let Some(action) = item.action {
+            let action_w = Self::recovery_card_action_width(action).min(item.bubble_w - 24.0);
+            let action_rect = Rect::new(bx + 12.0, y + item.bubble_h - 38.0, action_w, 28.0);
+            self.paint_recovery_action(ctx, theme, pal, action, action_rect, true);
+            action_rects.push((action, action_rect));
+        }
+    }
+
+    fn paint_code_block(
+        ctx: &mut PaintCtx,
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+        rect: Rect,
+        code: &ChatCodeBlock,
+        dark: bool,
+    ) {
+        widgets::round_panel(ctx, rect, pal.field, pal.border, 7.0);
+        let header_h = 24.0;
+        widgets::fill_round_rect(
+            ctx,
+            Rect::new(rect.x(), rect.y(), rect.width(), header_h),
+            pal.titlebar,
+            7.0,
+        );
+        let label = code
+            .language
+            .as_deref()
+            .unwrap_or(if code.is_diff { "diff" } else { "text" });
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(rect.x() + 10.0, rect.y() + 3.0, rect.width() - 20.0, 16.0),
+            label,
+            pal.text_style(theme, 10.5, FontWeight::SEMIBOLD, pal.text_faint),
+        );
+        let content = Rect::new(
+            rect.x() + 8.0,
+            rect.y() + header_h + 6.0,
+            rect.width() - 16.0,
+            (rect.height() - header_h - 10.0).max(0.0),
+        );
+        ctx.push_clip_rect(content);
+        let base_style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text);
+        let highlighted = chat_render::highlight_code(code.language.as_deref(), &code.text, dark);
+        let source_lines = code.text.lines().collect::<Vec<_>>();
+        let mut y = content.y();
+        for (index, spans) in highlighted.iter().enumerate() {
+            if y + 17.0 > content.max_y() {
+                break;
+            }
+            let source = source_lines.get(index).copied().unwrap_or_default();
+            if code.is_diff {
+                let fill = if source.starts_with('+') && !source.starts_with("+++") {
+                    Some(pal.good.with_alpha(0.12))
+                } else if source.starts_with('-') && !source.starts_with("---") {
+                    Some(pal.bad.with_alpha(0.12))
+                } else if source.starts_with("@@") {
+                    Some(pal.accent.with_alpha(0.10))
+                } else {
+                    None
+                };
+                if let Some(fill) = fill {
+                    ctx.fill_rect(Rect::new(content.x(), y, content.width(), 17.0), fill);
+                }
+            }
+            let mut x = content.x() + 2.0;
+            for span in spans {
+                if span.text.is_empty() {
+                    continue;
+                }
+                let mut style = base_style.clone();
+                style.color = span.rgb.map(color_from_rgb).unwrap_or(if code.is_diff {
+                    diff_line_color(source, pal)
+                } else {
+                    pal.text
+                });
+                let width = Self::measure_text_width(ctx, &span.text, style.clone());
+                if x > content.max_x() {
+                    break;
+                }
+                ctx.draw_text(
+                    Rect::new(x, y, (content.max_x() - x).max(0.0), 17.0),
+                    &span.text,
+                    style,
+                );
+                x += width;
+            }
+            y += 17.0;
+        }
+        ctx.pop_clip();
+    }
+
+    fn paint_tool_item(
+        &self,
+        ctx: &mut PaintCtx,
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+        area: Rect,
+        item: &TranscriptLaidTool,
+        y: f32,
+        runtime_actions: &mut Vec<(RuntimeTranscriptAction, Rect)>,
+    ) {
+        match item {
+            TranscriptLaidTool::ChainCollapsed {
+                call_count,
+                latest,
+                bubble_w,
+                bubble_h,
+            } => {
+                let bx = area.x() + PAD;
+                let bubble = Rect::new(bx, y, *bubble_w, *bubble_h);
+                widgets::round_panel(ctx, bubble, pal.panel, pal.border, 10.0);
+                draw_glyph(
+                    ctx,
+                    IconGlyph::File,
+                    Rect::new(bx + 12.0, y + 13.0, 16.0, 16.0),
+                    pal.accent,
+                );
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(bx + 36.0, y + 8.0, bubble.width() - 124.0, 18.0),
+                    &format!("Tool activity · {call_count} calls"),
+                    pal.text_style(theme, 12.5, FontWeight::SEMIBOLD, pal.text),
+                );
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(bx + 36.0, y + 29.0, bubble.width() - 124.0, 18.0),
+                    &compact_line(latest, 72),
+                    pal.text_style(theme, 11.0, FontWeight::NORMAL, pal.text_faint),
+                );
+                let button = Rect::new(bubble.max_x() - 76.0, y + 18.0, 60.0, 28.0);
+                Self::paint_expander_button(ctx, pal, theme, button, "Show", false);
+                runtime_actions.push((RuntimeTranscriptAction::ToggleToolChain, button));
+            }
+            TranscriptLaidTool::ChainHeader {
+                call_count,
+                bubble_w,
+                bubble_h,
+            } => {
+                let bx = area.x() + PAD;
+                let bubble = Rect::new(bx, y, *bubble_w, *bubble_h);
+                widgets::round_panel(ctx, bubble, pal.panel, pal.border, 10.0);
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(bx + 12.0, y + 8.0, bubble.width() - 94.0, 20.0),
+                    &format!("Tool activity · {call_count} calls"),
+                    pal.text_style(theme, 12.5, FontWeight::SEMIBOLD, pal.text),
+                );
+                let button = Rect::new(bubble.max_x() - 72.0, y + 7.0, 56.0, 28.0);
+                Self::paint_expander_button(ctx, pal, theme, button, "Hide", true);
+                runtime_actions.push((RuntimeTranscriptAction::ToggleToolChain, button));
+            }
+            TranscriptLaidTool::Call {
+                call,
+                input_block,
+                output_block,
+                bubble_w,
+                bubble_h,
+            } => {
+                let bx = area.x() + PAD;
+                let bubble = Rect::new(bx, y, *bubble_w, *bubble_h);
+                widgets::round_panel(ctx, bubble, pal.panel, pal.border, 10.0);
+                widgets::fill_round_rect(
+                    ctx,
+                    Rect::new(bx + 12.0, y + 15.0, 8.0, 8.0),
+                    tone_color(pal, tool_status_tone(&call.status)),
+                    4.0,
+                );
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(bx + 30.0, y + 7.0, bubble.width() - 42.0, 18.0),
+                    &compact_line(&tool_display_name(&call.tool), 64),
+                    pal.text_style(theme, 12.5, FontWeight::SEMIBOLD, pal.text),
+                );
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(bx + 30.0, y + 27.0, bubble.width() - 42.0, 18.0),
+                    &compact_line(&tool_call_summary(call), 90),
+                    pal.text_style(theme, 11.0, FontWeight::NORMAL, pal.text_faint),
+                );
+                let mut ty = y + 50.0;
+                let dark = widgets::theme_is_dark(&self.shared);
+                if let Some(input) = input_block {
+                    Self::paint_tool_detail(
+                        ctx,
+                        pal,
+                        theme,
+                        Rect::new(bx + 12.0, ty, bubble.width() - 24.0, input.height),
+                        input,
+                        dark,
+                        runtime_actions,
+                    );
+                    ty += input.height;
+                }
+                if let Some(output) = output_block {
+                    Self::paint_tool_detail(
+                        ctx,
+                        pal,
+                        theme,
+                        Rect::new(bx + 12.0, ty, bubble.width() - 24.0, output.height),
+                        output,
+                        dark,
+                        runtime_actions,
+                    );
+                }
+            }
+        }
+    }
+
+    fn paint_tool_detail(
+        ctx: &mut PaintCtx,
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+        rect: Rect,
+        detail: &TranscriptLaidToolDetail,
+        dark: bool,
+        runtime_actions: &mut Vec<(RuntimeTranscriptAction, Rect)>,
+    ) {
+        let section_label = match detail.section {
+            ToolDetailSection::Input => "INPUT",
+            ToolDetailSection::Output => "OUTPUT",
+        };
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(rect.x(), rect.y() + 2.0, rect.width(), 16.0),
+            &format!("{section_label} · {}", detail.title),
+            pal.text_style(theme, 10.5, FontWeight::SEMIBOLD, pal.text_faint),
+        );
+        let mut y = rect.y() + 22.0;
+        if let Some(code) = &detail.code {
+            let code_rect = Rect::new(rect.x(), y, rect.width(), Self::code_block_height(code));
+            Self::paint_code_block(ctx, pal, theme, code_rect, code, dark);
+        } else {
+            let style =
+                Self::transcript_text_style(pal, theme, TranscriptTextStyleKind::Muted, pal.text);
+            for line in &detail.lines {
+                ctx.draw_text(
+                    Rect::new(rect.x(), y, rect.width(), style.line_height + 2.0),
+                    line,
+                    style.clone(),
+                );
+                y += style.line_height;
+            }
+        }
+        if detail.collapsible {
+            let button = Rect::new(rect.x(), rect.max_y() - 30.0, 126.0, 24.0);
+            Self::paint_expander_button(
+                ctx,
+                pal,
+                theme,
+                button,
+                if detail.expanded {
+                    "Show less"
+                } else {
+                    "Show more"
+                },
+                detail.expanded,
+            );
+            runtime_actions.push((
+                RuntimeTranscriptAction::ToggleToolDetail(detail.key.clone()),
+                button,
+            ));
+        }
+    }
+
+    fn paint_expander_button(
+        ctx: &mut PaintCtx,
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+        rect: Rect,
+        label: &str,
+        expanded: bool,
+    ) {
+        widgets::fill_round_rect(ctx, rect, pal.field, 6.0);
+        draw_glyph(
+            ctx,
+            if expanded {
+                IconGlyph::ChevronUp
+            } else {
+                IconGlyph::ChevronDown
+            },
+            Rect::new(rect.x() + 7.0, rect.y() + 5.0, 14.0, 14.0),
+            pal.accent,
+        );
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(rect.x() + 25.0, rect.y() + 3.0, rect.width() - 30.0, 18.0),
+            label,
+            pal.text_style(theme, 10.5, FontWeight::SEMIBOLD, pal.accent),
+        );
     }
 
     fn request_recovery_action_refresh(ctx: &mut EventCtx) {
@@ -9219,17 +10296,25 @@ impl Widget for TranscriptView {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
         match event {
             Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
-                let quick_hovered = self.quick_action_at(ctx.bounds(), pointer.position);
-                let recovery_hovered = if quick_hovered.is_none() {
+                let runtime_hovered = self.runtime_action_at(pointer.position);
+                let quick_hovered = if runtime_hovered.is_none() {
+                    self.quick_action_at(ctx.bounds(), pointer.position)
+                } else {
+                    None
+                };
+                let recovery_hovered = if quick_hovered.is_none() && runtime_hovered.is_none() {
                     self.recovery_action_at(ctx.bounds(), pointer.position)
                 } else {
                     None
                 };
+                let runtime_changed = *self.hovered_runtime_action.borrow() != runtime_hovered;
                 if self.hovered_quick_action.get() != quick_hovered
                     || self.hovered_recovery_action.get() != recovery_hovered
+                    || runtime_changed
                 {
                     self.hovered_quick_action.set(quick_hovered);
                     self.hovered_recovery_action.set(recovery_hovered);
+                    *self.hovered_runtime_action.borrow_mut() = runtime_hovered;
                     ctx.request_paint();
                     ctx.request_semantics();
                 }
@@ -9238,7 +10323,12 @@ impl Widget for TranscriptView {
                 if pointer.kind == PointerEventKind::Down
                     && pointer.button == Some(PointerButton::Primary) =>
             {
-                if let Some(action) = self.quick_action_at(ctx.bounds(), pointer.position) {
+                if let Some(action) = self.runtime_action_at(pointer.position) {
+                    *self.pressed_runtime_action.borrow_mut() = Some(action);
+                    ctx.request_pointer_capture(pointer.pointer_id);
+                    ctx.request_paint();
+                    ctx.set_handled();
+                } else if let Some(action) = self.quick_action_at(ctx.bounds(), pointer.position) {
                     self.pressed_quick_action.set(Some(action));
                     ctx.request_pointer_capture(pointer.pointer_id);
                     ctx.request_paint();
@@ -9255,6 +10345,17 @@ impl Widget for TranscriptView {
                 if pointer.kind == PointerEventKind::Up
                     && pointer.button == Some(PointerButton::Primary) =>
             {
+                let runtime_pressed = self.pressed_runtime_action.borrow_mut().take();
+                if let Some(pressed) = runtime_pressed {
+                    let released = self.runtime_action_at(pointer.position);
+                    if released.as_ref() == Some(&pressed) {
+                        self.activate_runtime_action(pressed);
+                    }
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    Self::request_recovery_action_refresh(ctx);
+                    ctx.set_handled();
+                    return;
+                }
                 if let Some(pressed) = self.pressed_quick_action.take() {
                     let released = self.quick_action_at(ctx.bounds(), pointer.position);
                     if released == Some(pressed) {
@@ -9286,10 +10387,18 @@ impl Widget for TranscriptView {
                 let had_press = self.pressed_recovery_action.take().is_some();
                 let had_quick_hover = self.hovered_quick_action.take().is_some();
                 let had_quick_press = self.pressed_quick_action.take().is_some();
-                if had_press || had_quick_press {
+                let had_runtime_hover = self.hovered_runtime_action.borrow_mut().take().is_some();
+                let had_runtime_press = self.pressed_runtime_action.borrow_mut().take().is_some();
+                if had_press || had_quick_press || had_runtime_press {
                     ctx.release_pointer_capture(pointer.pointer_id);
                 }
-                if had_hover || had_press || had_quick_hover || had_quick_press {
+                if had_hover
+                    || had_press
+                    || had_quick_hover
+                    || had_quick_press
+                    || had_runtime_hover
+                    || had_runtime_press
+                {
                     ctx.request_paint();
                     ctx.request_semantics();
                     ctx.set_handled();
@@ -9330,6 +10439,7 @@ impl Widget for TranscriptView {
         self.bounds.set(area);
         self.viewport_height.set(area.height());
         self.transcript_recovery_actions.borrow_mut().clear();
+        self.runtime_actions.borrow_mut().clear();
 
         let chat = self.shared.chat();
         if chat.messages.is_empty() {
@@ -9341,49 +10451,21 @@ impl Widget for TranscriptView {
 
         let max_bubble = (area.width() * 0.74).clamp(200.0, 620.0);
         let inner_w = max_bubble - 24.0;
-        let body = pal.text_style(&theme, 14.0, FontWeight::NORMAL, pal.text);
-        let line_h = body.line_height;
-
-        // Measure pass: wrap each message and compute its bubble box (releases the immutable
-        // `measure` borrow of `ctx` before drawing).
-        struct Laid {
-            is_user: bool,
-            kind: ChatMessageKind,
-            lines: Vec<String>,
-            bubble_w: f32,
-            bubble_h: f32,
-            action: Option<RecoveryCardAction>,
-        }
-        let mut laid: Vec<Laid> = Vec::with_capacity(chat.messages.len());
+        let mut laid: Vec<TranscriptLaidMessage> = Vec::with_capacity(chat.messages.len());
         let mut total = PAD;
-        {
-            let measure = |s: &str| {
-                ctx.measure_text(s, body.clone())
-                    .map(|m| m.width)
-                    .unwrap_or(0.0)
+        for msg in &chat.messages {
+            let item = Self::layout_message(ctx, &pal, &theme, msg, inner_w);
+            total += item.bubble_h + 12.0;
+            laid.push(item);
+        }
+        let tool_layout = Self::tool_trace_layout(ctx, &pal, &theme, &chat, inner_w, max_bubble);
+        for item in &tool_layout {
+            let height = match item {
+                TranscriptLaidTool::ChainCollapsed { bubble_h, .. }
+                | TranscriptLaidTool::ChainHeader { bubble_h, .. }
+                | TranscriptLaidTool::Call { bubble_h, .. } => *bubble_h,
             };
-            for msg in &chat.messages {
-                let is_user = msg.role == ChatRole::User;
-                let text = transcript_message_display_text(msg);
-                let lines = widgets::wrap_lines(&text, inner_w, measure);
-                let widest = lines.iter().map(|l| measure(l)).fold(0.0_f32, f32::max);
-                let action = transcript_message_recovery_action(msg);
-                let action_w = action
-                    .map(Self::recovery_card_action_width)
-                    .unwrap_or_default();
-                let bubble_w = widest.min(inner_w).max(action_w) + 24.0;
-                let action_h = if action.is_some() { 38.0 } else { 0.0 };
-                let bubble_h = lines.len().max(1) as f32 * line_h + 20.0 + action_h;
-                total += bubble_h + 12.0;
-                laid.push(Laid {
-                    is_user,
-                    kind: msg.kind,
-                    lines,
-                    bubble_w,
-                    bubble_h,
-                    action,
-                });
-            }
+            total += height + 10.0;
         }
         total += PAD;
         self.content_height.set(total);
@@ -9397,57 +10479,27 @@ impl Widget for TranscriptView {
 
         // Draw pass: only mutable ctx ops here.
         let mut action_rects = Vec::new();
+        let mut runtime_action_rects = Vec::new();
         let mut y = area.y() + PAD - scroll;
         for item in &laid {
-            let is_error = item.kind == ChatMessageKind::Error;
-            let (bx, bubble_color, text_color, border) = if item.is_user {
-                (
-                    area.x() + area.width() - PAD - item.bubble_w,
-                    pal.accent,
-                    pal.on_accent,
-                    None,
-                )
-            } else if is_error {
-                (area.x() + PAD, pal.panel, pal.text, Some(pal.bad))
-            } else {
-                (area.x() + PAD, pal.panel, pal.text, Some(pal.border))
-            };
             if y + item.bubble_h >= area.y() && y <= area.y() + area.height() {
-                let bubble = Rect::new(bx, y, item.bubble_w, item.bubble_h);
-                // C4 elevation: a very subtle drop shadow lifts each message bubble off the
-                // transcript background. Drawn BEFORE the fill so it sits behind. We use the toolkit's
-                // smallest box-shadow token (~5% black, 2px blur) so the lift stays on the theme's own
-                // elevation scale — restrained, since the agent bubbles also carry a border.
-                sui::paint_theme_shadow(ctx, bubble, [12.0; 4], &theme.shadows.box_shadow.xs);
-                match border {
-                    Some(bc) => widgets::round_panel(ctx, bubble, bubble_color, bc, 12.0),
-                    None => widgets::fill_round_rect(ctx, bubble, bubble_color, 12.0),
-                }
-                let style = sui::TextStyle {
-                    color: text_color,
-                    ..body.clone()
-                };
-                let mut ty = y + 10.0;
-                for line in &item.lines {
-                    ctx.draw_text(
-                        Rect::new(bx + 12.0, ty, item.bubble_w - 24.0, line_h + 2.0),
-                        line,
-                        style.clone(),
-                    );
-                    ty += line_h;
-                }
-                if let Some(action) = item.action {
-                    let action_w =
-                        Self::recovery_card_action_width(action).min(item.bubble_w - 24.0);
-                    let action_rect =
-                        Rect::new(bx + 12.0, y + item.bubble_h - 38.0, action_w, 28.0);
-                    self.paint_recovery_action(ctx, &theme, &pal, action, action_rect, true);
-                    action_rects.push((action, action_rect));
-                }
+                self.paint_laid_message(ctx, &pal, &theme, area, item, y, &mut action_rects);
             }
             y += item.bubble_h + 12.0;
         }
+        for item in &tool_layout {
+            let height = match item {
+                TranscriptLaidTool::ChainCollapsed { bubble_h, .. }
+                | TranscriptLaidTool::ChainHeader { bubble_h, .. }
+                | TranscriptLaidTool::Call { bubble_h, .. } => *bubble_h,
+            };
+            if y + height >= area.y() && y <= area.y() + area.height() {
+                self.paint_tool_item(ctx, &pal, &theme, area, item, y, &mut runtime_action_rects);
+            }
+            y += height + 10.0;
+        }
         *self.transcript_recovery_actions.borrow_mut() = action_rects;
+        *self.runtime_actions.borrow_mut() = runtime_action_rects;
         ctx.pop_clip();
 
         // Streaming / typing notice, pinned to the bottom of the transcript.
@@ -9527,6 +10579,30 @@ impl Widget for TranscriptView {
                     ctx.push(node);
                 }
                 return;
+            }
+            for (slot, (action, rect)) in self.runtime_actions.borrow().iter().enumerate() {
+                let mut node = SemanticsNode::new(
+                    Self::runtime_action_widget_id(ctx.widget_id(), slot),
+                    SemanticsRole::Button,
+                    *rect,
+                );
+                node.parent = Some(ctx.widget_id());
+                node.name = Some(runtime_action_label(action).to_string());
+                node.description = Some(match action {
+                    RuntimeTranscriptAction::ToggleToolChain => {
+                        "Show or hide the chain of tool calls".to_string()
+                    }
+                    RuntimeTranscriptAction::ToggleToolDetail(_) => {
+                        "Show or hide long tool input or output".to_string()
+                    }
+                });
+                node.actions = vec![SemanticsAction::Activate];
+                node.state.hovered = self
+                    .hovered_runtime_action
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|hovered| hovered == action);
+                ctx.push(node);
             }
             for (slot, (action, rect)) in self
                 .transcript_recovery_actions
@@ -11307,6 +12383,16 @@ fn view_signature(shared: &Shared) -> u64 {
     context_overview_summary(&chat).hash(&mut h);
     chat.activity.len().hash(&mut h);
     chat.tool_calls.len().hash(&mut h);
+    chat.tool_chain_expanded.hash(&mut h);
+    chat.expanded_tool_details.len().hash(&mut h);
+    for call in &chat.tool_calls {
+        call.status.hash(&mut h);
+        call.input_preview.hash(&mut h);
+        call.process_status.hash(&mut h);
+        call.exit_code.hash(&mut h);
+        call.stdout.len().hash(&mut h);
+        call.stderr.len().hash(&mut h);
+    }
     chat.control.task_count.hash(&mut h);
     chat.control.active_turn.hash(&mut h);
     chat.usage
@@ -16266,8 +17352,15 @@ mod tests {
             call_index: Some(0),
             call_id: Some("call-test".to_string()),
             tool: "shell".to_string(),
+            input: "cargo check".to_string(),
             input_preview: "cargo check".to_string(),
             status: "running".to_string(),
+            process_command: None,
+            process_status: None,
+            exit_code: None,
+            elapsed_ms: None,
+            stdout: String::new(),
+            stderr: String::new(),
         });
 
         assert_eq!(
@@ -16502,6 +17595,7 @@ mod tests {
                 call_index: Some(0),
                 call_id: Some("call_1".to_string()),
                 tool: "run_command".to_string(),
+                input: Some("{\"cmd\":\"date\"}".to_string()),
                 input_preview: Some("{\"cmd\":\"date\"}".to_string()),
             },
         });
@@ -16513,6 +17607,8 @@ mod tests {
                 status: "completed".to_string(),
                 exit_code: Some(0),
                 elapsed_ms: 12,
+                stdout: "Mon Jun 15".to_string(),
+                stderr: String::new(),
                 stdout_tail: "Mon Jun 15".to_string(),
                 stderr_tail: String::new(),
             },
@@ -16564,6 +17660,7 @@ mod tests {
                 call_index: Some(0),
                 call_id: Some("call_1".to_string()),
                 tool: "run_command".to_string(),
+                input: None,
                 input_preview: None,
             },
         });
@@ -16588,12 +17685,203 @@ mod tests {
                 call_index: Some(0),
                 call_id: Some("call_1".to_string()),
                 tool: "run_command".to_string(),
+                input: Some("{\"cmd\":\"date\"}".to_string()),
                 input_preview: Some("{\"cmd\":\"date\"}".to_string()),
             },
         });
         assert_eq!(state.tool_calls.len(), 1);
         assert_eq!(state.tool_calls[0].status, "completed");
         assert_eq!(state.tool_calls[0].tool, "run_command");
+    }
+
+    #[test]
+    fn tool_call_render_state_keeps_full_payloads_and_edit_diffs() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let session_id = state.session_id.clone();
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: crates/sinomo-app/src/ui/chat.rs\n@@\n-{}\n+{}\n*** End Patch\n",
+            "old line\n".repeat(80),
+            "new line\n".repeat(80)
+        );
+        let input = serde_json::to_string_pretty(&serde_json::json!({ "patch": patch }))
+            .expect("serialize patch input");
+
+        state.apply_event(ChatEvent::ToolCallCompleted {
+            session_id: session_id.clone(),
+            call: ChatToolCallSnapshot {
+                step_index: 2,
+                call_index: Some(0),
+                call_id: Some("call_patch".to_string()),
+                tool: "apply_patch".to_string(),
+                input: Some(input.clone()),
+                input_preview: Some(compact_line(&input, 80)),
+            },
+        });
+        state.apply_event(ChatEvent::Process {
+            session_id,
+            process: ChatProcessSnapshot {
+                process_id: "proc_patch".to_string(),
+                command: "apply_patch".to_string(),
+                status: "completed".to_string(),
+                exit_code: Some(0),
+                elapsed_ms: 20,
+                stdout: "patched 1 file".repeat(80),
+                stderr: String::new(),
+                stdout_tail: "patched 1 file".to_string(),
+                stderr_tail: String::new(),
+            },
+        });
+
+        let call = state.tool_calls.first().expect("tool call retained");
+        assert_eq!(call.input, input);
+        assert!(
+            call.stdout.len() > call.input_preview.len(),
+            "full output should be retained for expansion"
+        );
+        let edit = chat_render::file_edit_render(&call.tool, &call.input).expect("edit render");
+        assert!(edit.code.is_diff);
+        assert_eq!(edit.code.language.as_deref(), Some("diff"));
+        assert!(edit.code.text.contains("*** Update File"));
+    }
+
+    #[test]
+    fn tool_chain_and_long_details_are_expanders() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let long_input = serde_json::to_string_pretty(&serde_json::json!({
+            "cmd": "cargo test",
+            "notes": "x".repeat(900)
+        }))
+        .expect("serialize input");
+        state.tool_calls = vec![
+            ChatToolActivity {
+                step_index: 0,
+                call_index: Some(0),
+                call_id: Some("call_a".to_string()),
+                tool: "exec_command".to_string(),
+                input: long_input,
+                input_preview: "cargo test".to_string(),
+                status: "completed".to_string(),
+                process_command: Some("cargo test".to_string()),
+                process_status: Some("completed".to_string()),
+                exit_code: Some(0),
+                elapsed_ms: Some(10),
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+            },
+            ChatToolActivity {
+                step_index: 1,
+                call_index: Some(0),
+                call_id: Some("call_b".to_string()),
+                tool: "read_file".to_string(),
+                input: "{\"path\":\"Cargo.toml\"}".to_string(),
+                input_preview: "Cargo.toml".to_string(),
+                status: "running".to_string(),
+                process_command: None,
+                process_status: None,
+                exit_code: None,
+                elapsed_ms: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        ];
+
+        assert!(state.tool_chain_collapsible());
+        assert!(!state.tool_chain_expanded());
+        state.toggle_tool_chain_expanded();
+        assert!(state.tool_chain_expanded());
+
+        let key = tool_detail_key(&state.tool_calls[0], ToolDetailSection::Input);
+        assert!(!state.tool_detail_expanded(&key));
+        state.toggle_tool_detail(key.clone());
+        assert!(state.tool_detail_expanded(&key));
+    }
+
+    #[test]
+    fn rendered_tool_expanders_toggle_from_semantics() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+            chat.messages = vec![
+                ChatMessage::user("Patch the chat renderer"),
+                ChatMessage::model(
+                    "## Plan\n\n- Parse markdown\n- Render tool calls\n\n```rust\nfn main() {}\n```",
+                ),
+            ];
+            let patch = format!(
+                "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-{}\n+{}\n*** End Patch\n",
+                "old\n".repeat(80),
+                "new\n".repeat(80)
+            );
+            let input = serde_json::to_string_pretty(&serde_json::json!({ "patch": patch }))
+                .expect("serialize patch input");
+            chat.tool_calls = vec![
+                ChatToolActivity {
+                    step_index: 0,
+                    call_index: Some(0),
+                    call_id: Some("call_patch".to_string()),
+                    tool: "apply_patch".to_string(),
+                    input,
+                    input_preview: "patch chat renderer".to_string(),
+                    status: "completed".to_string(),
+                    process_command: Some("apply_patch".to_string()),
+                    process_status: Some("completed".to_string()),
+                    exit_code: Some(0),
+                    elapsed_ms: Some(15),
+                    stdout: "patched".to_string(),
+                    stderr: String::new(),
+                },
+                ChatToolActivity {
+                    step_index: 1,
+                    call_index: Some(0),
+                    call_id: Some("call_test".to_string()),
+                    tool: "exec_command".to_string(),
+                    input: "{\"cmd\":\"cargo test -p sinomo-app\"}".to_string(),
+                    input_preview: "cargo test -p sinomo-app".to_string(),
+                    status: "running".to_string(),
+                    process_command: None,
+                    process_status: None,
+                    exit_code: None,
+                    elapsed_ms: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            ];
+            chat.stick_bottom = true;
+            chat.scroll = f32::MAX;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat tool expanders")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert!(!shared.chat().tool_chain_expanded());
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Toggle tool activity")
+            .click()?;
+        assert!(shared.chat().tool_chain_expanded());
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Toggle tool detail")
+            .click()?;
+        assert!(
+            !shared.chat().expanded_tool_details.is_empty(),
+            "clicking the long detail expander should persist expanded state"
+        );
+
+        Ok(())
     }
 
     #[test]

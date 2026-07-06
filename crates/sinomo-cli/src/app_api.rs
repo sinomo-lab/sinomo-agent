@@ -208,6 +208,7 @@ pub struct ChatToolCallSnapshot {
     pub call_index: Option<usize>,
     pub call_id: Option<String>,
     pub tool: String,
+    pub input: Option<String>,
     pub input_preview: Option<String>,
 }
 
@@ -219,6 +220,8 @@ pub struct ChatProcessSnapshot {
     pub status: String,
     pub exit_code: Option<i32>,
     pub elapsed_ms: u64,
+    pub stdout: String,
+    pub stderr: String,
     pub stdout_tail: String,
     pub stderr_tail: String,
 }
@@ -2326,6 +2329,7 @@ fn forward_model_event(
                 call_index,
                 call_id,
                 tool,
+                input: None,
                 input_preview: None,
             }));
         }
@@ -2547,6 +2551,7 @@ fn chat_tool_call_snapshot(
         call_index,
         call_id: call_id.or(call.call_id),
         tool: call.tool,
+        input: json_display(&call.input),
         input_preview: json_preview(&call.input, 220),
     }
 }
@@ -2558,9 +2563,18 @@ fn chat_process_snapshot(process: sinomo_agent::AgentProcessSnapshot) -> ChatPro
         status: process.status.as_str().to_string(),
         exit_code: process.exit_code,
         elapsed_ms: process.elapsed_ms,
+        stdout: process.stdout.clone(),
+        stderr: process.stderr.clone(),
         stdout_tail: tail_chars(&process.stdout, 240),
         stderr_tail: tail_chars(&process.stderr, 240),
     }
+}
+
+fn json_display(value: &serde_json::Value) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    serde_json::to_string_pretty(value).ok()
 }
 
 fn json_preview(value: &serde_json::Value, max_chars: usize) -> Option<String> {

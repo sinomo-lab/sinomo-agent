@@ -1346,7 +1346,7 @@ fn capture_shell_chrome() {
 #[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_chat_composed() {
     use sinomo_app::theme::AppThemeMode;
-    use sinomo_app::ui::chat::{ChatMessage, ConversationKind, SessionRef};
+    use sinomo_app::ui::chat::{ChatMessage, ChatToolActivity, ConversationKind, SessionRef};
     use sui::SemanticsRole;
 
     // Write these alongside the other shots, but also mirror them under `target/shots` so they are
@@ -1465,6 +1465,64 @@ fn capture_chat_composed() {
         let window = app.main_window().expect("main window");
         app.run_until_idle().expect("settle chat-messages layout");
         capture("chat-composed-messages", &window);
+    }
+
+    // Code-editing transcript: markdown answer blocks, highlighted code, and tool-call expanders
+    // seeded from a file-editing patch.
+    {
+        let shared = boot(Tab::Sinomo);
+        {
+            let mut chat = shared.chat_mut();
+            chat.messages = vec![
+                ChatMessage::user("Refactor the chat transcript renderer and show the patch."),
+                ChatMessage::model(
+                    "## Renderer plan\n\n- Parse assistant markdown into blocks\n- Keep tool activity grouped\n- Highlight code fences\n\n```rust\nfn render_block(kind: BlockKind) {}\n```",
+                ),
+            ];
+            let patch = "*** Begin Patch\n*** Update File: crates/sinomo-app/src/ui/chat.rs\n@@\n-plain text\n+markdown blocks\n*** End Patch\n";
+            let input = serde_json::to_string_pretty(&serde_json::json!({ "patch": patch }))
+                .expect("serialize visual patch input");
+            chat.tool_calls = vec![
+                ChatToolActivity {
+                    step_index: 0,
+                    call_index: Some(0),
+                    call_id: Some("visual_apply_patch".to_string()),
+                    tool: "apply_patch".to_string(),
+                    input,
+                    input_preview: "patch chat renderer".to_string(),
+                    status: "completed".to_string(),
+                    process_command: Some("apply_patch".to_string()),
+                    process_status: Some("completed".to_string()),
+                    exit_code: Some(0),
+                    elapsed_ms: Some(18),
+                    stdout: "patched 1 file".to_string(),
+                    stderr: String::new(),
+                },
+                ChatToolActivity {
+                    step_index: 1,
+                    call_index: Some(0),
+                    call_id: Some("visual_cargo_test".to_string()),
+                    tool: "exec_command".to_string(),
+                    input: "{\"cmd\":\"cargo test -p sinomo-app chat_render\"}".to_string(),
+                    input_preview: "cargo test -p sinomo-app chat_render".to_string(),
+                    status: "running".to_string(),
+                    process_command: None,
+                    process_status: None,
+                    exit_code: None,
+                    elapsed_ms: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            ];
+            chat.stick_bottom = true;
+            chat.scroll = f32::MAX;
+        }
+        let runtime = build_runtime(shared).expect("build runtime");
+        let app = TestApp::from_runtime(runtime).expect("headless test app");
+        let window = app.main_window().expect("main window");
+        app.run_until_idle()
+            .expect("settle chat-code-editing layout");
+        capture("chat-composed-code-editing", &window);
     }
 
     // Populated transcript with the DEFAULT provider's models already loaded (Issue 2): the model
@@ -1764,16 +1822,30 @@ fn capture_chat_runtime_activity() {
                 call_index: Some(0),
                 call_id: Some("call_exec_daemon".to_string()),
                 tool: "exec_command".to_string(),
+                input: "cargo test -p sinomo-daemon service_adapter".to_string(),
                 input_preview: "cargo test -p sinomo-daemon service_adapter".to_string(),
                 status: "completed".to_string(),
+                process_command: Some("cargo test -p sinomo-daemon service_adapter".to_string()),
+                process_status: Some("completed".to_string()),
+                exit_code: Some(0),
+                elapsed_ms: Some(1842),
+                stdout: "test result: ok".to_string(),
+                stderr: String::new(),
             },
             ChatToolActivity {
                 step_index: 5,
                 call_index: Some(0),
                 call_id: Some("call_cluster_gate".to_string()),
                 tool: "sinomo test run".to_string(),
+                input: "--tag agent-readiness --require-cluster".to_string(),
                 input_preview: "--tag agent-readiness --require-cluster".to_string(),
                 status: "running".to_string(),
+                process_command: None,
+                process_status: None,
+                exit_code: None,
+                elapsed_ms: None,
+                stdout: String::new(),
+                stderr: String::new(),
             },
         ];
         chat.activity = vec![

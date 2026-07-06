@@ -33,6 +33,8 @@ serde_json = { workspace = true }
 time = { workspace = true, features = ["formatting", "parsing", "serde", "serde-well-known"] }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+pulldown-cmark = { workspace = true }
+syntect = { workspace = true }
 
 # Graphical toolkit (separate workspace, referenced by path). Keep this behind
 # the app feature so daemon rollout builds can load the workspace without the
