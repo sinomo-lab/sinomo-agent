@@ -16,6 +16,7 @@ module-id = "module.network-iroh"
 interface-version = "sinomo.network-iroh.v1"
 cache-key = "module/network/iroh"
 source = "rollout:modules/network/iroh"
+platforms = ["unix"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]
