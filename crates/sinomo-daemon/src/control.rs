@@ -703,6 +703,12 @@ async fn run_daemon_background_maintenance_loop(
         }
 
         let cluster_network_phase = async {
+            let pending_work_deadline = Instant::now()
+                .checked_add(
+                    DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT
+                        .saturating_sub(Duration::from_millis(500)),
+                )
+                .unwrap_or_else(Instant::now);
             match cluster_network
                 .tick_async(&paths, &options, runtime.clone())
                 .await
@@ -710,7 +716,11 @@ async fn run_daemon_background_maintenance_loop(
                 Ok(pending_work) => {
                     if let Some(pending_work) = pending_work {
                         cluster_network
-                            .run_pending_work_async(pending_work, runtime.clone())
+                            .run_pending_work_until_async(
+                                pending_work,
+                                runtime.clone(),
+                                pending_work_deadline,
+                            )
                             .await;
                     }
                 }

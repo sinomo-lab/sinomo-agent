@@ -140,6 +140,10 @@ const PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS_PER_SOURCE: usize =
 const PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS: usize =
     sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
 const CLUSTER_CONNECTIVITY_IMPORT_CONCURRENCY: usize = 16;
+const CLUSTER_NETWORK_PENDING_CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(8);
+const CLUSTER_NETWORK_PENDING_MEMBER_PUBLISH_TIMEOUT: Duration = Duration::from_secs(4);
+const CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT: Duration = Duration::from_secs(3);
+const CLUSTER_NETWORK_PENDING_SERVICE_PUBLISH_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[cfg(test)]
 fn cluster_network_info_key(node_id: &NodeId) -> String {
@@ -2505,10 +2509,31 @@ impl ClusterNetworkMaintenance {
         let _ = discovery.announce(&advertisement).await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn run_pending_work_async(
         &mut self,
         pending: ClusterNetworkMaintenancePendingWork,
         runtime: tokio::runtime::Handle,
+    ) {
+        self.run_pending_work_with_deadline_async(pending, runtime, None)
+            .await;
+    }
+
+    pub(crate) async fn run_pending_work_until_async(
+        &mut self,
+        pending: ClusterNetworkMaintenancePendingWork,
+        runtime: tokio::runtime::Handle,
+        deadline: Instant,
+    ) {
+        self.run_pending_work_with_deadline_async(pending, runtime, Some(deadline))
+            .await;
+    }
+
+    async fn run_pending_work_with_deadline_async(
+        &mut self,
+        pending: ClusterNetworkMaintenancePendingWork,
+        runtime: tokio::runtime::Handle,
+        deadline: Option<Instant>,
     ) {
         let ClusterNetworkMaintenancePendingWork {
             connectivity_probe,
@@ -2522,10 +2547,15 @@ impl ClusterNetworkMaintenance {
         let mut retry_status_refreshes = Vec::new();
         if formation_status_first {
             for refresh in &node_status_refreshes {
-                if !self
-                    .run_pending_node_status_refresh_async(refresh.clone(), runtime.clone())
-                    .await
-                {
+                let completed = cluster_network_pending_step_with_deadline(
+                    "node status refresh",
+                    CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT,
+                    deadline,
+                    self.run_pending_node_status_refresh_async(refresh.clone(), runtime.clone()),
+                )
+                .await
+                .unwrap_or(false);
+                if !completed {
                     retry_status_refreshes.push(refresh.clone());
                 }
             }
@@ -2533,27 +2563,61 @@ impl ClusterNetworkMaintenance {
         // Connectivity refreshes must run before cluster writes that may need those
         // freshly-probed relay routes to reach a voter from a segmented learner.
         if let Some(probe) = connectivity_probe {
-            self.run_pending_connectivity_probe_async(probe, runtime.clone())
-                .await;
+            if cluster_network_pending_step_with_deadline(
+                "connectivity probe",
+                CLUSTER_NETWORK_PENDING_CONNECTIVITY_TIMEOUT,
+                deadline,
+                self.run_pending_connectivity_probe_async(probe, runtime.clone()),
+            )
+            .await
+            .is_none()
+            {
+                self.connectivity_converged = false;
+                self.record_connectivity_publish_failure();
+            }
         }
         for publish in member_publishes {
-            self.run_pending_member_publish_async(publish, runtime.clone())
-                .await;
+            if cluster_network_pending_step_with_deadline(
+                "member publish",
+                CLUSTER_NETWORK_PENDING_MEMBER_PUBLISH_TIMEOUT,
+                deadline,
+                self.run_pending_member_publish_async(publish, runtime.clone()),
+            )
+            .await
+            .is_none()
+            {
+                self.record_publish_failure();
+            }
         }
         if formation_status_first {
             for refresh in retry_status_refreshes {
-                self.run_pending_node_status_refresh_async(refresh, runtime.clone())
-                    .await;
+                let _ = cluster_network_pending_step_with_deadline(
+                    "node status refresh retry",
+                    CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT,
+                    deadline,
+                    self.run_pending_node_status_refresh_async(refresh, runtime.clone()),
+                )
+                .await;
             }
         } else {
             for refresh in node_status_refreshes {
-                self.run_pending_node_status_refresh_async(refresh, runtime.clone())
-                    .await;
+                let _ = cluster_network_pending_step_with_deadline(
+                    "node status refresh",
+                    CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT,
+                    deadline,
+                    self.run_pending_node_status_refresh_async(refresh, runtime.clone()),
+                )
+                .await;
             }
         }
         if let Some(publish) = service_instance_publish {
-            self.run_pending_service_instance_publish_async(publish, runtime)
-                .await;
+            let _ = cluster_network_pending_step_with_deadline(
+                "service instance publish",
+                CLUSTER_NETWORK_PENDING_SERVICE_PUBLISH_TIMEOUT,
+                deadline,
+                self.run_pending_service_instance_publish_async(publish, runtime),
+            )
+            .await;
         }
     }
 
@@ -2822,6 +2886,39 @@ impl ClusterNetworkMaintenance {
             &plan.active_keys,
             probed,
         )
+    }
+}
+
+async fn cluster_network_pending_step_with_deadline<F, T>(
+    label: &str,
+    max_duration: Duration,
+    deadline: Option<Instant>,
+    future: F,
+) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let Some(deadline) = deadline else {
+        return Some(future.await);
+    };
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        tracing::warn!("sinomo daemon cluster network {label} skipped: maintenance budget expired");
+        return None;
+    };
+    if remaining == Duration::ZERO {
+        tracing::warn!("sinomo daemon cluster network {label} skipped: maintenance budget expired");
+        return None;
+    }
+    let timeout = remaining.min(max_duration);
+    match tokio::time::timeout(timeout, future).await {
+        Ok(result) => Some(result),
+        Err(_) => {
+            tracing::warn!(
+                "sinomo daemon cluster network {label} timed out after {}ms",
+                timeout.as_millis()
+            );
+            None
+        }
     }
 }
 
