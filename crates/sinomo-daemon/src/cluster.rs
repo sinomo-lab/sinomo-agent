@@ -3100,6 +3100,33 @@ async fn probe_connectivity_batch_async(
     now: time::OffsetDateTime,
     startup_settle_active: bool,
 ) -> Vec<(String, ClusterConnectivityRecord)> {
+    probe_connectivity_batch_with_fetch_async(
+        state,
+        entries,
+        timestamp,
+        now,
+        startup_settle_active,
+        CLUSTER_HEALTH_PROBE_TIMEOUT,
+        |endpoint, timeout| async move {
+            fetch_daemon_status_from_endpoint_direct_async(&endpoint, timeout).await
+        },
+    )
+    .await
+}
+
+async fn probe_connectivity_batch_with_fetch_async<F, Fut>(
+    state: ClusterBootstrapState,
+    entries: Vec<sinomo_core::network::ClusterConnectivityProbeBatchEntry>,
+    timestamp: String,
+    now: time::OffsetDateTime,
+    startup_settle_active: bool,
+    endpoint_timeout: Duration,
+    fetch_status: F,
+) -> Vec<(String, ClusterConnectivityRecord)>
+where
+    F: Fn(ClusterEndpointRecord, Duration) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<crate::DaemonStatus, DaemonError>> + Send + 'static,
+{
     let semaphore = Arc::new(tokio::sync::Semaphore::new(
         CLUSTER_CONNECTIVITY_PROBE_CONCURRENCY,
     ));
@@ -3110,14 +3137,27 @@ async fn probe_connectivity_batch_async(
         };
         let state = state.clone();
         let timestamp = timestamp.clone();
+        let fetch_status = fetch_status.clone();
         handles.push(tokio::spawn(async move {
             let _permit = permit;
             let started = Instant::now();
-            let result = fetch_daemon_status_from_endpoint_direct_async(
-                &entry.endpoint,
-                CLUSTER_HEALTH_PROBE_TIMEOUT,
+            let endpoint = entry.endpoint.clone();
+            let address = endpoint.address.clone();
+            let result = match tokio::time::timeout(
+                endpoint_timeout,
+                fetch_status(endpoint, endpoint_timeout),
             )
-            .await;
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(DaemonError::Network {
+                    address,
+                    detail: format!(
+                        "connectivity probe timed out after {}ms",
+                        endpoint_timeout.as_millis()
+                    ),
+                }),
+            };
             let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             connectivity_record_for_daemon_status_probe(
                 &state,
@@ -10900,6 +10940,99 @@ mod tests {
         assert_eq!(records, vec![record]);
         assert_eq!(records[0].source_node_id, local_node);
         assert_eq!(records[0].target_node_id, remote_node);
+    }
+
+    #[test]
+    fn connectivity_probe_bounds_each_endpoint_before_collecting_batch() {
+        let runtime = daemon_cluster_test_runtime();
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_daemon_probe_endpoint_timeout")
+            .expect("cluster id");
+        let local_node = NodeId::from_legacy_named("node_daemon_probe_endpoint_timeout_local")
+            .expect("local node");
+        let fast_node = NodeId::from_legacy_named("node_daemon_probe_endpoint_timeout_fast")
+            .expect("fast node");
+        let slow_node = NodeId::from_legacy_named("node_daemon_probe_endpoint_timeout_slow")
+            .expect("slow node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "connectivity endpoint timeout",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let fast_endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &fast_node,
+            "203.0.113.81:21353".to_string(),
+            10,
+        );
+        let slow_endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &slow_node,
+            "203.0.113.82:21353".to_string(),
+            10,
+        );
+        for (node, name, endpoint) in [
+            (fast_node.clone(), "fast", fast_endpoint.clone()),
+            (slow_node.clone(), "slow", slow_endpoint.clone()),
+        ] {
+            let mut member =
+                ClusterMemberRecord::local_voter(cluster_id.clone(), node, name, "pk", now);
+            member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+            member.allowed_capabilities = member.capabilities.clone();
+            member.endpoints = vec![endpoint];
+            state.members.push(member);
+        }
+        let entries = vec![
+            sinomo_core::network::ClusterConnectivityProbeBatchEntry {
+                key: cluster_connectivity_probe_key(&local_node, &fast_endpoint),
+                endpoint: fast_endpoint,
+                previous: None,
+            },
+            sinomo_core::network::ClusterConnectivityProbeBatchEntry {
+                key: cluster_connectivity_probe_key(&local_node, &slow_endpoint),
+                endpoint: slow_endpoint,
+                previous: None,
+            },
+        ];
+        let slow_node_for_fetch = slow_node.clone();
+        let started = Instant::now();
+        let records = runtime.block_on(probe_connectivity_batch_with_fetch_async(
+            state,
+            entries,
+            "test".to_string(),
+            now,
+            false,
+            Duration::from_millis(25),
+            move |endpoint, _timeout| {
+                let slow_node = slow_node_for_fetch.clone();
+                async move {
+                    if endpoint.node_id == slow_node {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                    Err(DaemonError::Network {
+                        address: endpoint.address,
+                        detail: "test probe failure".to_string(),
+                    })
+                }
+            },
+        ));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "one hanging endpoint must not hold the whole probe batch open"
+        );
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .any(|(_, record)| record.target_node_id == fast_node)
+        );
+        assert!(
+            records
+                .iter()
+                .any(|(_, record)| record.target_node_id == slow_node)
+        );
     }
 
     #[test]
