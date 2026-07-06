@@ -117,7 +117,13 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .map_err(|source| {
             SinomoTestError::failed(format!("cannot create network ping runtime: {source}"))
         })?;
-    let runtime_handle = runtime.handle().clone();
+    let daemon_client = sinomo_runtime::daemon::DaemonApiClient::connect()
+        .map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot connect to local daemon for network ping forwarding: {source}"
+            ))
+        })?
+        .with_timeout(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1)));
     let build_jobs =
         |phase: &str, requests_per_target: usize| -> Result<Vec<NetworkPingJob>, SinomoTestError> {
             let mut jobs = Vec::with_capacity(target_count.saturating_mul(requests_per_target));
@@ -142,7 +148,7 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                         response_payload_bytes,
                         nonce,
                         request,
-                        runtime: runtime_handle.clone(),
+                        daemon_client: daemon_client.clone(),
                     });
                 }
             }
@@ -417,7 +423,7 @@ struct NetworkPingJob {
     request_payload_bytes: usize,
     response_payload_bytes: usize,
     request: network::ObjectRpcRequest,
-    runtime: tokio::runtime::Handle,
+    daemon_client: sinomo_runtime::daemon::DaemonApiClient,
 }
 
 #[derive(Debug)]
@@ -447,17 +453,19 @@ async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
 }
 
 async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome {
-    let response = match sinomo_runtime::daemon::send_dfs_object_rpc_to_target_async(
-        &job.target_node_id,
-        &job.request,
-        job.timeout,
-        &job.runtime,
-        true,
-    )
+    let daemon_client = job.daemon_client.clone();
+    let target_node_id = job.target_node_id.clone();
+    let request = job.request.clone();
+    let timeout = job.timeout;
+    let response = match tokio::task::spawn_blocking(move || {
+        daemon_client.dfs_object_rpc_to_target(&target_node_id, &request, timeout, true)
+    })
     .await
+    .map_err(|source| source.to_string())
+    .and_then(|response| response.map_err(|source| source.to_string()))
     {
         Ok(response) => response,
-        Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
+        Err(error) => return NetworkPingOutcome::Failure(error),
     };
     let response = match cluster::decode_cluster_network_ping_rpc_response(&response) {
         Ok(response) => response,

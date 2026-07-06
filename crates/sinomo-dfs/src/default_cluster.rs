@@ -1215,10 +1215,7 @@ pub(crate) fn dfs_service_endpoint_for_member_with_graph(
     local_endpoint: &str,
     graph: Option<&ClusterConnectivityGraph>,
 ) -> String {
-    if member.node_id == state.local_node_id {
-        return local_endpoint.to_string();
-    }
-    member
+    let selected = member
         .endpoints
         .iter()
         .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
@@ -1234,9 +1231,14 @@ pub(crate) fn dfs_service_endpoint_for_member_with_graph(
                     sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
                 })
                 .min_by_key(|endpoint| dfs_service_endpoint_route_rank(graph, endpoint))
-        })
-        .map(|endpoint| endpoint.address.clone())
-        .unwrap_or_else(|| format!("cluster-member://{}", member.node_id))
+        });
+    if let Some(endpoint) = selected {
+        return endpoint.address.clone();
+    }
+    if member.node_id == state.local_node_id {
+        return local_endpoint.to_string();
+    }
+    format!("cluster-member://{}", member.node_id)
 }
 
 fn dfs_service_endpoint_route_rank(

@@ -752,11 +752,12 @@ struct ClusterDeliveryRoutingTableCacheEntry {
     last_used: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterDeliveryRoutingTableCacheMark {
     state: ClusterFileMark,
     pub directory_version: Option<crate::directory::DirectoryVersion>,
     local_connectivity_generation: u64,
+    module_dialer_transports: Vec<String>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1108,6 +1109,16 @@ fn cluster_delivery_routing_table_earliest_expires_at(
 pub fn cluster_delivery_routing_table_cache_mark(
     paths: &ClusterPaths,
 ) -> Option<ClusterDeliveryRoutingTableCacheMark> {
+    let mut module_dialer_transports = crate::network_module::network_module_registry()
+        .map(|registry| {
+            registry
+                .enabled_dialer_transports()
+                .into_iter()
+                .map(|transport| format!("{transport:?}"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    module_dialer_transports.sort();
     Some(ClusterDeliveryRoutingTableCacheMark {
         state: cluster_file_mark(&paths.state)?,
         // A directory version error means "unknown": return no mark at all
@@ -1120,6 +1131,7 @@ pub fn cluster_delivery_routing_table_cache_mark(
         ),
         local_connectivity_generation:
             crate::connectivity_store::local_cluster_connectivity_content_generation(paths),
+        module_dialer_transports,
     })
 }
 

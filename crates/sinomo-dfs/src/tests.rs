@@ -1353,6 +1353,36 @@ fn dfs_service_endpoint_for_member_ignores_shadow_daemon_endpoints() {
 }
 
 #[test]
+fn dfs_service_endpoint_for_local_member_prefers_routable_endpoint_over_loopback() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(
+        "cluster_dfs_service_endpoint_local_routable",
+    )
+    .expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_dfs_service_endpoint_local_routable").expect("local");
+    let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "dfs service endpoint local routable",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let mut local_member = state.members[0].clone();
+    local_member.endpoints = vec![
+        ClusterEndpointRecord::loopback(local.clone(), "127.0.0.1:21353"),
+        test_endpoint(&local, "10.14.1.11:21353"),
+    ];
+    state.members[0] = local_member.clone();
+
+    assert_eq!(
+        dfs_service_endpoint_for_member(&state, &local_member, "loopback://127.0.0.1:21353"),
+        "10.14.1.11:21353"
+    );
+}
+
+#[test]
 fn dfs_service_endpoint_for_member_prefers_healthy_lan_endpoint_over_public() {
     let now = OffsetDateTime::now_utc();
     let cluster_id =
