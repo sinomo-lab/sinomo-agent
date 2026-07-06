@@ -6771,6 +6771,7 @@ impl sinomo_core::network::ClusterRelayStreamForwardAsyncHost
                 &endpoint,
                 request,
                 timeouts,
+                &paths,
                 stream,
                 stream_address,
             )
@@ -7004,52 +7005,19 @@ async fn send_cluster_relay_request_to_next_hop_streaming_collect_async(
     runtime: &tokio::runtime::Handle,
     paths: &DaemonPaths,
 ) -> Result<ClusterRelayStreamCollectResult, DaemonError> {
-    let (mut request, request_auth) = tokio::task::spawn_blocking(move || {
-        let request_auth = crate::sign_daemon_rpc_request_for_local_node(&request)?;
-        Ok::<_, DaemonError>((request, request_auth))
-    })
-    .await
-    .map_err(|source| DaemonError::Network {
-        address: format!("cluster relay {}", endpoint.address),
-        detail: format!("cluster relay signing task failed: {source}"),
-    })??;
-    if let Some(result) = crate::tcp_tunnel::send_signed_endpoint_rpc_via_tcp_tunnel(
-        endpoint,
-        &request_auth,
-        &request,
-        timeouts,
-        runtime,
-        Some(paths),
-    )
-    .await
-    {
-        let response = result.map_err(DaemonError::from)?;
-        if sinomo_core::network::relay_response_is_routing_error(&response) {
-            return Ok(ClusterRelayStreamCollectResult::RoutingError(response));
-        }
-        return Ok(ClusterRelayStreamCollectResult::Forwarded(response));
-    }
-
-    request.auth = Some(request_auth);
-    let response = if matches!(
-        endpoint.transport,
-        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
-    ) {
-        sinomo_core::network::send_daemon_control_rpc_request_async(
-            &endpoint.address,
+    let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, true).with_paths(paths);
+    let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
+    let response = client
+        .call_endpoint(
+            endpoint,
             &request,
-            timeouts,
-            crate::control::DAEMON_COMMAND_MAX_BYTES,
+            sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
         )
         .await
-        .map_err(DaemonError::from)?
-    } else {
-        sinomo_core::network::send_daemon_rpc_to_cluster_endpoint_async(
-            endpoint, None, &request, timeouts,
-        )
-        .await
-        .map_err(DaemonError::from)?
-    };
+        .map_err(DaemonError::from)?;
+    if sinomo_core::network::relay_response_is_routing_error(&response) {
+        return Ok(ClusterRelayStreamCollectResult::RoutingError(response));
+    }
     Ok(ClusterRelayStreamCollectResult::Forwarded(response))
 }
 
@@ -7057,38 +7025,14 @@ async fn send_cluster_relay_request_to_next_hop_streaming_async(
     endpoint: &ClusterEndpointRecord,
     request: sinomo_core::network::ObjectRpcRequest,
     timeouts: sinomo_core::network::DaemonRpcTimeouts,
+    paths: &DaemonPaths,
     stream: &mut sinomo_core::network::AsyncDaemonControlStream,
     stream_address: &str,
 ) -> Result<ClusterRelayStreamForwardResult, DaemonError> {
-    let (mut request, request_auth) = tokio::task::spawn_blocking(move || {
-        let request_auth = crate::sign_daemon_rpc_request_for_local_node(&request)?;
-        Ok::<_, DaemonError>((request, request_auth))
-    })
-    .await
-    .map_err(|source| DaemonError::Network {
-        address: format!("cluster relay {}", endpoint.address),
-        detail: format!("cluster relay signing task failed: {source}"),
-    })??;
-    if let Some(result) = crate::tcp_tunnel::send_signed_endpoint_rpc_via_tcp_tunnel(
-        endpoint,
-        &request_auth,
-        &request,
-        timeouts,
-        &tokio::runtime::Handle::current(),
-        None,
-    )
-    .await
-    {
-        let response = result.map_err(DaemonError::from)?;
-        if sinomo_core::network::relay_response_is_routing_error(&response) {
-            return Ok(ClusterRelayStreamForwardResult::RoutingError(response));
-        }
-        write_cluster_relay_stream_response_to_upstream(response, stream, stream_address, timeouts)
-            .await?;
-        return Ok(ClusterRelayStreamForwardResult::Forwarded);
-    }
-    request.auth = Some(request_auth);
-    match sinomo_core::network::forward_streamed_daemon_rpc_to_cluster_endpoint_async(
+    let runtime = tokio::runtime::Handle::current();
+    let mut host = DaemonSignedEndpointRpcAsyncHost::new(&runtime, true).with_paths(paths);
+    match sinomo_core::network::forward_signed_streamed_daemon_rpc_to_cluster_endpoint_with_host_async(
+        &mut host,
         endpoint,
         &request,
         timeouts,
@@ -7109,40 +7053,6 @@ async fn send_cluster_relay_request_to_next_hop_streaming_async(
             ClusterRelayStreamForwardResult::StreamStartedThenFailed(DaemonError::from(error)),
         ),
     }
-}
-
-async fn write_cluster_relay_stream_response_to_upstream(
-    mut response: sinomo_core::network::ObjectRpcResponse,
-    stream: &mut sinomo_core::network::AsyncDaemonControlStream,
-    stream_address: &str,
-    timeouts: sinomo_core::network::DaemonRpcTimeouts,
-) -> Result<(), DaemonError> {
-    let frame_options =
-        sinomo_core::network::ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
-    let raw_body = if sinomo_core::network::object_rpc_response_stream_mode(&response)
-        == sinomo_core::network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
-    {
-        Some(std::mem::take(&mut response.body))
-    } else {
-        None
-    };
-    stream
-        .write_rpc_response(stream_address, &response, frame_options)
-        .await
-        .map_err(DaemonError::from)?;
-    if let Some(body) = raw_body {
-        for chunk in body.chunks(sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES) {
-            stream
-                .write_raw_byte_stream_chunk(stream_address, chunk, frame_options)
-                .await
-                .map_err(DaemonError::from)?;
-        }
-        stream
-            .write_raw_byte_stream_chunk(stream_address, &[], frame_options)
-            .await
-            .map_err(DaemonError::from)?;
-    }
-    Ok(())
 }
 
 fn relay_local_node_id(_paths: &DaemonPaths, state: &ClusterBootstrapState) -> NodeId {

@@ -184,9 +184,10 @@ pub use object::{
     AsyncDaemonControlListener, AsyncDaemonControlStream, DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
     DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts, OBJECT_STREAM_MAX_CHUNK_BYTES,
     ObjectFrameIoOptions, ObjectRpcRequestStreamMode, ObjectRpcResponseStreamMode,
-    RawByteStreamChunkOptions, SinomoObjectCodec, forward_raw_byte_stream_chunks_async,
-    object_rpc_request_stream_mode, object_rpc_response_stream_mode,
-    read_raw_byte_stream_chunks_to_vec_async, send_daemon_control_rpc_request_async,
+    ObjectRpcStreamBody, ObjectRpcStreamResponse, RawByteStreamChunkOptions, SinomoObjectCodec,
+    forward_raw_byte_stream_chunks_async, object_rpc_request_stream_mode,
+    object_rpc_response_stream_mode, read_raw_byte_stream_chunks_to_vec_async,
+    send_daemon_control_rpc_request_async, send_daemon_control_rpc_request_stream_response_async,
     set_object_rpc_request_stream_mode, set_object_rpc_response_stream_mode,
     write_borrowed_object_frame_async,
 };
@@ -208,7 +209,10 @@ pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, InProcessNetwork,
     InProcessTransport,
 };
-pub use roaming::send_daemon_rpc_to_cluster_endpoint_async;
+pub use roaming::{
+    send_daemon_rpc_stream_response_to_cluster_endpoint_async,
+    send_daemon_rpc_to_cluster_endpoint_async,
+};
 pub use route::{
     CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
     ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterRelayAsyncHost, ClusterRelayOptions,
@@ -216,6 +220,7 @@ pub use route::{
     ClusterRelayStreamRequestAction, ClusterRelayStreamSendOutcome,
     ClusterSignedEndpointRpcAsyncHost, ClusterSignedEndpointRpcFuture,
     ClusterSignedEndpointRpcObservation, RelayEnvelope, cluster_relay_stream_request_action,
+    forward_signed_streamed_daemon_rpc_to_cluster_endpoint_with_host_async,
     forward_streamed_daemon_rpc_to_cluster_endpoint_async, handle_cluster_relay_async_with_host,
     handle_cluster_relay_stream_forward_async_with_host, relay_request_inner_route,
     relay_response_is_routing_error,

@@ -8,7 +8,9 @@
 use std::io::Read;
 
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_core::network::{
+    NetworkError, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcStreamBody, ObjectRpcStreamResponse,
+};
 
 use crate::DfsError;
 use crate::content_store::{BlobReader, LocalContentStore};
@@ -38,6 +40,70 @@ pub(crate) const DFS_DIRECT_REMOTE_READ_MAX_BYTES: u64 = 128 * 1024 * 1024;
 pub struct DfsDirectReadStreamResponse {
     pub response: ObjectRpcResponse,
     pub reader: Option<BlobReader>,
+}
+
+#[derive(Debug)]
+pub struct DfsDirectReadClientStreamResponse {
+    pub request_id: String,
+    pub object_id: crate::DfsObjectId,
+    pub result: DfsDirectReadClientStreamResult,
+}
+
+#[derive(Debug)]
+pub enum DfsDirectReadClientStreamResult {
+    Found(DfsDirectReadClientStreamData),
+    NotFound,
+    Rejected { reason: String },
+}
+
+#[derive(Debug)]
+pub struct DfsDirectReadClientStreamData {
+    pub object_id: crate::DfsObjectId,
+    pub version: crate::DfsVersion,
+    pub content_hash: String,
+    pub content_size_bytes: usize,
+    pub body: ObjectRpcStreamBody,
+}
+
+impl DfsDirectReadClientStreamResponse {
+    pub async fn collect_to_read_response(self) -> Result<DfsReadResponse, NetworkError> {
+        let result = match self.result {
+            DfsDirectReadClientStreamResult::Found(mut data) => {
+                let bytes = data.body.collect_to_vec().await?;
+                if bytes.len() != data.content_size_bytes {
+                    return Err(dfs_network_serialization_error(format!(
+                        "DFS direct read streamed body has {} bytes, metadata expected {}",
+                        bytes.len(),
+                        data.content_size_bytes
+                    )));
+                }
+                let actual_hash = crate::content_hash(&bytes);
+                if actual_hash != data.content_hash {
+                    return Err(NetworkError::Serialization {
+                        detail: format!(
+                            "DFS direct read streamed body hash mismatch: expected {}, actual {}",
+                            data.content_hash, actual_hash
+                        ),
+                    });
+                }
+                DfsReadResult::Found(DfsReadData {
+                    object_id: data.object_id,
+                    version: data.version,
+                    content_hash: Some(data.content_hash),
+                    bytes,
+                })
+            }
+            DfsDirectReadClientStreamResult::NotFound => DfsReadResult::NotFound,
+            DfsDirectReadClientStreamResult::Rejected { reason } => {
+                DfsReadResult::Rejected { reason }
+            }
+        };
+        Ok(DfsReadResponse {
+            request_id: self.request_id,
+            object_id: self.object_id,
+            result,
+        })
+    }
 }
 
 pub fn dfs_direct_read_rpc_request(
@@ -405,6 +471,54 @@ pub fn dfs_direct_read_response_from_rpc_response(
         }
     };
     Ok(DfsReadResponse {
+        request_id,
+        object_id,
+        result,
+    })
+}
+
+pub fn dfs_direct_read_response_from_rpc_stream_response(
+    stream_response: ObjectRpcStreamResponse,
+) -> Result<DfsDirectReadClientStreamResponse, NetworkError> {
+    let ObjectRpcStreamResponse { response, body } = stream_response;
+    response.error_detail()?;
+    let status = dfs_direct_read_metadata(&response, DFS_DIRECT_READ_STATUS_METADATA_KEY)?;
+    let request_id =
+        dfs_direct_read_metadata(&response, DFS_DIRECT_READ_REQUEST_ID_METADATA_KEY)?.to_string();
+    let object_id = dfs_direct_read_metadata_id(&response, DFS_DIRECT_READ_OBJECT_ID_METADATA_KEY)?;
+    let result = match status {
+        DFS_DIRECT_READ_STATUS_FOUND => {
+            let version =
+                dfs_direct_read_metadata_id(&response, DFS_DIRECT_READ_VERSION_METADATA_KEY)?;
+            let content_hash =
+                dfs_direct_read_metadata(&response, DFS_DIRECT_READ_CONTENT_HASH_METADATA_KEY)?
+                    .to_string();
+            let content_size_bytes = dfs_direct_read_metadata_usize(
+                &response,
+                DFS_DIRECT_READ_CONTENT_SIZE_METADATA_KEY,
+            )?;
+            DfsDirectReadClientStreamResult::Found(DfsDirectReadClientStreamData {
+                object_id: object_id.clone(),
+                version,
+                content_hash,
+                content_size_bytes,
+                body,
+            })
+        }
+        DFS_DIRECT_READ_STATUS_NOT_FOUND => DfsDirectReadClientStreamResult::NotFound,
+        DFS_DIRECT_READ_STATUS_REJECTED => {
+            let reason =
+                dfs_direct_read_metadata(&response, DFS_DIRECT_READ_REJECTION_METADATA_KEY)?
+                    .to_string();
+            DfsDirectReadClientStreamResult::Rejected { reason }
+        }
+        other => {
+            return Err(dfs_network_serialization_error(format!(
+                "unknown DFS direct read status {other}"
+            )));
+        }
+    };
+    Ok(DfsDirectReadClientStreamResponse {
         request_id,
         object_id,
         result,

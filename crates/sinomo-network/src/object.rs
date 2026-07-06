@@ -378,6 +378,135 @@ pub struct AsyncDaemonControlStream {
     stream: tokio::net::TcpStream,
 }
 
+#[derive(Debug)]
+pub struct ObjectRpcStreamResponse {
+    pub response: crate::ObjectRpcResponse,
+    pub body: ObjectRpcStreamBody,
+}
+
+impl ObjectRpcStreamResponse {
+    pub fn from_buffered_response(
+        mut response: crate::ObjectRpcResponse,
+        options: RawByteStreamChunkOptions,
+    ) -> Self {
+        let body = if object_rpc_response_has_streamed_daemon_body(&response)
+            && !response.body.is_empty()
+        {
+            ObjectRpcStreamBody::Buffered {
+                bytes: std::mem::take(&mut response.body),
+                offset: 0,
+                options,
+            }
+        } else {
+            ObjectRpcStreamBody::Empty
+        };
+        Self { response, body }
+    }
+
+    fn from_daemon_stream_response(
+        response: crate::ObjectRpcResponse,
+        address: impl Into<String>,
+        stream: AsyncDaemonControlStream,
+        options: RawByteStreamChunkOptions,
+    ) -> Self {
+        let body = if object_rpc_response_has_streamed_daemon_body(&response) {
+            ObjectRpcStreamBody::DaemonControlRaw {
+                address: address.into(),
+                stream: Some(stream),
+                options,
+                total_read: 0,
+            }
+        } else {
+            ObjectRpcStreamBody::Empty
+        };
+        Self { response, body }
+    }
+
+    pub async fn collect_body_to_vec(mut self) -> Result<crate::ObjectRpcResponse, NetworkError> {
+        let body = self.body.collect_to_vec().await?;
+        self.response.body = body;
+        Ok(self.response)
+    }
+}
+
+#[derive(Debug)]
+pub enum ObjectRpcStreamBody {
+    Empty,
+    Buffered {
+        bytes: Vec<u8>,
+        offset: usize,
+        options: RawByteStreamChunkOptions,
+    },
+    DaemonControlRaw {
+        address: String,
+        stream: Option<AsyncDaemonControlStream>,
+        options: RawByteStreamChunkOptions,
+        total_read: u64,
+    },
+}
+
+impl ObjectRpcStreamBody {
+    pub async fn read_next_chunk(&mut self) -> Result<Option<Vec<u8>>, NetworkError> {
+        match self {
+            ObjectRpcStreamBody::Empty => Ok(None),
+            ObjectRpcStreamBody::Buffered {
+                bytes,
+                offset,
+                options,
+            } => {
+                let chunk_bytes = validate_raw_byte_stream_chunk_options(*options)?;
+                if *offset >= bytes.len() {
+                    Ok(None)
+                } else {
+                    let end = offset.saturating_add(chunk_bytes).min(bytes.len());
+                    checked_object_stream_total(0, end, options.max_total_bytes)?;
+                    let len = end.saturating_sub(*offset);
+                    let mut chunk = Vec::new();
+                    try_reserve_vec(&mut chunk, len, "read buffered raw byte stream chunk")?;
+                    chunk.extend_from_slice(&bytes[*offset..end]);
+                    *offset = end;
+                    Ok(Some(chunk))
+                }
+            }
+            ObjectRpcStreamBody::DaemonControlRaw {
+                address,
+                stream,
+                options,
+                total_read,
+            } => {
+                let Some(stream_ref) = stream.as_mut() else {
+                    return Ok(None);
+                };
+                let result =
+                    read_raw_byte_stream_chunk_from_async_stream(&mut stream_ref.stream, options)
+                        .await
+                        .map_err(|error| {
+                            map_daemon_control_frame_error(
+                                error,
+                                format!("read async daemon control stream {address}"),
+                            )
+                        })?;
+                let Some(bytes) = result else {
+                    *stream = None;
+                    return Ok(None);
+                };
+                *total_read =
+                    checked_object_stream_total(*total_read, bytes.len(), options.max_total_bytes)?;
+                Ok(Some(bytes))
+            }
+        }
+    }
+
+    pub async fn collect_to_vec(&mut self) -> Result<Vec<u8>, NetworkError> {
+        let mut output = Vec::new();
+        while let Some(chunk) = self.read_next_chunk().await? {
+            try_reserve_vec(&mut output, chunk.len(), "collect raw byte stream body")?;
+            output.extend_from_slice(&chunk);
+        }
+        Ok(output)
+    }
+}
+
 const ASYNC_DAEMON_CONTROL_STREAM_POOL_MAX_IDLE_PER_ADDRESS: usize = 64;
 
 static ASYNC_DAEMON_CONTROL_STREAM_POOL: LazyLock<
@@ -611,6 +740,33 @@ pub async fn send_daemon_control_rpc_request_async(
     };
     response.error_detail()?;
     Ok(response)
+}
+
+pub async fn send_daemon_control_rpc_request_stream_response_async(
+    address: &str,
+    request: &DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+    max_response_bytes: usize,
+) -> Result<ObjectRpcStreamResponse, NetworkError> {
+    let mut stream = AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
+    let frame_options = ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
+    stream
+        .write_request(address, request, frame_options)
+        .await?;
+    let response = stream
+        .read_rpc_response(address, max_response_bytes, frame_options)
+        .await?;
+    let body_options = RawByteStreamChunkOptions {
+        chunk_bytes: OBJECT_STREAM_MAX_CHUNK_BYTES,
+        max_total_bytes: u64::try_from(max_response_bytes).ok(),
+        idle_timeout: timeouts.idle_timeout,
+    };
+    Ok(ObjectRpcStreamResponse::from_daemon_stream_response(
+        response,
+        address,
+        stream,
+        body_options,
+    ))
 }
 
 pub(crate) async fn send_daemon_control_rpc_request_raw_response_async(
@@ -1685,6 +1841,57 @@ where
             );
         }
     }
+}
+
+async fn read_raw_byte_stream_chunk_from_async_stream<R>(
+    reader: &mut R,
+    options: &RawByteStreamChunkOptions,
+) -> Result<Option<Vec<u8>>, NetworkError>
+where
+    R: AsyncRead + Unpin,
+{
+    let chunk_bytes = validate_raw_byte_stream_chunk_options(*options)?;
+    let mut len_bytes = [0_u8; DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES];
+    read_exact_async_frame(
+        reader,
+        &mut len_bytes,
+        options.idle_timeout,
+        "read raw byte stream chunk length",
+        "length",
+    )
+    .await?;
+    let len = u64::from_be_bytes(len_bytes);
+    if len == 0 {
+        if let Some(observer) = io_observer() {
+            observer.on_net_recv(DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64);
+        }
+        return Ok(None);
+    }
+    let len_usize = usize::try_from(len).map_err(|_| NetworkError::FrameTooLarge {
+        actual_bytes: usize::MAX,
+        max_bytes: chunk_bytes,
+    })?;
+    if len_usize > chunk_bytes {
+        return Err(NetworkError::FrameTooLarge {
+            actual_bytes: len_usize,
+            max_bytes: chunk_bytes,
+        });
+    }
+    let mut bytes = try_zeroed_vec(len_usize, "read raw byte stream chunk")?;
+    read_exact_async_frame(
+        reader,
+        &mut bytes,
+        options.idle_timeout,
+        "read raw byte stream chunk body",
+        "body",
+    )
+    .await?;
+    if let Some(observer) = io_observer() {
+        observer.on_net_recv(
+            DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64 + len_usize as u64,
+        );
+    }
+    Ok(Some(bytes))
 }
 
 pub async fn forward_raw_byte_stream_chunks_async<R, W>(

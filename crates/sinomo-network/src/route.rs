@@ -1904,6 +1904,35 @@ pub async fn forward_streamed_daemon_rpc_to_cluster_endpoint_async(
     }
 }
 
+/// Signs and forwards a streamed object-RPC request to one concrete endpoint
+/// through the caller's endpoint host.
+///
+/// This keeps stream transport selection on the same endpoint-delivery seam as
+/// ordinary routed object RPC. Host implementations may reuse persistent
+/// connections or module transports, but callers do not need transport-specific
+/// branches.
+pub async fn forward_signed_streamed_daemon_rpc_to_cluster_endpoint_with_host_async(
+    host: &mut impl ClusterSignedEndpointRpcAsyncHost,
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    timeouts: DaemonRpcTimeouts,
+    upstream: &mut crate::object::AsyncDaemonControlStream,
+    upstream_address: &str,
+    max_response_bytes: usize,
+) -> Result<ClusterRelayStreamSendOutcome, NetworkError> {
+    let request_auth = host.sign_endpoint_rpc_request_async(request).await?;
+    host.forward_signed_endpoint_stream_rpc_async(
+        endpoint,
+        &request_auth,
+        request,
+        timeouts,
+        upstream,
+        upstream_address,
+        max_response_bytes,
+    )
+    .await
+}
+
 async fn forward_streamed_daemon_rpc_to_tcp_endpoint_async(
     endpoint: &ClusterEndpointRecord,
     request: &DaemonControlRequest,
@@ -2095,6 +2124,71 @@ pub trait ClusterSignedEndpointRpcAsyncHost: Send {
             result
         })
     }
+
+    fn send_signed_endpoint_stream_response_rpc_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        auth: &'a [u8],
+        request: &'a ObjectRpcRequest,
+        timeouts: DaemonRpcTimeouts,
+    ) -> ClusterSignedEndpointRpcFuture<'a, crate::ObjectRpcStreamResponse> {
+        Box::pin(async move {
+            let started = Instant::now();
+            let mut signed = request.clone();
+            signed.auth = Some(auth.to_vec());
+            let result =
+                crate::roaming::send_daemon_control_rpc_request_stream_response_to_cluster_endpoint_async(
+                    endpoint,
+                    &signed,
+                    timeouts,
+                )
+                .await;
+            if let Some(observation) =
+                cluster_signed_endpoint_stream_response_rpc_observation(result.as_ref(), started)
+            {
+                let _ = self
+                    .observe_signed_endpoint_rpc_async(endpoint, observation)
+                    .await;
+            }
+            result
+        })
+    }
+
+    fn forward_signed_endpoint_stream_rpc_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        auth: &'a [u8],
+        request: &'a ObjectRpcRequest,
+        timeouts: DaemonRpcTimeouts,
+        upstream: &'a mut crate::object::AsyncDaemonControlStream,
+        upstream_address: &'a str,
+        max_response_bytes: usize,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ClusterRelayStreamSendOutcome, NetworkError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let started = Instant::now();
+            let mut signed = request.clone();
+            signed.auth = Some(auth.to_vec());
+            let result = forward_streamed_daemon_rpc_to_cluster_endpoint_async(
+                endpoint,
+                &signed,
+                timeouts,
+                upstream,
+                upstream_address,
+                max_response_bytes,
+            )
+            .await;
+            if let Some(observation) =
+                cluster_signed_endpoint_stream_rpc_observation(result.as_ref(), started)
+            {
+                let _ = self
+                    .observe_signed_endpoint_rpc_async(endpoint, observation)
+                    .await;
+            }
+            result
+        })
+    }
 }
 
 fn cluster_signed_endpoint_rpc_observation(
@@ -2105,9 +2199,47 @@ fn cluster_signed_endpoint_rpc_observation(
         Ok(_) => Some(ClusterSignedEndpointRpcObservation::success(Some(
             cluster_signed_endpoint_rpc_elapsed_latency_ms(started),
         ))),
-        Err(NetworkError::Io { .. }) => Some(ClusterSignedEndpointRpcObservation::io_failure()),
-        Err(NetworkError::AuthDenied) => Some(ClusterSignedEndpointRpcObservation::auth_denied()),
-        Err(_) => None,
+        Err(error) => cluster_signed_endpoint_rpc_error_observation(error),
+    }
+}
+
+fn cluster_signed_endpoint_stream_response_rpc_observation(
+    result: Result<&crate::ObjectRpcStreamResponse, &NetworkError>,
+    started: Instant,
+) -> Option<ClusterSignedEndpointRpcObservation> {
+    match result {
+        Ok(_) => Some(ClusterSignedEndpointRpcObservation::success(Some(
+            cluster_signed_endpoint_rpc_elapsed_latency_ms(started),
+        ))),
+        Err(error) => cluster_signed_endpoint_rpc_error_observation(error),
+    }
+}
+
+fn cluster_signed_endpoint_stream_rpc_observation(
+    result: Result<&ClusterRelayStreamSendOutcome, &NetworkError>,
+    started: Instant,
+) -> Option<ClusterSignedEndpointRpcObservation> {
+    match result {
+        Ok(ClusterRelayStreamSendOutcome::Forwarded)
+        | Ok(ClusterRelayStreamSendOutcome::RoutingError(_)) => {
+            Some(ClusterSignedEndpointRpcObservation::success(Some(
+                cluster_signed_endpoint_rpc_elapsed_latency_ms(started),
+            )))
+        }
+        Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(_)) => {
+            Some(ClusterSignedEndpointRpcObservation::io_failure())
+        }
+        Err(error) => cluster_signed_endpoint_rpc_error_observation(error),
+    }
+}
+
+fn cluster_signed_endpoint_rpc_error_observation(
+    error: &NetworkError,
+) -> Option<ClusterSignedEndpointRpcObservation> {
+    match error {
+        NetworkError::Io { .. } => Some(ClusterSignedEndpointRpcObservation::io_failure()),
+        NetworkError::AuthDenied => Some(ClusterSignedEndpointRpcObservation::auth_denied()),
+        _ => None,
     }
 }
 
@@ -2167,6 +2299,16 @@ where
         self.call_endpoint_direct(endpoint, request, options).await
     }
 
+    pub async fn call_endpoint_stream(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+        options: ClusterObjectRpcOptions,
+    ) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
+        self.call_endpoint_stream_direct(endpoint, request, options)
+            .await
+    }
+
     pub async fn call_target(
         &mut self,
         state: &ClusterBootstrapState,
@@ -2181,6 +2323,30 @@ where
             });
         };
         self.call_target_from_paths(
+            context.runtime,
+            context.paths,
+            state,
+            target_node_id,
+            request,
+            options,
+        )
+        .await
+    }
+
+    pub async fn call_target_stream(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        options: ClusterObjectRpcOptions,
+    ) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
+        let Some(context) = self.route_context else {
+            return Err(NetworkError::Io {
+                operation: "cluster target stream rpc".to_string(),
+                detail: "cluster target stream RPC requires a route context".to_string(),
+            });
+        };
+        self.call_target_stream_from_paths(
             context.runtime,
             context.paths,
             state,
@@ -2211,6 +2377,34 @@ where
         let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
         self.host
             .send_signed_endpoint_rpc_async(
+                endpoint,
+                &request_auth,
+                request,
+                cluster_endpoint_transport_timeouts(options.timeouts, remaining),
+            )
+            .await
+    }
+
+    async fn call_endpoint_stream_direct(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+        options: ClusterObjectRpcOptions,
+    ) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
+        let deadline = ClusterEndpointRpcDeadline::new(options.timeouts.connect_timeout);
+        let Some(remaining) = deadline.checked_remaining() else {
+            return Err(deadline.timeout_error(endpoint));
+        };
+        let traced_request;
+        let request = if request.traceparent().is_some() {
+            request
+        } else {
+            traced_request = request.clone().with_trace_context_if_missing();
+            &traced_request
+        };
+        let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
+        self.host
+            .send_signed_endpoint_stream_response_rpc_async(
                 endpoint,
                 &request_auth,
                 request,
@@ -2549,6 +2743,354 @@ where
 
         Err(NetworkError::Io {
             operation: "cluster target rpc".to_string(),
+            detail: format!(
+                "route to target node {target_node_id} failed{}",
+                if failures.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", failures.join("; "))
+                }
+            ),
+        })
+    }
+
+    pub(crate) async fn call_target_stream_from_paths(
+        &mut self,
+        runtime: &tokio::runtime::Handle,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        options: ClusterObjectRpcOptions,
+    ) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
+        let traced_request;
+        let request = if request.traceparent().is_some() {
+            request
+        } else {
+            traced_request = request.clone().with_trace_context_if_missing();
+            &traced_request
+        };
+        let traceparent = request.traceparent().unwrap_or_default().to_string();
+        let call_started_at = Instant::now();
+        let sign_started_at = Instant::now();
+        let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
+        let request_sign_us = cluster_object_rpc_elapsed_us(sign_started_at);
+        metrics::histogram!(
+            "sinomo.object_rpc.sign.us",
+            "route" => request.route.clone(),
+            "category" => request.category.clone()
+        )
+        .record(request_sign_us as f64);
+        let deadline = ClusterEndpointRpcDeadline::new(options.timeouts.connect_timeout);
+        let mut failed_edges = ClusterDeliveryFailedEdges::default();
+        let mut failures = Vec::new();
+        let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
+        metrics::counter!(
+            "sinomo.object_rpc.target.calls",
+            "route" => request.route.clone(),
+            "category" => request.category.clone()
+        )
+        .increment(1);
+        tracing::debug!(
+            target: "sinomo.network.object_rpc",
+            %traceparent,
+            route = %request.route,
+            category = %request.category,
+            %target_node_id,
+            sign_us = request_sign_us,
+            stream = true,
+            "cluster object rpc stream route start"
+        );
+
+        for _ in 0..max_route_attempts {
+            let plan_started_at = Instant::now();
+            let Some(route_plan) = cluster_delivery_route_plan_async(
+                runtime,
+                paths,
+                state,
+                &state.local_node_id,
+                target_node_id,
+                failed_edges.try_clone()?,
+                Vec::new(),
+            )
+            .await?
+            else {
+                break;
+            };
+            let plan_us = cluster_object_rpc_elapsed_us(plan_started_at);
+            metrics::histogram!(
+                "sinomo.object_rpc.route_plan.us",
+                "route" => request.route.clone(),
+                "category" => request.category.clone()
+            )
+            .record(plan_us as f64);
+            if route_plan.endpoints.is_empty() {
+                failed_edges.try_insert(&state.local_node_id, &route_plan.next_hop)?;
+                failures.push(format!("{}: no usable endpoint", route_plan.next_hop));
+                continue;
+            }
+            tracing::trace!(
+                target: "sinomo.network.object_rpc",
+                %traceparent,
+                route = %request.route,
+                category = %request.category,
+                %target_node_id,
+                next_hop = %route_plan.next_hop,
+                plan_us,
+                endpoints = %cluster_object_rpc_endpoint_trace_list(&route_plan.endpoints),
+                stream = true,
+                "cluster object rpc stream route plan selected"
+            );
+            let route_endpoint_count = route_plan.endpoints.len();
+            for (endpoint_index, endpoint) in route_plan.endpoints.into_iter().enumerate() {
+                let attempt_started_at = Instant::now();
+                let Some(remaining) = deadline.checked_remaining() else {
+                    return Err(cluster_target_rpc_timeout_error(
+                        target_node_id,
+                        options.timeouts.connect_timeout,
+                    ));
+                };
+                let final_hop = &route_plan.next_hop == target_node_id;
+                let endpoints_left = route_endpoint_count.saturating_sub(endpoint_index).max(1);
+                let endpoint_attempt_budget = cluster_target_endpoint_attempt_budget(
+                    remaining,
+                    endpoints_left,
+                    route_endpoint_count,
+                );
+                let hop_timeouts = if final_hop {
+                    cluster_target_final_hop_transport_timeouts(
+                        options.timeouts,
+                        endpoint_attempt_budget,
+                        remaining,
+                    )
+                } else {
+                    cluster_relay_hop_transport_timeouts(options.timeouts, endpoint_attempt_budget)
+                };
+                let (outer_build_us, outer_sign_us, send_us, response) = if final_hop {
+                    let send_started_at = Instant::now();
+                    let response = self
+                        .host
+                        .send_signed_endpoint_stream_response_rpc_async(
+                            &endpoint,
+                            &request_auth,
+                            request,
+                            hop_timeouts,
+                        )
+                        .await;
+                    (
+                        0,
+                        0,
+                        cluster_object_rpc_elapsed_us(send_started_at),
+                        response,
+                    )
+                } else {
+                    let outer_build_started_at = Instant::now();
+                    let target_endpoints =
+                        cluster_delivery_target_endpoint_hints(paths, state, target_node_id)?;
+                    let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
+                        &state.cluster_id,
+                        target_node_id,
+                        request,
+                        request_auth.clone(),
+                        std::iter::once(state.local_node_id.clone()),
+                        &route_plan.path,
+                        &target_endpoints,
+                        options.timeouts.connect_timeout,
+                    )?;
+                    let outer_build_us = cluster_object_rpc_elapsed_us(outer_build_started_at);
+                    let outer_sign_started_at = Instant::now();
+                    let outer_auth = self.host.sign_endpoint_rpc_request_async(&outer).await?;
+                    let outer_sign_us = cluster_object_rpc_elapsed_us(outer_sign_started_at);
+                    let send_started_at = Instant::now();
+                    let response = self
+                        .host
+                        .send_signed_endpoint_stream_response_rpc_async(
+                            &endpoint,
+                            &outer_auth,
+                            &outer,
+                            hop_timeouts,
+                        )
+                        .await;
+                    (
+                        outer_build_us,
+                        outer_sign_us,
+                        cluster_object_rpc_elapsed_us(send_started_at),
+                        response,
+                    )
+                };
+                match response {
+                    Ok(response) if relay_response_is_routing_error(&response.response) => {
+                        metrics::counter!(
+                            "sinomo.object_rpc.target.routing_errors",
+                            "route" => request.route.clone(),
+                            "category" => request.category.clone()
+                        )
+                        .increment(1);
+                        tracing::debug!(
+                            target: "sinomo.network.object_rpc",
+                            %traceparent,
+                            route = %request.route,
+                            category = %request.category,
+                            %target_node_id,
+                            next_hop = %route_plan.next_hop,
+                            endpoint = %endpoint.address,
+                            transport = ?endpoint.transport,
+                            final_hop,
+                            stream = true,
+                            "cluster object rpc stream relay returned routing error"
+                        );
+                        failures.push(format!(
+                            "{} ({:?}) returned routing error: {}",
+                            endpoint.address,
+                            endpoint.transport,
+                            relay_response_routing_error_detail(&response.response)
+                        ));
+                        break;
+                    }
+                    Ok(response) => {
+                        if let Some(responder_node_id) = cluster_object_rpc_wrong_responder_node_id(
+                            &response.response,
+                            target_node_id,
+                        ) {
+                            metrics::counter!(
+                                "sinomo.object_rpc.target.responder_mismatch",
+                                "route" => request.route.clone(),
+                                "category" => request.category.clone()
+                            )
+                            .increment(1);
+                            tracing::debug!(
+                                target: "sinomo.network.object_rpc",
+                                %traceparent,
+                                route = %request.route,
+                                category = %request.category,
+                                %target_node_id,
+                                next_hop = %route_plan.next_hop,
+                                endpoint = %endpoint.address,
+                                transport = ?endpoint.transport,
+                                final_hop,
+                                expected = %target_node_id,
+                                got = %responder_node_id,
+                                sign_us = request_sign_us,
+                                plan_us,
+                                outer_build_us,
+                                outer_sign_us,
+                                send_us,
+                                attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at),
+                                total_us = cluster_object_rpc_elapsed_us(call_started_at),
+                                stream = true,
+                                "cluster object rpc stream responder mismatch"
+                            );
+                            let failure = if final_hop {
+                                record_cluster_delivery_endpoint_identity_mismatch(
+                                    paths, state, &endpoint,
+                                );
+                                format!(
+                                    "{} ({:?}) responder mismatch: expected {}, got {}",
+                                    endpoint.address,
+                                    endpoint.transport,
+                                    target_node_id,
+                                    responder_node_id
+                                )
+                            } else {
+                                format!(
+                                    "{} ({:?}) relay responder mismatch: expected final {}, got {}",
+                                    endpoint.address,
+                                    endpoint.transport,
+                                    target_node_id,
+                                    responder_node_id
+                                )
+                            };
+                            failures.push(failure);
+                            continue;
+                        }
+                        let attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at);
+                        let total_us = cluster_object_rpc_elapsed_us(call_started_at);
+                        metrics::histogram!(
+                            "sinomo.object_rpc.target.attempt.us",
+                            "route" => request.route.clone(),
+                            "category" => request.category.clone(),
+                            "outcome" => "ok"
+                        )
+                        .record(attempt_us as f64);
+                        metrics::histogram!(
+                            "sinomo.object_rpc.target.total.us",
+                            "route" => request.route.clone(),
+                            "category" => request.category.clone(),
+                            "outcome" => "ok"
+                        )
+                        .record(total_us as f64);
+                        tracing::debug!(
+                            target: "sinomo.network.object_rpc",
+                            %traceparent,
+                            route = %request.route,
+                            category = %request.category,
+                            %target_node_id,
+                            next_hop = %route_plan.next_hop,
+                            endpoint = %endpoint.address,
+                            transport = ?endpoint.transport,
+                            final_hop,
+                            sign_us = request_sign_us,
+                            plan_us,
+                            outer_build_us,
+                            outer_sign_us,
+                            send_us,
+                            attempt_us,
+                            total_us,
+                            stream = true,
+                            "cluster object rpc stream delivered"
+                        );
+                        return Ok(response);
+                    }
+                    Err(error) => {
+                        let attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at);
+                        let total_us = cluster_object_rpc_elapsed_us(call_started_at);
+                        metrics::histogram!(
+                            "sinomo.object_rpc.target.attempt.us",
+                            "route" => request.route.clone(),
+                            "category" => request.category.clone(),
+                            "outcome" => "error"
+                        )
+                        .record(attempt_us as f64);
+                        metrics::histogram!(
+                            "sinomo.object_rpc.target.total.us",
+                            "route" => request.route.clone(),
+                            "category" => request.category.clone(),
+                            "outcome" => "error"
+                        )
+                        .record(total_us as f64);
+                        tracing::debug!(
+                            target: "sinomo.network.object_rpc",
+                            %traceparent,
+                            route = %request.route,
+                            category = %request.category,
+                            %target_node_id,
+                            next_hop = %route_plan.next_hop,
+                            endpoint = %endpoint.address,
+                            transport = ?endpoint.transport,
+                            final_hop,
+                            sign_us = request_sign_us,
+                            plan_us,
+                            outer_build_us,
+                            outer_sign_us,
+                            send_us,
+                            attempt_us,
+                            total_us,
+                            error = %error,
+                            stream = true,
+                            "cluster object rpc stream attempt failed"
+                        );
+                        failures.push(format!(
+                            "{} ({:?}): {error}",
+                            endpoint.address, endpoint.transport
+                        ));
+                    }
+                }
+            }
+            failed_edges.try_insert(&state.local_node_id, &route_plan.next_hop)?;
+        }
+
+        Err(NetworkError::Io {
+            operation: "cluster target stream rpc".to_string(),
             detail: format!(
                 "route to target node {target_node_id} failed{}",
                 if failures.is_empty() {
@@ -3829,6 +4371,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingSignedHost {
         target_sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
+        stream_target_sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
         fail_first_send: bool,
     }
 
@@ -3861,6 +4404,37 @@ mod tests {
                 } else {
                     ObjectRpcResponse::encode_body("/test/target", &"ok")
                 }
+            })
+        }
+
+        fn send_signed_endpoint_stream_response_rpc_async<'a>(
+            &'a mut self,
+            endpoint: &'a ClusterEndpointRecord,
+            _auth: &'a [u8],
+            request: &'a ObjectRpcRequest,
+            timeouts: DaemonRpcTimeouts,
+        ) -> ClusterSignedEndpointRpcFuture<'a, crate::ObjectRpcStreamResponse> {
+            let endpoint = endpoint.clone();
+            let request = request.clone();
+            let sends = &mut self.stream_target_sends;
+            Box::pin(async move {
+                sends.push((endpoint, request, timeouts));
+                let mut response = ObjectRpcResponse::from_encoded_body(
+                    "/test/stream-target",
+                    b"stream-body".to_vec(),
+                );
+                crate::set_object_rpc_response_stream_mode(
+                    &mut response,
+                    crate::ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
+                );
+                Ok(crate::ObjectRpcStreamResponse::from_buffered_response(
+                    response,
+                    crate::RawByteStreamChunkOptions {
+                        chunk_bytes: 4,
+                        max_total_bytes: Some(1024),
+                        idle_timeout: Some(Duration::from_secs(1)),
+                    },
+                ))
             })
         }
     }
@@ -4074,6 +4648,75 @@ mod tests {
                 "idle budget must remain capped by the caller's route budget: {idle_timeout:?}"
             );
         }
+    }
+
+    #[test]
+    fn cluster_target_stream_routes_to_stream_endpoint_method() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-target-stream-route");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_target_stream_route").expect("cluster id");
+        let local_node = NodeId::from_legacy_named("node_target_stream_local").expect("local node");
+        let target_node =
+            NodeId::from_legacy_named("node_target_stream_target").expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "target stream route",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut target_member =
+            ClusterMemberRecord::local_voter(cluster_id, target_node.clone(), "target", "pk", now);
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "stream-target.test:21353".to_string(),
+            0,
+        )];
+        state.members.push(target_member);
+
+        let mut request =
+            ObjectRpcRequest::encode_body("/test/stream-target", "test", &"ping").expect("request");
+        crate::set_object_rpc_request_stream_mode(
+            &mut request,
+            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut host = RecordingSignedHost::default();
+        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
+
+        let mut response = runtime
+            .block_on(client.call_target_stream(
+                &state,
+                &target_node,
+                &request,
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
+                    Duration::from_secs(15),
+                )),
+            ))
+            .expect("stream target route");
+        let body = runtime
+            .block_on(response.body.collect_to_vec())
+            .expect("stream body");
+
+        assert_eq!(response.response.route, "/test/stream-target");
+        assert_eq!(body, b"stream-body");
+        assert_eq!(host.target_sends.len(), 0);
+        assert_eq!(host.stream_target_sends.len(), 1);
+        assert_eq!(
+            host.stream_target_sends[0].0.address,
+            "stream-target.test:21353"
+        );
     }
 
     #[test]

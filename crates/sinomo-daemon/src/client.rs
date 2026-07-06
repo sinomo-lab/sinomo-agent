@@ -803,6 +803,105 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEnd
             .await
         })
     }
+
+    fn send_signed_endpoint_stream_response_rpc_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        auth: &'a [u8],
+        request: &'a ObjectRpcRequest,
+        timeouts: sinomo_core::network::DaemonRpcTimeouts,
+    ) -> sinomo_core::network::ClusterSignedEndpointRpcFuture<
+        'a,
+        sinomo_core::network::ObjectRpcStreamResponse,
+    > {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            if self.use_tcp_tunnel
+                && let Some(result) = crate::tcp_tunnel::send_signed_endpoint_rpc_via_tcp_tunnel(
+                    endpoint,
+                    auth,
+                    request,
+                    timeouts,
+                    &runtime,
+                    self.paths.as_ref(),
+                )
+                .await
+            {
+                return result.map(|response| {
+                    sinomo_core::network::ObjectRpcStreamResponse::from_buffered_response(
+                        response,
+                        sinomo_core::network::RawByteStreamChunkOptions {
+                            chunk_bytes: sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES,
+                            max_total_bytes: u64::try_from(
+                                sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
+                            )
+                            .ok(),
+                            idle_timeout: timeouts.idle_timeout,
+                        },
+                    )
+                });
+            }
+            sinomo_core::network::send_daemon_rpc_stream_response_to_cluster_endpoint_async(
+                endpoint,
+                Some(auth),
+                request,
+                timeouts,
+            )
+            .await
+        })
+    }
+
+    fn forward_signed_endpoint_stream_rpc_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        auth: &'a [u8],
+        request: &'a ObjectRpcRequest,
+        timeouts: sinomo_core::network::DaemonRpcTimeouts,
+        upstream: &'a mut sinomo_core::network::AsyncDaemonControlStream,
+        upstream_address: &'a str,
+        max_response_bytes: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        sinomo_core::network::ClusterRelayStreamSendOutcome,
+                        sinomo_core::network::NetworkError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            if self.use_tcp_tunnel
+                && let Some(result) = crate::tcp_tunnel::forward_signed_endpoint_rpc_via_tcp_tunnel(
+                    endpoint,
+                    auth,
+                    request,
+                    timeouts,
+                    upstream,
+                    upstream_address,
+                    max_response_bytes,
+                    &runtime,
+                    self.paths.as_ref(),
+                )
+                .await
+            {
+                return result;
+            }
+            let mut signed = request.clone();
+            signed.auth = Some(auth.to_vec());
+            sinomo_core::network::forward_streamed_daemon_rpc_to_cluster_endpoint_async(
+                endpoint,
+                &signed,
+                timeouts,
+                upstream,
+                upstream_address,
+                max_response_bytes,
+            )
+            .await
+        })
+    }
 }
 
 fn daemon_paths_from_cluster_paths(

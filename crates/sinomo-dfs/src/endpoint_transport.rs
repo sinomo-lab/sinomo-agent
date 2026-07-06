@@ -12,16 +12,20 @@ use sinomo_core::ClusterEndpointRecord;
 use sinomo_core::local::SinomoDataDir;
 #[cfg(test)]
 use sinomo_core::network::ClusterPaths;
-use sinomo_core::network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse, SinomoObjectCodec};
+use sinomo_core::network::{
+    NetworkError, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcStreamResponse,
+    RawByteStreamChunkOptions, SinomoObjectCodec,
+};
 use sinomo_core::node::NodeId;
 
 use crate::{
-    AsyncDfsMessageTransport, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES, DfsDirectReadRequest,
-    DfsError, DfsMessageCommand, DfsMessageProcessResult, DfsMessageResponse, DfsMessageTransport,
-    DfsMessageTransportFuture, DfsNetworkMessage, DfsReadResponse, DfsRoutedMessage,
-    DfsTransferProfile, DfsTransportIdentity, DistributedRepairJob, NetworkedDfsService,
-    NetworkedDfsServiceEvent, decode_dfs_message_rpc_response,
-    dfs_direct_read_request_from_read_request, dfs_direct_read_response_from_rpc_response,
+    AsyncDfsMessageTransport, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
+    DfsDirectReadClientStreamResponse, DfsDirectReadRequest, DfsError, DfsMessageCommand,
+    DfsMessageProcessResult, DfsMessageResponse, DfsMessageTransport, DfsMessageTransportFuture,
+    DfsNetworkMessage, DfsReadResponse, DfsRoutedMessage, DfsTransferProfile, DfsTransportIdentity,
+    DistributedRepairJob, NetworkedDfsService, NetworkedDfsServiceEvent,
+    decode_dfs_message_rpc_response, dfs_direct_read_request_from_read_request,
+    dfs_direct_read_response_from_rpc_response, dfs_direct_read_response_from_rpc_stream_response,
     dfs_direct_read_rpc_request, dfs_message_is_read_only_request, dfs_message_rpc_request,
     dfs_network_message_allows_write_repair_progress, dfs_perf_trace, dfs_perf_trace_enabled,
     retained_networked_dfs_service_events,
@@ -93,6 +97,18 @@ pub(crate) type AsyncDfsDirectReadSender = Arc<
         + Sync,
 >;
 
+pub(crate) type AsyncDfsDirectReadStreamSender = Arc<
+    dyn for<'a> Fn(
+            &'a NodeId,
+            &'a DfsDirectReadRequest,
+            Duration,
+        ) -> DfsPeerTransportFuture<
+            'a,
+            Result<DfsDirectReadClientStreamResponse, DfsPeerTransportError>,
+        > + Send
+        + Sync,
+>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DfsObjectRpcSendOptions {
     pub connect_timeout: Duration,
@@ -131,6 +147,32 @@ pub trait AsyncDfsPeerTransport: Send + Sync {
         request: &'a ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResponse, DfsPeerTransportError>>;
+
+    fn call_object_rpc_stream_async<'a>(
+        &'a self,
+        target_node_id: &'a NodeId,
+        request: &'a ObjectRpcRequest,
+        options: DfsObjectRpcSendOptions,
+    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcStreamResponse, DfsPeerTransportError>> {
+        Box::pin(async move {
+            let response = self
+                .call_object_rpc_async(target_node_id, request, options)
+                .await?;
+            Ok(ObjectRpcStreamResponse::from_buffered_response(
+                response,
+                dfs_raw_stream_chunk_options(options.connect_timeout),
+            ))
+        })
+    }
+}
+
+fn dfs_raw_stream_chunk_options(connect_timeout: Duration) -> RawByteStreamChunkOptions {
+    RawByteStreamChunkOptions {
+        chunk_bytes: sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES,
+        max_total_bytes: u64::try_from(sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES)
+            .ok(),
+        idle_timeout: Some(connect_timeout),
+    }
 }
 
 pub(crate) type AsyncDfsMessageSender = Arc<
@@ -187,6 +229,27 @@ pub(crate) fn async_dfs_direct_read_sender_from_peer_transport(
     })
 }
 
+pub(crate) fn async_dfs_direct_read_stream_sender_from_peer_transport(
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+) -> AsyncDfsDirectReadStreamSender {
+    Arc::new(move |target_node_id, request, connect_timeout| {
+        let peer_transport = Arc::clone(&peer_transport);
+        Box::pin(async move {
+            let rpc_request = dfs_direct_read_rpc_request(request)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            let response = peer_transport
+                .call_object_rpc_stream_async(
+                    target_node_id,
+                    &rpc_request,
+                    DfsObjectRpcSendOptions::new(connect_timeout),
+                )
+                .await?;
+            dfs_direct_read_response_from_rpc_stream_response(response)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+        })
+    })
+}
+
 pub(crate) fn dfs_message_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMessageSender {
@@ -238,6 +301,7 @@ pub struct DfsEndpointTransport {
     async_sender: Option<AsyncDfsMessageSender>,
     direct_read_sender: Option<DfsDirectReadSender>,
     async_direct_read_sender: Option<AsyncDfsDirectReadSender>,
+    async_direct_read_stream_sender: Option<AsyncDfsDirectReadStreamSender>,
 }
 
 impl std::fmt::Debug for DfsEndpointTransport {
@@ -282,6 +346,7 @@ impl DfsEndpointTransport {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -296,6 +361,7 @@ impl DfsEndpointTransport {
             endpoints,
             connect_timeout,
             Some(sender),
+            None,
             None,
             None,
             None,
@@ -317,6 +383,7 @@ impl DfsEndpointTransport {
             Some(sender),
             None,
             None,
+            None,
         )
     }
 
@@ -334,6 +401,7 @@ impl DfsEndpointTransport {
             connect_timeout,
             Some(sender),
             Some(async_sender),
+            None,
             None,
             None,
         )
@@ -354,6 +422,7 @@ impl DfsEndpointTransport {
             Some(sender),
             Some(async_sender),
             Some(direct_read_sender),
+            None,
             None,
         )
     }
@@ -379,6 +448,9 @@ impl DfsEndpointTransport {
                 direct_read_peer_transport,
             )),
             Some(async_dfs_direct_read_sender_from_peer_transport(
+                Arc::clone(&async_direct_read_peer_transport),
+            )),
+            Some(async_dfs_direct_read_stream_sender_from_peer_transport(
                 async_direct_read_peer_transport,
             )),
         )
@@ -392,6 +464,7 @@ impl DfsEndpointTransport {
         async_sender: AsyncDfsMessageSender,
         direct_read_sender: DfsDirectReadSender,
         async_direct_read_sender: AsyncDfsDirectReadSender,
+        async_direct_read_stream_sender: AsyncDfsDirectReadStreamSender,
     ) -> Self {
         Self::with_senders(
             local_node_id,
@@ -401,6 +474,7 @@ impl DfsEndpointTransport {
             Some(async_sender),
             Some(direct_read_sender),
             Some(async_direct_read_sender),
+            Some(async_direct_read_stream_sender),
         )
     }
 
@@ -412,6 +486,7 @@ impl DfsEndpointTransport {
         async_sender: Option<AsyncDfsMessageSender>,
         direct_read_sender: Option<DfsDirectReadSender>,
         async_direct_read_sender: Option<AsyncDfsDirectReadSender>,
+        async_direct_read_stream_sender: Option<AsyncDfsDirectReadStreamSender>,
     ) -> Self {
         let mut endpoints_by_node_id: BTreeMap<NodeId, Vec<ClusterEndpointRecord>> =
             BTreeMap::new();
@@ -433,6 +508,7 @@ impl DfsEndpointTransport {
             async_sender,
             direct_read_sender,
             async_direct_read_sender,
+            async_direct_read_stream_sender,
         }
     }
 
@@ -552,22 +628,32 @@ impl DfsEndpointTransport {
         target_node_id: &NodeId,
         routed_message: &DfsRoutedMessage,
     ) -> Result<Option<Vec<DfsRoutedMessage>>, NetworkError> {
-        let Some(sender) = self.async_direct_read_sender.as_ref().cloned() else {
-            return Ok(None);
-        };
         let DfsNetworkMessage::ReadRequest(read_request) = &routed_message.message else {
             return Ok(None);
         };
         let Some(request) = dfs_direct_read_request_from_read_request(read_request) else {
             return Ok(None);
         };
-        let response = send_dfs_direct_read_to_endpoint_async(
-            sender,
-            self.connect_timeout,
-            target_node_id.clone(),
-            &request,
-        )
-        .await?;
+        let response = if let Some(sender) = self.async_direct_read_stream_sender.as_ref().cloned()
+        {
+            send_dfs_direct_read_stream_to_endpoint_async(
+                sender,
+                self.connect_timeout,
+                target_node_id.clone(),
+                &request,
+            )
+            .await?
+        } else if let Some(sender) = self.async_direct_read_sender.as_ref().cloned() {
+            send_dfs_direct_read_to_endpoint_async(
+                sender,
+                self.connect_timeout,
+                target_node_id.clone(),
+                &request,
+            )
+            .await?
+        } else {
+            return Ok(None);
+        };
         Ok(Some(vec![dfs_direct_read_response_routed_message(
             target_node_id,
             routed_message,
@@ -869,6 +955,43 @@ async fn send_dfs_direct_read_to_endpoint_async(
     }
 }
 
+async fn send_dfs_direct_read_stream_to_endpoint_async(
+    sender: AsyncDfsDirectReadStreamSender,
+    connect_timeout: Duration,
+    target_node_id: NodeId,
+    request: &DfsDirectReadRequest,
+) -> Result<DfsReadResponse, NetworkError> {
+    let send_started = Instant::now();
+    match sender(&target_node_id, request, connect_timeout).await {
+        Ok(response) => {
+            let response = response.collect_to_read_response().await?;
+            dfs_perf_trace(format_args!(
+                "direct-read-stream-send-async local_request={} target={} request={} bytes={} elapsed_ms={}",
+                request.object_id,
+                target_node_id,
+                request.request_id,
+                request.content_size_bytes,
+                send_started.elapsed().as_millis()
+            ));
+            Ok(response)
+        }
+        Err(error) => {
+            dfs_perf_trace(format_args!(
+                "direct-read-stream-send-async-error target={} request={} bytes={} elapsed_ms={} error={}",
+                target_node_id,
+                request.request_id,
+                request.content_size_bytes,
+                send_started.elapsed().as_millis(),
+                error
+            ));
+            Err(NetworkError::Io {
+                operation: format!("direct DFS read stream from {target_node_id}"),
+                detail: error.to_string(),
+            })
+        }
+    }
+}
+
 async fn send_dfs_routed_message_to_endpoint_async(
     sender: AsyncDfsMessageSender,
     connect_timeout: Duration,
@@ -1066,6 +1189,7 @@ impl DfsEndpointServedMessageTransport {
             endpoints,
             connect_timeout,
             Some(sender),
+            None,
             None,
             None,
             None,

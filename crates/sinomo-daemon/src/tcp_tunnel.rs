@@ -6,10 +6,10 @@ use sinomo_core::cluster::read_cluster_state_without_kv;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     AsyncDaemonControlStream, CLUSTER_TCP_TUNNEL_OPEN_ROUTE, CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
-    CLUSTER_TCP_TUNNEL_RPC_CATEGORY, ClusterEndpointSelectionPurpose, ClusterTcpTunnelFrame,
-    ClusterTcpTunnelOpenRequest, ClusterTcpTunnelOpenResponse, DaemonRpcTimeouts, NetworkError,
-    ObjectFrameIoOptions, ObjectRpcRequest, ObjectRpcResponse, read_object_frame_async,
-    write_object_frame_async,
+    CLUSTER_TCP_TUNNEL_RPC_CATEGORY, ClusterEndpointSelectionPurpose,
+    ClusterRelayStreamSendOutcome, ClusterTcpTunnelFrame, ClusterTcpTunnelOpenRequest,
+    ClusterTcpTunnelOpenResponse, DaemonRpcTimeouts, NetworkError, ObjectFrameIoOptions,
+    ObjectRpcRequest, ObjectRpcResponse, read_object_frame_async, write_object_frame_async,
 };
 use sinomo_core::node::NodeId;
 use sinomo_core::{
@@ -32,8 +32,23 @@ const TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX: &str = "tcp-tunnel://";
 type PendingTcpTunnelMap = Arc<tokio::sync::Mutex<HashMap<u64, PendingTcpTunnelRequest>>>;
 
 struct PendingTcpTunnelRequest {
-    tx: oneshot::Sender<Result<ObjectRpcResponse, NetworkError>>,
-    stream: Option<PendingTcpTunnelStreamResponse>,
+    kind: PendingTcpTunnelRequestKind,
+}
+
+enum PendingTcpTunnelRequestKind {
+    Collect {
+        tx: oneshot::Sender<Result<ObjectRpcResponse, NetworkError>>,
+        stream: Option<PendingTcpTunnelStreamResponse>,
+    },
+    Forward {
+        tx: mpsc::Sender<Result<TcpTunnelStreamForwardEvent, NetworkError>>,
+    },
+}
+
+enum TcpTunnelStreamForwardEvent {
+    Response(ObjectRpcResponse),
+    Chunk(Vec<u8>),
+    End,
 }
 
 struct PendingTcpTunnelStreamResponse {
@@ -147,10 +162,12 @@ impl TcpTunnelHandle {
         let _active_request = TcpTunnelActiveRequestGuard(&self.active_requests);
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .await
-            .insert(id, PendingTcpTunnelRequest { tx, stream: None });
+        self.pending.lock().await.insert(
+            id,
+            PendingTcpTunnelRequest {
+                kind: PendingTcpTunnelRequestKind::Collect { tx, stream: None },
+            },
+        );
         let frame = ClusterTcpTunnelFrame::Request { id, request };
         let send = self.tx.send(frame);
         let send_result = if let Some(timeout) = timeouts.connect_timeout {
@@ -198,16 +215,200 @@ impl TcpTunnelHandle {
         }
     }
 
+    async fn forward_stream(
+        &self,
+        request: ObjectRpcRequest,
+        timeouts: DaemonRpcTimeouts,
+        upstream: &mut AsyncDaemonControlStream,
+        upstream_address: &str,
+        max_response_bytes: usize,
+    ) -> Result<ClusterRelayStreamSendOutcome, NetworkError> {
+        self.active_requests.fetch_add(1, Ordering::Relaxed);
+        let _active_request = TcpTunnelActiveRequestGuard(&self.active_requests);
+        let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, mut rx) = mpsc::channel(TCP_TUNNEL_CHANNEL_CAPACITY);
+        self.pending.lock().await.insert(
+            id,
+            PendingTcpTunnelRequest {
+                kind: PendingTcpTunnelRequestKind::Forward { tx },
+            },
+        );
+        let send = self.tx.send(ClusterTcpTunnelFrame::Request { id, request });
+        let send_result = if let Some(timeout) = timeouts.connect_timeout {
+            match tokio::time::timeout(timeout, send).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.pending.lock().await.remove(&id);
+                    return Err(tcp_tunnel_timeout_error("send tcp tunnel request", timeout));
+                }
+            }
+        } else {
+            send.await
+        };
+        if send_result.is_err() {
+            self.pending.lock().await.remove(&id);
+            return Err(NetworkError::Io {
+                operation: "send tcp tunnel request".to_string(),
+                detail: "tunnel writer is closed".to_string(),
+            });
+        }
+
+        let frame_options = ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
+        let mut response_started = false;
+        let mut streamed_body = false;
+        let mut total_body_bytes: usize = 0;
+        loop {
+            let next = if let Some(timeout) = timeouts.idle_timeout.or(timeouts.connect_timeout) {
+                match tokio::time::timeout(timeout, rx.recv()).await {
+                    Ok(event) => event,
+                    Err(_) => {
+                        self.pending.lock().await.remove(&id);
+                        let error = tcp_tunnel_timeout_error("read tcp tunnel stream", timeout);
+                        return if response_started {
+                            Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
+                                error,
+                            ))
+                        } else {
+                            Err(error)
+                        };
+                    }
+                }
+            } else {
+                rx.recv().await
+            };
+            let Some(next) = next else {
+                self.pending.lock().await.remove(&id);
+                let error = NetworkError::Io {
+                    operation: "read tcp tunnel stream".to_string(),
+                    detail: "tunnel reader is closed".to_string(),
+                };
+                return if response_started {
+                    Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
+                        error,
+                    ))
+                } else {
+                    Err(error)
+                };
+            };
+            let event = match next {
+                Ok(event) => event,
+                Err(error) => {
+                    self.pending.lock().await.remove(&id);
+                    return if response_started {
+                        Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
+                            error,
+                        ))
+                    } else {
+                        Err(error)
+                    };
+                }
+            };
+            match event {
+                TcpTunnelStreamForwardEvent::Response(response) => {
+                    if sinomo_core::network::relay_response_is_routing_error(&response) {
+                        self.pending.lock().await.remove(&id);
+                        return Ok(ClusterRelayStreamSendOutcome::RoutingError(response));
+                    }
+                    streamed_body = sinomo_core::network::object_rpc_response_stream_mode(
+                        &response,
+                    )
+                        == sinomo_core::network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody;
+                    if let Err(error) = upstream
+                        .write_rpc_response(upstream_address, &response, frame_options)
+                        .await
+                    {
+                        self.pending.lock().await.remove(&id);
+                        return Err(error);
+                    }
+                    response_started = true;
+                    if !streamed_body {
+                        self.pending.lock().await.remove(&id);
+                        return Ok(ClusterRelayStreamSendOutcome::Forwarded);
+                    }
+                }
+                TcpTunnelStreamForwardEvent::Chunk(bytes) => {
+                    if !response_started || !streamed_body {
+                        self.pending.lock().await.remove(&id);
+                        let error = NetworkError::Io {
+                            operation: "read tcp tunnel stream".to_string(),
+                            detail: "tcp tunnel received stream chunk before streamed response"
+                                .to_string(),
+                        };
+                        return if response_started {
+                            Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
+                                error,
+                            ))
+                        } else {
+                            Err(error)
+                        };
+                    }
+                    let Some(next_total_body_bytes) = total_body_bytes.checked_add(bytes.len())
+                    else {
+                        return Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
+                            NetworkError::Io {
+                                operation: "read tcp tunnel stream".to_string(),
+                                detail: "tcp tunnel streamed response size overflow".to_string(),
+                            },
+                        ));
+                    };
+                    total_body_bytes = next_total_body_bytes;
+                    if total_body_bytes > max_response_bytes {
+                        self.pending.lock().await.remove(&id);
+                        return Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
+                            NetworkError::Io {
+                                operation: "read tcp tunnel stream".to_string(),
+                                detail: format!(
+                                    "tcp tunnel streamed response exceeded {max_response_bytes} bytes"
+                                ),
+                            },
+                        ));
+                    }
+                    if let Err(error) = upstream
+                        .write_raw_byte_stream_chunk(upstream_address, &bytes, frame_options)
+                        .await
+                    {
+                        self.pending.lock().await.remove(&id);
+                        return Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
+                            error,
+                        ));
+                    }
+                }
+                TcpTunnelStreamForwardEvent::End => {
+                    self.pending.lock().await.remove(&id);
+                    if streamed_body {
+                        if let Err(error) = upstream
+                            .write_raw_byte_stream_chunk(upstream_address, &[], frame_options)
+                            .await
+                        {
+                            return Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
+                                error,
+                            ));
+                        }
+                    }
+                    return Ok(ClusterRelayStreamSendOutcome::Forwarded);
+                }
+            }
+        }
+    }
+
     async fn fail_pending(&self, detail: String) {
         let pending = {
             let mut guard = self.pending.lock().await;
             std::mem::take(&mut *guard)
         };
         for sender in pending.into_values() {
-            let _ = sender.tx.send(Err(NetworkError::Io {
+            let error = NetworkError::Io {
                 operation: "tcp tunnel request".to_string(),
                 detail: detail.clone(),
-            }));
+            };
+            match sender.kind {
+                PendingTcpTunnelRequestKind::Collect { tx, .. } => {
+                    let _ = tx.send(Err(error));
+                }
+                PendingTcpTunnelRequestKind::Forward { tx } => {
+                    let _ = tx.send(Err(error)).await;
+                }
+            }
         }
     }
 }
@@ -308,6 +509,10 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
     if endpoint.transport != ClusterTransportKind::LanTcp {
         return None;
     }
+    if !tcp_tunnel_is_synthetic_endpoint(endpoint) {
+        spawn_tcp_tunnel_connect_attempt(endpoint, runtime, paths);
+        return None;
+    }
     let mut signed = request.clone();
     signed.auth = Some(auth.to_vec());
     if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
@@ -323,26 +528,82 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
             }
         };
     }
-    if tcp_tunnel_is_synthetic_endpoint(endpoint) {
-        if let Some(paths) = paths {
-            remember_tcp_tunnel_connectivity(
-                paths,
-                endpoint,
-                sinomo_core::network::ClusterConnectivityState::Unreachable,
-                Some(runtime),
-            )
-            .await;
-        }
-        return Some(Err(NetworkError::Io {
-            operation: "send tcp tunnel request".to_string(),
-            detail: format!(
-                "no persistent tcp tunnel to {} ({})",
-                endpoint.node_id, endpoint.address
-            ),
-        }));
+    if let Some(paths) = paths {
+        remember_tcp_tunnel_connectivity(
+            paths,
+            endpoint,
+            sinomo_core::network::ClusterConnectivityState::Unreachable,
+            Some(runtime),
+        )
+        .await;
     }
-    spawn_tcp_tunnel_connect_attempt(endpoint, runtime, paths);
-    None
+    Some(Err(NetworkError::Io {
+        operation: "send tcp tunnel request".to_string(),
+        detail: format!(
+            "no persistent tcp tunnel to {} ({})",
+            endpoint.node_id, endpoint.address
+        ),
+    }))
+}
+
+pub(crate) async fn forward_signed_endpoint_rpc_via_tcp_tunnel(
+    endpoint: &ClusterEndpointRecord,
+    auth: &[u8],
+    request: &ObjectRpcRequest,
+    timeouts: DaemonRpcTimeouts,
+    upstream: &mut AsyncDaemonControlStream,
+    upstream_address: &str,
+    max_response_bytes: usize,
+    runtime: &tokio::runtime::Handle,
+    paths: Option<&DaemonPaths>,
+) -> Option<Result<ClusterRelayStreamSendOutcome, NetworkError>> {
+    if endpoint.transport != ClusterTransportKind::LanTcp {
+        return None;
+    }
+    if !tcp_tunnel_is_synthetic_endpoint(endpoint) {
+        spawn_tcp_tunnel_connect_attempt(endpoint, runtime, paths);
+        return None;
+    }
+    let mut signed = request.clone();
+    signed.auth = Some(auth.to_vec());
+    if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
+        return match forward_stream_over_tcp_tunnel_handle(
+            handle,
+            signed,
+            timeouts,
+            upstream,
+            upstream_address,
+            max_response_bytes,
+        )
+        .await
+        {
+            Ok(response) => Some(Ok(response)),
+            Err(error) => {
+                tracing::debug!(
+                    "tcp tunnel stream forward to {} ({}) failed after request acceptance: {error}",
+                    endpoint.node_id,
+                    endpoint.address
+                );
+                Some(Err(error))
+            }
+        };
+    }
+    if let Some(paths) = paths {
+        remember_tcp_tunnel_connectivity(
+            paths,
+            endpoint,
+            sinomo_core::network::ClusterConnectivityState::Unreachable,
+            Some(runtime),
+        )
+        .await;
+    }
+    Some(Err(NetworkError::Io {
+        operation: "send tcp tunnel stream request".to_string(),
+        detail: format!(
+            "no persistent tcp tunnel to {} ({})",
+            endpoint.node_id, endpoint.address
+        ),
+    }))
 }
 
 fn tcp_tunnel_connectivity_context(
@@ -451,6 +712,36 @@ async fn send_over_tcp_tunnel_handle(
     if let Err(error) = result.as_ref() {
         TCP_TUNNELS.remove_if_same(&handle);
         let detail = format!("tcp tunnel evicted after request failure: {error}");
+        handle.request_close(detail.clone());
+        handle.fail_pending(detail).await;
+    }
+    result
+}
+
+async fn forward_stream_over_tcp_tunnel_handle(
+    handle: Arc<TcpTunnelHandle>,
+    request: ObjectRpcRequest,
+    timeouts: DaemonRpcTimeouts,
+    upstream: &mut AsyncDaemonControlStream,
+    upstream_address: &str,
+    max_response_bytes: usize,
+) -> Result<ClusterRelayStreamSendOutcome, NetworkError> {
+    let result = handle
+        .forward_stream(
+            request,
+            timeouts,
+            upstream,
+            upstream_address,
+            max_response_bytes,
+        )
+        .await;
+    if result.is_err() {
+        TCP_TUNNELS.remove_if_same(&handle);
+        let detail = result
+            .as_ref()
+            .err()
+            .map(|error| format!("tcp tunnel evicted after streamed request failure: {error}"))
+            .unwrap_or_else(|| "tcp tunnel evicted after streamed request failure".to_string());
         handle.request_close(detail.clone());
         handle.fail_pending(detail).await;
     }
@@ -920,65 +1211,135 @@ async fn tcp_tunnel_reader_loop(
                 if sinomo_core::network::object_rpc_response_stream_mode(&response)
                     == sinomo_core::network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
                 {
-                    if let Some(pending) = handle.pending.lock().await.get_mut(&id) {
-                        pending.stream = Some(PendingTcpTunnelStreamResponse {
-                            response,
-                            body: Vec::new(),
-                        });
+                    let mut response = Some(response);
+                    let forward_tx = {
+                        let mut pending = handle.pending.lock().await;
+                        match pending.get_mut(&id).map(|pending| &mut pending.kind) {
+                            Some(PendingTcpTunnelRequestKind::Collect { stream, .. }) => {
+                                *stream = Some(PendingTcpTunnelStreamResponse {
+                                    response: response
+                                        .take()
+                                        .expect("streamed response retained for collect"),
+                                    body: Vec::new(),
+                                });
+                                None
+                            }
+                            Some(PendingTcpTunnelRequestKind::Forward { tx }) => Some(tx.clone()),
+                            None => None,
+                        }
+                    };
+                    if let Some(tx) = forward_tx {
+                        let _ = tx
+                            .send(Ok(TcpTunnelStreamForwardEvent::Response(
+                                response.expect("streamed response retained for forward"),
+                            )))
+                            .await;
                     }
                 } else if let Some(pending) = handle.pending.lock().await.remove(&id) {
-                    let _ = pending.tx.send(Ok(response));
+                    match pending.kind {
+                        PendingTcpTunnelRequestKind::Collect { tx, .. } => {
+                            let _ = tx.send(Ok(response));
+                        }
+                        PendingTcpTunnelRequestKind::Forward { tx } => {
+                            let _ = tx
+                                .send(Ok(TcpTunnelStreamForwardEvent::Response(response)))
+                                .await;
+                        }
+                    }
                 }
             }
             ClusterTcpTunnelFrame::StreamChunk { id, bytes } => {
-                let mut pending = handle.pending.lock().await;
+                let mut forward_tx = None;
                 let mut failure = None;
-                if let Some(request) = pending.get_mut(&id) {
-                    if let Some(stream) = request.stream.as_mut() {
-                        if stream.body.try_reserve(bytes.len()).is_ok() {
-                            stream.body.extend_from_slice(&bytes);
-                        } else {
-                            failure =
-                                Some("tcp tunnel streamed response exhausted memory".to_string());
+                {
+                    let mut pending = handle.pending.lock().await;
+                    if let Some(request) = pending.get_mut(&id) {
+                        match &mut request.kind {
+                            PendingTcpTunnelRequestKind::Collect { stream, .. } => {
+                                if let Some(stream) = stream.as_mut() {
+                                    if stream.body.try_reserve(bytes.len()).is_ok() {
+                                        stream.body.extend_from_slice(&bytes);
+                                    } else {
+                                        failure = Some(
+                                            "tcp tunnel streamed response exhausted memory"
+                                                .to_string(),
+                                        );
+                                    }
+                                } else {
+                                    failure = Some(
+                                        "tcp tunnel received stream chunk before streamed response frame"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                            PendingTcpTunnelRequestKind::Forward { tx } => {
+                                forward_tx = Some(tx.clone());
+                            }
                         }
-                    } else {
-                        failure = Some(
-                            "tcp tunnel received stream chunk before streamed response frame"
-                                .to_string(),
-                        );
                     }
                 }
-                if let Some(detail) = failure
-                    && let Some(request) = pending.remove(&id)
+                if let Some(detail) = failure {
+                    if let Some(request) = handle.pending.lock().await.remove(&id) {
+                        let error = NetworkError::Io {
+                            operation: "read tcp tunnel stream".to_string(),
+                            detail,
+                        };
+                        match request.kind {
+                            PendingTcpTunnelRequestKind::Collect { tx, .. } => {
+                                let _ = tx.send(Err(error));
+                            }
+                            PendingTcpTunnelRequestKind::Forward { tx } => {
+                                let _ = tx.send(Err(error)).await;
+                            }
+                        }
+                    }
+                } else if let Some(tx) = forward_tx
+                    && tx
+                        .send(Ok(TcpTunnelStreamForwardEvent::Chunk(bytes)))
+                        .await
+                        .is_err()
                 {
-                    let _ = request.tx.send(Err(NetworkError::Io {
-                        operation: "read tcp tunnel stream".to_string(),
-                        detail,
-                    }));
+                    handle.pending.lock().await.remove(&id);
                 }
             }
             ClusterTcpTunnelFrame::StreamEnd { id } => {
-                if let Some(mut pending) = handle.pending.lock().await.remove(&id) {
-                    let result = match pending.stream.take() {
-                        Some(mut stream) => {
-                            stream.response.body = stream.body;
-                            Ok(stream.response)
+                if let Some(pending) = handle.pending.lock().await.remove(&id) {
+                    match pending.kind {
+                        PendingTcpTunnelRequestKind::Collect { tx, mut stream } => {
+                            let result = match stream.take() {
+                                Some(mut stream) => {
+                                    stream.response.body = stream.body;
+                                    Ok(stream.response)
+                                }
+                                None => Err(NetworkError::Io {
+                                    operation: "read tcp tunnel stream".to_string(),
+                                    detail:
+                                        "tcp tunnel received stream end before streamed response frame"
+                                            .to_string(),
+                                }),
+                            };
+                            let _ = tx.send(result);
                         }
-                        None => Err(NetworkError::Io {
-                            operation: "read tcp tunnel stream".to_string(),
-                            detail: "tcp tunnel received stream end before streamed response frame"
-                                .to_string(),
-                        }),
-                    };
-                    let _ = pending.tx.send(result);
+                        PendingTcpTunnelRequestKind::Forward { tx } => {
+                            let _ = tx.send(Ok(TcpTunnelStreamForwardEvent::End)).await;
+                        }
+                    }
                 }
             }
             ClusterTcpTunnelFrame::StreamError { id, detail } => {
                 if let Some(pending) = handle.pending.lock().await.remove(&id) {
-                    let _ = pending.tx.send(Err(NetworkError::Io {
+                    let error = NetworkError::Io {
                         operation: "read tcp tunnel stream".to_string(),
                         detail,
-                    }));
+                    };
+                    match pending.kind {
+                        PendingTcpTunnelRequestKind::Collect { tx, .. } => {
+                            let _ = tx.send(Err(error));
+                        }
+                        PendingTcpTunnelRequestKind::Forward { tx } => {
+                            let _ = tx.send(Err(error)).await;
+                        }
+                    }
                 }
             }
             ClusterTcpTunnelFrame::Close { detail } => {
@@ -1262,12 +1623,8 @@ mod tests {
         let node_id = NodeId::from_legacy_named(node_name).expect("test node id");
         let handle = test_tunnel_handle(node_name, tx);
         TCP_TUNNELS.insert(handle.clone());
-        let endpoint = test_endpoint(
-            "tcp_tunnel_route_error_endpoint",
-            &node_id,
-            "10.0.0.2:21353",
-            ClusterTransportKind::LanTcp,
-        );
+        let local = NodeId::from_legacy_named("tcp_tunnel_route_error_local").expect("local");
+        let endpoint = tcp_tunnel_synthetic_endpoint(&local, &node_id);
 
         let result = send_signed_endpoint_rpc_via_tcp_tunnel(
             &endpoint,
@@ -1283,6 +1640,142 @@ mod tests {
         assert!(TCP_TUNNELS.get(&node_id).is_none());
         assert!(handle.pending.lock().await.is_empty());
         assert!(handle.clean_shutdown.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_does_not_hijack_real_lan_endpoint() {
+        let (tx, _rx) = mpsc::channel(1);
+        let node_name = "tcp_tunnel_real_lan_not_hijacked";
+        let node_id = NodeId::from_legacy_named(node_name).expect("test node id");
+        let handle = test_tunnel_handle(node_name, tx);
+        TCP_TUNNELS.insert(handle.clone());
+        let endpoint = test_endpoint(
+            "tcp_tunnel_real_lan_not_hijacked_endpoint",
+            &node_id,
+            "10.0.0.2:21353",
+            ClusterTransportKind::LanTcp,
+        );
+
+        let result = send_signed_endpoint_rpc_via_tcp_tunnel(
+            &endpoint,
+            b"auth",
+            &test_rpc_request(),
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(5)),
+            &tokio::runtime::Handle::current(),
+            None,
+        )
+        .await;
+
+        assert!(result.is_none());
+        assert!(TCP_TUNNELS.get(&node_id).is_some());
+        assert!(handle.pending.lock().await.is_empty());
+        assert!(!handle.clean_shutdown.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_stream_forward_writes_chunks_to_upstream() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let handle = test_tunnel_handle("tcp_tunnel_stream_forward_peer", tx);
+        let upstream_listener =
+            sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind upstream listener");
+        let upstream_address = upstream_listener
+            .local_addr_string()
+            .expect("upstream address");
+        let upstream_client = tokio::spawn({
+            let upstream_address = upstream_address.clone();
+            async move {
+                let mut stream =
+                    sinomo_core::network::AsyncDaemonControlStream::connect(&upstream_address)
+                        .await
+                        .expect("connect upstream");
+                let frame_options = ObjectFrameIoOptions::none();
+                let response = stream
+                    .read_rpc_response("upstream", 1024, frame_options)
+                    .await
+                    .expect("read upstream response");
+                assert_eq!(
+                    sinomo_core::network::object_rpc_response_stream_mode(&response),
+                    sinomo_core::network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
+                );
+                let mut raw = stream.into_inner();
+                let mut bytes = Vec::new();
+                sinomo_core::network::read_raw_byte_stream_chunks_to_vec_async(
+                    &mut raw,
+                    &mut bytes,
+                    sinomo_core::network::RawByteStreamChunkOptions {
+                        chunk_bytes: 1024,
+                        max_total_bytes: Some(1024),
+                        idle_timeout: Some(Duration::from_secs(1)),
+                    },
+                )
+                .await
+                .expect("read upstream chunks");
+                bytes
+            }
+        });
+        let mut upstream = upstream_listener.accept().await.expect("accept upstream");
+        let forward = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .forward_stream(
+                        test_rpc_request(),
+                        DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
+                        &mut upstream,
+                        "upstream",
+                        1024,
+                    )
+                    .await
+                    .expect("forward stream")
+            }
+        });
+        let id = match rx.recv().await.expect("tunnel request") {
+            ClusterTcpTunnelFrame::Request { id, request } => {
+                assert_eq!(request.route, "/test/tcp-tunnel");
+                id
+            }
+            other => panic!("expected tunnel request, got {other:?}"),
+        };
+        let forward_tx = {
+            let pending = handle.pending.lock().await;
+            match pending.get(&id).map(|pending| &pending.kind) {
+                Some(PendingTcpTunnelRequestKind::Forward { tx }) => tx.clone(),
+                _ => panic!("expected pending forward request"),
+            }
+        };
+        let mut response = ObjectRpcResponse::from_encoded_body("/test/tcp-tunnel", Vec::new());
+        sinomo_core::network::set_object_rpc_response_stream_mode(
+            &mut response,
+            sinomo_core::network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
+        );
+        forward_tx
+            .send(Ok(TcpTunnelStreamForwardEvent::Response(response)))
+            .await
+            .expect("send response event");
+        forward_tx
+            .send(Ok(TcpTunnelStreamForwardEvent::Chunk(b"hello ".to_vec())))
+            .await
+            .expect("send chunk");
+        forward_tx
+            .send(Ok(TcpTunnelStreamForwardEvent::Chunk(b"stream".to_vec())))
+            .await
+            .expect("send chunk");
+        forward_tx
+            .send(Ok(TcpTunnelStreamForwardEvent::End))
+            .await
+            .expect("send end");
+
+        assert!(matches!(
+            forward.await.expect("forward task"),
+            ClusterRelayStreamSendOutcome::Forwarded
+        ));
+        assert_eq!(
+            upstream_client.await.expect("upstream client"),
+            b"hello stream"
+        );
+        assert!(handle.pending.lock().await.is_empty());
     }
 
     #[test]

@@ -138,8 +138,10 @@ pub(crate) use direct_read::{
     dfs_message_response_from_direct_read_rpc_response,
 };
 pub use direct_read::{
-    DFS_DIRECT_READ_STREAM_CHUNK_BYTES, DfsDirectReadStreamResponse,
-    dfs_direct_read_response_from_rpc_response, dfs_direct_read_rpc_request,
+    DFS_DIRECT_READ_STREAM_CHUNK_BYTES, DfsDirectReadClientStreamData,
+    DfsDirectReadClientStreamResponse, DfsDirectReadClientStreamResult,
+    DfsDirectReadStreamResponse, dfs_direct_read_response_from_rpc_response,
+    dfs_direct_read_response_from_rpc_stream_response, dfs_direct_read_rpc_request,
     handle_dfs_direct_read_rpc_request, handle_dfs_direct_read_stream_rpc_request,
 };
 pub(crate) use direct_read::{
@@ -158,8 +160,9 @@ pub use distributed::{
 };
 #[cfg(test)]
 pub(crate) use endpoint_transport::{
-    AsyncDfsDirectReadSender, AsyncDfsMessageSender, DfsDirectReadSender,
-    async_dfs_direct_read_sender_from_peer_transport, dfs_direct_read_sender_from_peer_transport,
+    AsyncDfsDirectReadSender, AsyncDfsDirectReadStreamSender, AsyncDfsMessageSender,
+    DfsDirectReadSender, async_dfs_direct_read_sender_from_peer_transport,
+    dfs_direct_read_sender_from_peer_transport,
 };
 pub use endpoint_transport::{
     AsyncDfsPeerTransport, DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT, DfsEndpointServedMessageTransport,

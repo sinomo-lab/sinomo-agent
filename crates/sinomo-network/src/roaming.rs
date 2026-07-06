@@ -225,6 +225,23 @@ pub async fn send_daemon_rpc_to_cluster_endpoint_async(
     Ok(response)
 }
 
+pub async fn send_daemon_rpc_stream_response_to_cluster_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    auth: Option<&[u8]>,
+    request: &crate::ObjectRpcRequest,
+    timeouts: DaemonRpcTimeouts,
+) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
+    let control_request = daemon_rpc_control_request(auth, request);
+    let response = send_daemon_control_rpc_request_stream_response_to_cluster_endpoint_async(
+        endpoint,
+        &control_request,
+        timeouts,
+    )
+    .await?;
+    response.response.error_detail()?;
+    Ok(response)
+}
+
 fn daemon_rpc_control_request(
     auth: Option<&[u8]>,
     request: &crate::ObjectRpcRequest,
@@ -324,6 +341,50 @@ pub(crate) async fn send_daemon_control_rpc_request_raw_response_to_cluster_endp
                 return module
                     .dial_rpc_raw_response(endpoint, &frame, timeouts)
                     .await;
+            }
+            Err(NetworkError::Io {
+                operation: format!("send streamed daemon rpc to {}", endpoint.address),
+                detail: format!(
+                    "streamed raw RPC responses are not supported over module transport {:?}",
+                    endpoint.transport
+                ),
+            })
+        }
+    }
+}
+
+pub(crate) async fn send_daemon_control_rpc_request_stream_response_to_cluster_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    request: &crate::DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
+    let body_options = crate::RawByteStreamChunkOptions {
+        chunk_bytes: crate::OBJECT_STREAM_MAX_CHUNK_BYTES,
+        max_total_bytes: u64::try_from(crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES).ok(),
+        idle_timeout: timeouts.idle_timeout,
+    };
+    match endpoint.transport {
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
+            crate::send_daemon_control_rpc_request_stream_response_async(
+                &endpoint.address,
+                request,
+                timeouts,
+                crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
+            )
+            .await
+        }
+        ref transport => {
+            if let Some(module) =
+                crate::network_module::registered_network_module_for_transport(transport)
+            {
+                let frame = crate::object::encode_object_frame_to_vec(request)?;
+                let response = module
+                    .dial_rpc_raw_response(endpoint, &frame, timeouts)
+                    .await?;
+                return Ok(crate::ObjectRpcStreamResponse::from_buffered_response(
+                    response,
+                    body_options,
+                ));
             }
             Err(NetworkError::Io {
                 operation: format!("send streamed daemon rpc to {}", endpoint.address),

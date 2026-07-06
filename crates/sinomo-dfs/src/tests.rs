@@ -2323,28 +2323,47 @@ fn endpoint_transport_async_read_message_uses_direct_sender_and_queues_response(
         let version = DfsVersion::from_legacy_named("version_async_endpoint_direct")
             .expect("version");
         let bytes = b"async direct endpoint read bytes".to_vec();
+        let bytes_hash = content_hash(&bytes);
         let direct_calls = Arc::new(Mutex::new(Vec::new()));
-        let direct_calls_for_sender = Arc::clone(&direct_calls);
-        let bytes_for_sender = bytes.clone();
-        let async_direct_sender: AsyncDfsDirectReadSender =
+        let async_direct_sender: AsyncDfsDirectReadSender = Arc::new(|_endpoint, _request, _timeout| {
+            Box::pin(async move {
+                Err(DfsPeerTransportError::new(
+                    "buffered async direct sender should not be used when stream sender is available",
+                ))
+            })
+        });
+        let direct_calls_for_stream_sender = Arc::clone(&direct_calls);
+        let bytes_for_stream_sender = bytes.clone();
+        let async_direct_stream_sender: AsyncDfsDirectReadStreamSender =
             Arc::new(move |_endpoint, request, _timeout| {
-                let direct_calls_for_sender = Arc::clone(&direct_calls_for_sender);
+                let direct_calls_for_stream_sender = Arc::clone(&direct_calls_for_stream_sender);
                 let request = request.clone();
-                let bytes_for_sender = bytes_for_sender.clone();
+                let bytes_for_stream_sender = bytes_for_stream_sender.clone();
                 Box::pin(async move {
-                    direct_calls_for_sender
+                    direct_calls_for_stream_sender
                         .lock()
                         .expect("direct calls")
                         .push(request.clone());
-                    Ok(DfsReadResponse {
+                    Ok(DfsDirectReadClientStreamResponse {
                         request_id: request.request_id.clone(),
                         object_id: request.object_id.clone(),
-                        result: DfsReadResult::Found(DfsReadData {
+                        result: DfsDirectReadClientStreamResult::Found(
+                            DfsDirectReadClientStreamData {
+                                content_size_bytes: bytes_for_stream_sender.len(),
+                                body: sinomo_core::network::ObjectRpcStreamBody::Buffered {
+                                    bytes: bytes_for_stream_sender,
+                                    offset: 0,
+                                    options: sinomo_core::network::RawByteStreamChunkOptions {
+                                        chunk_bytes: sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES,
+                                        max_total_bytes: None,
+                                        idle_timeout: None,
+                                    },
+                                },
                             object_id: request.object_id.clone(),
                             version: request.version.clone(),
-                            content_hash: Some(request.content_hash.clone()),
-                            bytes: bytes_for_sender,
-                        }),
+                            content_hash: request.content_hash.clone(),
+                            },
+                        ),
                     })
                 })
             });
@@ -2378,6 +2397,7 @@ fn endpoint_transport_async_read_message_uses_direct_sender_and_queues_response(
             async_sender,
             sync_direct_sender,
             async_direct_sender,
+            async_direct_stream_sender,
         );
         let message = DfsRoutedMessage {
             source_node_id: local.clone(),
@@ -2388,7 +2408,7 @@ fn endpoint_transport_async_read_message_uses_direct_sender_and_queues_response(
                 request_id: "endpoint-async-direct-read".to_string(),
                 object_id: object_id.clone(),
                 version: Some(version.clone()),
-                content_hash: Some("blake3:async-endpoint-direct".to_string()),
+                content_hash: Some(bytes_hash.clone()),
                 content_size_bytes: Some(bytes.len() as u64),
                 range_offset: None,
                 range_max_bytes: None,
@@ -2405,7 +2425,7 @@ fn endpoint_transport_async_read_message_uses_direct_sender_and_queues_response(
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].object_id, object_id);
         assert_eq!(calls[0].version, version);
-        assert_eq!(calls[0].content_hash, "blake3:async-endpoint-direct");
+        assert_eq!(calls[0].content_hash, bytes_hash);
         assert_eq!(calls[0].content_size_bytes, bytes.len() as u64);
         drop(calls);
         assert_eq!(*message_send_calls.lock().expect("message send calls"), 0);
