@@ -8,8 +8,8 @@
 //! the daemon — not the caller — owns the cluster transports and quorum paths.
 
 use crate::{
-    DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
-    DAEMON_STATUS_ROUTE, DaemonDfsObjectRpcForwardRequest, DaemonError, DaemonPaths,
+    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
+    DAEMON_STATUS_ROUTE, DaemonError, DaemonObjectRpcForwardRequest, DaemonPaths,
     DaemonProbeStatus, DaemonStatus, probe_daemon_status,
 };
 use sinomo_core::cluster::{
@@ -129,10 +129,37 @@ impl DaemonApiClient {
         Ok(response)
     }
 
-    /// Sends a DFS object-RPC from inside the running local daemon.
+    /// Sends an object-RPC from inside the running local daemon.
     ///
     /// This is intentionally daemon-mediated rather than a client-side routed
     /// send so CLI/app callers reuse the daemon's persistent cluster transports.
+    pub fn object_rpc_to_target(
+        &self,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        connect_timeout: Duration,
+        observe_connectivity: bool,
+    ) -> Result<ObjectRpcResponse, DaemonError> {
+        let payload = DaemonObjectRpcForwardRequest {
+            target_node_id: target_node_id.clone(),
+            request: request.clone(),
+            connect_timeout_millis: u64::try_from(connect_timeout.as_millis()).unwrap_or(u64::MAX),
+            observe_connectivity,
+        };
+        let request = ObjectRpcRequest::encode_body(
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+            DAEMON_RPC_CATEGORY,
+            &payload,
+        )?;
+        let response = crate::send_daemon_rpc_with_timeouts(
+            &self.address,
+            &request,
+            crate::client::object_rpc_transfer_timeouts(connect_timeout),
+        )?;
+        response.error_detail()?;
+        response.decode_body().map_err(DaemonError::from)
+    }
+
     pub fn dfs_object_rpc_to_target(
         &self,
         target_node_id: &NodeId,
@@ -140,21 +167,12 @@ impl DaemonApiClient {
         connect_timeout: Duration,
         observe_connectivity: bool,
     ) -> Result<ObjectRpcResponse, DaemonError> {
-        let payload = DaemonDfsObjectRpcForwardRequest {
-            target_node_id: target_node_id.clone(),
-            request: request.clone(),
-            connect_timeout_millis: u64::try_from(connect_timeout.as_millis()).unwrap_or(u64::MAX),
+        self.object_rpc_to_target(
+            target_node_id,
+            request,
+            connect_timeout,
             observe_connectivity,
-        };
-        let request = ObjectRpcRequest::encode_body(
-            DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
-            DAEMON_RPC_CATEGORY,
-            &payload,
-        )?;
-        let daemon_timeout = connect_timeout.saturating_add(Duration::from_secs(1));
-        let response = crate::send_daemon_rpc(&self.address, &request, daemon_timeout)?;
-        response.error_detail()?;
-        response.decode_body().map_err(DaemonError::from)
+        )
     }
 
     fn call_control_payload(

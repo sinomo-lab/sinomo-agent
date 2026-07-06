@@ -138,10 +138,9 @@ use time::OffsetDateTime;
 use sinomo_kv::ClusterKvRaftConfigRecord;
 use sinomo_network::ObjectRpcFuture;
 use sinomo_network::{
-    ClusterAuthMaterial, ClusterAuthVerifier, IceCandidateRecord, IceCandidateType, IrohKvExchange,
+    ClusterAuthMaterial, ClusterAuthVerifier, IceCandidateRecord, IceCandidateType,
     LanConnectionPlanner, RoamingConnectionPlanner, RoamingPathSelection, WebRtcKvExchange,
-    WebRtcSignalMessage, WebRtcSignalingEnvelope, iroh_endpoint_record_from_cluster_endpoint,
-    write_iroh_endpoint_record_async,
+    WebRtcSignalMessage, WebRtcSignalingEnvelope,
 };
 
 use sinomo_base::{
@@ -247,6 +246,41 @@ fn first_cluster_rollout_target_endpoint_for_main_with_command_endpoint(
         .rollout_targets_for_main_with_command_endpoint(main_node_id, command_endpoint, candidates)
         .into_iter()
         .next()
+}
+
+fn stable_iroh_endpoint_id(node_id: &NodeId, endpoint_public_key: &str) -> ClusterEndpointId {
+    ClusterEndpointId::derived(
+        "sinomo.iroh.endpoint",
+        format!("{}\0{endpoint_public_key}", node_id.as_str()),
+    )
+}
+
+fn test_iroh_endpoint(
+    cluster_id: &ClusterId,
+    node_id: &NodeId,
+    endpoint_public_key: &str,
+    relay_url: Option<&str>,
+) -> ClusterEndpointRecord {
+    let address = match relay_url {
+        Some(relay_url) => format!("iroh://{endpoint_public_key}?relay={relay_url}"),
+        None => format!("iroh://{endpoint_public_key}"),
+    };
+    let privacy = if relay_url.is_some() {
+        ClusterEndpointPrivacy::Relayed
+    } else {
+        ClusterEndpointPrivacy::InternetDirect
+    };
+    let _ = cluster_id;
+    ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(node_id, endpoint_public_key),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address,
+        source: ClusterEndpointSource::Rendezvous,
+        privacy,
+        priority: 90,
+        last_observed_latency_ms: None,
+    }
 }
 
 /// Installs the KV-backed cluster directory provider once for the whole test
@@ -557,45 +591,6 @@ fn direct_cluster_rpc_handlers_return_unknown_route_errors() {
     assert!(
         matches!(membership_error, NetworkError::UnknownRoute { ref route } if route == unknown_route)
     );
-}
-
-#[test]
-fn iroh_endpoint_record_async_helpers_round_trip_on_passed_runtime() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-endpoint-async");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    let cluster_id = ClusterId::from_legacy_named("cluster_iroh_endpoint_async").expect("cluster");
-    let node_id = NodeId::from_legacy_named("node_iroh_endpoint_async").expect("node");
-    let record = IrohEndpointRecord {
-        cluster_id,
-        node_id: node_id.clone(),
-        endpoint_public_key: "iroh_endpoint_async_public_key".to_string(),
-        direct_addresses: vec!["192.0.2.10:32000".to_string()],
-        relay_url: Some("https://relay.example./".to_string()),
-        relay_mode: IrohRelayMode::Default,
-        expires_after_tick: 42,
-    };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-
-    runtime
-        .block_on(write_iroh_endpoint_record_async(
-            runtime.handle(),
-            &paths,
-            &record,
-        ))
-        .expect("write iroh endpoint record async");
-    let loaded = runtime
-        .block_on(read_iroh_endpoint_record_async(
-            runtime.handle(),
-            &paths,
-            &node_id,
-        ))
-        .expect("read iroh endpoint record async");
-
-    assert_eq!(loaded, record);
 }
 
 fn object_rpc_router_from_registry(registry: Arc<ObjectRpcRouteRegistry>) -> ObjectRpcRouter {
@@ -1934,7 +1929,7 @@ fn async_daemon_control_client_round_trips_object_frames() {
             &address,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
-            sinomo_network::IROH_DAEMON_COMMAND_MAX_BYTES,
+            DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
         )
         .await
         .expect("response");
@@ -2031,7 +2026,7 @@ fn async_daemon_control_client_timeout_is_idle_not_total_transfer() {
             &address,
             &request,
             DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(25)),
-            sinomo_network::IROH_DAEMON_COMMAND_MAX_BYTES,
+            DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
         )
         .await
         .expect("response");
@@ -2072,7 +2067,7 @@ fn async_daemon_control_client_without_idle_timeout_allows_response_gap() {
             &address,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_millis(20)),
-            sinomo_network::IROH_DAEMON_COMMAND_MAX_BYTES,
+            DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
         )
         .await
         .expect("response");
@@ -2107,7 +2102,7 @@ fn async_daemon_control_client_explicit_idle_timeout_still_fails_on_stall() {
             &address,
             &request,
             DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(20)),
-            sinomo_network::IROH_DAEMON_COMMAND_MAX_BYTES,
+            DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
         )
         .await
         .expect_err("explicit idle timeout should fail");
@@ -2160,7 +2155,7 @@ fn async_daemon_rpc_client_rejects_legacy_wrapped_response() {
             &address,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
-            sinomo_network::IROH_DAEMON_COMMAND_MAX_BYTES,
+            DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
         )
         .await
         .expect_err("legacy wrapped response");
@@ -3150,20 +3145,23 @@ fn cluster_network_publish_interval_for_node_tracks_local_role() {
 }
 
 #[test]
-fn cluster_iroh_proxy_republish_sleep_waits_until_next_publish() {
+fn cluster_network_module_republish_sleep_waits_until_next_publish() {
     let now = Instant::now();
     assert_eq!(
-        cluster_iroh_proxy_republish_sleep_duration(now, now + CLUSTER_NETWORK_PUBLISH_INTERVAL),
+        cluster_network_module_republish_sleep_duration(
+            now,
+            now + CLUSTER_NETWORK_PUBLISH_INTERVAL
+        ),
         CLUSTER_NETWORK_PUBLISH_INTERVAL,
-        "stable iroh proxy publisher should not wake while republish is not due"
+        "stable network module publisher should not wake while republish is not due"
     );
     assert_eq!(
-        cluster_iroh_proxy_republish_sleep_duration(now, now),
+        cluster_network_module_republish_sleep_duration(now, now),
         Duration::from_millis(1),
         "overdue republish deadlines should still avoid a zero-duration spin"
     );
     assert_eq!(
-        cluster_iroh_proxy_republish_sleep_duration(
+        cluster_network_module_republish_sleep_duration(
             now,
             now.checked_sub(Duration::from_secs(1))
                 .expect("past instant")
@@ -3174,32 +3172,35 @@ fn cluster_iroh_proxy_republish_sleep_waits_until_next_publish() {
 }
 
 #[test]
-fn cluster_iroh_proxy_start_retry_backoff_grows_and_caps() {
+fn cluster_network_module_start_retry_backoff_grows_and_caps() {
     assert_eq!(
-        cluster_iroh_proxy_start_retry_sleep_duration(0, CLUSTER_NETWORK_PUBLISH_INTERVAL),
+        cluster_network_module_start_retry_sleep_duration(0, CLUSTER_NETWORK_PUBLISH_INTERVAL),
         Duration::from_secs(5),
         "first retry should keep the previous fast-recovery delay"
     );
     assert_eq!(
-        cluster_iroh_proxy_start_retry_sleep_duration(1, CLUSTER_NETWORK_PUBLISH_INTERVAL),
+        cluster_network_module_start_retry_sleep_duration(1, CLUSTER_NETWORK_PUBLISH_INTERVAL),
         Duration::from_secs(10)
     );
     assert_eq!(
-        cluster_iroh_proxy_start_retry_sleep_duration(3, CLUSTER_NETWORK_PUBLISH_INTERVAL),
+        cluster_network_module_start_retry_sleep_duration(3, CLUSTER_NETWORK_PUBLISH_INTERVAL),
         Duration::from_secs(40)
     );
     assert_eq!(
-        cluster_iroh_proxy_start_retry_sleep_duration(8, CLUSTER_NETWORK_PUBLISH_INTERVAL),
+        cluster_network_module_start_retry_sleep_duration(8, CLUSTER_NETWORK_PUBLISH_INTERVAL),
         CLUSTER_NETWORK_PUBLISH_INTERVAL,
         "workstation retries should cap at the publish cadence"
     );
     assert_eq!(
-        cluster_iroh_proxy_start_retry_sleep_duration(8, CLUSTER_NETWORK_MOBILE_PUBLISH_INTERVAL),
+        cluster_network_module_start_retry_sleep_duration(
+            8,
+            CLUSTER_NETWORK_MOBILE_PUBLISH_INTERVAL
+        ),
         Duration::from_secs(320).min(CLUSTER_NETWORK_MOBILE_PUBLISH_INTERVAL),
         "mobile retries should be allowed to back off beyond the workstation cadence"
     );
     assert_eq!(
-        cluster_iroh_proxy_start_retry_sleep_duration(8, Duration::from_secs(1)),
+        cluster_network_module_start_retry_sleep_duration(8, Duration::from_secs(1)),
         Duration::from_secs(5),
         "invalid tiny caps should still avoid a tight retry loop"
     );
@@ -5548,7 +5549,7 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
         .filter(|endpoint| endpoint.node_id == main_endpoint.node_id)
         .cloned()
         .collect::<Vec<_>>();
-    let dfs_targets = selector.select(ClusterEndpointSelectionPurpose::DfsData);
+    let data_plane_targets = selector.select(ClusterEndpointSelectionPurpose::MainDaemonDataPlane);
     assert_eq!(
         candidates
             .iter()
@@ -5574,13 +5575,13 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
         "node-scoped relay-hop selection should return only the target main endpoint"
     );
     assert_eq!(
-        dfs_targets
+        data_plane_targets
             .iter()
             .filter(|endpoint| endpoint.node_id == main_endpoint.node_id)
             .map(|endpoint| endpoint.endpoint_id.clone())
             .collect::<Vec<_>>(),
         vec![main_endpoint.endpoint_id.clone()],
-        "DFS data routing must use the same main-daemon target surface"
+        "main-daemon data-plane routing must use the same target surface"
     );
     let status_targets = selector
         .select(ClusterEndpointSelectionPurpose::MemberDaemonStatus)
@@ -5683,34 +5684,34 @@ fn main_daemon_command_targets_filter_known_unreachable_endpoints() {
         targets.is_empty(),
         "known-unreachable direct endpoints should not remain daemon command targets"
     );
-    let dfs_targets = ClusterEndpointSelector::new(&paths, &state)
-        .select(ClusterEndpointSelectionPurpose::DfsData);
+    let data_plane_targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::MainDaemonDataPlane);
     assert_eq!(
-        dfs_targets
+        data_plane_targets
             .iter()
             .map(|endpoint| &endpoint.endpoint_id)
             .collect::<Vec<_>>(),
         vec![&stale_tcp.endpoint_id],
-        "DFS data routing should keep the target record so relay can handle known-bad direct paths"
+        "main-daemon data-plane routing should keep the target record so relay can handle known-bad direct paths"
     );
 }
 
 #[test]
-fn dfs_data_targets_include_kv_main_daemon_endpoints() {
+fn main_daemon_data_plane_targets_include_kv_main_daemon_endpoints() {
     install_kv_directory_for_tests();
-    let root = sinomo_testdir::TestDir::new("sinomo-network-dfs-data-kv-endpoints");
+    let root = sinomo_testdir::TestDir::new("sinomo-network-main-data-kv-endpoints");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
     let now = OffsetDateTime::now_utc();
     let cluster_id =
-        ClusterId::from_legacy_named("cluster_network_dfs_data_kv_endpoints").expect("cluster");
-    let local = NodeId::from_legacy_named("node_network_dfs_data_kv_local").expect("local");
-    let remote = NodeId::from_legacy_named("node_network_dfs_data_kv_remote").expect("remote");
+        ClusterId::from_legacy_named("cluster_network_main_data_kv_endpoints").expect("cluster");
+    let local = NodeId::from_legacy_named("node_network_main_data_kv_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_network_main_data_kv_remote").expect("remote");
     let shadow = sinomo_node::shadow_daemon_node_id(&remote);
     let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id.clone(),
-        "network dfs data kv endpoints",
+        "network main data-plane kv endpoints",
         local.clone(),
         "local",
         "pk-local",
@@ -5765,24 +5766,24 @@ fn dfs_data_targets_include_kv_main_daemon_endpoints() {
     .expect("write stale offline status");
 
     let selector = ClusterEndpointSelector::new(&paths, &state);
-    let dfs_targets = selector.select(ClusterEndpointSelectionPurpose::DfsData);
+    let data_plane_targets = selector.select(ClusterEndpointSelectionPurpose::MainDaemonDataPlane);
     let raft_targets = selector.select(ClusterEndpointSelectionPurpose::ClusterStateCommand);
     let main_targets = selector.select(ClusterEndpointSelectionPurpose::MainDaemonCommand);
 
     assert!(
-        dfs_targets
+        data_plane_targets
             .iter()
             .any(|endpoint| endpoint.endpoint_id == direct_main_endpoint.endpoint_id),
-        "DFS data selection should include main daemon endpoints from cluster KV"
+        "main-daemon data-plane selection should include main daemon endpoints from cluster KV"
     );
     assert_eq!(
-        dfs_targets
+        data_plane_targets
             .iter()
             .filter(|endpoint| endpoint.node_id == remote)
             .map(|endpoint| endpoint.endpoint_id.clone())
             .collect::<Vec<_>>(),
         vec![direct_main_endpoint.endpoint_id.clone()],
-        "DFS data selection must use the KV main endpoint instead of folded shadow endpoints"
+        "main-daemon data-plane selection must use the KV main endpoint instead of folded shadow endpoints"
     );
     assert!(
         raft_targets
@@ -6236,13 +6237,12 @@ fn cluster_network_probe_targets_skip_iroh_endpoints() {
         now,
     );
     let tcp = daemon_lan_endpoint(&remote, "10.0.0.51:21353".to_string(), 10);
-    let iroh = IrohEndpointRecord::from_relay_url(
-        cluster_id.clone(),
-        remote.clone(),
+    let iroh = test_iroh_endpoint(
+        &cluster_id,
+        &remote,
         "iroh_public_key_network_probe_skip",
-        "https://relay.example./",
-    )
-    .endpoint();
+        Some("https://relay.example./"),
+    );
     let mut member =
         ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
     member.capabilities = main_daemon_capabilities(&member.role);
@@ -15397,20 +15397,21 @@ fn advertised_hostname_outranks_opportunistic_private_ip_for_docker_routes() {
 }
 
 #[test]
-fn dfs_data_targets_prefer_healthy_bridge_ip_over_degraded_hostname() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-dfs-healthy-bridge-before-hostname");
+fn main_daemon_data_plane_targets_prefer_healthy_bridge_ip_over_degraded_hostname() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-main-data-healthy-bridge");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
     let now = OffsetDateTime::now_utc();
     let cluster_id =
-        ClusterId::from_legacy_named("cluster_dfs_bridge_before_hostname").expect("cluster");
-    let local = NodeId::from_legacy_named("node_dfs_bridge_before_hostname_local").expect("local");
+        ClusterId::from_legacy_named("cluster_main_data_bridge_before_hostname").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_main_data_bridge_before_hostname_local").expect("local");
     let remote =
-        NodeId::from_legacy_named("node_dfs_bridge_before_hostname_remote").expect("remote");
+        NodeId::from_legacy_named("node_main_data_bridge_before_hostname_remote").expect("remote");
     let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id.clone(),
-        "dfs bridge before hostname",
+        "main data-plane bridge before hostname",
         local.clone(),
         "local",
         "pk-local",
@@ -15456,9 +15457,9 @@ fn dfs_data_targets_prefer_healthy_bridge_ip_over_degraded_hostname() {
     )
     .expect("connectivity records");
 
-    let dfs_targets = ClusterEndpointSelector::new(&paths, &state)
-        .select(ClusterEndpointSelectionPurpose::DfsData);
-    let ordered_endpoint_ids = dfs_targets
+    let data_plane_targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::MainDaemonDataPlane);
+    let ordered_endpoint_ids = data_plane_targets
         .iter()
         .filter(|endpoint| endpoint.node_id == bridge_ip.node_id)
         .map(|endpoint| endpoint.endpoint_id.clone())
@@ -15467,7 +15468,7 @@ fn dfs_data_targets_prefer_healthy_bridge_ip_over_degraded_hostname() {
     assert_eq!(
         ordered_endpoint_ids,
         vec![bridge_ip.endpoint_id, stable_hostname.endpoint_id],
-        "DFS should try the proven bridge path first, then retain the hostname fallback"
+        "main-daemon data-plane routing should try the proven bridge path first, then retain the hostname fallback"
     );
 }
 
@@ -25472,7 +25473,7 @@ fn node_endpoint_maps_cluster_roaming_transports() {
 }
 
 #[test]
-fn node_endpoint_maps_iroh_transport() {
+fn node_endpoint_maps_module_transport() {
     let node_id = NodeId::from_legacy_named("node_phone").expect("node");
     let endpoint = ClusterEndpointRecord {
         endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_iroh").expect("endpoint"),
@@ -25488,7 +25489,7 @@ fn node_endpoint_maps_iroh_transport() {
     let network_endpoint = NodeEndpoint::from_cluster_endpoint(&endpoint);
 
     assert_eq!(network_endpoint.node_id, node_id);
-    assert_eq!(network_endpoint.transport, TransportKind::Iroh);
+    assert_eq!(network_endpoint.transport, TransportKind::Module);
     assert_eq!(network_endpoint.address, "iroh://iroh_pk");
 }
 
@@ -26082,80 +26083,7 @@ fn webrtc_kv_exchange_round_trips_offer_answer_and_ice_candidates() {
 }
 
 #[test]
-fn iroh_kv_exchange_round_trips_endpoint_records() {
-    let cluster_id = ClusterId::from_legacy_named("cluster_home").expect("cluster");
-    let node_id = NodeId::from_legacy_named("node_mobile").expect("node");
-    let endpoint = IrohEndpointRecord {
-        cluster_id: cluster_id.clone(),
-        node_id: node_id.clone(),
-        endpoint_public_key: "iroh_public_key".to_string(),
-        direct_addresses: vec!["203.0.113.10:21356".to_string()],
-        relay_url: Some("https://relay.example".to_string()),
-        relay_mode: IrohRelayMode::Default,
-        expires_after_tick: 50,
-    };
-    let mut store = sinomo_kv::InProcessKvStore::new();
-    store
-        .apply_command(sinomo_kv::KvCommand::Op(
-            IrohKvExchange::put_endpoint(endpoint.clone(), None).expect("endpoint op"),
-        ))
-        .expect("put endpoint");
-
-    let entries = store
-        .range_prefix(&IrohKvExchange::endpoint_prefix(&cluster_id))
-        .expect("range prefix");
-    let parsed = IrohKvExchange::endpoint_from_entry(&entries[0]).expect("endpoint");
-    let cluster_endpoint = parsed.endpoint();
-
-    assert_eq!(entries.len(), 1);
-    assert_eq!(parsed, endpoint);
-    assert_eq!(cluster_endpoint.node_id, node_id);
-    assert_eq!(cluster_endpoint.transport, ClusterTransportKind::Iroh);
-    assert_eq!(cluster_endpoint.privacy, ClusterEndpointPrivacy::Relayed);
-    assert!(!cluster_endpoint.address.contains("direct="));
-    assert!(
-        cluster_endpoint
-            .address
-            .contains("relay=https://relay.example")
-    );
-    let parsed_endpoint =
-        iroh_endpoint_record_from_cluster_endpoint(&cluster_endpoint, &cluster_id)
-            .expect("cluster endpoint parse");
-    assert!(parsed_endpoint.direct_addresses.is_empty());
-    assert_eq!(parsed_endpoint.relay_url, endpoint.relay_url);
-}
-
-#[test]
-fn iroh_endpoint_record_uses_stable_id_for_public_key() {
-    let cluster_id = ClusterId::from_legacy_named("cluster_home").expect("cluster");
-    let node_id = NodeId::from_legacy_named("node_mobile").expect("node");
-    let first = IrohEndpointRecord {
-        cluster_id: cluster_id.clone(),
-        node_id: node_id.clone(),
-        endpoint_public_key: "iroh_public_key".to_string(),
-        direct_addresses: vec!["203.0.113.10:21356".to_string()],
-        relay_url: None,
-        relay_mode: IrohRelayMode::Default,
-        expires_after_tick: 50,
-    }
-    .endpoint();
-    let second = IrohEndpointRecord {
-        cluster_id,
-        node_id,
-        endpoint_public_key: "iroh_public_key".to_string(),
-        direct_addresses: vec!["203.0.113.11:21356".to_string()],
-        relay_url: None,
-        relay_mode: IrohRelayMode::Default,
-        expires_after_tick: 51,
-    }
-    .endpoint();
-
-    assert_eq!(first.endpoint_id, second.endpoint_id);
-    assert_eq!(first.address, second.address);
-}
-
-#[test]
-fn upsert_member_endpoint_replaces_iroh_record_for_same_public_key() {
+fn upsert_member_endpoint_replaces_stable_module_transport_record() {
     let cluster_id = ClusterId::from_legacy_named("cluster_home").expect("cluster");
     let node_id = NodeId::from_legacy_named("node_mobile").expect("node");
     let mut member = ClusterMemberRecord::local_voter(
@@ -26176,26 +26104,8 @@ fn upsert_member_endpoint_replaces_iroh_record_for_same_public_key() {
         priority: 40,
         last_observed_latency_ms: None,
     });
-    let first = IrohEndpointRecord {
-        cluster_id: cluster_id.clone(),
-        node_id: node_id.clone(),
-        endpoint_public_key: "iroh_public_key".to_string(),
-        direct_addresses: vec!["203.0.113.10:21356".to_string()],
-        relay_url: None,
-        relay_mode: IrohRelayMode::Default,
-        expires_after_tick: 50,
-    }
-    .endpoint();
-    let second = IrohEndpointRecord {
-        cluster_id,
-        node_id,
-        endpoint_public_key: "iroh_public_key".to_string(),
-        direct_addresses: vec!["203.0.113.11:21356".to_string()],
-        relay_url: None,
-        relay_mode: IrohRelayMode::Default,
-        expires_after_tick: 51,
-    }
-    .endpoint();
+    let first = test_iroh_endpoint(&cluster_id, &node_id, "iroh_public_key", None);
+    let second = test_iroh_endpoint(&cluster_id, &node_id, "iroh_public_key", None);
 
     assert!(upsert_member_endpoint(&mut member, first));
     assert!(!upsert_member_endpoint(&mut member, second));
@@ -26314,235 +26224,6 @@ fn local_daemon_membership_observation_updates_members_and_public_keys() {
             .iter()
             .any(|endpoint| endpoint.address == shadow_endpoint.address)
     );
-}
-
-#[test]
-fn cluster_iroh_endpoint_advertisement_updates_state_once() {
-    let now = OffsetDateTime::now_utc();
-    let cluster_id = ClusterId::from_legacy_named("cluster_iroh_advertisement").expect("cluster");
-    let node_id = NodeId::from_legacy_named("node_iroh_advertisement").expect("node");
-    let mut state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "iroh advertisement",
-        node_id.clone(),
-        "local",
-        "pk-local",
-        now,
-    );
-    let record = IrohEndpointRecord {
-        cluster_id,
-        node_id: node_id.clone(),
-        endpoint_public_key: "advertised_iroh_public_key".to_string(),
-        direct_addresses: vec!["203.0.113.44:21356".to_string()],
-        relay_url: None,
-        relay_mode: IrohRelayMode::Default,
-        expires_after_tick: 10,
-    };
-
-    let published = apply_cluster_iroh_endpoint_advertisement(
-        &mut state,
-        record.clone(),
-        Some(&[]),
-        now + time::Duration::seconds(1),
-    )
-    .expect("member to publish");
-
-    assert_eq!(published.node_id, node_id);
-    assert_eq!(state.updated_at, now + time::Duration::seconds(1));
-    assert!(published.endpoints.iter().any(|endpoint| {
-        endpoint.transport == ClusterTransportKind::Iroh
-            && endpoint.endpoint_id
-                == stable_iroh_endpoint_id(&node_id, "advertised_iroh_public_key")
-            && endpoint.address == "iroh://advertised_iroh_public_key"
-    }));
-    let persisted = state
-        .members
-        .iter()
-        .find(|member| member.node_id == node_id)
-        .expect("member")
-        .endpoints
-        .clone();
-    let unchanged_at = state.updated_at;
-    assert!(
-        apply_cluster_iroh_endpoint_advertisement(
-            &mut state,
-            record,
-            Some(&persisted),
-            now + time::Duration::seconds(2),
-        )
-        .is_none(),
-        "stable re-advertisement should avoid state writes"
-    );
-    assert_eq!(state.updated_at, unchanged_at);
-}
-
-#[test]
-fn cluster_iroh_endpoint_advertisement_folds_local_shadow_record() {
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_shadow_iroh_advertisement").expect("cluster");
-    let node_id = NodeId::from_legacy_named("node_shadow_iroh_advertisement").expect("node");
-    let shadow_node_id = sinomo_node::shadow_daemon_node_id(&node_id);
-    let mut state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "shadow iroh advertisement",
-        node_id.clone(),
-        "local",
-        "pk-local",
-        now,
-    );
-    let record = IrohEndpointRecord {
-        cluster_id,
-        node_id: shadow_node_id,
-        endpoint_public_key: "shadow_advertised_iroh_public_key".to_string(),
-        direct_addresses: Vec::new(),
-        relay_url: Some("https://relay.example/".to_string()),
-        relay_mode: IrohRelayMode::Custom {
-            relay_url: "https://relay.example/".to_string(),
-        },
-        expires_after_tick: 10,
-    };
-
-    let published = apply_cluster_iroh_endpoint_advertisement(
-        &mut state,
-        record,
-        Some(&[]),
-        now + time::Duration::seconds(1),
-    )
-    .expect("main member to publish shadow endpoint");
-
-    assert_eq!(published.node_id, node_id);
-    assert_eq!(state.updated_at, now + time::Duration::seconds(1));
-    assert!(published.endpoints.iter().any(|endpoint| {
-        endpoint.transport == ClusterTransportKind::Iroh
-            && endpoint.node_id == node_id
-            && endpoint.endpoint_id
-                == stable_iroh_endpoint_id(&node_id, "shadow_advertised_iroh_public_key")
-            && endpoint.address
-                == "iroh://shadow_advertised_iroh_public_key?relay=https://relay.example/"
-    }));
-}
-
-#[test]
-fn refresh_local_iroh_endpoints_from_disk_updates_local_daemon_members() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-refresh-local-iroh");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let now = OffsetDateTime::now_utc();
-    let updated_at = now + time::Duration::seconds(30);
-    let cluster_id = ClusterId::from_legacy_named("cluster_refresh_local_iroh").expect("cluster");
-    let local_node_id = NodeId::from_legacy_named("node_refresh_local_iroh").expect("local");
-    let shadow_node_id = sinomo_node::shadow_daemon_node_id(&local_node_id);
-    let mut state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "refresh local iroh",
-        local_node_id.clone(),
-        "local",
-        "pk-local",
-        now,
-    );
-    ensure_daemon_cluster_members(&mut state, Vec::new(), Vec::new(), now);
-
-    IrohEndpointRecord {
-        cluster_id: cluster_id.clone(),
-        node_id: local_node_id.clone(),
-        endpoint_public_key: "main_iroh_public_key".to_string(),
-        direct_addresses: vec!["203.0.113.21:21356".to_string()],
-        relay_url: None,
-        relay_mode: IrohRelayMode::Default,
-        expires_after_tick: 10,
-    }
-    .write(&paths)
-    .expect("write main iroh endpoint");
-    IrohEndpointRecord {
-        cluster_id,
-        node_id: shadow_node_id.clone(),
-        endpoint_public_key: "shadow_iroh_public_key".to_string(),
-        direct_addresses: Vec::new(),
-        relay_url: Some("https://relay.example/".to_string()),
-        relay_mode: IrohRelayMode::Custom {
-            relay_url: "https://relay.example/".to_string(),
-        },
-        expires_after_tick: 10,
-    }
-    .write(&paths)
-    .expect("write shadow iroh endpoint");
-
-    let mut async_state = state.clone();
-    let changed =
-        refresh_local_iroh_endpoints_from_disk(&paths, &mut state, updated_at).expect("refresh");
-
-    assert!(changed);
-    assert_eq!(state.updated_at, updated_at);
-    let main = state
-        .members
-        .iter()
-        .find(|member| member.node_id == local_node_id)
-        .expect("main member");
-    assert!(main.endpoints.iter().any(|endpoint| {
-        endpoint.transport == ClusterTransportKind::Iroh
-            && endpoint.endpoint_id
-                == stable_iroh_endpoint_id(&local_node_id, "main_iroh_public_key")
-            && endpoint.address == "iroh://main_iroh_public_key"
-    }));
-    assert!(main.endpoints.iter().any(|endpoint| {
-        endpoint.transport == ClusterTransportKind::Iroh
-            && endpoint.endpoint_id
-                == stable_iroh_endpoint_id(&local_node_id, "shadow_iroh_public_key")
-            && endpoint.node_id == local_node_id
-            && endpoint.address == "iroh://shadow_iroh_public_key?relay=https://relay.example/"
-    }));
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let async_changed = runtime
-        .block_on(refresh_local_iroh_endpoints_from_disk_async(
-            runtime.handle(),
-            &paths,
-            &mut async_state,
-            updated_at,
-        ))
-        .expect("async refresh");
-    assert!(async_changed);
-    assert_eq!(async_state.updated_at, updated_at);
-    let async_main = async_state
-        .members
-        .iter()
-        .find(|member| member.node_id == local_node_id)
-        .expect("async main member");
-    assert!(async_main.endpoints.iter().any(|endpoint| {
-        endpoint.transport == ClusterTransportKind::Iroh
-            && endpoint.endpoint_id
-                == stable_iroh_endpoint_id(&local_node_id, "main_iroh_public_key")
-    }));
-    let mut async_membership_state = ClusterBootstrapState::initialized_locally(
-        ClusterId::from_legacy_named("cluster_refresh_local_iroh_membership").expect("cluster"),
-        "refresh local iroh membership async",
-        local_node_id.clone(),
-        "local",
-        "old-main-public-key",
-        now,
-    );
-    ensure_daemon_cluster_members(&mut async_membership_state, Vec::new(), Vec::new(), now);
-    let membership_refresh = runtime
-        .block_on(refresh_local_daemon_membership_from_disk_async(
-            runtime.handle(),
-            &paths,
-            &mut async_membership_state,
-            ClusterLocalDaemonMembershipObservation {
-                main_endpoints: Vec::new(),
-                shadow_endpoints: Vec::new(),
-                main_public_key: "async-main-public-key".to_string(),
-                shadow_public_key: "async-shadow-public-key".to_string(),
-                timestamp: updated_at,
-            },
-        ))
-        .expect("async membership refresh");
-    assert!(membership_refresh.iroh_endpoints_changed);
-    assert!(membership_refresh.public_keys_changed);
 }
 
 #[test]
@@ -26665,16 +26346,7 @@ fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
         priority: 40,
         last_observed_latency_ms: None,
     });
-    let stable = IrohEndpointRecord {
-        cluster_id: cluster_id.clone(),
-        node_id: node_id.clone(),
-        endpoint_public_key: "same_public_key".to_string(),
-        direct_addresses: vec!["203.0.113.11:21356".to_string()],
-        relay_url: None,
-        relay_mode: IrohRelayMode::Default,
-        expires_after_tick: 51,
-    }
-    .endpoint();
+    let stable = test_iroh_endpoint(&cluster_id, &node_id, "same_public_key", None);
     let legacy_b = ClusterEndpointRecord {
         endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_legacy_iroh_b")
             .expect("legacy endpoint"),
@@ -26713,7 +26385,7 @@ fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
 }
 
 #[test]
-fn cleanup_member_iroh_endpoints_preserves_equal_rank_stable_record() {
+fn cleanup_member_endpoint_duplicates_preserves_equal_rank_stable_record() {
     let cluster_id = ClusterId::from_legacy_named("cluster_iroh_equal_rank").expect("cluster");
     let node_id = NodeId::from_legacy_named("node_iroh_equal_rank").expect("node");
     let mut member = ClusterMemberRecord::local_voter(
@@ -26723,36 +26395,24 @@ fn cleanup_member_iroh_endpoints_preserves_equal_rank_stable_record() {
         "public-key",
         OffsetDateTime::now_utc(),
     );
-    let first = IrohEndpointRecord {
-        cluster_id: cluster_id.clone(),
-        node_id: node_id.clone(),
-        endpoint_public_key: "same_public_key".to_string(),
-        direct_addresses: Vec::new(),
-        relay_url: Some("https://relay-a.example/".to_string()),
-        relay_mode: IrohRelayMode::Custom {
-            relay_url: "https://relay-a.example/".to_string(),
-        },
-        expires_after_tick: 50,
-    }
-    .endpoint();
-    let mut second = IrohEndpointRecord {
-        cluster_id,
-        node_id,
-        endpoint_public_key: "same_public_key".to_string(),
-        direct_addresses: Vec::new(),
-        relay_url: Some("https://relay-b.example/".to_string()),
-        relay_mode: IrohRelayMode::Custom {
-            relay_url: "https://relay-b.example/".to_string(),
-        },
-        expires_after_tick: 51,
-    }
-    .endpoint();
+    let first = test_iroh_endpoint(
+        &cluster_id,
+        &node_id,
+        "same_public_key",
+        Some("https://relay-a.example/"),
+    );
+    let mut second = test_iroh_endpoint(
+        &cluster_id,
+        &node_id,
+        "same_public_key",
+        Some("https://relay-b.example/"),
+    );
     second.priority = first.priority.saturating_add(1);
 
     member.endpoints.push(first.clone());
     member.endpoints.push(second);
 
-    assert!(cleanup_member_iroh_endpoints(&mut member));
+    assert!(cleanup_member_endpoint_duplicates(&mut member));
     let iroh: Vec<_> = member
         .endpoints
         .iter()
@@ -26846,7 +26506,7 @@ fn roaming_connection_planner_prefers_iroh_before_webrtc_and_relay() {
 
     assert!(matches!(
         selected,
-        RoamingPathSelection::Iroh(PeerEndpointCandidate { endpoint, .. })
+        RoamingPathSelection::Module(PeerEndpointCandidate { endpoint, .. })
             if endpoint.transport == ClusterTransportKind::Iroh
     ));
 }
@@ -26882,7 +26542,7 @@ fn roaming_connection_planner_falls_back_after_failed_lan_candidate() {
 
     assert!(matches!(
         selected,
-        RoamingPathSelection::Iroh(PeerEndpointCandidate { endpoint, .. })
+        RoamingPathSelection::Module(PeerEndpointCandidate { endpoint, .. })
             if endpoint.transport == ClusterTransportKind::Iroh
     ));
 }
@@ -31863,7 +31523,7 @@ impl LocalhostKvNode {
 fn read_localhost_kv_request(
     stream: &mut DaemonControlStream,
 ) -> Result<LocalhostKvRequest, NetworkError> {
-    read_object_frame_blocking(stream, IROH_DAEMON_COMMAND_MAX_BYTES)
+    read_object_frame_blocking(stream, DAEMON_CONTROL_RPC_MAX_FRAME_BYTES)
 }
 
 fn handle_localhost_kv_request(
@@ -31907,7 +31567,7 @@ fn send_localhost_kv_request(
     write_object_frame_blocking(&mut stream, &request).map_err(|source| source.to_string())?;
 
     let response: LocalhostKvResponse =
-        read_object_frame_blocking(&mut stream, IROH_DAEMON_COMMAND_MAX_BYTES)
+        read_object_frame_blocking(&mut stream, DAEMON_CONTROL_RPC_MAX_FRAME_BYTES)
             .map_err(|source| source.to_string())?;
     if let LocalhostKvResponse::Error { message } = &response {
         return Err(message.clone());

@@ -2319,7 +2319,7 @@ impl sinomo_runtime::dfs::DfsPeerTransport for CliDfsPeerTransport {
         sinomo_runtime::network::ObjectRpcResponse,
         sinomo_runtime::dfs::DfsPeerTransportError,
     > {
-        daemon_dfs_object_rpc_to_target(
+        daemon_object_rpc_to_target(
             target_node_id,
             request,
             options.connect_timeout,
@@ -2329,7 +2329,7 @@ impl sinomo_runtime::dfs::DfsPeerTransport for CliDfsPeerTransport {
     }
 }
 
-fn daemon_dfs_object_rpc_to_target(
+fn daemon_object_rpc_to_target(
     target_node_id: &sinomo_runtime::node::NodeId,
     request: &sinomo_runtime::network::ObjectRpcRequest,
     timeout: std::time::Duration,
@@ -2340,7 +2340,7 @@ fn daemon_dfs_object_rpc_to_target(
         detail: "DFS cluster object RPC requires the local daemon to be running".to_string(),
     })?;
     DaemonApiClient::at_address(status.address)
-        .dfs_object_rpc_to_target(target_node_id, request, timeout, observe_connectivity)
+        .object_rpc_to_target(target_node_id, request, timeout, observe_connectivity)
         .map_err(CliError::from)
 }
 
@@ -2763,7 +2763,7 @@ fn fetch_dfs_status_from_node_blocking(
             started_at.elapsed().as_millis()
         );
     }
-    let response = daemon_dfs_object_rpc_to_target(node_id, &rpc_request, timeout, true);
+    let response = daemon_object_rpc_to_target(node_id, &rpc_request, timeout, true);
     if trace {
         let outcome = if response.is_ok() { "ok" } else { "error" };
         eprintln!(

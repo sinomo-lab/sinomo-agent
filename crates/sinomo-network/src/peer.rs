@@ -754,8 +754,9 @@ fn ingest_event<S: EventStore>(
 
 /// Synchronous in-memory object-RPC harness.
 ///
-/// DFS tests use this to drive routed messages through the canonical object-RPC
-/// mailbox. The legacy frame mailbox is compiled only for network crate tests.
+/// Integration tests use this to drive routed messages through the canonical
+/// object-RPC mailbox. The legacy frame mailbox is compiled only for network
+/// crate tests.
 #[derive(Clone, Debug, Default)]
 pub struct InProcessNetwork {
     inner: Arc<InProcessNetworkInner>,

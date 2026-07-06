@@ -1231,7 +1231,7 @@ impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
                 return result;
             }
 
-            sinomo_runtime::daemon::send_dfs_object_rpc_to_target_async(
+            sinomo_runtime::daemon::send_object_rpc_to_target_async(
                 &target_node_id,
                 &request,
                 options.connect_timeout,
@@ -1261,7 +1261,7 @@ fn sifs_send_dfs_object_rpc(
         ) {
             return tokio::task::block_in_place(|| {
                 handle.block_on(async {
-                    sinomo_runtime::daemon::send_dfs_object_rpc_to_target_async(
+                    sinomo_runtime::daemon::send_object_rpc_to_target_async(
                         target_node_id,
                         request,
                         options.connect_timeout,
@@ -1280,7 +1280,7 @@ fn sifs_send_dfs_object_rpc(
     rpc_runtime
         .runtime
         .block_on(async {
-            sinomo_runtime::daemon::send_dfs_object_rpc_to_target_async(
+            sinomo_runtime::daemon::send_object_rpc_to_target_async(
                 target_node_id,
                 request,
                 options.connect_timeout,
@@ -1302,7 +1302,7 @@ fn sifs_send_dfs_object_rpc_via_daemon(
     };
     Some(
         client
-            .dfs_object_rpc_to_target(
+            .object_rpc_to_target(
                 target_node_id,
                 request,
                 options.connect_timeout,

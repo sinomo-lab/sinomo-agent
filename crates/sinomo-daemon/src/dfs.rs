@@ -1,7 +1,7 @@
 use crate::control::DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL;
 use crate::{
-    DaemonError, DaemonPaths, DaemonRunOptions, send_dfs_object_rpc_to_target_async,
-    send_dfs_object_rpc_to_target_on_runtime,
+    DaemonError, DaemonPaths, DaemonRunOptions, send_object_rpc_to_target_async,
+    send_object_rpc_to_target_on_runtime,
 };
 use sinomo_core::ClusterEndpointRecord;
 #[allow(unused_imports)]
@@ -444,7 +444,7 @@ impl DfsPeerTransport for DaemonDfsBlockingPeerTransport {
         request: &sinomo_core::network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> Result<sinomo_core::network::ObjectRpcResponse, DfsPeerTransportError> {
-        send_dfs_object_rpc_to_target_on_runtime(
+        send_object_rpc_to_target_on_runtime(
             target_node_id,
             request,
             options.connect_timeout,
@@ -467,7 +467,7 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsAsyncPeerTransport {
     > {
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            send_dfs_object_rpc_to_target_async(
+            send_object_rpc_to_target_async(
                 target_node_id,
                 request,
                 options.connect_timeout,

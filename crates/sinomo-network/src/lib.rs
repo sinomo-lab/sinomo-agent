@@ -284,8 +284,8 @@ before recommending operator action. Do not infer membership changes from a
 single stale row.
 
 Prefer read-only inspection. Do not use relay, membership mutation, rollout, or
-DFS repair tools unless the user explicitly asks for remediation and the current
-health evidence supports that action.
+storage repair tools unless the user explicitly asks for remediation and the
+current health evidence supports that action.
 "#;
 
 pub const CLUSTER_NETWORK_INSPECTION_PROMPT_MARKDOWN: &str = r#"# Cluster Network Inspection Prompt

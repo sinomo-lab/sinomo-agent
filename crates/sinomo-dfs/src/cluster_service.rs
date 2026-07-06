@@ -20,7 +20,7 @@ pub fn cluster_dfs_data_endpoints(
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
     sinomo_core::network::ClusterEndpointSelector::new(cluster_paths, state)
-        .select(sinomo_core::network::ClusterEndpointSelectionPurpose::DfsData)
+        .select(sinomo_core::network::ClusterEndpointSelectionPurpose::MainDaemonDataPlane)
 }
 
 pub(crate) fn open_cluster_dfs_service_with_message_sender(

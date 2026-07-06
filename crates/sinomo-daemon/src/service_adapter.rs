@@ -130,8 +130,9 @@ use crate::{
     DAEMON_DFS_BROWSER_RENAME_ROUTE, DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE,
     DAEMON_DFS_BROWSER_STATUS_ROUTE, DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
     DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
-    DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
-    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
+    DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
+    DAEMON_STATUS_ROUTE,
 };
 
 static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
@@ -463,6 +464,7 @@ impl Service for DaemonControlService {
             DAEMON_STATUS_ROUTE,
             DAEMON_SHUTDOWN_ROUTE,
             DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
             DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
         ]
     }
@@ -470,7 +472,9 @@ impl Service for DaemonControlService {
     fn route_categories(&self) -> Vec<ServiceRoute> {
         let mut routes = service_route_categories(self.routes(), DAEMON_RPC_CATEGORY);
         for route in &mut routes {
-            if route.route == DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE {
+            if route.route == DAEMON_OBJECT_RPC_FORWARD_ROUTE
+                || route.route == DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
+            {
                 route.auth_scope = Some("local-command".to_string());
             }
         }
@@ -525,12 +529,12 @@ impl Service for DaemonControlService {
                         ServiceDisposition::Continue,
                     )
                 }
-                DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE => {
-                    let payload: crate::DaemonDfsObjectRpcForwardRequest = request.decode_body()?;
+                DAEMON_OBJECT_RPC_FORWARD_ROUTE | DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE => {
+                    let payload: crate::DaemonObjectRpcForwardRequest = request.decode_body()?;
                     let runtime =
-                        require_service_runtime(runtime.as_ref(), "daemon DFS object RPC forward")?
+                        require_service_runtime(runtime.as_ref(), "daemon object RPC forward")?
                             .clone();
-                    let response = crate::client::send_dfs_object_rpc_to_target_async(
+                    let response = crate::client::send_object_rpc_to_target_async(
                         &payload.target_node_id,
                         &payload.request,
                         Duration::from_millis(payload.connect_timeout_millis),
@@ -540,10 +544,7 @@ impl Service for DaemonControlService {
                     .await
                     .map_err(daemon_error)?;
                     (
-                        ObjectRpcResponse::encode_body(
-                            DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
-                            &response,
-                        )?,
+                        ObjectRpcResponse::encode_body(request.route.as_str(), &response)?,
                         ServiceDisposition::Continue,
                     )
                 }
@@ -2631,7 +2632,7 @@ async fn publish_daemon_sifs_metadata(
                 let request = sinomo_dfs::dfs_metadata_journal_batch_rpc_request(command).map_err(
                     |source| sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string()),
                 )?;
-                let response = crate::client::send_dfs_object_rpc_to_target_async(
+                let response = crate::client::send_object_rpc_to_target_async(
                     target_node_id,
                     &request,
                     connect_timeout,
@@ -2656,7 +2657,7 @@ async fn publish_daemon_sifs_metadata(
                     .map_err(|source| {
                         sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string())
                     })?;
-                let response = crate::client::send_dfs_object_rpc_to_target_async(
+                let response = crate::client::send_object_rpc_to_target_async(
                     target_node_id,
                     &request,
                     connect_timeout,
@@ -5907,6 +5908,15 @@ mod tests {
         assert!(!registry.owns("/dfs/protocol/frame"));
         assert_eq!(registry.category_for_route("/dfs/protocol/frame"), None);
         let route_metadata = registry.route_categories();
+        let object_rpc_forward = route_metadata
+            .iter()
+            .find(|route| route.route == crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE)
+            .expect("daemon object RPC forward route metadata");
+        assert_eq!(object_rpc_forward.category, crate::DAEMON_RPC_CATEGORY);
+        assert_eq!(
+            object_rpc_forward.auth_scope.as_deref(),
+            Some("local-command")
+        );
         let snapshot = route_metadata
             .iter()
             .find(|route| route.route == CLUSTER_KV_SNAPSHOT_ROUTE)

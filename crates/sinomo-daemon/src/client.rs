@@ -31,6 +31,8 @@ use sinomo_rollout::{
 };
 use std::time::Duration;
 
+const OBJECT_RPC_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 fn object_rpc_request_from_kv_payload(
     payload: sinomo_core::kv::ClusterKvRpcPayload,
 ) -> ObjectRpcRequest {
@@ -990,14 +992,14 @@ pub async fn send_dfs_metadata_snapshot_install_to_endpoint_async(
     .await
 }
 
-pub fn send_dfs_object_rpc_to_target(
+pub fn send_object_rpc_to_target(
     target_node_id: &NodeId,
     request: &ObjectRpcRequest,
     connect_timeout: Duration,
     observe_connectivity: bool,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        return send_dfs_object_rpc_to_target_on_runtime(
+        return send_object_rpc_to_target_on_runtime(
             target_node_id,
             request,
             connect_timeout,
@@ -1012,7 +1014,7 @@ pub fn send_dfs_object_rpc_to_target(
             address: "daemon client runtime".to_string(),
             detail: source.to_string(),
         })?;
-    let result = send_dfs_object_rpc_to_target_on_runtime(
+    let result = send_object_rpc_to_target_on_runtime(
         target_node_id,
         request,
         connect_timeout,
@@ -1023,7 +1025,7 @@ pub fn send_dfs_object_rpc_to_target(
     result
 }
 
-pub(crate) fn send_dfs_object_rpc_to_target_on_runtime(
+pub(crate) fn send_object_rpc_to_target_on_runtime(
     target_node_id: &NodeId,
     request: &ObjectRpcRequest,
     connect_timeout: Duration,
@@ -1034,7 +1036,7 @@ pub(crate) fn send_dfs_object_rpc_to_target_on_runtime(
     let request = request.clone();
     let runtime_for_future = runtime.clone();
     block_on_daemon_client_on_owner_runtime(runtime, async move {
-        send_dfs_object_rpc_to_target_async(
+        send_object_rpc_to_target_async(
             &target_node_id,
             &request,
             connect_timeout,
@@ -1045,7 +1047,7 @@ pub(crate) fn send_dfs_object_rpc_to_target_on_runtime(
     })
 }
 
-pub async fn send_dfs_object_rpc_to_target_async(
+pub async fn send_object_rpc_to_target_async(
     target_node_id: &NodeId,
     request: &ObjectRpcRequest,
     connect_timeout: Duration,
@@ -1055,7 +1057,45 @@ pub async fn send_dfs_object_rpc_to_target_async(
     send_daemon_rpc_to_target_async_with_connectivity_observation(
         target_node_id,
         request,
-        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(connect_timeout),
+        object_rpc_transfer_timeouts(connect_timeout),
+        runtime,
+        observe_connectivity,
+    )
+    .await
+}
+
+pub(crate) fn object_rpc_transfer_timeouts(
+    connect_timeout: Duration,
+) -> sinomo_core::network::DaemonRpcTimeouts {
+    sinomo_core::network::DaemonRpcTimeouts::connect_only(connect_timeout)
+        .with_idle_timeout(Some(OBJECT_RPC_TRANSFER_IDLE_TIMEOUT))
+}
+
+pub fn send_dfs_object_rpc_to_target(
+    target_node_id: &NodeId,
+    request: &ObjectRpcRequest,
+    connect_timeout: Duration,
+    observe_connectivity: bool,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    send_object_rpc_to_target(
+        target_node_id,
+        request,
+        connect_timeout,
+        observe_connectivity,
+    )
+}
+
+pub async fn send_dfs_object_rpc_to_target_async(
+    target_node_id: &NodeId,
+    request: &ObjectRpcRequest,
+    connect_timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+    observe_connectivity: bool,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    send_object_rpc_to_target_async(
+        target_node_id,
+        request,
+        connect_timeout,
         runtime,
         observe_connectivity,
     )
@@ -1512,6 +1552,14 @@ pub fn send_daemon_rollout_diagnostics_to_endpoint(
 mod tests {
     use sinomo_core::network::ObjectRpcRequest;
     use std::time::Duration;
+
+    #[test]
+    fn object_rpc_transfer_timeouts_keep_transfer_idle_separate_from_connect_budget() {
+        let timeouts = super::object_rpc_transfer_timeouts(Duration::from_secs(60));
+
+        assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(300)));
+    }
 
     #[test]
     fn daemon_rpc_sync_client_rejects_current_thread_runtime() {

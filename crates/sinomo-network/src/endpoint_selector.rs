@@ -297,8 +297,8 @@ pub enum ClusterEndpointSelectionPurpose {
     ClusterStateAuthority,
     ClusterStateCommand,
     DaemonCommand,
-    DfsData,
     InvitePublish,
+    MainDaemonDataPlane,
     MainDaemonCommand,
     MainDaemonCommandCandidates,
     MemberDaemonStatus,
@@ -406,8 +406,8 @@ impl<'a> ClusterEndpointSelector<'a> {
                 ClusterEndpointSelectionPurpose::DaemonCommand,
             ) => try_cluster_daemon_command_targets_impl(self.paths, self.state),
             ClusterEndpointInternalSelectionPurpose::Public(
-                ClusterEndpointSelectionPurpose::DfsData,
-            ) => try_cluster_dfs_data_targets_impl(self.paths, self.state),
+                ClusterEndpointSelectionPurpose::MainDaemonDataPlane,
+            ) => try_cluster_main_daemon_data_plane_targets_impl(self.paths, self.state),
             ClusterEndpointInternalSelectionPurpose::Public(
                 ClusterEndpointSelectionPurpose::InvitePublish,
             ) => try_cluster_invite_publish_targets_impl(self.paths, self.state),
@@ -947,7 +947,7 @@ fn cluster_daemon_command_endpoint_is_usable(
     }
 }
 
-pub(crate) fn try_cluster_dfs_data_targets_impl(
+pub(crate) fn try_cluster_main_daemon_data_plane_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
@@ -965,7 +965,7 @@ pub(crate) fn try_cluster_dfs_data_targets_impl(
         }
         let Some(endpoint) =
             graph.best_healthy_endpoint_matching(&state.local_node_id, &node_id, |endpoint| {
-                dfs_data_endpoint_is_usable_for_main_daemon(&main_daemon_node_ids, endpoint)
+                main_daemon_data_plane_endpoint_is_usable(&main_daemon_node_ids, endpoint)
             })
         else {
             continue;
@@ -977,7 +977,7 @@ pub(crate) fn try_cluster_dfs_data_targets_impl(
         try_cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)?;
     append_cluster_kv_main_daemon_endpoints(paths, state, &mut fallback_targets)?;
     fallback_targets.retain(|endpoint| {
-        dfs_data_endpoint_is_usable_for_main_daemon(&main_daemon_node_ids, endpoint)
+        main_daemon_data_plane_endpoint_is_usable(&main_daemon_node_ids, endpoint)
     });
     fallback_targets.sort_by(|left, right| {
         cluster_sync_targets_with_connectivity_cmp(&graph, &node_statuses, left, right)
@@ -1002,7 +1002,7 @@ fn collect_remote_main_daemon_node_ids(
     Ok(main_daemon_node_ids)
 }
 
-fn dfs_data_endpoint_is_usable_for_main_daemon(
+fn main_daemon_data_plane_endpoint_is_usable(
     main_daemon_node_ids: &EndpointNodeSet,
     endpoint: &ClusterEndpointRecord,
 ) -> bool {
@@ -1021,10 +1021,14 @@ fn append_cluster_kv_main_daemon_endpoints(
     match cluster_directory_for(paths).endpoints() {
         Ok(kv_endpoints) => {
             for endpoint in kv_endpoints {
-                if !dfs_data_endpoint_is_usable_for_main_daemon(&main_daemon_node_ids, &endpoint) {
+                if !main_daemon_data_plane_endpoint_is_usable(&main_daemon_node_ids, &endpoint) {
                     continue;
                 }
-                crate::object::try_reserve_vec(targets, 1, "collect DFS data KV endpoints")?;
+                crate::object::try_reserve_vec(
+                    targets,
+                    1,
+                    "collect main daemon data-plane KV endpoints",
+                )?;
                 targets.push(endpoint);
             }
         }
@@ -1897,20 +1901,20 @@ mod tests {
     }
 
     #[test]
-    fn dfs_data_targets_seed_healthy_observed_endpoint_before_public_fallback() {
-        let root = sinomo_testdir::TestDir::new("sinomo-network-dfs-data-healthy-endpoint");
+    fn main_daemon_data_plane_targets_seed_healthy_observed_endpoint_before_public_fallback() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-main-data-healthy-endpoint");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("root layout");
         let paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            ClusterId::from_legacy_named("cluster_dfs_data_healthy_endpoint").expect("cluster id");
-        let local = NodeId::from_legacy_named("node_dfs_data_healthy_local").expect("local node");
+            ClusterId::from_legacy_named("cluster_main_data_healthy_endpoint").expect("cluster id");
+        let local = NodeId::from_legacy_named("node_main_data_healthy_local").expect("local node");
         let remote =
-            NodeId::from_legacy_named("node_dfs_data_healthy_remote").expect("remote node");
+            NodeId::from_legacy_named("node_main_data_healthy_remote").expect("remote node");
         let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
-            "dfs data healthy endpoint",
+            "main data-plane healthy endpoint",
             local.clone(),
             "local",
             "pk-local",
@@ -1956,7 +1960,8 @@ mod tests {
         )
         .expect("write local connectivity");
 
-        let targets = try_cluster_dfs_data_targets_impl(&paths, &state).expect("dfs data targets");
+        let targets = try_cluster_main_daemon_data_plane_targets_impl(&paths, &state)
+            .expect("main daemon data-plane targets");
 
         assert_eq!(
             targets.first().map(|endpoint| endpoint.address.as_str()),
