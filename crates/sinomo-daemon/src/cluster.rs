@@ -79,6 +79,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 pub const DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const CLUSTER_CONNECTIVITY_IMPORT_ENDPOINT_TIMEOUT: Duration = CLUSTER_HEALTH_PROBE_TIMEOUT;
 const CLUSTER_HEALTH_ROUTED_PING_TIMEOUT: Duration = Duration::from_millis(750);
 const CLUSTER_HEALTH_DIRECT_STATUS_TIMEOUT: Duration = Duration::from_millis(750);
 const CLUSTER_HEALTH_DIRECT_STATUS_MAX_ENDPOINTS: usize = 4;
@@ -138,6 +139,7 @@ const PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS_PER_SOURCE: usize =
     sinomo_core::network::MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS;
 const PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS: usize =
     sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
+const CLUSTER_CONNECTIVITY_IMPORT_CONCURRENCY: usize = 16;
 
 #[cfg(test)]
 fn cluster_network_info_key(node_id: &NodeId) -> String {
@@ -2713,25 +2715,35 @@ impl ClusterNetworkMaintenance {
         pending: ClusterConnectivityPendingProbe,
         runtime: tokio::runtime::Handle,
     ) {
+        let ClusterConnectivityPendingProbe {
+            paths,
+            source_node_id,
+            state,
+            plan,
+            use_formation_timeouts,
+        } = pending;
+        let import_probe_keys = connectivity_import_probe_keys_for_plan(&plan);
         let records = self
-            .execute_connectivity_probe_plan_async(&pending.state, pending.plan)
+            .execute_connectivity_probe_plan_async(&state, plan)
             .await;
         let written = sinomo_core::network::write_local_cluster_connectivity_record_set_async(
             &runtime,
-            &pending.paths,
-            &pending.source_node_id,
+            &paths,
+            &source_node_id,
             &records,
         )
         .await;
         match written {
             Ok(()) => {
                 self.idle_stats.incr_connectivity_record_sets_written();
+                let import_records =
+                    connectivity_import_records_for_probe_keys(&import_probe_keys, &records);
                 let imported = import_peer_connectivity_records_from_reachable_endpoints_async(
-                    &pending.paths,
-                    &pending.state,
-                    &records,
+                    &paths,
+                    &state,
+                    &import_records,
                     runtime,
-                    pending.use_formation_timeouts,
+                    use_formation_timeouts,
                 )
                 .await;
                 if imported > 0 {
@@ -2813,6 +2825,33 @@ impl ClusterNetworkMaintenance {
     }
 }
 
+fn connectivity_import_probe_keys_for_plan(
+    plan: &ClusterConnectivityProbePlan,
+) -> BTreeSet<(NodeId, sinomo_core::network::ClusterEndpointId)> {
+    plan.entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.endpoint.node_id.clone(),
+                entry.endpoint.endpoint_id.clone(),
+            )
+        })
+        .collect()
+}
+
+fn connectivity_import_records_for_probe_keys(
+    keys: &BTreeSet<(NodeId, sinomo_core::network::ClusterEndpointId)>,
+    records: &[ClusterConnectivityRecord],
+) -> Vec<ClusterConnectivityRecord> {
+    records
+        .iter()
+        .filter(|record| {
+            keys.contains(&(record.target_node_id.clone(), record.endpoint_id.clone()))
+        })
+        .cloned()
+        .collect()
+}
+
 async fn import_peer_connectivity_records_from_reachable_endpoints_async(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -2837,7 +2876,7 @@ async fn import_peer_connectivity_records_from_reachable_endpoints_async(
         cluster_control_plane_timeouts()
     };
     let mut visited = BTreeSet::new();
-    let mut imported = 0_usize;
+    let mut endpoints = Vec::new();
     for record in records {
         let Some(endpoint) = peer_connectivity_import_endpoint_for_record(state, record) else {
             continue;
@@ -2846,52 +2885,48 @@ async fn import_peer_connectivity_records_from_reachable_endpoints_async(
         if !visited.insert(key) {
             continue;
         }
-        let timeout = match endpoint.transport {
-            ClusterTransportKind::Iroh => timeouts.iroh_command_timeout,
-            _ => timeouts.tcp_command_timeout,
+        endpoints.push(endpoint);
+    }
+    if endpoints.is_empty() {
+        return 0;
+    }
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(
+        CLUSTER_CONNECTIVITY_IMPORT_CONCURRENCY,
+    ));
+    let mut handles = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        let Ok(permit) = semaphore.clone().acquire_owned().await else {
+            break;
         };
-        let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
-            DaemonClusterRpcMode::new(runtime.clone()),
-            timeouts,
-        );
-        let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
-        let response = client
-            .call_endpoint(
-                &endpoint,
-                &request,
-                sinomo_core::network::ClusterObjectRpcOptions::new(
-                    sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
-                ),
+        let state = state.clone();
+        let request = request.clone();
+        let runtime = runtime.clone();
+        let timeout = connectivity_import_timeout_for_endpoint(&endpoint, timeouts);
+        handles.push(tokio::spawn(async move {
+            let _permit = permit;
+            let result = fetch_peer_connectivity_records_from_endpoint_async(
+                state, endpoint, request, runtime, timeout,
             )
             .await;
-        let response = match response {
-            Ok(response) => response,
+            result
+        }));
+    }
+
+    let mut imported = 0_usize;
+    for handle in handles {
+        let (endpoint, peer_records) = match handle.await {
+            Ok(result) => result,
             Err(error) => {
-                tracing::debug!(
-                    "sinomo daemon peer connectivity import from {} failed: {error}",
-                    endpoint.address
-                );
+                tracing::debug!("sinomo daemon peer connectivity import task failed: {error}");
                 continue;
             }
         };
-        if let Err(error) = response.error_detail() {
-            tracing::debug!(
-                "sinomo daemon peer connectivity import from {} returned error: {error}",
-                endpoint.address
-            );
-            continue;
-        }
-        let peer_records = match response.decode_body::<Vec<ClusterConnectivityRecord>>() {
-            Ok(records) => records
-                .into_iter()
-                .filter(|record| {
-                    record.cluster_id == state.cluster_id
-                        && record.source_node_id == endpoint.node_id
-                })
-                .collect::<Vec<_>>(),
+        let peer_records = match peer_records {
+            Ok(peer_records) => peer_records,
             Err(error) => {
                 tracing::debug!(
-                    "sinomo daemon peer connectivity import from {} decode failed: {error}",
+                    "sinomo daemon peer connectivity import from {} failed: {error}",
                     endpoint.address
                 );
                 continue;
@@ -2913,6 +2948,65 @@ async fn import_peer_connectivity_records_from_reachable_endpoints_async(
         }
     }
     imported
+}
+
+fn connectivity_import_timeout_for_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
+) -> Duration {
+    let timeout = match endpoint.transport {
+        ClusterTransportKind::Iroh => timeouts.iroh_command_timeout,
+        _ => timeouts.tcp_command_timeout,
+    };
+    timeout.min(CLUSTER_CONNECTIVITY_IMPORT_ENDPOINT_TIMEOUT)
+}
+
+async fn fetch_peer_connectivity_records_from_endpoint_async(
+    state: ClusterBootstrapState,
+    endpoint: ClusterEndpointRecord,
+    request: ObjectRpcRequest,
+    runtime: tokio::runtime::Handle,
+    timeout: Duration,
+) -> (
+    ClusterEndpointRecord,
+    Result<Vec<ClusterConnectivityRecord>, String>,
+) {
+    let result = async {
+        let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+            DaemonClusterRpcMode::new(runtime.clone()),
+            cluster_control_plane_timeouts(),
+        );
+        let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
+        let response = client
+            .call_endpoint(
+                &endpoint,
+                &request,
+                sinomo_core::network::ClusterObjectRpcOptions::new(
+                    sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+                ),
+            )
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => return Err(error.to_string()),
+        };
+        if let Err(error) = response.error_detail() {
+            return Err(format!("returned error: {error}"));
+        }
+        let peer_records = match response.decode_body::<Vec<ClusterConnectivityRecord>>() {
+            Ok(records) => records
+                .into_iter()
+                .filter(|record| {
+                    record.cluster_id == state.cluster_id
+                        && record.source_node_id == endpoint.node_id
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => return Err(format!("decode failed: {error}")),
+        };
+        Ok(peer_records)
+    }
+    .await;
+    (endpoint, result)
 }
 
 fn peer_connectivity_import_endpoint_for_record(
@@ -12505,6 +12599,132 @@ mod tests {
         assert_eq!(endpoint.source, ClusterEndpointSource::Observed);
         assert_eq!(endpoint.privacy, ClusterEndpointPrivacy::Lan);
         assert_eq!(endpoint.last_observed_latency_ms, Some(42));
+    }
+
+    #[test]
+    fn peer_connectivity_import_caps_endpoint_timeout() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_peer_import_timeout").expect("cluster id");
+        let remote_node =
+            NodeId::from_legacy_named("node_peer_import_timeout_remote").expect("remote node");
+        let tcp = sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "10.0.0.41:21353".to_string(),
+            10,
+        );
+        let iroh = IrohEndpointRecord::from_relay_url(
+            cluster_id,
+            remote_node,
+            "iroh_public_key_peer_import_timeout",
+            "https://relay.example./",
+        )
+        .endpoint();
+
+        let normal_timeouts = cluster_control_plane_timeouts();
+        assert_eq!(
+            connectivity_import_timeout_for_endpoint(&tcp, normal_timeouts),
+            CLUSTER_CONNECTIVITY_IMPORT_ENDPOINT_TIMEOUT
+        );
+        assert_eq!(
+            connectivity_import_timeout_for_endpoint(&iroh, normal_timeouts),
+            CLUSTER_CONNECTIVITY_IMPORT_ENDPOINT_TIMEOUT
+        );
+
+        let formation_timeouts = cluster_formation_control_plane_timeouts();
+        assert_eq!(
+            connectivity_import_timeout_for_endpoint(&tcp, formation_timeouts),
+            DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT
+        );
+        assert_eq!(
+            connectivity_import_timeout_for_endpoint(&iroh, formation_timeouts),
+            CLUSTER_CONNECTIVITY_IMPORT_ENDPOINT_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn peer_connectivity_import_uses_current_probe_batch_records_only() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_peer_import_probe_batch").expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_peer_import_probe_batch_local").expect("local node");
+        let selected_node = NodeId::from_legacy_named("node_peer_import_probe_batch_selected")
+            .expect("selected node");
+        let skipped_node = NodeId::from_legacy_named("node_peer_import_probe_batch_skipped")
+            .expect("skipped node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "peer import probe batch",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let selected_endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &selected_node,
+            "203.0.113.41:21353".to_string(),
+            10,
+        );
+        let skipped_endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &skipped_node,
+            "203.0.113.42:21353".to_string(),
+            10,
+        );
+        for (node, name, endpoint) in [
+            (selected_node.clone(), "selected", selected_endpoint.clone()),
+            (skipped_node.clone(), "skipped", skipped_endpoint.clone()),
+        ] {
+            let mut member =
+                ClusterMemberRecord::local_voter(cluster_id.clone(), node, name, "pk", now);
+            member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+            member.allowed_capabilities = member.capabilities.clone();
+            member.endpoints = vec![endpoint];
+            state.members.push(member);
+        }
+
+        let selected_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &selected_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(4),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            60,
+        );
+        let skipped_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &skipped_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(5),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            60,
+        );
+        let plan = ClusterConnectivityProbePlan {
+            active_keys: vec![cluster_connectivity_probe_key(
+                &local_node,
+                &selected_endpoint,
+            )],
+            entries: vec![sinomo_core::network::ClusterConnectivityProbeBatchEntry {
+                key: cluster_connectivity_probe_key(&local_node, &selected_endpoint),
+                endpoint: selected_endpoint.clone(),
+                previous: None,
+            }],
+            timestamp: "test".to_string(),
+            now,
+            startup_settle_active: false,
+        };
+        let import_keys = connectivity_import_probe_keys_for_plan(&plan);
+        let import_records = connectivity_import_records_for_probe_keys(
+            &import_keys,
+            &[selected_record.clone(), skipped_record],
+        );
+
+        assert_eq!(import_records, vec![selected_record]);
     }
 
     #[test]
