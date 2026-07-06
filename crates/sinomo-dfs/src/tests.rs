@@ -16573,6 +16573,50 @@ fn repair_retry_schedule_does_not_double_count_completed_inflight_attempt() {
 }
 
 #[test]
+fn repair_retry_schedule_preserves_network_error_diagnostics() {
+    let root = temp_root("repair-retry-preserves-network-error");
+    let owner = NodeId::from_legacy_named("node_retry_error_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_retry_error_replica").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_retry_error").expect("object");
+    let version = DfsVersion::from_legacy_named("version_retry_error").expect("version");
+    let mut dfs = networked_sifs_with_backend(&root, owner);
+    let intent_id = "dfs_intent_retry_error";
+    dfs.pending_writes.insert(
+        intent_id.to_string(),
+        PendingNetworkedWrite::new(
+            object_id.clone(),
+            version.clone(),
+            "blake3:retry-error".to_string(),
+            64,
+        ),
+    );
+
+    dfs.repair_retry_tick = 12;
+    dfs.record_repair_retry_scheduled_with_error(
+        intent_id,
+        &replica,
+        Some("route to target node failed: no usable endpoint".to_string()),
+    );
+
+    let records = dfs.active_repair_attempt_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].intent_id, intent_id);
+    assert_eq!(records[0].object_id, object_id);
+    assert_eq!(records[0].version, version);
+    assert_eq!(records[0].missing_replica_node_id, replica);
+    assert_eq!(records[0].attempts, 1);
+    assert!(!records[0].in_flight);
+    assert!(
+        records[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("no usable endpoint"))
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn repair_replica_chunk_window_respects_resume_and_tail_probe() {
     assert_eq!(repair_replica_chunk_start_and_window(0, 4, 16), (0, 4));
     assert_eq!(repair_replica_chunk_start_and_window(4, 4, 16), (4, 4));
@@ -17234,6 +17278,7 @@ fn completed_chunked_stage_and_repair_keep_probe_offset_until_response() {
             sent: true,
             complete: true,
             next_chunk_index: 17,
+            last_error: None,
         },
     );
     let pending = dfs
@@ -17264,6 +17309,7 @@ fn completed_chunked_stage_and_repair_keep_probe_offset_until_response() {
             sent: true,
             complete: true,
             next_chunk_index: 5,
+            last_error: None,
         },
     );
     let pending = dfs
@@ -17307,6 +17353,7 @@ fn partial_chunked_repair_preserves_resume_offset_without_backoff() {
             sent: true,
             complete: false,
             next_chunk_index: 4,
+            last_error: None,
         },
     );
 
@@ -17361,6 +17408,7 @@ fn stale_chunked_repair_resume_restarts_from_zero_without_backoff() {
             sent: true,
             complete: true,
             next_chunk_index: 8,
+            last_error: None,
         },
     );
     dfs.repair_attempt_records.insert(
@@ -19245,6 +19293,7 @@ fn completed_repair_transfer_retry_deadline_scales_with_payload_size() {
             sent: true,
             complete: true,
             next_chunk_index: blob_chunk_count_for_size(chunked_size).expect("chunk count"),
+            last_error: None,
         },
     );
 
@@ -19391,6 +19440,7 @@ fn repair_replica_streams_complete_large_chunk_transfer() {
             sent: true,
             complete: false,
             next_chunk_index: DFS_STAGE_CHUNK_WINDOW_SIZE,
+            last_error: None,
         }
     );
     let chunks = drain_dfs_messages(&mut replica_transport)
@@ -19434,6 +19484,7 @@ fn repair_replica_streams_complete_large_chunk_transfer() {
             sent: true,
             complete: true,
             next_chunk_index: total_chunks,
+            last_error: None,
         }
     );
     let resumed_chunks = drain_dfs_messages(&mut replica_transport)
@@ -19484,6 +19535,7 @@ fn repair_replica_streams_complete_large_chunk_transfer() {
             sent: true,
             complete: true,
             next_chunk_index: total_chunks,
+            last_error: None,
         }
     );
     let stale_partial_chunks = drain_dfs_messages(&mut replica_transport)

@@ -220,6 +220,7 @@ pub(crate) struct StageBlobSendOutcome {
     pub(crate) sent: bool,
     pub(crate) complete: bool,
     pub(crate) next_chunk_index: u32,
+    pub(crate) last_error: Option<String>,
 }
 
 /// Freshness classification for read data returned by a networked DFS service.

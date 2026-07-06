@@ -168,16 +168,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     )?;
                     continue;
                 }
-                let fetch_requested = self.request_repair_blob_from_alternate(&job, &pending)?;
-                if !fetch_requested {
-                    self.record_repair_retry_scheduled(intent_id, &replica_node_id);
+                let fetch_outcome = self.request_repair_blob_from_alternate(&job, &pending)?;
+                if !fetch_outcome.requested {
+                    self.record_repair_retry_scheduled_with_error(
+                        intent_id,
+                        &replica_node_id,
+                        fetch_outcome.last_error,
+                    );
                 }
                 continue;
             }
             if self.open_pending_write_blob_stream(&pending).is_err() {
-                let fetch_requested = self.request_repair_blob_from_alternate(&job, &pending)?;
-                if !fetch_requested {
-                    self.record_repair_retry_scheduled(intent_id, &replica_node_id);
+                let fetch_outcome = self.request_repair_blob_from_alternate(&job, &pending)?;
+                if !fetch_outcome.requested {
+                    self.record_repair_retry_scheduled_with_error(
+                        intent_id,
+                        &replica_node_id,
+                        fetch_outcome.last_error,
+                    );
                 }
                 continue;
             }
@@ -214,7 +222,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     outcome,
                 );
             } else {
-                self.record_repair_retry_scheduled(intent_id, &replica_node_id);
+                self.record_repair_retry_scheduled_with_error(
+                    intent_id,
+                    &replica_node_id,
+                    outcome.last_error,
+                );
             }
         }
         Ok(())

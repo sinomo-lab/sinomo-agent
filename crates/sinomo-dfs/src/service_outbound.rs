@@ -17,6 +17,12 @@ use crate::transfer::{
 };
 use crate::*;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DfsBestEffortMessageSendOutcome {
+    pub(crate) sent: bool,
+    pub(crate) last_error: Option<String>,
+}
+
 impl<T> NetworkedDfsService<T>
 where
     T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
@@ -65,6 +71,7 @@ where
                 sent,
                 complete: sent,
                 next_chunk_index: 0,
+                last_error: None,
             });
         }
 
@@ -75,6 +82,7 @@ where
                 sent: true,
                 complete: true,
                 next_chunk_index: total_chunks,
+                last_error: None,
             });
         }
         let end_chunk_index = start_chunk_index
@@ -112,6 +120,7 @@ where
                     sent: false,
                     complete: false,
                     next_chunk_index: chunk_index,
+                    last_error: None,
                 });
             }
         }
@@ -119,6 +128,7 @@ where
             sent: true,
             complete: end_chunk_index >= total_chunks,
             next_chunk_index: end_chunk_index,
+            last_error: None,
         })
     }
 
@@ -170,6 +180,7 @@ where
                 sent,
                 complete: sent,
                 next_chunk_index: 0,
+                last_error: None,
             });
         }
 
@@ -231,8 +242,8 @@ where
                 usize::try_from(total_size_bytes).unwrap_or(usize::MAX),
             )?;
             let bytes = read_small_blob_from_reader(content_hash, total_size_bytes, &mut reader)?;
-            let sent = self
-                .send_best_effort_message_if_routable_async(
+            let send_outcome = self
+                .send_best_effort_message_if_routable_outcome_async(
                     target_node_id,
                     DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
                         request_id: request_id.clone(),
@@ -249,9 +260,10 @@ where
                 )
                 .await?;
             return Ok(StageBlobSendOutcome {
-                sent,
-                complete: sent,
+                sent: send_outcome.sent,
+                complete: send_outcome.sent,
                 next_chunk_index: 0,
+                last_error: send_outcome.last_error,
             });
         }
 
@@ -308,6 +320,7 @@ where
                 sent: true,
                 complete: true,
                 next_chunk_index: total_chunks,
+                last_error: None,
             });
         }
         let max_chunks = max_chunks.max(1);
@@ -383,6 +396,7 @@ where
                     sent: false,
                     complete: false,
                     next_chunk_index: chunk_index,
+                    last_error: None,
                 });
             }
         }
@@ -403,6 +417,7 @@ where
             sent: true,
             complete: end_chunk_index >= total_chunks,
             next_chunk_index: end_chunk_index,
+            last_error: None,
         })
     }
 
@@ -411,12 +426,28 @@ where
         target_node_id: &NodeId,
         message: DfsNetworkMessage,
     ) -> Result<bool, DfsError> {
+        self.send_best_effort_message_if_routable_outcome_async(target_node_id, message)
+            .await
+            .map(|outcome| outcome.sent)
+    }
+
+    pub(crate) async fn send_best_effort_message_if_routable_outcome_async(
+        &mut self,
+        target_node_id: &NodeId,
+        message: DfsNetworkMessage,
+    ) -> Result<DfsBestEffortMessageSendOutcome, DfsError> {
         match self
             .send_dfs_message_if_routable_async(target_node_id, message)
             .await
         {
-            Ok(sent) => Ok(sent),
-            Err(DfsError::Network { .. }) => Ok(false),
+            Ok(sent) => Ok(DfsBestEffortMessageSendOutcome {
+                sent,
+                last_error: None,
+            }),
+            Err(DfsError::Network { message }) => Ok(DfsBestEffortMessageSendOutcome {
+                sent: false,
+                last_error: Some(message),
+            }),
             Err(error) => Err(error),
         }
     }
@@ -561,6 +592,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 sent,
                 complete: sent,
                 next_chunk_index: 0,
+                last_error: None,
             });
         }
 
@@ -571,6 +603,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 sent: true,
                 complete: true,
                 next_chunk_index: total_chunks,
+                last_error: None,
             });
         }
         let end_chunk_index = start_chunk_index
@@ -606,6 +639,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     sent: false,
                     complete: false,
                     next_chunk_index: chunk_index,
+                    last_error: None,
                 });
             }
         }
@@ -613,6 +647,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             sent: true,
             complete: end_chunk_index >= total_chunks,
             next_chunk_index: end_chunk_index,
+            last_error: None,
         })
     }
 
@@ -662,6 +697,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 sent,
                 complete: sent,
                 next_chunk_index: 0,
+                last_error: None,
             });
         }
 
@@ -722,7 +758,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 usize::try_from(total_size_bytes).unwrap_or(usize::MAX),
             )?;
             let bytes = read_small_blob_from_reader(content_hash, total_size_bytes, &mut reader)?;
-            let sent = self.send_best_effort_message_if_routable(
+            let send_outcome = self.send_best_effort_message_if_routable_outcome(
                 target_node_id,
                 DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
                     request_id: request_id.clone(),
@@ -738,9 +774,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }),
             )?;
             return Ok(StageBlobSendOutcome {
-                sent,
-                complete: sent,
+                sent: send_outcome.sent,
+                complete: send_outcome.sent,
                 next_chunk_index: 0,
+                last_error: send_outcome.last_error,
             });
         }
 
@@ -796,6 +833,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 sent: true,
                 complete: true,
                 next_chunk_index: total_chunks,
+                last_error: None,
             });
         }
         let max_chunks = max_chunks.max(1);
@@ -869,6 +907,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     sent: false,
                     complete: false,
                     next_chunk_index: chunk_index,
+                    last_error: None,
                 });
             }
         }
@@ -889,6 +928,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             sent: true,
             complete: end_chunk_index >= total_chunks,
             next_chunk_index: end_chunk_index,
+            last_error: None,
         })
     }
 
@@ -897,9 +937,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target_node_id: &NodeId,
         message: DfsNetworkMessage,
     ) -> Result<bool, DfsError> {
+        self.send_best_effort_message_if_routable_outcome(target_node_id, message)
+            .map(|outcome| outcome.sent)
+    }
+
+    pub(crate) fn send_best_effort_message_if_routable_outcome(
+        &mut self,
+        target_node_id: &NodeId,
+        message: DfsNetworkMessage,
+    ) -> Result<DfsBestEffortMessageSendOutcome, DfsError> {
         match self.send_dfs_message_if_routable(target_node_id, message) {
-            Ok(sent) => Ok(sent),
-            Err(DfsError::Network { .. }) => Ok(false),
+            Ok(sent) => Ok(DfsBestEffortMessageSendOutcome {
+                sent,
+                last_error: None,
+            }),
+            Err(DfsError::Network { message }) => Ok(DfsBestEffortMessageSendOutcome {
+                sent: false,
+                last_error: Some(message),
+            }),
             Err(error) => Err(error),
         }
     }

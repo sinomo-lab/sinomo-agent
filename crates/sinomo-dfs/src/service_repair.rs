@@ -25,6 +25,12 @@ pub(crate) const DFS_CHUNK_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs
 /// before assuming the requester gave up.
 const DFS_REMOTE_WRITE_RESPONSE_TTL: Duration = Duration::from_secs(60);
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DfsRepairBlobRequestOutcome {
+    pub(crate) requested: bool,
+    pub(crate) last_error: Option<String>,
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn handle_repair_replica(
         &mut self,
@@ -677,26 +683,28 @@ where
                     )?;
                     continue;
                 }
-                let fetch_requested = self
+                let fetch_outcome = self
                     .request_repair_blob_from_alternate_async(&job, &pending)
                     .await?;
-                if !fetch_requested {
-                    self.record_repair_retry_scheduled(
+                if !fetch_outcome.requested {
+                    self.record_repair_retry_scheduled_with_error(
                         &job.intent_id,
                         &job.missing_replica_node_id,
+                        fetch_outcome.last_error,
                     );
                 }
                 continue;
             }
 
             if self.open_pending_write_blob_stream(&pending).is_err() {
-                let fetch_requested = self
+                let fetch_outcome = self
                     .request_repair_blob_from_alternate_async(&job, &pending)
                     .await?;
-                if !fetch_requested {
-                    self.record_repair_retry_scheduled(
+                if !fetch_outcome.requested {
+                    self.record_repair_retry_scheduled_with_error(
                         &job.intent_id,
                         &job.missing_replica_node_id,
+                        fetch_outcome.last_error,
                     );
                 }
                 continue;
@@ -745,7 +753,11 @@ where
                     break;
                 }
             } else {
-                self.record_repair_retry_scheduled(&job.intent_id, &job.missing_replica_node_id);
+                self.record_repair_retry_scheduled_with_error(
+                    &job.intent_id,
+                    &job.missing_replica_node_id,
+                    outcome.last_error,
+                );
             }
         }
 
@@ -977,8 +989,9 @@ where
         &mut self,
         job: &DistributedRepairJob,
         pending: &PendingNetworkedWrite,
-    ) -> Result<bool, DfsError> {
+    ) -> Result<DfsRepairBlobRequestOutcome, DfsError> {
         let mut skipped_failed_source = false;
+        let mut last_error = None;
         let authority_object = self.current_read_object_metadata(&pending.object_id).ok();
         let authority_shard = self.command_authority_shard_for_object(authority_object.as_ref())?;
         for source_node_id in self.repair_blob_sources(job, pending)? {
@@ -1000,8 +1013,8 @@ where
                 .copied()
                 .unwrap_or(0);
             let max_chunks = self.adaptive_fetch_chunk_window(&source_node_id, pending.size_bytes);
-            let sent = self
-                .send_best_effort_message_if_routable_async(
+            let send_outcome = self
+                .send_best_effort_message_if_routable_outcome_async(
                     &source_node_id,
                     DfsNetworkMessage::FetchBlob(DfsFetchBlobCommand {
                         request_id: request_id.clone(),
@@ -1015,7 +1028,7 @@ where
                     }),
                 )
                 .await?;
-            if sent {
+            if send_outcome.sent {
                 tracing::debug!(
                     target: "sinomo.dfs.repair",
                     local_node_id = %self.node_id,
@@ -1038,7 +1051,13 @@ where
                     max_chunks,
                 );
                 self.record_repair_fetch_inflight(&job.intent_id, &job.missing_replica_node_id);
-                return Ok(true);
+                return Ok(DfsRepairBlobRequestOutcome {
+                    requested: true,
+                    last_error: None,
+                });
+            }
+            if send_outcome.last_error.is_some() {
+                last_error = send_outcome.last_error;
             }
         }
         if skipped_failed_source && let Some(pending) = self.pending_writes.get_mut(&job.intent_id)
@@ -1056,7 +1075,10 @@ where
             skipped_failed_source,
             "no routable DFS repair blob alternate source"
         );
-        Ok(false)
+        Ok(DfsRepairBlobRequestOutcome {
+            requested: false,
+            last_error,
+        })
     }
 }
 
@@ -1240,22 +1262,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     )?;
                     continue;
                 }
-                let fetch_requested = self.request_repair_blob_from_alternate(&job, &pending)?;
-                if !fetch_requested {
-                    self.record_repair_retry_scheduled(
+                let fetch_outcome = self.request_repair_blob_from_alternate(&job, &pending)?;
+                if !fetch_outcome.requested {
+                    self.record_repair_retry_scheduled_with_error(
                         &job.intent_id,
                         &job.missing_replica_node_id,
+                        fetch_outcome.last_error,
                     );
                 }
                 continue;
             }
 
             if self.open_pending_write_blob_stream(&pending).is_err() {
-                let fetch_requested = self.request_repair_blob_from_alternate(&job, &pending)?;
-                if !fetch_requested {
-                    self.record_repair_retry_scheduled(
+                let fetch_outcome = self.request_repair_blob_from_alternate(&job, &pending)?;
+                if !fetch_outcome.requested {
+                    self.record_repair_retry_scheduled_with_error(
                         &job.intent_id,
                         &job.missing_replica_node_id,
+                        fetch_outcome.last_error,
                     );
                 }
                 continue;
@@ -1302,7 +1326,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     break;
                 }
             } else {
-                self.record_repair_retry_scheduled(&job.intent_id, &job.missing_replica_node_id);
+                self.record_repair_retry_scheduled_with_error(
+                    &job.intent_id,
+                    &job.missing_replica_node_id,
+                    outcome.last_error,
+                );
             }
         }
 
@@ -2315,7 +2343,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
         replica_node_id: &NodeId,
     ) {
+        self.record_repair_retry_scheduled_with_error(intent_id, replica_node_id, None);
+    }
+
+    pub(crate) fn record_repair_retry_scheduled_with_error(
+        &mut self,
+        intent_id: &str,
+        replica_node_id: &NodeId,
+        last_error: Option<String>,
+    ) {
         let tick = self.repair_retry_tick;
+        let mut record_update = None;
         if let Some(pending) = self.pending_writes.get_mut(intent_id) {
             let state = pending
                 .repair_retries
@@ -2334,6 +2372,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             state.next_retry_tick = tick.saturating_add(repair_retry_delay_ticks(state.attempts));
             pending.repair_inflight_request_ids.remove(replica_node_id);
             pending.repair_next_chunk_indexes.remove(replica_node_id);
+            if let Some(last_error) = last_error {
+                let remaining_ticks = state.next_retry_tick.saturating_sub(tick);
+                record_update = Some(DfsRepairAttemptRecord {
+                    intent_id: intent_id.to_string(),
+                    object_id: pending.object_id.clone(),
+                    version: pending.version.clone(),
+                    content_hash: pending.content_hash.clone(),
+                    missing_replica_node_id: replica_node_id.clone(),
+                    attempts: state.attempts,
+                    in_flight: false,
+                    last_attempt_unix_nanos: dfs_now_unix_nanos(),
+                    next_retry_unix_nanos: dfs_now_unix_nanos()
+                        .saturating_add(repair_retry_delay_nanos_for_ticks(remaining_ticks)),
+                    next_chunk_index: None,
+                    last_error: Some(last_error),
+                });
+            }
+        }
+        if let Some(record) = record_update {
+            self.repair_attempt_records.insert(
+                (
+                    record.intent_id.clone(),
+                    record.missing_replica_node_id.clone(),
+                ),
+                record,
+            );
         }
     }
 
@@ -2440,8 +2504,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         job: &DistributedRepairJob,
         pending: &PendingNetworkedWrite,
-    ) -> Result<bool, DfsError> {
+    ) -> Result<DfsRepairBlobRequestOutcome, DfsError> {
         let mut skipped_failed_source = false;
+        let mut last_error = None;
         let authority_object = self.current_read_object_metadata(&pending.object_id).ok();
         let authority_shard = self.command_authority_shard_for_object(authority_object.as_ref())?;
         for source_node_id in self.repair_blob_sources(job, pending)? {
@@ -2463,7 +2528,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .copied()
                 .unwrap_or(0);
             let max_chunks = self.adaptive_fetch_chunk_window(&source_node_id, pending.size_bytes);
-            let sent = self.send_best_effort_message_if_routable(
+            let send_outcome = self.send_best_effort_message_if_routable_outcome(
                 &source_node_id,
                 DfsNetworkMessage::FetchBlob(DfsFetchBlobCommand {
                     request_id: request_id.clone(),
@@ -2476,7 +2541,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     max_chunks,
                 }),
             )?;
-            if sent {
+            if send_outcome.sent {
                 tracing::debug!(
                     target: "sinomo.dfs.repair",
                     local_node_id = %self.node_id,
@@ -2499,7 +2564,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     max_chunks,
                 );
                 self.record_repair_fetch_inflight(&job.intent_id, &job.missing_replica_node_id);
-                return Ok(true);
+                return Ok(DfsRepairBlobRequestOutcome {
+                    requested: true,
+                    last_error: None,
+                });
+            }
+            if send_outcome.last_error.is_some() {
+                last_error = send_outcome.last_error;
             }
         }
         if skipped_failed_source && let Some(pending) = self.pending_writes.get_mut(&job.intent_id)
@@ -2517,7 +2588,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             skipped_failed_source,
             "no routable DFS repair blob alternate source"
         );
-        Ok(false)
+        Ok(DfsRepairBlobRequestOutcome {
+            requested: false,
+            last_error,
+        })
     }
 
     pub(crate) fn repair_blob_sources(
