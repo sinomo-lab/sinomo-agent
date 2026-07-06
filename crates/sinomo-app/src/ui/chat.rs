@@ -9758,6 +9758,10 @@ impl TranscriptView {
         )
     }
 
+    fn timeline_header_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
+        sui::WidgetId::new(parent.get().wrapping_mul(53).wrapping_add(10_301))
+    }
+
     fn empty_text_widget_id(parent: sui::WidgetId, slot: usize) -> sui::WidgetId {
         sui::WidgetId::new(
             parent
@@ -10821,6 +10825,26 @@ impl Widget for TranscriptView {
                     ctx.push(node);
                 }
                 return;
+            }
+            let timeline_summary = {
+                let chat = self.shared.chat();
+                chat.timeline.visible_summary(chat.messages.len())
+            };
+            if let Some(summary) = timeline_summary {
+                let rect = Rect::new(
+                    ctx.bounds().x() + PAD,
+                    ctx.bounds().y() + PAD,
+                    (ctx.bounds().width() - PAD * 2.0).max(0.0),
+                    26.0,
+                );
+                let mut node = SemanticsNode::new(
+                    Self::timeline_header_widget_id(ctx.widget_id()),
+                    SemanticsRole::Text,
+                    rect,
+                );
+                node.parent = Some(ctx.widget_id());
+                node.name = Some(summary);
+                ctx.push(node);
             }
             for (slot, (action, rect)) in self.runtime_actions.borrow().iter().enumerate() {
                 let mut node = SemanticsNode::new(
@@ -14113,6 +14137,181 @@ mod tests {
         let mut state = ChatState::new(&backend);
         state.sessions.clear();
         (backend, state)
+    }
+
+    fn mock_chunked_timeline_shared(
+        title: &str,
+        total_messages: u64,
+        loaded_start_sequence: u64,
+        loaded_end_sequence: u64,
+        overview_sections: usize,
+    ) -> Shared {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let session_id = SessionId::generate().to_string();
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.sessions = vec![SessionRef {
+                id: session_id.clone(),
+                title: title.to_string(),
+                kind: ConversationKind::Channel,
+                updated_unix: 1,
+                participant_count: 2,
+                participant_names: vec!["main-agent".to_string(), "coding-agent".to_string()],
+            }];
+            chat.session_id = session_id;
+            chat.models_loading = false;
+            chat.messages = (loaded_start_sequence..=loaded_end_sequence)
+                .map(|sequence| {
+                    let text = format!("chunked message {sequence}");
+                    if sequence % 2 == 0 {
+                        ChatMessage::model(format!("main-agent: {text}")).with_sequence(sequence)
+                    } else {
+                        ChatMessage::user(text).with_sequence(sequence)
+                    }
+                })
+                .collect();
+            let section_count = overview_sections.max(1) as u64;
+            let section_size = total_messages.div_ceil(section_count).max(1);
+            chat.timeline = ConversationTimelineState {
+                total_messages,
+                chunk_size: section_size,
+                loaded_start_sequence: Some(loaded_start_sequence),
+                loaded_end_sequence: Some(loaded_end_sequence),
+                has_older: loaded_start_sequence > 1,
+                has_newer: loaded_end_sequence < total_messages,
+                overview: (0..overview_sections)
+                    .scan(1_u64, |start, index| {
+                        if *start > total_messages {
+                            return None;
+                        }
+                        let segment_start = *start;
+                        let segment_end = if index + 1 == overview_sections {
+                            total_messages
+                        } else {
+                            (*start + section_size - 1).min(total_messages)
+                        };
+                        *start = segment_end.saturating_add(1);
+                        Some(ConversationTimelineSegment {
+                            start_sequence: segment_start,
+                            end_sequence: segment_end,
+                            message_count: segment_end.saturating_sub(segment_start) + 1,
+                            first_created_unix: Some(index as i64 * 86_400),
+                            last_created_unix: Some(index as i64 * 86_400 + 3_600),
+                            preview: Some(format!("chunk {} starts at {segment_start}", index + 1)),
+                        })
+                    })
+                    .collect(),
+            };
+            chat.stick_bottom = false;
+            chat.scroll = 0.0;
+        }
+        shared
+    }
+
+    #[test]
+    fn rendered_chunked_timeline_window_exposes_overview_without_message_semantics()
+    -> sui::Result<()> {
+        let shared = mock_chunked_timeline_shared("Chunked timeline", 1_024, 401, 800, 8);
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chunked timeline")
+                    .root(view(shared)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        app.run_until_idle()?;
+        let snapshot = window.snapshot()?;
+        let summary = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find_map(|node| {
+                (node.role == SemanticsRole::Text)
+                    .then(|| node.name.as_deref())
+                    .flatten()
+                    .filter(|name| name.starts_with("Messages 401-800 of 1024"))
+            })
+            .expect("chunked transcript timeline summary");
+
+        assert!(summary.contains("8 sections"));
+        assert!(summary.contains("span 1-1024"));
+        assert!(summary.contains("older/newer available"));
+        assert!(
+            !snapshot.accessibility.nodes.iter().any(|node| {
+                node.name
+                    .as_deref()
+                    .is_some_and(|name| name.contains("chunked message 401"))
+            }),
+            "message text should stay paint-only instead of creating one semantic node per row"
+        );
+        assert!(
+            !snapshot.accessibility.nodes.iter().any(|node| {
+                node.name
+                    .as_deref()
+                    .is_some_and(|name| name.contains("chunked message 800"))
+            }),
+            "large chunked windows should not expose every rendered message as accessibility text"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_chunked_timeline_large_window_keeps_semantics_bounded() -> sui::Result<()> {
+        let loaded_count = TRANSCRIPT_MAX_LOADED_MESSAGES as u64;
+        let loaded_start = 20_001;
+        let loaded_end = loaded_start + loaded_count - 1;
+        let shared =
+            mock_chunked_timeline_shared("Long channel", 50_000, loaded_start, loaded_end, 20);
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Long channel")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        app.run_until_idle()?;
+        let snapshot = window.snapshot()?;
+        let expected_summary_prefix = format!("Messages {loaded_start}-{loaded_end} of 50000");
+        assert!(
+            snapshot.accessibility.nodes.iter().any(|node| {
+                node.role == SemanticsRole::Text
+                    && node
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.starts_with(&expected_summary_prefix))
+            }),
+            "large rendered transcript should expose the loaded range summary"
+        );
+        assert_eq!(
+            shared.chat().messages.len(),
+            TRANSCRIPT_MAX_LOADED_MESSAGES,
+            "mock should exercise the same bounded transcript window the app keeps loaded"
+        );
+        let message_semantics = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.name
+                    .as_deref()
+                    .is_some_and(|name| name.contains("chunked message "))
+            })
+            .count();
+        assert_eq!(
+            message_semantics, 0,
+            "loaded transcript windows must not allocate semantic nodes for every message"
+        );
+
+        Ok(())
     }
 
     fn seed_backend_chat(
