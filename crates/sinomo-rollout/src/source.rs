@@ -365,7 +365,6 @@ fn rollout_cargo_build_command(
     command
         .args(build_args)
         .current_dir(repo)
-        .env("CARGO_INCREMENTAL", "0")
         .env(ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV, commit);
     if let Some(target_dir) = target_dir {
         command.env("CARGO_TARGET_DIR", target_dir);
@@ -391,11 +390,8 @@ fn run_rollout_cargo_build(
 fn rollout_cargo_build_log_command(build_args: &[String], target_dir: Option<&Path>) -> String {
     let command = format!("cargo {}", build_args.join(" "));
     match target_dir {
-        Some(target_dir) => format!(
-            "CARGO_INCREMENTAL=0 CARGO_TARGET_DIR={} {command}",
-            target_dir.display()
-        ),
-        None => format!("CARGO_INCREMENTAL=0 {command}"),
+        Some(target_dir) => format!("CARGO_TARGET_DIR={} {command}", target_dir.display()),
+        None => command,
     }
 }
 
@@ -1469,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn rollout_cargo_build_command_disables_incremental_and_sets_optional_target_dir() {
+    fn rollout_cargo_build_command_sets_optional_target_dir() {
         let root = unique_temp("sinomo-rollout-build-command");
         run_git_for_test(&root, &["init"]);
         run_git_for_test(&root, &["config", "user.email", "test@example.com"]);
@@ -1492,7 +1488,7 @@ mod tests {
             })
             .collect::<std::collections::BTreeMap<_, _>>();
 
-        assert_eq!(envs.get("CARGO_INCREMENTAL"), Some(&Some("0".to_string())));
+        assert!(!envs.contains_key("CARGO_INCREMENTAL"));
         assert_eq!(
             envs.get("CARGO_TARGET_DIR"),
             Some(&Some(target_dir.display().to_string()))
@@ -1500,7 +1496,7 @@ mod tests {
         assert_eq!(
             rollout_cargo_build_log_command(&args, Some(&target_dir)),
             format!(
-                "CARGO_INCREMENTAL=0 CARGO_TARGET_DIR={} cargo build -p sinomo",
+                "CARGO_TARGET_DIR={} cargo build -p sinomo",
                 target_dir.display()
             )
         );
