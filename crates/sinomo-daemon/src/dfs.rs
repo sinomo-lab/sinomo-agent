@@ -82,6 +82,7 @@ struct DaemonDfsMessageRouteSnapshot {
 struct DaemonDfsMessageServiceLane {
     service: DaemonDfsMessageService,
     last_metadata_refresh: Instant,
+    metadata_hydrated: bool,
 }
 
 #[derive(Debug)]
@@ -704,6 +705,7 @@ fn open_daemon_dfs_message_service_lane(
     Ok(Arc::new(Mutex::new(DaemonDfsMessageServiceLane {
         service,
         last_metadata_refresh: Instant::now(),
+        metadata_hydrated: false,
     })))
 }
 
@@ -817,11 +819,12 @@ fn process_daemon_dfs_message_command_on_runtime(
     let endpoint_refresh_ms = endpoint_refresh_started.elapsed().as_millis();
     let hydrate_started = Instant::now();
     let mut hydrated_metadata = false;
-    if requires_fresh_metadata
+    if (requires_fresh_metadata && !service_lane.metadata_hydrated)
         || service_lane.last_metadata_refresh.elapsed() >= DAEMON_DFS_MESSAGE_CACHE_REFRESH_INTERVAL
     {
         service_lane.service.hydrate_from_metadata_backend()?;
         service_lane.last_metadata_refresh = Instant::now();
+        service_lane.metadata_hydrated = true;
         hydrated_metadata = true;
     }
     let hydrate_ms = hydrate_started.elapsed().as_millis();
@@ -3112,38 +3115,49 @@ mod tests {
         write_test_cluster_state(&data_root, &local);
         let runtime = daemon_test_runtime("daemon-dfs-message-warm-cache");
 
-        for frame_id in 1..=2 {
-            let response = handle_daemon_dfs_message_on_runtime(
-                &paths,
-                test_dfs_message_command(
-                    format!("dfs_message_warm_cache_{frame_id}"),
-                    test_dfs_lookup_routed_message(
-                        &remote,
-                        &local,
-                        frame_id,
-                        &format!("/services/warm-cache-{frame_id}.txt"),
-                    ),
-                ),
-                runtime.handle(),
-            )
-            .expect("DFS message");
-            assert_eq!(
-                response.request_id,
-                format!("dfs_message_warm_cache_{frame_id}")
-            );
-        }
-
         let cache_key = SinomoDataDir::new(&data_root).root();
+        let response = handle_daemon_dfs_message_on_runtime(
+            &paths,
+            test_dfs_message_command(
+                "dfs_message_warm_cache_1",
+                test_dfs_lookup_routed_message(&remote, &local, 1, "/services/warm-cache-1.txt"),
+            ),
+            runtime.handle(),
+        )
+        .expect("first DFS message");
+        assert_eq!(response.request_id, "dfs_message_warm_cache_1");
         let primary_service = {
             let cache = daemon_dfs_message_service_cache()
                 .lock()
                 .expect("cache lock");
             Arc::clone(&cache.get(&cache_key).expect("cache entry").primary_service)
         };
-        let first_refresh = primary_service
+        let first_refresh = {
+            let lane = primary_service.lock().expect("primary service lock");
+            assert!(
+                lane.metadata_hydrated,
+                "first fresh-metadata message should hydrate the cold lane"
+            );
+            lane.last_metadata_refresh
+        };
+        let response = handle_daemon_dfs_message_on_runtime(
+            &paths,
+            test_dfs_message_command(
+                "dfs_message_warm_cache_2",
+                test_dfs_lookup_routed_message(&remote, &local, 2, "/services/warm-cache-2.txt"),
+            ),
+            runtime.handle(),
+        )
+        .expect("second DFS message");
+        assert_eq!(response.request_id, "dfs_message_warm_cache_2");
+        let second_refresh = primary_service
             .lock()
             .expect("primary service lock")
             .last_metadata_refresh;
+        assert_eq!(
+            second_refresh, first_refresh,
+            "recently hydrated fresh-metadata commands should reuse the warm lane"
+        );
         write_test_cluster_state_with_remote_endpoint(
             &data_root,
             &local,
@@ -3160,13 +3174,13 @@ mod tests {
         )
         .expect("third DFS message");
         assert_eq!(response.request_id, "dfs_message_warm_cache_3");
-        let second_refresh = primary_service
+        let third_refresh = primary_service
             .lock()
             .expect("primary service lock")
             .last_metadata_refresh;
-        assert!(
-            second_refresh >= first_refresh,
-            "namespace lookups should keep fresh metadata available after endpoint refreshes"
+        assert_eq!(
+            third_refresh, first_refresh,
+            "endpoint refreshes should not force another full metadata hydrate"
         );
         let second_primary_service = {
             let cache = daemon_dfs_message_service_cache()
