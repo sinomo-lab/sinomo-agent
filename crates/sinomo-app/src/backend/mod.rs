@@ -23,12 +23,13 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use sinomo_runtime::api::{
+    DaemonApiClient, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
+    RemoteConfigClient, probe_daemon_status,
+};
 use sinomo_runtime::cluster::ClusterControlInitRequest;
 use sinomo_runtime::config::{ConfigClient, ConfigRegistry, ConfigStore, LocalConfigClient};
-use sinomo_runtime::daemon::{
-    DaemonApiClient, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonServiceRegistryHook,
-    DaemonStatus, RemoteConfigClient, probe_daemon_status, run_daemon_control_loop_with_services,
-};
+use sinomo_runtime::daemon::{DaemonServiceRegistryHook, run_daemon_control_loop_with_services};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::node::NodeProfile;
 

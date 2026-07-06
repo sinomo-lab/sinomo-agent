@@ -3289,9 +3289,9 @@ impl SifsBrowser {
     }
 
     fn open_remote_backend(backend: RemoteSifsBrowser) -> Result<Self, String> {
-        let status: sinomo_runtime::daemon::DaemonDfsBrowserStatusResponse = backend.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_STATUS_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserStatusRequest::node_only(),
+        let status: sinomo_runtime::api::DaemonDfsBrowserStatusResponse = backend.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_STATUS_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserStatusRequest::node_only(),
         )?;
         Ok(Self {
             backend: SifsBrowserBackend::Remote(backend),
@@ -3547,10 +3547,10 @@ impl SifsBrowser {
 }
 
 impl RemoteSifsBrowser {
-    fn status(&self) -> Result<sinomo_runtime::daemon::DaemonDfsBrowserStatusResponse, String> {
+    fn status(&self) -> Result<sinomo_runtime::api::DaemonDfsBrowserStatusResponse, String> {
         self.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_STATUS_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserStatusRequest::with_health(),
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_STATUS_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserStatusRequest::with_health(),
         )
     }
 
@@ -3560,11 +3560,11 @@ impl RemoteSifsBrowser {
         Resp: serde::de::DeserializeOwned,
     {
         let request =
-            ObjectRpcRequest::encode_body(route, sinomo_runtime::daemon::DAEMON_RPC_CATEGORY, body)
+            ObjectRpcRequest::encode_body(route, sinomo_runtime::api::DAEMON_RPC_CATEGORY, body)
                 .map_err(|error| error.to_string())?;
         let response = if let Some(runtime) = &self.runtime {
             runtime
-                .block_on(sinomo_runtime::daemon::send_daemon_rpc_async(
+                .block_on(sinomo_runtime::api::send_daemon_rpc_async(
                     &self.address,
                     &request,
                     sinomo_runtime::network::DaemonRpcTimeouts::connect_and_idle(self.timeout),
@@ -3572,7 +3572,7 @@ impl RemoteSifsBrowser {
                 ))
                 .map_err(|error| error.to_string())?
         } else {
-            sinomo_runtime::daemon::send_daemon_rpc(&self.address, &request, self.timeout)
+            sinomo_runtime::api::send_daemon_rpc(&self.address, &request, self.timeout)
                 .map_err(|error| error.to_string())?
         };
         response.decode_body().map_err(|error| error.to_string())
@@ -3584,14 +3584,14 @@ impl RemoteSifsBrowser {
         shallow: bool,
         missing_is_empty: bool,
     ) -> Result<Vec<SifsEntry>, String> {
-        let response: sinomo_runtime::daemon::DaemonDfsBrowserListResponse = self.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_LIST_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserListRequest {
+        let response: sinomo_runtime::api::DaemonDfsBrowserListResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_LIST_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserListRequest {
                 path: path.to_string(),
                 shallow,
                 missing_is_empty,
-                sort_key: sinomo_runtime::daemon::DaemonDfsBrowserSortKey::Name,
-                sort_direction: sinomo_runtime::daemon::DaemonDfsBrowserSortDirection::Ascending,
+                sort_key: sinomo_runtime::api::DaemonDfsBrowserSortKey::Name,
+                sort_direction: sinomo_runtime::api::DaemonDfsBrowserSortDirection::Ascending,
                 offset: 0,
                 limit: None,
             },
@@ -3610,9 +3610,9 @@ impl RemoteSifsBrowser {
         missing_is_empty: bool,
         options: SifsListOptions,
     ) -> Result<SifsEntryPage, String> {
-        let response: sinomo_runtime::daemon::DaemonDfsBrowserListResponse = self.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_LIST_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserListRequest {
+        let response: sinomo_runtime::api::DaemonDfsBrowserListResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_LIST_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserListRequest {
                 path: path.to_string(),
                 shallow,
                 missing_is_empty,
@@ -3635,9 +3635,9 @@ impl RemoteSifsBrowser {
     }
 
     fn stat(&self, path: &str) -> Result<SifsObjectDetails, String> {
-        let response: sinomo_runtime::daemon::DaemonDfsBrowserStatResponse = self.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_STAT_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserStatRequest {
+        let response: sinomo_runtime::api::DaemonDfsBrowserStatResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_STAT_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserStatRequest {
                 path: path.to_string(),
             },
         )?;
@@ -3645,9 +3645,9 @@ impl RemoteSifsBrowser {
     }
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
-        let response: sinomo_runtime::daemon::DaemonDfsBrowserReadFileResponse = self.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserReadFileRequest {
+        let response: sinomo_runtime::api::DaemonDfsBrowserReadFileResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserReadFileRequest {
                 path: path.to_string(),
             },
         )?;
@@ -3655,9 +3655,9 @@ impl RemoteSifsBrowser {
     }
 
     fn read_file_prefix(&self, path: &str, max_bytes: u64) -> Result<SifsFileRead, String> {
-        let response: sinomo_runtime::daemon::DaemonDfsBrowserReadFilePrefixResponse = self.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserReadFilePrefixRequest {
+        let response: sinomo_runtime::api::DaemonDfsBrowserReadFilePrefixResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserReadFilePrefixRequest {
                 path: path.to_string(),
                 max_bytes,
             },
@@ -3672,9 +3672,9 @@ impl RemoteSifsBrowser {
         &self,
         paths: &[String],
     ) -> Result<Vec<(String, Result<Vec<u8>, String>)>, String> {
-        let response: sinomo_runtime::daemon::DaemonDfsBrowserReadFilesResponse = self.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserReadFilesRequest {
+        let response: sinomo_runtime::api::DaemonDfsBrowserReadFilesResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserReadFilesRequest {
                 paths: paths.to_vec(),
             },
         )?;
@@ -3693,9 +3693,9 @@ impl RemoteSifsBrowser {
     }
 
     fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
-        let _: sinomo_runtime::daemon::DaemonDfsBrowserWriteFileResponse = self.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserWriteFileRequest {
+        let _: sinomo_runtime::api::DaemonDfsBrowserWriteFileResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserWriteFileRequest {
                 path: path.to_string(),
                 bytes: bytes.to_vec(),
             },
@@ -3704,9 +3704,9 @@ impl RemoteSifsBrowser {
     }
 
     fn create_dir_all(&self, path: &str) -> Result<(), String> {
-        let _: sinomo_runtime::daemon::DaemonDfsBrowserCreateDirAllResponse = self.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserCreateDirAllRequest {
+        let _: sinomo_runtime::api::DaemonDfsBrowserCreateDirAllResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserCreateDirAllRequest {
                 path: path.to_string(),
             },
         )?;
@@ -3714,9 +3714,9 @@ impl RemoteSifsBrowser {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<(), String> {
-        let _: sinomo_runtime::daemon::DaemonDfsBrowserRenameResponse = self.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_RENAME_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserRenameRequest {
+        let _: sinomo_runtime::api::DaemonDfsBrowserRenameResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_RENAME_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserRenameRequest {
                 from: from.to_string(),
                 to: to.to_string(),
             },
@@ -3725,9 +3725,9 @@ impl RemoteSifsBrowser {
     }
 
     fn delete(&self, path: &str, directory: bool) -> Result<(), String> {
-        let _: sinomo_runtime::daemon::DaemonDfsBrowserDeleteResponse = self.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_DELETE_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserDeleteRequest {
+        let _: sinomo_runtime::api::DaemonDfsBrowserDeleteResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_DELETE_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserDeleteRequest {
                 path: path.to_string(),
                 directory,
             },
@@ -3736,17 +3736,17 @@ impl RemoteSifsBrowser {
     }
 
     fn request_maintenance_refresh(&self) -> Result<(), String> {
-        let _: sinomo_runtime::daemon::DaemonClusterMaintenanceRefreshResponse = self.rpc(
-            sinomo_runtime::daemon::DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
-            &sinomo_runtime::daemon::DaemonClusterMaintenanceRefreshRequest,
+        let _: sinomo_runtime::api::DaemonClusterMaintenanceRefreshResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
+            &sinomo_runtime::api::DaemonClusterMaintenanceRefreshRequest,
         )?;
         Ok(())
     }
 
     fn pin_content(&self, path: &str) -> Result<String, String> {
-        let response: sinomo_runtime::daemon::DaemonDfsBrowserPinContentResponse = self.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserPinContentRequest {
+        let response: sinomo_runtime::api::DaemonDfsBrowserPinContentResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserPinContentRequest {
                 path: path.to_string(),
             },
         )?;
@@ -3754,9 +3754,9 @@ impl RemoteSifsBrowser {
     }
 
     fn unpin_content(&self, path: &str) -> Result<bool, String> {
-        let response: sinomo_runtime::daemon::DaemonDfsBrowserUnpinContentResponse = self.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserUnpinContentRequest {
+        let response: sinomo_runtime::api::DaemonDfsBrowserUnpinContentResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserUnpinContentRequest {
                 path: path.to_string(),
             },
         )?;
@@ -3764,9 +3764,9 @@ impl RemoteSifsBrowser {
     }
 
     fn pin_metadata(&self, path: &str) -> Result<String, String> {
-        let response: sinomo_runtime::daemon::DaemonDfsBrowserPinMetadataResponse = self.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserPinMetadataRequest {
+        let response: sinomo_runtime::api::DaemonDfsBrowserPinMetadataResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserPinMetadataRequest {
                 path: path.to_string(),
             },
         )?;
@@ -3774,9 +3774,9 @@ impl RemoteSifsBrowser {
     }
 
     fn unpin_metadata(&self, path: &str) -> Result<bool, String> {
-        let response: sinomo_runtime::daemon::DaemonDfsBrowserUnpinMetadataResponse = self.rpc(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
-            &sinomo_runtime::daemon::DaemonDfsBrowserUnpinMetadataRequest {
+        let response: sinomo_runtime::api::DaemonDfsBrowserUnpinMetadataResponse = self.rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserUnpinMetadataRequest {
                 path: path.to_string(),
             },
         )?;
@@ -3787,14 +3787,14 @@ impl RemoteSifsBrowser {
         &self,
         path: &str,
     ) -> Result<SifsMetadataPrimaryTransferOutcome, String> {
-        let response: sinomo_runtime::daemon::DaemonDfsBrowserTransferMetadataPrimaryResponse =
-            self.rpc(
-                sinomo_runtime::daemon::DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
-                &sinomo_runtime::daemon::DaemonDfsBrowserTransferMetadataPrimaryRequest {
-                    path: path.to_string(),
-                    expected_epoch: None,
-                },
-            )?;
+        let response: sinomo_runtime::api::DaemonDfsBrowserTransferMetadataPrimaryResponse = self
+            .rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
+            &sinomo_runtime::api::DaemonDfsBrowserTransferMetadataPrimaryRequest {
+                path: path.to_string(),
+                expected_epoch: None,
+            },
+        )?;
         Ok(sifs_metadata_primary_transfer_from_rpc(response))
     }
 }
@@ -3809,7 +3809,7 @@ fn sifs_entry_from_file_manager(entry: crate::file_manager::FileManagerEntry) ->
     }
 }
 
-fn sifs_entry_from_rpc(entry: sinomo_runtime::daemon::DaemonDfsBrowserEntry) -> SifsEntry {
+fn sifs_entry_from_rpc(entry: sinomo_runtime::api::DaemonDfsBrowserEntry) -> SifsEntry {
     SifsEntry {
         name: entry.name,
         path: entry.path,
@@ -3853,7 +3853,7 @@ fn sifs_details_from_stat(
 }
 
 fn sifs_details_from_rpc(
-    response: sinomo_runtime::daemon::DaemonDfsBrowserStatResponse,
+    response: sinomo_runtime::api::DaemonDfsBrowserStatResponse,
 ) -> SifsObjectDetails {
     SifsObjectDetails {
         file_system_id: response.file_system_id,
@@ -3909,7 +3909,7 @@ fn sifs_metadata_shard_from_config(
 }
 
 fn sifs_metadata_shard_from_rpc(
-    shard: sinomo_runtime::daemon::DaemonDfsBrowserMetadataShard,
+    shard: sinomo_runtime::api::DaemonDfsBrowserMetadataShard,
 ) -> SifsMetadataShardDetails {
     SifsMetadataShardDetails {
         shard_id: shard.shard_id,
@@ -3939,7 +3939,7 @@ fn sifs_metadata_primary_transfer_from_backend(
 }
 
 fn sifs_metadata_primary_transfer_from_rpc(
-    response: sinomo_runtime::daemon::DaemonDfsBrowserTransferMetadataPrimaryResponse,
+    response: sinomo_runtime::api::DaemonDfsBrowserTransferMetadataPrimaryResponse,
 ) -> SifsMetadataPrimaryTransferOutcome {
     SifsMetadataPrimaryTransferOutcome {
         file_system_id: response.file_system_id,
@@ -3961,7 +3961,7 @@ fn sifs_pin_from_record(pin: sinomo_runtime::dfs::DfsPinRecord) -> SifsPinDetail
     }
 }
 
-fn sifs_pin_from_rpc(pin: sinomo_runtime::daemon::DaemonDfsBrowserPinRecord) -> SifsPinDetails {
+fn sifs_pin_from_rpc(pin: sinomo_runtime::api::DaemonDfsBrowserPinRecord) -> SifsPinDetails {
     SifsPinDetails {
         pinned_by_node_id: pin.pinned_by_node_id,
         mode: sifs_pin_mode_label(&pin.mode).to_string(),
@@ -3970,7 +3970,7 @@ fn sifs_pin_from_rpc(pin: sinomo_runtime::daemon::DaemonDfsBrowserPinRecord) -> 
 }
 
 fn sifs_object_health_from_rpc(
-    health: sinomo_runtime::daemon::DaemonDfsBrowserObjectHealth,
+    health: sinomo_runtime::api::DaemonDfsBrowserObjectHealth,
 ) -> SifsObjectHealth {
     SifsObjectHealth {
         agent_state: sifs_agent_state_label(&health.agent_state).to_string(),
@@ -3999,7 +3999,7 @@ fn sifs_health_from_status(status: sinomo_runtime::dfs::DfsOperatorStatus) -> Si
 }
 
 fn sifs_health_summary_from_rpc(
-    health: sinomo_runtime::daemon::DaemonDfsBrowserHealthSummary,
+    health: sinomo_runtime::api::DaemonDfsBrowserHealthSummary,
 ) -> SifsHealthSummary {
     SifsHealthSummary {
         file_system_count: health.file_system_count,
@@ -4126,23 +4126,23 @@ fn compare_sifs_entry_names(left: &SifsEntry, right: &SifsEntry) -> std::cmp::Or
 
 fn daemon_sort_key_from_sifs(
     sort_key: SifsListSortKey,
-) -> sinomo_runtime::daemon::DaemonDfsBrowserSortKey {
+) -> sinomo_runtime::api::DaemonDfsBrowserSortKey {
     match sort_key {
-        SifsListSortKey::Name => sinomo_runtime::daemon::DaemonDfsBrowserSortKey::Name,
-        SifsListSortKey::Kind => sinomo_runtime::daemon::DaemonDfsBrowserSortKey::Kind,
-        SifsListSortKey::Size => sinomo_runtime::daemon::DaemonDfsBrowserSortKey::Size,
+        SifsListSortKey::Name => sinomo_runtime::api::DaemonDfsBrowserSortKey::Name,
+        SifsListSortKey::Kind => sinomo_runtime::api::DaemonDfsBrowserSortKey::Kind,
+        SifsListSortKey::Size => sinomo_runtime::api::DaemonDfsBrowserSortKey::Size,
     }
 }
 
 fn daemon_sort_direction_from_sifs(
     direction: SifsListSortDirection,
-) -> sinomo_runtime::daemon::DaemonDfsBrowserSortDirection {
+) -> sinomo_runtime::api::DaemonDfsBrowserSortDirection {
     match direction {
         SifsListSortDirection::Ascending => {
-            sinomo_runtime::daemon::DaemonDfsBrowserSortDirection::Ascending
+            sinomo_runtime::api::DaemonDfsBrowserSortDirection::Ascending
         }
         SifsListSortDirection::Descending => {
-            sinomo_runtime::daemon::DaemonDfsBrowserSortDirection::Descending
+            sinomo_runtime::api::DaemonDfsBrowserSortDirection::Descending
         }
     }
 }

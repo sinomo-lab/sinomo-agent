@@ -26,6 +26,29 @@ pub enum DaemonError {
     ClusterReadOnly { detail: String },
 }
 
+impl From<sinomo_api::DaemonApiError> for DaemonError {
+    fn from(error: sinomo_api::DaemonApiError) -> Self {
+        match error {
+            sinomo_api::DaemonApiError::AuthDenied => Self::AuthDenied,
+            sinomo_api::DaemonApiError::AuthExpired => Self::AuthExpired,
+            sinomo_api::DaemonApiError::Io { path, detail } => Self::Io { path, detail },
+            sinomo_api::DaemonApiError::Json { path, detail } => Self::Json { path, detail },
+            sinomo_api::DaemonApiError::Parse { detail } => Self::Parse { detail },
+            sinomo_api::DaemonApiError::Network { address, detail } => {
+                Self::Network { address, detail }
+            }
+            sinomo_api::DaemonApiError::AlreadyRunning { lock_file, detail } => {
+                Self::AlreadyRunning { lock_file, detail }
+            }
+            sinomo_api::DaemonApiError::NotRunning { detail } => Self::NotRunning { detail },
+            sinomo_api::DaemonApiError::ClusterOrphan => Self::ClusterOrphan,
+            sinomo_api::DaemonApiError::ClusterReadOnly { detail } => {
+                Self::ClusterReadOnly { detail }
+            }
+        }
+    }
+}
+
 impl From<sinomo_core::service::ServiceError> for DaemonError {
     fn from(error: sinomo_core::service::ServiceError) -> Self {
         use sinomo_core::service::ServiceError;

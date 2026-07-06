@@ -214,7 +214,7 @@ pub use route::{
     ClusterRelayStreamForwardAsyncHost, ClusterRelayStreamForwardOutcome,
     ClusterRelayStreamRequestAction, ClusterRelayStreamSendOutcome,
     ClusterSignedEndpointRpcAsyncHost, ClusterSignedEndpointRpcFuture,
-    ClusterSignedEndpointRpcObservation, cluster_relay_stream_request_action,
+    ClusterSignedEndpointRpcObservation, RelayEnvelope, cluster_relay_stream_request_action,
     handle_cluster_relay_async_with_host, handle_cluster_relay_stream_forward_async_with_host,
     relay_request_inner_route, relay_response_is_routing_error,
 };
@@ -609,8 +609,6 @@ pub use route::CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX;
 pub use route::ClusterDeliveryFailedEdges;
 #[cfg(any(test, feature = "test-support"))]
 pub use route::ClusterDeliveryRouteGraph;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::RelayEnvelope;
 #[cfg(any(test, feature = "test-support"))]
 pub use route::cluster_delivery_build_routing_table;
 #[cfg(any(test, feature = "test-support"))]

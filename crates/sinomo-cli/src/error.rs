@@ -352,6 +352,33 @@ impl From<sinomo_runtime::daemon::DaemonError> for CliError {
     }
 }
 
+impl From<sinomo_runtime::api::DaemonApiError> for CliError {
+    fn from(error: sinomo_runtime::api::DaemonApiError) -> Self {
+        match error {
+            sinomo_runtime::api::DaemonApiError::AuthDenied => Self::AuthDenied,
+            sinomo_runtime::api::DaemonApiError::AuthExpired => Self::AuthExpired,
+            sinomo_runtime::api::DaemonApiError::Io { path, detail } => Self::Io { path, detail },
+            sinomo_runtime::api::DaemonApiError::Json { path, detail } => {
+                Self::Json { path, detail }
+            }
+            sinomo_runtime::api::DaemonApiError::Parse { detail } => Self::Parse { detail },
+            sinomo_runtime::api::DaemonApiError::Network { address, detail } => {
+                Self::Network { address, detail }
+            }
+            sinomo_runtime::api::DaemonApiError::AlreadyRunning { lock_file, detail } => {
+                Self::DaemonAlreadyRunning { lock_file, detail }
+            }
+            sinomo_runtime::api::DaemonApiError::NotRunning { detail } => {
+                Self::DaemonNotRunning { detail }
+            }
+            sinomo_runtime::api::DaemonApiError::ClusterOrphan => Self::ClusterOrphan,
+            sinomo_runtime::api::DaemonApiError::ClusterReadOnly { detail } => {
+                Self::ClusterReadOnly { detail }
+            }
+        }
+    }
+}
+
 impl From<sinomo_runtime::node::NodeIdentityError> for CliError {
     fn from(error: sinomo_runtime::node::NodeIdentityError) -> Self {
         match error {

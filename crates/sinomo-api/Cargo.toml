@@ -6,12 +6,21 @@ authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-include = ["src/**/*.rs", "Cargo.toml"]
+include = ["src/**/*.rs", "build.rs", "Cargo.toml"]
 
 [package.metadata.sinomo]
 ring = "r1"
 
 [dependencies]
+fs2.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sinomo-core = { path = "../sinomo-core" }
+sinomo-config = { path = "../sinomo-config" }
 sinomo-dfs = { path = "../sinomo-dfs" }
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+sinomo-testdir = { path = "../sinomo-testdir" }

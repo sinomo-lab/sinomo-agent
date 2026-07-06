@@ -7,12 +7,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 pub use sinomo_cli::app_api::{AppClusterInvite, AppClusterStatus};
+use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster::ClusterHealthRow;
 use sinomo_runtime::core::{
     ClusterEndpointPrivacy, ClusterMemberRecord, ClusterMemberState, ClusterNodeAvailability,
     ClusterNodeStatusRecord,
 };
-use sinomo_runtime::daemon::DaemonApiClient;
 use sinomo_runtime::network::{ClusterConnectivityRecord, ClusterConnectivityState, ClusterPaths};
 use sinomo_runtime::node::{
     cluster_invitation_key, cluster_member_expected_daemon_process, cluster_node_is_local_process,
@@ -305,12 +305,10 @@ fn fetch_cluster_health_rows(address: &str) -> Result<Vec<ClusterHealthRow>, Str
 
 fn fetch_local_health_rows(address: &str) -> Result<Vec<ClusterHealthRow>, String> {
     let request = cluster::cluster_local_health_rpc_request().map_err(|error| error.to_string())?;
-    let response = sinomo_runtime::daemon::send_daemon_rpc(
-        address,
-        &request,
-        CLUSTER_LOCAL_SNAPSHOT_RPC_TIMEOUT,
-    )
-    .map_err(|error| error.to_string())?;
+    let response = DaemonApiClient::at_address(address)
+        .with_timeout(CLUSTER_LOCAL_SNAPSHOT_RPC_TIMEOUT)
+        .call_request(&request)
+        .map_err(|error| error.to_string())?;
     cluster::decode_cluster_health_rpc_response(&response).map_err(|error| error.to_string())
 }
 

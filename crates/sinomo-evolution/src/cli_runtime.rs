@@ -19,13 +19,13 @@ use sinomo_lm::{
     model_config_from_cluster_kv_snapshot, model_config_store, normalize_model_id_for_provider,
     normalize_model_provider, resolve_default_model,
 };
+use sinomo_runtime::api::default_main_daemon_status as daemon_default_main_daemon_status;
 use sinomo_runtime::cli_registry::{
     CliAutocompleteOption, CliAutocompleteSpec, CliAutocompleteValue, CliCommand,
     CliCommandContext, CliCommandError, CliCommandHandler, CliCommandHelp, CliCommandMetadata,
     CliCommandPolicy, CliParseError,
 };
 use sinomo_runtime::core::{EvaluationOutcome, EventEnvelope};
-use sinomo_runtime::daemon::default_main_daemon_status as daemon_default_main_daemon_status;
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, JsonlEventStore, ReplayDirection, ReplayQuery};
 #[cfg(not(test))]
@@ -71,6 +71,8 @@ pub enum EvolutionCliError {
     Registry(#[from] sinomo_runtime::registry::RegistryError),
     #[error(transparent)]
     Network(#[from] sinomo_runtime::network::NetworkError),
+    #[error(transparent)]
+    DaemonApi(#[from] sinomo_runtime::api::DaemonApiError),
     #[error(transparent)]
     Daemon(#[from] sinomo_runtime::daemon::DaemonError),
     #[error(transparent)]

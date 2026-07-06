@@ -115,6 +115,7 @@ pub fn run_android(android_app: sui::AndroidApp) -> sui::Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::rendering::{AppRenderMode, resolve_render_options};
+    use std::path::{Path, PathBuf};
     use sui::{WindowColorManagementMode, WindowStemDarkening, WindowTextHinting};
 
     #[test]
@@ -137,5 +138,51 @@ mod tests {
             options.color_management_mode,
             WindowColorManagementMode::ForceSdr
         );
+    }
+
+    #[test]
+    fn daemon_impl_imports_stay_in_embedded_backend_wrapper() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let src_dir = manifest_dir.join("src");
+        let mut violations = Vec::new();
+        let forbidden = ["sinomo_runtime", "::daemon"].concat();
+        collect_daemon_impl_import_violations(&src_dir, &src_dir, &forbidden, &mut violations);
+
+        assert!(
+            violations.is_empty(),
+            "app code should use sinomo_runtime::api; daemon implementation imports are allowed only in backend/mod.rs: {}",
+            violations.join(", ")
+        );
+    }
+
+    fn collect_daemon_impl_import_violations(
+        root: &Path,
+        dir: &Path,
+        forbidden: &str,
+        violations: &mut Vec<String>,
+    ) {
+        for entry in std::fs::read_dir(dir).expect("read app source directory") {
+            let entry = entry.expect("read app source entry");
+            let path = entry.path();
+            if path.is_dir() {
+                collect_daemon_impl_import_violations(root, &path, forbidden, violations);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .expect("app source file under root")
+                .display()
+                .to_string();
+            if relative == "backend/mod.rs" {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read app source file");
+            if source.contains(forbidden) {
+                violations.push(relative);
+            }
+        }
     }
 }

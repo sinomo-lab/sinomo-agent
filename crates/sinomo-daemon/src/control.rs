@@ -341,7 +341,7 @@ pub fn run_daemon_control_loop_with_services(
                             // Connect address, not the bind address: a wildcard
                             // bind (0.0.0.0/::) is not dialable by the module's
                             // inbound-frame forwarder.
-                            daemon_forward_address: crate::status::daemon_connect_address(
+                            daemon_forward_address: crate::daemon_connect_address(
                                 &options.host,
                                 options.port,
                             ),
@@ -1155,12 +1155,14 @@ async fn daemon_liveness_status_response_async(
 ) -> Result<crate::DaemonStatus, DaemonError> {
     let read_paths = paths.clone();
     let read_path = read_paths.root.display().to_string();
-    tokio::task::spawn_blocking(move || read_daemon_status(&read_paths))
-        .await
-        .map_err(|source| DaemonError::Io {
-            path: read_path,
-            detail: format!("daemon liveness status read task failed: {source}"),
-        })?
+    Ok(
+        tokio::task::spawn_blocking(move || read_daemon_status(&read_paths))
+            .await
+            .map_err(|source| DaemonError::Io {
+                path: read_path,
+                detail: format!("daemon liveness status read task failed: {source}"),
+            })??,
+    )
 }
 
 pub(crate) async fn dispatch_daemon_control_request_in_process_async(

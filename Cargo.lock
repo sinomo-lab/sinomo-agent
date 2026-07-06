@@ -7633,9 +7633,16 @@ dependencies = [
 name = "sinomo-api"
 version = "0.1.0"
 dependencies = [
+ "fs2",
  "serde",
+ "serde_json",
+ "sinomo-config",
  "sinomo-core",
  "sinomo-dfs",
+ "sinomo-testdir",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
 ]
 
 [[package]]

@@ -4,6 +4,7 @@
 //! The Docker cluster gate uses them before DFS scenarios so routing, relay,
 //! authentication, and concurrent request handling must be healthy first.
 
+use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster;
 use sinomo_runtime::core::{ClusterBootstrapState, ClusterMemberRecord};
 use sinomo_runtime::local::SinomoDataDir;
@@ -117,7 +118,7 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .map_err(|source| {
             SinomoTestError::failed(format!("cannot create network ping runtime: {source}"))
         })?;
-    let daemon_client = sinomo_runtime::daemon::DaemonApiClient::connect()
+    let daemon_client = DaemonApiClient::connect()
         .map_err(|source| {
             SinomoTestError::failed(format!(
                 "cannot connect to local daemon for network ping forwarding: {source}"
@@ -423,7 +424,7 @@ struct NetworkPingJob {
     request_payload_bytes: usize,
     response_payload_bytes: usize,
     request: network::ObjectRpcRequest,
-    daemon_client: sinomo_runtime::daemon::DaemonApiClient,
+    daemon_client: DaemonApiClient,
 }
 
 #[derive(Debug)]

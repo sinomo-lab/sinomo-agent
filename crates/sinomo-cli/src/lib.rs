@@ -76,6 +76,15 @@ use sinomo_pytorch::{
     PytorchDevice, PytorchMode, RemotePytorchRuntime, RemotePytorchRuntimeConfig,
     is_loopback_http_endpoint,
 };
+use sinomo_runtime::api::{
+    DaemonApiClient, DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions,
+    DaemonStatus, IdleStatsSnapshot, SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT,
+    SINOMO_SHADOW_DAEMON_DEFAULT_PORT, cluster_node_status_from_daemon_status, daemon_bind_address,
+    daemon_connect_address, daemon_options_from_status,
+    default_main_daemon_status as daemon_default_main_daemon_status, probe_daemon_status,
+};
+#[cfg(test)]
+use sinomo_runtime::api::{daemon_package_version, write_daemon_status};
 use sinomo_runtime::cli_registry::{
     CliCommandContext, CliCommandRegistry, CliParseError, RegisteredCliCommand,
 };
@@ -98,23 +107,18 @@ use sinomo_runtime::core::{
 use sinomo_runtime::daemon::{
     AuthenticatedDaemonCommand, DaemonError, DaemonSignerAuthority, SignedDaemonCommand,
     authenticate_daemon_control_request, authorize_authenticated_daemon_command,
-    daemon_package_version, sign_daemon_rpc_request_from_data_dir, write_daemon_status,
+    sign_daemon_rpc_request_from_data_dir,
 };
 use sinomo_runtime::daemon::{
-    DaemonApiClient, DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus,
-    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DaemonStopBeforeInstallStart,
-    DaemonStopBeforeInstallStatus, DaemonStopIfRunningStatus, IdleStatsSnapshot, InstallLayout,
+    DaemonClusterProcess, DaemonClusterRegistration, DaemonStopBeforeInstallStart,
+    DaemonStopBeforeInstallStatus, DaemonStopIfRunningStatus, InstallLayout,
     InstalledDaemonInstallPlanRequest, InstalledDaemonStartStatus, ManagedSourceRepoInstallStatus,
-    SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
-    activate_boot_entries as daemon_activate_boot_entries, cluster_node_status_from_daemon_status,
-    current_shadow_daemon_options, daemon_advertised_endpoints_for_state_with_manual_config,
-    daemon_bind_address, daemon_cluster_registration, daemon_cluster_status,
-    daemon_connect_address, daemon_install_start_installed_sinomo_daemon,
+    activate_boot_entries as daemon_activate_boot_entries, current_shadow_daemon_options,
+    daemon_advertised_endpoints_for_state_with_manual_config, daemon_cluster_registration,
+    daemon_cluster_status, daemon_install_start_installed_sinomo_daemon,
     daemon_install_stop_daemon_before_install, daemon_install_stop_daemon_if_running,
-    daemon_main_binary_for_shadow_start, daemon_options_from_status,
-    deactivate_boot_entries as daemon_deactivate_boot_entries,
+    daemon_main_binary_for_shadow_start, deactivate_boot_entries as daemon_deactivate_boot_entries,
     default_boot_dir as daemon_default_boot_dir,
-    default_main_daemon_status as daemon_default_main_daemon_status,
     ensure_install_layout_dirs as daemon_ensure_install_layout_dirs,
     fetch_daemon_status_from_address as daemon_fetch_daemon_status_from_address,
     fetch_daemon_status_from_endpoint as daemon_fetch_daemon_status_from_endpoint,
@@ -125,8 +129,7 @@ use sinomo_runtime::daemon::{
     managed_source_git_status_lines as daemon_managed_source_git_status_lines,
     prepare_installed_daemon_install_plan as daemon_prepare_installed_daemon_install_plan,
     prepare_local_rollout_main_activation as daemon_prepare_local_rollout_main_activation,
-    probe_daemon_status, read_daemon_endpoint_advertisement_config,
-    remove_boot_entry as daemon_remove_boot_entry,
+    read_daemon_endpoint_advertisement_config, remove_boot_entry as daemon_remove_boot_entry,
     run_daemon_control_loop_with_services as daemon_run_daemon_control_loop_with_services,
     run_shadow_daemon_supervision_loop as daemon_run_shadow_daemon_supervision_loop,
     send_daemon_cluster_maintenance_refresh as daemon_send_daemon_cluster_maintenance_refresh,

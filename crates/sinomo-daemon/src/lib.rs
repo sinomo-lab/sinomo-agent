@@ -16,7 +16,44 @@ mod service_adapter;
 mod status;
 mod tcp_tunnel;
 
-pub use sinomo_api::*;
+pub use sinomo_api::{
+    DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE, DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
+    DAEMON_DFS_BROWSER_DELETE_ROUTE, DAEMON_DFS_BROWSER_LIST_ROUTE,
+    DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILES_ROUTE, DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
+    DAEMON_DFS_BROWSER_RENAME_ROUTE, DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE,
+    DAEMON_DFS_BROWSER_STATUS_ROUTE, DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
+    DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
+    DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
+    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DaemonApiError,
+    DaemonClusterMaintenanceRefreshRequest, DaemonClusterMaintenanceRefreshResponse,
+    DaemonClusterStatus, DaemonDfsBrowserCreateDirAllRequest, DaemonDfsBrowserCreateDirAllResponse,
+    DaemonDfsBrowserDeleteRequest, DaemonDfsBrowserDeleteResponse, DaemonDfsBrowserEntry,
+    DaemonDfsBrowserFileRead, DaemonDfsBrowserHealthSummary, DaemonDfsBrowserListRequest,
+    DaemonDfsBrowserListResponse, DaemonDfsBrowserMetadataShard, DaemonDfsBrowserObjectHealth,
+    DaemonDfsBrowserPinContentRequest, DaemonDfsBrowserPinContentResponse,
+    DaemonDfsBrowserPinMetadataRequest, DaemonDfsBrowserPinMetadataResponse,
+    DaemonDfsBrowserPinRecord, DaemonDfsBrowserReadFilePrefixRequest,
+    DaemonDfsBrowserReadFilePrefixResponse, DaemonDfsBrowserReadFileRequest,
+    DaemonDfsBrowserReadFileResponse, DaemonDfsBrowserReadFilesRequest,
+    DaemonDfsBrowserReadFilesResponse, DaemonDfsBrowserReadObjectVersionRequest,
+    DaemonDfsBrowserReadObjectVersionResponse, DaemonDfsBrowserRenameRequest,
+    DaemonDfsBrowserRenameResponse, DaemonDfsBrowserSortDirection, DaemonDfsBrowserSortKey,
+    DaemonDfsBrowserStatRequest, DaemonDfsBrowserStatResponse, DaemonDfsBrowserStatusRequest,
+    DaemonDfsBrowserStatusResponse, DaemonDfsBrowserTransferMetadataPrimaryRequest,
+    DaemonDfsBrowserTransferMetadataPrimaryResponse, DaemonDfsBrowserUnpinContentRequest,
+    DaemonDfsBrowserUnpinContentResponse, DaemonDfsBrowserUnpinMetadataRequest,
+    DaemonDfsBrowserUnpinMetadataResponse, DaemonDfsBrowserWriteFileRequest,
+    DaemonDfsBrowserWriteFileResponse, DaemonDfsObjectRpcForwardRequest, DaemonPaths,
+    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, IdleStatsSnapshot,
+    SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
+    cluster_node_status_from_daemon_status, daemon_bind_address, daemon_connect_address,
+    daemon_git_commit, daemon_hostname, daemon_options_from_status, daemon_package_version,
+    daemon_paths_from_data_dir, daemon_status_matches_options, default_main_daemon_status,
+    probe_daemon_status, probe_daemon_status_async, probe_daemon_status_at_address,
+    read_daemon_status, shadow_daemon_paths_from_data_dir, write_daemon_status,
+};
 
 pub(crate) fn cluster_join_trace(args: std::fmt::Arguments<'_>) {
     let enabled = std::env::var("SINOMO_CLUSTER_JOIN_TRACE")
@@ -124,8 +161,7 @@ pub(crate) use client::{
     fetch_daemon_status_from_endpoint_on_runtime, send_cluster_kv_watch_events_async,
     send_cluster_member_publish_async, send_cluster_raft_append_async,
     send_cluster_raft_append_on_runtime, send_cluster_raft_vote_async,
-    send_cluster_raft_vote_on_runtime, send_daemon_rpc_on_runtime,
-    send_dfs_object_rpc_to_target_on_runtime,
+    send_cluster_raft_vote_on_runtime, send_dfs_object_rpc_to_target_on_runtime,
 };
 pub use client::{
     RemoteConfigClient, fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
@@ -160,7 +196,6 @@ pub use control::{
     run_daemon_control_loop, run_daemon_control_loop_with_services,
 };
 pub use error::DaemonError;
-pub use idle_stats::IdleStatsSnapshot;
 pub(crate) use idle_stats::{
     IdleStatsAtomics, install_process_idle_stats, process_idle_stats, register_io_observer,
 };
@@ -183,7 +218,6 @@ pub use install::{UserPathUpdate, ensure_windows_user_path_contains};
 pub(crate) use observe::{
     OperationalSeverity, append_operational_event_best_effort, append_operational_log_best_effort,
 };
-pub use paths::DaemonPaths;
 pub(crate) use process::{
     CandidateMainDiagnostics, build_daemon_async_runtime, main_exit_observation_from_status,
     prepare_background_command, spawn_candidate_main_daemon_process, spawn_main_daemon_process,
@@ -203,25 +237,19 @@ pub(crate) use rollout::{
     handle_daemon_finalize_shadow_rollout,
 };
 pub use status::{
-    DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus, DaemonDataOwnerLock,
-    DaemonEndpointAdvertisementConfig, DaemonLock, DaemonManualEndpointConfig, DaemonProbeStatus,
-    DaemonRunOptions, DaemonStatus, SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT,
-    SINOMO_SHADOW_DAEMON_DEFAULT_PORT, cluster_node_status_from_daemon_status,
+    DaemonClusterProcess, DaemonClusterRegistration, DaemonDataOwnerLock,
+    DaemonEndpointAdvertisementConfig, DaemonLock, DaemonManualEndpointConfig,
     current_shadow_daemon_options, daemon_advertised_endpoints_for_state,
     daemon_advertised_endpoints_for_state_async,
     daemon_advertised_endpoints_for_state_with_manual_config,
-    daemon_advertised_endpoints_for_state_with_manual_config_async, daemon_bind_address,
-    daemon_cluster_registration, daemon_cluster_status, daemon_connect_address,
-    daemon_endpoint_advertisement_config_file, daemon_options_from_status, daemon_package_version,
-    daemon_status_matches_options, default_main_daemon_status,
-    invite_introducers_from_daemon_status, probe_daemon_status,
-    read_daemon_endpoint_advertisement_config, write_daemon_status,
+    daemon_advertised_endpoints_for_state_with_manual_config_async, daemon_cluster_registration,
+    daemon_cluster_status, daemon_endpoint_advertisement_config_file,
+    invite_introducers_from_daemon_status, read_daemon_endpoint_advertisement_config,
 };
 pub(crate) use status::{
     current_daemon_cluster_options, current_shadow_daemon_options_on_runtime,
     daemon_cluster_options_from_status, daemon_cluster_process_from_paths,
     daemon_cluster_status_matches, daemon_probe_status_needs_restart_for_options,
-    probe_daemon_status_async, probe_daemon_status_at_address, read_daemon_status,
 };
 
 pub fn register_storage_paths(

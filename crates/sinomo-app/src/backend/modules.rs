@@ -3,13 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::config::{
     CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY, CONFIG_SET_ROUTE, ConfigGetRequest, ConfigGetResponse,
     ConfigSetRequest, ConfigSetResponse, ConfigWriteTarget,
 };
-use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::module::{
     MODULE_CLUSTER_CONFIG_KEY, MODULE_NODE_CONFIG_KEY, ModuleRuntimeConfig,
     ModuleRuntimeConfigEntry, read_native_dylib_module_cache_entries_excluding_cache_keys,
@@ -301,7 +300,7 @@ impl Backend {
         body: &Req,
     ) -> Result<Resp, String>
     where
-        Req: Serialize + ?Sized,
+        Req: serde::Serialize + ?Sized,
         Resp: DeserializeOwned,
     {
         let address = self
@@ -309,34 +308,16 @@ impl Backend {
             .daemon_address()
             .ok_or_else(|| "remote node module config requires a daemon connection".to_string())?;
         let target_node_id = parse_node_id(node_id)?;
-        let paths = ClusterPaths::new(self.data_dir.as_ref());
-        let state = sinomo_runtime::cluster::read_cluster_state(&paths)
-            .map_err(|error| error.to_string())?;
         let inner = ObjectRpcRequest::encode_body(route, CONFIG_RPC_CATEGORY, body)
             .map_err(|error| error.to_string())?;
-        let auth = sinomo_runtime::daemon::sign_daemon_rpc_request_from_data_dir(
-            self.data_dir.as_ref(),
-            &inner,
-        )
-        .map_err(|error| error.to_string())?;
-        let relay = ObjectRpcRequest::encode_body(
-            sinomo_runtime::network::CLUSTER_RELAY_ROUTE,
-            sinomo_runtime::network::CLUSTER_ROUTING_RPC_CATEGORY,
-            &ModuleConfigRelayEnvelope {
-                cluster_id: state.cluster_id,
-                target_node_id,
-                ttl: 8,
-                visited: Vec::new(),
-                planned_path: Vec::new(),
-                target_endpoints: Vec::new(),
-                max_hop_timeout_ms: None,
-                inner: inner.with_auth(auth),
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        let response =
-            sinomo_runtime::daemon::send_daemon_rpc(address, &relay, MODULE_CONFIG_RPC_TIMEOUT)
-                .map_err(|error| error.to_string())?;
+        let response = DaemonApiClient::at_address(address)
+            .relay_signed_request_to_node_from_data_dir(
+                self.data_dir.as_ref(),
+                &target_node_id,
+                inner,
+                MODULE_CONFIG_RPC_TIMEOUT,
+            )
+            .map_err(|error| error.to_string())?;
         response.decode_body().map_err(|error| error.to_string())
     }
 
@@ -373,18 +354,6 @@ fn parse_node_id(node_id: &str) -> Result<NodeId, String> {
     NodeId::new(node_id.to_string())
         .or_else(|_| NodeId::from_legacy_named(node_id.to_string()))
         .map_err(|error| format!("invalid node id `{node_id}`: {error}"))
-}
-
-#[derive(Serialize)]
-struct ModuleConfigRelayEnvelope {
-    cluster_id: sinomo_runtime::node::ClusterId,
-    target_node_id: NodeId,
-    ttl: u8,
-    visited: Vec<NodeId>,
-    planned_path: Vec<NodeId>,
-    target_endpoints: Vec<ClusterEndpointRecord>,
-    max_hop_timeout_ms: Option<u64>,
-    inner: ObjectRpcRequest,
 }
 
 fn module_label(module_id: &str) -> String {

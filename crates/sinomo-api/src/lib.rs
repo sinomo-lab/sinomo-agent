@@ -5,6 +5,33 @@
 //! only need to talk to a daemon can depend on this crate instead of linking the
 //! full daemon implementation.
 
+mod client;
+mod error;
+mod idle_stats;
+mod paths;
+mod status;
+
+pub use client::{
+    DAEMON_API_CLUSTER_CONTROL_TIMEOUT, DAEMON_API_DEFAULT_TIMEOUT, DAEMON_API_PROBE_TIMEOUT,
+    DaemonApiClient, RemoteConfigClient, send_daemon_rpc, send_daemon_rpc_async,
+    send_daemon_rpc_on_runtime, send_daemon_rpc_raw, send_daemon_rpc_raw_with_timeouts,
+    send_daemon_rpc_stream, send_daemon_rpc_stream_async, send_daemon_rpc_with_timeouts,
+};
+pub use error::DaemonApiError;
+pub use idle_stats::IdleStatsSnapshot;
+pub use paths::{DaemonPaths, daemon_paths_from_data_dir, shadow_daemon_paths_from_data_dir};
+pub use status::{
+    DaemonClusterStatus, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
+    SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
+    cluster_node_status_from_daemon_status, daemon_bind_address, daemon_connect_address,
+    daemon_data_dir_from_paths, daemon_git_commit, daemon_hostname, daemon_options_from_status,
+    daemon_package_version, daemon_status_matches_options, default_main_daemon_status,
+    probe_daemon_status, probe_daemon_status_async, probe_daemon_status_at_address,
+    probe_daemon_status_at_address_on_runtime, probe_daemon_status_at_address_with_timeouts_async,
+    probe_daemon_status_on_runtime, probe_daemon_status_with_timeouts_async, read_daemon_status,
+    write_daemon_status,
+};
+
 pub const DAEMON_RPC_CATEGORY: &str = "daemon";
 pub const DAEMON_STATUS_ROUTE: &str = "/daemon/status";
 pub const DAEMON_SHUTDOWN_ROUTE: &str = "/daemon/shutdown";
