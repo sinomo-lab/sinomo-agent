@@ -2599,6 +2599,15 @@ impl ClusterNetworkMaintenance {
                 self.record_connectivity_publish_failure();
             }
         }
+        for refresh in node_status_refreshes {
+            let _ = cluster_network_pending_step_with_deadline(
+                "node status refresh",
+                CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT,
+                deadline,
+                self.run_pending_node_status_refresh_async(refresh, runtime.clone()),
+            )
+            .await;
+        }
         for publish in member_publishes {
             if cluster_network_pending_step_with_deadline(
                 "member publish",
@@ -2611,15 +2620,6 @@ impl ClusterNetworkMaintenance {
             {
                 self.record_publish_failure();
             }
-        }
-        for refresh in node_status_refreshes {
-            let _ = cluster_network_pending_step_with_deadline(
-                "node status refresh",
-                CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT,
-                deadline,
-                self.run_pending_node_status_refresh_async(refresh, runtime.clone()),
-            )
-            .await;
         }
         if let Some(publish) = service_instance_publish {
             let _ = cluster_network_pending_step_with_deadline(
