@@ -10444,6 +10444,86 @@ fn committed_remote_manifest_self_repair_fetches_from_durable_requester() {
 }
 
 #[test]
+fn nonforeground_remote_manifest_self_repair_defers_fetch_from_durable_requester() {
+    let root = temp_root("remote-manifest-self-repair-defers-fetch");
+    let writer =
+        NodeId::from_legacy_named("node_remote_manifest_defer_writer").expect("writer node");
+    let primary =
+        NodeId::from_legacy_named("node_remote_manifest_defer_primary").expect("primary node");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_remote_manifest_defer_fetch").expect("object");
+    let version_1 =
+        DfsVersion::from_legacy_named("version_remote_manifest_defer_fetch_1").expect("version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_remote_manifest_defer_fetch_2").expect("version");
+    let bytes = b"reader backed bytes should not be fetched by nonforeground write";
+    let content_hash = content_hash(bytes);
+    let network = InProcessNetwork::new();
+    let mut writer_mailbox = network.add_node(writer.clone());
+    let content = LocalContentStore::new(root.join("primary-content")).expect("content");
+    let metadata =
+        open_root_local_metadata_backend(root.join("primary-metadata")).expect("primary metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(primary.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let mut object = file_metadata(primary.clone());
+    object.object_id = object_id.clone();
+    object.path = "/services/remote-manifest-defer-fetch.txt".to_string();
+    object.version = version_1.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(object).expect("object metadata");
+
+    let outcome = dfs
+        .write_distributed_eventual_from_remote_manifest_with_base(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: writer.clone(),
+            },
+            Some(version_1),
+            content_hash.clone(),
+            bytes.len() as u64,
+            vec![writer.clone(), primary.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+            false,
+        )
+        .expect("nonforeground remote manifest write");
+    let intent_id = match outcome {
+        NetworkedDfsWriteOutcome::Committed {
+            intent_id,
+            repair_jobs,
+            ..
+        } => {
+            assert!(
+                repair_jobs
+                    .iter()
+                    .any(|job| job.missing_replica_node_id == primary)
+            );
+            intent_id
+        }
+        other => panic!("expected threshold commit with deferred self repair, got {other:?}"),
+    };
+
+    let pending = dfs.pending_writes.get(&intent_id).expect("pending repair");
+    assert!(
+        !pending.fetch_inflight_from.contains(&writer),
+        "nonforeground writes must not fetch committed self-repair content before returning"
+    );
+    let messages = drain_dfs_messages(&mut writer_mailbox);
+    assert!(
+        messages
+            .iter()
+            .all(|message| !matches!(message, DfsNetworkMessage::FetchBlob(_))),
+        "nonforeground remote manifest write should not synchronously fetch missing local copy, got {messages:?}"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn stage_response_restores_transient_intent_record_without_visible_object() {
     let root = temp_root("stage-response-restores-transient-intent-record");
     let primary =
