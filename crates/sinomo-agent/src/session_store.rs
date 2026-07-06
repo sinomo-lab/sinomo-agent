@@ -4,13 +4,13 @@ use crate::agent::{
     AgentRole, AgentRunContext, AgentSession, AgentSessionControlSnapshot, AgentSessionProjection,
     AgentSteeringMessage, AgentStopReason, AgentStoragePaths, AgentTaskSnapshot, agent_item_id,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{RealtimeAudioSampleFormat, RealtimeVideoFrameFormat};
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use sinomo_runtime::vfs::{VfsAppendOptions, VfsError, VfsHandle, VfsWriteOptions};
+use std::path::{Component, Path};
 use std::sync::{Arc, Mutex, mpsc};
 
 pub const AGENT_SESSION_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -489,6 +489,7 @@ impl AgentSessionStore for NoopAgentSessionStore {
 #[derive(Clone)]
 pub struct FileAgentSessionStore {
     paths: AgentStoragePaths,
+    vfs: VfsHandle,
     live_streams: Arc<Mutex<Vec<FileAgentSessionStoreLiveStream>>>,
 }
 
@@ -500,8 +501,10 @@ struct FileAgentSessionStoreLiveStream {
 
 impl FileAgentSessionStore {
     pub fn new(paths: AgentStoragePaths) -> Self {
+        let vfs = VfsHandle::local(paths.root.clone()).expect("agent session VFS root");
         Self {
             paths,
+            vfs,
             live_streams: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -550,7 +553,7 @@ impl FileAgentSessionStore {
             .paths
             .session_audio_dir_for_session(session_id)
             .join(&file_name);
-        replace_file(&path, bytes)?;
+        self.replace_file(&path, bytes)?;
         let audio = AgentAudioDataRef {
             relative_path,
             byte_len: bytes.len() as u64,
@@ -558,7 +561,7 @@ impl FileAgentSessionStore {
         };
         let record =
             AgentAudioSegmentRecord::new(segment_id, session_id.clone(), input.clone(), audio);
-        append_jsonl_record(
+        self.append_jsonl_record(
             &self
                 .paths
                 .session_audio_segments_path_for_session(session_id),
@@ -604,7 +607,7 @@ impl FileAgentSessionStore {
             .paths
             .session_video_dir_for_session(session_id)
             .join(&file_name);
-        replace_file(&path, bytes)?;
+        self.replace_file(&path, bytes)?;
         let frame = AgentVideoDataRef {
             relative_path,
             byte_len: bytes.len() as u64,
@@ -612,7 +615,7 @@ impl FileAgentSessionStore {
             mime_type: input.format.mime_type().to_string(),
         };
         let record = AgentVideoFrameRecord::new(frame_id, session_id.clone(), input.clone(), frame);
-        append_jsonl_record(
+        self.append_jsonl_record(
             &self.paths.session_video_frames_path_for_session(session_id),
             &record,
         )?;
@@ -641,29 +644,8 @@ impl FileAgentSessionStore {
         let path = self
             .paths
             .session_audio_segments_path_for_session(session_id);
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let file = File::open(&path).map_err(|source| AgentSessionStoreError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
         let mut segments = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|source| AgentSessionStoreError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let record: AgentAudioSegmentRecord =
-                serde_json::from_str(&line).map_err(|source| {
-                    AgentSessionStoreError::Deserialization {
-                        path: path.display().to_string(),
-                        detail: source.to_string(),
-                    }
-                })?;
+        for record in self.read_jsonl_records::<AgentAudioSegmentRecord>(&path)? {
             if record.schema_version != AGENT_SESSION_AUDIO_SEGMENT_SCHEMA_VERSION {
                 return Err(AgentSessionStoreError::UnsupportedSnapshotSchema {
                     path: path.display().to_string(),
@@ -680,28 +662,8 @@ impl FileAgentSessionStore {
         session_id: &SessionId,
     ) -> Result<Vec<AgentVideoFrameRecord>, AgentSessionStoreError> {
         let path = self.paths.session_video_frames_path_for_session(session_id);
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let file = File::open(&path).map_err(|source| AgentSessionStoreError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
         let mut frames = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|source| AgentSessionStoreError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let record: AgentVideoFrameRecord = serde_json::from_str(&line).map_err(|source| {
-                AgentSessionStoreError::Deserialization {
-                    path: path.display().to_string(),
-                    detail: source.to_string(),
-                }
-            })?;
+        for record in self.read_jsonl_records::<AgentVideoFrameRecord>(&path)? {
             if record.schema_version != AGENT_SESSION_VIDEO_FRAME_SCHEMA_VERSION {
                 return Err(AgentSessionStoreError::UnsupportedSnapshotSchema {
                     path: path.display().to_string(),
@@ -725,6 +687,84 @@ impl FileAgentSessionStore {
             stream.sender.send(record.clone()).is_ok()
         });
     }
+
+    fn read_optional_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, AgentSessionStoreError> {
+        let vfs_path = self.vfs_path_for(path)?;
+        self.vfs
+            .read_optional(&vfs_path)
+            .map_err(|source| session_vfs_error(path, source))
+    }
+
+    fn read_optional_text(&self, path: &Path) -> Result<Option<String>, AgentSessionStoreError> {
+        let Some(bytes) = self.read_optional_bytes(path)? else {
+            return Ok(None);
+        };
+        String::from_utf8(bytes).map(Some).map_err(|source| {
+            AgentSessionStoreError::Deserialization {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            }
+        })
+    }
+
+    fn read_jsonl_records<T>(&self, path: &Path) -> Result<Vec<T>, AgentSessionStoreError>
+    where
+        T: DeserializeOwned,
+    {
+        let Some(contents) = self.read_optional_text(path)? else {
+            return Ok(Vec::new());
+        };
+        let mut records = Vec::new();
+        for line in contents.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            records.push(serde_json::from_str(line).map_err(|source| {
+                AgentSessionStoreError::Deserialization {
+                    path: path.display().to_string(),
+                    detail: source.to_string(),
+                }
+            })?);
+        }
+        Ok(records)
+    }
+
+    fn append_jsonl_record<T: Serialize>(
+        &self,
+        path: &Path,
+        record: &T,
+    ) -> Result<(), AgentSessionStoreError> {
+        let vfs_path = self.vfs_path_for(path)?;
+        if let Some(parent) = vfs_parent_path(&vfs_path) {
+            self.vfs
+                .create_dir_all(parent)
+                .map_err(|source| session_vfs_error(path, source))?;
+        }
+        let mut line =
+            serde_json::to_vec(record).map_err(|source| AgentSessionStoreError::Serialization {
+                detail: source.to_string(),
+            })?;
+        line.push(b'\n');
+        self.vfs
+            .append_with_options(&vfs_path, line, VfsAppendOptions::local())
+            .map_err(|source| session_vfs_error(path, source))
+    }
+
+    fn replace_file(&self, path: &Path, bytes: &[u8]) -> Result<(), AgentSessionStoreError> {
+        let vfs_path = self.vfs_path_for(path)?;
+        if let Some(parent) = vfs_parent_path(&vfs_path) {
+            self.vfs
+                .create_dir_all(parent)
+                .map_err(|source| session_vfs_error(path, source))?;
+        }
+        self.vfs
+            .write_with_options(&vfs_path, bytes, VfsWriteOptions::local_replace())
+            .map_err(|source| session_vfs_error(path, source))
+    }
+
+    fn vfs_path_for(&self, path: &Path) -> Result<String, AgentSessionStoreError> {
+        relative_vfs_path(&self.paths.root, path)
+    }
 }
 
 impl AgentSessionStore for FileAgentSessionStore {
@@ -733,13 +773,9 @@ impl AgentSessionStore for FileAgentSessionStore {
         session_id: &SessionId,
     ) -> Result<Option<AgentSession>, AgentSessionStoreError> {
         let path = self.paths.session_snapshot_path_for_session(session_id);
-        if !path.exists() {
+        let Some(contents) = self.read_optional_text(&path)? else {
             return Ok(None);
-        }
-        let contents = fs::read_to_string(&path).map_err(|source| AgentSessionStoreError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
+        };
         let snapshot: AgentSessionSnapshot = serde_json::from_str(&contents).map_err(|source| {
             AgentSessionStoreError::Deserialization {
                 path: path.display().to_string(),
@@ -765,7 +801,7 @@ impl AgentSessionStore for FileAgentSessionStore {
         let path = self
             .paths
             .session_snapshot_path_for_session(&session.session_id);
-        replace_file(&path, &bytes)?;
+        self.replace_file(&path, &bytes)?;
         self.append_record(&AgentSessionStoreRecord::new(
             session.session_id.clone(),
             AgentSessionStoreRecordKind::SnapshotSaved {
@@ -787,7 +823,7 @@ impl AgentSessionStore for FileAgentSessionStore {
         }
         let path = self.paths.session_items_path_for_session(session_id);
         for item in items {
-            append_jsonl_record(
+            self.append_jsonl_record(
                 &path,
                 &AgentSessionItemRecord::new(session_id.clone(), item.clone()),
             )?;
@@ -807,7 +843,7 @@ impl AgentSessionStore for FileAgentSessionStore {
         projection: &AgentSessionProjection,
     ) -> Result<(), AgentSessionStoreError> {
         let path = self.paths.session_projections_path_for_session(session_id);
-        append_jsonl_record(
+        self.append_jsonl_record(
             &path,
             &AgentSessionProjectionRecord::new(session_id.clone(), projection.clone()),
         )?;
@@ -828,7 +864,7 @@ impl AgentSessionStore for FileAgentSessionStore {
         let path = self
             .paths
             .session_events_path_for_session(&record.session_id);
-        append_jsonl_record(&path, record)?;
+        self.append_jsonl_record(&path, record)?;
         self.publish_record(record);
         Ok(())
     }
@@ -838,29 +874,8 @@ impl AgentSessionStore for FileAgentSessionStore {
         session_id: &SessionId,
     ) -> Result<Option<AgentSessionControlSnapshot>, AgentSessionStoreError> {
         let path = self.paths.session_events_path_for_session(session_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let file = File::open(&path).map_err(|source| AgentSessionStoreError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
         let mut latest = None;
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|source| AgentSessionStoreError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let record: AgentSessionStoreRecord =
-                serde_json::from_str(&line).map_err(|source| {
-                    AgentSessionStoreError::Deserialization {
-                        path: path.display().to_string(),
-                        detail: source.to_string(),
-                    }
-                })?;
+        for record in self.read_jsonl_records::<AgentSessionStoreRecord>(&path)? {
             if let AgentSessionStoreRecordKind::ControlSnapshotSaved { snapshot } = record.record {
                 latest = Some(snapshot);
             }
@@ -873,29 +888,8 @@ impl AgentSessionStore for FileAgentSessionStore {
         session_id: &SessionId,
     ) -> Result<Vec<AgentEvent>, AgentSessionStoreError> {
         let path = self.paths.session_events_path_for_session(session_id);
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let file = File::open(&path).map_err(|source| AgentSessionStoreError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
         let mut events = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|source| AgentSessionStoreError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let record: AgentSessionStoreRecord =
-                serde_json::from_str(&line).map_err(|source| {
-                    AgentSessionStoreError::Deserialization {
-                        path: path.display().to_string(),
-                        detail: source.to_string(),
-                    }
-                })?;
+        for record in self.read_jsonl_records::<AgentSessionStoreRecord>(&path)? {
             if let AgentSessionStoreRecordKind::ControlEventPublished { event } = record.record {
                 events.push(event);
             }
@@ -907,6 +901,7 @@ impl AgentSessionStore for FileAgentSessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::time::Duration;
 
     #[test]
@@ -1032,103 +1027,45 @@ mod tests {
     }
 }
 
-fn append_jsonl_record<T: Serialize>(
-    path: &Path,
-    record: &T,
-) -> Result<(), AgentSessionStoreError> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).map_err(|source| AgentSessionStoreError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let line =
-        serde_json::to_string(record).map_err(|source| AgentSessionStoreError::Serialization {
-            detail: source.to_string(),
-        })?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+fn relative_vfs_path(root: &Path, path: &Path) -> Result<String, AgentSessionStoreError> {
+    let relative = path
+        .strip_prefix(root)
         .map_err(|source| AgentSessionStoreError::Io {
             path: path.display().to_string(),
-            detail: source.to_string(),
+            detail: format!("path is outside agent storage root: {source}"),
         })?;
-    writeln!(file, "{line}").map_err(|source| AgentSessionStoreError::Io {
+    let mut segments = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(segment) => {
+                let Some(segment) = segment.to_str() else {
+                    return Err(AgentSessionStoreError::Io {
+                        path: path.display().to_string(),
+                        detail: "path segment is not valid UTF-8".to_string(),
+                    });
+                };
+                segments.push(segment.to_string());
+            }
+            Component::CurDir => {}
+            _ => {
+                return Err(AgentSessionStoreError::Io {
+                    path: path.display().to_string(),
+                    detail: "path contains unsupported component".to_string(),
+                });
+            }
+        }
+    }
+    Ok(segments.join("/"))
+}
+
+fn vfs_parent_path(path: &str) -> Option<&str> {
+    path.rsplit_once('/').map(|(parent, _)| parent)
+}
+
+fn session_vfs_error(path: &Path, source: VfsError) -> AgentSessionStoreError {
+    AgentSessionStoreError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
-    })
-}
-
-fn replace_file(path: &Path, bytes: &[u8]) -> Result<(), AgentSessionStoreError> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).map_err(|source| AgentSessionStoreError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let tmp_path = temporary_path_for(path);
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)
-            .map_err(|source| AgentSessionStoreError::Io {
-                path: tmp_path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        file.write_all(bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|source| AgentSessionStoreError::Io {
-                path: tmp_path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-    }
-    rename_replacing(&tmp_path, path)
-}
-
-fn temporary_path_for(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("snapshot");
-    path.with_file_name(format!(".{file_name}.{}.tmp", TaskId::generate()))
-}
-
-#[cfg(not(windows))]
-fn rename_replacing(source: &Path, target: &Path) -> Result<(), AgentSessionStoreError> {
-    fs::rename(source, target).map_err(|error| AgentSessionStoreError::Io {
-        path: target.display().to_string(),
-        detail: error.to_string(),
-    })
-}
-
-#[cfg(windows)]
-fn rename_replacing(source: &Path, target: &Path) -> Result<(), AgentSessionStoreError> {
-    match fs::rename(source, target) {
-        Ok(()) => Ok(()),
-        Err(error) if target.exists() => {
-            fs::remove_file(target).map_err(|remove_error| AgentSessionStoreError::Io {
-                path: target.display().to_string(),
-                detail: remove_error.to_string(),
-            })?;
-            fs::rename(source, target).map_err(|rename_error| AgentSessionStoreError::Io {
-                path: target.display().to_string(),
-                detail: format!(
-                    "{error}; retry after removing existing file failed: {rename_error}"
-                ),
-            })
-        }
-        Err(error) => Err(AgentSessionStoreError::Io {
-            path: target.display().to_string(),
-            detail: error.to_string(),
-        }),
     }
 }
 

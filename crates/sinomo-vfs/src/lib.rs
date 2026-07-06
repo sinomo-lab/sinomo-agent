@@ -3,22 +3,17 @@
 //! The VFS layer gives high-level crates a storage-oriented API without
 //! binding them to the current backing store. Handles are always scoped to a
 //! root path, so callers can operate with local names while the backend remains
-//! local, mounted SIFS, daemon-backed SIFS, or an in-memory test store.
+//! local, remote, service-backed, or an in-memory test store.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use sinomo_core::network::ObjectRpcRequest;
 use sinomo_core::object::{LengthMode, serde_ext};
-use sinomo_dfs::{
-    DfsDirEntry, DfsObjectKind, DfsPosixError, DfsStat, DfsWriteOptions, OpenedMountedSifsService,
-};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, VfsError>;
@@ -189,6 +184,48 @@ impl VfsWriteOptions {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VfsAppendOptions {
+    pub durability: VfsWriteDurability,
+    pub consistency: VfsConsistencyTarget,
+    pub create: bool,
+    pub conflict_behavior: VfsConflictBehavior,
+}
+
+impl Default for VfsAppendOptions {
+    fn default() -> Self {
+        Self {
+            durability: VfsWriteDurability::ReplicatedEventual,
+            consistency: VfsConsistencyTarget::ReadYourWrites,
+            create: true,
+            conflict_behavior: VfsConflictBehavior::Fail,
+        }
+    }
+}
+
+impl VfsAppendOptions {
+    pub fn local() -> Self {
+        Self {
+            durability: VfsWriteDurability::Local,
+            ..Self::default()
+        }
+    }
+
+    pub fn service_artifact() -> Self {
+        Self {
+            durability: VfsWriteDurability::ReplicatedEventual,
+            consistency: VfsConsistencyTarget::BestEffort,
+            create: true,
+            conflict_behavior: VfsConflictBehavior::Overwrite,
+        }
+    }
+
+    pub fn without_create(mut self) -> Self {
+        self.create = false;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VfsRemoveOptions {
     pub directory: bool,
     pub missing_ok: bool,
@@ -228,6 +265,7 @@ pub trait VfsBackend: Send + Sync + std::fmt::Debug {
     fn read(&self, path: &str) -> Result<Vec<u8>>;
     fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<VfsFileRead>;
     fn write(&self, path: &str, bytes: &[u8], options: &VfsWriteOptions) -> Result<()>;
+    fn append(&self, path: &str, bytes: &[u8], options: &VfsAppendOptions) -> Result<()>;
     fn create_dir_all(&self, path: &str) -> Result<()>;
     fn rename(&self, from: &str, to: &str) -> Result<()>;
     fn remove(&self, path: &str, options: &VfsRemoveOptions) -> Result<()>;
@@ -247,20 +285,6 @@ impl VfsHandle {
 
     pub fn local(root: impl Into<PathBuf>) -> Result<Self> {
         Self::new(Arc::new(LocalVfsBackend::new(root.into())), "/")
-    }
-
-    pub fn mounted_sifs(data_dir: Option<PathBuf>) -> Result<Self> {
-        Ok(Self {
-            backend: Arc::new(MountedSifsVfsBackend::open(data_dir)?),
-            root: "/".to_string(),
-        })
-    }
-
-    pub fn daemon_sifs(address: impl Into<String>) -> Result<Self> {
-        Ok(Self {
-            backend: Arc::new(DaemonSifsVfsBackend::new(address.into())),
-            root: "/".to_string(),
-        })
     }
 
     pub fn memory() -> Self {
@@ -336,6 +360,20 @@ impl VfsHandle {
     ) -> Result<()> {
         let path = self.resolve(path.as_ref())?;
         self.backend.write(&path, bytes.as_ref(), &options)
+    }
+
+    pub fn append(&self, path: impl AsRef<str>, bytes: impl AsRef<[u8]>) -> Result<()> {
+        self.append_with_options(path, bytes, VfsAppendOptions::default())
+    }
+
+    pub fn append_with_options(
+        &self,
+        path: impl AsRef<str>,
+        bytes: impl AsRef<[u8]>,
+        options: VfsAppendOptions,
+    ) -> Result<()> {
+        let path = self.resolve(path.as_ref())?;
+        self.backend.append(&path, bytes.as_ref(), &options)
     }
 
     pub fn create_dir_all(&self, path: impl AsRef<str>) -> Result<()> {
@@ -463,7 +501,7 @@ impl VfsBackend for LocalVfsBackend {
         let metadata = fs::metadata(&host_path).map_err(|source| self.map_io(path, source))?;
         let mut file = fs::File::open(host_path).map_err(|source| self.map_io(path, source))?;
         let mut bytes = Vec::new();
-        file.by_ref()
+        Read::by_ref(&mut file)
             .take(max_bytes)
             .read_to_end(&mut bytes)
             .map_err(|source| self.map_io(path, source))?;
@@ -476,6 +514,21 @@ impl VfsBackend for LocalVfsBackend {
     fn write(&self, path: &str, bytes: &[u8], options: &VfsWriteOptions) -> Result<()> {
         enforce_local_create_mode(path, &self.host_path(path), options)?;
         fs::write(self.host_path(path), bytes).map_err(|source| self.map_io(path, source))
+    }
+
+    fn append(&self, path: &str, bytes: &[u8], options: &VfsAppendOptions) -> Result<()> {
+        let mut open_options = fs::OpenOptions::new();
+        open_options.append(true).create(options.create);
+        let mut file = open_options
+            .open(self.host_path(path))
+            .map_err(|source| self.map_io(path, source))?;
+        file.write_all(bytes)
+            .map_err(|source| self.map_io(path, source))?;
+        if options.consistency == VfsConsistencyTarget::ReadYourWrites {
+            file.sync_all()
+                .map_err(|source| self.map_io(path, source))?;
+        }
+        Ok(())
     }
 
     fn create_dir_all(&self, path: &str) -> Result<()> {
@@ -498,324 +551,6 @@ impl VfsBackend for LocalVfsBackend {
             Err(source) if options.missing_ok && source.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(source) => Err(self.map_io(path, source)),
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct MountedSifsVfsBackend {
-    opened: Mutex<OpenedMountedSifsService>,
-}
-
-impl MountedSifsVfsBackend {
-    pub fn open(data_dir: Option<PathBuf>) -> Result<Self> {
-        let opened = sinomo_dfs::open_mounted_sifs_service(data_dir).map_err(|source| {
-            VfsError::Backend {
-                backend: "mounted-sifs".to_string(),
-                path: "/".to_string(),
-                detail: source.to_string(),
-            }
-        })?;
-        Ok(Self {
-            opened: Mutex::new(opened),
-        })
-    }
-
-    fn lock(&self, path: &str) -> Result<std::sync::MutexGuard<'_, OpenedMountedSifsService>> {
-        self.opened.lock().map_err(|_| VfsError::Backend {
-            backend: self.backend_name().to_string(),
-            path: path.to_string(),
-            detail: "mounted SIFS backend lock is poisoned".to_string(),
-        })
-    }
-
-    fn stat_exists(opened: &mut OpenedMountedSifsService, path: &str) -> Result<bool> {
-        match opened.service.posix_stat_distributed(path) {
-            Ok(_) => Ok(true),
-            Err(DfsPosixError::NotFound { .. }) => Ok(false),
-            Err(source) => Err(dfs_error_to_vfs("mounted-sifs", path, source)),
-        }
-    }
-}
-
-impl VfsBackend for MountedSifsVfsBackend {
-    fn backend_name(&self) -> &'static str {
-        "mounted-sifs"
-    }
-
-    fn stat(&self, path: &str) -> Result<VfsMetadata> {
-        let mut opened = self.lock(path)?;
-        let stat = opened
-            .service
-            .posix_stat_distributed(path)
-            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
-        Ok(metadata_from_dfs_stat(stat))
-    }
-
-    fn list(&self, path: &str) -> Result<Vec<VfsDirEntry>> {
-        let mut opened = self.lock(path)?;
-        let entries = opened
-            .service
-            .posix_list_dir_distributed(path)
-            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
-        Ok(entries.into_iter().map(dir_entry_from_dfs).collect())
-    }
-
-    fn read(&self, path: &str) -> Result<Vec<u8>> {
-        let mut opened = self.lock(path)?;
-        opened
-            .service
-            .posix_read_file_distributed(path)
-            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))
-    }
-
-    fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<VfsFileRead> {
-        let mut opened = self.lock(path)?;
-        let stat = opened
-            .service
-            .posix_stat_distributed(path)
-            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
-        let length = usize::try_from(max_bytes).map_err(|_| VfsError::InvalidPath {
-            path: path.to_string(),
-            detail: "read prefix length does not fit this platform".to_string(),
-        })?;
-        let bytes = opened
-            .service
-            .posix_read_file_range(path, 0, length)
-            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
-        Ok(VfsFileRead {
-            bytes,
-            truncated: stat.size_bytes.unwrap_or(0) > max_bytes,
-        })
-    }
-
-    fn write(&self, path: &str, bytes: &[u8], options: &VfsWriteOptions) -> Result<()> {
-        let mut opened = self.lock(path)?;
-        enforce_sifs_create_mode(&mut opened, path, options, self.backend_name())?;
-        let mut candidates = if options.durability == VfsWriteDurability::Local {
-            vec![opened.service.node_id().clone()]
-        } else {
-            opened.replica_candidates.clone()
-        };
-        if !candidates.contains(opened.service.node_id()) {
-            candidates.insert(0, opened.service.node_id().clone());
-        }
-        let mut dfs_options = DfsWriteOptions::replicated_eventual(candidates);
-        dfs_options.foreground_replica_repair =
-            options.consistency == VfsConsistencyTarget::ReadYourWrites;
-        opened
-            .service
-            .posix_write_file(path, bytes, dfs_options)
-            .map(drop)
-            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))
-    }
-
-    fn create_dir_all(&self, path: &str) -> Result<()> {
-        let mut opened = self.lock(path)?;
-        opened
-            .service
-            .posix_mkdir_all(path)
-            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))
-    }
-
-    fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let mut opened = self.lock(from)?;
-        opened
-            .service
-            .posix_rename(from, to)
-            .map(drop)
-            .map_err(|source| dfs_error_to_vfs(self.backend_name(), from, source))
-    }
-
-    fn remove(&self, path: &str, options: &VfsRemoveOptions) -> Result<()> {
-        let mut opened = self.lock(path)?;
-        let result = if options.directory {
-            opened.service.posix_rmdir(path)
-        } else {
-            opened.service.posix_unlink(path)
-        };
-        match result {
-            Ok(_) => Ok(()),
-            Err(DfsPosixError::NotFound { .. }) if options.missing_ok => Ok(()),
-            Err(source) => Err(dfs_error_to_vfs(self.backend_name(), path, source)),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct DaemonSifsVfsBackend {
-    address: String,
-    timeout: Duration,
-}
-
-impl DaemonSifsVfsBackend {
-    pub fn new(address: String) -> Self {
-        Self {
-            address,
-            timeout: Duration::from_secs(5),
-        }
-    }
-
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    fn rpc<Request, Response>(
-        &self,
-        path: &str,
-        route: &str,
-        request_body: &Request,
-    ) -> Result<Response>
-    where
-        Request: Serialize + ?Sized,
-        Response: DeserializeOwned,
-    {
-        let request =
-            ObjectRpcRequest::encode_body(route, sinomo_daemon::DAEMON_RPC_CATEGORY, request_body)
-                .map_err(|source| {
-                    daemon_detail_to_vfs(self.backend_name(), path, source.to_string())
-                })?;
-        let response = sinomo_daemon::send_daemon_rpc(&self.address, &request, self.timeout)
-            .map_err(|source| {
-                daemon_detail_to_vfs(self.backend_name(), path, source.to_string())
-            })?;
-        response
-            .decode_body()
-            .map_err(|source| daemon_detail_to_vfs(self.backend_name(), path, source.to_string()))
-    }
-
-    fn stat_exists(&self, path: &str) -> Result<bool> {
-        match self.stat(path) {
-            Ok(_) => Ok(true),
-            Err(VfsError::NotFound { .. }) => Ok(false),
-            Err(source) => Err(source),
-        }
-    }
-}
-
-impl VfsBackend for DaemonSifsVfsBackend {
-    fn backend_name(&self) -> &'static str {
-        "daemon-sifs"
-    }
-
-    fn stat(&self, path: &str) -> Result<VfsMetadata> {
-        let response: sinomo_daemon::DaemonDfsBrowserStatResponse = self.rpc(
-            path,
-            sinomo_daemon::DAEMON_DFS_BROWSER_STAT_ROUTE,
-            &sinomo_daemon::DaemonDfsBrowserStatRequest {
-                path: path.to_string(),
-            },
-        )?;
-        Ok(VfsMetadata {
-            path: response.path,
-            kind: vfs_kind_from_dfs(&response.kind),
-            size_bytes: response.size_bytes,
-            content_hash: response.content_hash,
-            version: Some(response.version),
-        })
-    }
-
-    fn list(&self, path: &str) -> Result<Vec<VfsDirEntry>> {
-        let response: sinomo_daemon::DaemonDfsBrowserListResponse = self.rpc(
-            path,
-            sinomo_daemon::DAEMON_DFS_BROWSER_LIST_ROUTE,
-            &sinomo_daemon::DaemonDfsBrowserListRequest {
-                path: path.to_string(),
-                shallow: true,
-                missing_is_empty: false,
-                sort_key: sinomo_daemon::DaemonDfsBrowserSortKey::Name,
-                sort_direction: sinomo_daemon::DaemonDfsBrowserSortDirection::Ascending,
-                offset: 0,
-                limit: None,
-            },
-        )?;
-        Ok(response
-            .entries
-            .into_iter()
-            .map(|entry| VfsDirEntry {
-                name: entry.name,
-                path: entry.path,
-                kind: vfs_kind_from_dfs(&entry.kind),
-                size_bytes: entry.size,
-            })
-            .collect())
-    }
-
-    fn read(&self, path: &str) -> Result<Vec<u8>> {
-        let response: sinomo_daemon::DaemonDfsBrowserReadFileResponse = self.rpc(
-            path,
-            sinomo_daemon::DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
-            &sinomo_daemon::DaemonDfsBrowserReadFileRequest {
-                path: path.to_string(),
-            },
-        )?;
-        Ok(response.bytes)
-    }
-
-    fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<VfsFileRead> {
-        let response: sinomo_daemon::DaemonDfsBrowserReadFilePrefixResponse = self.rpc(
-            path,
-            sinomo_daemon::DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
-            &sinomo_daemon::DaemonDfsBrowserReadFilePrefixRequest {
-                path: path.to_string(),
-                max_bytes,
-            },
-        )?;
-        Ok(VfsFileRead {
-            bytes: response.bytes,
-            truncated: response.truncated,
-        })
-    }
-
-    fn write(&self, path: &str, bytes: &[u8], options: &VfsWriteOptions) -> Result<()> {
-        enforce_daemon_create_mode(self, path, options)?;
-        let _: sinomo_daemon::DaemonDfsBrowserWriteFileResponse = self.rpc(
-            path,
-            sinomo_daemon::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
-            &sinomo_daemon::DaemonDfsBrowserWriteFileRequest {
-                path: path.to_string(),
-                bytes: bytes.to_vec(),
-            },
-        )?;
-        Ok(())
-    }
-
-    fn create_dir_all(&self, path: &str) -> Result<()> {
-        let _: sinomo_daemon::DaemonDfsBrowserCreateDirAllResponse = self.rpc(
-            path,
-            sinomo_daemon::DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
-            &sinomo_daemon::DaemonDfsBrowserCreateDirAllRequest {
-                path: path.to_string(),
-            },
-        )?;
-        Ok(())
-    }
-
-    fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let _: sinomo_daemon::DaemonDfsBrowserRenameResponse = self.rpc(
-            from,
-            sinomo_daemon::DAEMON_DFS_BROWSER_RENAME_ROUTE,
-            &sinomo_daemon::DaemonDfsBrowserRenameRequest {
-                from: from.to_string(),
-                to: to.to_string(),
-            },
-        )?;
-        Ok(())
-    }
-
-    fn remove(&self, path: &str, options: &VfsRemoveOptions) -> Result<()> {
-        if options.missing_ok && !self.stat_exists(path)? {
-            return Ok(());
-        }
-        let _: sinomo_daemon::DaemonDfsBrowserDeleteResponse = self.rpc(
-            path,
-            sinomo_daemon::DAEMON_DFS_BROWSER_DELETE_ROUTE,
-            &sinomo_daemon::DaemonDfsBrowserDeleteRequest {
-                path: path.to_string(),
-                directory: options.directory,
-            },
-        )?;
-        Ok(())
     }
 }
 
@@ -940,6 +675,42 @@ impl VfsBackend for MemoryVfsBackend {
         let parent = parent_vfs_path(path).ok_or_else(|| VfsError::InvalidPath {
             path: path.to_string(),
             detail: "cannot write root as a file".to_string(),
+        })?;
+        match nodes.get(&parent) {
+            Some(MemoryNode::Directory) => {}
+            Some(MemoryNode::File(_)) => {
+                return Err(VfsError::NotDirectory { path: parent });
+            }
+            None => {
+                return Err(VfsError::NotFound { path: parent });
+            }
+        }
+        nodes.insert(path.to_string(), MemoryNode::File(bytes.to_vec()));
+        Ok(())
+    }
+
+    fn append(&self, path: &str, bytes: &[u8], options: &VfsAppendOptions) -> Result<()> {
+        let mut nodes = self.lock(path)?;
+        match nodes.get_mut(path) {
+            Some(MemoryNode::File(existing)) => {
+                existing.extend_from_slice(bytes);
+                return Ok(());
+            }
+            Some(MemoryNode::Directory) => {
+                return Err(VfsError::IsDirectory {
+                    path: path.to_string(),
+                });
+            }
+            None if !options.create => {
+                return Err(VfsError::NotFound {
+                    path: path.to_string(),
+                });
+            }
+            None => {}
+        }
+        let parent = parent_vfs_path(path).ok_or_else(|| VfsError::InvalidPath {
+            path: path.to_string(),
+            detail: "cannot append to root as a file".to_string(),
         })?;
         match nodes.get(&parent) {
             Some(MemoryNode::Directory) => {}
@@ -1458,32 +1229,6 @@ fn enforce_memory_create_mode(
     enforce_create_mode(path, nodes.contains_key(path), options)
 }
 
-fn enforce_sifs_create_mode(
-    opened: &mut OpenedMountedSifsService,
-    path: &str,
-    options: &VfsWriteOptions,
-    backend: &str,
-) -> Result<()> {
-    let exists = MountedSifsVfsBackend::stat_exists(opened, path)?;
-    enforce_create_mode(path, exists, options).map_err(|source| match source {
-        VfsError::Conflict { path, detail } => VfsError::Backend {
-            backend: backend.to_string(),
-            path,
-            detail,
-        },
-        other => other,
-    })
-}
-
-fn enforce_daemon_create_mode(
-    backend: &DaemonSifsVfsBackend,
-    path: &str,
-    options: &VfsWriteOptions,
-) -> Result<()> {
-    let exists = backend.stat_exists(path)?;
-    enforce_create_mode(path, exists, options)
-}
-
 fn enforce_create_mode(path: &str, exists: bool, options: &VfsWriteOptions) -> Result<()> {
     match options.create_mode {
         VfsCreateMode::CreateNew if exists => Err(VfsError::AlreadyExists {
@@ -1493,96 +1238,6 @@ fn enforce_create_mode(path: &str, exists: bool, options: &VfsWriteOptions) -> R
             path: path.to_string(),
         }),
         _ => Ok(()),
-    }
-}
-
-fn metadata_from_dfs_stat(stat: DfsStat) -> VfsMetadata {
-    VfsMetadata {
-        path: stat.path,
-        kind: vfs_kind_from_dfs(&stat.kind),
-        size_bytes: stat.size_bytes,
-        content_hash: stat.content_hash,
-        version: Some(stat.version.as_str().to_string()),
-    }
-}
-
-fn dir_entry_from_dfs(entry: DfsDirEntry) -> VfsDirEntry {
-    VfsDirEntry {
-        name: entry.name,
-        path: entry.path,
-        kind: vfs_kind_from_dfs(&entry.kind),
-        size_bytes: None,
-    }
-}
-
-fn vfs_kind_from_dfs(kind: &DfsObjectKind) -> VfsObjectKind {
-    match kind {
-        DfsObjectKind::File => VfsObjectKind::File,
-        DfsObjectKind::Directory => VfsObjectKind::Directory,
-        DfsObjectKind::Symlink => VfsObjectKind::Symlink,
-        DfsObjectKind::Hardlink => VfsObjectKind::Hardlink,
-        DfsObjectKind::Artifact => VfsObjectKind::Artifact,
-        DfsObjectKind::Mount => VfsObjectKind::Mount,
-        DfsObjectKind::Tombstone => VfsObjectKind::Tombstone,
-    }
-}
-
-fn dfs_error_to_vfs(backend: &str, path: &str, source: DfsPosixError) -> VfsError {
-    match source {
-        DfsPosixError::NotFound { path } => VfsError::NotFound { path },
-        DfsPosixError::AlreadyExists { path } => VfsError::AlreadyExists { path },
-        DfsPosixError::NotDirectory { path } => VfsError::NotDirectory { path },
-        DfsPosixError::IsDirectory { path } => VfsError::IsDirectory { path },
-        DfsPosixError::DirectoryNotEmpty { path } => VfsError::DirectoryNotEmpty { path },
-        DfsPosixError::InvalidPath { path } => VfsError::InvalidPath {
-            path,
-            detail: "invalid SIFS path".to_string(),
-        },
-        DfsPosixError::Conflict { path, reason } => VfsError::Conflict {
-            path,
-            detail: reason,
-        },
-        other => VfsError::Backend {
-            backend: backend.to_string(),
-            path: path.to_string(),
-            detail: other.to_string(),
-        },
-    }
-}
-
-fn daemon_detail_to_vfs(backend: &str, path: &str, detail: String) -> VfsError {
-    let lower = detail.to_ascii_lowercase();
-    if lower.contains("not found") {
-        VfsError::NotFound {
-            path: path.to_string(),
-        }
-    } else if lower.contains("already exists") {
-        VfsError::AlreadyExists {
-            path: path.to_string(),
-        }
-    } else if lower.contains("not a directory") {
-        VfsError::NotDirectory {
-            path: path.to_string(),
-        }
-    } else if lower.contains("is a directory") {
-        VfsError::IsDirectory {
-            path: path.to_string(),
-        }
-    } else if lower.contains("directory is not empty") {
-        VfsError::DirectoryNotEmpty {
-            path: path.to_string(),
-        }
-    } else if lower.contains("conflict") || lower.contains("conflicted") {
-        VfsError::Conflict {
-            path: path.to_string(),
-            detail,
-        }
-    } else {
-        VfsError::Backend {
-            backend: backend.to_string(),
-            path: path.to_string(),
-            detail,
-        }
     }
 }
 
@@ -1650,6 +1305,24 @@ mod tests {
             Err(VfsError::NotFound { .. })
         ));
         assert_eq!(handle.read("beta.txt").unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn memory_backend_appends_bytes_generically() {
+        let handle = VfsHandle::memory().scoped("/logs").unwrap();
+        handle.create_dir_all("").unwrap();
+        handle.append("events.log", b"one\n").unwrap();
+        handle.append("events.log", b"two\n").unwrap();
+        assert_eq!(handle.read("events.log").unwrap(), b"one\ntwo\n");
+
+        assert!(matches!(
+            handle.append_with_options(
+                "missing.log",
+                b"nope",
+                VfsAppendOptions::local().without_create()
+            ),
+            Err(VfsError::NotFound { .. })
+        ));
     }
 
     #[test]
@@ -1727,5 +1400,26 @@ mod tests {
             .join("agents")
             .join("agent.json");
         assert_eq!(fs::read(host_path).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn local_backend_appends_under_host_root() {
+        let test_dir = sinomo_testdir::TestDir::new("sinomo-vfs-local-append");
+        let handle = VfsHandle::local(test_dir.path()).unwrap();
+        handle.create_dir_all("/events").unwrap();
+        handle
+            .append_with_options("/events/trace.jsonl", b"first\n", VfsAppendOptions::local())
+            .unwrap();
+        handle
+            .append_with_options(
+                "/events/trace.jsonl",
+                b"second\n",
+                VfsAppendOptions::local(),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(test_dir.path().join("events").join("trace.jsonl")).unwrap(),
+            b"first\nsecond\n"
+        );
     }
 }

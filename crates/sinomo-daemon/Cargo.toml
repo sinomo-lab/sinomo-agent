@@ -28,6 +28,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["blocking"
 serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
+sinomo-api = { path = "../sinomo-api" }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-dfs = { path = "../sinomo-dfs" }

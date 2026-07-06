@@ -19,6 +19,7 @@ native-devices = ["sinomo-device/native-devices"]
 cluster-test-support = ["sinomo-core/cluster-test-support"]
 
 [dependencies]
+sinomo-api = { path = "../sinomo-api" }
 sinomo-cli-registry = { path = "../sinomo-cli-registry" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-core = { path = "../sinomo-core" }
@@ -40,3 +41,4 @@ sinomo-sandbox-wasix-host = { path = "../sinomo-sandbox-wasix-host", optional = 
 sinomo-supervision = { path = "../sinomo-supervision" }
 sinomo-test = { path = "../sinomo-test" }
 sinomo-vfs = { path = "../sinomo-vfs" }
+sinomo-vfs-sifs = { path = "../sinomo-vfs-sifs" }

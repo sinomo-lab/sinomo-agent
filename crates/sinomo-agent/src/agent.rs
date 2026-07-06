@@ -37,9 +37,9 @@ use sinomo_runtime::core::{
 };
 use sinomo_runtime::events::{EventId, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::vfs::{VfsAppendOptions, VfsHandle};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -608,33 +608,39 @@ impl FileAgentTraceStore {
 
 impl AgentTraceStore for FileAgentTraceStore {
     fn append(&self, record: &AgentTraceRecord) -> Result<(), AgentTraceStoreError> {
-        if let Some(parent) = self
+        let parent = self
             .path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).map_err(|source| AgentTraceStoreError::Io {
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .ok_or_else(|| AgentTraceStoreError::Io {
+                path: self.path.display().to_string(),
+                detail: "trace path does not end with a UTF-8 file name".to_string(),
+            })?;
+        let vfs = VfsHandle::local(&parent).map_err(|source| AgentTraceStoreError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        vfs.create_dir_all("")
+            .map_err(|source| AgentTraceStoreError::Io {
                 path: parent.display().to_string(),
                 detail: source.to_string(),
             })?;
-        }
-        let line = serde_json::to_string(record).map_err(|source| {
-            AgentTraceStoreError::Serialization {
+        let mut line =
+            serde_json::to_vec(record).map_err(|source| AgentTraceStoreError::Serialization {
                 detail: source.to_string(),
-            }
-        })?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
+            })?;
+        line.push(b'\n');
+        vfs.append_with_options(file_name, line, VfsAppendOptions::local())
             .map_err(|source| AgentTraceStoreError::Io {
                 path: self.path.display().to_string(),
                 detail: source.to_string(),
-            })?;
-        writeln!(file, "{line}").map_err(|source| AgentTraceStoreError::Io {
-            path: self.path.display().to_string(),
-            detail: source.to_string(),
-        })
+            })
     }
 }
 

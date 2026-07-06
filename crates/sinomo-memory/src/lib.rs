@@ -7,13 +7,11 @@ use sinomo_runtime::core::{
 };
 use sinomo_runtime::events::{SessionId, StoredEvent};
 use sinomo_runtime::object::{LengthMode, serde_ext};
-use sinomo_runtime::storage::durable_file::{
-    self, DurableAtomicFileOptions, DurableFileSync, DurableLengthEndian,
-    DurableRecordAppendOptions, DurableRecordReadOptions,
+use sinomo_runtime::vfs::{
+    VfsAppendOptions, VfsError, VfsHandle, VfsObjectKind, VfsRemoveOptions, VfsWriteOptions,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use thiserror::Error;
@@ -1153,14 +1151,18 @@ pub fn evaluate_memory_retrieval(
 #[derive(Clone, Debug)]
 pub struct DurableMemoryStore {
     root: PathBuf,
+    vfs: VfsHandle,
     records_per_segment: u64,
     write_lock: Arc<Mutex<()>>,
 }
 
 impl DurableMemoryStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let vfs = VfsHandle::local(root.clone()).expect("durable memory VFS root");
         Self {
-            root: root.into(),
+            root,
+            vfs,
             records_per_segment: DEFAULT_MEMORY_RECORDS_PER_SEGMENT,
             write_lock: Arc::new(Mutex::new(())),
         }
@@ -1989,50 +1991,106 @@ impl DurableMemoryStore {
 
     pub fn load_snapshot(&self) -> Result<Option<MemorySnapshot>, MemoryError> {
         let path = self.snapshot_path();
-        match durable_file::read_object_file_bytes(
-            &path,
-            durable_file::DEFAULT_OBJECT_FILE_MAX_READ_BYTES,
-        ) {
-            Ok(bytes) => {
-                let snapshot = decode_sobj::<MemorySnapshot>(&path, &bytes)?;
-                if snapshot.schema_version != MEMORY_STORAGE_SCHEMA_VERSION {
-                    return Err(MemoryError::UnsupportedSchema {
-                        path: path.display().to_string(),
-                        schema_version: snapshot.schema_version,
-                    });
-                }
-                Ok(Some(snapshot))
-            }
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(MemoryError::DurableFile {
-                path: source.path().to_string(),
-                detail: source.detail().to_string(),
-            }),
+        let Some(bytes) = self.read_optional_bytes(&path)? else {
+            return Ok(None);
+        };
+        let snapshot = decode_sobj::<MemorySnapshot>(&path, &bytes)?;
+        if snapshot.schema_version != MEMORY_STORAGE_SCHEMA_VERSION {
+            return Err(MemoryError::UnsupportedSchema {
+                path: path.display().to_string(),
+                schema_version: snapshot.schema_version,
+            });
         }
+        Ok(Some(snapshot))
     }
 
     pub fn load_index(&self) -> Result<Option<MemoryIndexSnapshot>, MemoryError> {
         let path = self.index_path();
-        match durable_file::read_object_file_bytes(
-            &path,
-            durable_file::DEFAULT_OBJECT_FILE_MAX_READ_BYTES,
-        ) {
-            Ok(bytes) => {
-                let index = decode_sobj::<MemoryIndexSnapshot>(&path, &bytes)?;
-                if index.schema_version != MEMORY_STORAGE_SCHEMA_VERSION {
-                    return Err(MemoryError::UnsupportedSchema {
+        let Some(bytes) = self.read_optional_bytes(&path)? else {
+            return Ok(None);
+        };
+        let index = decode_sobj::<MemoryIndexSnapshot>(&path, &bytes)?;
+        if index.schema_version != MEMORY_STORAGE_SCHEMA_VERSION {
+            return Err(MemoryError::UnsupportedSchema {
+                path: path.display().to_string(),
+                schema_version: index.schema_version,
+            });
+        }
+        Ok(Some(index))
+    }
+
+    fn read_optional_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, MemoryError> {
+        let vfs_path = self.vfs_path_for(path)?;
+        self.vfs
+            .read_optional(&vfs_path)
+            .map_err(|source| memory_vfs_error(path, source))
+    }
+
+    fn append_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), MemoryError> {
+        let vfs_path = self.vfs_path_for(path)?;
+        let parent = vfs_parent_path(&vfs_path).unwrap_or("");
+        self.vfs
+            .create_dir_all(parent)
+            .map_err(|source| memory_vfs_error(path, source))?;
+        self.vfs
+            .append_with_options(&vfs_path, bytes, VfsAppendOptions::local())
+            .map_err(|source| memory_vfs_error(path, source))
+    }
+
+    fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), MemoryError> {
+        let vfs_path = self.vfs_path_for(path)?;
+        let parent = vfs_parent_path(&vfs_path).unwrap_or("");
+        self.vfs
+            .create_dir_all(parent)
+            .map_err(|source| memory_vfs_error(path, source))?;
+        self.vfs
+            .write_with_options(&vfs_path, bytes, VfsWriteOptions::local_replace())
+            .map_err(|source| memory_vfs_error(path, source))
+    }
+
+    fn remove_file_if_exists(&self, path: &Path) -> Result<(), MemoryError> {
+        let vfs_path = self.vfs_path_for(path)?;
+        self.vfs
+            .remove_with_options(&vfs_path, VfsRemoveOptions::file().missing_ok())
+            .map_err(|source| memory_vfs_error(path, source))
+    }
+
+    fn remove_empty_dir_if_exists(&self, path: &Path) -> Result<(), MemoryError> {
+        let vfs_path = self.vfs_path_for(path)?;
+        self.vfs
+            .remove_with_options(&vfs_path, VfsRemoveOptions::directory().missing_ok())
+            .map_err(|source| memory_vfs_error(path, source))
+    }
+
+    fn vfs_path_for(&self, path: &Path) -> Result<String, MemoryError> {
+        let relative = path
+            .strip_prefix(&self.root)
+            .map_err(|source| MemoryError::Vfs {
+                path: path.display().to_string(),
+                detail: format!("path is outside memory store root: {source}"),
+            })?;
+        let mut segments = Vec::new();
+        for component in relative.components() {
+            match component {
+                Component::Normal(segment) => {
+                    let Some(segment) = segment.to_str() else {
+                        return Err(MemoryError::Vfs {
+                            path: path.display().to_string(),
+                            detail: "path segment is not valid UTF-8".to_string(),
+                        });
+                    };
+                    segments.push(segment.to_string());
+                }
+                Component::CurDir => {}
+                _ => {
+                    return Err(MemoryError::Vfs {
                         path: path.display().to_string(),
-                        schema_version: index.schema_version,
+                        detail: "path contains unsupported component".to_string(),
                     });
                 }
-                Ok(Some(index))
             }
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(MemoryError::DurableFile {
-                path: source.path().to_string(),
-                detail: source.detail().to_string(),
-            }),
         }
+        Ok(segments.join("/"))
     }
 
     pub fn rebuild_embedding_index(
@@ -2313,26 +2371,35 @@ impl DurableMemoryStore {
     }
 
     fn read_log_entries_from_path(&self, path: &Path) -> Result<Vec<MemoryLogEntry>, MemoryError> {
-        let mut file = match File::open(path) {
-            Ok(file) => file,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(source) => {
-                return Err(MemoryError::Io {
-                    path: path.display().to_string(),
-                    source,
-                });
-            }
+        let Some(bytes) = self.read_optional_bytes(path)? else {
+            return Ok(Vec::new());
         };
         let mut entries = Vec::new();
-        let options = DurableRecordReadOptions::new(DurableLengthEndian::Big)
-            .max_record_bytes(MAX_MEMORY_LOG_RECORD_BYTES);
-        while let Some(record) = durable_file::read_length_prefixed_record(&mut file, path, options)
-            .map_err(|source| MemoryError::DurableFile {
-                path: source.path().to_string(),
-                detail: source.detail().to_string(),
-            })?
-        {
-            let entry = decode_sobj::<MemoryLogEntry>(path, &record.bytes)?;
+        let mut offset = 0_usize;
+        while offset < bytes.len() {
+            if bytes.len().saturating_sub(offset) < 4 {
+                break;
+            }
+            let length = u32::from_be_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]) as usize;
+            if length > MAX_MEMORY_LOG_RECORD_BYTES {
+                return Err(MemoryError::DurableFile {
+                    path: path.display().to_string(),
+                    detail: format!(
+                        "length-prefixed record is {length} bytes; max is {MAX_MEMORY_LOG_RECORD_BYTES}"
+                    ),
+                });
+            }
+            let record_start = offset.saturating_add(4);
+            let record_end = record_start.saturating_add(length);
+            if record_end > bytes.len() {
+                break;
+            }
+            let entry = decode_sobj::<MemoryLogEntry>(path, &bytes[record_start..record_end])?;
             if entry.schema_version != MEMORY_STORAGE_SCHEMA_VERSION {
                 return Err(MemoryError::UnsupportedSchema {
                     path: path.display().to_string(),
@@ -2340,6 +2407,7 @@ impl DurableMemoryStore {
                 });
             }
             entries.push(entry);
+            offset = record_end;
         }
         Ok(entries)
     }
@@ -2350,23 +2418,14 @@ impl DurableMemoryStore {
         }
         let path = self.segment_path(entry.sequence);
         let bytes = encode_sobj(&path, entry)?;
-        let mut append_file = durable_file::open_file_for_append(&path).map_err(|source| {
-            MemoryError::DurableFile {
-                path: source.path().to_string(),
-                detail: source.detail().to_string(),
-            }
+        let length = u32::try_from(bytes.len()).map_err(|_| MemoryError::DurableFile {
+            path: path.display().to_string(),
+            detail: format!("length-prefixed record exceeds u32 length: {}", bytes.len()),
         })?;
-        durable_file::append_length_prefixed_records(
-            &mut append_file.file,
-            &path,
-            std::iter::once(bytes),
-            DurableRecordAppendOptions::new(DurableLengthEndian::Big).sync(DurableFileSync::Data),
-        )
-        .map_err(|source| MemoryError::DurableFile {
-            path: source.path().to_string(),
-            detail: source.detail().to_string(),
-        })?;
-        Ok(())
+        let mut framed = Vec::with_capacity(4 + bytes.len());
+        framed.extend_from_slice(&length.to_be_bytes());
+        framed.extend_from_slice(&bytes);
+        self.append_bytes(&path, &framed)
     }
 
     fn write_index_snapshot(&self, state: &MemoryReplayState) -> Result<(), MemoryError> {
@@ -2555,27 +2614,14 @@ impl DurableMemoryStore {
     fn log_paths(&self) -> Result<Vec<PathBuf>, MemoryError> {
         let mut paths = Vec::new();
         let segments_dir = self.segments_dir();
-        let entries = match fs::read_dir(&segments_dir) {
-            Ok(entries) => entries,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                paths.sort();
-                return Ok(paths);
-            }
-            Err(source) => {
-                return Err(MemoryError::Io {
-                    path: segments_dir.display().to_string(),
-                    source,
-                });
-            }
-        };
-        for entry in entries {
-            let entry = entry.map_err(|source| MemoryError::Io {
-                path: segments_dir.display().to_string(),
-                source,
-            })?;
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) == Some("sobjlog") {
-                paths.push(path);
+        let vfs_path = self.vfs_path_for(&segments_dir)?;
+        for entry in self
+            .vfs
+            .list_if_exists(&vfs_path)
+            .map_err(|source| memory_vfs_error(&segments_dir, source))?
+        {
+            if entry.kind == VfsObjectKind::File && entry.name.ends_with(".sobjlog") {
+                paths.push(self.root.join(entry.path.trim_start_matches('/')));
             }
         }
         paths.sort();
@@ -2584,19 +2630,9 @@ impl DurableMemoryStore {
 
     fn clear_log_segments(&self) -> Result<(), MemoryError> {
         for path in self.log_paths()? {
-            durable_file::remove_file_if_exists_and_sync_parent(&path).map_err(|source| {
-                MemoryError::DurableFile {
-                    path: source.path().to_string(),
-                    detail: source.detail().to_string(),
-                }
-            })?;
+            self.remove_file_if_exists(&path)?;
         }
-        durable_file::remove_empty_dir_if_exists_and_sync_parent(&self.segments_dir()).map_err(
-            |source| MemoryError::DurableFile {
-                path: source.path().to_string(),
-                detail: source.detail().to_string(),
-            },
-        )?;
+        self.remove_empty_dir_if_exists(&self.segments_dir())?;
         Ok(())
     }
 
@@ -2610,15 +2646,7 @@ impl DurableMemoryStore {
     }
 
     fn write_file_atomic(&self, path: &Path, bytes: &[u8]) -> Result<(), MemoryError> {
-        durable_file::write_file_atomic(
-            path,
-            bytes,
-            DurableAtomicFileOptions::new("sobj", "memory-tmp").sync_all(),
-        )
-        .map_err(|source| MemoryError::DurableFile {
-            path: source.path().to_string(),
-            detail: source.detail().to_string(),
-        })
+        self.write_bytes(path, bytes)
     }
 
     fn write_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, MemoryError> {
@@ -3761,6 +3789,17 @@ fn decode_sobj<T: for<'de> Deserialize<'de>>(path: &Path, bytes: &[u8]) -> Resul
     })
 }
 
+fn vfs_parent_path(path: &str) -> Option<&str> {
+    path.rsplit_once('/').map(|(parent, _)| parent)
+}
+
+fn memory_vfs_error(path: &Path, source: VfsError) -> MemoryError {
+    MemoryError::Vfs {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    }
+}
+
 fn promotion_reason(event: &EventEnvelope) -> Option<PromotionReason> {
     let kind = event.kind.as_str();
     if kind.starts_with("safety.") {
@@ -3852,6 +3891,8 @@ pub enum MemoryError {
     },
     #[error("memory durable file error at {path}: {detail}")]
     DurableFile { path: String, detail: String },
+    #[error("memory VFS error at {path}: {detail}")]
+    Vfs { path: String, detail: String },
     #[error("failed to serialize memory SOBJ for {path}: {detail}")]
     SobjSerialize { path: String, detail: String },
     #[error("failed to deserialize memory SOBJ from {path}: {detail}")]

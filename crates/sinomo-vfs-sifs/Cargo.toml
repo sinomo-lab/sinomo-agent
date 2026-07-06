@@ -1,0 +1,20 @@
+[package]
+name = "sinomo-vfs-sifs"
+version.workspace = true
+description = "SIFS-backed virtual filesystem backends for sinomo-vfs"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["src/**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[dependencies]
+serde.workspace = true
+sinomo-api = { path = "../sinomo-api" }
+sinomo-core = { path = "../sinomo-core" }
+sinomo-dfs = { path = "../sinomo-dfs" }
+sinomo-vfs = { path = "../sinomo-vfs" }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "rt-multi-thread", "time"] }

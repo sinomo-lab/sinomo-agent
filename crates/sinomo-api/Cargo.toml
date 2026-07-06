@@ -1,0 +1,17 @@
+[package]
+name = "sinomo-api"
+version.workspace = true
+description = "Lightweight Sinomo daemon wire API contracts"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["src/**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[dependencies]
+serde.workspace = true
+sinomo-core = { path = "../sinomo-core" }
+sinomo-dfs = { path = "../sinomo-dfs" }

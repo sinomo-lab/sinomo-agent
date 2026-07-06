@@ -1,7 +1,7 @@
 [package]
 name = "sinomo-vfs"
 version.workspace = true
-description = "Rooted virtual filesystem facade for local, SIFS, daemon, and test storage"
+description = "Rooted virtual filesystem facade for generic file storage backends"
 authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
@@ -15,8 +15,6 @@ ring = "r1"
 serde.workspace = true
 serde_json.workspace = true
 sinomo-core = { path = "../sinomo-core" }
-sinomo-daemon = { path = "../sinomo-daemon", default-features = false }
-sinomo-dfs = { path = "../sinomo-dfs" }
 thiserror.workspace = true
 
 [dev-dependencies]

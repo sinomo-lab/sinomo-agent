@@ -10,6 +10,7 @@ default-members = [
     "crates/sinomo",
     "crates/sinomo-actions",
     "crates/sinomo-agent",
+    "crates/sinomo-api",
     "crates/sinomo-app",
     "crates/sinomo-audio",
     "crates/sinomo-base",
@@ -54,6 +55,7 @@ default-members = [
     "crates/sinomo-test",
     "crates/sinomo-testdir",
     "crates/sinomo-vfs",
+    "crates/sinomo-vfs-sifs",
     "crates/sinomo-video",
     "crates/sinomo-voice",
 ]

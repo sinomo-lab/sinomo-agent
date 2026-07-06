@@ -35,9 +35,10 @@ use sinomo_runtime::kv::read_cluster_kv_prefix_entries;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
+use sinomo_runtime::vfs::{VfsAppendOptions, VfsError, VfsHandle, VfsObjectKind, VfsWriteOptions};
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -159,10 +160,7 @@ impl EvolutionPaths {
             &self.proposed_regression_gate_memory_dir,
             &self.logs,
         ] {
-            fs::create_dir_all(path).map_err(|source| EvolutionPersistenceError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?;
+            create_dir_all_vfs(path)?;
         }
         Ok(())
     }
@@ -208,10 +206,7 @@ impl BackgroundSchedulerPaths {
     }
 
     pub fn ensure(&self) -> Result<(), EvolutionPersistenceError> {
-        fs::create_dir_all(&self.root).map_err(|source| EvolutionPersistenceError::Io {
-            path: self.root.display().to_string(),
-            detail: source.to_string(),
-        })
+        create_dir_all_vfs(&self.root)
     }
 }
 
@@ -499,7 +494,7 @@ pub fn write_candidate_evolution_memory(
     let lesson_memory_path = paths
         .lesson_memory_dir
         .join(format!("{}.json", safe_memory_path_component(&memory_id)));
-    let new_lesson_record = !lesson_memory_path.exists();
+    let new_lesson_record = !path_exists_vfs(&lesson_memory_path)?;
     write_json(&lesson_memory_path, &lesson_record)?;
     if new_lesson_record {
         append_jsonl(&paths.lesson_memory_jsonl, &lesson_record)?;
@@ -526,7 +521,7 @@ pub fn write_candidate_evolution_memory(
             "{}.json",
             safe_memory_path_component(&gate_record.memory_id)
         ));
-        let new_gate_record = !gate_memory_path.exists();
+        let new_gate_record = !path_exists_vfs(&gate_memory_path)?;
         write_json(&gate_memory_path, &gate_record)?;
         if new_gate_record {
             append_jsonl(&paths.proposed_regression_gate_memory_jsonl, &gate_record)?;
@@ -633,15 +628,9 @@ pub fn record_candidate_verification(
         let path = PathBuf::from(&record.bundle.bundle_path)
             .join("command-logs")
             .join(format!("{safe_name}.txt"));
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| EvolutionPersistenceError::Io {
-                path: parent.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        }
-        fs::write(
+        write_text_file(
             &path,
-            format!(
+            &format!(
                 "name: {}\ncommand: {}\nexpected_exit_code: {}\nexit_code: {}\nduration_ms: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
                 result.name,
                 result.command,
@@ -651,11 +640,7 @@ pub fn record_candidate_verification(
                 result.stdout,
                 result.stderr
             ),
-        )
-        .map_err(|source| EvolutionPersistenceError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
+        )?;
         command_log_paths.push(path);
     }
     record.verification_outcome = Some(scorecard.outcome.clone());
@@ -788,19 +773,13 @@ pub fn read_stored_job_artifact(
     artifact: StoredJobArtifactKind,
 ) -> Result<String, EvolutionPersistenceError> {
     let path = stored_job_artifact_path(record, artifact)?;
-    fs::read_to_string(&path).map_err(|source| EvolutionPersistenceError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
+    read_text_file(&path)
 }
 
 pub fn read_json_file<T: for<'de> Deserialize<'de>>(
     path: &Path,
 ) -> Result<T, EvolutionPersistenceError> {
-    let content = fs::read_to_string(path).map_err(|source| EvolutionPersistenceError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
+    let content = read_text_file(path)?;
     serde_json::from_str(&content).map_err(|source| EvolutionPersistenceError::Json {
         path: path.display().to_string(),
         detail: source.to_string(),
@@ -810,25 +789,17 @@ pub fn read_json_file<T: for<'de> Deserialize<'de>>(
 pub fn list_job_records(
     paths: &EvolutionPaths,
 ) -> Result<Vec<StoredEvolutionJob>, EvolutionPersistenceError> {
-    if !paths.jobs.exists() {
-        return Ok(Vec::new());
-    }
     let mut records = Vec::new();
-    for entry in fs::read_dir(&paths.jobs).map_err(|source| EvolutionPersistenceError::Io {
-        path: paths.jobs.display().to_string(),
-        detail: source.to_string(),
-    })? {
-        let entry = entry.map_err(|source| EvolutionPersistenceError::Io {
-            path: paths.jobs.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        let entry_path = entry.path();
-        if entry_path.is_dir() {
+    for entry in list_dir_vfs(&paths.jobs)? {
+        let entry_path = entry.path;
+        if entry.kind == VfsObjectKind::Directory {
             let record_path = entry_path.join("record.json");
-            if record_path.exists() {
+            if path_exists_vfs(&record_path)? {
                 records.push(read_stored_job(&record_path)?);
             }
-        } else if entry_path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+        } else if entry.kind == VfsObjectKind::File
+            && entry_path.extension().and_then(|ext| ext.to_str()) == Some("json")
+        {
             records.push(read_stored_job(&entry_path)?);
         }
     }
@@ -858,12 +829,12 @@ pub fn register_config_definitions(
 
 pub fn read_config(paths: &EvolutionPaths) -> Result<EvolutionConfig, EvolutionPersistenceError> {
     let data_dir = SinomoDataDir::new(paths.data_dir.clone());
-    if paths.config.exists() {
+    if path_exists_vfs(&paths.config)? {
         return evolution_config_store()?
             .get_typed(&data_dir, None, EVOLUTION_CONFIG_KEY)
             .map_err(map_evolution_config_error);
     }
-    if paths.legacy_config.exists() {
+    if path_exists_vfs(&paths.legacy_config)? {
         let config = read_json_file(&paths.legacy_config)?;
         write_config(paths, &config)?;
         return Ok(config);
@@ -902,22 +873,151 @@ fn map_evolution_config_error(source: ConfigError) -> EvolutionPersistenceError 
     }
 }
 
-pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), EvolutionPersistenceError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| EvolutionPersistenceError::Io {
-            path: parent.display().to_string(),
+#[derive(Debug)]
+struct LocalVfsDirEntry {
+    path: PathBuf,
+    kind: VfsObjectKind,
+}
+
+fn create_dir_all_vfs(path: &Path) -> Result<(), EvolutionPersistenceError> {
+    let handle =
+        VfsHandle::local(path.to_path_buf()).map_err(|source| evolution_vfs_error(path, source))?;
+    handle
+        .create_dir_all("")
+        .map_err(|source| evolution_vfs_error(path, source))
+}
+
+fn read_text_file(path: &Path) -> Result<String, EvolutionPersistenceError> {
+    let Some(bytes) = read_optional_bytes_file(path)? else {
+        return Err(EvolutionPersistenceError::Io {
+            path: path.display().to_string(),
+            detail: "file not found".to_string(),
+        });
+    };
+    String::from_utf8(bytes).map_err(|source| EvolutionPersistenceError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn read_optional_text_file(path: &Path) -> Result<Option<String>, EvolutionPersistenceError> {
+    let Some(bytes) = read_optional_bytes_file(path)? else {
+        return Ok(None);
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|source| EvolutionPersistenceError::Io {
+            path: path.display().to_string(),
             detail: source.to_string(),
-        })?;
+        })
+}
+
+fn read_optional_bytes_file(path: &Path) -> Result<Option<Vec<u8>>, EvolutionPersistenceError> {
+    let (handle, file_name) = local_file_vfs(path)?;
+    handle
+        .read_optional(&file_name)
+        .map_err(|source| evolution_vfs_error(path, source))
+}
+
+fn write_text_file(path: &Path, content: &str) -> Result<(), EvolutionPersistenceError> {
+    write_bytes_file(path, content.as_bytes())
+}
+
+fn write_bytes_file(path: &Path, bytes: &[u8]) -> Result<(), EvolutionPersistenceError> {
+    let (handle, file_name) = local_file_vfs(path)?;
+    handle
+        .create_dir_all("")
+        .map_err(|source| evolution_vfs_error(path, source))?;
+    handle
+        .write_with_options(&file_name, bytes, VfsWriteOptions::local_replace())
+        .map_err(|source| evolution_vfs_error(path, source))
+}
+
+fn append_bytes_file(path: &Path, bytes: &[u8]) -> Result<(), EvolutionPersistenceError> {
+    let (handle, file_name) = local_file_vfs(path)?;
+    handle
+        .create_dir_all("")
+        .map_err(|source| evolution_vfs_error(path, source))?;
+    handle
+        .append_with_options(&file_name, bytes, VfsAppendOptions::local())
+        .map_err(|source| evolution_vfs_error(path, source))
+}
+
+fn read_jsonl_file<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>, EvolutionPersistenceError> {
+    let Some(content) = read_optional_text_file(path)? else {
+        return Ok(Vec::new());
+    };
+    content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::from_str(line).map_err(|source| EvolutionPersistenceError::Json {
+                path: format!("{}:{}", path.display(), index + 1),
+                detail: source.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn list_dir_vfs(path: &Path) -> Result<Vec<LocalVfsDirEntry>, EvolutionPersistenceError> {
+    let handle =
+        VfsHandle::local(path.to_path_buf()).map_err(|source| evolution_vfs_error(path, source))?;
+    let mut entries = handle
+        .list_if_exists("")
+        .map_err(|source| evolution_vfs_error(path, source))?
+        .into_iter()
+        .map(|entry| LocalVfsDirEntry {
+            path: path.join(entry.path.trim_start_matches('/')),
+            kind: entry.kind,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
+}
+
+fn path_exists_vfs(path: &Path) -> Result<bool, EvolutionPersistenceError> {
+    let (handle, file_name) = local_file_vfs(path)?;
+    match handle.stat(&file_name) {
+        Ok(_) => Ok(true),
+        Err(VfsError::NotFound { .. }) => Ok(false),
+        Err(source) => Err(evolution_vfs_error(path, source)),
     }
+}
+
+fn local_file_vfs(path: &Path) -> Result<(VfsHandle, String), EvolutionPersistenceError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let file_name = path
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .ok_or_else(|| EvolutionPersistenceError::Io {
+            path: path.display().to_string(),
+            detail: "path does not end with a UTF-8 file name".to_string(),
+        })?
+        .to_string();
+    let handle =
+        VfsHandle::local(parent.clone()).map_err(|source| evolution_vfs_error(&parent, source))?;
+    Ok((handle, file_name))
+}
+
+fn evolution_vfs_error(path: &Path, source: VfsError) -> EvolutionPersistenceError {
+    EvolutionPersistenceError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    }
+}
+
+pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), EvolutionPersistenceError> {
     let content =
         serde_json::to_string_pretty(value).map_err(|source| EvolutionPersistenceError::Json {
             path: path.display().to_string(),
             detail: source.to_string(),
         })?;
-    fs::write(path, content).map_err(|source| EvolutionPersistenceError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
+    write_text_file(path, &content)
 }
 
 pub fn write_campaign_bundle(
@@ -925,10 +1025,7 @@ pub fn write_campaign_bundle(
     campaign: &EvolutionCampaign,
 ) -> Result<CampaignBundlePaths, EvolutionPersistenceError> {
     let bundle = CampaignBundlePaths::new(paths, &campaign.campaign_id);
-    fs::create_dir_all(&bundle.root).map_err(|source| EvolutionPersistenceError::Io {
-        path: bundle.root.display().to_string(),
-        detail: source.to_string(),
-    })?;
+    create_dir_all_vfs(&bundle.root)?;
     write_json(&bundle.campaign_json, campaign)?;
     write_json(&bundle.objective_card_json, &campaign.objective_card)?;
     write_json(&bundle.stages_json, &campaign.stages)?;
@@ -1118,7 +1215,7 @@ pub fn write_evolution_lesson_memory(
         "{}.json",
         safe_memory_path_component(&lesson_record.memory_id)
     ));
-    let new_lesson_record = !lesson_path.exists();
+    let new_lesson_record = !path_exists_vfs(&lesson_path)?;
     write_json(&lesson_path, &lesson_record)?;
     if new_lesson_record {
         append_jsonl(&paths.lesson_memory_jsonl, &lesson_record)?;
@@ -1141,7 +1238,7 @@ pub fn write_evolution_lesson_memory(
             "{}.json",
             safe_memory_path_component(&gate_record.memory_id)
         ));
-        let new_gate_record = !gate_path.exists();
+        let new_gate_record = !path_exists_vfs(&gate_path)?;
         write_json(&gate_path, &gate_record)?;
         if new_gate_record {
             append_jsonl(&paths.proposed_regression_gate_memory_jsonl, &gate_record)?;
@@ -1168,13 +1265,12 @@ fn read_recent_jsonl<T: DeserializeOwned>(
     path: &Path,
     limit: usize,
 ) -> Result<Vec<T>, EvolutionPersistenceError> {
-    if limit == 0 || !path.exists() {
+    if limit == 0 {
         return Ok(Vec::new());
     }
-    let content = fs::read_to_string(path).map_err(|source| EvolutionPersistenceError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
+    let Some(content) = read_optional_text_file(path)? else {
+        return Ok(Vec::new());
+    };
     let mut values = content
         .lines()
         .rev()
@@ -1332,21 +1428,12 @@ pub fn read_background_tick_campaigns(
             .collect();
     }
     let mut campaigns = Vec::new();
-    if !paths.campaigns.exists() {
-        return Ok(campaigns);
-    }
-    let entries =
-        fs::read_dir(&paths.campaigns).map_err(|source| EvolutionPersistenceError::Io {
-            path: paths.campaigns.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    for entry in entries {
-        let entry = entry.map_err(|source| EvolutionPersistenceError::Io {
-            path: paths.campaigns.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        let path = entry.path().join("campaign.json");
-        if path.exists() {
+    for entry in list_dir_vfs(&paths.campaigns)? {
+        if entry.kind != VfsObjectKind::Directory {
+            continue;
+        }
+        let path = entry.path.join("campaign.json");
+        if path_exists_vfs(&path)? {
             campaigns.push(read_json_file(&path)?);
         }
     }
@@ -1361,48 +1448,17 @@ pub fn read_background_opportunity_intake_event_ids(
 ) -> Result<BTreeSet<String>, EvolutionPersistenceError> {
     let background_paths = BackgroundSchedulerPaths::new(paths);
     let mut event_ids = BTreeSet::new();
-    if background_paths.opportunity_intake_json.exists() {
+    if path_exists_vfs(&background_paths.opportunity_intake_json)? {
         let intakes: Vec<BackgroundOpportunityIntake> =
             read_json_file(&background_paths.opportunity_intake_json)?;
         for intake in &intakes {
             collect_background_opportunity_intake_event_id(&mut event_ids, intake);
         }
     }
-    if background_paths.opportunity_intakes_jsonl.exists() {
-        let file =
-            fs::File::open(&background_paths.opportunity_intakes_jsonl).map_err(|source| {
-                EvolutionPersistenceError::Io {
-                    path: background_paths
-                        .opportunity_intakes_jsonl
-                        .display()
-                        .to_string(),
-                    detail: source.to_string(),
-                }
-            })?;
-        for (index, line) in BufReader::new(file).lines().enumerate() {
-            let line = line.map_err(|source| EvolutionPersistenceError::Io {
-                path: format!(
-                    "{}:{}",
-                    background_paths.opportunity_intakes_jsonl.display(),
-                    index + 1
-                ),
-                detail: source.to_string(),
-            })?;
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let intake: BackgroundOpportunityIntake =
-                serde_json::from_str(line).map_err(|source| EvolutionPersistenceError::Json {
-                    path: format!(
-                        "{}:{}",
-                        background_paths.opportunity_intakes_jsonl.display(),
-                        index + 1
-                    ),
-                    detail: source.to_string(),
-                })?;
-            collect_background_opportunity_intake_event_id(&mut event_ids, &intake);
-        }
+    for intake in
+        read_jsonl_file::<BackgroundOpportunityIntake>(&background_paths.opportunity_intakes_jsonl)?
+    {
+        collect_background_opportunity_intake_event_id(&mut event_ids, &intake);
     }
     Ok(event_ids)
 }
@@ -1417,40 +1473,18 @@ fn collect_background_opportunity_intake_event_id(
 }
 
 pub fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<(), EvolutionPersistenceError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| EvolutionPersistenceError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|source| EvolutionPersistenceError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    let line = serde_json::to_string(value).map_err(|source| EvolutionPersistenceError::Json {
+    let mut line = serde_json::to_vec(value).map_err(|source| EvolutionPersistenceError::Json {
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
-    writeln!(file, "{line}").map_err(|source| EvolutionPersistenceError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
+    line.push(b'\n');
+    append_bytes_file(path, &line)
 }
 
 pub fn write_jsonl<T: Serialize>(
     path: &Path,
     values: &[T],
 ) -> Result<(), EvolutionPersistenceError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| EvolutionPersistenceError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
     let mut lines = String::new();
     for value in values {
         lines.push_str(&serde_json::to_string(value).map_err(|source| {
@@ -1461,10 +1495,7 @@ pub fn write_jsonl<T: Serialize>(
         })?);
         lines.push('\n');
     }
-    fs::write(path, lines).map_err(|source| EvolutionPersistenceError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
+    write_text_file(path, &lines)
 }
 
 pub fn is_terminal_status(status: &EvolutionJobStatus) -> bool {

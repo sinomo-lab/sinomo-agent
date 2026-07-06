@@ -13,8 +13,8 @@ use sinomo_runtime::core::{
 use sinomo_runtime::events::{EventId, EventStore, ReplayDirection, ReplayQuery, SessionId};
 use sinomo_runtime::node::NodeId;
 use sinomo_runtime::observe::{ObserveError, ObserveMetricRecord};
+use sinomo_runtime::vfs::{VfsHandle, VfsObjectKind};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -98,6 +98,12 @@ fn agent_observe_metrics(
 ) -> Result<Vec<ObserveMetricRecord>, ObserveError> {
     let paths = AgentStoragePaths::from_data_dir(data_dir);
     let store = FileAgentSessionStore::new(paths.clone());
+    let vfs = VfsHandle::local(paths.root.clone()).map_err(|source| ObserveError::Runtime {
+        detail: format!(
+            "agent snapshot metric export failed to open VFS root {}: {source}",
+            paths.root.display()
+        ),
+    })?;
     let mut session_dirs = 0_usize;
     let mut session_snapshots = 0_usize;
     let mut control_snapshots = 0_usize;
@@ -112,47 +118,26 @@ fn agent_observe_metrics(
     let mut cancelled_tasks = 0_usize;
     let mut timed_out_tasks = 0_usize;
 
-    let entries = match fs::read_dir(&paths.sessions_dir) {
-        Ok(entries) => entries,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(agent_metric_records(AgentMetricSnapshot::default()));
-        }
-        Err(source) => {
-            return Err(ObserveError::Runtime {
-                detail: format!(
-                    "agent snapshot metric export failed to read {}: {source}",
-                    paths.sessions_dir.display()
-                ),
-            });
-        }
-    };
-
-    for entry in entries {
-        let entry = entry.map_err(|source| ObserveError::Runtime {
+    let entries = vfs
+        .list_if_exists("sessions")
+        .map_err(|source| ObserveError::Runtime {
             detail: format!(
-                "agent snapshot metric export failed to scan {}: {source}",
+                "agent snapshot metric export failed to read {}: {source}",
                 paths.sessions_dir.display()
             ),
         })?;
-        let file_type = entry.file_type().map_err(|source| ObserveError::Runtime {
-            detail: format!(
-                "agent snapshot metric export failed to inspect {}: {source}",
-                entry.path().display()
-            ),
-        })?;
-        if !file_type.is_dir() {
+
+    for entry in entries {
+        if entry.kind != VfsObjectKind::Directory {
             continue;
         }
         session_dirs = session_dirs.saturating_add(1);
-        let session_name = entry.file_name().to_string_lossy().to_string();
-        let Ok(session_id) = session_name.parse::<SessionId>() else {
+        let Ok(session_id) = entry.name.parse::<SessionId>() else {
             invalid_session_dirs = invalid_session_dirs.saturating_add(1);
             continue;
         };
-        if paths
-            .session_snapshot_path_for_session(&session_id)
-            .exists()
-        {
+        let snapshot_path = format!("sessions/{}/snapshot.json", session_id.as_str());
+        if vfs.stat(&snapshot_path).is_ok() {
             session_snapshots = session_snapshots.saturating_add(1);
         }
         match store.load_control_snapshot(&session_id) {
@@ -1361,7 +1346,7 @@ pub struct AgentDefinitionSifsStore {
 
 impl AgentDefinitionSifsStore {
     pub fn open(data_dir: Option<PathBuf>) -> Result<Self, AgentDefinitionStoreError> {
-        let handle = sinomo_runtime::vfs::VfsHandle::mounted_sifs(data_dir)
+        let handle = sinomo_runtime::vfs::mounted_sifs(data_dir)
             .and_then(|handle| handle.scoped(AGENT_DEFINITION_SIFS_ROOT))
             .map_err(agent_definition_vfs_error)?;
         let objects = sinomo_runtime::vfs::DirectoryObjectStore::json(handle, "json");

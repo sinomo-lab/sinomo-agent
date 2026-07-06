@@ -9,10 +9,9 @@ use sinomo_lm::{
 };
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::vfs::{VfsAppendOptions, VfsError, VfsHandle, VfsObjectKind, VfsWriteOptions};
 use std::collections::{BTreeMap, VecDeque};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 pub const AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub const AGENT_CHANNEL_APP_USER_ID: &str = "user.app.local";
@@ -584,14 +583,16 @@ where
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct FileAgentChannelStore {
     paths: AgentStoragePaths,
+    vfs: VfsHandle,
 }
 
 impl FileAgentChannelStore {
     pub fn new(paths: AgentStoragePaths) -> Self {
-        Self { paths }
+        let vfs = VfsHandle::local(paths.root.clone()).expect("agent channel VFS root");
+        Self { paths, vfs }
     }
 
     pub fn for_data_dir(data_dir: &SinomoDataDir) -> Self {
@@ -617,15 +618,54 @@ impl FileAgentChannelStore {
             .join(attachment_id.to_string())
             .join(safe_agent_channel_attachment_file_name(file_name))
     }
+
+    fn read_optional_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, AgentChannelStoreError> {
+        let vfs_path = self.vfs_path_for(path)?;
+        self.vfs
+            .read_optional(&vfs_path)
+            .map_err(|source| channel_vfs_error(path, source))
+    }
+
+    fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), AgentChannelStoreError> {
+        let vfs_path = self.vfs_path_for(path)?;
+        if let Some(parent) = vfs_parent_path(&vfs_path) {
+            self.vfs
+                .create_dir_all(parent)
+                .map_err(|source| channel_vfs_error(path, source))?;
+        }
+        self.vfs
+            .write_with_options(&vfs_path, bytes, VfsWriteOptions::local_replace())
+            .map_err(|source| channel_vfs_error(path, source))
+    }
+
+    fn append_json_line<T: Serialize>(
+        &self,
+        path: &Path,
+        value: &T,
+    ) -> Result<(), AgentChannelStoreError> {
+        let vfs_path = self.vfs_path_for(path)?;
+        if let Some(parent) = vfs_parent_path(&vfs_path) {
+            self.vfs
+                .create_dir_all(parent)
+                .map_err(|source| channel_vfs_error(path, source))?;
+        }
+        let mut line =
+            serde_json::to_vec(value).map_err(|source| AgentChannelStoreError::Serialization {
+                detail: source.to_string(),
+            })?;
+        line.push(b'\n');
+        self.vfs
+            .append_with_options(&vfs_path, line, VfsAppendOptions::local())
+            .map_err(|source| channel_vfs_error(path, source))
+    }
+
+    fn vfs_path_for(&self, path: &Path) -> Result<String, AgentChannelStoreError> {
+        relative_vfs_path(&self.paths.root, path)
+    }
 }
 
 impl AgentChannelStore for FileAgentChannelStore {
     fn save_channel(&self, channel: &AgentChannel) -> Result<(), AgentChannelStoreError> {
-        let dir = self.channel_dir(&channel.channel_id);
-        fs::create_dir_all(&dir).map_err(|source| AgentChannelStoreError::Io {
-            path: dir.display().to_string(),
-            detail: source.to_string(),
-        })?;
         let snapshot = AgentChannelSnapshot {
             schema_version: AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION,
             channel,
@@ -638,10 +678,7 @@ impl AgentChannelStore for FileAgentChannelStore {
         let path = self
             .paths
             .channel_snapshot_path_for_channel(&channel.channel_id);
-        fs::write(&path, bytes).map_err(|source| AgentChannelStoreError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })
+        self.write_bytes(&path, &bytes)
     }
 
     fn load_channel(
@@ -649,15 +686,8 @@ impl AgentChannelStore for FileAgentChannelStore {
         channel_id: &SessionId,
     ) -> Result<Option<AgentChannel>, AgentChannelStoreError> {
         let path = self.paths.channel_snapshot_path_for_channel(channel_id);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => {
-                return Err(AgentChannelStoreError::Io {
-                    path: path.display().to_string(),
-                    detail: source.to_string(),
-                });
-            }
+        let Some(bytes) = self.read_optional_bytes(&path)? else {
+            return Ok(None);
         };
         let snapshot =
             serde_json::from_slice::<OwnedAgentChannelSnapshot>(&bytes).map_err(|source| {
@@ -677,33 +707,17 @@ impl AgentChannelStore for FileAgentChannelStore {
     }
 
     fn list_channels(&self) -> Result<Vec<AgentChannel>, AgentChannelStoreError> {
-        let entries = match fs::read_dir(&self.paths.channels_dir) {
-            Ok(entries) => entries,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(source) => {
-                return Err(AgentChannelStoreError::Io {
-                    path: self.paths.channels_dir.display().to_string(),
-                    detail: source.to_string(),
-                });
-            }
-        };
+        let channels_vfs_path = self.vfs_path_for(&self.paths.channels_dir)?;
         let mut channels = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|source| AgentChannelStoreError::Io {
-                path: self.paths.channels_dir.display().to_string(),
-                detail: source.to_string(),
-            })?;
-            let file_type = entry
-                .file_type()
-                .map_err(|source| AgentChannelStoreError::Io {
-                    path: entry.path().display().to_string(),
-                    detail: source.to_string(),
-                })?;
-            if !file_type.is_dir() {
+        for entry in self
+            .vfs
+            .list_if_exists(&channels_vfs_path)
+            .map_err(|source| channel_vfs_error(&self.paths.channels_dir, source))?
+        {
+            if entry.kind != VfsObjectKind::Directory {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Ok(channel_id) = name.parse::<SessionId>() else {
+            let Ok(channel_id) = entry.name.parse::<SessionId>() else {
                 continue;
             };
             if let Some(channel) = self.load_channel(&channel_id)? {
@@ -721,8 +735,8 @@ impl AgentChannelStore for FileAgentChannelStore {
         channel_id: &SessionId,
         message: &AgentChannelMessage,
     ) -> Result<(), AgentChannelStoreError> {
-        append_json_line(
-            self.paths.channel_messages_path_for_channel(channel_id),
+        self.append_json_line(
+            &self.paths.channel_messages_path_for_channel(channel_id),
             message,
         )
     }
@@ -732,7 +746,10 @@ impl AgentChannelStore for FileAgentChannelStore {
         channel_id: &SessionId,
         turn: &AgentChannelTurn,
     ) -> Result<(), AgentChannelStoreError> {
-        append_json_line(self.paths.channel_events_path_for_channel(channel_id), turn)
+        self.append_json_line(
+            &self.paths.channel_events_path_for_channel(channel_id),
+            turn,
+        )
     }
 
     fn save_attachment(
@@ -743,19 +760,7 @@ impl AgentChannelStore for FileAgentChannelStore {
         bytes: &[u8],
     ) -> Result<String, AgentChannelStoreError> {
         let path = self.attachment_path(channel_id, attachment_id, file_name);
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).map_err(|source| AgentChannelStoreError::Io {
-                path: parent.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        }
-        fs::write(&path, bytes).map_err(|source| AgentChannelStoreError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
+        self.write_bytes(&path, bytes)?;
         Ok(path.display().to_string())
     }
 }
@@ -794,32 +799,46 @@ struct OwnedAgentChannelSnapshot {
     channel: AgentChannel,
 }
 
-fn append_json_line<T: Serialize>(path: PathBuf, value: &T) -> Result<(), AgentChannelStoreError> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).map_err(|source| AgentChannelStoreError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let line =
-        serde_json::to_string(value).map_err(|source| AgentChannelStoreError::Serialization {
-            detail: source.to_string(),
-        })?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+fn relative_vfs_path(root: &Path, path: &Path) -> Result<String, AgentChannelStoreError> {
+    let relative = path
+        .strip_prefix(root)
         .map_err(|source| AgentChannelStoreError::Io {
             path: path.display().to_string(),
-            detail: source.to_string(),
+            detail: format!("path is outside agent channel storage root: {source}"),
         })?;
-    writeln!(file, "{line}").map_err(|source| AgentChannelStoreError::Io {
+    let mut segments = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(segment) => {
+                let Some(segment) = segment.to_str() else {
+                    return Err(AgentChannelStoreError::Io {
+                        path: path.display().to_string(),
+                        detail: "path segment is not valid UTF-8".to_string(),
+                    });
+                };
+                segments.push(segment.to_string());
+            }
+            Component::CurDir => {}
+            _ => {
+                return Err(AgentChannelStoreError::Io {
+                    path: path.display().to_string(),
+                    detail: "path contains unsupported component".to_string(),
+                });
+            }
+        }
+    }
+    Ok(segments.join("/"))
+}
+
+fn vfs_parent_path(path: &str) -> Option<&str> {
+    path.rsplit_once('/').map(|(parent, _)| parent)
+}
+
+fn channel_vfs_error(path: &Path, source: VfsError) -> AgentChannelStoreError {
+    AgentChannelStoreError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
-    })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

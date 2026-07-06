@@ -28,6 +28,7 @@ pub mod r0 {
 /// supervision, and command evaluation. R2 services may build on these crates,
 /// but R1 crates must not depend back on R2 service crates.
 pub mod r1 {
+    pub use sinomo_api as api;
     pub use sinomo_cli_registry as cli_registry;
     pub use sinomo_config as config;
     pub use sinomo_daemon as daemon;
@@ -57,7 +58,12 @@ pub mod r1 {
     pub use sinomo_sandbox_wasix_host as sandbox_wasix_host;
     pub use sinomo_supervision as supervision;
     pub use sinomo_test as test;
-    pub use sinomo_vfs as vfs;
+    pub mod vfs {
+        pub use sinomo_vfs::*;
+        pub use sinomo_vfs_sifs::{
+            DaemonSifsVfsBackend, MountedSifsVfsBackend, daemon_sifs, mounted_sifs,
+        };
+    }
 
     pub use sinomo_core::{cluster, events, kv, local, network, node, service};
 
@@ -91,7 +97,7 @@ pub use r0::{core, object};
 #[cfg(feature = "sandbox")]
 pub use r1::sandbox_wasix_host;
 pub use r1::{
-    cli_registry, config, daemon, device, dfs, dfs_cloud_files_api, eval, events, kv, local,
+    api, cli_registry, config, daemon, device, dfs, dfs_cloud_files_api, eval, events, kv, local,
     module, module_api, modules, network, network_module, node, observe, policy, registry, rollout,
     sandbox, sandbox_simple, sandbox_wasix_api, service, storage, supervision, test, vfs,
 };

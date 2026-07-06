@@ -6,9 +6,9 @@ use sinomo_runtime::module::{
     read_declarative_module_loader_states, read_declarative_module_registrations,
 };
 use sinomo_runtime::object::{LengthMode, serde_ext};
+use sinomo_runtime::vfs::{VfsHandle, VfsWriteOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
 use thiserror::Error;
 
 pub const SKILL_CATALOG_SCHEMA_VERSION: u32 = 1;
@@ -1200,21 +1200,20 @@ fn declarative_registration_matches_loader_state(
 #[derive(Debug)]
 pub struct SkillCatalogSifsStore {
     root: String,
-    opened: Mutex<sinomo_runtime::dfs::OpenedMountedSifsService>,
+    vfs: VfsHandle,
 }
 
 impl SkillCatalogSifsStore {
     pub fn open(data_dir: Option<PathBuf>) -> Result<Self, SkillCatalogError> {
-        let opened =
-            sinomo_runtime::dfs::open_mounted_sifs_service(data_dir).map_err(|source| {
-                SkillCatalogError::Store {
-                    path: SKILL_CATALOG_SIFS_ROOT.to_string(),
-                    detail: source.to_string(),
-                }
-            })?;
+        let vfs = sinomo_runtime::vfs::mounted_sifs(data_dir).map_err(|source| {
+            SkillCatalogError::Store {
+                path: SKILL_CATALOG_SIFS_ROOT.to_string(),
+                detail: source.to_string(),
+            }
+        })?;
         Ok(Self {
             root: SKILL_CATALOG_SIFS_ROOT.to_string(),
-            opened: Mutex::new(opened),
+            vfs,
         })
     }
 }
@@ -1226,45 +1225,26 @@ impl SkillCatalogStore for SkillCatalogSifsStore {
 
     fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, SkillCatalogError> {
         validate_sifs_path(path, "SIFS read path")?;
-        let mut opened = self.opened.lock().map_err(|_| SkillCatalogError::Store {
-            path: path.to_string(),
-            detail: "SIFS skill catalog lock is poisoned".to_string(),
-        })?;
-        match opened.service.posix_read_file_distributed(path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(sinomo_runtime::dfs::DfsPosixError::NotFound { .. }) => Ok(None),
-            Err(source) => Err(SkillCatalogError::Store {
+        self.vfs
+            .read_optional(path)
+            .map_err(|source| SkillCatalogError::Store {
                 path: path.to_string(),
                 detail: source.to_string(),
-            }),
-        }
+            })
     }
 
     fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), SkillCatalogError> {
         validate_sifs_path(path, "SIFS write path")?;
-        let mut opened = self.opened.lock().map_err(|_| SkillCatalogError::Store {
-            path: path.to_string(),
-            detail: "SIFS skill catalog lock is poisoned".to_string(),
-        })?;
         if let Some(parent) = parent_sifs_path(path) {
-            opened
-                .service
-                .posix_mkdir_all(&parent)
+            self.vfs
+                .create_dir_all(&parent)
                 .map_err(|source| SkillCatalogError::Store {
                     path: parent,
                     detail: source.to_string(),
                 })?;
         }
-        let mut candidates = opened.replica_candidates.clone();
-        if !candidates.contains(opened.service.node_id()) {
-            candidates.insert(0, opened.service.node_id().clone());
-        }
-        let mut options = sinomo_runtime::dfs::DfsWriteOptions::replicated_eventual(candidates);
-        options.foreground_replica_repair = false;
-        opened
-            .service
-            .posix_write_file(path, bytes, options)
-            .map(drop)
+        self.vfs
+            .write_with_options(path, bytes, VfsWriteOptions::service_artifact())
             .map_err(|source| SkillCatalogError::Store {
                 path: path.to_string(),
                 detail: source.to_string(),
@@ -1380,21 +1360,16 @@ pub trait SkillCatalogStore {
 #[derive(Debug)]
 pub struct LocalSkillCatalogStore {
     root: String,
-    local_root: PathBuf,
+    vfs: VfsHandle,
 }
 
 impl LocalSkillCatalogStore {
     pub fn new(local_root: impl Into<PathBuf>) -> Self {
+        let local_root = local_root.into();
         Self {
             root: SKILL_CATALOG_SIFS_ROOT.to_string(),
-            local_root: local_root.into(),
+            vfs: VfsHandle::local(local_root).expect("local skill catalog VFS root"),
         }
-    }
-
-    fn local_path(&self, path: &str) -> Result<PathBuf, SkillCatalogError> {
-        validate_sifs_path(path, "local SIFS path")?;
-        let relative = path.trim_start_matches('/');
-        Ok(self.local_root.join(relative))
     }
 }
 
@@ -1404,29 +1379,31 @@ impl SkillCatalogStore for LocalSkillCatalogStore {
     }
 
     fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, SkillCatalogError> {
-        let local_path = self.local_path(path)?;
-        match std::fs::read(&local_path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(SkillCatalogError::Store {
+        validate_sifs_path(path, "local SIFS path")?;
+        self.vfs
+            .read_optional(path)
+            .map_err(|source| SkillCatalogError::Store {
                 path: path.to_string(),
                 detail: source.to_string(),
-            }),
-        }
+            })
     }
 
     fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), SkillCatalogError> {
-        let local_path = self.local_path(path)?;
-        if let Some(parent) = local_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| SkillCatalogError::Store {
-                path: parent.display().to_string(),
-                detail: source.to_string(),
-            })?;
+        validate_sifs_path(path, "local SIFS path")?;
+        if let Some(parent) = parent_sifs_path(path) {
+            self.vfs
+                .create_dir_all(&parent)
+                .map_err(|source| SkillCatalogError::Store {
+                    path: parent,
+                    detail: source.to_string(),
+                })?;
         }
-        std::fs::write(&local_path, bytes).map_err(|source| SkillCatalogError::Store {
-            path: path.to_string(),
-            detail: source.to_string(),
-        })
+        self.vfs
+            .write_with_options(path, bytes, VfsWriteOptions::local_replace())
+            .map_err(|source| SkillCatalogError::Store {
+                path: path.to_string(),
+                detail: source.to_string(),
+            })
     }
 }
 

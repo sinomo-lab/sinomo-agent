@@ -375,7 +375,7 @@ Current crate ownership:
 |---|---|
 | R0 | `sinomo-base`, `sinomo-object`, `sinomo-storage`, `sinomo-local`, `sinomo-node`, `sinomo-events`, `sinomo-network`, `sinomo-kv`, `sinomo-cluster`, `sinomo-service` |
 | R0 boundary | `sinomo-core` |
-| R1 | `sinomo-daemon`, `sinomo-dfs`, `sinomo-dfs-cloud-files-api`, `sinomo-module`, `sinomo-module-api`, `sinomo-registry`, `sinomo-rollout`, `sinomo-policy`, `sinomo-eval`, `sinomo-config`, `sinomo-observe`, `sinomo-device`, `sinomo-supervision`, `sinomo-cli-registry`, `sinomo-test`, the `sinomo-sandbox*` crates, and the native module packages under `modules/` |
+| R1 | `sinomo-api`, `sinomo-daemon`, `sinomo-dfs`, `sinomo-dfs-cloud-files-api`, `sinomo-module`, `sinomo-module-api`, `sinomo-registry`, `sinomo-rollout`, `sinomo-policy`, `sinomo-eval`, `sinomo-config`, `sinomo-observe`, `sinomo-device`, `sinomo-supervision`, `sinomo-cli-registry`, `sinomo-test`, `sinomo-vfs`, `sinomo-vfs-sifs`, the `sinomo-sandbox*` crates, and the native module packages under `modules/` |
 | R1 boundary | `sinomo-runtime` |
 | R2 | `sinomo-actions`, `sinomo-agent`, `sinomo-audio`, `sinomo-deliberation`, `sinomo-evolution`, `sinomo-fusion`, `sinomo-gateway`, `sinomo-lm`, `sinomo-memory`, `sinomo-models`, `sinomo-pytorch`, `sinomo-video`, `sinomo-voice` |
 | Application/tooling | `sinomo`, `sinomo-app`, `sinomo-cli`, `sinomo-dfs-fuse`, `sinomo-testdir` |
@@ -598,6 +598,7 @@ sinomo-agent/
     sinomo-service/       # Service registration, discovery, routing target selection
     sinomo-core/          # R0 boundary facade aggregating the cluster foundation crates
     # R1 trusted runtime
+    sinomo-api/           # Lightweight daemon wire API contracts
     sinomo-daemon/        # Local daemon: runtime registry, cluster operator, control routes
     sinomo-device/        # Device registry, source/action target metadata
     sinomo-dfs/           # Local-first distributed workspace filesystem
@@ -617,6 +618,8 @@ sinomo-agent/
     sinomo-supervision/   # Supervision and incident contracts
     sinomo-cli-registry/  # CLI command registry contracts
     sinomo-test/          # Shared test harness utilities
+    sinomo-vfs/           # Root-scoped VFS facade and local/test backends
+    sinomo-vfs-sifs/      # SIFS/daemon-backed VFS adapters
     sinomo-runtime/       # R1 boundary facade over sinomo-core plus the R1 crates
     # R2 trusted services
     sinomo-gateway/       # Ingress adapters and session wiring
