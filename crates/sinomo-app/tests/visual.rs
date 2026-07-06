@@ -584,6 +584,48 @@ fn settings_narrow_click_navigates() {
     );
 }
 
+#[test]
+fn mobile_phone_layout_accepts_touch_navigation() {
+    use sui::{Event, SemanticsRole, Size, WindowEvent};
+
+    let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Sinomo, "mobile-phone");
+    let runtime = build_runtime(shared.clone()).expect("build runtime");
+    let app = TestApp::from_runtime_with_frame_budget(runtime, 8).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    let root = window.root();
+    app.pump_frames(2).expect("pump initial layout");
+    root.dispatch_event_now(Event::Window(WindowEvent::Resized(Size::new(390.0, 844.0))))
+        .expect("resize phone");
+    app.pump_frames(8).expect("pump phone layout");
+
+    let snapshot = window.snapshot_now().expect("snapshot phone shell");
+    let tab_bar = snapshot
+        .accessibility
+        .nodes
+        .iter()
+        .find(|node| {
+            node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
+        })
+        .expect("shell tab bar semantics");
+    touch_at(
+        &root,
+        tab_bar.bounds.max_x() - 22.0,
+        tab_bar.bounds.y() + tab_bar.bounds.height() / 2.0,
+    );
+    app.pump_frames(8).expect("pump touch tab switch");
+
+    assert_eq!(
+        shared.active_tab(),
+        Tab::Settings,
+        "touching the compact Settings tab switches the mobile shell content"
+    );
+
+    let shot = window
+        .capture_screenshot_now()
+        .expect("capture phone layout");
+    assert_eq!((shot.width(), shot.height()), (390, 844));
+}
+
 fn click_at(root: &sui_testing::Locator, x: f32, y: f32) {
     use sui::{Event, Point, PointerButton, PointerButtons, PointerEvent, PointerEventKind};
     let pos = Point::new(x, y);
@@ -599,6 +641,26 @@ fn click_at(root: &sui_testing::Locator, x: f32, y: f32) {
     let mut up = PointerEvent::new(PointerEventKind::Up, pos);
     up.button = Some(PointerButton::Primary);
     root.dispatch_event(Event::Pointer(up)).expect("up");
+}
+
+fn touch_at(root: &sui_testing::Locator, x: f32, y: f32) {
+    use sui::{
+        Event, Point, PointerButton, PointerButtons, PointerEvent, PointerEventKind, PointerKind,
+    };
+    let pos = Point::new(x, y);
+    let mut down = PointerEvent::new(PointerEventKind::Down, pos);
+    down.pointer_id = 1;
+    down.pointer_kind = PointerKind::Touch;
+    down.button = Some(PointerButton::Primary);
+    down.buttons = PointerButtons::new(1);
+    root.dispatch_event_now(Event::Pointer(down))
+        .expect("touch down");
+    let mut up = PointerEvent::new(PointerEventKind::Up, pos);
+    up.pointer_id = 1;
+    up.pointer_kind = PointerKind::Touch;
+    up.button = Some(PointerButton::Primary);
+    root.dispatch_event_now(Event::Pointer(up))
+        .expect("touch up");
 }
 
 fn seed_chat_providers(shared: &sinomo_app::state::Shared) {
@@ -1035,6 +1097,77 @@ fn capture_advanced_settings() {
 
     let shot = window.capture_screenshot().expect("capture screenshot");
     let path = dir.join("sinomo-app-settings-advanced.png");
+    shot.write_png(&path).expect("write png");
+    println!("wrote {}", path.display());
+}
+
+/// The schema-backed Advanced settings editor, expanded on a module runtime config row. This
+/// exercises the SUI semantics/debug path for field-driven config rendering.
+#[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
+fn capture_advanced_settings_schema_expanded() {
+    use sinomo_app::backend::Backend;
+    use sinomo_app::ui::settings::SettingsSection;
+    use sinomo_runtime::config::ConfigWriteTarget;
+    use sui::{Event, SemanticsRole, Size, WindowEvent};
+
+    let dir = shots_dir();
+    std::fs::create_dir_all(&dir).expect("create shots dir");
+
+    let (data_dir, _cleanup) = visual_temp_data_dir("advanced-schema");
+    let backend = Backend::local_fallback_for_data_dir(data_dir);
+    backend
+        .config
+        .set(
+            sinomo_runtime::module::MODULE_NODE_CONFIG_KEY,
+            serde_json::json!({
+                "modules": {
+                    "observe": { "enabled": true },
+                    "wasix": { "enabled": false }
+                }
+            }),
+            ConfigWriteTarget::Local,
+        )
+        .expect("seed module config");
+    let mut state = sinomo_app::state::AppState::ready(backend);
+    state.active_tab = Tab::Settings;
+    let shared = sinomo_app::state::Shared::new(state);
+    shared.settings_mut().selected = Some(SettingsSection::Configuration);
+
+    let runtime = build_runtime(shared).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    let root = window.root();
+    app.run_until_idle().expect("settle advanced layout");
+    root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+        1280.0, 1500.0,
+    ))))
+    .expect("resize tall");
+    app.run_until_idle().expect("settle tall advanced layout");
+
+    let snapshot = window.snapshot().expect("advanced schema snapshot");
+    let edit_fields = snapshot
+        .accessibility
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.role == SemanticsRole::Button && node.name.as_deref() == Some("Edit fields")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        edit_fields.len() >= 2,
+        "expected both module config schema disclosure buttons"
+    );
+    let node_override_button = edit_fields[1];
+    click_at(
+        &root,
+        node_override_button.bounds.x() + node_override_button.bounds.width() / 2.0,
+        node_override_button.bounds.y() + node_override_button.bounds.height() / 2.0,
+    );
+    app.run_until_idle().expect("settle expanded schema fields");
+
+    let shot = window.capture_screenshot().expect("capture screenshot");
+    let path = dir.join("sinomo-app-settings-advanced-schema-expanded.png");
     shot.write_png(&path).expect("write png");
     println!("wrote {}", path.display());
 }

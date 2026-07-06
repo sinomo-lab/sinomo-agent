@@ -1,9 +1,10 @@
 use crate::{
-    AGENT_OBJECT_RPC_ROUTES, AGENT_RPC_CATEGORY, AGENT_RUNTIME_CONTROL_OBJECT_RPC_ROUTES,
-    AGENT_SESSION_FOLLOW_UP_ROUTE, AGENT_SESSION_INSPECT_ROUTE, AGENT_SESSION_INTERRUPT_ROUTE,
-    AGENT_SESSION_PROGRESS_ROUTE, AGENT_SESSION_RESUME_ROUTE, AGENT_SESSION_STEER_ROUTE,
-    AGENT_SESSION_TERMINAL_RESULTS_ROUTE, Agent, AgentCancellationToken, AgentCatalog,
-    AgentCompactor, AgentConfig, AgentContextAttachment, AgentDefinition, AgentDefinitionStore,
+    AGENT_DEFINITION_SIFS_ROOT, AGENT_OBJECT_RPC_ROUTES, AGENT_RPC_CATEGORY,
+    AGENT_RUNTIME_CONTROL_OBJECT_RPC_ROUTES, AGENT_SESSION_FOLLOW_UP_ROUTE,
+    AGENT_SESSION_INSPECT_ROUTE, AGENT_SESSION_INTERRUPT_ROUTE, AGENT_SESSION_PROGRESS_ROUTE,
+    AGENT_SESSION_RESUME_ROUTE, AGENT_SESSION_STEER_ROUTE, AGENT_SESSION_TERMINAL_RESULTS_ROUTE,
+    Agent, AgentCancellationToken, AgentCatalog, AgentCompactor, AgentConfig,
+    AgentContextAttachment, AgentDefinition, AgentDefinitionSifsStore, AgentDefinitionStore,
     AgentDefinitionValidationError, AgentItem, AgentLoopInput, AgentLoopResponseMode,
     AgentModelDecisionSource, AgentModelEvent, AgentModuleToolProjection, AgentOp,
     AgentOutputFormat, AgentPackageProvenance, AgentPackageSource, AgentPlacementMetadata,
@@ -23,10 +24,10 @@ use crate::{
     AgentToolProgressEvent, AgentToolProgressSink, AgentToolRegistry, AgentToolRequest,
     AgentToolResult, AgentToolSpec, AgentToolStatus, AgentToolSurface, AgentTranscript,
     AsyncTaskNextAction, AsyncTaskStatus, AsyncTaskUpdate, CodingCommandFailureKind,
-    CodingPatchStatus, CodingStopDecision, CodingValidationStatus, FileAgentDefinitionStore,
-    FileAgentSessionStore, InteractionModel, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, LocalWorkspaceAgentConfig, TaskId, WorkspaceRef,
-    parse_agent_loop_response, user_interaction_input_event,
+    CodingPatchStatus, CodingStopDecision, CodingValidationStatus, FileAgentSessionStore,
+    InteractionModel, InteractionSession, InteractionSurface, InteractionSurfaceKind,
+    LocalWorkspaceAgentConfig, TaskId, WorkspaceRef, parse_agent_loop_response,
+    user_interaction_input_event,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -865,7 +866,17 @@ fn check_package_artifact_store_smoke() -> AgentReadinessCheck {
         TaskId::generate()
     ));
     let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
-    let store = FileAgentDefinitionStore::for_data_dir(&data_dir);
+    let store = match AgentDefinitionSifsStore::open(Some(data_dir.root())) {
+        Ok(store) => store,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&root);
+            return failed(
+                "package_artifact_store_smoke",
+                "SIFS-backed agent package store failed to open",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+        }
+    };
     let source_path = "agent-packages/readiness-imported-agent.json";
     let definition = AgentDefinition::custom(
         "readiness-imported-agent",
@@ -889,7 +900,7 @@ fn check_package_artifact_store_smoke() -> AgentReadinessCheck {
         Err(error) => {
             return failed(
                 "package_artifact_store_smoke",
-                "file-backed agent package save failed",
+                "SIFS-backed agent package save failed",
                 serde_json::json!({ "error": error.to_string() }),
             );
         }
@@ -899,9 +910,9 @@ fn check_package_artifact_store_smoke() -> AgentReadinessCheck {
         Err(error) => {
             return failed(
                 "package_artifact_store_smoke",
-                "file-backed agent package load failed",
+                "SIFS-backed agent package load failed",
                 serde_json::json!({
-                    "saved_path": saved_path.display().to_string(),
+                    "saved_path": saved_path,
                     "error": error.to_string(),
                 }),
             );
@@ -915,21 +926,18 @@ fn check_package_artifact_store_smoke() -> AgentReadinessCheck {
         Err(error) => {
             return failed(
                 "package_artifact_store_smoke",
-                "agent catalog failed to load file-backed package",
+                "agent catalog failed to load SIFS-backed package",
                 serde_json::json!({
-                    "saved_path": saved_path.display().to_string(),
+                    "saved_path": saved_path,
                     "error": error.to_string(),
                 }),
             );
         }
     };
     let catalog_definition = catalog.get(definition.key());
-    let saved_exists = saved_path.exists();
-    let expected_file_name = format!("{}.json", definition.key());
-    let saved_file_name_matches = saved_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .is_some_and(|file_name| file_name == expected_file_name);
+    let saved_in_sifs = loaded_definition.is_some();
+    let expected_sifs_path = format!("{}/{}.json", AGENT_DEFINITION_SIFS_ROOT, definition.key());
+    let saved_path_matches = saved_path == expected_sifs_path;
     let loaded_matches = loaded_definition.is_some_and(|loaded| {
         loaded.package.version == "1.2.3"
             && loaded.package.provenance.source == AgentPackageSource::Imported
@@ -945,13 +953,13 @@ fn check_package_artifact_store_smoke() -> AgentReadinessCheck {
     });
     let _ = fs::remove_dir_all(&root);
 
-    if saved_exists && saved_file_name_matches && loaded_matches && catalog_matches {
+    if saved_in_sifs && saved_path_matches && loaded_matches && catalog_matches {
         passed(
             "package_artifact_store_smoke",
-            "file-backed agent package artifacts save, load, and merge into the catalog with import provenance",
+            "SIFS-backed agent package artifacts save, load, and merge into the catalog with import provenance",
             serde_json::json!({
                 "agent": definition.key(),
-                "saved_file": expected_file_name,
+                "saved_path": expected_sifs_path,
                 "package_version": "1.2.3",
                 "provenance": "imported",
                 "source_path": source_path,
@@ -960,12 +968,12 @@ fn check_package_artifact_store_smoke() -> AgentReadinessCheck {
     } else {
         failed(
             "package_artifact_store_smoke",
-            "file-backed agent package artifact round-trip lost package data",
+            "SIFS-backed agent package artifact round-trip lost package data",
             serde_json::json!({
                 "agent": definition.key(),
-                "saved_path": saved_path.display().to_string(),
-                "saved_exists": saved_exists,
-                "saved_file_name_matches": saved_file_name_matches,
+                "saved_path": saved_path,
+                "saved_in_sifs": saved_in_sifs,
+                "saved_path_matches": saved_path_matches,
                 "loaded_matches": loaded_matches,
                 "catalog_matches": catalog_matches,
                 "loaded_count": loaded.len(),

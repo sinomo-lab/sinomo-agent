@@ -3420,6 +3420,33 @@ impl ChatState {
         }
     }
 
+    /// Replace the selectable agent catalog after Settings changes custom definitions.
+    pub fn refresh_agents(&mut self, agents: Vec<AgentSummary>) {
+        let previous = self.info.agent.clone();
+        self.agents = agents;
+        if self.agents.is_empty() {
+            self.channel_agent_idx = 0;
+            return;
+        }
+        if self.channel_agent_idx >= self.agents.len() {
+            self.channel_agent_idx = 0;
+        }
+        if !previous.trim().is_empty()
+            && !self
+                .agents
+                .iter()
+                .any(|agent| agent.key == previous || agent.name == previous)
+        {
+            self.info.agent = self
+                .agents
+                .iter()
+                .find(|agent| agent.key == "main-agent" || agent.name == "main-agent")
+                .or_else(|| self.agents.first())
+                .map(|agent| agent.key.clone())
+                .unwrap_or_default();
+        }
+    }
+
     /// Update the composer draft (bound to the composer `TextArea` via its `on_change`).
     fn set_draft(&mut self, text: String) {
         self.cursor = text.len();

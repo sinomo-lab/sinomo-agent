@@ -408,6 +408,11 @@ fn native_device_kind_label(kind: &sinomo_runtime::device::DeviceKind) -> &'stat
         sinomo_runtime::device::DeviceKind::Filesystem => "filesystem",
         sinomo_runtime::device::DeviceKind::Gpu => "gpu",
         sinomo_runtime::device::DeviceKind::NotificationSurface => "notification",
+        sinomo_runtime::device::DeviceKind::Location => "location",
+        sinomo_runtime::device::DeviceKind::Touchscreen => "touchscreen",
+        sinomo_runtime::device::DeviceKind::MotionSensor => "motion-sensor",
+        sinomo_runtime::device::DeviceKind::Battery => "battery",
+        sinomo_runtime::device::DeviceKind::Haptic => "haptic",
         sinomo_runtime::device::DeviceKind::Other => "other",
     }
 }

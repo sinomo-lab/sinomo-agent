@@ -4683,7 +4683,8 @@ mod tests {
         let definition =
             AgentDefinition::custom("worker-agent", AgentRole::Main, "Use the worker sandbox.")
                 .with_sandbox_runtime_node_id("worker-node");
-        let definition_store = sinomo_agent::FileAgentDefinitionStore::for_data_dir(&data_dir);
+        let definition_store = sinomo_agent::AgentDefinitionSifsStore::open(Some(data_dir.root()))
+            .expect("open agent definition store");
         sinomo_agent::AgentDefinitionStore::save_definition(&definition_store, &definition)
             .expect("save agent definition");
 
@@ -4712,7 +4713,8 @@ mod tests {
         let definition =
             AgentDefinition::custom("worker-agent", AgentRole::Main, "Use the worker sandbox.")
                 .with_sandbox_runtime_node_id("worker-node");
-        let definition_store = sinomo_agent::FileAgentDefinitionStore::for_data_dir(&data_dir);
+        let definition_store = sinomo_agent::AgentDefinitionSifsStore::open(Some(data_dir.root()))
+            .expect("open agent definition store");
         sinomo_agent::AgentDefinitionStore::save_definition(&definition_store, &definition)
             .expect("save agent definition");
 

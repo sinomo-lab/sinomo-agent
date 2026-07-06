@@ -53,6 +53,7 @@ default-members = [
     "crates/sinomo-supervision",
     "crates/sinomo-test",
     "crates/sinomo-testdir",
+    "crates/sinomo-vfs",
     "crates/sinomo-video",
     "crates/sinomo-voice",
 ]
@@ -72,6 +73,11 @@ opt-level = 2
 
 [profile.dev.package."*"]
 opt-level = 2
+
+[profile.android-debug-small]
+inherits = "dev"
+debug = 0
+strip = "debuginfo"
 
 [patch.crates-io]
 virtual-fs = { path = "modules/sandbox/wasix/vendor/virtual-fs" }

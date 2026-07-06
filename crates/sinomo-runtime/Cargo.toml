@@ -39,3 +39,4 @@ sinomo-sandbox-wasix-api = { path = "../sinomo-sandbox-wasix-api" }
 sinomo-sandbox-wasix-host = { path = "../sinomo-sandbox-wasix-host", optional = true }
 sinomo-supervision = { path = "../sinomo-supervision" }
 sinomo-test = { path = "../sinomo-test" }
+sinomo-vfs = { path = "../sinomo-vfs" }

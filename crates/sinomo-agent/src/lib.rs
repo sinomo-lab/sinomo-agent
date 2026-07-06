@@ -15,7 +15,7 @@ use sinomo_runtime::node::NodeId;
 use sinomo_runtime::observe::{ObserveError, ObserveMetricRecord};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
@@ -41,6 +41,7 @@ pub use skill_catalog::*;
 pub use tools::*;
 
 pub type TaskId = Id;
+pub const AGENT_DEFINITION_SIFS_ROOT: &str = "/services/sinomo/agents";
 
 #[derive(Clone, Debug, Default)]
 pub struct AgentCancellationToken {
@@ -75,7 +76,7 @@ pub fn register_storage_paths(
         "sinomo-agent",
         sinomo_runtime::storage::StorageRing::R2,
         "agents",
-        "local user-defined agent definitions",
+        "local agent workspace homes; cluster-wide agent definitions live in SIFS",
     )?;
     layout.register_escape_path(
         "sinomo-agent",
@@ -1286,7 +1287,7 @@ impl AgentCatalog {
         data_dir: &sinomo_runtime::local::SinomoDataDir,
     ) -> Result<Self, AgentCatalogError> {
         let mut catalog = Self::built_ins();
-        let store = FileAgentDefinitionStore::for_data_dir(data_dir);
+        let store = AgentDefinitionSifsStore::open(Some(data_dir.root()))?;
         for definition in store.load_definitions()? {
             catalog.upsert(definition)?;
         }
@@ -1348,73 +1349,53 @@ pub trait AgentDefinitionStore {
     fn save_definition(
         &self,
         definition: &AgentDefinition,
-    ) -> Result<PathBuf, AgentDefinitionStoreError>;
+    ) -> Result<String, AgentDefinitionStoreError>;
+    fn delete_definition(&self, id: &str) -> Result<bool, AgentDefinitionStoreError>;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FileAgentDefinitionStore {
-    root: PathBuf,
+#[derive(Debug)]
+pub struct AgentDefinitionSifsStore {
+    root: String,
+    objects: sinomo_runtime::vfs::DirectoryObjectStore<AgentDefinition>,
 }
 
-impl FileAgentDefinitionStore {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+impl AgentDefinitionSifsStore {
+    pub fn open(data_dir: Option<PathBuf>) -> Result<Self, AgentDefinitionStoreError> {
+        let handle = sinomo_runtime::vfs::VfsHandle::mounted_sifs(data_dir)
+            .and_then(|handle| handle.scoped(AGENT_DEFINITION_SIFS_ROOT))
+            .map_err(agent_definition_vfs_error)?;
+        let objects = sinomo_runtime::vfs::DirectoryObjectStore::json(handle, "json");
+        Ok(Self {
+            root: AGENT_DEFINITION_SIFS_ROOT.to_string(),
+            objects,
+        })
     }
 
-    pub fn for_data_dir(data_dir: &sinomo_runtime::local::SinomoDataDir) -> Self {
-        Self::new(data_dir.root().join("agents"))
-    }
-
-    pub fn root(&self) -> &Path {
+    pub fn root(&self) -> &str {
         &self.root
     }
 
-    fn definition_path(&self, definition: &AgentDefinition) -> PathBuf {
-        self.root.join(format!("{}.json", definition.key()))
+    fn validate_definition_id(&self, id: &str) -> Result<(), AgentDefinitionStoreError> {
+        if !is_valid_agent_definition_id(id) {
+            return Err(AgentDefinitionStoreError::Validation(
+                AgentDefinitionValidationError::InvalidId { id: id.to_string() },
+            ));
+        }
+        Ok(())
     }
 }
 
-impl AgentDefinitionStore for FileAgentDefinitionStore {
+impl AgentDefinitionStore for AgentDefinitionSifsStore {
     fn load_definitions(&self) -> Result<Vec<AgentDefinition>, AgentDefinitionStoreError> {
-        if !self.root.exists() {
-            return Ok(Vec::new());
-        }
-        let entries = fs::read_dir(&self.root).map_err(|source| AgentDefinitionStoreError::Io {
-            path: self.root.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        let mut paths = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|source| AgentDefinitionStoreError::Io {
-                path: self.root.display().to_string(),
-                detail: source.to_string(),
-            })?;
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) == Some("json") {
-                paths.push(path);
-            }
-        }
-        paths.sort();
-
-        let mut definitions = Vec::new();
-        for path in paths {
-            let content =
-                fs::read_to_string(&path).map_err(|source| AgentDefinitionStoreError::Io {
-                    path: path.display().to_string(),
-                    detail: source.to_string(),
-                })?;
-            let mut definition: AgentDefinition =
-                serde_json::from_str(&content).map_err(|source| {
-                    AgentDefinitionStoreError::Json {
-                        path: path.display().to_string(),
-                        detail: source.to_string(),
-                    }
-                })?;
+        let mut definitions = self
+            .objects
+            .load_all()
+            .map_err(agent_definition_vfs_error)?;
+        for definition in &mut definitions {
             if definition.id.is_empty() {
                 definition.id = definition.name.clone();
             }
             definition.validate()?;
-            definitions.push(definition);
         }
         Ok(definitions)
     }
@@ -1422,33 +1403,38 @@ impl AgentDefinitionStore for FileAgentDefinitionStore {
     fn save_definition(
         &self,
         definition: &AgentDefinition,
-    ) -> Result<PathBuf, AgentDefinitionStoreError> {
+    ) -> Result<String, AgentDefinitionStoreError> {
         let mut definition = definition.clone();
         if definition.id.is_empty() {
             definition.id = definition.name.clone();
         }
         definition.validate()?;
-        fs::create_dir_all(&self.root).map_err(|source| AgentDefinitionStoreError::Io {
-            path: self.root.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        let path = self.definition_path(&definition);
-        let bytes = serde_json::to_vec_pretty(&definition).map_err(|source| {
-            AgentDefinitionStoreError::Json {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            }
-        })?;
-        let tmp_path = path.with_extension("json.tmp");
-        fs::write(&tmp_path, bytes).map_err(|source| AgentDefinitionStoreError::Io {
-            path: tmp_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        fs::rename(&tmp_path, &path).map_err(|source| AgentDefinitionStoreError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        Ok(path)
+        self.validate_definition_id(definition.key())?;
+        self.objects
+            .save(definition.key(), &definition)
+            .map_err(agent_definition_vfs_error)
+    }
+
+    fn delete_definition(&self, id: &str) -> Result<bool, AgentDefinitionStoreError> {
+        self.validate_definition_id(id)?;
+        self.objects.delete(id).map_err(agent_definition_vfs_error)
+    }
+}
+
+fn agent_definition_vfs_error(source: sinomo_runtime::vfs::VfsError) -> AgentDefinitionStoreError {
+    let path = source
+        .path()
+        .unwrap_or(AGENT_DEFINITION_SIFS_ROOT)
+        .to_string();
+    match source {
+        sinomo_runtime::vfs::VfsError::Json { detail, .. }
+        | sinomo_runtime::vfs::VfsError::Sobj { detail, .. } => {
+            AgentDefinitionStoreError::Json { path, detail }
+        }
+        other => AgentDefinitionStoreError::Io {
+            path,
+            detail: other.to_string(),
+        },
     }
 }
 
@@ -2796,10 +2782,10 @@ mod tests {
     }
 
     #[test]
-    fn file_agent_definition_store_round_trips_custom_definition() {
+    fn sifs_agent_definition_store_round_trips_custom_definition() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-definition-store");
         let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
-        let store = FileAgentDefinitionStore::for_data_dir(&data_dir);
+        let store = AgentDefinitionSifsStore::open(Some(data_dir.root())).expect("open store");
         let definition =
             AgentDefinition::custom("docs-agent", AgentRole::Deliberation, "Write docs.")
                 .with_package_version("2.3.4")
@@ -2817,8 +2803,8 @@ mod tests {
         let loaded = store.load_definitions().expect("load definitions");
 
         assert_eq!(
-            path.file_name().and_then(|name| name.to_str()),
-            Some("docs-agent.json")
+            path,
+            format!("{AGENT_DEFINITION_SIFS_ROOT}/docs-agent.json")
         );
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].key(), "docs-agent");
@@ -2834,6 +2820,8 @@ mod tests {
         assert_eq!(loaded[0].skills, vec!["docs.write"]);
         assert_eq!(loaded[0].temperature, Some(0.3));
         assert_eq!(loaded[0].model_policy.max_output_tokens, Some(456));
+        assert!(store.delete_definition("docs-agent").expect("delete"));
+        assert!(store.load_definitions().expect("reload").is_empty());
     }
 
     #[test]

@@ -49,6 +49,14 @@ impl DeviceProfile {
         Self::new(node_id, "mock screen", DeviceKind::Screen)
     }
 
+    pub fn mobile_location(node_id: NodeId) -> Self {
+        Self::new(node_id, "mobile location", DeviceKind::Location)
+    }
+
+    pub fn mobile_touchscreen(node_id: NodeId) -> Self {
+        Self::new(node_id, "mobile touchscreen", DeviceKind::Touchscreen)
+    }
+
     pub fn with_capability(mut self, capability: DeviceCapability) -> Self {
         self.capabilities.push(capability);
         self
@@ -98,6 +106,11 @@ pub enum DeviceKind {
     Gpu,
     Speaker,
     NotificationSurface,
+    Location,
+    Touchscreen,
+    MotionSensor,
+    Battery,
+    Haptic,
     Other,
 }
 
@@ -178,5 +191,20 @@ mod tests {
 
         assert_eq!(source.node_id, node_id);
         assert_eq!(source.device_id, device.device_id);
+    }
+
+    #[test]
+    fn mobile_device_kinds_round_trip_json() {
+        for kind in [
+            DeviceKind::Location,
+            DeviceKind::Touchscreen,
+            DeviceKind::MotionSensor,
+            DeviceKind::Battery,
+            DeviceKind::Haptic,
+        ] {
+            let json = serde_json::to_string(&kind).expect("serialize mobile kind");
+            let parsed: DeviceKind = serde_json::from_str(&json).expect("deserialize mobile kind");
+            assert_eq!(parsed, kind);
+        }
     }
 }

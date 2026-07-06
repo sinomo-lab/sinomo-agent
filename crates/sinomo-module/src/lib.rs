@@ -176,6 +176,172 @@ pub struct NativeRustModuleRuntimeState {
     pub reason: String,
 }
 
+pub const MODULE_CLUSTER_CONFIG_KEY: &str = "module.runtime.cluster-defaults";
+pub const MODULE_NODE_CONFIG_KEY: &str = "module.runtime.node-overrides";
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModuleRuntimeConfig {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub modules: BTreeMap<String, ModuleRuntimeConfigEntry>,
+}
+
+impl ModuleRuntimeConfig {
+    pub fn module_ids(&self) -> impl Iterator<Item = &str> {
+        self.modules.keys().map(String::as_str)
+    }
+
+    pub fn setting(&self, module_id: &str) -> Option<ModuleRuntimeConfigEntry> {
+        self.modules.get(module_id).copied()
+    }
+
+    pub fn set(
+        &mut self,
+        module_id: impl AsRef<str>,
+        setting: ModuleRuntimeConfigEntry,
+    ) -> Result<(), String> {
+        let module_id = normalize_module_config_id(module_id.as_ref())?;
+        self.modules.insert(module_id, setting);
+        Ok(())
+    }
+
+    pub fn clear(&mut self, module_id: impl AsRef<str>) -> Result<(), String> {
+        let module_id = normalize_module_config_id(module_id.as_ref())?;
+        self.modules.remove(&module_id);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModuleRuntimeConfigEntry {
+    pub enabled: bool,
+}
+
+impl ModuleRuntimeConfigEntry {
+    pub fn enabled(enabled: bool) -> Self {
+        Self { enabled }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModuleRuntimeConfigSource {
+    Node,
+    Cluster,
+    DisabledDefault,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ResolvedModuleRuntimeConfig {
+    pub enabled: bool,
+    pub source: ModuleRuntimeConfigSource,
+}
+
+pub fn resolve_module_runtime_config(
+    node: &ModuleRuntimeConfig,
+    cluster: &ModuleRuntimeConfig,
+    module_id: &str,
+) -> ResolvedModuleRuntimeConfig {
+    if let Some(setting) = node.setting(module_id) {
+        return ResolvedModuleRuntimeConfig {
+            enabled: setting.enabled,
+            source: ModuleRuntimeConfigSource::Node,
+        };
+    }
+    if let Some(setting) = cluster.setting(module_id) {
+        return ResolvedModuleRuntimeConfig {
+            enabled: setting.enabled,
+            source: ModuleRuntimeConfigSource::Cluster,
+        };
+    }
+    ResolvedModuleRuntimeConfig {
+        enabled: false,
+        source: ModuleRuntimeConfigSource::DisabledDefault,
+    }
+}
+
+pub fn module_runtime_config_schema() -> sinomo_config::ConfigSchema {
+    sinomo_config::ConfigSchema::object(
+        "ModuleRuntimeConfig",
+        "Runtime module enablement keyed by module id.",
+        vec![
+            sinomo_config::ConfigSchemaField::new(
+                "modules",
+                "Modules",
+                "Configured module runtime states. Missing module ids inherit the next config layer.",
+                sinomo_config::ConfigSchemaValue::map(
+                    sinomo_config::ConfigSchemaValue::object(vec![
+                        sinomo_config::ConfigSchemaField::new(
+                            "enabled",
+                            "Enabled",
+                            "Whether this module should run when this config layer applies.",
+                            sinomo_config::ConfigSchemaValue::bool(),
+                        ),
+                    ])
+                    .without_unknown_fields(),
+                ),
+            )
+            .optional(),
+        ],
+    )
+}
+
+pub fn module_cluster_config_definition() -> Result<sinomo_config::ConfigDefinition, String> {
+    sinomo_config::ConfigDefinition::new(
+        MODULE_CLUSTER_CONFIG_KEY,
+        "sinomo-module",
+        sinomo_config::ConfigValueType::Object {
+            schema_name: "ModuleRuntimeConfig".to_string(),
+        },
+        "Cluster-level default module runtime enablement. Node-local overrides take priority.",
+        sinomo_config::ConfigClusterMode::ClusterOnly,
+    )
+    .map_err(|error| error.to_string())?
+    .with_default(&ModuleRuntimeConfig::default())
+    .map_err(|error| error.to_string())?
+    .with_schema(module_runtime_config_schema())
+    .map_err(|error| error.to_string())
+}
+
+pub fn module_node_config_definition() -> Result<sinomo_config::ConfigDefinition, String> {
+    sinomo_config::ConfigDefinition::new(
+        MODULE_NODE_CONFIG_KEY,
+        "sinomo-module",
+        sinomo_config::ConfigValueType::Object {
+            schema_name: "ModuleRuntimeConfig".to_string(),
+        },
+        "Node-local module runtime enablement overrides. Missing modules inherit cluster defaults.",
+        sinomo_config::ConfigClusterMode::LocalOnly,
+    )
+    .map_err(|error| error.to_string())?
+    .with_default(&ModuleRuntimeConfig::default())
+    .map_err(|error| error.to_string())?
+    .with_schema(module_runtime_config_schema())
+    .map_err(|error| error.to_string())
+}
+
+pub fn register_config_definitions(
+    builder: sinomo_config::ConfigRegistryBuilder,
+) -> Result<sinomo_config::ConfigRegistryBuilder, String> {
+    let builder = builder
+        .register(module_cluster_config_definition()?)
+        .map_err(|error| error.to_string())?;
+    builder
+        .register(module_node_config_definition()?)
+        .map_err(|error| error.to_string())
+}
+
+fn normalize_module_config_id(module_id: &str) -> Result<String, String> {
+    let module_id = module_id.trim();
+    if module_id.is_empty() {
+        return Err("module id must not be empty".to_string());
+    }
+    if ModuleId::new(module_id).is_ok() || ModuleId::from_legacy_named(module_id).is_ok() {
+        Ok(module_id.to_string())
+    } else {
+        Err(format!("invalid module id `{module_id}`"))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeDylibModuleInstallRequest {
     pub expected_module_id: Option<ModuleId>,
@@ -4514,6 +4680,31 @@ mod tests {
     use sinomo_core::{Id, ModuleManifest};
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn module_runtime_config_resolves_node_then_cluster_then_disabled() {
+        let module_id = "module.remote-management";
+        let mut cluster = ModuleRuntimeConfig::default();
+        cluster
+            .set(module_id, ModuleRuntimeConfigEntry::enabled(true))
+            .expect("cluster default");
+        let node = ModuleRuntimeConfig::default();
+
+        let inherited = resolve_module_runtime_config(&node, &cluster, module_id);
+        assert!(inherited.enabled);
+        assert_eq!(inherited.source, ModuleRuntimeConfigSource::Cluster);
+
+        let mut node = ModuleRuntimeConfig::default();
+        node.set(module_id, ModuleRuntimeConfigEntry::enabled(false))
+            .expect("node override");
+        let overridden = resolve_module_runtime_config(&node, &cluster, module_id);
+        assert!(!overridden.enabled);
+        assert_eq!(overridden.source, ModuleRuntimeConfigSource::Node);
+
+        let missing = resolve_module_runtime_config(&node, &cluster, "module.unconfigured");
+        assert!(!missing.enabled);
+        assert_eq!(missing.source, ModuleRuntimeConfigSource::DisabledDefault);
+    }
 
     #[test]
     fn module_registry_preserves_registration_order_and_rejects_duplicates() {
