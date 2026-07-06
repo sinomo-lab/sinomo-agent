@@ -1213,10 +1213,27 @@ impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
         options: DfsObjectRpcSendOptions,
     ) -> DfsPeerTransportFuture<'a, Result<network::ObjectRpcResponse, DfsPeerTransportError>> {
         let handle = self.rpc_runtime.runtime.handle().clone();
+        let target_node_id = target_node_id.clone();
+        let request = request.clone();
         Box::pin(async move {
+            let daemon_target_node_id = target_node_id.clone();
+            let daemon_request = request.clone();
+            if let Some(result) = tokio::task::spawn_blocking(move || {
+                sifs_send_dfs_object_rpc_via_daemon(
+                    &daemon_target_node_id,
+                    &daemon_request,
+                    options,
+                )
+            })
+            .await
+            .map_err(|error| DfsPeerTransportError::new(error.to_string()))?
+            {
+                return result;
+            }
+
             sinomo_runtime::daemon::send_dfs_object_rpc_to_target_async(
-                target_node_id,
-                request,
+                &target_node_id,
+                &request,
                 options.connect_timeout,
                 &handle,
                 options.observe_connectivity,
@@ -1233,6 +1250,10 @@ fn sifs_send_dfs_object_rpc(
     request: &network::ObjectRpcRequest,
     options: DfsObjectRpcSendOptions,
 ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
+    if let Some(result) = sifs_send_dfs_object_rpc_via_daemon(target_node_id, request, options) {
+        return result;
+    }
+
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         if matches!(
             handle.runtime_flavor(),
@@ -1269,6 +1290,26 @@ fn sifs_send_dfs_object_rpc(
             .await
         })
         .map_err(|error| DfsPeerTransportError::new(error.to_string()))
+}
+
+fn sifs_send_dfs_object_rpc_via_daemon(
+    target_node_id: &NodeId,
+    request: &network::ObjectRpcRequest,
+    options: DfsObjectRpcSendOptions,
+) -> Option<Result<network::ObjectRpcResponse, DfsPeerTransportError>> {
+    let Ok(client) = sinomo_runtime::daemon::DaemonApiClient::connect() else {
+        return None;
+    };
+    Some(
+        client
+            .dfs_object_rpc_to_target(
+                target_node_id,
+                request,
+                options.connect_timeout,
+                options.observe_connectivity,
+            )
+            .map_err(|error| DfsPeerTransportError::new(error.to_string())),
+    )
 }
 
 fn publish_sifs_metadata_journal_from_data_dir(
