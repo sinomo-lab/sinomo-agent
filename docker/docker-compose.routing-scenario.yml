@@ -1,0 +1,103 @@
+# Focused 3-node routing scenario for docker/test-routing-scenario.sh.
+#
+# Topology:
+#
+#   lan_a:       node1, node2
+#   lan_b:       node3
+#   routed_lan:  node1, node3
+#
+# node1 also publishes a manual host-forwarded endpoint. This models a public
+# address that exists outside the node's own interface list, while node1 and
+# node3 still have a private routed-LAN path despite different primary LANs.
+
+x-node-defaults: &node-defaults
+  image: sinomo-dev-runtime
+  restart: unless-stopped
+  build:
+    context: .
+    dockerfile: Dockerfile.dev
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  node1:
+    <<: *node-defaults
+    hostname: node1
+    ports:
+      - "${SINOMO_SCENARIO_PUBLIC_PORT:-32166}:21353"
+    environment:
+      ROLE: seed
+      NODE_NAME: node1
+      CLUSTER_NAME: routing-scenario
+      SINOMO_DISABLE_IROH: "1"
+      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_CLUSTER_JOIN_TRACE: "${SINOMO_CLUSTER_JOIN_TRACE:-0}"
+      SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
+      SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
+      SINOMO_MANUAL_ENDPOINTS_JSON: '{"main":[{"address":"tcp://host.docker.internal:${SINOMO_SCENARIO_PUBLIC_PORT:-32166}","scope":"internet-direct","priority":0}]}'
+      PUBLISH_INVITES: "node1:21353=/shared/lan-a-invite.json host.docker.internal:${SINOMO_SCENARIO_PUBLIC_PORT:-32166}=/shared/forwarded-invite.json"
+    volumes:
+      - node1-data:/data
+      - invite:/shared
+      - ../target/debug/sinomo:/usr/local/bin/sinomo:ro
+      - ./entrypoint.sh:/usr/local/bin/sinomo-node-entrypoint:ro
+    networks: [lan_a, routed_lan]
+
+  node2:
+    <<: *node-defaults
+    hostname: node2
+    depends_on: [node1]
+    environment:
+      ROLE: joiner
+      NODE_NAME: node2
+      CLUSTER_NAME: routing-scenario
+      SINOMO_DISABLE_IROH: "1"
+      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_CLUSTER_JOIN_TRACE: "${SINOMO_CLUSTER_JOIN_TRACE:-0}"
+      SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
+      SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
+      WAIT_FOR_INTRODUCER_READY: "1"
+      INTRODUCER: node1:21353
+      JOIN_INVITE: /shared/lan-a-invite.json
+    volumes:
+      - node2-data:/data
+      - invite:/shared
+      - ../target/debug/sinomo:/usr/local/bin/sinomo:ro
+      - ./entrypoint.sh:/usr/local/bin/sinomo-node-entrypoint:ro
+    networks: [lan_a]
+
+  node3:
+    <<: *node-defaults
+    hostname: node3
+    depends_on: [node1]
+    environment:
+      ROLE: joiner
+      NODE_NAME: node3
+      CLUSTER_NAME: routing-scenario
+      SINOMO_DISABLE_IROH: "1"
+      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_CLUSTER_JOIN_TRACE: "${SINOMO_CLUSTER_JOIN_TRACE:-0}"
+      SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
+      SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
+      INTRODUCER: host.docker.internal:${SINOMO_SCENARIO_PUBLIC_PORT:-32166}
+      JOIN_INVITE: /shared/forwarded-invite.json
+    volumes:
+      - node3-data:/data
+      - invite:/shared
+      - ../target/debug/sinomo:/usr/local/bin/sinomo:ro
+      - ./entrypoint.sh:/usr/local/bin/sinomo-node-entrypoint:ro
+    networks: [lan_b, routed_lan]
+
+networks:
+  lan_a:
+    driver: bridge
+  lan_b:
+    driver: bridge
+  routed_lan:
+    driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  invite:

@@ -2659,7 +2659,7 @@ impl DfsPeerTransport for EvolutionSifsPeerTransport {
         request: &network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
-        sinomo_runtime::daemon::send_dfs_object_rpc_to_target(
+        sinomo_runtime::daemon::send_object_rpc_to_target(
             target_node_id,
             request,
             options.connect_timeout,

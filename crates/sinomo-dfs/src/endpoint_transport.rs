@@ -34,7 +34,11 @@ use crate::{
     run_cluster_dfs_metadata_publish_after_events_with_peer_transport,
 };
 
-pub const DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+// This budget is passed to the daemon object-RPC layer as both the connect budget and
+// the final-hop response idle budget. Routed DFS operations may perform foreground
+// authority, journal, and repair work before responding, so keep this aligned with the
+// DFS chunk-transfer idle window rather than a short health-probe timeout.
+pub const DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const DFS_SERVED_MESSAGE_REPAIR_MAX_JOBS: usize = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

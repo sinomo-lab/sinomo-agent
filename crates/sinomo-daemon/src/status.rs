@@ -726,7 +726,7 @@ impl Drop for DaemonLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::node::shadow_daemon_node_id;
+    use sinomo_core::node::{ClusterId, shadow_daemon_node_id};
     use sinomo_core::{
         ClusterEndpointPrivacy, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState,
         ClusterTransportKind,
@@ -841,8 +841,8 @@ mod tests {
             &[],
             &[],
             &[DaemonManualEndpointConfig {
-                address: "tcp://129.146.106.76".to_string(),
-                scope: None,
+                address: "tcp://public-node.example".to_string(),
+                scope: Some(ClusterEndpointPrivacy::InternetDirect),
                 priority: None,
             }],
         );
@@ -850,7 +850,7 @@ mod tests {
         assert!(endpoints.iter().any(|endpoint| {
             endpoint.node_id == state.local_node_id
                 && endpoint.transport == ClusterTransportKind::LanTcp
-                && endpoint.address == "129.146.106.76:21353"
+                && endpoint.address == "public-node.example:21353"
                 && endpoint.source == ClusterEndpointSource::Static
                 && endpoint.privacy == ClusterEndpointPrivacy::InternetDirect
                 && endpoint.priority == 5
@@ -876,7 +876,7 @@ mod tests {
             &[],
             &[],
             &[DaemonManualEndpointConfig {
-                address: "tcp://129.146.106.76".to_string(),
+                address: "tcp://public-node.example".to_string(),
                 scope: Some(ClusterEndpointPrivacy::Relayed),
                 priority: Some(9),
             }],
@@ -885,7 +885,7 @@ mod tests {
         assert!(endpoints.iter().any(|endpoint| {
             endpoint.node_id == state.local_node_id
                 && endpoint.transport == ClusterTransportKind::LanTcp
-                && endpoint.address == "129.146.106.76:21353"
+                && endpoint.address == "public-node.example:21353"
                 && endpoint.source == ClusterEndpointSource::Static
                 && endpoint.privacy == ClusterEndpointPrivacy::Relayed
                 && endpoint.priority == 9
@@ -902,13 +902,13 @@ mod tests {
             br#"{
                 "main": [
                     {
-                        "address": "tcp://129.146.106.76:21353",
+                        "address": "tcp://public-node.example:21353",
                         "scope": "internet-direct"
                     }
                 ],
                 "shadow": [
                     {
-                        "address": "129.146.106.76",
+                        "address": "public-node.example",
                         "privacy": "internet-direct",
                         "priority": 12
                     }
@@ -922,14 +922,14 @@ mod tests {
         assert_eq!(config.main_endpoints.len(), 1);
         assert_eq!(
             config.main_endpoints[0].address,
-            "tcp://129.146.106.76:21353"
+            "tcp://public-node.example:21353"
         );
         assert_eq!(
             config.main_endpoints[0].scope,
             Some(ClusterEndpointPrivacy::InternetDirect)
         );
         assert_eq!(config.shadow_endpoints.len(), 1);
-        assert_eq!(config.shadow_endpoints[0].address, "129.146.106.76");
+        assert_eq!(config.shadow_endpoints[0].address, "public-node.example");
         assert_eq!(
             config.shadow_endpoints[0].scope,
             Some(ClusterEndpointPrivacy::InternetDirect)

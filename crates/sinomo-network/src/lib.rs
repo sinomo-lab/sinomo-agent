@@ -184,8 +184,9 @@ pub use object::{
     AsyncDaemonControlListener, AsyncDaemonControlStream, DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
     DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts, OBJECT_STREAM_MAX_CHUNK_BYTES,
     ObjectFrameIoOptions, ObjectRpcRequestStreamMode, ObjectRpcResponseStreamMode,
-    RawByteStreamChunkOptions, SinomoObjectCodec, object_rpc_request_stream_mode,
-    object_rpc_response_stream_mode, send_daemon_control_rpc_request_async,
+    RawByteStreamChunkOptions, SinomoObjectCodec, forward_raw_byte_stream_chunks_async,
+    object_rpc_request_stream_mode, object_rpc_response_stream_mode,
+    read_raw_byte_stream_chunks_to_vec_async, send_daemon_control_rpc_request_async,
     set_object_rpc_request_stream_mode, set_object_rpc_response_stream_mode,
     write_borrowed_object_frame_async,
 };
@@ -215,8 +216,9 @@ pub use route::{
     ClusterRelayStreamRequestAction, ClusterRelayStreamSendOutcome,
     ClusterSignedEndpointRpcAsyncHost, ClusterSignedEndpointRpcFuture,
     ClusterSignedEndpointRpcObservation, RelayEnvelope, cluster_relay_stream_request_action,
-    handle_cluster_relay_async_with_host, handle_cluster_relay_stream_forward_async_with_host,
-    relay_request_inner_route, relay_response_is_routing_error,
+    forward_streamed_daemon_rpc_to_cluster_endpoint_async, handle_cluster_relay_async_with_host,
+    handle_cluster_relay_stream_forward_async_with_host, relay_request_inner_route,
+    relay_response_is_routing_error,
 };
 pub use rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_RPC_ROUTE_METADATA,
@@ -284,8 +286,8 @@ before recommending operator action. Do not infer membership changes from a
 single stale row.
 
 Prefer read-only inspection. Do not use relay, membership mutation, rollout, or
-DFS repair tools unless the user explicitly asks for remediation and the current
-health evidence supports that action.
+storage repair tools unless the user explicitly asks for remediation and the
+current health evidence supports that action.
 "#;
 
 pub const CLUSTER_NETWORK_INSPECTION_PROMPT_MARKDOWN: &str = r#"# Cluster Network Inspection Prompt

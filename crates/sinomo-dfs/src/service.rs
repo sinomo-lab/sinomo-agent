@@ -22,16 +22,17 @@ use std::time::Instant;
 
 use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
-    DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE, DFS_METADATA_JOURNAL_BATCH_ROUTE,
-    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE,
-    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMessageCommand, DfsMessageResponse,
-    DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
-    DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
-    DfsOperatorInspector, DfsOperatorStatus, DfsSmokeReport, decode_dfs_message_rpc_request,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root,
+    DFS_DIRECT_READ_STREAM_CHUNK_BYTES, DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE,
+    DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_SMOKE_ROUTE,
+    DFS_STATUS_ROUTE, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMessageCommand,
+    DfsMessageResponse, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
+    DfsMetadataJournalBatchResponse, DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand,
+    DfsMetadataSnapshotInstallResponse, DfsOperatorInspector, DfsOperatorStatus, DfsSmokeReport,
+    decode_dfs_message_rpc_request, default_dfs_metadata_root, default_dfs_metadata_shards_root,
     default_dfs_repair_attempt_snapshot_path, dfs_module_surfaces, dfs_route_is_message_data_plane,
     ensure_default_cluster_aware_dfs_expose_config, handle_dfs_direct_read_rpc_request,
-    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
+    handle_dfs_direct_read_stream_rpc_request, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend,
     read_dfs_repair_attempt_snapshot, resolve_dfs_conflicts, sifs_file_system_id,
     use_dfs_conflict_version,
 };
@@ -41,7 +42,7 @@ use sinomo_core::network::{ClusterPaths, ObjectRpcRequest, ObjectRpcResponse};
 
 use sinomo_core::service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
-    ServiceRegistryBuilder, ServiceRoute,
+    ServiceRegistryBuilder, ServiceRoute, ServiceStreamFuture, ServiceStreamResponse,
 };
 
 const DFS_DEFAULT_ROUTE_CONCURRENCY_LIMIT: usize = 8;
@@ -248,6 +249,30 @@ impl Service for DfsDataPlaneService {
             ctx.respond(response)?;
             Ok(ServiceDisposition::Continue)
         })
+    }
+
+    fn handle_stream(
+        &self,
+        ctx: ServiceContext,
+        request: ObjectRpcRequest,
+    ) -> Option<ServiceStreamFuture<'_>> {
+        if request.route != DFS_DIRECT_READ_ROUTE
+            || !sinomo_core::network::object_rpc_request_stream_mode(&request)
+                .expects_raw_streamed_response()
+        {
+            return None;
+        }
+        Some(Box::pin(async move {
+            let stream_response = handle_dfs_direct_read_stream_rpc_request(&ctx.data_dir, request)
+                .map_err(service_error)?;
+            Ok(ServiceStreamResponse {
+                response: stream_response.response,
+                reader: stream_response
+                    .reader
+                    .map(|reader| Box::new(reader) as Box<dyn std::io::Read + Send>),
+                chunk_bytes: DFS_DIRECT_READ_STREAM_CHUNK_BYTES,
+            })
+        }))
     }
 }
 

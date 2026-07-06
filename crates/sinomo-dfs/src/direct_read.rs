@@ -2,7 +2,8 @@
 //!
 //! The normal DFS data plane uses framed [`DfsNetworkMessage`] traffic. Direct
 //! read is the optimized read-only path used when a full-object read can be
-//! served as a single object-RPC response or a raw streamed daemon body.
+//! served as a single object-RPC response or a generic streamed object-RPC
+//! body carried by `sinomo-network`.
 
 use std::io::Read;
 
@@ -48,13 +49,7 @@ pub fn dfs_direct_read_rpc_request(
         &mut rpc_request,
         sinomo_core::network::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
     );
-    Ok(rpc_request)
-}
-
-pub fn dfs_direct_read_rpc_request_accepts_streamed_response(request: &ObjectRpcRequest) -> bool {
-    request.route == DFS_DIRECT_READ_ROUTE
-        && sinomo_core::network::object_rpc_request_stream_mode(request)
-            .expects_raw_streamed_response()
+    Ok(rpc_request.with_response_retry_safe())
 }
 
 #[cfg(test)]

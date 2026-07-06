@@ -1352,7 +1352,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 } else {
                     let _ = self.request_stage_blob_from_alternate(&updated_intent, &pending)?;
                 }
-            } else if local_desired_copy_missing {
+            } else if foreground_replica_repair && local_desired_copy_missing {
                 let _ = self.request_stage_blob_from_alternate(&updated_intent, &pending)?;
             }
         }
@@ -1472,6 +1472,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     policy,
                     object,
                     shard,
+                    foreground_replica_repair,
                 );
             }
             Some(shard) => shard.epoch,
@@ -1762,6 +1763,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         policy: DfsReplicationPolicy,
         object: DfsObjectMetadata,
         shard: DfsMetadataShardConfig,
+        foreground_replica_repair: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let request_id = self.next_request_id();
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
@@ -1789,7 +1791,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             policy,
             object_metadata: Some(object.clone()),
             touch_parent_on_create: true,
-            foreground_replica_repair: true,
+            foreground_replica_repair,
         };
         let sent = self.send_dfs_message_if_routable(
             &primary_node_id,

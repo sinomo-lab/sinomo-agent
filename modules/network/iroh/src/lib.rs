@@ -224,9 +224,6 @@ pub fn iroh_network_module_descriptor() -> NetworkModuleDescriptor {
         dialer: true,
         listener: true,
         supports_runtime_toggle: true,
-        // The iroh proxy re-frames responses; raw/streamed daemon response
-        // framing is not supported over this transport.
-        supports_raw_response: false,
     }
 }
 
@@ -710,7 +707,6 @@ mod tests {
         assert!(descriptor.dialer);
         assert!(descriptor.listener);
         assert!(descriptor.supports_runtime_toggle);
-        assert!(!descriptor.supports_raw_response);
     }
 
     #[test]

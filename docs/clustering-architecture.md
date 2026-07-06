@@ -90,13 +90,13 @@ The daemon reads this file during membership refresh and merges the configured e
 {
   "main": [
     {
-      "address": "tcp://129.146.106.76:21353",
+      "address": "tcp://198.51.100.76:21353",
       "scope": "internet-direct"
     }
   ],
   "shadow": [
     {
-      "address": "tcp://129.146.106.76:21354",
+      "address": "tcp://198.51.100.76:21354",
       "scope": "internet-direct"
     }
   ]

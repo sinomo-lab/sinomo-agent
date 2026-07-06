@@ -544,7 +544,6 @@ mod tests {
             dialer: true,
             listener: true,
             supports_runtime_toggle: true,
-            supports_raw_response: false,
         };
         let bytes = encode_network_module_sobj(&descriptor).expect("encode descriptor");
         let decoded: NetworkModuleDescriptor =

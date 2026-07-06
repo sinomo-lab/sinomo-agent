@@ -25,10 +25,11 @@ pub use sinomo_api::{
     DAEMON_DFS_BROWSER_RENAME_ROUTE, DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE,
     DAEMON_DFS_BROWSER_STATUS_ROUTE, DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
     DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
-    DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
-    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DaemonApiError,
-    DaemonClusterMaintenanceRefreshRequest, DaemonClusterMaintenanceRefreshResponse,
-    DaemonClusterStatus, DaemonDfsBrowserCreateDirAllRequest, DaemonDfsBrowserCreateDirAllResponse,
+    DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
+    DAEMON_STATUS_ROUTE, DaemonApiError, DaemonClusterMaintenanceRefreshRequest,
+    DaemonClusterMaintenanceRefreshResponse, DaemonClusterStatus,
+    DaemonDfsBrowserCreateDirAllRequest, DaemonDfsBrowserCreateDirAllResponse,
     DaemonDfsBrowserDeleteRequest, DaemonDfsBrowserDeleteResponse, DaemonDfsBrowserEntry,
     DaemonDfsBrowserFileRead, DaemonDfsBrowserHealthSummary, DaemonDfsBrowserListRequest,
     DaemonDfsBrowserListResponse, DaemonDfsBrowserMetadataShard, DaemonDfsBrowserObjectHealth,
@@ -45,14 +46,15 @@ pub use sinomo_api::{
     DaemonDfsBrowserTransferMetadataPrimaryResponse, DaemonDfsBrowserUnpinContentRequest,
     DaemonDfsBrowserUnpinContentResponse, DaemonDfsBrowserUnpinMetadataRequest,
     DaemonDfsBrowserUnpinMetadataResponse, DaemonDfsBrowserWriteFileRequest,
-    DaemonDfsBrowserWriteFileResponse, DaemonDfsObjectRpcForwardRequest, DaemonPaths,
-    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, IdleStatsSnapshot,
-    SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
-    cluster_node_status_from_daemon_status, daemon_bind_address, daemon_connect_address,
-    daemon_git_commit, daemon_hostname, daemon_options_from_status, daemon_package_version,
-    daemon_paths_from_data_dir, daemon_status_matches_options, default_main_daemon_status,
-    probe_daemon_status, probe_daemon_status_async, probe_daemon_status_at_address,
-    read_daemon_status, shadow_daemon_paths_from_data_dir, write_daemon_status,
+    DaemonDfsBrowserWriteFileResponse, DaemonDfsObjectRpcForwardRequest,
+    DaemonObjectRpcForwardRequest, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
+    IdleStatsSnapshot, SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT,
+    SINOMO_SHADOW_DAEMON_DEFAULT_PORT, cluster_node_status_from_daemon_status, daemon_bind_address,
+    daemon_connect_address, daemon_git_commit, daemon_hostname, daemon_options_from_status,
+    daemon_package_version, daemon_paths_from_data_dir, daemon_status_matches_options,
+    default_main_daemon_status, probe_daemon_status, probe_daemon_status_async,
+    probe_daemon_status_at_address, read_daemon_status, shadow_daemon_paths_from_data_dir,
+    write_daemon_status,
 };
 
 pub(crate) fn cluster_join_trace(args: std::fmt::Arguments<'_>) {
@@ -161,7 +163,7 @@ pub(crate) use client::{
     fetch_daemon_status_from_endpoint_on_runtime, send_cluster_kv_watch_events_async,
     send_cluster_member_publish_async, send_cluster_raft_append_async,
     send_cluster_raft_append_on_runtime, send_cluster_raft_vote_async,
-    send_cluster_raft_vote_on_runtime, send_dfs_object_rpc_to_target_on_runtime,
+    send_cluster_raft_vote_on_runtime, send_object_rpc_to_target_on_runtime,
 };
 pub use client::{
     RemoteConfigClient, fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
@@ -180,8 +182,8 @@ pub use client::{
     send_daemon_rpc_to_endpoint_async, send_daemon_rpc_to_endpoint_with_timeouts,
     send_daemon_rpc_with_timeouts, send_daemon_shutdown_request,
     send_dfs_metadata_journal_batch_to_endpoint_async,
-    send_dfs_metadata_snapshot_install_to_endpoint_async, send_dfs_object_rpc_to_target,
-    send_dfs_object_rpc_to_target_async,
+    send_dfs_metadata_snapshot_install_to_endpoint_async, send_object_rpc_to_target,
+    send_object_rpc_to_target_async,
 };
 pub use cluster::commit_cluster_kv_txn_with_quorum;
 pub use control::{

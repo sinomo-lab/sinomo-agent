@@ -366,8 +366,8 @@ fn dfs_message_read_requests_require_fresh_metadata() {
         }),
     );
 
-    assert!(dfs_message_requires_fresh_metadata(&read));
-    assert!(dfs_message_requires_fresh_metadata(&bulk));
+    assert!(dfs_message_requires_full_metadata_hydrate(&read));
+    assert!(dfs_message_requires_full_metadata_hydrate(&bulk));
 }
 
 #[test]
@@ -837,7 +837,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
         }),
     );
     assert!(dfs_message_is_read_only_request(&read));
-    assert!(dfs_message_requires_fresh_metadata(&read));
+    assert!(dfs_message_requires_full_metadata_hydrate(&read));
 
     let lookup = test_dfs_message_command_from_message(
         &local,
@@ -856,7 +856,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
     );
     assert!(!dfs_message_is_read_only_request(&lookup));
     assert!(
-        dfs_message_requires_fresh_metadata(&lookup),
+        dfs_message_requires_full_metadata_hydrate(&lookup),
         "lookup requests still require fresh daemon metadata before answering primary path checks"
     );
 
@@ -872,8 +872,8 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
     );
     assert!(!dfs_message_is_read_only_request(&write));
     assert!(
-        dfs_message_requires_fresh_metadata(&write),
-        "routed writes must hydrate daemon metadata before accepting primary-side commits"
+        !dfs_message_requires_full_metadata_hydrate(&write),
+        "routed writes validate target metadata in the write path instead of forcing a full daemon hydrate"
     );
 
     let lookup_paths = test_dfs_message_command_from_message(
@@ -896,7 +896,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
     );
     assert!(!dfs_message_is_read_only_request(&lookup_paths));
     assert!(
-        dfs_message_requires_fresh_metadata(&lookup_paths),
+        dfs_message_requires_full_metadata_hydrate(&lookup_paths),
         "batched lookup requests still require fresh daemon metadata before answering primary path checks"
     );
 
@@ -916,7 +916,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
         }),
     );
     assert!(!dfs_message_is_read_only_request(&sync));
-    assert!(dfs_message_requires_fresh_metadata(&sync));
+    assert!(dfs_message_requires_full_metadata_hydrate(&sync));
 
     let apply = test_dfs_message_command_from_message(
         &local,
@@ -940,7 +940,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
         }),
     );
     assert!(!dfs_message_is_read_only_request(&apply));
-    assert!(dfs_message_requires_fresh_metadata(&apply));
+    assert!(dfs_message_requires_full_metadata_hydrate(&apply));
 }
 
 struct FailingSendTransport {
@@ -1412,7 +1412,7 @@ fn dfs_service_endpoint_for_member_prefers_healthy_lan_endpoint_over_public() {
         "pk-local",
         now,
     );
-    let mut public_endpoint = test_endpoint(&remote, "129.146.106.76:21353");
+    let mut public_endpoint = test_endpoint(&remote, "198.51.100.76:21353");
     public_endpoint.privacy = ClusterEndpointPrivacy::InternetDirect;
     public_endpoint.priority = 0;
     let lan_endpoint = test_endpoint(&remote, "10.0.0.41:21353");
@@ -2149,9 +2149,11 @@ fn direct_read_stream_rpc_keeps_blob_out_of_initial_response() {
         content_size_bytes: bytes.len() as u64,
     };
     let direct_request = dfs_direct_read_rpc_request(&direct_read).expect("direct request");
-    assert!(dfs_direct_read_rpc_request_accepts_streamed_response(
-        &direct_request
-    ));
+    assert_eq!(
+        sinomo_core::network::object_rpc_request_stream_mode(&direct_request),
+        sinomo_core::network::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse
+    );
+    assert!(direct_request.is_response_retry_safe());
 
     let mut stream_response =
         handle_dfs_direct_read_stream_rpc_request(&data_dir, direct_request).expect("stream");
@@ -9761,6 +9763,100 @@ fn routed_manifest_write_controls_response_journal_replay() {
 }
 
 #[test]
+fn routed_inline_write_preserves_nonforeground_repair_mode() {
+    let root = temp_root("routed-inline-nonforeground-repair");
+    let writer = NodeId::from_legacy_named("node_routed_inline_writer").expect("writer");
+    let primary = NodeId::from_legacy_named("node_routed_inline_primary").expect("primary");
+    let file_system = file_system(primary.clone());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![writer.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control.put_metadata_shard(&shard).expect("metadata shard");
+    });
+
+    let captured_commands = Arc::new(Mutex::new(Vec::<DfsDistributedWriteCommand>::new()));
+    let captured_commands_for_sender = Arc::clone(&captured_commands);
+    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+        if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
+            &command.routed_message.message
+        {
+            captured_commands_for_sender
+                .lock()
+                .expect("capture")
+                .push(write_command.clone());
+        }
+        Ok(DfsMessageResponse {
+            request_id: command.request_id.clone(),
+            outbound_messages: Vec::new(),
+        })
+    });
+    let transport = DfsEndpointTransport::with_connect_timeout(
+        writer.clone(),
+        vec![test_endpoint(&primary, "192.0.2.67:21353")],
+        Duration::from_millis(1),
+        sender,
+    );
+    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(transport, writer_content)
+        .with_control_plane(control_plane)
+        .with_metadata_backend(
+            open_local_sharded_metadata_backend(root.join("metadata"), vec![shard.clone()])
+                .expect("metadata backend"),
+        )
+        .expect("attach metadata backend");
+    dfs.add_file_system(file_system.clone())
+        .expect("writer filesystem");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = "/routed-inline-nonforeground.bin".to_string();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(object.clone())
+        .expect("writer object");
+
+    dfs.route_distributed_write_to_metadata_primary(
+        DfsWriteRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            target_version: DfsVersion::from_legacy_named("version_routed_inline_nonforeground")
+                .expect("version"),
+            requesting_node_id: writer.clone(),
+        },
+        Some(object.version.clone()),
+        b"routed-inline-nonforeground".to_vec(),
+        vec![writer, primary],
+        DfsReplicationPolicy::new(1, 2).expect("policy"),
+        object,
+        shard,
+        false,
+    )
+    .expect("route inline nonforeground write");
+
+    let commands = captured_commands.lock().expect("capture").clone();
+    assert_eq!(commands.len(), 1);
+    assert!(
+        !commands[0].foreground_replica_repair,
+        "inline routed writes must preserve nonforeground repair mode"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
     let root = temp_root("served-endpoint-reader-write-fetch-stage");
     let writer = NodeId::from_legacy_named("node_served_endpoint_writer").expect("writer node");
@@ -10344,6 +10440,86 @@ fn committed_remote_manifest_self_repair_fetches_from_durable_requester() {
             )
         }),
         "expected retry self-repair FetchBlob after restoring pending repair, got {retry_messages:?}"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn nonforeground_remote_manifest_self_repair_defers_fetch_from_durable_requester() {
+    let root = temp_root("remote-manifest-self-repair-defers-fetch");
+    let writer =
+        NodeId::from_legacy_named("node_remote_manifest_defer_writer").expect("writer node");
+    let primary =
+        NodeId::from_legacy_named("node_remote_manifest_defer_primary").expect("primary node");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_remote_manifest_defer_fetch").expect("object");
+    let version_1 =
+        DfsVersion::from_legacy_named("version_remote_manifest_defer_fetch_1").expect("version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_remote_manifest_defer_fetch_2").expect("version");
+    let bytes = b"reader backed bytes should not be fetched by nonforeground write";
+    let content_hash = content_hash(bytes);
+    let network = InProcessNetwork::new();
+    let mut writer_mailbox = network.add_node(writer.clone());
+    let content = LocalContentStore::new(root.join("primary-content")).expect("content");
+    let metadata =
+        open_root_local_metadata_backend(root.join("primary-metadata")).expect("primary metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(primary.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let mut object = file_metadata(primary.clone());
+    object.object_id = object_id.clone();
+    object.path = "/services/remote-manifest-defer-fetch.txt".to_string();
+    object.version = version_1.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(object).expect("object metadata");
+
+    let outcome = dfs
+        .write_distributed_eventual_from_remote_manifest_with_base(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: writer.clone(),
+            },
+            Some(version_1),
+            content_hash.clone(),
+            bytes.len() as u64,
+            vec![writer.clone(), primary.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+            false,
+        )
+        .expect("nonforeground remote manifest write");
+    let intent_id = match outcome {
+        NetworkedDfsWriteOutcome::Committed {
+            intent_id,
+            repair_jobs,
+            ..
+        } => {
+            assert!(
+                repair_jobs
+                    .iter()
+                    .any(|job| job.missing_replica_node_id == primary)
+            );
+            intent_id
+        }
+        other => panic!("expected threshold commit with deferred self repair, got {other:?}"),
+    };
+
+    let pending = dfs.pending_writes.get(&intent_id).expect("pending repair");
+    assert!(
+        !pending.fetch_inflight_from.contains(&writer),
+        "nonforeground writes must not fetch committed self-repair content before returning"
+    );
+    let messages = drain_dfs_messages(&mut writer_mailbox);
+    assert!(
+        messages
+            .iter()
+            .all(|message| !matches!(message, DfsNetworkMessage::FetchBlob(_))),
+        "nonforeground remote manifest write should not synchronously fetch missing local copy, got {messages:?}"
     );
 
     std::fs::remove_dir_all(root).ok();

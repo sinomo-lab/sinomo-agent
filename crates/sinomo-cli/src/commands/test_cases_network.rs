@@ -459,7 +459,7 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
     let request = job.request.clone();
     let timeout = job.timeout;
     let response = match tokio::task::spawn_blocking(move || {
-        daemon_client.dfs_object_rpc_to_target(&target_node_id, &request, timeout, true)
+        daemon_client.object_rpc_to_target(&target_node_id, &request, timeout, true)
     })
     .await
     .map_err(|source| source.to_string())
