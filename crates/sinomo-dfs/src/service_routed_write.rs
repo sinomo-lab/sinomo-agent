@@ -289,12 +289,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             send_result.is_ok()
         ));
         send_result?;
+        self.schedule_committed_routed_write_local_fetch_if_needed(&result)?;
         Ok(NetworkedDfsServiceEvent::RemoteWriteServed {
             request_id,
             object_id,
             requester_node_id,
             result,
         })
+    }
+
+    fn schedule_committed_routed_write_local_fetch_if_needed(
+        &mut self,
+        result: &DfsDistributedWriteResult,
+    ) -> Result<(), DfsError> {
+        let DfsDistributedWriteResult::Outcome {
+            outcome:
+                NetworkedDfsWriteOutcome::Committed {
+                    intent_id,
+                    repair_jobs,
+                    ..
+                },
+        } = result
+        else {
+            return Ok(());
+        };
+        if !repair_jobs
+            .iter()
+            .any(|job| job.missing_replica_node_id == self.node_id)
+        {
+            return Ok(());
+        }
+        let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
+            return Ok(());
+        };
+        let Some(pending) = self.pending_writes.get(intent_id).cloned() else {
+            return Ok(());
+        };
+        let _ = self.request_stage_blob_from_alternate(&intent, &pending)?;
+        Ok(())
     }
 
     fn track_pending_remote_write_response(

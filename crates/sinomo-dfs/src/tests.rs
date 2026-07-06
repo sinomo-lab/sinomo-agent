@@ -26571,7 +26571,7 @@ fn sifs_cluster_writer_recovers_from_local_blob_loss_after_async_repair() {
         DfsWriteOptions {
             policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
             replica_candidates: vec![cluster.writer_node.clone(), cluster.primary_node.clone()],
-            wait_for_commit: true,
+            wait_for_commit: false,
             foreground_replica_repair: false,
         },
     ) {
@@ -26651,7 +26651,7 @@ fn sifs_cluster_async_commit_fetches_missing_local_desired_copy_without_maintena
         DfsWriteOptions {
             policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
             replica_candidates: vec![cluster.writer_node.clone(), cluster.primary_node.clone()],
-            wait_for_commit: true,
+            wait_for_commit: false,
             foreground_replica_repair: false,
         },
     ) {

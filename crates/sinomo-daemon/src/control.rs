@@ -1650,7 +1650,10 @@ async fn handle_authenticated_daemon_command_async(
         {
             abandon_daemon_dfs_message_replay(&paths, key);
         }
-        return result;
+        return match result {
+            Ok(stop) => Ok(stop),
+            Err(_) => Ok(false),
+        };
     }
 
     let route = authenticated.route.as_str();
@@ -4618,6 +4621,126 @@ mod tests {
             error,
             sinomo_core::network::NetworkError::AuthDenied
         ));
+        server.join().expect("server thread");
+    }
+
+    struct FailingRegistryService;
+
+    impl sinomo_core::service::Service for FailingRegistryService {
+        fn name(&self) -> &'static str {
+            "failing-registry"
+        }
+
+        fn routes(&self) -> &'static [&'static str] {
+            &["/benchmarks/cancel-probe"]
+        }
+
+        fn route_categories(&self) -> Vec<sinomo_core::service::ServiceRoute> {
+            vec![
+                sinomo_core::service::ServiceRoute::new("/benchmarks/cancel-probe", "benchmarks")
+                    .with_concurrency_limit(1),
+            ]
+        }
+
+        fn handle(
+            &self,
+            _ctx: sinomo_core::service::ServiceContext,
+            _request: sinomo_core::network::ObjectRpcRequest,
+        ) -> sinomo_core::service::ServiceFuture<'_> {
+            Box::pin(async {
+                Err(sinomo_core::service::ServiceError::Service(
+                    "injected registry failure".to_string(),
+                ))
+            })
+        }
+    }
+
+    #[test]
+    fn authenticated_registry_failure_returns_framed_error_without_connection_error() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-registry-rpc-error");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = DaemonPaths::new(&data_dir);
+        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
+            "/benchmarks/cancel-probe",
+            "benchmarks",
+            &(),
+        )
+        .expect("request");
+        let signed =
+            sign_daemon_rpc_request_from_data_dir(&data_dir, &request).expect("signed request");
+        let control_request = request.with_auth(signed);
+        let (address_tx, address_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let runtime =
+                crate::build_daemon_async_runtime("daemon-registry-error-test").expect("runtime");
+            let service_runtime = runtime.handle().clone();
+            runtime
+                .block_on(async move {
+                    let listener =
+                        sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+                            .await
+                            .expect("listener");
+                    let stream_address = listener.local_addr_string().expect("listener address");
+                    address_tx
+                        .send(stream_address.clone())
+                        .expect("send listener address");
+                    let service_host =
+                        crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_services(
+                            paths.clone(),
+                            service_runtime.clone(),
+                            vec![crate::DaemonServiceRegistryHook::new(|builder| {
+                                builder.register(FailingRegistryService)
+                            })],
+                        )
+                        .await
+                        .expect("service host");
+                    let stream = listener.accept().await.expect("accept");
+                    handle_daemon_connection_async(
+                        stream,
+                        paths,
+                        service_host,
+                        service_runtime,
+                        stream_address,
+                    )
+                    .await
+                })
+                .expect("registry failure is framed and handled");
+        });
+
+        let address = address_rx.recv().expect("listener address");
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("client runtime");
+        let response = client_runtime
+            .block_on(async {
+                let timeouts = sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
+                    Duration::from_secs(2),
+                );
+                let frame_options = sinomo_core::network::ObjectFrameIoOptions::none()
+                    .with_idle_timeout(timeouts.idle_timeout);
+                let mut stream =
+                    sinomo_core::network::AsyncDaemonControlStream::connect_with_options(
+                        &address, timeouts,
+                    )
+                    .await?;
+                stream
+                    .write_request(&address, &control_request, frame_options)
+                    .await?;
+                stream
+                    .read_response(&address, DAEMON_COMMAND_MAX_BYTES, frame_options)
+                    .await
+            })
+            .expect("framed registry error response");
+        assert_eq!(response.route, "/benchmarks/cancel-probe");
+        let error = response
+            .error_detail()
+            .expect_err("handler failures are RPC errors");
+        assert!(
+            error.to_string().contains("injected registry failure"),
+            "unexpected error detail: {error}"
+        );
         server.join().expect("server thread");
     }
 

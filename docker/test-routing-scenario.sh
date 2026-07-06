@@ -3,8 +3,8 @@
 #
 # This starts exactly one Sinomo compose project, extends the 6-node segmented
 # topology shape into a smaller host-forwarded/manual-endpoint plus routed-LAN
-# case, then verifies cluster health, endpoint probing, routed RPC, and a small
-# DFS cross-node flow.
+# case, then verifies cluster health, endpoint probing, routed RPC, routed
+# payload throughput, and small plus large DFS cross-node flows.
 set -euo pipefail
 
 SINOMO_DOCKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,6 +16,23 @@ DFS_READY_WAIT="${SINOMO_SCENARIO_DFS_READY_WAIT:-120}"
 EXPECT_TIMEOUT="${SINOMO_SCENARIO_EXPECT_TIMEOUT:-90}"
 POLL_INTERVAL="${SINOMO_SCENARIO_POLL_INTERVAL:-1}"
 PUBLIC_PORT="${SINOMO_SCENARIO_PUBLIC_PORT:-32166}"
+NETWORK_REQUESTS_PER_TARGET="${SINOMO_SCENARIO_NETWORK_REQUESTS_PER_TARGET:-4}"
+NETWORK_WARMUP_REQUESTS_PER_TARGET="${SINOMO_SCENARIO_NETWORK_WARMUP_REQUESTS_PER_TARGET:-2}"
+NETWORK_CONCURRENCY="${SINOMO_SCENARIO_NETWORK_CONCURRENCY:-8}"
+NETWORK_TIMEOUT_MS="${SINOMO_SCENARIO_NETWORK_TIMEOUT_MS:-2000}"
+NETWORK_PAYLOAD_REQUESTS_PER_TARGET="${SINOMO_SCENARIO_NETWORK_PAYLOAD_REQUESTS_PER_TARGET:-4}"
+NETWORK_PAYLOAD_WARMUP_REQUESTS_PER_TARGET="${SINOMO_SCENARIO_NETWORK_PAYLOAD_WARMUP_REQUESTS_PER_TARGET:-2}"
+NETWORK_PAYLOAD_CONCURRENCY="${SINOMO_SCENARIO_NETWORK_PAYLOAD_CONCURRENCY:-8}"
+NETWORK_PAYLOAD_TIMEOUT_MS="${SINOMO_SCENARIO_NETWORK_PAYLOAD_TIMEOUT_MS:-5000}"
+NETWORK_PAYLOAD_REQUEST_BYTES="${SINOMO_SCENARIO_NETWORK_PAYLOAD_REQUEST_BYTES:-262144}"
+NETWORK_PAYLOAD_RESPONSE_BYTES="${SINOMO_SCENARIO_NETWORK_PAYLOAD_RESPONSE_BYTES:-262144}"
+NETWORK_PAYLOAD_MIN_BYTES_PER_SEC="${SINOMO_SCENARIO_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC:-8388608}"
+NETWORK_READY_WAIT="${SINOMO_SCENARIO_NETWORK_READY_WAIT:-20}"
+LARGE_BYTES="${SINOMO_SCENARIO_LARGE_BYTES:-16777216}"
+LARGE_TIMEOUT="${SINOMO_SCENARIO_LARGE_TIMEOUT:-180}"
+LARGE_MIN_WRITE_BYTES_PER_SEC="${SINOMO_SCENARIO_LARGE_MIN_WRITE_BYTES_PER_SEC:-4194304}"
+LARGE_MIN_READ_BYTES_PER_SEC="${SINOMO_SCENARIO_LARGE_MIN_READ_BYTES_PER_SEC:-4194304}"
+LARGE_MAX_READ_PROC_WRITE_BYTES="${SINOMO_SCENARIO_LARGE_MAX_READ_PROC_WRITE_BYTES:-0}"
 EXPECTED_MAINS=3
 NODES="node1 node2 node3"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
@@ -145,6 +162,47 @@ wait_for_dfs_ready() {
   done
 }
 
+wait_for_network_ready() {
+  local deadline node pending still
+  deadline=$(( $(date +%s) + NETWORK_READY_WAIT ))
+  pending="$NODES"
+  log "waiting for routed RPC readiness on all nodes (<=${NETWORK_READY_WAIT}s)"
+  while :; do
+    still=""
+    for node in $pending; do
+      if compose exec -T "$node" sinomo test run cluster.network.ping-benchmark \
+          --require-cluster \
+          --json \
+          --param expected-targets=2 \
+          --param "requests-per-target=$NETWORK_REQUESTS_PER_TARGET" \
+          --param "warmup-requests-per-target=$NETWORK_WARMUP_REQUESTS_PER_TARGET" \
+          --param "concurrency=$NETWORK_CONCURRENCY" \
+          --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
+          --param max-failures=0 \
+          --param max-p50-ms=1000 \
+          --param max-p95-ms=3000 \
+          --param max-p50-us=0 \
+          --param max-p95-us=0 \
+          --param min-requests-per-second=1 \
+          >"$ARTIFACTS/network-ready-$node.last.json" 2>&1; then
+        log "  network-ready: $node"
+      else
+        still="$still $node"
+      fi
+    done
+    pending="${still# }"
+    [ -z "$pending" ] && return 0
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      log "routed RPC readiness timed out for: $pending"
+      for node in $pending; do
+        sed 's/^/[routing-scenario]   /' "$ARTIFACTS/network-ready-$node.last.json" | tail -12
+      done
+      return 1
+    fi
+    sleep "$POLL_INTERVAL"
+  done
+}
+
 PROBE_INDEX=0
 run_probe() {
   local node="$1" id="$2" slug probe_log
@@ -166,16 +224,35 @@ run_network_probe() {
   local node="$1"
   run_probe "$node" cluster.network.ping-benchmark \
     --param expected-targets=2 \
-    --param requests-per-target=4 \
-    --param warmup-requests-per-target=2 \
-    --param concurrency=8 \
-    --param timeout-ms=2000 \
+    --param "requests-per-target=$NETWORK_REQUESTS_PER_TARGET" \
+    --param "warmup-requests-per-target=$NETWORK_WARMUP_REQUESTS_PER_TARGET" \
+    --param "concurrency=$NETWORK_CONCURRENCY" \
+    --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
     --param max-failures=0 \
     --param max-p50-ms=1000 \
     --param max-p95-ms=3000 \
     --param max-p50-us=0 \
     --param max-p95-us=0 \
     --param min-requests-per-second=1
+}
+
+run_network_payload_probe() {
+  local node="$1"
+  run_probe "$node" cluster.network.ping-benchmark \
+    --param expected-targets=2 \
+    --param "requests-per-target=$NETWORK_PAYLOAD_REQUESTS_PER_TARGET" \
+    --param "warmup-requests-per-target=$NETWORK_PAYLOAD_WARMUP_REQUESTS_PER_TARGET" \
+    --param "concurrency=$NETWORK_PAYLOAD_CONCURRENCY" \
+    --param "timeout-ms=$NETWORK_PAYLOAD_TIMEOUT_MS" \
+    --param max-failures=0 \
+    --param max-p50-ms=0 \
+    --param max-p95-ms=0 \
+    --param max-p50-us=0 \
+    --param max-p95-us=0 \
+    --param "payload-bytes=$NETWORK_PAYLOAD_REQUEST_BYTES" \
+    --param "response-payload-bytes=$NETWORK_PAYLOAD_RESPONSE_BYTES" \
+    --param min-requests-per-second=0 \
+    --param "min-payload-bytes-per-second=$NETWORK_PAYLOAD_MIN_BYTES_PER_SEC"
 }
 
 assert_forwarded_endpoint_configured() {
@@ -227,6 +304,34 @@ run_cross_segment_dfs() {
     --param "timeout-seconds=$EXPECT_TIMEOUT"
 }
 
+run_large_routed_dfs() {
+  local path_a path_b
+  path_a="/services/routing-scenario/$RUN_ID/large-node2-to-node3.bin"
+  path_b="/services/routing-scenario/$RUN_ID/large-node3-to-node2.bin"
+  run_probe node2 cluster.dfs.large-write \
+    --param "path=$path_a" \
+    --param "bytes=$LARGE_BYTES" \
+    --param "timeout-seconds=$LARGE_TIMEOUT" \
+    --param "min-bytes-per-second=$LARGE_MIN_WRITE_BYTES_PER_SEC" \
+  && run_probe node3 cluster.dfs.large-expect \
+    --param "path=$path_a" \
+    --param "bytes=$LARGE_BYTES" \
+    --param "timeout-seconds=$LARGE_TIMEOUT" \
+    --param "min-bytes-per-second=$LARGE_MIN_READ_BYTES_PER_SEC" \
+    --param "max-proc-write-bytes=$LARGE_MAX_READ_PROC_WRITE_BYTES" \
+  && run_probe node3 cluster.dfs.large-write \
+    --param "path=$path_b" \
+    --param "bytes=$LARGE_BYTES" \
+    --param "timeout-seconds=$LARGE_TIMEOUT" \
+    --param "min-bytes-per-second=$LARGE_MIN_WRITE_BYTES_PER_SEC" \
+  && run_probe node2 cluster.dfs.large-expect \
+    --param "path=$path_b" \
+    --param "bytes=$LARGE_BYTES" \
+    --param "timeout-seconds=$LARGE_TIMEOUT" \
+    --param "min-bytes-per-second=$LARGE_MIN_READ_BYTES_PER_SEC" \
+    --param "max-proc-write-bytes=$LARGE_MAX_READ_PROC_WRITE_BYTES"
+}
+
 require_no_other_sinomo_projects
 if [ "${SINOMO_SCENARIO_BUILD:-1}" = 1 ]; then
   log "building host binary"
@@ -241,10 +346,16 @@ log "starting compose project $PROJECT"
 compose up --build -d
 wait_for_cluster_ready
 assert_forwarded_endpoint_configured
+wait_for_network_ready
 run_network_probe node1
+run_network_probe node2
 run_network_probe node3
+run_network_payload_probe node1
+run_network_payload_probe node2
+run_network_payload_probe node3
 assert_forwarded_endpoint_active
 wait_for_dfs_ready
 run_cross_segment_dfs
+run_large_routed_dfs
 
 log "PASS; artifacts in $ARTIFACTS"
