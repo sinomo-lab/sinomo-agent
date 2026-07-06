@@ -94,12 +94,7 @@ impl TcpTunnelRegistry {
             return Ok(());
         };
         if let Some(existing) = peers.get(&handle.peer_node_id).cloned() {
-            if existing.active_requests.load(Ordering::Relaxed) > 0 {
-                return Err(existing);
-            }
-            peers.insert(handle.peer_node_id.clone(), handle);
-            existing.request_close("replaced by newer idle tunnel".to_string());
-            return Ok(());
+            return Err(existing);
         }
         peers.insert(handle.peer_node_id.clone(), handle);
         Ok(())
@@ -127,6 +122,13 @@ impl TcpTunnelRegistry {
             .lock()
             .ok()
             .and_then(|mut peers| peers.remove(node_id))
+    }
+
+    fn peer_ids(&self) -> Vec<NodeId> {
+        self.peers
+            .lock()
+            .map(|peers| peers.keys().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -828,35 +830,39 @@ async fn maintain_tcp_tunnels_once(
         selector.select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates);
     endpoints.extend(selector.select(ClusterEndpointSelectionPurpose::NetworkProbe));
     let mut live_peers = BTreeSet::new();
+    for peer_node_id in TCP_TUNNELS.peer_ids() {
+        if peer_node_id == state.local_node_id {
+            continue;
+        }
+        match ping_tcp_tunnel_peer(&state.local_node_id, &peer_node_id, paths, runtime).await {
+            Ok(()) => {
+                let synthetic = tcp_tunnel_synthetic_endpoint(&state.local_node_id, &peer_node_id);
+                remember_tcp_tunnel_connectivity(
+                    paths,
+                    &synthetic,
+                    sinomo_core::network::ClusterConnectivityState::Healthy,
+                    Some(runtime),
+                )
+                .await;
+                live_peers.insert(peer_node_id);
+            }
+            Err(error) => {
+                evict_tcp_tunnel_peer(&peer_node_id, format!("maintenance ping failed: {error}"))
+                    .await;
+                let synthetic = tcp_tunnel_synthetic_endpoint(&state.local_node_id, &peer_node_id);
+                remember_tcp_tunnel_connectivity(
+                    paths,
+                    &synthetic,
+                    sinomo_core::network::ClusterConnectivityState::Unreachable,
+                    Some(runtime),
+                )
+                .await;
+            }
+        }
+    }
     for endpoint in tcp_tunnel_maintenance_candidate_endpoints(&state.local_node_id, endpoints) {
         if live_peers.contains(&endpoint.node_id) {
             continue;
-        }
-        if TCP_TUNNELS.contains(&endpoint.node_id) {
-            match ping_tcp_tunnel_peer(&state.local_node_id, &endpoint.node_id, paths, runtime)
-                .await
-            {
-                Ok(()) => {
-                    live_peers.insert(endpoint.node_id.clone());
-                    continue;
-                }
-                Err(error) => {
-                    evict_tcp_tunnel_peer(
-                        &endpoint.node_id,
-                        format!("maintenance ping failed: {error}"),
-                    )
-                    .await;
-                    let synthetic =
-                        tcp_tunnel_synthetic_endpoint(&state.local_node_id, &endpoint.node_id);
-                    remember_tcp_tunnel_connectivity(
-                        paths,
-                        &synthetic,
-                        sinomo_core::network::ClusterConnectivityState::Unreachable,
-                        Some(runtime),
-                    )
-                    .await;
-                }
-            }
         }
         if connect_tcp_tunnel_to_endpoint(&endpoint, runtime, Some(paths))
             .await
@@ -908,6 +914,7 @@ fn tcp_tunnel_maintenance_candidate_endpoints(
         .filter(|endpoint| {
             endpoint.node_id != *local_node_id
                 && endpoint.transport == ClusterTransportKind::LanTcp
+                && !tcp_tunnel_is_synthetic_endpoint(endpoint)
                 && sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
                 && tcp_tunnel_should_maintain_outbound(local_node_id, &endpoint.node_id)
         })
@@ -980,6 +987,17 @@ async fn connect_tcp_tunnel_to_endpoint_after_lock(
         Some(runtime),
     )
     .await;
+    let synthetic =
+        tcp_tunnel_connectivity_context(&paths, &endpoint.node_id).map(|(_, _, endpoint)| endpoint);
+    if let Some(synthetic) = synthetic.as_ref() {
+        remember_tcp_tunnel_connectivity(
+            &paths,
+            synthetic,
+            sinomo_core::network::ClusterConnectivityState::Healthy,
+            Some(runtime),
+        )
+        .await;
+    }
     Ok(handle)
 }
 
@@ -1615,6 +1633,31 @@ mod tests {
         assert!(handle.clean_shutdown.load(Ordering::Relaxed));
     }
 
+    #[test]
+    fn tcp_tunnel_registry_keeps_existing_tunnel_on_duplicate_open() {
+        let (existing_tx, _existing_rx) = mpsc::channel(1);
+        let (duplicate_tx, _duplicate_rx) = mpsc::channel(1);
+        let node_name = "tcp_tunnel_duplicate_retains_existing";
+        let existing = test_tunnel_handle(node_name, existing_tx);
+        let duplicate = test_tunnel_handle(node_name, duplicate_tx);
+        let registry = TcpTunnelRegistry::default();
+
+        assert!(registry.insert_or_existing(existing.clone()).is_ok());
+        let returned = registry
+            .insert_or_existing(duplicate.clone())
+            .expect_err("duplicate should return existing handle");
+
+        assert!(Arc::ptr_eq(&returned, &existing));
+        assert!(Arc::ptr_eq(
+            &registry
+                .get(&existing.peer_node_id)
+                .expect("registered existing tunnel"),
+            &existing
+        ));
+        assert!(!existing.clean_shutdown.load(Ordering::Relaxed));
+        assert!(!duplicate.clean_shutdown.load(Ordering::Relaxed));
+    }
+
     #[tokio::test]
     async fn tcp_tunnel_existing_request_failure_is_route_error() {
         let (tx, rx) = mpsc::channel(1);
@@ -1809,6 +1852,7 @@ mod tests {
                 "198.51.100.76:21353",
                 ClusterTransportKind::LanTcp,
             ),
+            tcp_tunnel_synthetic_endpoint(&local, &peer),
             test_endpoint(
                 "tcp_tunnel_maintenance_loopback",
                 &peer,
@@ -2028,7 +2072,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_tunnel_duplicate_insert_replaces_idle_existing_handle() {
+    fn tcp_tunnel_duplicate_insert_keeps_idle_existing_handle() {
         let registry = TcpTunnelRegistry::default();
         let peer_name = "tcp_tunnel_duplicate_idle_peer";
         let peer = NodeId::from_legacy_named(peer_name).expect("test node id");
@@ -2038,13 +2082,16 @@ mod tests {
         let second = test_tunnel_handle(peer_name, second_tx);
 
         assert!(registry.insert_or_existing(first.clone()).is_ok());
-        assert!(registry.insert_or_existing(second.clone()).is_ok());
+        let duplicate = registry.insert_or_existing(second.clone());
 
+        assert!(duplicate.is_err());
+        let existing = duplicate.err().expect("existing handle");
+        assert!(Arc::ptr_eq(&existing, &first));
         assert!(Arc::ptr_eq(
             &registry.get(&peer).expect("registered"),
-            &second
+            &first
         ));
-        assert!(first.clean_shutdown.load(Ordering::Relaxed));
+        assert!(!first.clean_shutdown.load(Ordering::Relaxed));
         assert!(!second.clean_shutdown.load(Ordering::Relaxed));
     }
 }
