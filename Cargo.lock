@@ -8232,6 +8232,7 @@ dependencies = [
  "sinomo-sandbox-wasix-host",
  "sinomo-supervision",
  "sinomo-test",
+ "sinomo-vfs",
 ]
 
 [[package]]
@@ -8377,6 +8378,19 @@ dependencies = [
 [[package]]
 name = "sinomo-testdir"
 version = "0.1.0"
+
+[[package]]
+name = "sinomo-vfs"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-core",
+ "sinomo-daemon",
+ "sinomo-dfs",
+ "sinomo-testdir",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "sinomo-video"

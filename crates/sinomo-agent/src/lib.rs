@@ -16,8 +16,8 @@ use sinomo_runtime::observe::{ObserveError, ObserveMetricRecord};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 mod agent;
@@ -1356,21 +1356,18 @@ pub trait AgentDefinitionStore {
 #[derive(Debug)]
 pub struct AgentDefinitionSifsStore {
     root: String,
-    opened: Mutex<sinomo_runtime::dfs::OpenedMountedSifsService>,
+    objects: sinomo_runtime::vfs::DirectoryObjectStore<AgentDefinition>,
 }
 
 impl AgentDefinitionSifsStore {
     pub fn open(data_dir: Option<PathBuf>) -> Result<Self, AgentDefinitionStoreError> {
-        let opened =
-            sinomo_runtime::dfs::open_mounted_sifs_service(data_dir).map_err(|source| {
-                AgentDefinitionStoreError::Io {
-                    path: AGENT_DEFINITION_SIFS_ROOT.to_string(),
-                    detail: source.to_string(),
-                }
-            })?;
+        let handle = sinomo_runtime::vfs::VfsHandle::mounted_sifs(data_dir)
+            .and_then(|handle| handle.scoped(AGENT_DEFINITION_SIFS_ROOT))
+            .map_err(agent_definition_vfs_error)?;
+        let objects = sinomo_runtime::vfs::DirectoryObjectStore::json(handle, "json");
         Ok(Self {
             root: AGENT_DEFINITION_SIFS_ROOT.to_string(),
-            opened: Mutex::new(opened),
+            objects,
         })
     }
 
@@ -1378,73 +1375,27 @@ impl AgentDefinitionSifsStore {
         &self.root
     }
 
-    fn definition_path_for_id(&self, id: &str) -> Result<String, AgentDefinitionStoreError> {
+    fn validate_definition_id(&self, id: &str) -> Result<(), AgentDefinitionStoreError> {
         if !is_valid_agent_definition_id(id) {
             return Err(AgentDefinitionStoreError::Validation(
                 AgentDefinitionValidationError::InvalidId { id: id.to_string() },
             ));
         }
-        Ok(format!("{}/{}.json", self.root, id))
-    }
-
-    fn definition_path(
-        &self,
-        definition: &AgentDefinition,
-    ) -> Result<String, AgentDefinitionStoreError> {
-        self.definition_path_for_id(definition.key())
+        Ok(())
     }
 }
 
 impl AgentDefinitionStore for AgentDefinitionSifsStore {
     fn load_definitions(&self) -> Result<Vec<AgentDefinition>, AgentDefinitionStoreError> {
-        let mut opened = self
-            .opened
-            .lock()
-            .map_err(|_| AgentDefinitionStoreError::Io {
-                path: self.root.clone(),
-                detail: "SIFS agent definition store lock is poisoned".to_string(),
-            })?;
-        let entries = match opened.service.posix_list_dir_distributed(&self.root) {
-            Ok(entries) => entries,
-            Err(sinomo_runtime::dfs::DfsPosixError::NotFound { .. }) => return Ok(Vec::new()),
-            Err(source) => {
-                return Err(AgentDefinitionStoreError::Io {
-                    path: self.root.clone(),
-                    detail: source.to_string(),
-                });
-            }
-        };
-        let mut paths = entries
-            .into_iter()
-            .filter(|entry| {
-                entry.kind == sinomo_runtime::dfs::DfsObjectKind::File
-                    && entry.name.ends_with(".json")
-            })
-            .map(|entry| entry.path)
-            .collect::<Vec<_>>();
-        paths.sort();
-
-        let mut definitions = Vec::new();
-        for path in paths {
-            let bytes = opened
-                .service
-                .posix_read_file_distributed(&path)
-                .map_err(|source| AgentDefinitionStoreError::Io {
-                    path: path.clone(),
-                    detail: source.to_string(),
-                })?;
-            let mut definition: AgentDefinition =
-                serde_json::from_slice(&bytes).map_err(|source| {
-                    AgentDefinitionStoreError::Json {
-                        path: path.clone(),
-                        detail: source.to_string(),
-                    }
-                })?;
+        let mut definitions = self
+            .objects
+            .load_all()
+            .map_err(agent_definition_vfs_error)?;
+        for definition in &mut definitions {
             if definition.id.is_empty() {
                 definition.id = definition.name.clone();
             }
             definition.validate()?;
-            definitions.push(definition);
         }
         Ok(definitions)
     }
@@ -1458,61 +1409,32 @@ impl AgentDefinitionStore for AgentDefinitionSifsStore {
             definition.id = definition.name.clone();
         }
         definition.validate()?;
-        let path = self.definition_path(&definition)?;
-        let bytes = serde_json::to_vec_pretty(&definition).map_err(|source| {
-            AgentDefinitionStoreError::Json {
-                path: path.clone(),
-                detail: source.to_string(),
-            }
-        })?;
-        let mut opened = self
-            .opened
-            .lock()
-            .map_err(|_| AgentDefinitionStoreError::Io {
-                path: path.clone(),
-                detail: "SIFS agent definition store lock is poisoned".to_string(),
-            })?;
-        opened
-            .service
-            .posix_mkdir_all(&self.root)
-            .map_err(|source| AgentDefinitionStoreError::Io {
-                path: self.root.clone(),
-                detail: source.to_string(),
-            })?;
-        let mut candidates = opened.replica_candidates.clone();
-        if !candidates.contains(opened.service.node_id()) {
-            candidates.insert(0, opened.service.node_id().clone());
-        }
-        let mut options = sinomo_runtime::dfs::DfsWriteOptions::replicated_eventual(candidates);
-        options.foreground_replica_repair = false;
-        opened
-            .service
-            .posix_write_file(&path, &bytes, options)
-            .map(drop)
-            .map_err(|source| AgentDefinitionStoreError::Io {
-                path: path.clone(),
-                detail: source.to_string(),
-            })?;
-        Ok(path)
+        self.validate_definition_id(definition.key())?;
+        self.objects
+            .save(definition.key(), &definition)
+            .map_err(agent_definition_vfs_error)
     }
 
     fn delete_definition(&self, id: &str) -> Result<bool, AgentDefinitionStoreError> {
-        let path = self.definition_path_for_id(id)?;
-        let mut opened = self
-            .opened
-            .lock()
-            .map_err(|_| AgentDefinitionStoreError::Io {
-                path: path.clone(),
-                detail: "SIFS agent definition store lock is poisoned".to_string(),
-            })?;
-        match opened.service.posix_unlink(&path) {
-            Ok(_) => Ok(true),
-            Err(sinomo_runtime::dfs::DfsPosixError::NotFound { .. }) => Ok(false),
-            Err(source) => Err(AgentDefinitionStoreError::Io {
-                path,
-                detail: source.to_string(),
-            }),
+        self.validate_definition_id(id)?;
+        self.objects.delete(id).map_err(agent_definition_vfs_error)
+    }
+}
+
+fn agent_definition_vfs_error(source: sinomo_runtime::vfs::VfsError) -> AgentDefinitionStoreError {
+    let path = source
+        .path()
+        .unwrap_or(AGENT_DEFINITION_SIFS_ROOT)
+        .to_string();
+    match source {
+        sinomo_runtime::vfs::VfsError::Json { detail, .. }
+        | sinomo_runtime::vfs::VfsError::Sobj { detail, .. } => {
+            AgentDefinitionStoreError::Json { path, detail }
         }
+        other => AgentDefinitionStoreError::Io {
+            path,
+            detail: other.to_string(),
+        },
     }
 }
 

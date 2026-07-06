@@ -53,6 +53,7 @@ default-members = [
     "crates/sinomo-supervision",
     "crates/sinomo-test",
     "crates/sinomo-testdir",
+    "crates/sinomo-vfs",
     "crates/sinomo-video",
     "crates/sinomo-voice",
 ]
