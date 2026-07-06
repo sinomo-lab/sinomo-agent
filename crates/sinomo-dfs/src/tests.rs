@@ -9761,6 +9761,100 @@ fn routed_manifest_write_controls_response_journal_replay() {
 }
 
 #[test]
+fn routed_inline_write_preserves_nonforeground_repair_mode() {
+    let root = temp_root("routed-inline-nonforeground-repair");
+    let writer = NodeId::from_legacy_named("node_routed_inline_writer").expect("writer");
+    let primary = NodeId::from_legacy_named("node_routed_inline_primary").expect("primary");
+    let file_system = file_system(primary.clone());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![writer.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control.put_metadata_shard(&shard).expect("metadata shard");
+    });
+
+    let captured_commands = Arc::new(Mutex::new(Vec::<DfsDistributedWriteCommand>::new()));
+    let captured_commands_for_sender = Arc::clone(&captured_commands);
+    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+        if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
+            &command.routed_message.message
+        {
+            captured_commands_for_sender
+                .lock()
+                .expect("capture")
+                .push(write_command.clone());
+        }
+        Ok(DfsMessageResponse {
+            request_id: command.request_id.clone(),
+            outbound_messages: Vec::new(),
+        })
+    });
+    let transport = DfsEndpointTransport::with_connect_timeout(
+        writer.clone(),
+        vec![test_endpoint(&primary, "192.0.2.67:21353")],
+        Duration::from_millis(1),
+        sender,
+    );
+    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(transport, writer_content)
+        .with_control_plane(control_plane)
+        .with_metadata_backend(
+            open_local_sharded_metadata_backend(root.join("metadata"), vec![shard.clone()])
+                .expect("metadata backend"),
+        )
+        .expect("attach metadata backend");
+    dfs.add_file_system(file_system.clone())
+        .expect("writer filesystem");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = "/routed-inline-nonforeground.bin".to_string();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(object.clone())
+        .expect("writer object");
+
+    dfs.route_distributed_write_to_metadata_primary(
+        DfsWriteRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            target_version: DfsVersion::from_legacy_named("version_routed_inline_nonforeground")
+                .expect("version"),
+            requesting_node_id: writer.clone(),
+        },
+        Some(object.version.clone()),
+        b"routed-inline-nonforeground".to_vec(),
+        vec![writer, primary],
+        DfsReplicationPolicy::new(1, 2).expect("policy"),
+        object,
+        shard,
+        false,
+    )
+    .expect("route inline nonforeground write");
+
+    let commands = captured_commands.lock().expect("capture").clone();
+    assert_eq!(commands.len(), 1);
+    assert!(
+        !commands[0].foreground_replica_repair,
+        "inline routed writes must preserve nonforeground repair mode"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
     let root = temp_root("served-endpoint-reader-write-fetch-stage");
     let writer = NodeId::from_legacy_named("node_served_endpoint_writer").expect("writer node");
