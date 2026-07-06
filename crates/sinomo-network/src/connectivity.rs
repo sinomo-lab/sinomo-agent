@@ -903,6 +903,9 @@ pub fn cluster_connectivity_probe_due_with_startup_settle(
     if startup_settle_active && record.state != ClusterConnectivityState::Healthy {
         return true;
     }
+    if startup_settle_active && retry_due {
+        return true;
+    }
     if record.expires_at <= refresh_deadline {
         return true;
     }

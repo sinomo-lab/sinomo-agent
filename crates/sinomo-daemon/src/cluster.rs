@@ -11143,6 +11143,76 @@ mod tests {
     }
 
     #[test]
+    fn connectivity_probe_revalidates_old_healthy_during_startup_settle() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_daemon_startup_healthy_reprobe")
+            .expect("cluster id");
+        let local_node = NodeId::from_legacy_named("node_daemon_startup_healthy_reprobe_local")
+            .expect("local node");
+        let remote_node = NodeId::from_legacy_named("node_daemon_startup_healthy_reprobe_remote")
+            .expect("remote node");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "startup healthy reprobe",
+            local_node,
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "10.0.0.57:21353".to_string(),
+            10,
+        );
+        let record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            sinomo_core::network::ClusterConnectivityState::Healthy,
+            Some(5),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let retry_at =
+            now + time::Duration::seconds(DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL.as_secs() as i64);
+        let refresh_deadline =
+            retry_at + time::Duration::seconds(CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS);
+
+        assert!(
+            !sinomo_core::network::cluster_connectivity_probe_due_with_startup_settle(
+                &record,
+                now + time::Duration::milliseconds(250),
+                now + time::Duration::seconds(CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS),
+                &ClusterNodeRole::Workstation,
+                true,
+            ),
+            "fresh healthy records should not churn every startup-settle tick"
+        );
+        assert!(
+            sinomo_core::network::cluster_connectivity_probe_due_with_startup_settle(
+                &record,
+                retry_at,
+                refresh_deadline,
+                &ClusterNodeRole::Workstation,
+                true,
+            ),
+            "startup settle should revalidate old healthy records from the previous daemon"
+        );
+        assert!(
+            !sinomo_core::network::cluster_connectivity_probe_due_with_startup_settle(
+                &record,
+                retry_at,
+                refresh_deadline,
+                &ClusterNodeRole::Workstation,
+                false,
+            ),
+            "steady state keeps healthy records until refresh margin"
+        );
+    }
+
+    #[test]
     fn connectivity_probe_suppresses_rerouted_unhealthy_endpoint() {
         let now = OffsetDateTime::now_utc();
         let due_at =
