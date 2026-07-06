@@ -17,7 +17,7 @@
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -50,7 +50,8 @@ use sinomo_core::network::{
 use sinomo_core::service::{
     ClusterAccess, ResponseSink, Service, ServiceContext, ServiceDisposition, ServiceError,
     ServiceFuture, ServiceRegistry, ServiceRegistryBuilder, ServiceRegistrySnapshot,
-    ServiceRegistrySnapshotStore, ServiceRoute, ServiceSigner, ServiceStreamResponse,
+    ServiceRegistrySnapshotStore, ServiceRoute, ServiceSigner, ServiceStreamFuture,
+    ServiceStreamResponse,
 };
 use sinomo_dfs::register_services as register_dfs_services;
 use sinomo_module::{MODULE_NATIVE_DYLIB_CANCEL_ROUTE, MODULE_RPC_CATEGORY};
@@ -155,6 +156,39 @@ fn require_service_runtime<'a>(
             "{operation} requires the daemon-owned Tokio runtime"
         ))
     })
+}
+
+async fn forward_object_rpc_from_daemon_control(
+    payload: crate::DaemonObjectRpcForwardRequest,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ObjectRpcResponse, ServiceError> {
+    crate::client::send_object_rpc_to_target_async(
+        &payload.target_node_id,
+        &payload.request,
+        Duration::from_millis(payload.connect_timeout_millis),
+        runtime,
+        payload.observe_connectivity,
+    )
+    .await
+    .map_err(daemon_error)
+}
+
+fn service_stream_response_from_collected_object_rpc_response(
+    mut response: ObjectRpcResponse,
+) -> ServiceStreamResponse {
+    let reader = if sinomo_core::network::object_rpc_response_stream_mode(&response)
+        == sinomo_core::network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
+    {
+        Some(Box::new(Cursor::new(std::mem::take(&mut response.body)))
+            as Box<dyn std::io::Read + Send>)
+    } else {
+        None
+    };
+    ServiceStreamResponse {
+        response,
+        reader,
+        chunk_bytes: sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES,
+    }
 }
 
 /// Real cluster-KV access for services that consume it. Reads come from the local
@@ -527,18 +561,17 @@ impl Service for DaemonControlService {
                 }
                 DAEMON_OBJECT_RPC_FORWARD_ROUTE => {
                     let payload: crate::DaemonObjectRpcForwardRequest = request.decode_body()?;
+                    if payload.raw_response {
+                        return Err(ServiceError::Service(
+                            "raw daemon object-RPC forward requires a streamed daemon-control request"
+                                .to_string(),
+                        ));
+                    }
                     let runtime =
                         require_service_runtime(runtime.as_ref(), "daemon object RPC forward")?
                             .clone();
-                    let response = crate::client::send_object_rpc_to_target_async(
-                        &payload.target_node_id,
-                        &payload.request,
-                        Duration::from_millis(payload.connect_timeout_millis),
-                        &runtime,
-                        payload.observe_connectivity,
-                    )
-                    .await
-                    .map_err(daemon_error)?;
+                    let response =
+                        forward_object_rpc_from_daemon_control(payload, &runtime).await?;
                     (
                         ObjectRpcResponse::encode_body(request.route.as_str(), &response)?,
                         ServiceDisposition::Continue,
@@ -549,6 +582,35 @@ impl Service for DaemonControlService {
             ctx.respond(response)?;
             Ok(disposition)
         })
+    }
+
+    fn handle_stream(
+        &self,
+        _ctx: ServiceContext,
+        request: ObjectRpcRequest,
+    ) -> Option<ServiceStreamFuture<'_>> {
+        if request.route != DAEMON_OBJECT_RPC_FORWARD_ROUTE
+            || !sinomo_core::network::object_rpc_request_stream_mode(&request)
+                .expects_raw_streamed_response()
+        {
+            return None;
+        }
+        let runtime = self.runtime.clone();
+        Some(Box::pin(async move {
+            let payload: crate::DaemonObjectRpcForwardRequest = request.decode_body()?;
+            if !payload.raw_response {
+                return Err(ServiceError::Service(
+                    "streamed daemon object-RPC forward requires raw_response=true".to_string(),
+                ));
+            }
+            let runtime =
+                require_service_runtime(runtime.as_ref(), "daemon object RPC stream forward")?
+                    .clone();
+            let response = forward_object_rpc_from_daemon_control(payload, &runtime).await?;
+            Ok(service_stream_response_from_collected_object_rpc_response(
+                response,
+            ))
+        }))
     }
 }
 
@@ -4700,6 +4762,34 @@ mod tests {
     use super::*;
     use sinomo_core::kv::{InProcessKvStore, KvEntry, KvRevision, KvVersion};
     use std::time::Duration;
+
+    #[test]
+    fn collected_raw_object_rpc_response_is_reemitted_as_stream() {
+        let mut response =
+            ObjectRpcResponse::from_encoded_body("/test/raw-stream", b"stream-body".to_vec());
+        sinomo_core::network::set_object_rpc_response_stream_mode(
+            &mut response,
+            sinomo_core::network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
+        );
+
+        let mut stream_response =
+            service_stream_response_from_collected_object_rpc_response(response);
+
+        assert_eq!(stream_response.response.route, "/test/raw-stream");
+        assert!(stream_response.response.body.is_empty());
+        assert_eq!(
+            sinomo_core::network::object_rpc_response_stream_mode(&stream_response.response),
+            sinomo_core::network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
+        );
+        let mut bytes = Vec::new();
+        stream_response
+            .reader
+            .as_mut()
+            .expect("raw streamed response should keep a reader")
+            .read_to_end(&mut bytes)
+            .expect("read stream");
+        assert_eq!(bytes, b"stream-body");
+    }
 
     struct TestStopService;
 

@@ -74,6 +74,8 @@ pub struct DaemonObjectRpcForwardRequest {
     pub connect_timeout_millis: u64,
     #[serde(default)]
     pub observe_connectivity: bool,
+    #[serde(default)]
+    pub raw_response: bool,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, Eq, PartialEq)]

@@ -140,11 +140,22 @@ impl DaemonApiClient {
         connect_timeout: Duration,
         observe_connectivity: bool,
     ) -> Result<ObjectRpcResponse, DaemonError> {
+        if sinomo_core::network::object_rpc_request_stream_mode(request)
+            .expects_raw_streamed_response()
+        {
+            return self.object_rpc_to_target_raw_response(
+                target_node_id,
+                request,
+                connect_timeout,
+                observe_connectivity,
+            );
+        }
         let payload = DaemonObjectRpcForwardRequest {
             target_node_id: target_node_id.clone(),
             request: request.clone(),
             connect_timeout_millis: u64::try_from(connect_timeout.as_millis()).unwrap_or(u64::MAX),
             observe_connectivity,
+            raw_response: false,
         };
         let request = ObjectRpcRequest::encode_body(
             DAEMON_OBJECT_RPC_FORWARD_ROUTE,
@@ -154,10 +165,42 @@ impl DaemonApiClient {
         let response = crate::send_daemon_rpc_with_timeouts(
             &self.address,
             &request,
-            crate::client::object_rpc_transfer_timeouts(connect_timeout),
+            crate::client::object_rpc_forward_control_timeouts(connect_timeout),
         )?;
         response.error_detail()?;
         response.decode_body().map_err(DaemonError::from)
+    }
+
+    fn object_rpc_to_target_raw_response(
+        &self,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        connect_timeout: Duration,
+        observe_connectivity: bool,
+    ) -> Result<ObjectRpcResponse, DaemonError> {
+        let payload = DaemonObjectRpcForwardRequest {
+            target_node_id: target_node_id.clone(),
+            request: request.clone(),
+            connect_timeout_millis: u64::try_from(connect_timeout.as_millis()).unwrap_or(u64::MAX),
+            observe_connectivity,
+            raw_response: true,
+        };
+        let mut request = ObjectRpcRequest::encode_body(
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+            DAEMON_RPC_CATEGORY,
+            &payload,
+        )?;
+        sinomo_core::network::set_object_rpc_request_stream_mode(
+            &mut request,
+            sinomo_core::network::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+        );
+        let response = crate::send_daemon_rpc_with_timeouts(
+            &self.address,
+            &request,
+            crate::client::object_rpc_forward_control_timeouts(connect_timeout),
+        )?;
+        response.error_detail()?;
+        Ok(response)
     }
 
     pub fn dfs_object_rpc_to_target(

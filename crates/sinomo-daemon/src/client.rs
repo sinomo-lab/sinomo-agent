@@ -1071,6 +1071,12 @@ pub(crate) fn object_rpc_transfer_timeouts(
         .with_idle_timeout(Some(OBJECT_RPC_TRANSFER_IDLE_TIMEOUT))
 }
 
+pub(crate) fn object_rpc_forward_control_timeouts(
+    connect_timeout: Duration,
+) -> sinomo_core::network::DaemonRpcTimeouts {
+    object_rpc_transfer_timeouts(connect_timeout).with_idle_timeout(Some(connect_timeout))
+}
+
 pub fn fetch_daemon_status_from_address(
     address: &str,
     timeout: Duration,
@@ -1528,6 +1534,14 @@ mod tests {
 
         assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(60)));
         assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn object_rpc_forward_control_timeouts_bound_silent_local_forward() {
+        let timeouts = super::object_rpc_forward_control_timeouts(Duration::from_secs(60));
+
+        assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(60)));
     }
 
     #[test]
