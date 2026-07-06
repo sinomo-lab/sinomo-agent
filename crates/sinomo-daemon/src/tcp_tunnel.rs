@@ -18,14 +18,14 @@ use sinomo_core::{
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
 
 const TCP_TUNNEL_CHANNEL_CAPACITY: usize = 128;
-const TCP_TUNNEL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15);
+const TCP_TUNNEL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 const TCP_TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 const TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX: &str = "tcp-tunnel://";
 
@@ -74,13 +74,25 @@ impl TcpTunnelRegistry {
             .clone()
     }
 
-    fn insert(&self, handle: Arc<TcpTunnelHandle>) {
+    fn insert_or_existing(&self, handle: Arc<TcpTunnelHandle>) -> Result<(), Arc<TcpTunnelHandle>> {
         let Ok(mut peers) = self.peers.lock() else {
-            return;
+            return Ok(());
         };
-        if let Some(previous) = peers.insert(handle.peer_node_id.clone(), handle) {
-            previous.request_close("replaced by newer tunnel".to_string());
+        if let Some(existing) = peers.get(&handle.peer_node_id).cloned() {
+            if existing.active_requests.load(Ordering::Relaxed) > 0 {
+                return Err(existing);
+            }
+            peers.insert(handle.peer_node_id.clone(), handle);
+            existing.request_close("replaced by newer idle tunnel".to_string());
+            return Ok(());
         }
+        peers.insert(handle.peer_node_id.clone(), handle);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn insert(&self, handle: Arc<TcpTunnelHandle>) {
+        let _ = self.insert_or_existing(handle);
     }
 
     fn remove_if_same(&self, handle: &Arc<TcpTunnelHandle>) {
@@ -108,7 +120,16 @@ struct TcpTunnelHandle {
     tx: mpsc::Sender<ClusterTcpTunnelFrame>,
     pending: PendingTcpTunnelMap,
     next_request_id: AtomicU64,
+    active_requests: AtomicUsize,
     clean_shutdown: AtomicBool,
+}
+
+struct TcpTunnelActiveRequestGuard<'a>(&'a AtomicUsize);
+
+impl Drop for TcpTunnelActiveRequestGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl TcpTunnelHandle {
@@ -122,6 +143,8 @@ impl TcpTunnelHandle {
         request: ObjectRpcRequest,
         timeouts: DaemonRpcTimeouts,
     ) -> Result<ObjectRpcResponse, NetworkError> {
+        self.active_requests.fetch_add(1, Ordering::Relaxed);
+        let _active_request = TcpTunnelActiveRequestGuard(&self.active_requests);
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending
@@ -318,27 +341,8 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
             ),
         }));
     }
-    match connect_tcp_tunnel_to_endpoint(endpoint, runtime, paths).await {
-        Ok(handle) => match send_over_tcp_tunnel_handle(handle, signed, timeouts).await {
-            Ok(response) => Some(Ok(response)),
-            Err(error) => {
-                tracing::debug!(
-                    "tcp tunnel send to {} ({}) failed after tunnel open: {error}",
-                    endpoint.node_id,
-                    endpoint.address
-                );
-                Some(Err(error))
-            }
-        },
-        Err(error) => {
-            tracing::debug!(
-                "tcp tunnel open to {} ({}) failed: {error}",
-                endpoint.node_id,
-                endpoint.address
-            );
-            None
-        }
-    }
+    spawn_tcp_tunnel_connect_attempt(endpoint, runtime, paths);
+    None
 }
 
 fn tcp_tunnel_connectivity_context(
@@ -518,7 +522,7 @@ fn send_tcp_tunnel_stream_chunks_blocking(
 }
 
 fn tcp_tunnel_should_maintain_outbound(local_node_id: &NodeId, peer_node_id: &NodeId) -> bool {
-    local_node_id < peer_node_id
+    local_node_id != peer_node_id
 }
 
 async fn maintain_tcp_tunnels_once(
@@ -629,6 +633,14 @@ async fn connect_tcp_tunnel_to_endpoint(
     }
     let connect_lock = TCP_TUNNELS.connect_lock(&endpoint.node_id);
     let _connect_guard = connect_lock.lock().await;
+    connect_tcp_tunnel_to_endpoint_after_lock(endpoint, runtime, paths).await
+}
+
+async fn connect_tcp_tunnel_to_endpoint_after_lock(
+    endpoint: &ClusterEndpointRecord,
+    runtime: &tokio::runtime::Handle,
+    paths: Option<&DaemonPaths>,
+) -> Result<Arc<TcpTunnelHandle>, NetworkError> {
     if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
         return Ok(handle);
     }
@@ -680,6 +692,33 @@ async fn connect_tcp_tunnel_to_endpoint(
     Ok(handle)
 }
 
+fn spawn_tcp_tunnel_connect_attempt(
+    endpoint: &ClusterEndpointRecord,
+    runtime: &tokio::runtime::Handle,
+    paths: Option<&DaemonPaths>,
+) {
+    let connect_lock = TCP_TUNNELS.connect_lock(&endpoint.node_id);
+    let Ok(connect_guard) = connect_lock.try_lock_owned() else {
+        return;
+    };
+    let endpoint = endpoint.clone();
+    let runtime_for_task = runtime.clone();
+    let paths = paths.cloned().or_else(daemon_paths_from_env);
+    runtime.spawn(async move {
+        let _connect_guard = connect_guard;
+        if let Err(error) =
+            connect_tcp_tunnel_to_endpoint_after_lock(&endpoint, &runtime_for_task, paths.as_ref())
+                .await
+        {
+            tracing::debug!(
+                "background tcp tunnel open to {} ({}) failed: {error}",
+                endpoint.node_id,
+                endpoint.address
+            );
+        }
+    });
+}
+
 async fn signed_tcp_tunnel_open_request(
     runtime: &tokio::runtime::Handle,
 ) -> Result<ObjectRpcRequest, NetworkError> {
@@ -728,9 +767,24 @@ fn spawn_tcp_tunnel(
         tx,
         pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         next_request_id: AtomicU64::new(1),
+        active_requests: AtomicUsize::new(0),
         clean_shutdown: AtomicBool::new(false),
     });
-    TCP_TUNNELS.insert(handle.clone());
+    if let Err(existing) = TCP_TUNNELS.insert_or_existing(handle.clone()) {
+        drop(read_half);
+        tokio::spawn(async move {
+            let mut write_half = write_half;
+            let _ = write_object_frame_async(
+                &mut write_half,
+                &ClusterTcpTunnelFrame::Close {
+                    detail: "duplicate tunnel ignored; existing tunnel is active".to_string(),
+                },
+                ObjectFrameIoOptions::none(),
+            )
+            .await;
+        });
+        return existing;
+    }
     tokio::spawn(tcp_tunnel_writer_loop(handle.clone(), write_half, rx));
     tokio::spawn(tcp_tunnel_reader_loop(
         handle.clone(),
@@ -1021,6 +1075,7 @@ mod tests {
             tx,
             pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             next_request_id: AtomicU64::new(1),
+            active_requests: AtomicUsize::new(0),
             clean_shutdown: AtomicBool::new(false),
         })
     }
@@ -1231,13 +1286,14 @@ mod tests {
     }
 
     #[test]
-    fn tcp_tunnel_maintenance_uses_one_canonical_outbound_dialer() {
+    fn tcp_tunnel_maintenance_allows_either_peer_to_dial() {
         let low = NodeId::from_legacy_named("tcp_tunnel_maintenance_low").expect("low node id");
         let high = NodeId::from_legacy_named("tcp_tunnel_maintenance_high").expect("high node id");
         let (first, second) = if low < high { (low, high) } else { (high, low) };
 
         assert!(tcp_tunnel_should_maintain_outbound(&first, &second));
-        assert!(!tcp_tunnel_should_maintain_outbound(&second, &first));
+        assert!(tcp_tunnel_should_maintain_outbound(&second, &first));
+        assert!(!tcp_tunnel_should_maintain_outbound(&first, &first));
     }
 
     #[test]
@@ -1452,5 +1508,50 @@ mod tests {
         let second = registry.connect_lock(&peer);
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn tcp_tunnel_duplicate_insert_keeps_active_existing_handle() {
+        let registry = TcpTunnelRegistry::default();
+        let peer_name = "tcp_tunnel_duplicate_insert_peer";
+        let peer = NodeId::from_legacy_named(peer_name).expect("test node id");
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        let first = test_tunnel_handle(peer_name, first_tx);
+        let second = test_tunnel_handle(peer_name, second_tx);
+
+        assert!(registry.insert_or_existing(first.clone()).is_ok());
+        first.active_requests.fetch_add(1, Ordering::Relaxed);
+        let duplicate = registry.insert_or_existing(second.clone());
+
+        assert!(duplicate.is_err());
+        let existing = duplicate.err().expect("existing handle");
+        assert!(Arc::ptr_eq(&existing, &first));
+        assert!(Arc::ptr_eq(
+            &registry.get(&peer).expect("registered"),
+            &first
+        ));
+        assert!(!first.clean_shutdown.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn tcp_tunnel_duplicate_insert_replaces_idle_existing_handle() {
+        let registry = TcpTunnelRegistry::default();
+        let peer_name = "tcp_tunnel_duplicate_idle_peer";
+        let peer = NodeId::from_legacy_named(peer_name).expect("test node id");
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        let first = test_tunnel_handle(peer_name, first_tx);
+        let second = test_tunnel_handle(peer_name, second_tx);
+
+        assert!(registry.insert_or_existing(first.clone()).is_ok());
+        assert!(registry.insert_or_existing(second.clone()).is_ok());
+
+        assert!(Arc::ptr_eq(
+            &registry.get(&peer).expect("registered"),
+            &second
+        ));
+        assert!(first.clean_shutdown.load(Ordering::Relaxed));
+        assert!(!second.clean_shutdown.load(Ordering::Relaxed));
     }
 }
