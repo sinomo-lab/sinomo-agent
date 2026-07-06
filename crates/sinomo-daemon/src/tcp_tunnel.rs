@@ -12,7 +12,9 @@ use sinomo_core::network::{
     write_object_frame_async,
 };
 use sinomo_core::node::NodeId;
-use sinomo_core::{ClusterEndpointRecord, ClusterTransportKind};
+use sinomo_core::{
+    ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterTransportKind,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,6 +26,7 @@ use tokio::sync::{mpsc, oneshot};
 const TCP_TUNNEL_CHANNEL_CAPACITY: usize = 128;
 const TCP_TUNNEL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15);
 const TCP_TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
+const TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX: &str = "tcp-tunnel://";
 
 type PendingTcpTunnelMap =
     Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Result<ObjectRpcResponse, NetworkError>>>>>;
@@ -228,16 +231,26 @@ pub(crate) async fn accept_tcp_tunnel_connection_async(
         .write_response(&stream_address, &response, ObjectFrameIoOptions::none())
         .await
         .map_err(DaemonError::from)?;
-    // An inbound tunnel proves only that the peer can dial this node. Do not
-    // publish peer endpoint health from it; that would make private endpoints
-    // look directly reachable to independent CLI/app processes.
+    let connectivity_endpoint = tcp_tunnel_connectivity_context(&paths, &peer_node_id);
+    let tunnel_record_endpoint = connectivity_endpoint
+        .as_ref()
+        .map(|(_, _, endpoint)| endpoint.clone());
     spawn_tcp_tunnel(
-        peer_node_id,
+        peer_node_id.clone(),
         stream.into_inner(),
-        paths,
-        service_runtime,
-        None,
+        paths.clone(),
+        service_runtime.clone(),
+        tunnel_record_endpoint,
     );
+    if let Some((cluster_paths, cluster_state, endpoint)) = connectivity_endpoint.as_ref() {
+        crate::cluster::remember_cluster_tunnel_connectivity(
+            cluster_paths,
+            cluster_state,
+            endpoint,
+            sinomo_core::network::ClusterConnectivityState::Healthy,
+            Some(&service_runtime),
+        );
+    }
     Ok(())
 }
 
@@ -267,6 +280,15 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
             }
         };
     }
+    if tcp_tunnel_is_synthetic_endpoint(endpoint) {
+        return Some(Err(NetworkError::Io {
+            operation: "send tcp tunnel request".to_string(),
+            detail: format!(
+                "no persistent tcp tunnel to {} ({})",
+                endpoint.node_id, endpoint.address
+            ),
+        }));
+    }
     match connect_tcp_tunnel_to_endpoint(endpoint, runtime, paths).await {
         Ok(handle) => match send_over_tcp_tunnel_handle(handle, signed, timeouts).await {
             Ok(response) => Some(Ok(response)),
@@ -288,6 +310,46 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
             None
         }
     }
+}
+
+fn tcp_tunnel_connectivity_context(
+    paths: &DaemonPaths,
+    peer_node_id: &NodeId,
+) -> Option<(
+    sinomo_core::network::ClusterPaths,
+    sinomo_core::ClusterBootstrapState,
+    ClusterEndpointRecord,
+)> {
+    let cluster_paths = crate::cluster::cluster_paths_from_daemon_paths(paths).ok()?;
+    let state = read_cluster_state_without_kv(&cluster_paths).ok()?;
+    let endpoint = tcp_tunnel_synthetic_endpoint(&state.local_node_id, peer_node_id);
+    Some((cluster_paths, state, endpoint))
+}
+
+fn tcp_tunnel_synthetic_endpoint(
+    local_node_id: &NodeId,
+    peer_node_id: &NodeId,
+) -> ClusterEndpointRecord {
+    ClusterEndpointRecord {
+        endpoint_id: sinomo_core::network::ClusterEndpointId::derived(
+            "sinomo.daemon.tcp-tunnel.endpoint",
+            format!("{}\0{}", local_node_id.as_str(), peer_node_id.as_str()),
+        ),
+        node_id: peer_node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: format!("{TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX}{peer_node_id}"),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: None,
+    }
+}
+
+fn tcp_tunnel_is_synthetic_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
+    endpoint.transport == ClusterTransportKind::LanTcp
+        && endpoint
+            .address
+            .starts_with(TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
 }
 
 async fn send_over_tcp_tunnel_handle(
@@ -597,12 +659,11 @@ async fn remember_tcp_tunnel_connectivity(
     let paths = cluster_paths.clone();
     let endpoint = endpoint.clone();
     let work = move || {
-        crate::cluster::remember_cluster_endpoint_command_connectivity_without_failure_grace(
+        crate::cluster::remember_cluster_tunnel_connectivity(
             &paths,
             &cluster_state,
             &endpoint,
             state,
-            None,
             None,
         );
     };
@@ -645,6 +706,93 @@ mod tests {
 
     fn test_rpc_request() -> ObjectRpcRequest {
         ObjectRpcRequest::encode_body("/test/tcp-tunnel", "test", &()).expect("test request")
+    }
+
+    #[test]
+    fn tcp_tunnel_synthetic_endpoint_is_stable_for_node_pair() {
+        let local = NodeId::from_legacy_named("tcp_tunnel_synthetic_local").expect("local node id");
+        let peer = NodeId::from_legacy_named("tcp_tunnel_synthetic_peer").expect("peer node id");
+
+        let first = tcp_tunnel_synthetic_endpoint(&local, &peer);
+        let second = tcp_tunnel_synthetic_endpoint(&local, &peer);
+
+        assert_eq!(first.endpoint_id, second.endpoint_id);
+        assert_eq!(first.node_id, peer);
+        assert_eq!(first.transport, ClusterTransportKind::LanTcp);
+        assert!(tcp_tunnel_is_synthetic_endpoint(&first));
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_synthetic_endpoint_without_handle_does_not_direct_dial() {
+        let local =
+            NodeId::from_legacy_named("tcp_tunnel_synthetic_send_local").expect("local node id");
+        let peer =
+            NodeId::from_legacy_named("tcp_tunnel_synthetic_send_peer").expect("peer node id");
+        let endpoint = tcp_tunnel_synthetic_endpoint(&local, &peer);
+
+        let result = send_signed_endpoint_rpc_via_tcp_tunnel(
+            &endpoint,
+            b"auth",
+            &test_rpc_request(),
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(60)),
+            &tokio::runtime::Handle::current(),
+            None,
+        )
+        .await;
+
+        match result {
+            Some(Err(NetworkError::Io { operation, detail })) => {
+                assert_eq!(operation, "send tcp tunnel request");
+                assert!(detail.contains("no persistent tcp tunnel"));
+            }
+            other => panic!("expected synthetic tunnel endpoint error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tcp_tunnel_unreachable_record_is_not_identity_mismatch() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-tcp-tunnel-unreachable-record");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let now = time::OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_tcp_tunnel_unreachable")
+                .expect("cluster id");
+        let local =
+            NodeId::from_legacy_named("node_tcp_tunnel_unreachable_local").expect("local node id");
+        let peer =
+            NodeId::from_legacy_named("node_tcp_tunnel_unreachable_peer").expect("peer node id");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "tcp tunnel unreachable",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint = tcp_tunnel_synthetic_endpoint(&local, &peer);
+
+        crate::cluster::remember_cluster_tunnel_connectivity(
+            &cluster_paths,
+            &state,
+            &endpoint,
+            sinomo_core::network::ClusterConnectivityState::Unreachable,
+            None,
+        );
+
+        let records = sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+            &cluster_paths,
+            &local,
+        )
+        .expect("connectivity records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].state,
+            sinomo_core::network::ClusterConnectivityState::Unreachable
+        );
+        assert_eq!(records[0].failure_reason, None);
     }
 
     fn test_endpoint(

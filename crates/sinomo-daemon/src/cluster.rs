@@ -917,6 +917,62 @@ pub(crate) fn remember_cluster_endpoint_command_connectivity_without_failure_gra
     );
 }
 
+pub(crate) fn remember_cluster_tunnel_connectivity(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    connectivity_state: sinomo_core::network::ClusterConnectivityState,
+    runtime: Option<&tokio::runtime::Handle>,
+) {
+    let now = OffsetDateTime::now_utc();
+    let timestamp = now
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let (latency_ms, consecutive_failures, last_success_at, last_failure_at, ttl_seconds) =
+        match &connectivity_state {
+            sinomo_core::network::ClusterConnectivityState::Healthy => (
+                Some(0),
+                0,
+                Some(timestamp.clone()),
+                None,
+                sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+            ),
+            sinomo_core::network::ClusterConnectivityState::Degraded => (
+                None,
+                1,
+                None,
+                Some(timestamp.clone()),
+                sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+            ),
+            sinomo_core::network::ClusterConnectivityState::Unreachable => (
+                None,
+                sinomo_core::network::CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
+                None,
+                Some(timestamp),
+                sinomo_core::network::CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
+            ),
+        };
+    let record = sinomo_core::network::cluster_connectivity_record(
+        state,
+        endpoint,
+        connectivity_state,
+        latency_ms,
+        consecutive_failures,
+        last_success_at,
+        last_failure_at,
+        now,
+        ttl_seconds,
+    );
+    match sinomo_core::network::write_local_cluster_connectivity_records(
+        paths,
+        &state.local_node_id,
+        std::slice::from_ref(&record),
+    ) {
+        Ok(()) => publish_command_connectivity_if_needed(paths, state, &record, runtime),
+        Err(error) => tracing::warn!("sinomo daemon tunnel connectivity write failed: {error}"),
+    }
+}
+
 fn remember_cluster_endpoint_command_connectivity_with_failure_grace(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,

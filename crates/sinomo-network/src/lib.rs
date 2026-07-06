@@ -61,12 +61,9 @@ pub use connectivity::{
 pub use connectivity::{
     cluster_connectivity_stable_eq, validate_cluster_connectivity_records_for_source,
 };
-pub use connectivity_store::read_local_cluster_connectivity_records;
-#[cfg(any(test, feature = "test-support"))]
-pub use connectivity_store::write_local_cluster_connectivity_records;
 pub use connectivity_store::{
-    read_local_cluster_connectivity_records_for_source,
-    record_local_cluster_endpoint_command_connectivity,
+    read_local_cluster_connectivity_records, read_local_cluster_connectivity_records_for_source,
+    record_local_cluster_endpoint_command_connectivity, write_local_cluster_connectivity_records,
 };
 pub use connectivity_store::{
     write_local_cluster_connectivity_record_set, write_local_cluster_connectivity_record_set_async,
