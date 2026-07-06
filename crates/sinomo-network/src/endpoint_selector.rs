@@ -1,3 +1,4 @@
+use crate::ClusterPaths;
 use crate::NetworkError;
 use crate::directory::cluster_directory_for;
 use crate::endpoint_records::locally_learned_bridge_route_endpoint;
@@ -7,7 +8,6 @@ use crate::lan::{
     is_invitable_ip,
 };
 use crate::{ClusterConnectivityGraph, ClusterConnectivityState};
-use crate::{ClusterPaths, iroh_endpoint_public_key};
 use sinomo_base::{
     ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
     ClusterNodeAvailability, ClusterNodeStatusRecord, ClusterTransportKind,
@@ -250,8 +250,7 @@ fn deprioritize_endpoints_without_dialable_transport(endpoints: &mut [ClusterEnd
 }
 
 /// Whether the local process can currently dial `transport`.
-/// Loopback/LAN-TCP are always built in; everything else — iroh included,
-/// its dialer lives in the modules/network/iroh dylib — needs an enabled
+/// Loopback/LAN-TCP are always built in; everything else needs an enabled
 /// module dialer.
 ///
 /// `module_transports` is `None` when no module registry is installed in
@@ -264,11 +263,19 @@ fn cluster_endpoint_transport_is_dialable(
 ) -> bool {
     match transport {
         ClusterTransportKind::Loopback | ClusterTransportKind::LanTcp => true,
-        ClusterTransportKind::Iroh => {
-            module_transports.is_some_and(|transports| transports.contains(transport))
-        }
         other => module_transports.is_some_and(|transports| transports.contains(other)),
     }
+}
+
+fn cluster_endpoint_transport_is_currently_dialable(transport: &ClusterTransportKind) -> bool {
+    let module_transports = crate::network_module::network_module_registry()
+        .map(|registry| registry.enabled_dialer_transports());
+    cluster_endpoint_transport_is_dialable(transport, module_transports.as_deref())
+}
+
+fn cluster_endpoint_is_probeable(endpoint: &ClusterEndpointRecord) -> bool {
+    endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+        && cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
 }
 
 fn cluster_endpoint_transport_rank(transport: &ClusterTransportKind) -> u8 {
@@ -277,10 +284,10 @@ fn cluster_endpoint_transport_rank(transport: &ClusterTransportKind) -> u8 {
         ClusterTransportKind::Loopback => 1,
         ClusterTransportKind::LanTcp => 2,
         ClusterTransportKind::LanQuic => 3,
-        ClusterTransportKind::Iroh => 4,
         ClusterTransportKind::WebRtc => 5,
         ClusterTransportKind::TurnRelay => 6,
         ClusterTransportKind::HttpsRelay => 7,
+        _ => 4,
     }
 }
 
@@ -599,10 +606,7 @@ fn cluster_endpoint_transfer_profile(
         ClusterTransportKind::LanTcp | ClusterTransportKind::LanQuic => {
             ClusterEndpointTransferProfile::Lan
         }
-        ClusterTransportKind::Iroh
-        | ClusterTransportKind::WebRtc
-        | ClusterTransportKind::TurnRelay
-        | ClusterTransportKind::HttpsRelay => ClusterEndpointTransferProfile::Conservative,
+        _ => ClusterEndpointTransferProfile::Conservative,
     }
 }
 
@@ -880,14 +884,7 @@ pub(crate) fn cluster_member_unreachable_via_connectivity(
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
     let mut has_probeable_endpoint = false;
     for endpoint in &member.endpoints {
-        let probeable = endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
-            && matches!(
-                endpoint.transport,
-                ClusterTransportKind::LanTcp
-                    | ClusterTransportKind::Loopback
-                    | ClusterTransportKind::Iroh
-            );
-        if !probeable {
+        if !cluster_endpoint_is_probeable(endpoint) {
             continue;
         }
         has_probeable_endpoint = true;
@@ -1012,12 +1009,7 @@ fn dfs_data_endpoint_is_usable_for_main_daemon(
     endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
         && main_daemon_node_ids.contains(&endpoint.node_id)
         && cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
-        && matches!(
-            endpoint.transport,
-            ClusterTransportKind::LanTcp
-                | ClusterTransportKind::Loopback
-                | ClusterTransportKind::Iroh
-        )
+        && cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
 }
 
 fn append_cluster_kv_main_daemon_endpoints(
@@ -1112,14 +1104,14 @@ pub(crate) fn cluster_endpoint_identifies_shadow_daemon_for_node(
         ClusterTransportKind::Loopback => {
             endpoint.endpoint_id == daemon_loopback_endpoint_id(&shadow_node_id)
         }
-        ClusterTransportKind::Iroh => {
-            iroh_endpoint_public_key(endpoint).is_some_and(|public_key| {
-                endpoint.endpoint_id == crate::stable_iroh_endpoint_id(&shadow_node_id, &public_key)
-            })
-        }
         _ => false,
     };
-    stable_shadow_endpoint || cluster_endpoint_uses_default_shadow_daemon_port(endpoint)
+    stable_shadow_endpoint
+        || cluster_endpoint_uses_default_shadow_daemon_port(endpoint)
+        || crate::network_module::network_module_registry().is_some_and(|registry| {
+            registry.endpoint_role(endpoint)
+                == crate::network_module::NetworkModuleEndpointRole::ShadowDaemon
+        })
 }
 
 pub fn cluster_endpoint_can_carry_main_daemon_rpc(endpoint: &ClusterEndpointRecord) -> bool {
@@ -1368,12 +1360,7 @@ fn try_cluster_member_daemon_status_targets_with_graph(
         if member_runs_main_daemon && cluster_endpoint_identifies_shadow_daemon_for_node(endpoint) {
             continue;
         }
-        if !matches!(
-            endpoint.transport,
-            ClusterTransportKind::LanTcp
-                | ClusterTransportKind::Loopback
-                | ClusterTransportKind::Iroh
-        ) {
+        if !cluster_endpoint_transport_is_currently_dialable(&endpoint.transport) {
             continue;
         }
         crate::object::try_reserve_vec(
@@ -1425,12 +1412,7 @@ pub(crate) fn try_cluster_rollout_endpoint_targets_impl(
         for endpoint in member.endpoints.iter().filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
                 && cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
-                && matches!(
-                    endpoint.transport,
-                    ClusterTransportKind::LanTcp
-                        | ClusterTransportKind::Loopback
-                        | ClusterTransportKind::Iroh
-                )
+                && cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
         }) {
             if !endpoint_ids.try_insert_clone(&endpoint.endpoint_id, "collect rollout endpoints")? {
                 continue;
@@ -1446,12 +1428,7 @@ pub(crate) fn try_cluster_rollout_endpoint_targets_impl(
         Ok(kv_endpoints) => {
             for endpoint in kv_endpoints {
                 if endpoint.privacy == ClusterEndpointPrivacy::LocalOnly
-                    || !matches!(
-                        endpoint.transport,
-                        ClusterTransportKind::LanTcp
-                            | ClusterTransportKind::Loopback
-                            | ClusterTransportKind::Iroh
-                    )
+                    || !cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
                     || !endpoint_ids
                         .try_insert_clone(&endpoint.endpoint_id, "collect rollout kv endpoints")?
                 {
@@ -1616,9 +1593,9 @@ fn cluster_raft_route_availability_rank(
 ) -> u8 {
     match (&endpoint.transport, connectivity) {
         (_, Some(ClusterConnectivityState::Unreachable)) => 4,
-        (&ClusterTransportKind::Iroh, Some(ClusterConnectivityState::Healthy)) => 2,
-        (&ClusterTransportKind::Iroh, _) => 3,
         (_, Some(ClusterConnectivityState::Healthy)) => 0,
+        (ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback, _) => 1,
+        _ if cluster_endpoint_transport_is_currently_dialable(&endpoint.transport) => 3,
         _ => 1,
     }
 }
@@ -1628,7 +1605,7 @@ fn cluster_endpoint_static_fallback_rank(endpoint: &ClusterEndpointRecord) -> u8
         ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
             cluster_direct_endpoint_static_fallback_rank(endpoint)
         }
-        ClusterTransportKind::Iroh => 2,
+        _ if cluster_endpoint_transport_is_currently_dialable(&endpoint.transport) => 2,
         _ => 8,
     }
 }
@@ -1709,12 +1686,7 @@ pub(crate) fn try_cluster_network_probe_targets_impl(
         for endpoint in member.endpoints.iter().filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
                 && cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
-                && matches!(
-                    endpoint.transport,
-                    ClusterTransportKind::LanTcp
-                        | ClusterTransportKind::Loopback
-                        | ClusterTransportKind::Iroh
-                )
+                && cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
         }) {
             if !endpoint_ids
                 .try_insert_clone(&endpoint.endpoint_id, "select network probe endpoints")?
@@ -1859,12 +1831,7 @@ pub(crate) fn try_cluster_sync_targets(
         for endpoint in member.endpoints.iter().filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
                 && !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
-                && matches!(
-                    endpoint.transport,
-                    ClusterTransportKind::LanTcp
-                        | ClusterTransportKind::Loopback
-                        | ClusterTransportKind::Iroh
-                )
+                && cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
         }) {
             crate::object::try_reserve_vec(&mut endpoints, 1, "collect cluster sync endpoints")?;
             endpoints.push(try_clone_selector_endpoint(
@@ -1903,7 +1870,6 @@ fn cluster_sync_endpoint_cmp(
 mod tests {
     use super::*;
     use crate::ClusterEndpointId;
-    use crate::IrohEndpointRecord;
     use sinomo_base::ClusterEndpointSource;
     use sinomo_local::SinomoDataDir;
     use sinomo_node::ClusterId;
@@ -1997,109 +1963,6 @@ mod tests {
                 .iter()
                 .any(|endpoint| endpoint.address == "129.146.106.76:21353"),
             "the static public endpoint remains available as a fallback"
-        );
-    }
-
-    #[test]
-    fn network_probe_targets_include_iroh_main_daemon_endpoints() {
-        let now = OffsetDateTime::now_utc();
-        let cluster_id =
-            ClusterId::from_legacy_named("cluster_probe_targets_iroh").expect("cluster id");
-        let local = NodeId::from_legacy_named("node_probe_targets_local").expect("local node");
-        let remote = NodeId::from_legacy_named("node_probe_targets_remote").expect("remote node");
-        let mut state = ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "probe targets iroh",
-            local.clone(),
-            "local",
-            "pk-local",
-            now,
-        );
-        let iroh_endpoint = IrohEndpointRecord::from_relay_url(
-            cluster_id.clone(),
-            remote.clone(),
-            "probe-targets-remote-key",
-            "https://relay.example/",
-        )
-        .endpoint();
-        let tcp_endpoint =
-            selector_test_endpoint(&remote, "10.0.0.41:21353", ClusterEndpointPrivacy::Lan, 0);
-        let mut member = ClusterMemberRecord::local_voter(
-            cluster_id,
-            remote.clone(),
-            "remote",
-            "pk-remote",
-            now,
-        );
-        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
-        member.endpoints = vec![tcp_endpoint, iroh_endpoint.clone()];
-        state.members.push(member);
-
-        let targets = try_cluster_network_probe_targets_impl(&state).expect("probe targets");
-
-        assert!(
-            targets
-                .iter()
-                .any(|endpoint| endpoint.endpoint_id == iroh_endpoint.endpoint_id),
-            "Iroh endpoints need active probing so route choice can use them when TCP is unreachable"
-        );
-    }
-
-    #[test]
-    fn network_probe_targets_skip_iroh_shadow_daemon_endpoints() {
-        let now = OffsetDateTime::now_utc();
-        let cluster_id =
-            ClusterId::from_legacy_named("cluster_probe_targets_shadow").expect("cluster id");
-        let local =
-            NodeId::from_legacy_named("node_probe_targets_shadow_local").expect("local node");
-        let remote =
-            NodeId::from_legacy_named("node_probe_targets_shadow_remote").expect("remote node");
-        let mut state = ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "probe targets shadow",
-            local.clone(),
-            "local",
-            "pk-local",
-            now,
-        );
-        let main_endpoint = IrohEndpointRecord::from_relay_url(
-            cluster_id.clone(),
-            remote.clone(),
-            "probe-targets-main-key",
-            "https://relay.example/",
-        )
-        .endpoint();
-        let mut shadow_endpoint = IrohEndpointRecord::from_relay_url(
-            cluster_id.clone(),
-            shadow_daemon_node_id(&remote),
-            "probe-targets-shadow-key",
-            "https://relay.example/",
-        )
-        .endpoint();
-        shadow_endpoint.node_id = remote.clone();
-        let mut member = ClusterMemberRecord::local_voter(
-            cluster_id,
-            remote.clone(),
-            "remote",
-            "pk-remote",
-            now,
-        );
-        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
-        member.endpoints = vec![main_endpoint.clone(), shadow_endpoint.clone()];
-        state.members.push(member);
-
-        let targets = try_cluster_network_probe_targets_impl(&state).expect("probe targets");
-
-        assert!(
-            targets
-                .iter()
-                .any(|endpoint| endpoint.endpoint_id == main_endpoint.endpoint_id)
-        );
-        assert!(
-            !targets
-                .iter()
-                .any(|endpoint| endpoint.endpoint_id == shadow_endpoint.endpoint_id),
-            "shadow Iroh endpoints must not be probed as main daemon targets"
         );
     }
 

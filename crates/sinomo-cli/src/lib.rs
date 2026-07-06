@@ -90,9 +90,8 @@ use sinomo_runtime::cluster::{ClusterInviteChallengeProof, ClusterInviteChalleng
 use sinomo_runtime::core::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterJoinInvite, ClusterMemberRecord,
     ClusterMemberRole, ClusterMemberState, ClusterMigrationMode, ClusterMigrationPhase,
-    ClusterMigrationRecord, ClusterNodeAvailability, ClusterNodeRole, ClusterNodeRolloutStatus,
-    ClusterNodeStatusRecord, ClusterTransportKind, EvaluationScorecard, EventEnvelope, Id,
-    RollbackTrigger, cluster_migration_key,
+    ClusterNodeAvailability, ClusterNodeRole, ClusterNodeRolloutStatus, ClusterNodeStatusRecord,
+    ClusterTransportKind, EvaluationScorecard, EventEnvelope, Id, RollbackTrigger,
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::{
@@ -107,10 +106,9 @@ use sinomo_runtime::daemon::{
     InstalledDaemonInstallPlanRequest, InstalledDaemonStartStatus, ManagedSourceRepoInstallStatus,
     SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
     activate_boot_entries as daemon_activate_boot_entries, cluster_node_status_from_daemon_status,
-    current_shadow_daemon_options, daemon_advertised_endpoints_for_state,
-    daemon_advertised_endpoints_for_state_with_manual_config, daemon_bind_address,
-    daemon_cluster_registration, daemon_cluster_status, daemon_connect_address,
-    daemon_endpoint_advertisement_config_file, daemon_install_start_installed_sinomo_daemon,
+    current_shadow_daemon_options, daemon_advertised_endpoints_for_state_with_manual_config,
+    daemon_bind_address, daemon_cluster_registration, daemon_cluster_status,
+    daemon_connect_address, daemon_install_start_installed_sinomo_daemon,
     daemon_install_stop_daemon_before_install, daemon_install_stop_daemon_if_running,
     daemon_main_binary_for_shadow_start, daemon_options_from_status,
     deactivate_boot_entries as daemon_deactivate_boot_entries,
@@ -175,6 +173,10 @@ use sinomo_runtime::daemon::{
 use sinomo_runtime::daemon::{
     UserPathUpdate, ensure_windows_user_path_contains as daemon_ensure_windows_user_path_contains,
 };
+#[cfg(test)]
+use sinomo_runtime::daemon::{
+    daemon_advertised_endpoints_for_state, daemon_endpoint_advertisement_config_file,
+};
 #[cfg(all(test, feature = "sandbox"))]
 use sinomo_runtime::daemon::{
     handle_daemon_sandbox_http_fetch_to_file as daemon_handle_daemon_sandbox_http_fetch_to_file,
@@ -210,9 +212,8 @@ use sinomo_runtime::network::{self, ClusterPaths};
 #[cfg(test)]
 use sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE;
 use sinomo_runtime::node::{
-    ClusterId, ClusterInviteId, NodeId, cluster_member_expected_daemon_process,
-    cluster_member_is_local_process, load_or_create_main_node_identity,
-    load_or_create_shadow_node_identity, shadow_daemon_node_id,
+    ClusterId, NodeId, cluster_member_expected_daemon_process, cluster_member_is_local_process,
+    load_or_create_main_node_identity, load_or_create_shadow_node_identity, shadow_daemon_node_id,
 };
 #[cfg(test)]
 use sinomo_runtime::rollout::read_rollout_status;

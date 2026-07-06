@@ -1376,26 +1376,6 @@ fn handle_daemon_network_modules_request(
             let payload: sinomo_core::network::NetworkModuleSetEnabledRequest =
                 request.decode_body()?;
             if payload.enabled {
-                let claims_iroh_listener = modules
-                    .registry
-                    .snapshot()
-                    .iter()
-                    .find(|status| status.descriptor.id == payload.id)
-                    .is_some_and(|status| {
-                        status.descriptor.listener
-                            && status
-                                .descriptor
-                                .transports
-                                .contains(&sinomo_core::ClusterTransportKind::Iroh)
-                    });
-                if claims_iroh_listener && sinomo_core::network::iroh_disabled_by_env() {
-                    // Doctrine kill switch: SINOMO_DISABLE_IROH silences every
-                    // iroh listener; a module toggle must not sidestep it.
-                    return Err(ServiceError::Service(format!(
-                        "network module {} not enabled: SINOMO_DISABLE_IROH is set for this daemon",
-                        payload.id
-                    )));
-                }
                 // A module registered pre-cluster has no stored context; give
                 // it the current one so enabling actually starts the listener.
                 match crate::cluster::daemon_network_module_context_now(&paths) {

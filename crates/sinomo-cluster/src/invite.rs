@@ -5,10 +5,10 @@ use crate::read_cluster_state;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
+use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 #[allow(unused_imports)]
 pub use sinomo_network::is_loopback_connect_address;
-use sinomo_network::{ClusterPaths, iroh_endpoint_public_key, stable_iroh_endpoint_id};
 use sinomo_node::NodeIdentity;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -399,25 +399,16 @@ pub fn invite_channels_for_join_registration(
 }
 
 pub fn is_remote_join_registration_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
-    matches!(endpoint.transport, ClusterTransportKind::Iroh)
-        || is_remote_usable_invite_endpoint(endpoint)
+    is_remote_usable_invite_endpoint(endpoint)
 }
 
 pub fn push_unique_introducer(
     introducers: &mut Vec<ClusterEndpointRecord>,
     endpoint: ClusterEndpointRecord,
 ) {
-    if let Some(public_key) = iroh_endpoint_public_key(&endpoint)
-        && introducers
-            .iter()
-            .any(|candidate| iroh_endpoint_public_key(candidate).as_deref() == Some(&public_key))
-    {
-        return;
-    }
-    if !introducers
-        .iter()
-        .any(|candidate| candidate.address == endpoint.address)
-    {
+    if !introducers.iter().any(|candidate| {
+        candidate.endpoint_id == endpoint.endpoint_id || candidate.address == endpoint.address
+    }) {
         introducers.push(endpoint);
     }
 }
@@ -537,7 +528,7 @@ pub fn is_remote_usable_invite_endpoint(endpoint: &ClusterEndpointRecord) -> boo
         && !is_loopback_connect_address(&endpoint.address)
 }
 
-fn iroh_address_has_direct_query(address: &str) -> bool {
+fn address_has_direct_query(address: &str) -> bool {
     let Some((_, query)) = address.split_once('?') else {
         return false;
     };
@@ -546,25 +537,29 @@ fn iroh_address_has_direct_query(address: &str) -> bool {
 }
 
 pub fn invite_introducer_endpoint(node_id: &NodeId, address: String) -> ClusterEndpointRecord {
-    if let Some(rest) = address.strip_prefix("iroh://") {
-        let public_key = rest.split(['?', '#']).next().unwrap_or_default().trim();
-        if !public_key.is_empty() {
-            let has_direct_address = iroh_address_has_direct_query(&address);
-            return ClusterEndpointRecord {
-                endpoint_id: stable_iroh_endpoint_id(node_id, public_key),
-                node_id: node_id.clone(),
-                transport: ClusterTransportKind::Iroh,
-                address,
-                source: ClusterEndpointSource::Rendezvous,
-                privacy: if has_direct_address {
-                    ClusterEndpointPrivacy::InternetDirect
-                } else {
-                    ClusterEndpointPrivacy::Relayed
-                },
-                priority: if has_direct_address { 40 } else { 90 },
-                last_observed_latency_ms: None,
-            };
-        }
+    if let Some((scheme, _)) = address.split_once("://") {
+        let transport = sinomo_network::network_module_registry()
+            .and_then(|registry| registry.module_for_address_scheme(scheme))
+            .and_then(|module| module.descriptor().transports.first().cloned())
+            .unwrap_or(ClusterTransportKind::HttpsRelay);
+        let has_direct_address = address_has_direct_query(&address);
+        return ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::derived(
+                "sinomo.invite.endpoint",
+                format!("{}\0{address}", node_id.as_str()),
+            ),
+            node_id: node_id.clone(),
+            transport,
+            address,
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: if has_direct_address {
+                ClusterEndpointPrivacy::InternetDirect
+            } else {
+                ClusterEndpointPrivacy::Relayed
+            },
+            priority: if has_direct_address { 40 } else { 90 },
+            last_observed_latency_ms: None,
+        };
     }
     let is_loopback = is_loopback_connect_address(&address);
     let privacy = if is_loopback {

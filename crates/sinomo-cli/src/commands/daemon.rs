@@ -1,7 +1,6 @@
 use super::*;
 #[allow(unused_imports)]
 use sinomo_runtime::cluster;
-use sinomo_runtime::cluster::ClusterKvPathsExt;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DaemonCliCommand {
@@ -375,7 +374,6 @@ pub(crate) fn print_daemon_status_with_paths(
                     format_member_role(&cluster.member_role),
                     format_member_state(&cluster.member_state)
                 );
-                print_local_daemon_iroh_endpoint(&paths, &status);
             }
             if let Some(stats) = &status.idle_stats {
                 print_daemon_idle_stats(stats);
@@ -410,7 +408,6 @@ pub(crate) fn print_daemon_status_with_paths(
                         format_member_role(&cluster.member_role),
                         format_member_state(&cluster.member_state)
                     );
-                    print_local_daemon_iroh_endpoint(&paths, &status);
                 }
             } else {
                 println!("  default bind: {}:{}", options.host, options.port);
@@ -503,20 +500,6 @@ fn print_daemon_idle_stats(stats: &IdleStatsSnapshot) {
         "    dfs metadata replications sent: {}",
         stats.dfs_metadata_replications_sent
     );
-}
-
-fn print_local_daemon_iroh_endpoint(paths: &DaemonPaths, status: &DaemonStatus) {
-    let Some(cluster) = status.cluster.as_ref() else {
-        return;
-    };
-    let Some(data_dir) = paths.root.parent() else {
-        return;
-    };
-    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    let Ok(record) = network::IrohEndpointRecord::read(&cluster_paths, &cluster.node_id) else {
-        return;
-    };
-    println!("  iroh endpoint: {}", record.endpoint().address);
 }
 
 pub(crate) fn stop_daemon(options: DaemonRunOptions) -> Result<(), CliError> {

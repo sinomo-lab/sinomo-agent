@@ -14,7 +14,7 @@ use sinomo_network::{
 };
 use sinomo_network::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState,
-    ClusterEndpointSelector, ClusterPaths, NetworkError, iroh_endpoint_public_key,
+    ClusterEndpointSelector, ClusterPaths, NetworkError,
 };
 use sinomo_network::{cluster_endpoint_can_carry_main_daemon_rpc, cluster_route_next_hop};
 use sinomo_node::{
@@ -668,18 +668,16 @@ pub fn cluster_doctor_findings(
         if !cluster_health_member_is_reportable(member) {
             continue;
         }
-        let mut by_public_key = BTreeMap::<String, usize>::new();
+        let mut by_address = BTreeMap::<String, usize>::new();
         for endpoint in &member.endpoints {
-            if let Some(public_key) = iroh_endpoint_public_key(endpoint) {
-                *by_public_key.entry(public_key).or_default() += 1;
-            }
+            *by_address.entry(endpoint.address.clone()).or_default() += 1;
         }
-        for (public_key, count) in by_public_key {
+        for (address, count) in by_address {
             if count > 1 {
                 findings.push(ClusterDoctorFinding::warning(
-                    "duplicate-iroh-endpoint",
+                    "duplicate-endpoint",
                     format!(
-                        "{} has {count} Iroh endpoint records for public key {public_key}",
+                        "{} has {count} endpoint records for address {address}",
                         member.node_id
                     ),
                 ));

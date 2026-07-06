@@ -19,7 +19,7 @@ use sinomo_network::ClusterConnectivityRecord;
 use sinomo_network::NetworkError;
 use sinomo_network::SinomoObjectCodec;
 use sinomo_network::{
-    cleanup_cluster_iroh_endpoints, cleanup_member_iroh_endpoints, upsert_member_endpoint,
+    cleanup_cluster_endpoint_duplicates, cleanup_member_endpoint_duplicates, upsert_member_endpoint,
 };
 use sinomo_node::{
     ClusterCapabilityPolicyRecord, ClusterIdentityRecord, DAEMON_SHADOW_CLUSTER_ROLE, NodeId,
@@ -93,17 +93,17 @@ pub(crate) fn merge_member_record(
         let mut changed = false;
         if incoming.updated_at > existing.updated_at {
             *existing = incoming;
-            cleanup_member_iroh_endpoints(existing);
+            cleanup_member_endpoint_duplicates(existing);
             return true;
         }
         for endpoint in incoming.endpoints {
             changed |= upsert_member_endpoint(existing, endpoint);
         }
-        changed |= cleanup_member_iroh_endpoints(existing);
+        changed |= cleanup_member_endpoint_duplicates(existing);
         changed
     } else {
         let mut incoming = incoming;
-        cleanup_member_iroh_endpoints(&mut incoming);
+        cleanup_member_endpoint_duplicates(&mut incoming);
         local.members.push(incoming);
         true
     }
@@ -115,7 +115,7 @@ pub(crate) fn cluster_state_sync_txn_from_store(
     validate_config_transition: bool,
 ) -> Result<KvTxn, NetworkError> {
     let mut state = state.clone();
-    cleanup_cluster_iroh_endpoints(&mut state);
+    cleanup_cluster_endpoint_duplicates(&mut state);
     let new_config = ClusterKvRaftConfigRecord::from(&state);
     let current_config_entry = store.get(&sinomo_kv::cluster_kv_raft_config_key()).cloned();
     let mut compares = Vec::new();
@@ -313,7 +313,7 @@ pub fn cluster_member_update_ops_from_store(
     member: &ClusterMemberRecord,
 ) -> Result<Vec<KvOp>, NetworkError> {
     let mut member = member.clone();
-    cleanup_member_iroh_endpoints(&mut member);
+    cleanup_member_endpoint_duplicates(&mut member);
     let mut ops = Vec::new();
     let member_key = cluster_member_key(&member.node_id);
     if store.get(&member_key).is_none_or(|entry| {

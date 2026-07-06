@@ -52,7 +52,7 @@ pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
 pub const DAEMON_NETWORK_ENVIRONMENT_WATCH_ENV: &str = "SINOMO_DAEMON_NETWORK_ENVIRONMENT_WATCH";
 pub(crate) const ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE: Duration = Duration::from_millis(200);
 const DAEMON_RUNTIME_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
-const DAEMON_IROH_PROXY_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+const DAEMON_NETWORK_MODULE_CONTEXT_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_BACKGROUND_MAINTENANCE_TASK_JOIN_TIMEOUT: Duration = DAEMON_RUNTIME_TASK_JOIN_TIMEOUT;
 const DAEMON_RUNTIME_TASK_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const DAEMON_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -324,11 +324,10 @@ pub fn run_daemon_control_loop_with_services(
             "cluster_node_id": cluster.as_ref().map(|status| status.node_id.to_string()),
         }),
     );
-    // Stage C (docs/plans/r0-r1-crate-boundary-refactor.md): load native-dylib
-    // network modules (e.g. modules/network/iroh) into the process-wide
+    // Load native-dylib network modules into the process-wide
     // NetworkModuleRegistry before serving traffic. Loopback/LAN-TCP keep
     // their in-crate dial paths inside sinomo-network; every other transport
-    // (iroh included) goes through the registry.
+    // goes through the registry.
     match daemon_data_dir_path(&paths) {
         Ok(data_dir_root) => {
             let network_module_context = match cluster_paths_from_daemon_paths(&paths) {
@@ -337,7 +336,7 @@ pub fn run_daemon_control_loop_with_services(
                         .as_ref()
                         .map(|status| sinomo_core::network::NetworkModuleContext {
                             cluster_root: cluster_paths.root.clone(),
-                            node_id: crate::cluster::daemon_iroh_proxy_node_id(status),
+                            node_id: crate::cluster::daemon_network_module_node_id(status),
                             cluster_id: Some(status.cluster_id.clone()),
                             // Connect address, not the bind address: a wildcard
                             // bind (0.0.0.0/::) is not dialable by the module's
@@ -527,7 +526,7 @@ fn join_daemon_runtime_task(
 
 fn daemon_runtime_task_join_timeout(label: &str) -> Duration {
     match label {
-        "iroh proxy" => DAEMON_IROH_PROXY_TASK_JOIN_TIMEOUT,
+        "network module context" => DAEMON_NETWORK_MODULE_CONTEXT_TASK_JOIN_TIMEOUT,
         "background maintenance" => DAEMON_BACKGROUND_MAINTENANCE_TASK_JOIN_TIMEOUT,
         _ => DAEMON_RUNTIME_TASK_JOIN_TIMEOUT,
     }
@@ -4432,18 +4431,19 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn daemon_iroh_proxy_runtime_task_gets_graceful_join_budget() {
+    fn daemon_network_module_context_runtime_task_gets_graceful_join_budget() {
         assert_eq!(
-            daemon_runtime_task_join_timeout("iroh proxy"),
-            DAEMON_IROH_PROXY_TASK_JOIN_TIMEOUT
+            daemon_runtime_task_join_timeout("network module context"),
+            DAEMON_NETWORK_MODULE_CONTEXT_TASK_JOIN_TIMEOUT
         );
         assert!(
-            !daemon_runtime_task_abort_before_join("iroh proxy"),
-            "Iroh endpoint close keeps its graceful shutdown path"
+            !daemon_runtime_task_abort_before_join("network module context"),
+            "network module shutdown keeps its graceful shutdown path"
         );
         assert!(
-            daemon_runtime_task_join_timeout("iroh proxy") > DAEMON_RUNTIME_TASK_JOIN_TIMEOUT,
-            "Iroh endpoint close needs more time than generic helper task shutdown"
+            daemon_runtime_task_join_timeout("network module context")
+                > DAEMON_RUNTIME_TASK_JOIN_TIMEOUT,
+            "network module shutdown needs more time than generic helper task shutdown"
         );
         assert_eq!(
             daemon_runtime_task_join_timeout("control accept"),

@@ -7,7 +7,6 @@ use std::path::PathBuf;
 pub struct ClusterPaths {
     pub root: PathBuf,
     pub state: PathBuf,
-    pub iroh: PathBuf,
     pub connectivity_local: PathBuf,
 }
 
@@ -16,7 +15,6 @@ impl ClusterPaths {
         let root = data_dir.root().join("cluster");
         Self {
             state: root.join("state.sobj"),
-            iroh: root.join("iroh"),
             connectivity_local: root.join("connectivity-local.sobj"),
             root,
         }

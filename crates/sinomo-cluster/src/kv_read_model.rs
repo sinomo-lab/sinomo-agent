@@ -11,7 +11,7 @@ use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvSnapshot};
 use sinomo_network::ClusterNetworkInfoRecord;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
-use sinomo_network::cleanup_member_iroh_endpoints;
+use sinomo_network::cleanup_member_endpoint_duplicates;
 use sinomo_network::{ClusterConnectivityRecord, cluster_network_record_live};
 use sinomo_node::{ClusterCapabilityPolicyRecord, NodeId};
 use std::collections::BTreeMap;
@@ -51,7 +51,7 @@ pub fn read_cluster_members_from_snapshot(
                 member.endpoints.push(endpoint);
             }
         }
-        cleanup_member_iroh_endpoints(member);
+        cleanup_member_endpoint_duplicates(member);
     }
     members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     Ok(members)

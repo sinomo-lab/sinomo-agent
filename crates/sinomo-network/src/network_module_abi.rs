@@ -29,6 +29,7 @@
 use crate::error::NetworkError;
 use crate::network_module::{
     NetworkFuture, NetworkModule, NetworkModuleContext, NetworkModuleDescriptor,
+    NetworkModuleEndpointRole,
 };
 use crate::object::DaemonRpcTimeouts;
 use serde::Serialize;
@@ -178,6 +179,15 @@ pub struct SinomoNetworkModuleVtableV1 {
         *mut c_void,
         *mut SinomoNetworkByteBuffer,
     ) -> SinomoNetworkModuleStatusCode,
+    /// Optional SOBJ endpoint -> SOBJ NetworkModuleEndpointRole classifier.
+    /// Null means the module does not classify endpoint roles.
+    pub endpoint_role: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            SinomoNetworkByteSlice,
+            *mut SinomoNetworkByteBuffer,
+        ) -> SinomoNetworkModuleStatusCode,
+    >,
     pub free_buffer: unsafe extern "C" fn(SinomoNetworkByteBuffer),
     pub destroy: unsafe extern "C" fn(*mut c_void),
 }
@@ -445,6 +455,32 @@ impl NetworkModule for FfiNetworkModule {
         }
         decode_network_module_sobj(&bytes)
     }
+
+    fn endpoint_role(&self, endpoint: &ClusterEndpointRecord) -> NetworkModuleEndpointRole {
+        let Some(endpoint_role) = self.shared.vtable.endpoint_role else {
+            return NetworkModuleEndpointRole::Unknown;
+        };
+        let Ok(endpoint_bytes) = encode_network_module_sobj(endpoint) else {
+            return NetworkModuleEndpointRole::Unknown;
+        };
+        let mut buffer = SinomoNetworkByteBuffer::null();
+        // SAFETY: instance/vtable are valid per the entry contract; the input
+        // byte view borrows local encoded bytes for the duration of the call.
+        let status = unsafe {
+            endpoint_role(
+                self.shared.instance.0,
+                SinomoNetworkByteSlice::from_slice(&endpoint_bytes),
+                &mut buffer,
+            )
+        };
+        // SAFETY: buffer was produced by the module; released via its
+        // free_buffer.
+        let bytes = unsafe { copy_and_free_network_buffer(buffer, self.shared.vtable.free_buffer) };
+        if status != SINOMO_NETWORK_MODULE_STATUS_OK || bytes.is_empty() {
+            return NetworkModuleEndpointRole::Unknown;
+        }
+        decode_network_module_sobj(&bytes).unwrap_or(NetworkModuleEndpointRole::Unknown)
+    }
 }
 
 /// Copies a module-owned buffer into host memory and releases the module
@@ -502,9 +538,9 @@ mod tests {
     #[test]
     fn network_module_sobj_round_trips_descriptor() {
         let descriptor = NetworkModuleDescriptor {
-            id: "iroh".to_string(),
-            transports: vec![ClusterTransportKind::Iroh],
-            address_schemes: vec!["iroh".to_string()],
+            id: "mesh".to_string(),
+            transports: vec![ClusterTransportKind::WebRtc],
+            address_schemes: vec!["mesh".to_string()],
             dialer: true,
             listener: true,
             supports_runtime_toggle: true,

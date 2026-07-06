@@ -30,9 +30,7 @@ use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 #[cfg(test)]
 pub(crate) use sinomo_runtime::node::apply_cluster_raft_role;
-use sinomo_runtime::node::{
-    cluster_member_is_legacy_shadow_daemon, cluster_member_is_local_process,
-};
+use sinomo_runtime::node::cluster_member_is_legacy_shadow_daemon;
 
 #[cfg(test)]
 pub(crate) fn build_cluster_raft_append_request_from_next_index(
@@ -1256,9 +1254,6 @@ pub(crate) fn default_invite_introducers(
         {
             for endpoint in invite_introducers_from_daemon_status(&state.local_node_id, &status) {
                 cluster::push_unique_introducer(&mut introducers, endpoint);
-            }
-            if let Ok(record) = network::IrohEndpointRecord::read(paths, &state.local_node_id) {
-                cluster::push_unique_introducer(&mut introducers, record.endpoint());
             }
         }
     }

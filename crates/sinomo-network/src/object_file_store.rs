@@ -146,8 +146,8 @@ pub fn write_object_file_compare_read_bytes_for_test<T: Serialize>(
 /// Filesystems without hard-link support fall back to a metadata check followed
 /// by `rename`; callers must serialize writers for the same `path` so that
 /// fallback cannot replace a concurrently created winner.
-// Unconditional since stage C: dylib network modules (the iroh module's
-// secret-key create path) reuse this helper through the sinomo-core facade.
+// Unconditional since stage C: dylib network modules reuse this helper
+// through the sinomo-core facade.
 pub fn write_object_file_create_new_serialized<T: Serialize>(
     path: &PathBuf,
     value: &T,

@@ -7,10 +7,8 @@
 //! object-frame contract owned by `sinomo-network`; this module only reads
 //! and writes whole frames as opaque bytes.
 
-use sinomo_core::network::{
-    IROH_DAEMON_COMMAND_MAX_BYTES, NetworkError, OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL,
-    try_zeroed_vec,
-};
+use crate::IROH_DAEMON_COMMAND_MAX_BYTES;
+use sinomo_core::network::{NetworkError, OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL, try_zeroed_vec};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -57,18 +55,22 @@ impl IrohProxyByteBudget {
         let would_use = match state.in_flight_bytes.checked_add(frame_bytes) {
             Some(would_use) => would_use,
             None => {
-                return Err(NetworkError::IrohProxyFrameBudgetExceeded {
-                    frame_bytes,
-                    in_flight_bytes: state.in_flight_bytes,
-                    max_in_flight_bytes: self.max_bytes,
+                return Err(NetworkError::ResourceExhausted {
+                    operation: format!(
+                        "reserve iroh proxy frame: {frame_bytes} bytes requested with {} bytes in flight and {} max",
+                        state.in_flight_bytes, self.max_bytes
+                    ),
+                    requested_bytes: frame_bytes,
                 });
             }
         };
         if frame_bytes > self.max_bytes || would_use > self.max_bytes {
-            return Err(NetworkError::IrohProxyFrameBudgetExceeded {
-                frame_bytes,
-                in_flight_bytes: state.in_flight_bytes,
-                max_in_flight_bytes: self.max_bytes,
+            return Err(NetworkError::ResourceExhausted {
+                operation: format!(
+                    "reserve iroh proxy frame: {frame_bytes} bytes requested with {} bytes in flight and {} max",
+                    state.in_flight_bytes, self.max_bytes
+                ),
+                requested_bytes: frame_bytes,
             });
         }
         state.in_flight_bytes = would_use;
@@ -315,13 +317,13 @@ mod tests {
         let second = budget.try_acquire(4).expect("second frame budget");
 
         assert_eq!(budget.in_flight_bytes(), 10);
+        let error = budget.try_acquire(1).expect_err("budget rejection");
         assert!(matches!(
-            budget.try_acquire(1),
-            Err(NetworkError::IrohProxyFrameBudgetExceeded {
-                frame_bytes: 1,
-                in_flight_bytes: 10,
-                max_in_flight_bytes: 10,
-            })
+            error,
+            NetworkError::ResourceExhausted {
+                ref operation,
+                requested_bytes: 1,
+            } if operation.contains("10 bytes in flight and 10 max")
         ));
 
         drop(first);
@@ -386,11 +388,10 @@ mod tests {
         .expect_err("budget error");
         assert!(matches!(
             error,
-            NetworkError::IrohProxyFrameBudgetExceeded {
-                frame_bytes: 8,
-                in_flight_bytes: 0,
-                max_in_flight_bytes: 7,
-            }
+            NetworkError::ResourceExhausted {
+                ref operation,
+                requested_bytes: 8,
+            } if operation.contains("0 bytes in flight and 7 max")
         ));
         assert_eq!(budget.in_flight_bytes(), 0);
 

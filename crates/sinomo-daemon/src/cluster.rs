@@ -47,8 +47,8 @@ use sinomo_core::kv::{KvCompare, KvOpResponse};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     AsyncMdnsDiscoverySocket, ClusterConnectivityRecord, ClusterConnectivityState,
-    ClusterNetworkInfoRecord, ClusterPaths, IrohEndpointRecord, MdnsDiscoveryCache,
-    ObjectRpcRequest, ObjectRpcResponse,
+    ClusterNetworkInfoRecord, ClusterPaths, MdnsDiscoveryCache, ObjectRpcRequest,
+    ObjectRpcResponse,
 };
 #[cfg(test)]
 use sinomo_core::network::{ClusterConnectivityProbeState, MdnsDiscoveryAdvertisement};
@@ -953,9 +953,9 @@ pub(crate) fn cluster_paths_from_daemon_paths(
 /// a cluster identity, starting any enabled module whose listener is not yet
 /// running (modules registered pre-cluster, before `cluster init`/`join`).
 ///
-/// This replaces the removed built-in iroh proxy loop: transports are
-/// module-owned now (modules/network/iroh), the module writes its own
-/// endpoint record, and that record reaches cluster KV through the regular
+/// This replaces built-in transport-specific listener loops: non-built-in
+/// transports are module-owned now. Modules advertise their own endpoint
+/// records, and those records reach cluster KV through the regular
 /// maintenance/status publishes and the repair-route refresh.
 ///
 /// Returns `None` when there is nothing to wait for: no registry, no
@@ -1045,7 +1045,7 @@ pub(crate) fn start_daemon_network_module_context_task(
             // `/network/modules/set-enabled`, which refreshes the context.
             let module_context = sinomo_core::network::NetworkModuleContext {
                 cluster_root: cluster_paths.root.clone(),
-                node_id: daemon_iroh_proxy_node_id(&current_cluster),
+                node_id: daemon_network_module_node_id(&current_cluster),
                 cluster_id: Some(current_cluster.cluster_id.clone()),
                 daemon_forward_address: daemon_address.clone(),
             };
@@ -1082,7 +1082,7 @@ async fn daemon_cluster_sleep_or_shutdown(
     }
 }
 
-pub(crate) fn daemon_iroh_proxy_node_id(cluster: &DaemonClusterStatus) -> NodeId {
+pub(crate) fn daemon_network_module_node_id(cluster: &DaemonClusterStatus) -> NodeId {
     if cluster.process == sinomo_core::node::DAEMON_SHADOW_CLUSTER_ROLE {
         shadow_daemon_node_id(&cluster.node_id)
     } else {
@@ -1113,46 +1113,35 @@ pub(crate) fn daemon_network_module_context_now(
     let status = read_daemon_status(paths)?;
     Ok(Some(sinomo_core::network::NetworkModuleContext {
         cluster_root: cluster_paths.root.clone(),
-        node_id: daemon_iroh_proxy_node_id(&cluster),
+        node_id: daemon_network_module_node_id(&cluster),
         cluster_id: Some(cluster.cluster_id.clone()),
         daemon_forward_address: status.address,
     }))
 }
 
-pub(crate) fn refresh_daemon_iroh_repair_route_on_runtime(
+pub(crate) fn refresh_daemon_network_module_repair_routes_on_runtime(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
 ) -> Result<bool, DaemonError> {
-    refresh_daemon_iroh_repair_route_with_runtime(paths, Some(runtime))
+    refresh_daemon_network_module_repair_routes_with_runtime(paths, Some(runtime))
 }
 
-#[cfg(test)]
-fn refresh_daemon_iroh_repair_route(paths: &DaemonPaths) -> Result<bool, DaemonError> {
-    refresh_daemon_iroh_repair_route_with_runtime(paths, None)
-}
-
-fn refresh_daemon_iroh_repair_route_with_runtime(
+fn refresh_daemon_network_module_repair_routes_with_runtime(
     paths: &DaemonPaths,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<bool, DaemonError> {
     let Some(cluster) = daemon_cluster_status_from_paths_on_runtime(paths, runtime)? else {
         return Ok(false);
     };
-    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let endpoint_node_id = daemon_iroh_proxy_node_id(&cluster);
-    match IrohEndpointRecord::read(&cluster_paths, &endpoint_node_id) {
-        Ok(record) => {
-            advertise_daemon_iroh_endpoint_with_runtime(paths, record, runtime)?;
-            Ok(true)
-        }
-        Err(error) => {
-            tracing::warn!(
-                "sinomo {} iroh repair route unavailable: {error}",
-                cluster.process
-            );
-            Ok(false)
-        }
+    let endpoints = local_network_module_endpoints()?;
+    if endpoints.is_empty() {
+        tracing::debug!(
+            "sinomo {} network module repair routes unavailable: no module endpoints",
+            cluster.process
+        );
+        return Ok(false);
     }
+    advertise_daemon_network_module_endpoints_with_runtime(paths, endpoints, runtime)
 }
 
 pub(crate) fn start_shadow_daemon_status_publisher(
@@ -1162,7 +1151,6 @@ pub(crate) fn start_shadow_daemon_status_publisher(
 ) -> Result<tokio::task::JoinHandle<()>, DaemonError> {
     let status_paths = paths.clone();
     let task = runtime.clone().spawn(async move {
-        let iroh_disabled = sinomo_core::network::iroh_disabled_by_env();
         let mut startup_retries_remaining = DAEMON_SHADOW_STATUS_STARTUP_RETRY_ATTEMPTS;
         let mut publish_interval = DAEMON_SHADOW_STATUS_STARTUP_RETRY_INTERVAL;
         loop {
@@ -1175,14 +1163,13 @@ pub(crate) fn start_shadow_daemon_status_publisher(
                 let settled_solo =
                     daemon_paths_have_settled_solo_cluster(&tick_paths).unwrap_or(false);
                 if !settled_solo {
-                    if !iroh_disabled {
-                        if let Err(error) =
-                            refresh_daemon_iroh_repair_route_on_runtime(&tick_paths, &tick_runtime)
-                        {
-                            tracing::warn!(
-                                "sinomo shadow daemon iroh repair route tick failed: {error}"
-                            );
-                        }
+                    if let Err(error) = refresh_daemon_network_module_repair_routes_on_runtime(
+                        &tick_paths,
+                        &tick_runtime,
+                    ) {
+                        tracing::warn!(
+                            "sinomo shadow daemon network module repair route tick failed: {error}"
+                        );
                     }
                 }
                 let clustered =
@@ -1247,38 +1234,21 @@ fn daemon_paths_have_settled_solo_cluster(paths: &DaemonPaths) -> Result<bool, D
     Ok(sinomo_core::network::cluster_is_settled_solo(&state))
 }
 
-fn advertise_daemon_iroh_endpoint_with_runtime(
+fn advertise_daemon_network_module_endpoints_with_runtime(
     paths: &DaemonPaths,
-    record: IrohEndpointRecord,
+    endpoints: Vec<ClusterEndpointRecord>,
     runtime: Option<&tokio::runtime::Handle>,
-) -> Result<(), DaemonError> {
+) -> Result<bool, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
     let mut state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
-    let persisted_endpoints = state
-        .members
-        .iter()
-        .find(|member| member.node_id == record.node_id)
-        .map(|member| member.endpoints.clone());
-    prepare_local_cluster_state(&cluster_paths, &mut state)?;
-    // Persist/replicate only when this member's endpoint set actually differs
-    // from disk. prepare_local_cluster_state already folds iroh endpoints in
-    // from disk, so we compare against the persisted endpoints rather than the
-    // upsert delta: otherwise a brand-new endpoint that prepare merged would
-    // never be written, while an idle re-advertise still short-circuits here
-    // without touching disk, the KV mirror, or the raft log.
-    if sinomo_core::network::apply_cluster_iroh_endpoint_advertisement(
-        &mut state,
-        record,
-        persisted_endpoints.as_deref(),
-        OffsetDateTime::now_utc(),
-    )
-    .is_some()
-    {
+    if apply_network_module_endpoints_to_state(&mut state, endpoints, OffsetDateTime::now_utc())? {
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)?;
         if let Some(runtime) = runtime {
             if let Err(error) = sync_cluster_state_to_kv_on_runtime(&cluster_paths, &state, runtime)
             {
-                tracing::warn!("sinomo iroh endpoint cluster state publication failed: {error}");
+                tracing::warn!(
+                    "sinomo network module endpoint cluster state publication failed: {error}"
+                );
             }
             let publish_result = publish_local_members_to_quorum_if_needed_on_runtime(
                 &cluster_paths,
@@ -1286,11 +1256,12 @@ fn advertise_daemon_iroh_endpoint_with_runtime(
                 runtime,
             );
             if let Err(error) = publish_result {
-                tracing::warn!("sinomo iroh endpoint member publication failed: {error}");
+                tracing::warn!("sinomo network module endpoint member publication failed: {error}");
             }
         }
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 pub(crate) fn handle_daemon_cluster_kv_snapshot(
@@ -2164,7 +2135,7 @@ impl ClusterNetworkMaintenance {
                 &runtime,
             )
             .await;
-            self.idle_stats.incr_disk_reads_iroh_endpoints();
+            self.idle_stats.incr_disk_reads_network_module_endpoints();
             let local_state_changed = refresh_local_daemon_membership_async(
                 &runtime,
                 &cluster_paths,
@@ -4048,7 +4019,58 @@ pub(crate) fn prepare_local_cluster_state(
         &shadow_options,
         OffsetDateTime::now_utc(),
     )?;
+    let _ = refresh_local_network_module_endpoints(state, OffsetDateTime::now_utc())?;
     Ok(())
+}
+
+fn fold_local_shadow_network_module_endpoint_node_id(
+    state: &ClusterBootstrapState,
+    endpoint: &mut ClusterEndpointRecord,
+) {
+    if endpoint.node_id == shadow_daemon_node_id(&state.local_node_id) {
+        endpoint.node_id = state.local_node_id.clone();
+    }
+}
+
+fn local_network_module_endpoints() -> Result<Vec<ClusterEndpointRecord>, DaemonError> {
+    let Some(modules) = crate::registry::daemon_network_modules() else {
+        return Ok(Vec::new());
+    };
+    modules
+        .registry
+        .local_endpoints()
+        .map_err(DaemonError::from)
+}
+
+fn refresh_local_network_module_endpoints(
+    state: &mut ClusterBootstrapState,
+    timestamp: OffsetDateTime,
+) -> Result<bool, DaemonError> {
+    apply_network_module_endpoints_to_state(state, local_network_module_endpoints()?, timestamp)
+}
+
+fn apply_network_module_endpoints_to_state(
+    state: &mut ClusterBootstrapState,
+    endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+    timestamp: OffsetDateTime,
+) -> Result<bool, DaemonError> {
+    let mut changed = false;
+    for mut endpoint in endpoints {
+        fold_local_shadow_network_module_endpoint_node_id(state, &mut endpoint);
+        let Some(member) = state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == endpoint.node_id)
+        else {
+            continue;
+        };
+        changed |= sinomo_core::network::upsert_member_endpoint(member, endpoint);
+        changed |= sinomo_core::network::cleanup_member_endpoint_duplicates(member);
+    }
+    if changed {
+        state.updated_at = timestamp;
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -4530,11 +4552,12 @@ fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
 }
 
 /// Daemon-side default invite introducers: the daemon's own advertised
-/// addresses, its iroh endpoint record, and remote-capable main-daemon member
-/// endpoints. Ported from the CLI's `default_invite_introducers`.
+/// addresses, currently advertised network-module endpoints, and
+/// remote-capable main-daemon member endpoints. Ported from the CLI's
+/// `default_invite_introducers`.
 fn daemon_default_invite_introducers(
     daemon_paths: &DaemonPaths,
-    paths: &ClusterPaths,
+    _paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
     let mut introducers = Vec::new();
@@ -4543,9 +4566,10 @@ fn daemon_default_invite_introducers(
         {
             sinomo_core::cluster::push_unique_introducer(&mut introducers, endpoint);
         }
-        if let Ok(record) = IrohEndpointRecord::read(paths, &state.local_node_id) {
-            sinomo_core::cluster::push_unique_introducer(&mut introducers, record.endpoint());
-        }
+    }
+    for mut endpoint in local_network_module_endpoints().unwrap_or_default() {
+        fold_local_shadow_network_module_endpoint_node_id(state, &mut endpoint);
+        sinomo_core::cluster::push_unique_introducer(&mut introducers, endpoint);
     }
     for endpoint in state
         .members
@@ -6421,7 +6445,7 @@ impl sinomo_core::network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost
                         &local_address,
                         &inner_request,
                         timeouts,
-                        sinomo_core::network::IROH_DAEMON_COMMAND_MAX_BYTES,
+                        sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
                     )
                     .await
                     .map(Some)
@@ -6922,6 +6946,23 @@ fn cluster_raft_append_attempt_timeout(
 mod tests {
     use super::*;
 
+    fn test_network_module_relay_endpoint(node_id: &NodeId, key: &str) -> ClusterEndpointRecord {
+        let address = format!("iroh://{key}?relay=https://relay.example./");
+        ClusterEndpointRecord {
+            endpoint_id: sinomo_core::network::ClusterEndpointId::derived(
+                "sinomo.test.daemon.module.endpoint",
+                format!("{}\0{address}", node_id.as_str()),
+            ),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address,
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 20,
+            last_observed_latency_ms: None,
+        }
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum RecordingRelayStreamForwardMode {
         Forward,
@@ -7090,10 +7131,11 @@ mod tests {
     }
 
     #[test]
-    fn daemon_iroh_proxy_node_id_uses_process_specific_identity() {
+    fn daemon_network_module_node_id_uses_process_specific_identity() {
         let cluster_id =
-            ClusterId::from_legacy_named("cluster_daemon_iroh_proxy_node").expect("cluster");
-        let node_id = NodeId::from_legacy_named("node_daemon_iroh_proxy_node").expect("node id");
+            ClusterId::from_legacy_named("cluster_daemon_network_module_node").expect("cluster");
+        let node_id =
+            NodeId::from_legacy_named("node_daemon_network_module_node").expect("node id");
         let main = DaemonClusterStatus {
             cluster_id: cluster_id.clone(),
             node_id: node_id.clone(),
@@ -7104,9 +7146,9 @@ mod tests {
         let mut shadow = main.clone();
         shadow.process = sinomo_core::node::DAEMON_SHADOW_CLUSTER_ROLE.to_string();
 
-        assert_eq!(daemon_iroh_proxy_node_id(&main), node_id.clone());
+        assert_eq!(daemon_network_module_node_id(&main), node_id.clone());
         assert_eq!(
-            daemon_iroh_proxy_node_id(&shadow),
+            daemon_network_module_node_id(&shadow),
             shadow_daemon_node_id(&node_id)
         );
     }
@@ -10189,8 +10231,8 @@ mod tests {
     }
 
     #[test]
-    fn shadow_iroh_repair_route_refreshes_local_state_from_disk() {
-        let root = unique_cluster_test_root("sinomo-daemon-shadow-iroh-repair-route");
+    fn shadow_network_module_repair_route_refreshes_local_state() {
+        let root = unique_cluster_test_root("sinomo-daemon-shadow-module-repair-route");
         let data_dir = SinomoDataDir::new(&root);
         let cluster_paths = ClusterPaths::new(&data_dir);
         cluster_paths.ensure().expect("cluster paths");
@@ -10198,10 +10240,10 @@ mod tests {
         shadow_paths.ensure().expect("shadow paths");
         let now = OffsetDateTime::now_utc();
         let mut state = ClusterBootstrapState::initialized_locally(
-            ClusterId::from_legacy_named("cluster_shadow_iroh_repair_route").expect("cluster"),
-            "shadow iroh repair route".to_string(),
-            NodeId::from_legacy_named("node_shadow_iroh_repair_route").expect("node"),
-            "shadow iroh repair route".to_string(),
+            ClusterId::from_legacy_named("cluster_shadow_module_repair_route").expect("cluster"),
+            "shadow module repair route".to_string(),
+            NodeId::from_legacy_named("node_shadow_module_repair_route").expect("node"),
+            "shadow module repair route".to_string(),
             "main-public-key".to_string(),
             now,
         );
@@ -10223,18 +10265,19 @@ mod tests {
             &crate::DaemonStatus::new(&shadow_options, &shadow_paths, Some(shadow_cluster)),
         )
         .expect("write shadow status");
-        IrohEndpointRecord::from_relay_url(
-            state.cluster_id.clone(),
-            shadow_daemon_node_id(&state.local_node_id),
-            "iroh_public_key_shadow_repair_route",
-            "https://relay.example./",
-        )
-        .write(&cluster_paths)
-        .expect("write iroh endpoint record");
+        let module_endpoint = test_network_module_relay_endpoint(
+            &shadow_daemon_node_id(&state.local_node_id),
+            "module_public_key_shadow_repair_route",
+        );
 
         assert!(
-            refresh_daemon_iroh_repair_route(&shadow_paths).expect("refresh repair route"),
-            "shadow repair route should be refreshed from the local iroh endpoint record"
+            advertise_daemon_network_module_endpoints_with_runtime(
+                &shadow_paths,
+                vec![module_endpoint],
+                None,
+            )
+            .expect("refresh repair route"),
+            "shadow repair route should be refreshed from the local network module endpoint"
         );
         let updated = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
             .expect("read state");
@@ -10246,7 +10289,7 @@ mod tests {
         assert!(main_member.endpoints.iter().any(|endpoint| {
             endpoint.transport == ClusterTransportKind::Iroh
                 && endpoint.address
-                    == "iroh://iroh_public_key_shadow_repair_route?relay=https://relay.example./"
+                    == "iroh://module_public_key_shadow_repair_route?relay=https://relay.example./"
         }));
     }
 
@@ -11444,13 +11487,19 @@ mod tests {
             "10.0.0.53:21353".to_string(),
             10,
         );
-        let iroh = IrohEndpointRecord::from_relay_url(
-            cluster_id.clone(),
-            remote_node.clone(),
-            "iroh_public_key_daemon_command_connectivity",
-            "https://relay.example./",
-        )
-        .endpoint();
+        let public_tcp = ClusterEndpointRecord {
+            endpoint_id: sinomo_core::network::ClusterEndpointId::from_legacy_named(
+                "endpoint_daemon_command_connectivity_public",
+            )
+            .expect("endpoint"),
+            node_id: remote_node.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "203.0.113.53:21353".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 20,
+            last_observed_latency_ms: None,
+        };
         let mut remote_member = ClusterMemberRecord::local_voter(
             cluster_id,
             remote_node.clone(),
@@ -11461,7 +11510,7 @@ mod tests {
         remote_member.capabilities =
             sinomo_core::node::main_daemon_capabilities(&remote_member.role);
         remote_member.allowed_capabilities = remote_member.capabilities.clone();
-        remote_member.endpoints = vec![tcp.clone(), iroh.clone()];
+        remote_member.endpoints = vec![tcp.clone(), public_tcp.clone()];
         state.members.push(remote_member);
 
         let read_tcp_record = || {
@@ -11493,8 +11542,8 @@ mod tests {
         assert_eq!(record.consecutive_failures, 0);
         assert_eq!(record.latency_ms, Some(8));
         assert!(
-            !cached_connectivity_matches(&paths, &record),
-            "command-path observations must not enter the published cache before a KV sync"
+            cached_connectivity_matches(&paths, &record),
+            "command-path observations should update the local connectivity publish cache for dedupe"
         );
 
         remember_cluster_endpoint_command_connectivity(
@@ -11564,8 +11613,8 @@ mod tests {
             .select(sinomo_core::network::ClusterEndpointSelectionPurpose::ClusterStateCommand);
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
-            Some(&iroh.endpoint_id),
-            "unreachable direct command endpoint should not outrank relay fallback"
+            Some(&public_tcp.endpoint_id),
+            "unreachable private command endpoint should not outrank public fallback"
         );
 
         remember_cluster_endpoint_command_connectivity(
@@ -11661,8 +11710,8 @@ mod tests {
             .select(sinomo_core::network::ClusterEndpointSelectionPurpose::ClusterStateCommand);
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
-            Some(&iroh.endpoint_id),
-            "identity-failed direct command endpoint should not outrank relay fallback"
+            Some(&public_tcp.endpoint_id),
+            "identity-failed private command endpoint should not outrank public fallback"
         );
 
         remember_cluster_endpoint_command_connectivity(
@@ -12151,13 +12200,19 @@ mod tests {
             "10.0.0.41:21353".to_string(),
             10,
         );
-        let iroh = IrohEndpointRecord::from_relay_url(
-            cluster_id.clone(),
-            remote_node.clone(),
-            "iroh_public_key_daemon_raft_connectivity",
-            "https://relay.example./",
-        )
-        .endpoint();
+        let public_tcp = ClusterEndpointRecord {
+            endpoint_id: sinomo_core::network::ClusterEndpointId::from_legacy_named(
+                "endpoint_daemon_raft_connectivity_public",
+            )
+            .expect("endpoint"),
+            node_id: remote_node.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "203.0.113.41:21353".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 20,
+            last_observed_latency_ms: None,
+        };
         let mut remote_member = ClusterMemberRecord::local_voter(
             cluster_id.clone(),
             remote_node,
@@ -12168,7 +12223,7 @@ mod tests {
         remote_member.capabilities =
             sinomo_core::node::main_daemon_capabilities(&remote_member.role);
         remote_member.allowed_capabilities = remote_member.capabilities.clone();
-        remote_member.endpoints = vec![tcp.clone(), iroh.clone()];
+        remote_member.endpoints = vec![tcp.clone(), public_tcp.clone()];
         state.members.push(remote_member);
 
         sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write cluster state");
@@ -12191,7 +12246,7 @@ mod tests {
                 ),
                 sinomo_core::network::cluster_connectivity_record(
                     &state,
-                    &iroh,
+                    &public_tcp,
                     sinomo_core::network::ClusterConnectivityState::Healthy,
                     Some(40),
                     0,
@@ -12209,8 +12264,8 @@ mod tests {
 
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
-            Some(&iroh.endpoint_id),
-            "raft/KV forwarding must not spend the command budget on an unreachable TCP endpoint before a healthy Iroh path"
+            Some(&public_tcp.endpoint_id),
+            "raft/KV forwarding must not spend the command budget on an unreachable private TCP endpoint before a healthy public TCP path"
         );
         assert!(
             targets
@@ -12525,7 +12580,7 @@ mod tests {
     }
 
     #[test]
-    fn raft_command_targets_try_unknown_tcp_before_unknown_iroh_fallbacks() {
+    fn raft_command_targets_skip_unclaimed_module_fallbacks() {
         let root = unique_cluster_test_root("sinomo-daemon-raft-unknown-tcp-order");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -12556,13 +12611,10 @@ mod tests {
             "10.0.0.41:21353".to_string(),
             20,
         );
-        let iroh = IrohEndpointRecord::from_relay_url(
-            cluster_id.clone(),
-            remote_node.clone(),
-            "iroh_public_key_daemon_raft_unknown_tcp",
-            "https://relay.example./",
-        )
-        .endpoint();
+        let iroh = test_network_module_relay_endpoint(
+            &remote_node,
+            "module_public_key_daemon_raft_unknown_tcp",
+        );
         let mut remote_member = ClusterMemberRecord::local_voter(
             cluster_id.clone(),
             remote_node,
@@ -12586,17 +12638,23 @@ mod tests {
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
             Some(&private_tcp.endpoint_id),
-            "raft/KV forwarding should try bounded TCP before spending the command budget on relay fallback when neither path has current connectivity data"
+            "raft/KV forwarding should try bounded TCP first when neither path has current connectivity data"
         );
-        let iroh_position = targets
-            .iter()
-            .position(|endpoint| endpoint.endpoint_id == iroh.endpoint_id)
-            .expect("iroh target");
+        assert!(
+            targets
+                .iter()
+                .all(|endpoint| endpoint.endpoint_id != iroh.endpoint_id),
+            "unclaimed module endpoints must not be command targets"
+        );
         let public_position = targets
             .iter()
             .position(|endpoint| endpoint.endpoint_id == public_tcp.endpoint_id)
             .expect("public tcp target");
-        assert!(public_position < iroh_position);
+        let private_position = targets
+            .iter()
+            .position(|endpoint| endpoint.endpoint_id == private_tcp.endpoint_id)
+            .expect("private tcp target");
+        assert!(private_position < public_position);
         assert!(
             targets
                 .iter()
@@ -12770,8 +12828,6 @@ mod tests {
 
     #[test]
     fn peer_connectivity_import_caps_endpoint_timeout() {
-        let cluster_id =
-            ClusterId::from_legacy_named("cluster_peer_import_timeout").expect("cluster id");
         let remote_node =
             NodeId::from_legacy_named("node_peer_import_timeout_remote").expect("remote node");
         let tcp = sinomo_core::network::daemon_lan_endpoint(
@@ -12779,13 +12835,10 @@ mod tests {
             "10.0.0.41:21353".to_string(),
             10,
         );
-        let iroh = IrohEndpointRecord::from_relay_url(
-            cluster_id,
-            remote_node,
-            "iroh_public_key_peer_import_timeout",
-            "https://relay.example./",
-        )
-        .endpoint();
+        let iroh = test_network_module_relay_endpoint(
+            &remote_node,
+            "module_public_key_peer_import_timeout",
+        );
 
         let normal_timeouts = cluster_control_plane_timeouts();
         assert_eq!(
@@ -13296,13 +13349,19 @@ mod tests {
             "10.0.0.41:21353".to_string(),
             10,
         );
-        let first_iroh = IrohEndpointRecord::from_relay_url(
-            cluster_id.clone(),
-            first_node.clone(),
-            "iroh_public_key_daemon_raft_interleave_first",
-            "https://relay.example./",
-        )
-        .endpoint();
+        let first_public_tcp = ClusterEndpointRecord {
+            endpoint_id: sinomo_core::network::ClusterEndpointId::from_legacy_named(
+                "endpoint_daemon_raft_interleave_first_public",
+            )
+            .expect("endpoint"),
+            node_id: first_node.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "203.0.113.41:21353".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 20,
+            last_observed_latency_ms: None,
+        };
         let second_tcp = sinomo_core::network::daemon_lan_endpoint(
             &second_node,
             "10.0.0.42:21353".to_string(),
@@ -13313,7 +13372,7 @@ mod tests {
                 first_node.clone(),
                 "first",
                 "pk-first",
-                vec![first_tcp.clone(), first_iroh.clone()],
+                vec![first_tcp.clone(), first_public_tcp.clone()],
             ),
             (
                 second_node.clone(),
@@ -13341,17 +13400,17 @@ mod tests {
 
         let targets = sinomo_core::network::ClusterEndpointSelector::new(&paths, &state)
             .select(sinomo_core::network::ClusterEndpointSelectionPurpose::ClusterStateCommand);
-        let first_iroh_position = targets
+        let first_public_position = targets
             .iter()
-            .position(|endpoint| endpoint.endpoint_id == first_iroh.endpoint_id)
-            .expect("first iroh");
+            .position(|endpoint| endpoint.endpoint_id == first_public_tcp.endpoint_id)
+            .expect("first public tcp");
         let second_tcp_position = targets
             .iter()
             .position(|endpoint| endpoint.endpoint_id == second_tcp.endpoint_id)
             .expect("second tcp");
 
         assert!(
-            second_tcp_position < first_iroh_position,
+            second_tcp_position < first_public_position,
             "raft/KV forwarding should try another voter's best endpoint before fallbacks for one voter"
         );
     }
@@ -13472,13 +13531,8 @@ mod tests {
     #[test]
     fn raft_command_timeout_caps_single_iroh_attempt_to_preserve_fallback_budget() {
         let node_id = NodeId::from_legacy_named("node_daemon_raft_iroh_timeout").expect("node");
-        let endpoint = IrohEndpointRecord::from_relay_url(
-            ClusterId::from_legacy_named("cluster_daemon_raft_iroh_timeout").expect("cluster"),
-            node_id,
-            "iroh_public_key_daemon_raft_timeout",
-            "https://relay.example./",
-        )
-        .endpoint();
+        let endpoint =
+            test_network_module_relay_endpoint(&node_id, "module_public_key_daemon_raft_timeout");
 
         assert_eq!(
             cluster_state_authority_reachability_options().command_timeout(
@@ -13508,13 +13562,10 @@ mod tests {
             priority: 20,
             last_observed_latency_ms: None,
         };
-        let iroh = IrohEndpointRecord::from_relay_url(
-            ClusterId::from_legacy_named("cluster_daemon_raft_foreground").expect("cluster"),
-            node_id,
-            "iroh_public_key_daemon_raft_foreground",
-            "https://relay.example./",
-        )
-        .endpoint();
+        let iroh = test_network_module_relay_endpoint(
+            &node_id,
+            "module_public_key_daemon_raft_foreground",
+        );
 
         let timeout_options = cluster_state_authority_reachability_options();
         assert_eq!(

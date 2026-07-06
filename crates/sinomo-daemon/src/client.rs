@@ -87,7 +87,7 @@ pub async fn send_daemon_rpc_async(
         address,
         &control_request,
         timeouts,
-        sinomo_core::network::IROH_DAEMON_COMMAND_MAX_BYTES,
+        sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
     )
     .await?;
     Ok(response)
@@ -134,7 +134,7 @@ pub(crate) fn send_daemon_rpc_raw_with_timeouts(
             address,
             &control_request,
             timeouts,
-            sinomo_core::network::IROH_DAEMON_COMMAND_MAX_BYTES,
+            sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
         )
         .await
         .map_err(DaemonError::from)
@@ -277,7 +277,7 @@ pub async fn send_daemon_rpc_stream_async(
         let rpc = stream
             .read_response(
                 address,
-                sinomo_core::network::IROH_DAEMON_COMMAND_MAX_BYTES,
+                sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
                 frame_options,
             )
             .await?;

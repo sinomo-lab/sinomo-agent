@@ -19,7 +19,7 @@ use sinomo_kv::{KvRevision, push_bounded_txn_success_op};
 use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
-use sinomo_network::cleanup_member_iroh_endpoints;
+use sinomo_network::cleanup_member_endpoint_duplicates;
 use sinomo_network::{
     ClusterConnectivityRecord, ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector,
 };
@@ -104,7 +104,7 @@ pub fn cluster_member_publish_matches_kv(
     };
     for member in members {
         let mut member = cluster_member_publish_record_for_snapshot(Some(&snapshot), member);
-        cleanup_member_iroh_endpoints(&mut member);
+        cleanup_member_endpoint_duplicates(&mut member);
         member
             .endpoints
             .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
@@ -115,7 +115,7 @@ pub fn cluster_member_publish_matches_kv(
         let Ok(mut existing) = entry.decode::<ClusterMemberRecord>() else {
             return Ok(false);
         };
-        cleanup_member_iroh_endpoints(&mut existing);
+        cleanup_member_endpoint_duplicates(&mut existing);
         existing
             .endpoints
             .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
@@ -649,7 +649,7 @@ fn cluster_member_publish_txn_with_snapshot(
     let mut success = Vec::new();
     for member in members {
         let mut member = cluster_member_publish_record_for_snapshot(snapshot, member);
-        cleanup_member_iroh_endpoints(&mut member);
+        cleanup_member_endpoint_duplicates(&mut member);
         push_snapshot_member_diff_put_op(
             snapshot,
             cluster_member_key(&member.node_id),

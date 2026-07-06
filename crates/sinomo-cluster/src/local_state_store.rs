@@ -16,7 +16,7 @@ use sinomo_network::NetworkError;
 use sinomo_network::remove_optional_file;
 use sinomo_network::{ClusterFileMark, cluster_file_mark};
 use sinomo_network::{
-    cleanup_cluster_iroh_endpoints, cleanup_member_iroh_endpoints, upsert_member_endpoint,
+    cleanup_cluster_endpoint_duplicates, cleanup_member_endpoint_duplicates, upsert_member_endpoint,
 };
 use sinomo_network::{read_optional_object_file, write_object_file_with_semantic_skip};
 use sinomo_node::{
@@ -160,7 +160,7 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
                 for endpoint in kv_member.endpoints.drain(..) {
                     upsert_member_endpoint(&mut local_member, endpoint);
                 }
-                cleanup_member_iroh_endpoints(&mut local_member);
+                cleanup_member_endpoint_duplicates(&mut local_member);
                 upsert_member_record(&mut state, local_member);
             } else {
                 upsert_member_record(&mut state, local_member);
@@ -169,7 +169,7 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
         state
             .members
             .sort_by(|left, right| left.node_id.cmp(&right.node_id));
-        cleanup_cluster_iroh_endpoints(&mut state);
+        cleanup_cluster_endpoint_duplicates(&mut state);
         return Ok(state);
     }
     for member in kv_members {
@@ -184,7 +184,7 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
             for endpoint in member.endpoints {
                 upsert_member_endpoint(&mut local_member, endpoint);
             }
-            cleanup_member_iroh_endpoints(&mut local_member);
+            cleanup_member_endpoint_duplicates(&mut local_member);
             upsert_member_record(&mut state, local_member);
             continue;
         }
@@ -196,7 +196,7 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
     if let Some(local_member) = local_member {
         upsert_member_record(&mut state, local_member);
     }
-    cleanup_cluster_iroh_endpoints(&mut state);
+    cleanup_cluster_endpoint_duplicates(&mut state);
     Ok(state)
 }
 

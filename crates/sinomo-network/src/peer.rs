@@ -380,7 +380,7 @@ pub enum TransportKind {
     Loopback,
     Tcp,
     Quic,
-    Iroh,
+    Module,
     WebRtc,
     TurnRelay,
     HttpsRelay,
@@ -394,10 +394,10 @@ impl TransportKind {
             sinomo_base::ClusterTransportKind::Loopback => Self::Loopback,
             sinomo_base::ClusterTransportKind::LanTcp => Self::Tcp,
             sinomo_base::ClusterTransportKind::LanQuic => Self::Quic,
-            sinomo_base::ClusterTransportKind::Iroh => Self::Iroh,
             sinomo_base::ClusterTransportKind::WebRtc => Self::WebRtc,
             sinomo_base::ClusterTransportKind::TurnRelay => Self::TurnRelay,
             sinomo_base::ClusterTransportKind::HttpsRelay => Self::HttpsRelay,
+            _ => Self::Module,
         }
     }
 }

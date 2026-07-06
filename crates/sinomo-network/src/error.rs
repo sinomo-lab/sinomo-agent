@@ -59,14 +59,6 @@ pub enum NetworkError {
     #[error("in-process mailbox for {node_id} is full: max {max_frames} frames")]
     MailboxFull { node_id: NodeId, max_frames: usize },
     #[error(
-        "iroh daemon proxy in-flight frame budget exceeded: requested {frame_bytes} bytes with {in_flight_bytes} already active; max is {max_in_flight_bytes}"
-    )]
-    IrohProxyFrameBudgetExceeded {
-        frame_bytes: usize,
-        in_flight_bytes: usize,
-        max_in_flight_bytes: usize,
-    },
-    #[error(
         "object frame in-flight memory unavailable: requested {frame_bytes} bytes with {in_flight_bytes} already active and {available_memory_bytes:?} bytes available"
     )]
     ObjectFrameMemoryUnavailable {

@@ -387,13 +387,6 @@ impl ParsedManualDaemonEndpoint {
             ClusterTransportKind::LanTcp => {
                 sinomo_core::network::daemon_lan_endpoint(node_id, self.address, priority)
             }
-            ClusterTransportKind::Iroh => {
-                let mut endpoint =
-                    sinomo_core::network::daemon_lan_endpoint(node_id, self.address, priority);
-                endpoint.transport = ClusterTransportKind::Iroh;
-                endpoint.privacy = ClusterEndpointPrivacy::Relayed;
-                endpoint
-            }
             transport => {
                 let mut endpoint =
                     sinomo_core::network::daemon_lan_endpoint(node_id, self.address, priority);
@@ -438,40 +431,35 @@ fn parse_manual_daemon_endpoint(
                 }
             })
         }
-        "iroh" => {
-            let address = format!("iroh://{rest}");
-            let (public_key, default_scope) = parse_manual_iroh_endpoint_scope(&address)?;
+        scheme => {
+            let module = sinomo_core::network::network_module_registry()?
+                .module_for_address_scheme(scheme)?;
+            let transport = module.descriptor().transports.first().cloned()?;
+            let address = format!("{scheme}://{rest}");
             Some(ParsedManualDaemonEndpoint {
-                transport: ClusterTransportKind::Iroh,
-                address,
-                endpoint_id: Some(sinomo_core::network::stable_iroh_endpoint_id(
-                    node_id,
-                    &public_key,
+                transport,
+                endpoint_id: Some(sinomo_core::network::ClusterEndpointId::derived(
+                    "sinomo.manual.daemon.endpoint",
+                    format!("{}\0{scheme}\0{address}", node_id.as_str()),
                 )),
-                default_scope: Some(default_scope),
+                default_scope: default_scope_for_url_manual_endpoint(&address),
+                address,
             })
         }
-        _ => None,
     }
 }
 
-fn parse_manual_iroh_endpoint_scope(address: &str) -> Option<(String, ClusterEndpointPrivacy)> {
-    let rest = address.strip_prefix("iroh://")?;
-    let (public_key, query) = rest.split_once('?').unwrap_or((rest, ""));
-    let public_key = public_key.trim();
-    if public_key.is_empty() {
-        return None;
-    }
+fn default_scope_for_url_manual_endpoint(address: &str) -> Option<ClusterEndpointPrivacy> {
+    let (_, query) = address.split_once('?')?;
     let has_relay = query.split('&').any(|part| {
         part.strip_prefix("relay=")
             .is_some_and(|value| !value.trim().is_empty())
     });
-    let scope = if has_relay {
+    Some(if has_relay {
         ClusterEndpointPrivacy::Relayed
     } else {
         ClusterEndpointPrivacy::InternetDirect
-    };
-    Some((public_key.to_string(), scope))
+    })
 }
 
 fn normalize_tcp_manual_endpoint_address(raw: &str, default_port: u16) -> Option<String> {
@@ -1268,17 +1256,16 @@ mod tests {
     }
 
     #[test]
-    fn manual_endpoint_config_adds_iroh_url_endpoint() {
+    fn manual_endpoint_config_applies_scope_and_priority() {
         let now = OffsetDateTime::now_utc();
         let state = ClusterBootstrapState::initialized_locally(
-            ClusterId::from_legacy_named("cluster_manual_iroh_endpoint").expect("cluster"),
-            "manual iroh endpoint".to_string(),
-            NodeId::from_legacy_named("node_manual_iroh_endpoint").expect("node"),
-            "manual iroh endpoint".to_string(),
+            ClusterId::from_legacy_named("cluster_manual_scoped_endpoint").expect("cluster"),
+            "manual scoped endpoint".to_string(),
+            NodeId::from_legacy_named("node_manual_scoped_endpoint").expect("node"),
+            "manual scoped endpoint".to_string(),
             "main-public-key".to_string(),
             now,
         );
-        let address = "iroh://manual_iroh_key?relay=https://relay.example/".to_string();
         let endpoints = daemon_advertised_endpoints_for_state_with_manual_config(
             &state,
             &state.local_node_id,
@@ -1287,21 +1274,16 @@ mod tests {
             &[],
             &[],
             &[DaemonManualEndpointConfig {
-                address: address.clone(),
-                scope: None,
+                address: "tcp://129.146.106.76".to_string(),
+                scope: Some(ClusterEndpointPrivacy::Relayed),
                 priority: Some(9),
             }],
         );
 
         assert!(endpoints.iter().any(|endpoint| {
             endpoint.node_id == state.local_node_id
-                && endpoint.endpoint_id
-                    == sinomo_core::network::stable_iroh_endpoint_id(
-                        &state.local_node_id,
-                        "manual_iroh_key",
-                    )
-                && endpoint.transport == ClusterTransportKind::Iroh
-                && endpoint.address == address
+                && endpoint.transport == ClusterTransportKind::LanTcp
+                && endpoint.address == "129.146.106.76:21353"
                 && endpoint.source == ClusterEndpointSource::Static
                 && endpoint.privacy == ClusterEndpointPrivacy::Relayed
                 && endpoint.priority == 9

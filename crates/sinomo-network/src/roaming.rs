@@ -1,18 +1,11 @@
-//! Roaming transport support: the transport-neutral iroh pieces this crate
-//! keeps (the `IrohEndpointRecord` data type, `iroh://` parse/format, stable
-//! endpoint ids, record file I/O) plus registry-aware daemon RPC dispatch.
+//! Roaming transport support and registry-aware daemon RPC dispatch.
 //!
-//! The iroh-SDK-backed implementation (endpoint builder, secret keys, proxy
-//! supervisor, dial client) is module-only: it lives in the
-//! `modules/network/iroh` dylib (stage C of
-//! docs/plans/r0-r1-crate-boundary-refactor.md). Dispatch reaches it through
-//! the process-wide network-module registry; iroh endpoints and `iroh://`
-//! addresses that no registered module claims are un-dialable.
+//! Built-in loopback/LAN-TCP paths stay in this crate. Additional transports
+//! are loaded at runtime through the network-module registry and are dialed by
+//! transport kind or address scheme.
 
-use crate::ClusterPaths;
 use crate::error::NetworkError;
 use crate::object::DaemonRpcTimeouts;
-use crate::object_file_store::{read_object_file, write_object_file};
 #[cfg(any(test, feature = "test-support"))]
 use crate::peer::{EndpointCandidateStatus, PeerEndpointCandidate};
 use crate::prelude::*;
@@ -20,8 +13,6 @@ use crate::prelude::*;
 use sinomo_kv::KvEntry;
 #[cfg(any(test, feature = "test-support"))]
 use sinomo_kv::{KvOp, LeaseId};
-
-pub const IROH_DAEMON_COMMAND_MAX_BYTES: usize = crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES;
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -212,256 +203,6 @@ impl WebRtcKvExchange {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct IrohEndpointRecord {
-    pub cluster_id: ClusterId,
-    pub node_id: NodeId,
-    pub endpoint_public_key: String,
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "crate::fallible_serde::deserialize_vec"
-    )]
-    pub direct_addresses: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub relay_url: Option<String>,
-    pub relay_mode: IrohRelayMode,
-    pub expires_after_tick: u64,
-}
-
-impl IrohEndpointRecord {
-    pub fn read(paths: &ClusterPaths, node_id: &NodeId) -> Result<Self, NetworkError> {
-        read_iroh_endpoint_record(paths, node_id)
-    }
-
-    pub fn from_relay_url(
-        cluster_id: ClusterId,
-        node_id: NodeId,
-        endpoint_public_key: impl Into<String>,
-        relay_url: impl Into<String>,
-    ) -> Self {
-        let relay_url = relay_url.into();
-        Self {
-            cluster_id,
-            node_id,
-            endpoint_public_key: endpoint_public_key.into(),
-            direct_addresses: Vec::new(),
-            relay_url: Some(relay_url.clone()),
-            relay_mode: IrohRelayMode::Custom { relay_url },
-            expires_after_tick: 0,
-        }
-    }
-
-    pub fn endpoint(&self) -> ClusterEndpointRecord {
-        let has_relay = self.relay_url.is_some();
-        let address = if has_relay {
-            let mut query = Vec::new();
-            if let Some(relay_url) = &self.relay_url {
-                query.push(format!("relay={relay_url}"));
-            }
-            format!("iroh://{}?{}", self.endpoint_public_key, query.join("&"))
-        } else {
-            format!("iroh://{}", self.endpoint_public_key)
-        };
-
-        ClusterEndpointRecord {
-            endpoint_id: stable_iroh_endpoint_id(&self.node_id, &self.endpoint_public_key),
-            node_id: self.node_id.clone(),
-            transport: ClusterTransportKind::Iroh,
-            address,
-            source: ClusterEndpointSource::Rendezvous,
-            privacy: if has_relay {
-                ClusterEndpointPrivacy::Relayed
-            } else {
-                ClusterEndpointPrivacy::InternetDirect
-            },
-            priority: 90,
-            last_observed_latency_ms: None,
-        }
-    }
-
-    pub fn write(&self, paths: &ClusterPaths) -> Result<(), NetworkError> {
-        write_iroh_endpoint_record(paths, self)
-    }
-}
-
-pub fn stable_iroh_endpoint_id(node_id: &NodeId, endpoint_public_key: &str) -> ClusterEndpointId {
-    ClusterEndpointId::derived(
-        "sinomo.iroh.endpoint",
-        format!("{}\0{endpoint_public_key}", node_id.as_str()),
-    )
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum IrohRelayMode {
-    Disabled,
-    Default,
-    Custom { relay_url: String },
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub struct IrohKvExchange;
-
-#[cfg(any(test, feature = "test-support"))]
-impl IrohKvExchange {
-    pub fn endpoint_key(cluster_id: &ClusterId, node_id: &NodeId) -> String {
-        format!("/iroh/endpoints/{cluster_id}/{node_id}")
-    }
-
-    pub fn endpoint_prefix(cluster_id: &ClusterId) -> String {
-        format!("/iroh/endpoints/{cluster_id}/")
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn put_endpoint(
-        endpoint: IrohEndpointRecord,
-        lease_id: Option<LeaseId>,
-    ) -> Result<KvOp, NetworkError> {
-        let key = Self::endpoint_key(&endpoint.cluster_id, &endpoint.node_id);
-        KvOp::put_serde(key, &endpoint, lease_id).map_err(NetworkError::directory)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn endpoint_from_entry(entry: &KvEntry) -> Result<IrohEndpointRecord, NetworkError> {
-        entry.decode().map_err(NetworkError::directory)
-    }
-}
-
-fn iroh_endpoint_record_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
-    paths
-        .iroh
-        .join(format!("{}.endpoint.sobj", node_id.as_str()))
-}
-
-async fn spawn_roaming_disk_task_on_runtime<T, F>(
-    runtime: &tokio::runtime::Handle,
-    operation: &'static str,
-    task: F,
-) -> Result<T, NetworkError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, NetworkError> + Send + 'static,
-{
-    runtime
-        .spawn_blocking(task)
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: operation.to_string(),
-            detail: source.to_string(),
-        })?
-}
-
-pub(crate) fn read_iroh_endpoint_record(
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-) -> Result<IrohEndpointRecord, NetworkError> {
-    let path = iroh_endpoint_record_path(paths, node_id);
-    read_object_file(&path)
-}
-
-pub async fn read_iroh_endpoint_record_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-) -> Result<IrohEndpointRecord, NetworkError> {
-    let paths = paths.clone();
-    let node_id = node_id.clone();
-    spawn_roaming_disk_task_on_runtime(runtime, "read iroh endpoint record", move || {
-        IrohEndpointRecord::read(&paths, &node_id)
-    })
-    .await
-}
-
-pub(crate) fn write_iroh_endpoint_record(
-    paths: &ClusterPaths,
-    record: &IrohEndpointRecord,
-) -> Result<(), NetworkError> {
-    write_object_file(&iroh_endpoint_record_path(paths, &record.node_id), record)
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub async fn write_iroh_endpoint_record_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    record: &IrohEndpointRecord,
-) -> Result<(), NetworkError> {
-    let paths = paths.clone();
-    let record = record.clone();
-    spawn_roaming_disk_task_on_runtime(runtime, "write iroh endpoint record", move || {
-        record.write(&paths)
-    })
-    .await
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub fn iroh_endpoint_record_from_cluster_endpoint(
-    endpoint: &ClusterEndpointRecord,
-    cluster_id: &ClusterId,
-) -> Result<IrohEndpointRecord, NetworkError> {
-    if endpoint.transport != ClusterTransportKind::Iroh {
-        return Err(NetworkError::Io {
-            operation: "parse iroh endpoint".to_string(),
-            detail: format!("endpoint {} is not an iroh endpoint", endpoint.endpoint_id),
-        });
-    }
-    iroh_endpoint_record_from_address(&endpoint.address, cluster_id, &endpoint.node_id)
-}
-
-/// Parses an `iroh://<public-key>?direct=...&relay=...` address into an
-/// [`IrohEndpointRecord`]. Unconditionally public since stage C: the
-/// `iroh://` parse/format contract stays in this crate while dylib network
-/// modules reuse it through the sinomo-core facade.
-pub fn iroh_endpoint_record_from_address(
-    address: &str,
-    cluster_id: &ClusterId,
-    node_id: &NodeId,
-) -> Result<IrohEndpointRecord, NetworkError> {
-    let rest = address
-        .strip_prefix("iroh://")
-        .ok_or_else(|| NetworkError::Serialization {
-            detail: format!("invalid iroh endpoint address `{address}`"),
-        })?;
-    let (public_key, query) = rest.split_once('?').unwrap_or((rest, ""));
-    if public_key.trim().is_empty() {
-        return Err(NetworkError::Serialization {
-            detail: format!("invalid iroh endpoint address `{address}`"),
-        });
-    }
-    let mut direct_addresses = Vec::new();
-    let mut relay_url = None;
-    for part in query.split('&').filter(|part| !part.trim().is_empty()) {
-        if let Some(value) = part.strip_prefix("direct=") {
-            direct_addresses.extend(
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned),
-            );
-        } else if let Some(value) = part.strip_prefix("relay=") {
-            if !value.trim().is_empty() {
-                relay_url = Some(value.to_string());
-            }
-        }
-    }
-    let relay_mode = relay_url
-        .as_ref()
-        .map(|relay_url| IrohRelayMode::Custom {
-            relay_url: relay_url.clone(),
-        })
-        .unwrap_or(IrohRelayMode::Default);
-    Ok(IrohEndpointRecord {
-        cluster_id: cluster_id.clone(),
-        node_id: node_id.clone(),
-        endpoint_public_key: public_key.to_string(),
-        direct_addresses,
-        relay_url,
-        relay_mode,
-        expires_after_tick: 0,
-    })
-}
-
 pub async fn send_daemon_rpc_to_cluster_endpoint_async(
     endpoint: &ClusterEndpointRecord,
     auth: Option<&[u8]>,
@@ -504,11 +245,6 @@ async fn send_daemon_control_request_to_cluster_endpoint_async(
             send_daemon_control_request_to_address_async(&endpoint.address, request, timeouts).await
         }
         ref transport => {
-            // Registry-aware dispatch (stage C): transports without a
-            // built-in path — iroh included, its dialer lives in the
-            // modules/network/iroh dylib — dial through a registered module
-            // when one claims them; otherwise keep the historical
-            // unsupported-transport error.
             if let Some(module) =
                 crate::network_module::registered_network_module_for_transport(transport)
             {
@@ -539,13 +275,15 @@ async fn dial_daemon_control_request_via_network_module(
 ) -> Result<crate::DaemonControlResponse, NetworkError> {
     let frame = crate::object::encode_object_frame_to_vec(request)?;
     let response = module.dial_rpc(endpoint, &frame, timeouts).await?;
-    crate::object::decode_single_object_frame_from_slice(&response, IROH_DAEMON_COMMAND_MAX_BYTES)
+    crate::object::decode_single_object_frame_from_slice(
+        &response,
+        crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
+    )
 }
 
 /// Synthesizes the endpoint record handed to a network module when dispatch
 /// starts from a bare address string (scheme sniff) instead of a cluster
-/// endpoint record. Mirrors the placeholder identities the (since-removed)
-/// built-in iroh address dial historically used.
+/// endpoint record.
 fn cluster_endpoint_record_for_module_address_dial(
     address: &str,
     transport: ClusterTransportKind,
@@ -574,17 +312,14 @@ async fn send_daemon_control_rpc_request_raw_response_to_cluster_endpoint_async(
                 &endpoint.address,
                 request,
                 timeouts,
-                IROH_DAEMON_COMMAND_MAX_BYTES,
+                crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
             )
             .await
         }
-        ClusterTransportKind::Iroh => {
-            // Registry-aware dispatch (stage C): raw/streamed responses only
-            // route through a module that declares `supports_raw_response`
-            // (the iroh module does not — its proxy re-frames responses).
-            if let Some(module) = crate::network_module::registered_network_module_for_transport(
-                &ClusterTransportKind::Iroh,
-            ) && module.descriptor().supports_raw_response
+        ref transport => {
+            if let Some(module) =
+                crate::network_module::registered_network_module_for_transport(transport)
+                && module.descriptor().supports_raw_response
             {
                 // DaemonControlResponse == ObjectRpcResponse, so the module
                 // frame decode is identical to the non-raw path.
@@ -598,14 +333,12 @@ async fn send_daemon_control_rpc_request_raw_response_to_cluster_endpoint_async(
             }
             Err(NetworkError::Io {
                 operation: format!("send streamed daemon rpc to {}", endpoint.address),
-                detail: "streamed raw RPC responses are not supported over iroh proxy transport"
-                    .to_string(),
+                detail: format!(
+                    "streamed raw RPC responses are not supported over module transport {:?}",
+                    endpoint.transport
+                ),
             })
         }
-        _ => Err(NetworkError::Io {
-            operation: format!("send streamed daemon rpc to {}", endpoint.address),
-            detail: format!("unsupported daemon rpc transport {:?}", endpoint.transport),
-        }),
     }
 }
 
@@ -614,19 +347,17 @@ async fn send_daemon_control_request_to_address_async(
     request: &crate::DaemonControlRequest,
     timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::DaemonControlResponse, NetworkError> {
-    if daemon_rpc_address_uses_iroh(address) {
-        // Registry-aware dispatch (stage C): `iroh://` strings can ride on
-        // LanTcp-tagged endpoint records, so this scheme sniff — not only the
-        // transport-kind arm above — must consult the registry. Iroh dialing
-        // is module-only; without a registered module claiming the scheme the
-        // address is un-dialable.
+    if let Some(scheme) = crate::network_module::endpoint_address_scheme(address) {
         if let Some(module) =
-            crate::network_module::registered_network_module_for_address_scheme("iroh")
+            crate::network_module::registered_network_module_for_address_scheme(scheme)
         {
-            let endpoint = cluster_endpoint_record_for_module_address_dial(
-                address,
-                ClusterTransportKind::Iroh,
-            );
+            let transport = module
+                .descriptor()
+                .transports
+                .first()
+                .cloned()
+                .unwrap_or(ClusterTransportKind::HttpsRelay);
+            let endpoint = cluster_endpoint_record_for_module_address_dial(address, transport);
             return dial_daemon_control_request_via_network_module(
                 module.as_ref(),
                 &endpoint,
@@ -637,23 +368,16 @@ async fn send_daemon_control_request_to_address_async(
         }
         return Err(NetworkError::Io {
             operation: format!("send daemon rpc to {address}"),
-            detail: format!(
-                "unsupported daemon rpc transport {:?}",
-                ClusterTransportKind::Iroh
-            ),
+            detail: format!("unsupported daemon rpc address scheme `{scheme}`"),
         });
     }
     crate::send_daemon_control_request_async(
         address,
         request,
         timeouts,
-        IROH_DAEMON_COMMAND_MAX_BYTES,
+        crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
     )
     .await
-}
-
-fn daemon_rpc_address_uses_iroh(address: &str) -> bool {
-    address.trim_start().starts_with("iroh://")
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -830,7 +554,7 @@ impl LanConnectionPlanner {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum RoamingPathSelection {
     Direct(PeerEndpointCandidate),
-    Iroh(PeerEndpointCandidate),
+    Module(PeerEndpointCandidate),
     WebRtc(PeerEndpointCandidate),
     Relay(PeerEndpointCandidate),
 }
@@ -849,8 +573,16 @@ impl RoamingConnectionPlanner {
         if let Some(candidate) = candidates
             .iter()
             .filter(|candidate| {
-                candidate.endpoint.transport == ClusterTransportKind::Iroh
-                    && candidate.status != EndpointCandidateStatus::Failed
+                !matches!(
+                    candidate.endpoint.transport,
+                    ClusterTransportKind::InProcess
+                        | ClusterTransportKind::Loopback
+                        | ClusterTransportKind::LanTcp
+                        | ClusterTransportKind::LanQuic
+                        | ClusterTransportKind::WebRtc
+                        | ClusterTransportKind::TurnRelay
+                        | ClusterTransportKind::HttpsRelay
+                ) && candidate.status != EndpointCandidateStatus::Failed
             })
             .min_by_key(|candidate| {
                 let privacy_score = match candidate.endpoint.privacy {
@@ -862,7 +594,7 @@ impl RoamingConnectionPlanner {
                 privacy_score + u32::from(candidate.score)
             })
         {
-            return Some(RoamingPathSelection::Iroh(candidate.clone()));
+            return Some(RoamingPathSelection::Module(candidate.clone()));
         }
 
         if let Some(candidate) = candidates

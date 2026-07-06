@@ -12,10 +12,13 @@ use crate::frames::{
     IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES, IrohProxyByteBudget, IrohProxyByteBudgetPermit,
     read_proxy_frame_async, write_all_frame_async,
 };
+use crate::{
+    IROH_DAEMON_COMMAND_MAX_BYTES,
+    endpoint::{IrohEndpointRecord, IrohRelayMode, iroh_endpoint_dir},
+};
 use fs2::FileExt;
 use sinomo_core::network::{
-    ClusterPaths, DaemonControlRequest, DaemonRpcTimeouts, IROH_DAEMON_COMMAND_MAX_BYTES,
-    IrohEndpointRecord, IrohRelayMode, NetworkError, ObjectRpcResponse,
+    ClusterPaths, DaemonControlRequest, DaemonRpcTimeouts, NetworkError, ObjectRpcResponse,
     decode_single_object_frame_from_slice, encode_object_frame_to_vec, read_object_file,
     read_optional_object_file, write_object_file_create_new_serialized,
 };
@@ -102,11 +105,11 @@ pub(crate) fn sinomo_iroh_endpoint_builder() -> Result<iroh::endpoint::Builder, 
 }
 
 fn iroh_endpoint_key_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
-    paths.iroh.join(format!("{}.secret.sobj", node_id.as_str()))
+    iroh_endpoint_dir(paths).join(format!("{}.secret.sobj", node_id.as_str()))
 }
 
 fn iroh_endpoint_key_lock_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
-    paths.iroh.join(format!("{}.secret.lock", node_id.as_str()))
+    iroh_endpoint_dir(paths).join(format!("{}.secret.lock", node_id.as_str()))
 }
 
 fn storage_io(path: &std::path::Path, detail: impl std::fmt::Display) -> NetworkError {
@@ -1216,7 +1219,7 @@ mod tests {
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
         let node_id = NodeId::from_legacy_named("node_iroh_secret_lock_timeout").expect("node");
-        std::fs::create_dir_all(&paths.iroh).expect("iroh dir");
+        std::fs::create_dir_all(iroh_endpoint_dir(&paths)).expect("iroh dir");
         let key_lock_path = iroh_endpoint_key_lock_path(&paths, &node_id);
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let holder = thread::spawn({

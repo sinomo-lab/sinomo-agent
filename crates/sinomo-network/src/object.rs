@@ -2974,7 +2974,7 @@ mod serde_bytes_tests {
             &address,
             &request,
             DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
-            crate::IROH_DAEMON_COMMAND_MAX_BYTES,
+            crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
         )
         .await
         .expect("streamed response");

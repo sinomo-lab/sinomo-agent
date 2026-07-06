@@ -1591,9 +1591,14 @@ fn cluster_delivery_endpoint_path_cost(
                 20
             }
         }
-        ClusterTransportKind::Iroh => 60,
         ClusterTransportKind::WebRtc => 70,
         ClusterTransportKind::TurnRelay | ClusterTransportKind::HttpsRelay => 100,
+        _ => match privacy {
+            ClusterEndpointPrivacy::InternetDirect => 60,
+            ClusterEndpointPrivacy::Relayed => 100,
+            ClusterEndpointPrivacy::Lan => 70,
+            ClusterEndpointPrivacy::LocalOnly => 120,
+        },
     }
 }
 
@@ -1612,10 +1617,10 @@ fn cluster_delivery_transport_sort_rank(transport: &ClusterTransportKind) -> u8 
         ClusterTransportKind::Loopback => 1,
         ClusterTransportKind::LanTcp => 2,
         ClusterTransportKind::LanQuic => 3,
-        ClusterTransportKind::Iroh => 4,
         ClusterTransportKind::WebRtc => 5,
         ClusterTransportKind::TurnRelay => 6,
         ClusterTransportKind::HttpsRelay => 7,
+        _ => 4,
     }
 }
 

@@ -32,7 +32,7 @@ use sinomo_network::{
     CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY,
     ObjectRpcRequest, ObjectRpcResponse,
 };
-use sinomo_network::{cleanup_member_iroh_endpoints, upsert_member_endpoint};
+use sinomo_network::{cleanup_member_endpoint_duplicates, upsert_member_endpoint};
 use sinomo_node::{
     ClusterCapabilityPolicyRecord, ClusterIdentityRecord, cluster_member_is_local_process,
     upsert_member_record,
@@ -634,7 +634,7 @@ pub fn accepted_cluster_join_state_from_kv_snapshot(
                 upsert_member_endpoint(&mut member, endpoint);
             }
         }
-        cleanup_member_iroh_endpoints(&mut member);
+        cleanup_member_endpoint_duplicates(&mut member);
         members.push(member);
     }
     let authority_public_key = if invite.issuer_public_key.trim().is_empty() {

@@ -1,13 +1,12 @@
 //! Runtime network-module system (stage C of
 //! docs/plans/r0-r1-crate-boundary-refactor.md).
 //!
-//! A network module owns one or more cluster transports (iroh, serial, LoRa,
-//! ...) behind the [`NetworkModule`] trait: it can dial daemon RPCs to a
-//! [`ClusterEndpointRecord`], optionally run a listener/proxy, and advertise
-//! the endpoints it currently serves. Modules are registered in a
-//! [`NetworkModuleRegistry`]; routing code dispatches by endpoint transport
-//! kind AND by address scheme (today `iroh://` strings can ride on
-//! LanTcp-tagged endpoint records, so scheme-aware dispatch is required).
+//! A network module owns one or more non-built-in cluster transports behind
+//! the [`NetworkModule`] trait: it can dial daemon RPCs to a
+//! [`ClusterEndpointRecord`], optionally run a listener/proxy, advertise the
+//! endpoints it currently serves, and classify protocol-specific endpoint
+//! roles. Modules are registered in a [`NetworkModuleRegistry`]; routing code
+//! dispatches by endpoint transport kind and by address scheme.
 //!
 //! Loopback and LAN-TCP remain built-in transports inside this crate — their
 //! pooled/streamed raw dial paths never cross the module seam. The daemon
@@ -89,11 +88,11 @@ pub type NetworkFuture<T> = Pin<Box<dyn Future<Output = Result<T, NetworkError>>
 /// without breaking older modules.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct NetworkModuleDescriptor {
-    /// Stable module id, e.g. `"iroh"`, `"lan-tcp"`, `"serial"`, `"lora"`.
+    /// Stable module id, e.g. `"mesh"`, `"serial"`, `"lora"`.
     pub id: String,
     /// Endpoint transport kinds this module can serve.
     pub transports: Vec<ClusterTransportKind>,
-    /// Address schemes this module dials, e.g. `"iroh"` for `iroh://...`.
+    /// Address schemes this module dials, e.g. `"mesh"` for `mesh://...`.
     /// Dispatch is scheme-aware, not only kind-aware: scheme-tagged addresses
     /// can ride on endpoint records with a different transport kind.
     #[serde(default)]
@@ -108,6 +107,18 @@ pub struct NetworkModuleDescriptor {
     /// framing. When `false` the dispatch layer must not route raw or
     /// streamed requests through this module.
     pub supports_raw_response: bool,
+}
+
+/// Protocol-specific role classification for an endpoint owned by a network
+/// module. The network crate needs this generic answer to avoid routing main
+/// daemon traffic to a shadow/supervision endpoint, but the protocol-specific
+/// parsing and stable-id rules stay inside the module.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkModuleEndpointRole {
+    Unknown,
+    MainDaemon,
+    ShadowDaemon,
 }
 
 /// Host-provided context a network module needs to start its listener/proxy:
@@ -154,6 +165,12 @@ pub trait NetworkModule: Send + Sync {
     /// Endpoint records the module currently advertises (empty when the
     /// module is not listening).
     fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError>;
+
+    /// Protocol-specific endpoint role. Default is unknown so older/simple
+    /// modules do not need to implement classification.
+    fn endpoint_role(&self, _endpoint: &ClusterEndpointRecord) -> NetworkModuleEndpointRole {
+        NetworkModuleEndpointRole::Unknown
+    }
 }
 
 /// One registry entry: the module, its cached descriptor, the context it was
@@ -421,6 +438,33 @@ impl NetworkModuleRegistry {
         })
     }
 
+    /// Role classification for `endpoint`, when a registered module claims
+    /// either its transport kind or its address scheme.
+    pub fn endpoint_role(&self, endpoint: &ClusterEndpointRecord) -> NetworkModuleEndpointRole {
+        self.entries
+            .load()
+            .values()
+            .find_map(|entry| {
+                let claims_transport = entry.descriptor.transports.contains(&endpoint.transport);
+                let claims_scheme =
+                    endpoint_address_scheme(&endpoint.address).is_some_and(|scheme| {
+                        entry
+                            .descriptor
+                            .address_schemes
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(scheme))
+                    });
+                if !claims_transport && !claims_scheme {
+                    return None;
+                }
+                match entry.module.endpoint_role(endpoint) {
+                    NetworkModuleEndpointRole::Unknown => None,
+                    role => Some(role),
+                }
+            })
+            .unwrap_or(NetworkModuleEndpointRole::Unknown)
+    }
+
     /// The module registered under `id`, regardless of enabled state (for
     /// diagnostics; dispatch must use the transport/scheme lookups).
     pub fn module(&self, id: &str) -> Option<Arc<dyn NetworkModule>> {
@@ -459,6 +503,18 @@ impl NetworkModuleRegistry {
         }
         transports
     }
+
+    /// Endpoint records currently advertised by enabled listener modules.
+    pub fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+        let mut endpoints = Vec::new();
+        for entry in self.entries.load().values() {
+            if !(entry.enabled && entry.started && entry.descriptor.listener) {
+                continue;
+            }
+            endpoints.extend(entry.module.local_endpoints()?);
+        }
+        Ok(endpoints)
+    }
 }
 
 static NETWORK_MODULE_REGISTRY: LazyLock<ArcSwap<Option<Arc<NetworkModuleRegistry>>>> =
@@ -489,6 +545,23 @@ pub(crate) fn registered_network_module_for_address_scheme(
     scheme: &str,
 ) -> Option<Arc<dyn NetworkModule>> {
     network_module_registry()?.module_for_address_scheme(scheme)
+}
+
+/// Returns the scheme of an address like `scheme://rest`. Scheme validation is
+/// deliberately small and URL-parser-free because daemon endpoint addresses are
+/// transport strings, not necessarily full URLs.
+pub(crate) fn endpoint_address_scheme(address: &str) -> Option<&str> {
+    let address = address.trim_start();
+    let (scheme, _) = address.split_once("://")?;
+    let scheme = scheme.trim();
+    if scheme.is_empty()
+        || !scheme
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(scheme)
 }
 
 #[cfg(test)]
@@ -554,6 +627,14 @@ mod tests {
         fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
             Ok(Vec::new())
         }
+
+        fn endpoint_role(&self, endpoint: &ClusterEndpointRecord) -> NetworkModuleEndpointRole {
+            if endpoint.address.contains("shadow") {
+                NetworkModuleEndpointRole::ShadowDaemon
+            } else {
+                NetworkModuleEndpointRole::MainDaemon
+            }
+        }
     }
 
     fn test_context() -> NetworkModuleContext {
@@ -569,39 +650,39 @@ mod tests {
     #[test]
     fn registry_dispatches_by_transport_and_scheme() {
         let registry = NetworkModuleRegistry::new();
-        let iroh = Arc::new(TestModule::new(
-            "iroh",
-            vec![ClusterTransportKind::Iroh],
-            vec!["iroh"],
+        let mesh = Arc::new(TestModule::new(
+            "mesh",
+            vec![ClusterTransportKind::WebRtc],
+            vec!["mesh"],
         ));
         let serial = Arc::new(TestModule::new(
             "serial",
             vec![ClusterTransportKind::LanQuic],
             vec!["serial"],
         ));
-        registry.register(iroh.clone(), None, true, false);
+        registry.register(mesh.clone(), None, true, false);
         registry.register(serial.clone(), None, true, false);
 
         let by_transport = registry
-            .module_for_transport(&ClusterTransportKind::Iroh)
-            .expect("iroh module by transport");
-        assert_eq!(by_transport.descriptor().id, "iroh");
+            .module_for_transport(&ClusterTransportKind::WebRtc)
+            .expect("module by transport");
+        assert_eq!(by_transport.descriptor().id, "mesh");
 
         let by_scheme = registry
-            .module_for_address_scheme("IROH")
-            .expect("iroh module by scheme, case-insensitive");
-        assert_eq!(by_scheme.descriptor().id, "iroh");
+            .module_for_address_scheme("MESH")
+            .expect("module by scheme, case-insensitive");
+        assert_eq!(by_scheme.descriptor().id, "mesh");
 
         assert!(
             registry
-                .module_for_transport(&ClusterTransportKind::WebRtc)
+                .module_for_transport(&ClusterTransportKind::HttpsRelay)
                 .is_none(),
             "unclaimed transports must not dispatch"
         );
         assert!(registry.module_for_address_scheme("lora").is_none());
 
         let transports = registry.enabled_dialer_transports();
-        assert!(transports.contains(&ClusterTransportKind::Iroh));
+        assert!(transports.contains(&ClusterTransportKind::WebRtc));
         assert!(transports.contains(&ClusterTransportKind::LanQuic));
     }
 
@@ -609,24 +690,24 @@ mod tests {
     fn set_enabled_stops_and_restarts_without_dropping_the_module() {
         let registry = NetworkModuleRegistry::new();
         let module = Arc::new(TestModule::new(
-            "iroh",
-            vec![ClusterTransportKind::Iroh],
-            vec!["iroh"],
+            "mesh",
+            vec![ClusterTransportKind::WebRtc],
+            vec!["mesh"],
         ));
         registry.register(module.clone(), Some(test_context()), true, true);
 
-        let disabled = registry.set_enabled("iroh", false).expect("disable");
+        let disabled = registry.set_enabled("mesh", false).expect("disable");
         assert!(!disabled.enabled);
         assert!(!disabled.started);
         assert_eq!(module.stops.load(Ordering::SeqCst), 1);
         assert!(
             registry
-                .module_for_transport(&ClusterTransportKind::Iroh)
+                .module_for_transport(&ClusterTransportKind::WebRtc)
                 .is_none(),
             "disabled modules must not dispatch"
         );
         assert!(
-            registry.module("iroh").is_some(),
+            registry.module("mesh").is_some(),
             "disable must keep the module registered (never dropped)"
         );
         assert_eq!(
@@ -635,10 +716,10 @@ mod tests {
         );
 
         // Idempotent disable performs no extra stop.
-        registry.set_enabled("iroh", false).expect("disable again");
+        registry.set_enabled("mesh", false).expect("disable again");
         assert_eq!(module.stops.load(Ordering::SeqCst), 1);
 
-        let enabled = registry.set_enabled("iroh", true).expect("enable");
+        let enabled = registry.set_enabled("mesh", true).expect("enable");
         assert!(enabled.enabled);
         assert!(enabled.started);
         assert_eq!(module.starts.load(Ordering::SeqCst), 1);
@@ -654,7 +735,7 @@ mod tests {
         );
         assert!(
             registry
-                .module_for_transport(&ClusterTransportKind::Iroh)
+                .module_for_transport(&ClusterTransportKind::WebRtc)
                 .is_some()
         );
 
@@ -669,9 +750,9 @@ mod tests {
         let registry = NetworkModuleRegistry::new();
         registry.register(
             Arc::new(TestModule::new(
-                "iroh",
-                vec![ClusterTransportKind::Iroh],
-                vec!["iroh"],
+                "mesh",
+                vec![ClusterTransportKind::WebRtc],
+                vec!["mesh"],
             )),
             None,
             true,
@@ -690,16 +771,54 @@ mod tests {
 
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.len(), 2);
-        let iroh = snapshot
+        let mesh = snapshot
             .iter()
-            .find(|status| status.descriptor.id == "iroh")
-            .expect("iroh status");
-        assert!(iroh.enabled);
-        assert!(iroh.descriptor.dialer);
+            .find(|status| status.descriptor.id == "mesh")
+            .expect("module status");
+        assert!(mesh.enabled);
+        assert!(mesh.descriptor.dialer);
         let lora = snapshot
             .iter()
             .find(|status| status.descriptor.id == "lora")
             .expect("lora status");
         assert!(!lora.enabled);
+    }
+
+    #[test]
+    fn registry_classifies_module_endpoint_roles() {
+        let registry = NetworkModuleRegistry::new();
+        registry.register(
+            Arc::new(TestModule::new(
+                "mesh",
+                vec![ClusterTransportKind::WebRtc],
+                vec!["mesh"],
+            )),
+            None,
+            true,
+            false,
+        );
+        let node_id = NodeId::from_legacy_named("node_network_module_role_test").expect("node id");
+        let main = ClusterEndpointRecord {
+            endpoint_id: sinomo_base::Id::generate(),
+            node_id,
+            transport: ClusterTransportKind::WebRtc,
+            address: "mesh://main".to_string(),
+            source: sinomo_base::ClusterEndpointSource::Rendezvous,
+            privacy: sinomo_base::ClusterEndpointPrivacy::Relayed,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+        let shadow = ClusterEndpointRecord {
+            address: "mesh://shadow".to_string(),
+            ..main.clone()
+        };
+        assert_eq!(
+            registry.endpoint_role(&main),
+            NetworkModuleEndpointRole::MainDaemon
+        );
+        assert_eq!(
+            registry.endpoint_role(&shadow),
+            NetworkModuleEndpointRole::ShadowDaemon
+        );
     }
 }

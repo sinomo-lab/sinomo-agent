@@ -6,8 +6,7 @@ use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_network::{CLUSTER_NETWORK_INFO_TTL_SECONDS, build_cluster_network_info_record};
 use sinomo_network::{
-    cleanup_cluster_iroh_endpoints, cluster_state_needs_join_registration,
-    refresh_local_iroh_endpoints_from_disk, refresh_local_iroh_endpoints_from_disk_async,
+    cleanup_cluster_endpoint_duplicates, cluster_state_needs_join_registration,
     upsert_member_endpoint,
 };
 use sinomo_network::{
@@ -178,11 +177,11 @@ pub fn refresh_local_daemon_membership_from_disk(
     observation: ClusterLocalDaemonMembershipObservation,
 ) -> Result<ClusterLocalDaemonMembershipRefresh, NetworkError> {
     let timestamp = observation.timestamp;
-    let iroh_cleanup_changed = cleanup_cluster_iroh_endpoints(state);
+    let endpoint_cleanup_changed = cleanup_cluster_endpoint_duplicates(state);
     let mut refresh = apply_local_daemon_membership_observation(state, observation);
-    refresh.iroh_endpoints_changed =
-        iroh_cleanup_changed | refresh_local_iroh_endpoints_from_disk(paths, state, timestamp)?;
-    if iroh_cleanup_changed {
+    let _ = paths;
+    refresh.iroh_endpoints_changed = endpoint_cleanup_changed;
+    if endpoint_cleanup_changed {
         state.updated_at = timestamp;
     }
     Ok(refresh)
@@ -195,11 +194,11 @@ pub async fn refresh_local_daemon_membership_from_disk_async(
     observation: ClusterLocalDaemonMembershipObservation,
 ) -> Result<ClusterLocalDaemonMembershipRefresh, NetworkError> {
     let timestamp = observation.timestamp;
-    let iroh_cleanup_changed = cleanup_cluster_iroh_endpoints(state);
+    let endpoint_cleanup_changed = cleanup_cluster_endpoint_duplicates(state);
     let mut refresh = apply_local_daemon_membership_observation(state, observation);
-    refresh.iroh_endpoints_changed = iroh_cleanup_changed
-        | refresh_local_iroh_endpoints_from_disk_async(runtime, paths, state, timestamp).await?;
-    if iroh_cleanup_changed {
+    let _ = (runtime, paths);
+    refresh.iroh_endpoints_changed = endpoint_cleanup_changed;
+    if endpoint_cleanup_changed {
         state.updated_at = timestamp;
     }
     Ok(refresh)

@@ -36,7 +36,7 @@ use sinomo_kv::{ClusterKvRaftConfigRecord, InProcessKvStore, KvCommand, KvSnapsh
 use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
-use sinomo_network::cleanup_cluster_iroh_endpoints;
+use sinomo_network::cleanup_cluster_endpoint_duplicates;
 use sinomo_node::{NodeId, cluster_member_is_legacy_shadow_daemon, shadow_daemon_node_id};
 use std::collections::BTreeSet;
 use time::OffsetDateTime;
@@ -226,7 +226,7 @@ pub fn sync_cluster_state_to_kv_with_host(
 ) -> Result<KvSnapshot, NetworkError> {
     let mut keyed_state = state.clone();
     host.prepare_cluster_state_for_kv_sync(paths, &mut keyed_state)?;
-    cleanup_cluster_iroh_endpoints(&mut keyed_state);
+    cleanup_cluster_endpoint_duplicates(&mut keyed_state);
     let (current_snapshot, txn) =
         cluster_state_sync_txn_with_current_snapshot(paths, &keyed_state)?;
     if txn.success.is_empty() {
@@ -245,7 +245,7 @@ pub async fn sync_cluster_state_to_kv_async_with_host(
     let mut keyed_state = state.clone();
     host.prepare_cluster_state_for_kv_sync_async(paths, &mut keyed_state)
         .await?;
-    cleanup_cluster_iroh_endpoints(&mut keyed_state);
+    cleanup_cluster_endpoint_duplicates(&mut keyed_state);
     let paths_for_txn = paths.clone();
     let keyed_state_for_txn = keyed_state.clone();
     let (current_snapshot, txn) = runtime

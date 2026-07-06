@@ -87,6 +87,9 @@ impl IdleStatsAtomics {
         self.disk_reads_iroh_endpoints
             .fetch_add(1, Ordering::Relaxed);
     }
+    pub fn incr_disk_reads_network_module_endpoints(&self) {
+        self.incr_disk_reads_iroh_endpoints();
+    }
     pub fn incr_disk_reads_dfs_metadata(&self) {
         self.disk_reads_dfs_metadata.fetch_add(1, Ordering::Relaxed);
     }

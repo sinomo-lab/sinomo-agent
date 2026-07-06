@@ -1,12 +1,11 @@
 //! Iroh roaming transport as a trusted native-dylib network module.
 //!
-//! Stage C of docs/plans/r0-r1-crate-boundary-refactor.md moves the
-//! iroh-specific half of `crates/sinomo-network/src/roaming.rs` here:
-//! endpoint builder + relay-mode config, secret-key load/create, the daemon
-//! proxy supervisor/accept loop/frame budget, and the dial client.
-//! `sinomo-network` keeps the transport-neutral pieces (the
-//! `IrohEndpointRecord` data type, `iroh://` parse/format, the stable
-//! endpoint id, record file I/O, and selector ranking).
+//! This module owns every Iroh-specific behavior: endpoint builder +
+//! relay-mode config, secret-key load/create, endpoint record parse/format,
+//! stable endpoint ids, endpoint record file I/O, the daemon proxy
+//! supervisor/accept loop/frame budget, and the dial client. `sinomo-network`
+//! only sees generic network-module descriptors, endpoint records, and the
+//! optional endpoint-role classification hook.
 //!
 //! The dylib exports two ABI surfaces:
 //! - the standard `sinomo-module-api` symbols so it installs/registers like
@@ -19,9 +18,11 @@
 //!   `FfiNetworkModule` and registers in its `NetworkModuleRegistry`.
 
 mod dial;
+mod endpoint;
 mod frames;
 mod proxy;
 
+use endpoint::{iroh_endpoint_public_key, stable_iroh_endpoint_id};
 use sinomo_core::ClusterTransportKind;
 use sinomo_core::network::network_module_abi::{
     SINOMO_NETWORK_MODULE_ABI_VERSION, SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT,
@@ -31,8 +32,9 @@ use sinomo_core::network::network_module_abi::{
 };
 use sinomo_core::network::{
     ClusterPaths, DaemonRpcTimeouts, NetworkError, NetworkModuleDescriptor,
+    NetworkModuleEndpointRole,
 };
-use sinomo_core::node::{ClusterId, NodeId};
+use sinomo_core::node::{ClusterId, NodeId, shadow_daemon_node_id};
 use sinomo_module_api::{
     NativeModuleBackend, NativeModuleCapabilitiesResponse, NativeModuleDescriptor,
     NativeModuleErrorResponse, NativeModuleRequest, NativeModuleResponse, NativeModuleSurfaces,
@@ -54,6 +56,13 @@ pub const SINOMO_NETWORK_IROH_MODULE_ID: &str = "module.network-iroh";
 pub const SINOMO_NETWORK_IROH_INTERFACE_VERSION: &str = "sinomo.network-iroh.v1";
 /// Network-module descriptor id (`NetworkModuleDescriptor::id`).
 pub const SINOMO_NETWORK_IROH_NETWORK_MODULE_ID: &str = "iroh";
+pub const IROH_DAEMON_COMMAND_MAX_BYTES: usize =
+    sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES;
+const SINOMO_DISABLE_IROH_ENV: &str = "SINOMO_DISABLE_IROH";
+
+fn iroh_disabled_by_env() -> bool {
+    std::env::var(SINOMO_DISABLE_IROH_ENV).ok().as_deref() == Some("1")
+}
 
 // ---------------------------------------------------------------------------
 // Standard sinomo-module-api surface
@@ -260,6 +269,12 @@ impl IrohNetworkModuleInstance {
     fn start(&self, config: IrohModuleStartConfig) -> Result<(), NetworkError> {
         // Restart semantics: stop a running proxy before starting anew.
         self.stop()?;
+        if iroh_disabled_by_env() {
+            eprintln!(
+                "sinomo iroh network module listener disabled by {SINOMO_DISABLE_IROH_ENV}=1"
+            );
+            return Ok(());
+        }
         let Some(cluster_id) = config.cluster_id else {
             // Pre-cluster start: the listener/proxy needs a cluster identity
             // for its endpoint record; dialing works without start(). Treat
@@ -308,6 +323,12 @@ impl IrohNetworkModuleInstance {
         request_frame: &[u8],
         timeouts: DaemonRpcTimeouts,
     ) -> Result<Vec<u8>, NetworkError> {
+        if iroh_disabled_by_env() {
+            return Err(NetworkError::Io {
+                operation: "dial iroh network module".to_string(),
+                detail: format!("{SINOMO_DISABLE_IROH_ENV}=1"),
+            });
+        }
         let runtime = self.runtime()?;
         runtime.block_on(self.dialer.dial_daemon_control_frame_async(
             address,
@@ -326,6 +347,23 @@ impl IrohNetworkModuleInstance {
     }
 }
 
+fn iroh_endpoint_role(endpoint: &sinomo_core::ClusterEndpointRecord) -> NetworkModuleEndpointRole {
+    if endpoint.transport != ClusterTransportKind::Iroh {
+        return NetworkModuleEndpointRole::Unknown;
+    }
+    let Some(public_key) = iroh_endpoint_public_key(endpoint) else {
+        return NetworkModuleEndpointRole::Unknown;
+    };
+    let shadow_node_id = shadow_daemon_node_id(&endpoint.node_id);
+    if endpoint.endpoint_id == stable_iroh_endpoint_id(&shadow_node_id, &public_key) {
+        return NetworkModuleEndpointRole::ShadowDaemon;
+    }
+    if endpoint.endpoint_id == stable_iroh_endpoint_id(&endpoint.node_id, &public_key) {
+        return NetworkModuleEndpointRole::MainDaemon;
+    }
+    NetworkModuleEndpointRole::Unknown
+}
+
 /// Parsed start config (from the FFI config struct's UTF-8 views).
 struct IrohModuleStartConfig {
     cluster_root: PathBuf,
@@ -340,7 +378,6 @@ struct IrohModuleStartConfig {
 fn cluster_paths_from_root(root: PathBuf) -> ClusterPaths {
     ClusterPaths {
         state: root.join("state.sobj"),
-        iroh: root.join("iroh"),
         connectivity_local: root.join("connectivity-local.sobj"),
         root,
     }
@@ -555,6 +592,35 @@ unsafe extern "C" fn iroh_network_module_local_endpoints_ffi(
     result.unwrap_or(SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR)
 }
 
+unsafe extern "C" fn iroh_network_module_endpoint_role_ffi(
+    _instance: *mut c_void,
+    endpoint_sobj: SinomoNetworkByteSlice,
+    out: *mut SinomoNetworkByteBuffer,
+) -> SinomoNetworkModuleStatusCode {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if out.is_null() {
+            return SINOMO_NETWORK_MODULE_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the host guarantees the request view is valid for the call.
+        let endpoint_bytes = unsafe { endpoint_sobj.as_slice() };
+        let endpoint = match sinomo_core::network::network_module_abi::decode_network_module_sobj::<
+            sinomo_core::ClusterEndpointRecord,
+        >(endpoint_bytes)
+        {
+            Ok(endpoint) => endpoint,
+            Err(error) => return network_error_status(out, &error),
+        };
+        match encode_network_module_sobj(&iroh_endpoint_role(&endpoint)) {
+            Ok(bytes) => {
+                write_network_buffer(out, bytes);
+                SINOMO_NETWORK_MODULE_STATUS_OK
+            }
+            Err(error) => network_error_status(out, &error),
+        }
+    }));
+    result.unwrap_or(SINOMO_NETWORK_MODULE_STATUS_RUNTIME_ERROR)
+}
+
 unsafe extern "C" fn iroh_network_module_free_buffer_ffi(buffer: SinomoNetworkByteBuffer) {
     // SAFETY: the host only frees buffers this module produced via
     // SinomoNetworkByteBuffer::from_vec.
@@ -607,6 +673,7 @@ pub unsafe extern "C" fn sinomo_network_module_create_v1(
                 stop: iroh_network_module_stop_ffi,
                 dial_rpc: iroh_network_module_dial_rpc_ffi,
                 local_endpoints: iroh_network_module_local_endpoints_ffi,
+                endpoint_role: Some(iroh_network_module_endpoint_role_ffi),
                 free_buffer: iroh_network_module_free_buffer_ffi,
                 destroy: iroh_network_module_destroy_ffi,
             };

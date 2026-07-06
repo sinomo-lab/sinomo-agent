@@ -45,7 +45,7 @@ pub fn cluster_network_publish_interval_for_role(role: &ClusterNodeRole) -> Dura
     }
 }
 
-pub fn cluster_iroh_proxy_republish_sleep_duration(
+pub fn cluster_network_module_republish_sleep_duration(
     now: Instant,
     next_republish: Instant,
 ) -> Duration {
@@ -57,7 +57,7 @@ pub fn cluster_iroh_proxy_republish_sleep_duration(
     }
 }
 
-pub fn cluster_iroh_proxy_start_retry_sleep_duration(
+pub fn cluster_network_module_start_retry_sleep_duration(
     consecutive_failures: u32,
     max_delay: Duration,
 ) -> Duration {

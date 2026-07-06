@@ -64,14 +64,9 @@ fn cluster_network_observed_addresses(endpoints: &[ClusterEndpointRecord]) -> Ve
     let mut observed_addresses = endpoints
         .iter()
         .filter(|endpoint| {
-            matches!(
+            !matches!(
                 endpoint.transport,
-                ClusterTransportKind::LanTcp
-                    | ClusterTransportKind::LanQuic
-                    | ClusterTransportKind::Iroh
-                    | ClusterTransportKind::WebRtc
-                    | ClusterTransportKind::TurnRelay
-                    | ClusterTransportKind::HttpsRelay
+                ClusterTransportKind::InProcess | ClusterTransportKind::Loopback
             )
         })
         .map(|endpoint| endpoint.address.clone())

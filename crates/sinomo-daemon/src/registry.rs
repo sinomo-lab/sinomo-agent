@@ -380,8 +380,8 @@ fn network_capability(name: &str) -> sinomo_core::CapabilityName {
 //
 // Built-in transports (Loopback/LAN-TCP) keep their in-crate dial paths
 // inside `sinomo-network`; they are NOT wrapped as registry modules. The
-// registry carries native-dylib network modules (iroh included), which
-// routing consults before the built-in paths.
+// registry carries native-dylib network modules, which routing consults
+// before the built-in paths.
 
 /// The daemon's loaded network modules: the registry routing dispatches
 /// through plus the loader-state module id behind each network-module id
@@ -407,7 +407,7 @@ pub fn daemon_network_modules() -> Option<Arc<DaemonNetworkModules>> {
 /// Persisted enabled flag for a network module's dylib. Network modules reuse
 /// the `NativeRustModuleRuntimeState`-style enablement store (keyed by module
 /// id under `module/loader-state/native-rust`) rather than growing a parallel
-/// mechanism; ids like `module.network-iroh` cannot collide with native-rust
+/// mechanism; native-dylib module ids cannot collide with native-rust
 /// registration keys.
 pub fn network_module_enabled_state(
     data_dir_root: &std::path::Path,
@@ -509,9 +509,8 @@ pub fn load_daemon_network_module_registry(
 
     // The registry is process-wide; in the unit-test binary a lifecycle test
     // booting a daemon would replace it mid-run and perturb concurrently
-    // running endpoint-ranking tests (with no registry installed the selector
-    // keeps iroh rankable). Tests exercise the loader through the returned
-    // handle instead.
+    // running endpoint-ranking tests. Tests exercise the loader through the
+    // returned handle instead.
     #[cfg(not(test))]
     sinomo_core::network::set_network_module_registry(registry.clone());
     let modules = Arc::new(DaemonNetworkModules {
@@ -598,22 +597,7 @@ fn load_daemon_network_module_from_loader_state(
         )
     }?;
     let descriptor = sinomo_core::network::NetworkModule::descriptor(&module);
-    let mut enabled = network_module_enabled_state(data_dir_root, &state.module_id);
-    // SINOMO_DISABLE_IROH is a doctrine-level kill switch: it must silence
-    // module-owned iroh listeners and dials the same way it silences the
-    // built-in proxy. Runtime state only — the persisted flag is untouched.
-    if enabled
-        && sinomo_core::network::iroh_disabled_by_env()
-        && descriptor
-            .transports
-            .contains(&sinomo_core::ClusterTransportKind::Iroh)
-    {
-        tracing::info!(
-            "sinomo daemon network module {} disabled for this run (SINOMO_DISABLE_IROH)",
-            descriptor.id
-        );
-        enabled = false;
-    }
+    let enabled = network_module_enabled_state(data_dir_root, &state.module_id);
     let module: Arc<dyn sinomo_core::network::NetworkModule> = Arc::new(module);
     let mut started = false;
     if enabled && let Some(context) = context {

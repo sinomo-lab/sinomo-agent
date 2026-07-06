@@ -351,13 +351,6 @@ pub fn discover_interface_ip_candidates() -> Vec<IpAddr> {
     candidates
 }
 
-/// Whether iroh transport is disabled for this process via the `SINOMO_DISABLE_IROH`
-/// environment variable (`=1`). Lets a deployment run on direct LAN transports only --
-/// e.g. the segmented network test cluster -- without starting or advertising iroh.
-pub fn iroh_disabled_by_env() -> bool {
-    std::env::var("SINOMO_DISABLE_IROH").ok().as_deref() == Some("1")
-}
-
 pub(crate) async fn discover_default_public_ip_candidates_for_local_ips_async(
     local_ips: impl IntoIterator<Item = IpAddr>,
 ) -> Vec<IpAddr> {
@@ -1203,16 +1196,16 @@ pub struct MdnsDiscoveryRecord {
     pub expires_after_tick: u64,
 }
 
-fn cluster_transport_kind_label(transport: &ClusterTransportKind) -> &'static str {
+fn cluster_transport_kind_label(transport: &ClusterTransportKind) -> String {
     match transport {
-        ClusterTransportKind::InProcess => "in-process",
-        ClusterTransportKind::Loopback => "loopback",
-        ClusterTransportKind::LanTcp => "lan-tcp",
-        ClusterTransportKind::LanQuic => "lan-quic",
-        ClusterTransportKind::Iroh => "iroh",
-        ClusterTransportKind::WebRtc => "webrtc",
-        ClusterTransportKind::TurnRelay => "turn-relay",
-        ClusterTransportKind::HttpsRelay => "https-relay",
+        ClusterTransportKind::InProcess => "in-process".to_string(),
+        ClusterTransportKind::Loopback => "loopback".to_string(),
+        ClusterTransportKind::LanTcp => "lan-tcp".to_string(),
+        ClusterTransportKind::LanQuic => "lan-quic".to_string(),
+        ClusterTransportKind::WebRtc => "webrtc".to_string(),
+        ClusterTransportKind::TurnRelay => "turn-relay".to_string(),
+        ClusterTransportKind::HttpsRelay => "https-relay".to_string(),
+        other => format!("{other:?}").to_ascii_lowercase(),
     }
 }
 

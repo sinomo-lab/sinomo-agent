@@ -93,13 +93,10 @@ pub use endpoint_advertisement::{
     daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host_async,
     daemon_advertised_endpoints_from_static_addresses, daemon_lan_endpoint,
 };
-pub use endpoint_records::apply_cluster_iroh_endpoint_advertisement;
-pub use endpoint_records::iroh_endpoint_public_key;
-pub use endpoint_records::{
-    cleanup_cluster_iroh_endpoints, refresh_local_iroh_endpoints_from_disk,
-    refresh_local_iroh_endpoints_from_disk_async,
-};
-pub use endpoint_records::{cleanup_member_iroh_endpoints, upsert_member_endpoint};
+pub use endpoint_records::apply_cluster_endpoint_advertisement;
+pub use endpoint_records::cleanup_cluster_endpoint_duplicates;
+pub use endpoint_records::cleanup_member_endpoint_duplicates;
+pub use endpoint_records::upsert_member_endpoint;
 pub use endpoint_records::{cluster_is_settled_solo, cluster_state_needs_join_registration};
 pub use endpoint_selector::{
     ClusterEndpointInternalSelectionPurpose, cluster_node_blocks_leader_preference,
@@ -127,7 +124,7 @@ pub use lan::is_loopback_connect_address;
 pub use lan::{
     AsyncMdnsDiscoverySocket, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache, MdnsDiscoveryRecord,
     apply_lan_discovery_advertisements, discover_default_lan_ip_candidates,
-    discover_default_lan_ip_candidates_async, format_ip_port, iroh_disabled_by_env,
+    discover_default_lan_ip_candidates_async, format_ip_port,
     lan_discovery_advertisement_for_state,
 };
 pub use maintenance::{
@@ -141,11 +138,11 @@ pub use maintenance::{
     CLUSTER_NETWORK_STABLE_DISCOVERY_ANNOUNCE_TICK_STRIDE,
     CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS, ClusterNetworkMaintenanceDue,
     ClusterNetworkMaintenanceSchedule, cluster_connectivity_probe_max_endpoints_per_tick_for_role,
-    cluster_iroh_proxy_republish_sleep_duration, cluster_iroh_proxy_start_retry_sleep_duration,
     cluster_local_node_role, cluster_network_discovery_interval_for_role,
     cluster_network_maintenance_due, cluster_network_maintenance_interval_due,
     cluster_network_maintenance_last_timestamp_for_next_due,
-    cluster_network_maintenance_next_due_duration, cluster_network_probe_interval_for_role,
+    cluster_network_maintenance_next_due_duration, cluster_network_module_republish_sleep_duration,
+    cluster_network_module_start_retry_sleep_duration, cluster_network_probe_interval_for_role,
     cluster_network_publish_interval_for_role, cluster_network_stable_discovery_announcement_due,
 };
 pub use network_info::cluster_network_info_stable_eq;
@@ -158,10 +155,10 @@ pub use network_module::{
     NETWORK_MODULES_ADMIN_CAPABILITY, NETWORK_MODULES_LIST_ROUTE, NETWORK_MODULES_RPC_CATEGORY,
     NETWORK_MODULES_RPC_ROUTE_POLICIES, NETWORK_MODULES_RPC_ROUTES,
     NETWORK_MODULES_SET_ENABLED_ROUTE, NetworkFuture, NetworkModule, NetworkModuleContext,
-    NetworkModuleDescriptor, NetworkModuleListResponse, NetworkModuleRegistry,
-    NetworkModuleRoutePolicy, NetworkModuleSetEnabledRequest, NetworkModuleSetEnabledResponse,
-    NetworkModuleStatus, network_module_registry, network_modules_rpc_route_policy,
-    set_network_module_registry,
+    NetworkModuleDescriptor, NetworkModuleEndpointRole, NetworkModuleListResponse,
+    NetworkModuleRegistry, NetworkModuleRoutePolicy, NetworkModuleSetEnabledRequest,
+    NetworkModuleSetEnabledResponse, NetworkModuleStatus, network_module_registry,
+    network_modules_rpc_route_policy, set_network_module_registry,
 };
 pub use network_module_abi::FfiNetworkModule;
 pub use object::try_clone_id;
@@ -213,11 +210,7 @@ pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, InProcessNetwork,
     InProcessTransport,
 };
-pub use roaming::iroh_endpoint_record_from_address;
-pub use roaming::read_iroh_endpoint_record_async;
 pub use roaming::send_daemon_rpc_to_cluster_endpoint_async;
-pub use roaming::stable_iroh_endpoint_id;
-pub use roaming::{IROH_DAEMON_COMMAND_MAX_BYTES, IrohEndpointRecord, IrohRelayMode};
 pub use route::{
     CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
     ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterRelayAsyncHost, ClusterRelayOptions,
@@ -408,12 +401,7 @@ pub fn register_storage_paths(
         .field("target_node_id", "NodeId")
         .field("endpoint_id", "ClusterEndpointId"),
     )?;
-    layout.register_escape_path(
-        "sinomo-network",
-        StorageRing::R1,
-        "cluster/iroh",
-        "dynamic iroh key and endpoint object files keyed by node id",
-    )
+    Ok(())
 }
 
 pub(crate) mod prelude {
@@ -424,10 +412,9 @@ pub(crate) mod prelude {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) use sinomo_base::EventEnvelope;
     pub(crate) use sinomo_base::{
-        CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
-        ClusterEndpointSource, ClusterInvitationChannel, ClusterJoinInvite, ClusterMemberRecord,
-        ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole,
-        ClusterNodeStatusRecord, ClusterTransportKind, TrustDomain,
+        ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
+        ClusterEndpointSource, ClusterMemberRecord, ClusterMemberRole, ClusterNodeRole,
+        ClusterTransportKind,
     };
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) use sinomo_base::{LatencyClass, RoutingScope};
@@ -439,18 +426,16 @@ pub(crate) mod prelude {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) use sinomo_local::SinomoDataDir;
     pub(crate) use sinomo_node::ClusterId;
-    pub(crate) use sinomo_node::ClusterInviteId;
+    pub(crate) use sinomo_node::NodeId;
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) use sinomo_node::main_daemon_capabilities;
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) use sinomo_node::{NodeAvailability, NodeHealth, NodeProfile};
-    pub(crate) use sinomo_node::{NodeId, shadow_daemon_node_id};
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) use std::collections::HashSet;
     pub(crate) use std::collections::{BTreeMap, BTreeSet, VecDeque};
     pub(crate) use std::io;
     pub(crate) use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-    pub(crate) use std::path::PathBuf;
     pub(crate) use std::sync::{Arc, Mutex};
     pub(crate) use std::time::Duration;
     pub(crate) use thiserror::Error;
@@ -460,46 +445,6 @@ pub(crate) mod prelude {
 // test-support re-exports (crate internals for sibling integration tests)
 #[cfg(any(test, feature = "test-support"))]
 pub use connectivity_store::local_cluster_connectivity_content_generation;
-#[cfg(any(test, feature = "test-support"))]
-pub use lan::PublicIpDiscoveryResult;
-#[cfg(any(test, feature = "test-support"))]
-pub use object::write_object_frame_blocking;
-#[cfg(any(test, feature = "test-support"))]
-pub use object_file_store::object_file_write_mark_cache_capacity_for_test;
-#[cfg(any(test, feature = "test-support"))]
-pub use object_file_store::object_file_write_mark_cache_contains_for_test;
-#[cfg(any(test, feature = "test-support"))]
-pub use object_file_store::record_object_file_write_mark_for_test;
-#[cfg(any(test, feature = "test-support"))]
-pub use object_file_store::refresh_object_file_write_mark_for_test;
-#[cfg(any(test, feature = "test-support"))]
-pub use object_file_store::remove_object_file_write_mark_entries_under_root_for_test;
-#[cfg(any(test, feature = "test-support"))]
-pub use object_file_store::write_object_file_compare_read_bytes_for_test;
-#[cfg(any(test, feature = "test-support"))]
-pub use peer::SeenEventCache;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::ClusterDeliveryFailedEdges;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::ClusterDeliveryRouteGraph;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::RelayEnvelope;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::cluster_delivery_build_routing_table;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::cluster_delivery_route_plan;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::cluster_delivery_route_plan_async;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::cluster_delivery_routing_table_cache_mark;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::cluster_delivery_shortest_path_next_hop;
-#[cfg(any(test, feature = "test-support"))]
-pub use route_graph_read_model::cluster_route_graph_cache_mark;
-// Unconditional since stage C: dylib network modules reuse the no-clobber
-// object-file write (iroh secret-key create) through the sinomo-core facade.
 #[cfg(any(test, feature = "test-support"))]
 pub use connectivity_store::local_cluster_connectivity_prune_passes_for_test;
 #[cfg(any(test, feature = "test-support"))]
@@ -522,6 +467,8 @@ pub use lan::MAX_SINOMO_LAN_DISCOVERY_TTL_TICKS;
 pub use lan::PUBLIC_IP_DISCOVERY_DEFERRED_CACHE_TTL;
 #[cfg(any(test, feature = "test-support"))]
 pub use lan::PUBLIC_IP_DISCOVERY_EMPTY_CACHE_TTL;
+#[cfg(any(test, feature = "test-support"))]
+pub use lan::PublicIpDiscoveryResult;
 #[cfg(any(test, feature = "test-support"))]
 pub use lan::age_public_ip_discovery_cache_for_test;
 #[cfg(any(test, feature = "test-support"))]
@@ -555,9 +502,23 @@ pub use object::DaemonControlStream;
 #[cfg(any(test, feature = "test-support"))]
 pub use object::read_object_frame_blocking;
 #[cfg(any(test, feature = "test-support"))]
+pub use object::write_object_frame_blocking;
+#[cfg(any(test, feature = "test-support"))]
 pub use object_file_store::clear_write_object_file_create_new_unsupported_link_for_test;
 #[cfg(any(test, feature = "test-support"))]
 pub use object_file_store::force_write_object_file_create_new_unsupported_link_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use object_file_store::object_file_write_mark_cache_capacity_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use object_file_store::object_file_write_mark_cache_contains_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use object_file_store::record_object_file_write_mark_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use object_file_store::refresh_object_file_write_mark_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use object_file_store::remove_object_file_write_mark_entries_under_root_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use object_file_store::write_object_file_compare_read_bytes_for_test;
 pub use object_file_store::write_object_file_create_new_serialized;
 #[cfg(any(test, feature = "test-support"))]
 pub use peer::AsyncNetworkServiceHandle;
@@ -618,6 +579,8 @@ pub use peer::RouteDelivery;
 #[cfg(any(test, feature = "test-support"))]
 pub use peer::RouteDeliveryId;
 #[cfg(any(test, feature = "test-support"))]
+pub use peer::SeenEventCache;
+#[cfg(any(test, feature = "test-support"))]
 pub use peer::TransportKind;
 #[cfg(any(test, feature = "test-support"))]
 pub use peer::ack_timeout_for_latency_class;
@@ -629,8 +592,6 @@ pub use roaming::ClusterAuthVerifier;
 pub use roaming::IceCandidateRecord;
 #[cfg(any(test, feature = "test-support"))]
 pub use roaming::IceCandidateType;
-#[cfg(any(test, feature = "test-support"))]
-pub use roaming::IrohKvExchange;
 #[cfg(any(test, feature = "test-support"))]
 pub use roaming::LanConnectionPlanner;
 #[cfg(any(test, feature = "test-support"))]
@@ -646,8 +607,24 @@ pub use roaming::WebRtcSignalingEnvelope;
 #[cfg(any(test, feature = "test-support"))]
 pub use roaming::configure_daemon_control_stream_idle_timeout;
 #[cfg(any(test, feature = "test-support"))]
-pub use roaming::iroh_endpoint_record_from_cluster_endpoint;
+pub use route::CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX;
 #[cfg(any(test, feature = "test-support"))]
-pub use roaming::write_iroh_endpoint_record_async;
+pub use route::ClusterDeliveryFailedEdges;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::ClusterDeliveryRouteGraph;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::RelayEnvelope;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::cluster_delivery_build_routing_table;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::cluster_delivery_route_plan;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::cluster_delivery_route_plan_async;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::cluster_delivery_routing_table_cache_mark;
+#[cfg(any(test, feature = "test-support"))]
+pub use route::cluster_delivery_shortest_path_next_hop;
+#[cfg(any(test, feature = "test-support"))]
+pub use route_graph_read_model::cluster_route_graph_cache_mark;
 #[cfg(any(test, feature = "test-support"))]
 pub use rpc::ObjectRpcFuture;
