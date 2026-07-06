@@ -399,10 +399,10 @@ pub use routes::{
     decode_dfs_metadata_snapshot_install_rpc_response, decode_dfs_smoke_rpc_response,
     decode_dfs_status_rpc_response, dfs_inspection_rpc_request,
     dfs_message_allows_write_repair_progress, dfs_message_is_read_only_request,
-    dfs_message_requires_fresh_metadata, dfs_message_rpc_request,
-    dfs_metadata_journal_batch_rpc_request, dfs_metadata_snapshot_install_rpc_request,
-    dfs_route_is_message_data_plane, dfs_routed_message_rpc_request, dfs_smoke_rpc_request,
-    dfs_status_rpc_request,
+    dfs_message_requires_fresh_metadata, dfs_message_requires_full_metadata_hydrate,
+    dfs_message_rpc_request, dfs_metadata_journal_batch_rpc_request,
+    dfs_metadata_snapshot_install_rpc_request, dfs_route_is_message_data_plane,
+    dfs_routed_message_rpc_request, dfs_smoke_rpc_request, dfs_status_rpc_request,
 };
 pub(crate) use routes::{
     build_dfs_routed_message, dfs_network_message_allows_write_repair_progress,

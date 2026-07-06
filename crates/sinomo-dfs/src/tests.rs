@@ -366,8 +366,8 @@ fn dfs_message_read_requests_require_fresh_metadata() {
         }),
     );
 
-    assert!(dfs_message_requires_fresh_metadata(&read));
-    assert!(dfs_message_requires_fresh_metadata(&bulk));
+    assert!(dfs_message_requires_full_metadata_hydrate(&read));
+    assert!(dfs_message_requires_full_metadata_hydrate(&bulk));
 }
 
 #[test]
@@ -837,7 +837,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
         }),
     );
     assert!(dfs_message_is_read_only_request(&read));
-    assert!(dfs_message_requires_fresh_metadata(&read));
+    assert!(dfs_message_requires_full_metadata_hydrate(&read));
 
     let lookup = test_dfs_message_command_from_message(
         &local,
@@ -856,7 +856,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
     );
     assert!(!dfs_message_is_read_only_request(&lookup));
     assert!(
-        dfs_message_requires_fresh_metadata(&lookup),
+        dfs_message_requires_full_metadata_hydrate(&lookup),
         "lookup requests still require fresh daemon metadata before answering primary path checks"
     );
 
@@ -872,8 +872,8 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
     );
     assert!(!dfs_message_is_read_only_request(&write));
     assert!(
-        dfs_message_requires_fresh_metadata(&write),
-        "routed writes must hydrate daemon metadata before accepting primary-side commits"
+        !dfs_message_requires_full_metadata_hydrate(&write),
+        "routed writes validate target metadata in the write path instead of forcing a full daemon hydrate"
     );
 
     let lookup_paths = test_dfs_message_command_from_message(
@@ -896,7 +896,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
     );
     assert!(!dfs_message_is_read_only_request(&lookup_paths));
     assert!(
-        dfs_message_requires_fresh_metadata(&lookup_paths),
+        dfs_message_requires_full_metadata_hydrate(&lookup_paths),
         "batched lookup requests still require fresh daemon metadata before answering primary path checks"
     );
 
@@ -916,7 +916,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
         }),
     );
     assert!(!dfs_message_is_read_only_request(&sync));
-    assert!(dfs_message_requires_fresh_metadata(&sync));
+    assert!(dfs_message_requires_full_metadata_hydrate(&sync));
 
     let apply = test_dfs_message_command_from_message(
         &local,
@@ -940,7 +940,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
         }),
     );
     assert!(!dfs_message_is_read_only_request(&apply));
-    assert!(dfs_message_requires_fresh_metadata(&apply));
+    assert!(dfs_message_requires_full_metadata_hydrate(&apply));
 }
 
 struct FailingSendTransport {

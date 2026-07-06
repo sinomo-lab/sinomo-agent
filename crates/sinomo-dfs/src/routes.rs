@@ -266,18 +266,24 @@ pub fn dfs_message_is_read_only_request(command: &DfsMessageCommand) -> bool {
     dfs_network_message_is_read_only_request(&command.routed_message.message)
 }
 
-fn dfs_network_message_requires_fresh_metadata(message: &DfsNetworkMessage) -> bool {
+fn dfs_network_message_requires_full_metadata_hydrate(message: &DfsNetworkMessage) -> bool {
     matches!(
         message,
         DfsNetworkMessage::ReadRequest(_)
             | DfsNetworkMessage::BulkReadRequest(_)
-            | DfsNetworkMessage::DistributedWriteRequest(_)
             | DfsNetworkMessage::NamespaceRequest(_)
     )
 }
 
+pub fn dfs_message_requires_full_metadata_hydrate(command: &DfsMessageCommand) -> bool {
+    dfs_network_message_requires_full_metadata_hydrate(&command.routed_message.message)
+}
+
+/// Backward-compatible name for callers that classify daemon message commands.
+/// This now means a full backend hydrate; distributed writes perform targeted
+/// metadata validation inside the write path instead.
 pub fn dfs_message_requires_fresh_metadata(command: &DfsMessageCommand) -> bool {
-    dfs_network_message_requires_fresh_metadata(&command.routed_message.message)
+    dfs_message_requires_full_metadata_hydrate(command)
 }
 
 pub(crate) fn dfs_network_message_allows_write_repair_progress(

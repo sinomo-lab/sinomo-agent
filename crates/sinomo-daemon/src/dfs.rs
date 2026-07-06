@@ -725,7 +725,8 @@ fn process_daemon_dfs_message_command_on_runtime(
     let ensure_ms = ensure_started.elapsed().as_millis();
     let cache_key = data_dir.root();
     let use_read_lane = sinomo_dfs::dfs_message_is_read_only_request(&command);
-    let requires_fresh_metadata = sinomo_dfs::dfs_message_requires_fresh_metadata(&command);
+    let requires_full_metadata_hydrate =
+        sinomo_dfs::dfs_message_requires_full_metadata_hydrate(&command);
     let request_id = command.request_id.clone();
     let route_started = Instant::now();
     let cached_route_snapshot = cached_daemon_dfs_message_route_snapshot(&cache_key)?;
@@ -819,8 +820,10 @@ fn process_daemon_dfs_message_command_on_runtime(
     let endpoint_refresh_ms = endpoint_refresh_started.elapsed().as_millis();
     let hydrate_started = Instant::now();
     let mut hydrated_metadata = false;
-    if (requires_fresh_metadata && !service_lane.metadata_hydrated)
-        || service_lane.last_metadata_refresh.elapsed() >= DAEMON_DFS_MESSAGE_CACHE_REFRESH_INTERVAL
+    if requires_full_metadata_hydrate
+        && (!service_lane.metadata_hydrated
+            || service_lane.last_metadata_refresh.elapsed()
+                >= DAEMON_DFS_MESSAGE_CACHE_REFRESH_INTERVAL)
     {
         service_lane.service.hydrate_from_metadata_backend()?;
         service_lane.last_metadata_refresh = Instant::now();
@@ -833,7 +836,7 @@ fn process_daemon_dfs_message_command_on_runtime(
         service_lane.service.process_message_command(command)?;
     let process_ms = process_started.elapsed().as_millis();
     daemon_dfs_perf_trace(format_args!(
-        "dfs-message-dispatch request={} read_lane={} route_cache_hit={} route_ms={} ensure_ms={} cache_select_ms={} cache_lock_wait_ms={} lane_lock_wait_ms={} endpoint_refresh_ms={} hydrate={} hydrate_ms={} process_ms={} outbound_messages={} events={} total_ms={}",
+        "dfs-message-dispatch request={} read_lane={} route_cache_hit={} route_ms={} ensure_ms={} cache_select_ms={} cache_lock_wait_ms={} lane_lock_wait_ms={} endpoint_refresh_ms={} full_hydrate={} hydrate_ms={} process_ms={} outbound_messages={} events={} total_ms={}",
         request_id,
         use_read_lane,
         route_cache_hit,
@@ -1170,13 +1173,13 @@ mod tests {
     use sinomo_core::node::NodeId;
     use sinomo_core::{
         ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterTransportKind,
-        DfsObjectPolicy,
+        DfsObjectPolicy, DfsWriteRequest,
     };
     use sinomo_dfs::{
-        DfsBlobTransferResult, DfsMetadataJournalReplicationOutcome, DfsNamespaceCommand,
-        DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNetworkMessage, DfsObjectId,
-        DfsObjectKind, DfsObjectMetadata, DfsRoutedMessage, DfsStageBlobCommand, DfsVersion,
-        DfsWriteOptions,
+        DfsBlobTransferResult, DfsDistributedWriteCommand, DfsMetadataJournalReplicationOutcome,
+        DfsNamespaceCommand, DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNetworkMessage,
+        DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsReplicationPolicy, DfsRoutedMessage,
+        DfsStageBlobCommand, DfsVersion, DfsWriteOptions,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -1197,6 +1200,71 @@ mod tests {
             operation: DfsNamespaceOperation::LookupPath {
                 path: path.to_string(),
             },
+        });
+        DfsRoutedMessage {
+            source_node_id: source_node_id.clone(),
+            target_node_id: target_node_id.clone(),
+            frame_id,
+            message_id: frame_id,
+            message,
+        }
+    }
+
+    fn test_dfs_write_routed_message(
+        source_node_id: &NodeId,
+        target_node_id: &NodeId,
+        frame_id: u64,
+        path: &str,
+    ) -> DfsRoutedMessage {
+        let object_id = DfsObjectId::from_legacy_named(format!("obj_daemon_dfs_write_{frame_id}"))
+            .expect("object id");
+        let base_version =
+            DfsVersion::from_legacy_named(format!("version_daemon_dfs_write_base_{frame_id}"))
+                .expect("base version");
+        let target_version =
+            DfsVersion::from_legacy_named(format!("version_daemon_dfs_write_target_{frame_id}"))
+                .expect("target version");
+        let bytes = format!("daemon DFS write message {frame_id}").into_bytes();
+        let object = DfsObjectMetadata {
+            object_id: object_id.clone(),
+            file_system_id: sinomo_dfs::sifs_file_system_id(),
+            path: path.to_string(),
+            kind: DfsObjectKind::File,
+            owner_node_id: target_node_id.clone(),
+            current_locations: vec![source_node_id.clone()],
+            content_hash: None,
+            content_size_bytes: None,
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: base_version.clone(),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        let message = DfsNetworkMessage::DistributedWriteRequest(DfsDistributedWriteCommand {
+            request_id: format!("daemon_dfs_write_{frame_id}"),
+            request: DfsWriteRequest {
+                file_system_id: sinomo_dfs::sifs_file_system_id(),
+                object_id,
+                target_version,
+                requesting_node_id: source_node_id.clone(),
+            },
+            expected_base_version: Some(base_version),
+            metadata_journal_after_sequence: None,
+            bytes,
+            content_hash: None,
+            content_size_bytes: None,
+            desired_replica_nodes: vec![source_node_id.clone()],
+            policy: DfsReplicationPolicy::new(1, 1).expect("replication policy"),
+            object_metadata: Some(object),
+            touch_parent_on_create: false,
+            foreground_replica_repair: false,
         });
         DfsRoutedMessage {
             source_node_id: source_node_id.clone(),
@@ -3103,6 +3171,44 @@ mod tests {
         )
         .expect_err("wrong target rejected");
         assert!(error.to_string().contains("does not match local node"));
+    }
+
+    #[test]
+    fn daemon_dfs_distributed_write_skips_cold_full_metadata_hydrate() {
+        let root = temp_root("daemon_dfs_write_skips_cold_hydrate");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let local = NodeId::from_legacy_named("node_dfs_protocol_write_local").expect("local");
+        write_test_cluster_state(&data_root, &local);
+        let runtime = daemon_test_runtime("daemon-dfs-write-skips-cold-hydrate");
+
+        let cache_key = SinomoDataDir::new(&data_root).root();
+        let response = handle_daemon_dfs_message_on_runtime(
+            &paths,
+            test_dfs_message_command(
+                "dfs_message_write_skips_cold_hydrate",
+                test_dfs_write_routed_message(
+                    &local,
+                    &local,
+                    1,
+                    "/services/daemon-write-skips-cold-hydrate.txt",
+                ),
+            ),
+            runtime.handle(),
+        )
+        .expect("distributed write DFS message");
+        assert_eq!(response.request_id, "dfs_message_write_skips_cold_hydrate");
+        let primary_service = {
+            let cache = daemon_dfs_message_service_cache()
+                .lock()
+                .expect("cache lock");
+            Arc::clone(&cache.get(&cache_key).expect("cache entry").primary_service)
+        };
+        let lane = primary_service.lock().expect("primary service lock");
+        assert!(
+            !lane.metadata_hydrated,
+            "distributed writes must not force a full metadata hydrate on a cold daemon message lane"
+        );
     }
 
     #[test]
