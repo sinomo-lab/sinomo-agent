@@ -129,6 +129,56 @@ impl AgentChannelSummary {
     }
 }
 
+/// Sequence-bounded channel timeline page for app transcript rendering.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentChannelMessagePage {
+    pub channel_id: SessionId,
+    pub messages: Vec<AgentChannelMessage>,
+    pub start_sequence: Option<u64>,
+    pub end_sequence: Option<u64>,
+    pub has_older: bool,
+    pub has_newer: bool,
+    pub total_messages: u64,
+    pub chunk_size: u64,
+}
+
+impl AgentChannelMessagePage {
+    fn empty(channel_id: &SessionId, total_messages: u64) -> Self {
+        Self {
+            channel_id: channel_id.clone(),
+            messages: Vec::new(),
+            start_sequence: None,
+            end_sequence: None,
+            has_older: false,
+            has_newer: false,
+            total_messages,
+            chunk_size: SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE,
+        }
+    }
+}
+
+/// Coarse chunk-level timeline metadata for long-history navigation.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentChannelTimelineOverview {
+    pub channel_id: SessionId,
+    pub total_messages: u64,
+    pub oldest_sequence: Option<u64>,
+    pub newest_sequence: Option<u64>,
+    pub chunk_size: u64,
+    pub segments: Vec<AgentChannelTimelineSegment>,
+}
+
+/// A chunk-level timeline segment suitable for overview rails and jump lists.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentChannelTimelineSegment {
+    pub start_sequence: u64,
+    pub end_sequence: u64,
+    pub message_count: u64,
+    pub first_created_unix: Option<i64>,
+    pub last_created_unix: Option<i64>,
+    pub preview: Option<String>,
+}
+
 /// The active agent / model selection, as plain strings.
 #[derive(Clone, Debug, Default)]
 pub struct ChatRuntimeInfo {
@@ -503,6 +553,10 @@ impl SifsAgentChannelStore {
 
     fn message_chunk_path(channel_id: &SessionId, sequence: u64) -> String {
         let chunk = sequence.saturating_sub(1) / SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE;
+        Self::message_chunk_path_by_index(channel_id, chunk)
+    }
+
+    fn message_chunk_path_by_index(channel_id: &SessionId, chunk: u64) -> String {
         format!("{}/{chunk:08}.jsonl", Self::message_chunks_dir(channel_id))
     }
 
@@ -657,42 +711,205 @@ impl SifsAgentChannelStore {
         Ok(index)
     }
 
+    fn load_channel_snapshot_only(
+        &self,
+        channel_id: &SessionId,
+    ) -> Result<Option<AgentChannel>, AgentChannelStoreError> {
+        let path = Self::snapshot_path(channel_id);
+        let bytes = match self.browser.read_file(&path) {
+            Ok(bytes) => bytes,
+            Err(detail) if sifs_error_is_not_found(&detail) => return Ok(None),
+            Err(detail) => return Err(channel_store_io(&path, detail)),
+        };
+        let snapshot =
+            serde_json::from_slice::<OwnedSifsAgentChannelSnapshot>(&bytes).map_err(|source| {
+                AgentChannelStoreError::Serialization {
+                    detail: source.to_string(),
+                }
+            })?;
+        if snapshot.schema_version != AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION {
+            return Err(AgentChannelStoreError::Serialization {
+                detail: format!(
+                    "unsupported agent channel snapshot schema version {}",
+                    snapshot.schema_version
+                ),
+            });
+        }
+        Ok(Some(snapshot.channel))
+    }
+
+    pub fn load_channel_summary(
+        &self,
+        channel_id: &SessionId,
+    ) -> Result<Option<AgentChannelSummary>, AgentChannelStoreError> {
+        Ok(self
+            .load_channel_snapshot_only(channel_id)?
+            .map(|channel| AgentChannelSummary::from_channel(&channel)))
+    }
+
     pub fn load_recent_messages(
         &self,
         channel_id: &SessionId,
         limit: usize,
     ) -> Result<Vec<AgentChannelMessage>, AgentChannelStoreError> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let index = self.read_chunked_log_index(&Self::message_index_path(channel_id))?;
-        if index.entry_count == 0 {
-            return Ok(Vec::new());
-        }
-        self.load_recent_indexed_message_chunks(channel_id, limit, index.entry_count)
+        Ok(self.load_recent_message_page(channel_id, limit)?.messages)
     }
 
-    fn load_recent_indexed_message_chunks(
+    pub fn load_recent_message_page(
         &self,
         channel_id: &SessionId,
         limit: usize,
-        entry_count: u64,
-    ) -> Result<Vec<AgentChannelMessage>, AgentChannelStoreError> {
-        let first_sequence = entry_count.saturating_sub(limit as u64).saturating_add(1);
-        let first_chunk = first_sequence.saturating_sub(1) / SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE;
-        let last_chunk = entry_count.saturating_sub(1) / SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE;
-        let mut collected = Vec::new();
-        for chunk in (first_chunk..=last_chunk).rev() {
-            let path = format!("{}/{chunk:08}.jsonl", Self::message_chunks_dir(channel_id));
+    ) -> Result<AgentChannelMessagePage, AgentChannelStoreError> {
+        if limit == 0 {
+            return Ok(AgentChannelMessagePage::empty(channel_id, 0));
+        }
+        let index = self.read_chunked_log_index(&Self::message_index_path(channel_id))?;
+        if index.entry_count == 0 {
+            return Ok(AgentChannelMessagePage::empty(channel_id, 0));
+        }
+        let first_sequence = index
+            .entry_count
+            .saturating_sub(limit as u64)
+            .saturating_add(1);
+        self.load_message_page_range(channel_id, first_sequence, index.entry_count, limit)
+    }
+
+    pub fn load_message_page_from(
+        &self,
+        channel_id: &SessionId,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Result<AgentChannelMessagePage, AgentChannelStoreError> {
+        let index = self.read_chunked_log_index(&Self::message_index_path(channel_id))?;
+        if limit == 0 || index.entry_count == 0 {
+            return Ok(AgentChannelMessagePage::empty(
+                channel_id,
+                index.entry_count,
+            ));
+        }
+        if start_sequence > index.entry_count {
+            let mut page = AgentChannelMessagePage::empty(channel_id, index.entry_count);
+            page.has_older = index.entry_count > 0;
+            page.has_newer = false;
+            return Ok(page);
+        }
+        let start_sequence = start_sequence.max(1).min(index.entry_count);
+        let end_sequence = start_sequence
+            .saturating_add(limit as u64)
+            .saturating_sub(1)
+            .min(index.entry_count);
+        self.load_message_page_range(channel_id, start_sequence, end_sequence, limit)
+    }
+
+    pub fn load_message_page_before(
+        &self,
+        channel_id: &SessionId,
+        before_sequence: u64,
+        limit: usize,
+    ) -> Result<AgentChannelMessagePage, AgentChannelStoreError> {
+        let index = self.read_chunked_log_index(&Self::message_index_path(channel_id))?;
+        if limit == 0 || index.entry_count == 0 {
+            return Ok(AgentChannelMessagePage::empty(
+                channel_id,
+                index.entry_count,
+            ));
+        }
+        if before_sequence <= 1 {
+            let mut page = AgentChannelMessagePage::empty(channel_id, index.entry_count);
+            page.has_newer = index.entry_count > 0;
+            return Ok(page);
+        }
+        let end_sequence = before_sequence.saturating_sub(1).min(index.entry_count);
+        if end_sequence == 0 {
+            return Ok(AgentChannelMessagePage::empty(
+                channel_id,
+                index.entry_count,
+            ));
+        }
+        let start_sequence = end_sequence.saturating_sub(limit as u64).saturating_add(1);
+        self.load_message_page_range(channel_id, start_sequence, end_sequence, limit)
+    }
+
+    pub fn load_timeline_overview(
+        &self,
+        channel_id: &SessionId,
+    ) -> Result<AgentChannelTimelineOverview, AgentChannelStoreError> {
+        let index = self.read_chunked_log_index(&Self::message_index_path(channel_id))?;
+        if index.entry_count == 0 {
+            return Ok(AgentChannelTimelineOverview {
+                channel_id: channel_id.clone(),
+                total_messages: 0,
+                oldest_sequence: None,
+                newest_sequence: None,
+                chunk_size: SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE,
+                segments: Vec::new(),
+            });
+        }
+
+        let last_chunk = index.entry_count.saturating_sub(1) / SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE;
+        let mut segments = Vec::new();
+        for chunk in 0..=last_chunk {
+            let path = Self::message_chunk_path_by_index(channel_id, chunk);
             let bytes = match self.browser.read_file(&path) {
                 Ok(bytes) => bytes,
                 Err(detail) if sifs_error_is_not_found(&detail) => continue,
                 Err(detail) => return Err(channel_store_io(&path, detail)),
             };
             let mut messages = parse_json_lines::<AgentChannelMessage>(&bytes)?;
-            messages.reverse();
-            for message in messages {
-                if message.sequence < first_sequence || message.sequence > entry_count {
+            if messages.is_empty() {
+                continue;
+            }
+            messages.sort_by_key(|message| message.sequence);
+            let first = messages.first().expect("non-empty messages");
+            let last = messages.last().expect("non-empty messages");
+            segments.push(AgentChannelTimelineSegment {
+                start_sequence: first.sequence,
+                end_sequence: last.sequence,
+                message_count: messages.len() as u64,
+                first_created_unix: Some(first.created_at.unix_timestamp()),
+                last_created_unix: Some(last.created_at.unix_timestamp()),
+                preview: messages.iter().find_map(timeline_preview_for_message),
+            });
+        }
+
+        Ok(AgentChannelTimelineOverview {
+            channel_id: channel_id.clone(),
+            total_messages: index.entry_count,
+            oldest_sequence: segments.first().map(|segment| segment.start_sequence),
+            newest_sequence: segments.last().map(|segment| segment.end_sequence),
+            chunk_size: SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE,
+            segments,
+        })
+    }
+
+    fn load_message_page_range(
+        &self,
+        channel_id: &SessionId,
+        start_sequence: u64,
+        end_sequence: u64,
+        limit: usize,
+    ) -> Result<AgentChannelMessagePage, AgentChannelStoreError> {
+        let index = self.read_chunked_log_index(&Self::message_index_path(channel_id))?;
+        if limit == 0 || index.entry_count == 0 {
+            return Ok(AgentChannelMessagePage::empty(
+                channel_id,
+                index.entry_count,
+            ));
+        }
+        let start_sequence = start_sequence.max(1).min(index.entry_count);
+        let end_sequence = end_sequence.max(start_sequence).min(index.entry_count);
+        let first_chunk = start_sequence.saturating_sub(1) / SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE;
+        let last_chunk = end_sequence.saturating_sub(1) / SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE;
+        let mut collected = Vec::new();
+        for chunk in first_chunk..=last_chunk {
+            let path = Self::message_chunk_path_by_index(channel_id, chunk);
+            let bytes = match self.browser.read_file(&path) {
+                Ok(bytes) => bytes,
+                Err(detail) if sifs_error_is_not_found(&detail) => continue,
+                Err(detail) => return Err(channel_store_io(&path, detail)),
+            };
+            for message in parse_json_lines::<AgentChannelMessage>(&bytes)? {
+                if message.sequence < start_sequence || message.sequence > end_sequence {
                     continue;
                 }
                 collected.push(message);
@@ -704,8 +921,20 @@ impl SifsAgentChannelStore {
                 break;
             }
         }
-        collected.reverse();
-        Ok(collected)
+        collected.sort_by_key(|message| message.sequence);
+        collected.truncate(limit);
+        let start_sequence = collected.first().map(|message| message.sequence);
+        let end_sequence = collected.last().map(|message| message.sequence);
+        Ok(AgentChannelMessagePage {
+            channel_id: channel_id.clone(),
+            messages: collected,
+            start_sequence,
+            end_sequence,
+            has_older: start_sequence.is_some_and(|sequence| sequence > 1),
+            has_newer: end_sequence.is_some_and(|sequence| sequence < index.entry_count),
+            total_messages: index.entry_count,
+            chunk_size: SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE,
+        })
     }
 
     fn channel_ids_from_sifs(&self) -> Result<BTreeSet<SessionId>, AgentChannelStoreError> {
@@ -786,27 +1015,9 @@ impl AgentChannelStore for SifsAgentChannelStore {
         &self,
         channel_id: &SessionId,
     ) -> Result<Option<AgentChannel>, AgentChannelStoreError> {
-        let path = Self::snapshot_path(channel_id);
-        let bytes = match self.browser.read_file(&path) {
-            Ok(bytes) => bytes,
-            Err(detail) if sifs_error_is_not_found(&detail) => return Ok(None),
-            Err(detail) => return Err(channel_store_io(&path, detail)),
+        let Some(mut channel) = self.load_channel_snapshot_only(channel_id)? else {
+            return Ok(None);
         };
-        let snapshot =
-            serde_json::from_slice::<OwnedSifsAgentChannelSnapshot>(&bytes).map_err(|source| {
-                AgentChannelStoreError::Serialization {
-                    detail: source.to_string(),
-                }
-            })?;
-        if snapshot.schema_version != AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION {
-            return Err(AgentChannelStoreError::Serialization {
-                detail: format!(
-                    "unsupported agent channel snapshot schema version {}",
-                    snapshot.schema_version
-                ),
-            });
-        }
-        let mut channel = snapshot.channel;
         let recent =
             self.load_recent_messages(channel_id, AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT)?;
         if !recent.is_empty() {
@@ -897,6 +1108,36 @@ fn parse_json_lines<T: DeserializeOwned>(bytes: &[u8]) -> Result<Vec<T>, AgentCh
             })
         })
         .collect()
+}
+
+fn timeline_preview_for_message(message: &AgentChannelMessage) -> Option<String> {
+    let content = message.content.trim();
+    if content.is_empty() {
+        return None;
+    }
+    let author = match &message.author {
+        AgentChannelAuthor::User { display_name, .. } => {
+            if display_name.trim().is_empty() {
+                "User"
+            } else {
+                display_name.trim()
+            }
+        }
+        AgentChannelAuthor::Agent { agent_name, .. } => {
+            if agent_name.trim().is_empty() {
+                "Agent"
+            } else {
+                agent_name.trim()
+            }
+        }
+        AgentChannelAuthor::System => "System",
+    };
+    let mut preview = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if preview.chars().count() > 120 {
+        preview = preview.chars().take(117).collect::<String>();
+        preview.push_str("...");
+    }
+    Some(format!("{author}: {preview}"))
 }
 
 /// One running chat conversation backed by the main-agent runtime.
@@ -5094,6 +5335,65 @@ mod tests {
                 .last()
                 .map(|message| message.content.as_str()),
             Some("message 424")
+        );
+
+        let recent_page = store
+            .load_recent_message_page(&channel_id, AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT)
+            .expect("load recent page");
+        assert_eq!(recent_page.total_messages, total as u64);
+        assert_eq!(recent_page.start_sequence, Some(26));
+        assert_eq!(recent_page.end_sequence, Some(425));
+        assert!(recent_page.has_older);
+        assert!(!recent_page.has_newer);
+
+        let older_page = store
+            .load_message_page_before(
+                &channel_id,
+                recent_page.start_sequence.expect("recent start"),
+                AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT,
+            )
+            .expect("load older page");
+        assert_eq!(older_page.start_sequence, Some(1));
+        assert_eq!(older_page.end_sequence, Some(25));
+        assert!(!older_page.has_older);
+        assert!(older_page.has_newer);
+
+        let newer_page = store
+            .load_message_page_from(
+                &channel_id,
+                older_page
+                    .end_sequence
+                    .expect("older end")
+                    .saturating_add(1),
+                AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT,
+            )
+            .expect("load newer page");
+        assert_eq!(newer_page.start_sequence, Some(26));
+        assert_eq!(newer_page.end_sequence, Some(425));
+        assert!(newer_page.has_older);
+        assert!(!newer_page.has_newer);
+
+        let after_end = store
+            .load_message_page_from(&channel_id, total as u64 + 1, 10)
+            .expect("load after end page");
+        assert!(after_end.messages.is_empty());
+        assert!(after_end.has_older);
+        assert!(!after_end.has_newer);
+
+        let overview = store
+            .load_timeline_overview(&channel_id)
+            .expect("load timeline overview");
+        assert_eq!(overview.total_messages, total as u64);
+        assert_eq!(overview.oldest_sequence, Some(1));
+        assert_eq!(overview.newest_sequence, Some(425));
+        assert_eq!(overview.segments.len(), 4);
+        assert_eq!(overview.segments[0].start_sequence, 1);
+        assert_eq!(overview.segments[0].end_sequence, 128);
+        assert!(
+            overview.segments[0]
+                .preview
+                .as_deref()
+                .is_some_and(|preview| preview.contains("message 0"))
         );
     }
 

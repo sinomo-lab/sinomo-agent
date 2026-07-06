@@ -59,6 +59,7 @@ use sinomo_agent::{
     AgentChannelMessageKind, AgentChannelStore,
 };
 use sinomo_cli::app_api::{
+    AgentChannelMessagePage, AgentChannelTimelineOverview, AgentChannelTimelineSegment,
     AgentChatSifsStorage, AgentSummary, ChatAttachmentInput, ChatContextSnapshot,
     ChatHistoryMessage, ChatProcessSnapshot, ChatTaskSnapshot, ChatToolCallSnapshot,
     ChatToolRuntimeSelection, ChatUsageSnapshot, ProviderSummary, SifsAgentChannelStore,
@@ -111,6 +112,10 @@ const TOOL_CHAIN_COLLAPSE_AFTER: usize = 1;
 const TOOL_DETAIL_COLLAPSE_CHARS: usize = 420;
 const TOOL_DETAIL_PREVIEW_CHARS: usize = 220;
 const VISIBLE_TRANSCRIPT_RECENT_LIMIT: usize = AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT;
+const TRANSCRIPT_PAGE_SIZE: usize = AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT;
+const TRANSCRIPT_MAX_LOADED_MESSAGES: usize = TRANSCRIPT_PAGE_SIZE * 3;
+const TRANSCRIPT_OLDER_LOAD_THRESHOLD_PX: f32 = 72.0;
+const TRANSCRIPT_PREPEND_ESTIMATED_MESSAGE_H: f32 = 76.0;
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as the other tabs.)
@@ -130,6 +135,7 @@ pub struct ChatMessage {
     pub text: String,
     pub source: ChatMessageSource,
     pub kind: ChatMessageKind,
+    sequence: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +159,7 @@ impl ChatMessage {
             text: text.into(),
             source: ChatMessageSource::User,
             kind: ChatMessageKind::Message,
+            sequence: None,
         }
     }
 
@@ -162,6 +169,7 @@ impl ChatMessage {
             text: text.into(),
             source: ChatMessageSource::Model,
             kind: ChatMessageKind::Message,
+            sequence: None,
         }
     }
 
@@ -171,6 +179,7 @@ impl ChatMessage {
             text: text.into(),
             source: ChatMessageSource::System,
             kind: ChatMessageKind::Info,
+            sequence: None,
         }
     }
 
@@ -180,7 +189,13 @@ impl ChatMessage {
             text: text.into(),
             source: ChatMessageSource::System,
             kind: ChatMessageKind::Error,
+            sequence: None,
         }
+    }
+
+    fn with_sequence(mut self, sequence: u64) -> Self {
+        self.sequence = Some(sequence);
+        self
     }
 
     fn history_role(&self) -> &'static str {
@@ -635,6 +650,167 @@ enum ComposerPopup {
     Activity,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ConversationTimelineState {
+    total_messages: u64,
+    chunk_size: u64,
+    loaded_start_sequence: Option<u64>,
+    loaded_end_sequence: Option<u64>,
+    has_older: bool,
+    has_newer: bool,
+    overview: Vec<ConversationTimelineSegment>,
+}
+
+impl ConversationTimelineState {
+    fn apply_page(&mut self, page: &AgentChannelMessagePage) {
+        self.total_messages = page.total_messages;
+        self.chunk_size = page.chunk_size;
+        self.loaded_start_sequence = page.start_sequence;
+        self.loaded_end_sequence = page.end_sequence;
+        self.has_older = page.has_older;
+        self.has_newer = page.has_newer;
+    }
+
+    fn apply_older_page(&mut self, page: &AgentChannelMessagePage) {
+        self.total_messages = page.total_messages;
+        self.chunk_size = page.chunk_size;
+        if let Some(start) = page.start_sequence {
+            self.loaded_start_sequence = Some(start);
+        }
+        if self.loaded_end_sequence.is_none() {
+            self.loaded_end_sequence = page.end_sequence;
+        }
+        self.has_older = page.has_older;
+        self.has_newer = self
+            .loaded_end_sequence
+            .is_some_and(|sequence| sequence < page.total_messages);
+    }
+
+    fn apply_newer_page(&mut self, page: &AgentChannelMessagePage) {
+        self.total_messages = page.total_messages;
+        self.chunk_size = page.chunk_size;
+        if self.loaded_start_sequence.is_none() {
+            self.loaded_start_sequence = page.start_sequence;
+        }
+        if let Some(end) = page.end_sequence {
+            self.loaded_end_sequence = Some(end);
+        }
+        self.has_older = self
+            .loaded_start_sequence
+            .is_some_and(|sequence| sequence > 1);
+        self.has_newer = page.has_newer;
+    }
+
+    fn refresh_loaded_range_from_messages(&mut self, messages: &[ChatMessage]) {
+        self.loaded_start_sequence = messages.iter().find_map(|message| message.sequence);
+        self.loaded_end_sequence = messages.iter().rev().find_map(|message| message.sequence);
+        self.has_older = self
+            .loaded_start_sequence
+            .is_some_and(|sequence| sequence > 1);
+        self.has_newer = self
+            .loaded_end_sequence
+            .is_some_and(|sequence| sequence < self.total_messages);
+    }
+
+    fn apply_overview(&mut self, overview: AgentChannelTimelineOverview) {
+        self.total_messages = overview.total_messages;
+        self.chunk_size = overview.chunk_size;
+        self.overview = overview
+            .segments
+            .into_iter()
+            .map(ConversationTimelineSegment::from)
+            .collect();
+    }
+
+    fn visible_summary(&self, visible_count: usize) -> Option<String> {
+        if self.total_messages == 0 || visible_count == 0 {
+            return None;
+        }
+        let start = self.loaded_start_sequence?;
+        let end = self.loaded_end_sequence?;
+        let mut summary = format!("Messages {start}-{end} of {}", self.total_messages);
+        if let (Some(first), Some(last)) = (self.overview.first(), self.overview.last()) {
+            let indexed_messages = self
+                .overview
+                .iter()
+                .map(|segment| segment.message_count)
+                .sum::<u64>();
+            summary.push_str(&format!(
+                " · {} section{}",
+                self.overview.len(),
+                if self.overview.len() == 1 { "" } else { "s" }
+            ));
+            if indexed_messages != self.total_messages {
+                summary.push_str(&format!(" · indexed {indexed_messages}"));
+            }
+            if first.start_sequence != start || last.end_sequence != end {
+                summary.push_str(&format!(
+                    " · span {}-{}",
+                    first.start_sequence, last.end_sequence
+                ));
+            }
+            if let (Some(first_time), Some(last_time)) =
+                (first.first_created_unix, last.last_created_unix)
+                && last_time > first_time
+            {
+                summary.push_str(" · long range");
+            }
+            if let Some(preview) = self
+                .overview
+                .iter()
+                .find_map(|segment| segment.preview.as_ref())
+            {
+                summary.push_str(" · ");
+                summary.push_str(&compact_line(preview, 44));
+            }
+        }
+        if self.has_older && self.has_newer {
+            summary.push_str(" · older/newer available");
+        } else if self.has_older {
+            summary.push_str(" · older available");
+        } else if self.has_newer {
+            summary.push_str(" · newer available");
+        }
+        Some(summary)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ConversationTimelineSegment {
+    start_sequence: u64,
+    end_sequence: u64,
+    message_count: u64,
+    first_created_unix: Option<i64>,
+    last_created_unix: Option<i64>,
+    preview: Option<String>,
+}
+
+impl From<AgentChannelTimelineSegment> for ConversationTimelineSegment {
+    fn from(segment: AgentChannelTimelineSegment) -> Self {
+        Self {
+            start_sequence: segment.start_sequence,
+            end_sequence: segment.end_sequence,
+            message_count: segment.message_count,
+            first_created_unix: segment.first_created_unix,
+            last_created_unix: segment.last_created_unix,
+            preview: segment.preview,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscriptLoadMode {
+    Initial,
+    Older { before_sequence: u64 },
+    Newer { after_sequence: u64 },
+}
+
+struct ConversationTimelineLoad {
+    messages: Vec<ChatMessage>,
+    page: AgentChannelMessagePage,
+    overview: Option<AgentChannelTimelineOverview>,
+}
+
 /// State backing the chat tab.
 pub struct ChatState {
     pub data_dir: Arc<SinomoDataDir>,
@@ -657,6 +833,7 @@ pub struct ChatState {
     pub usage: Option<ChatUsageSnapshot>,
     pub activity: Vec<ChatActivityEntry>,
     pub tool_calls: Vec<ChatToolActivity>,
+    timeline: ConversationTimelineState,
     tool_chain_expanded: bool,
     expanded_tool_details: BTreeSet<String>,
     pub control: ChatControlOverview,
@@ -687,6 +864,7 @@ pub struct ChatState {
     delete_rx: Option<Receiver<DeleteWorkerResult>>,
     channel_create_rx: Option<Receiver<ChannelCreateWorkerResult>>,
     transcript_load_rx: Option<Receiver<TranscriptLoadWorkerResult>>,
+    transcript_load_mode: Option<TranscriptLoadMode>,
     transcript_load_started_at: Option<Instant>,
     transcript_load_slow_notice_shown: bool,
     session_list_rx: Option<Receiver<SessionListWorkerResult>>,
@@ -710,7 +888,8 @@ struct ChannelCreateWorkerResult {
 
 struct TranscriptLoadWorkerResult {
     session: SessionRef,
-    result: Result<Vec<ChatMessage>, String>,
+    mode: TranscriptLoadMode,
+    result: Result<ConversationTimelineLoad, String>,
 }
 
 struct SessionListWorkerResult {
@@ -775,6 +954,7 @@ impl ChatState {
             usage: None,
             activity: Vec::new(),
             tool_calls: Vec::new(),
+            timeline: ConversationTimelineState::default(),
             tool_chain_expanded: false,
             expanded_tool_details: BTreeSet::new(),
             control: ChatControlOverview::default(),
@@ -804,6 +984,7 @@ impl ChatState {
             delete_rx: None,
             channel_create_rx: None,
             transcript_load_rx: None,
+            transcript_load_mode: None,
             transcript_load_started_at: None,
             transcript_load_slow_notice_shown: false,
             session_list_rx: None,
@@ -842,7 +1023,7 @@ impl ChatState {
 
     /// Update the local sidebar row after backend-owned chat state changes.
     fn persist(&mut self) {
-        if self.transcript_load_pending() {
+        if self.initial_transcript_load_pending() {
             return;
         }
         let session_id = self.session_id.clone();
@@ -1856,6 +2037,7 @@ impl ChatState {
         self.usage = None;
         self.activity = preserved_activity;
         self.tool_calls.clear();
+        self.timeline = ConversationTimelineState::default();
         self.tool_chain_expanded = false;
         self.expanded_tool_details.clear();
         self.control = ChatControlOverview::default();
@@ -1871,12 +2053,63 @@ impl ChatState {
         self.session_title_draft.clear();
         self.session_delete_confirm_id = None;
         self.transcript_load_rx = None;
+        self.transcript_load_mode = None;
         self.transcript_load_started_at = None;
         self.transcript_load_slow_notice_shown = false;
     }
 
     fn transcript_load_pending(&self) -> bool {
         self.transcript_load_rx.is_some()
+    }
+
+    fn initial_transcript_load_pending(&self) -> bool {
+        matches!(self.transcript_load_mode, Some(TranscriptLoadMode::Initial))
+    }
+
+    fn maybe_start_older_transcript_load(&mut self) -> bool {
+        if self.transcript_load_pending() || !self.timeline.has_older {
+            return false;
+        }
+        let Some(before_sequence) = self.timeline.loaded_start_sequence else {
+            return false;
+        };
+        if before_sequence <= 1 {
+            self.timeline.has_older = false;
+            return false;
+        }
+        let Some(session) = self.current_session_ref().cloned() else {
+            return false;
+        };
+        self.replace_activity(
+            "chat load",
+            format!("Loading older messages before {before_sequence} from SIFS"),
+            ActivityTone::Running,
+        );
+        self.start_transcript_load(session, TranscriptLoadMode::Older { before_sequence });
+        true
+    }
+
+    fn maybe_start_newer_transcript_load(&mut self) -> bool {
+        if self.transcript_load_pending() || !self.timeline.has_newer {
+            return false;
+        }
+        let Some(after_sequence) = self.timeline.loaded_end_sequence else {
+            return false;
+        };
+        if after_sequence >= self.timeline.total_messages {
+            self.timeline.has_newer = false;
+            return false;
+        }
+        let Some(session) = self.current_session_ref().cloned() else {
+            return false;
+        };
+        self.replace_activity(
+            "chat load",
+            format!("Loading newer messages after {after_sequence} from SIFS"),
+            ActivityTone::Running,
+        );
+        self.start_transcript_load(session, TranscriptLoadMode::Newer { after_sequence });
+        true
     }
 
     fn visible_session_has_started(&self) -> bool {
@@ -2355,6 +2588,7 @@ impl ChatState {
         };
         self.session_id = session.id.clone();
         self.messages = vec![transcript_loading_message(&session)];
+        self.timeline = ConversationTimelineState::default();
         self.streaming = false;
         self.notice = None;
         self.context = None;
@@ -2374,15 +2608,16 @@ impl ChatState {
         self.session_title_draft.clear();
         self.session_delete_confirm_id = None;
         self.transcript_load_rx = None;
+        self.transcript_load_mode = None;
         self.replace_activity(
             "chat load",
             transcript_loading_detail(session.kind),
             ActivityTone::Running,
         );
-        self.start_transcript_load(session);
+        self.start_transcript_load(session, TranscriptLoadMode::Initial);
     }
 
-    fn start_transcript_load(&mut self, session: SessionRef) {
+    fn start_transcript_load(&mut self, session: SessionRef, mode: TranscriptLoadMode) {
         let (tx, rx) = mpsc::channel();
         let data_dir = self.data_dir.clone();
         let sifs_daemon = self.sifs_daemon.clone();
@@ -2391,14 +2626,16 @@ impl ChatState {
         let spawn_result = thread::Builder::new()
             .name("sinomo-app-chat-load".to_string())
             .spawn(move || {
-                let result = load_conversation_messages(
+                let result = load_conversation_timeline(
                     &data_dir,
                     sifs_daemon.as_ref(),
                     &worker_session.id,
                     worker_session.kind,
+                    mode,
                 );
                 let _ = tx.send(TranscriptLoadWorkerResult {
                     session: worker_session,
+                    mode,
                     result,
                 });
                 if let Some(waker) = worker_waker {
@@ -2409,16 +2646,20 @@ impl ChatState {
         match spawn_result {
             Ok(_) => {
                 self.transcript_load_rx = Some(rx);
+                self.transcript_load_mode = Some(mode);
                 self.transcript_load_started_at = Some(Instant::now());
                 self.transcript_load_slow_notice_shown = false;
             }
             Err(error) => {
                 let detail = error.to_string();
                 self.transcript_load_rx = None;
+                self.transcript_load_mode = None;
                 self.transcript_load_started_at = None;
                 self.transcript_load_slow_notice_shown = false;
-                self.messages = vec![transcript_load_error_message(session.kind)];
-                self.notice = Some(format!("chat load failed: {detail}"));
+                if mode == TranscriptLoadMode::Initial {
+                    self.messages = vec![transcript_load_error_message(session.kind)];
+                }
+                self.notice = Some(transcript_load_failed_notice(mode, &detail));
                 self.replace_activity("chat load", detail, ActivityTone::Warn);
             }
         }
@@ -2431,6 +2672,7 @@ impl ChatState {
         match result {
             Ok(result) => {
                 self.transcript_load_rx = None;
+                self.transcript_load_mode = None;
                 self.transcript_load_started_at = None;
                 self.transcript_load_slow_notice_shown = false;
                 self.apply_transcript_load_result(result);
@@ -2438,13 +2680,19 @@ impl ChatState {
             }
             Err(TryRecvError::Empty) => self.maybe_show_slow_transcript_load(),
             Err(TryRecvError::Disconnected) => {
+                let mode = self
+                    .transcript_load_mode
+                    .unwrap_or(TranscriptLoadMode::Initial);
                 self.transcript_load_rx = None;
+                self.transcript_load_mode = None;
                 self.transcript_load_started_at = None;
                 self.transcript_load_slow_notice_shown = false;
-                self.messages = vec![ChatMessage::system_error(
-                    "Chat history stopped loading before SIFS returned a transcript.",
-                )];
-                self.notice = Some("chat load failed: worker stopped".to_string());
+                if mode == TranscriptLoadMode::Initial {
+                    self.messages = vec![ChatMessage::system_error(
+                        "Chat history stopped loading before SIFS returned a transcript.",
+                    )];
+                }
+                self.notice = Some(transcript_load_failed_notice(mode, "worker stopped"));
                 self.replace_activity(
                     "chat load",
                     "worker stopped before loading chat history from SIFS".to_string(),
@@ -2457,6 +2705,7 @@ impl ChatState {
 
     fn maybe_show_slow_transcript_load(&mut self) -> bool {
         if self.transcript_load_slow_notice_shown
+            || self.transcript_load_mode != Some(TranscriptLoadMode::Initial)
             || !self
                 .transcript_load_started_at
                 .is_some_and(|started| started.elapsed() >= TRANSCRIPT_LOAD_UI_TIMEOUT)
@@ -2487,32 +2736,98 @@ impl ChatState {
             return;
         }
         match result.result {
-            Ok(messages) => {
-                let history: Vec<ChatHistoryMessage> = messages
-                    .iter()
-                    .map(|m| ChatHistoryMessage {
-                        role: m.history_role().to_string(),
-                        text: m.text.clone(),
-                    })
-                    .collect();
-                self.messages = messages;
-                self.activity.retain(|entry| entry.title != "chat load");
-                if self.notice.as_deref().is_some_and(|notice| {
-                    notice.starts_with("chat load failed:")
-                        || notice == "wait for this chat history to finish loading"
-                }) {
-                    self.notice = None;
+            Ok(load) => match result.mode {
+                TranscriptLoadMode::Initial => {
+                    let history: Vec<ChatHistoryMessage> = load
+                        .messages
+                        .iter()
+                        .map(|m| ChatHistoryMessage {
+                            role: m.history_role().to_string(),
+                            text: m.text.clone(),
+                        })
+                        .collect();
+                    self.messages = load.messages;
+                    self.timeline.apply_page(&load.page);
+                    if let Some(overview) = load.overview {
+                        self.timeline.apply_overview(overview);
+                    }
+                    self.activity.retain(|entry| entry.title != "chat load");
+                    if self.notice.as_deref().is_some_and(|notice| {
+                        notice.starts_with("chat load failed:")
+                            || notice == "wait for this chat history to finish loading"
+                    }) {
+                        self.notice = None;
+                    }
+                    self.scroll = f32::MAX;
+                    self.stick_bottom = true;
+                    self.handle.send_command(ChatCommand::Resume {
+                        session_id: result.session.id,
+                        history,
+                    });
                 }
-                self.scroll = f32::MAX;
-                self.stick_bottom = true;
-                self.handle.send_command(ChatCommand::Resume {
-                    session_id: result.session.id,
-                    history,
-                });
-            }
+                TranscriptLoadMode::Older { before_sequence } => {
+                    let added = prepend_timeline_messages(&mut self.messages, load.messages);
+                    self.timeline.apply_older_page(&load.page);
+                    let pruned = trim_timeline_window(&mut self.messages, TimelineTrimEdge::End);
+                    self.timeline
+                        .refresh_loaded_range_from_messages(&self.messages);
+                    if pruned > 0 {
+                        self.timeline.has_newer = true;
+                    }
+                    if added > 0 {
+                        self.scroll += added as f32 * TRANSCRIPT_PREPEND_ESTIMATED_MESSAGE_H;
+                        self.stick_bottom = false;
+                    }
+                    self.activity.retain(|entry| entry.title != "chat load");
+                    self.replace_activity(
+                        "chat history",
+                        if added == 0 {
+                            format!("No older messages before {before_sequence}")
+                        } else {
+                            format!(
+                                "Loaded {added} older message{}",
+                                if added == 1 { "" } else { "s" }
+                            )
+                        },
+                        ActivityTone::Good,
+                    );
+                }
+                TranscriptLoadMode::Newer { after_sequence } => {
+                    let added = append_timeline_messages(&mut self.messages, load.messages);
+                    self.timeline.apply_newer_page(&load.page);
+                    let pruned = trim_timeline_window(&mut self.messages, TimelineTrimEdge::Start);
+                    self.timeline
+                        .refresh_loaded_range_from_messages(&self.messages);
+                    if pruned > 0 {
+                        self.timeline.has_older = true;
+                        self.scroll = (self.scroll
+                            - pruned as f32 * TRANSCRIPT_PREPEND_ESTIMATED_MESSAGE_H)
+                            .max(0.0);
+                    }
+                    if !self.timeline.has_newer {
+                        self.scroll = f32::MAX;
+                        self.stick_bottom = true;
+                    }
+                    self.activity.retain(|entry| entry.title != "chat load");
+                    self.replace_activity(
+                        "chat history",
+                        if added == 0 {
+                            format!("No newer messages after {after_sequence}")
+                        } else {
+                            format!(
+                                "Loaded {added} newer message{}",
+                                if added == 1 { "" } else { "s" }
+                            )
+                        },
+                        ActivityTone::Good,
+                    );
+                }
+            },
             Err(detail) => {
-                self.messages = vec![transcript_load_error_message(result.session.kind)];
-                self.notice = Some(format!("chat load failed: {detail}"));
+                if result.mode == TranscriptLoadMode::Initial {
+                    self.messages = vec![transcript_load_error_message(result.session.kind)];
+                }
+                self.notice = Some(transcript_load_failed_notice(result.mode, &detail));
                 self.replace_activity("chat load", detail, ActivityTone::Warn);
             }
         }
@@ -2957,7 +3272,14 @@ impl ChatState {
                 self.notice = None;
                 Self::finish_turn_messages(&mut self.messages);
                 self.persist();
-                Self::trim_messages_to_recent_window(&mut self.messages);
+                if Self::trim_messages_to_recent_window(&mut self.messages) {
+                    self.timeline
+                        .refresh_loaded_range_from_messages(&self.messages);
+                    self.timeline.has_older = self
+                        .timeline
+                        .loaded_start_sequence
+                        .is_some_and(|sequence| sequence > 1);
+                }
             }
             ChatEvent::ControlStatus(status) => {
                 self.control.active_turn = status.active_turn;
@@ -3018,6 +3340,7 @@ impl ChatState {
                 }
                 self.session_id = session_id;
                 self.messages.clear();
+                self.timeline = ConversationTimelineState::default();
                 self.streaming = false;
                 self.notice = None;
                 self.context = None;
@@ -3071,7 +3394,14 @@ impl ChatState {
                     self.scroll = f32::MAX;
                 }
                 self.persist();
-                Self::trim_messages_to_recent_window(&mut self.messages);
+                if Self::trim_messages_to_recent_window(&mut self.messages) {
+                    self.timeline
+                        .refresh_loaded_range_from_messages(&self.messages);
+                    self.timeline.has_older = self
+                        .timeline
+                        .loaded_start_sequence
+                        .is_some_and(|sequence| sequence > 1);
+                }
             }
         }
         true
@@ -3122,7 +3452,7 @@ impl ChatState {
             self.notice = Some("set up a provider before sending".to_string());
             return;
         }
-        if self.transcript_load_pending() {
+        if self.initial_transcript_load_pending() {
             self.notice = Some("wait for this chat history to finish loading".to_string());
             return;
         }
@@ -3208,7 +3538,7 @@ impl ChatState {
     fn can_send(&self) -> bool {
         (!self.input.trim().is_empty() || !self.attachments.is_empty())
             && !self.providers.is_empty()
-            && !self.transcript_load_pending()
+            && !self.initial_transcript_load_pending()
     }
 
     fn latest_reusable_answer(&self) -> Option<&str> {
@@ -3223,7 +3553,7 @@ impl ChatState {
     fn can_reuse_latest_answer(&self) -> bool {
         !self.streaming
             && !self.providers.is_empty()
-            && !self.transcript_load_pending()
+            && !self.initial_transcript_load_pending()
             && self.input.trim().is_empty()
             && self.attachments.is_empty()
             && self.attachment_path_input.trim().is_empty()
@@ -3456,7 +3786,7 @@ impl ChatState {
             self.notice = Some("use channel config to add agents".to_string());
             return;
         }
-        if self.transcript_load_pending() {
+        if self.initial_transcript_load_pending() {
             self.notice = Some("wait for this chat history to finish loading".to_string());
             return;
         }
@@ -4008,64 +4338,221 @@ fn rename_chat_channel(
     store.save_channel(&channel).map_err(channel_store_io_error)
 }
 
+#[cfg(test)]
 fn channel_messages(channel: &AgentChannel) -> Vec<ChatMessage> {
-    channel
-        .transcript
+    channel_messages_from_agent(&channel.transcript)
+}
+
+fn channel_messages_from_agent(messages: &[sinomo_agent::AgentChannelMessage]) -> Vec<ChatMessage> {
+    messages
         .iter()
         .filter_map(|message| {
             if message.content.trim().is_empty() && message.attachments.is_empty() {
                 return None;
             }
             let content = visible_channel_message_text(message);
-            match &message.author {
-                AgentChannelAuthor::User { .. } => Some(ChatMessage::user(content)),
+            let chat_message = match &message.author {
+                AgentChannelAuthor::User { .. } => ChatMessage::user(content),
                 AgentChannelAuthor::Agent { agent_name, .. } => {
                     let label = if agent_name.trim().is_empty() {
                         "Agent"
                     } else {
                         agent_name
                     };
-                    Some(ChatMessage::model(format!("{label}: {content}")))
+                    ChatMessage::model(format!("{label}: {content}"))
                 }
                 AgentChannelAuthor::System => {
                     if message.message_kind == AgentChannelMessageKind::Error {
-                        Some(ChatMessage::system_error(content))
+                        ChatMessage::system_error(content)
                     } else {
-                        Some(ChatMessage::system_info(content))
+                        ChatMessage::system_info(content)
                     }
                 }
-            }
+            };
+            Some(chat_message.with_sequence(message.sequence))
         })
         .collect()
 }
 
+#[cfg(test)]
 fn load_conversation_messages(
     data_dir: &SinomoDataDir,
     sifs_daemon: Option<&SifsDaemonAccess>,
     id: &str,
     kind: ConversationKind,
 ) -> Result<Vec<ChatMessage>, String> {
-    let messages = load_channel_messages_from_sifs(data_dir, sifs_daemon, id)?;
-    match (messages, kind) {
-        (Some(messages), _) => Ok(messages),
-        (None, ConversationKind::Chat) => Ok(Vec::new()),
+    Ok(
+        load_conversation_timeline(data_dir, sifs_daemon, id, kind, TranscriptLoadMode::Initial)?
+            .messages,
+    )
+}
+
+fn load_conversation_timeline(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&SifsDaemonAccess>,
+    id: &str,
+    kind: ConversationKind,
+    mode: TranscriptLoadMode,
+) -> Result<ConversationTimelineLoad, String> {
+    let timeline = load_channel_timeline_from_sifs(data_dir, sifs_daemon, id, mode)?;
+    match (timeline, kind) {
+        (Some(timeline), _) => Ok(timeline),
+        (None, ConversationKind::Chat) => {
+            let channel_id = parse_channel_id(id).map_err(|error| error.to_string())?;
+            Ok(empty_conversation_timeline_load(channel_id))
+        }
         (None, ConversationKind::Channel) => Err("channel not found".to_string()),
     }
 }
 
-fn load_channel_messages_from_sifs(
+fn load_channel_timeline_from_sifs(
     data_dir: &SinomoDataDir,
     sifs_daemon: Option<&SifsDaemonAccess>,
     id: &str,
-) -> Result<Option<Vec<ChatMessage>>, String> {
+    mode: TranscriptLoadMode,
+) -> Result<Option<ConversationTimelineLoad>, String> {
     let channel_id = parse_channel_id(id).map_err(|error| error.to_string())?;
     let store =
         open_agent_channel_store(data_dir, sifs_daemon).map_err(|error| error.to_string())?;
-    let channel = store
-        .load_channel(&channel_id)
+    let summary = store
+        .load_channel_summary(&channel_id)
         .map_err(channel_store_io_error)
         .map_err(|error| error.to_string())?;
-    Ok(channel.map(|channel| channel_messages(&channel)))
+    let Some(summary) = summary else {
+        return Ok(None);
+    };
+    if summary.deleted_at.is_some() {
+        return Ok(None);
+    }
+    let page = match mode {
+        TranscriptLoadMode::Initial => {
+            store.load_recent_message_page(&channel_id, TRANSCRIPT_PAGE_SIZE)
+        }
+        TranscriptLoadMode::Older { before_sequence } => {
+            store.load_message_page_before(&channel_id, before_sequence, TRANSCRIPT_PAGE_SIZE)
+        }
+        TranscriptLoadMode::Newer { after_sequence } => store.load_message_page_from(
+            &channel_id,
+            after_sequence.saturating_add(1),
+            TRANSCRIPT_PAGE_SIZE,
+        ),
+    }
+    .map_err(channel_store_io_error)
+    .map_err(|error| error.to_string())?;
+    let overview = if mode == TranscriptLoadMode::Initial {
+        Some(
+            store
+                .load_timeline_overview(&channel_id)
+                .map_err(channel_store_io_error)
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    Ok(Some(ConversationTimelineLoad {
+        messages: channel_messages_from_agent(&page.messages),
+        page,
+        overview,
+    }))
+}
+
+fn empty_conversation_timeline_load(channel_id: SessionId) -> ConversationTimelineLoad {
+    let overview_channel_id = channel_id.clone();
+    ConversationTimelineLoad {
+        messages: Vec::new(),
+        page: AgentChannelMessagePage {
+            channel_id,
+            messages: Vec::new(),
+            start_sequence: None,
+            end_sequence: None,
+            has_older: false,
+            has_newer: false,
+            total_messages: 0,
+            chunk_size: 0,
+        },
+        overview: Some(AgentChannelTimelineOverview {
+            channel_id: overview_channel_id,
+            total_messages: 0,
+            oldest_sequence: None,
+            newest_sequence: None,
+            chunk_size: 0,
+            segments: Vec::new(),
+        }),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimelineTrimEdge {
+    Start,
+    End,
+}
+
+fn prepend_timeline_messages(messages: &mut Vec<ChatMessage>, older: Vec<ChatMessage>) -> usize {
+    let mut existing = messages
+        .iter()
+        .filter_map(|message| message.sequence)
+        .collect::<BTreeSet<_>>();
+    let mut unique = older
+        .into_iter()
+        .filter(|message| match message.sequence {
+            Some(sequence) => existing.insert(sequence),
+            None => true,
+        })
+        .collect::<Vec<_>>();
+    let added = unique.len();
+    unique.append(messages);
+    *messages = unique;
+    added
+}
+
+fn append_timeline_messages(messages: &mut Vec<ChatMessage>, newer: Vec<ChatMessage>) -> usize {
+    let mut existing = messages
+        .iter()
+        .filter_map(|message| message.sequence)
+        .collect::<BTreeSet<_>>();
+    let mut added = 0;
+    for message in newer {
+        if let Some(sequence) = message.sequence {
+            if !existing.insert(sequence) {
+                continue;
+            }
+        }
+        messages.push(message);
+        added += 1;
+    }
+    added
+}
+
+fn trim_timeline_window(messages: &mut Vec<ChatMessage>, edge: TimelineTrimEdge) -> usize {
+    let excess = messages
+        .len()
+        .saturating_sub(TRANSCRIPT_MAX_LOADED_MESSAGES);
+    if excess == 0 {
+        return 0;
+    }
+    match edge {
+        TimelineTrimEdge::Start => {
+            let removable = messages
+                .iter()
+                .take_while(|message| message.sequence.is_some())
+                .count()
+                .min(excess);
+            messages.drain(0..removable);
+            removable
+        }
+        TimelineTrimEdge::End => {
+            let mut removed = 0;
+            let mut index = messages.len();
+            while removed < excess && index > 0 {
+                index -= 1;
+                if messages[index].sequence.is_some() {
+                    messages.remove(index);
+                    removed += 1;
+                }
+            }
+            removed
+        }
+    }
 }
 
 fn transcript_loading_message(session: &SessionRef) -> ChatMessage {
@@ -4102,6 +4589,14 @@ fn transcript_load_error_message(kind: ConversationKind) -> ChatMessage {
             "Sinomo could not load this channel timeline. Open Activity for SIFS recovery details."
         }
     })
+}
+
+fn transcript_load_failed_notice(mode: TranscriptLoadMode, detail: &str) -> String {
+    match mode {
+        TranscriptLoadMode::Initial => format!("chat load failed: {detail}"),
+        TranscriptLoadMode::Older { .. } => format!("older history load failed: {detail}"),
+        TranscriptLoadMode::Newer { .. } => format!("newer history load failed: {detail}"),
+    }
 }
 
 fn visible_channel_message_text(message: &sinomo_agent::AgentChannelMessage) -> String {
@@ -9010,6 +9505,37 @@ impl TranscriptView {
             .collect()
     }
 
+    fn timeline_header_height(chat: &ChatState) -> f32 {
+        if chat
+            .timeline
+            .visible_summary(chat.messages.len())
+            .is_some_and(|summary| !summary.trim().is_empty())
+        {
+            34.0
+        } else {
+            0.0
+        }
+    }
+
+    fn paint_timeline_header(
+        &self,
+        ctx: &mut PaintCtx,
+        theme: &sui::DefaultTheme,
+        pal: &Palette,
+        area: Rect,
+        y: f32,
+        summary: &str,
+    ) {
+        let rect = Rect::new(area.x() + PAD, y, area.width() - PAD * 2.0, 26.0);
+        widgets::round_panel(ctx, rect, pal.field, pal.border, 7.0);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(rect.x() + 10.0, rect.y() + 5.0, rect.width() - 20.0, 16.0),
+            &compact_line(summary, 120),
+            pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text_faint),
+        );
+    }
+
     fn recovery_card_rect(area: Rect) -> Rect {
         let cx = area.x() + area.width() / 2.0;
         let cy = area.y() + area.height() / 2.0;
@@ -10118,6 +10644,11 @@ impl Widget for TranscriptView {
                     let mut chat = self.shared.chat_mut();
                     chat.scroll = (chat.scroll - dy).clamp(0.0, max);
                     chat.stick_bottom = chat.scroll >= max - 2.0;
+                    if chat.scroll <= TRANSCRIPT_OLDER_LOAD_THRESHOLD_PX {
+                        chat.maybe_start_older_transcript_load();
+                    } else if max - chat.scroll <= TRANSCRIPT_OLDER_LOAD_THRESHOLD_PX {
+                        chat.maybe_start_newer_transcript_load();
+                    }
                     drop(chat);
                     ctx.request_paint();
                 }
@@ -10155,6 +10686,9 @@ impl Widget for TranscriptView {
         let inner_w = max_bubble - 24.0;
         let mut laid: Vec<TranscriptLaidMessage> = Vec::with_capacity(chat.messages.len());
         let mut total = PAD;
+        let timeline_summary = chat.timeline.visible_summary(chat.messages.len());
+        let timeline_header_h = Self::timeline_header_height(&chat);
+        total += timeline_header_h;
         for msg in &chat.messages {
             let item = Self::layout_message(ctx, &pal, &theme, msg, inner_w);
             total += item.bubble_h + 12.0;
@@ -10183,6 +10717,12 @@ impl Widget for TranscriptView {
         let mut action_rects = Vec::new();
         let mut runtime_action_rects = Vec::new();
         let mut y = area.y() + PAD - scroll;
+        if let Some(summary) = timeline_summary.as_deref() {
+            if y + timeline_header_h >= area.y() && y <= area.y() + area.height() {
+                self.paint_timeline_header(ctx, &theme, &pal, area, y, summary);
+            }
+            y += timeline_header_h;
+        }
         for item in &laid {
             if y + item.bubble_h >= area.y() && y <= area.y() + area.height() {
                 self.paint_laid_message(ctx, &pal, &theme, area, item, y, &mut action_rects);
@@ -13703,6 +14243,61 @@ mod tests {
             state.can_send(),
             "composer should become available after the transcript loads"
         );
+    }
+
+    #[test]
+    fn transcript_history_loads_older_backend_page_without_blocking_composer() {
+        let (_backend, mut state) = isolated_chat_state("open-session-older-page");
+        seed_default_provider(&mut state);
+        let channel_id = SessionId::generate();
+        let messages = (0..(VISIBLE_TRANSCRIPT_RECENT_LIMIT + 25))
+            .map(|index| ChatMessage::user(format!("message {index}")))
+            .collect::<Vec<_>>();
+        seed_backend_chat(&state.data_dir, &channel_id, "Long chat", &messages);
+        let session_id = channel_id.to_string();
+        state.sessions = vec![SessionRef {
+            id: session_id.clone(),
+            title: "Long chat".to_string(),
+            kind: ConversationKind::Chat,
+            updated_unix: 1,
+            participant_count: 1,
+            participant_names: Vec::new(),
+        }];
+
+        state.open_session(0);
+        wait_for(&mut state, Duration::from_secs(30), |state| {
+            !state.transcript_load_pending()
+                && state.messages.len() == VISIBLE_TRANSCRIPT_RECENT_LIMIT
+        });
+        assert_eq!(state.messages[0].text, "message 25");
+        assert_eq!(state.timeline.loaded_start_sequence, Some(26));
+        assert_eq!(
+            state.timeline.total_messages,
+            (VISIBLE_TRANSCRIPT_RECENT_LIMIT + 25) as u64
+        );
+        assert!(state.timeline.has_older);
+
+        state.set_draft("follow up while history loads".to_string());
+        assert!(state.maybe_start_older_transcript_load());
+        assert!(
+            state.can_send(),
+            "older page loads should not block the composer"
+        );
+        wait_for(&mut state, Duration::from_secs(30), |state| {
+            !state.transcript_load_pending()
+                && state.messages.len() == VISIBLE_TRANSCRIPT_RECENT_LIMIT + 25
+        });
+
+        assert_eq!(state.messages[0].text, "message 0");
+        assert_eq!(state.messages[24].text, "message 24");
+        assert_eq!(state.messages[25].text, "message 25");
+        assert_eq!(state.timeline.loaded_start_sequence, Some(1));
+        assert_eq!(
+            state.timeline.loaded_end_sequence,
+            Some((VISIBLE_TRANSCRIPT_RECENT_LIMIT + 25) as u64)
+        );
+        assert!(!state.timeline.has_older);
+        assert!(!state.timeline.has_newer);
     }
 
     #[test]
