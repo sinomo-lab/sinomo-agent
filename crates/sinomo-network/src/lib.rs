@@ -184,8 +184,9 @@ pub use object::{
     AsyncDaemonControlListener, AsyncDaemonControlStream, DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
     DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts, OBJECT_STREAM_MAX_CHUNK_BYTES,
     ObjectFrameIoOptions, ObjectRpcRequestStreamMode, ObjectRpcResponseStreamMode,
-    RawByteStreamChunkOptions, SinomoObjectCodec, object_rpc_request_stream_mode,
-    object_rpc_response_stream_mode, send_daemon_control_rpc_request_async,
+    RawByteStreamChunkOptions, SinomoObjectCodec, forward_raw_byte_stream_chunks_async,
+    object_rpc_request_stream_mode, object_rpc_response_stream_mode,
+    read_raw_byte_stream_chunks_to_vec_async, send_daemon_control_rpc_request_async,
     set_object_rpc_request_stream_mode, set_object_rpc_response_stream_mode,
     write_borrowed_object_frame_async,
 };

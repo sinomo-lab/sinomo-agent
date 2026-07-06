@@ -2149,9 +2149,11 @@ fn direct_read_stream_rpc_keeps_blob_out_of_initial_response() {
         content_size_bytes: bytes.len() as u64,
     };
     let direct_request = dfs_direct_read_rpc_request(&direct_read).expect("direct request");
-    assert!(dfs_direct_read_rpc_request_accepts_streamed_response(
-        &direct_request
-    ));
+    assert_eq!(
+        sinomo_core::network::object_rpc_request_stream_mode(&direct_request),
+        sinomo_core::network::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse
+    );
+    assert!(direct_request.is_response_retry_safe());
 
     let mut stream_response =
         handle_dfs_direct_read_stream_rpc_request(&data_dir, direct_request).expect("stream");

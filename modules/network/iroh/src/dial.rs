@@ -16,7 +16,9 @@ use crate::{
 };
 use sinomo_core::network::{
     CLUSTER_HEALTH_ROUTE, DaemonControlRequest, DaemonRpcTimeouts, NetworkError,
-    decode_single_object_frame_from_slice,
+    OBJECT_STREAM_MAX_CHUNK_BYTES, ObjectRpcResponse, ObjectRpcResponseStreamMode,
+    RawByteStreamChunkOptions, decode_single_object_frame_from_slice, encode_object_frame_to_vec,
+    object_rpc_response_stream_mode, read_raw_byte_stream_chunks_to_vec_async,
 };
 use sinomo_core::node::{ClusterId, NodeId};
 use std::collections::HashMap;
@@ -303,10 +305,13 @@ async fn dial_iroh_daemon_control_frame_attempt_async(
         ));
     }
     // One response frame per dial; a fresh budget keeps the frame-size
-    // accounting shared with the proxy path.
+    // accounting shared with the proxy path. If that response announces a
+    // streamed object-RPC body, the body chunks belong to the same generic
+    // network transfer and are collected into the returned response frame for
+    // the pinned v1 module ABI.
     let response_budget =
         IrohProxyByteBudget::new(crate::frames::IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES);
-    let response = match read_proxy_frame_async(
+    let response_frame = match read_proxy_frame_async(
         &mut recv,
         &response_budget,
         "response",
@@ -323,8 +328,49 @@ async fn dial_iroh_daemon_control_frame_attempt_async(
             ));
         }
     };
+    let response =
+        match collect_streamed_response_body_if_needed(&mut recv, response_frame, timeouts).await {
+            Ok(response) => response,
+            Err(error) => {
+                dialer.evict_connection(cache_key, b"read failed").await;
+                drop(recv);
+                return Err(IrohDaemonControlAttemptError::AfterRequestAccepted(
+                    iroh_daemon_response_frame_error(error),
+                ));
+            }
+        };
     drop(recv);
     Ok(response)
+}
+
+async fn collect_streamed_response_body_if_needed<R>(
+    reader: &mut R,
+    response_frame: Vec<u8>,
+    timeouts: DaemonRpcTimeouts,
+) -> Result<Vec<u8>, NetworkError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut response: ObjectRpcResponse =
+        decode_single_object_frame_from_slice(&response_frame, IROH_DAEMON_COMMAND_MAX_BYTES)?;
+    if object_rpc_response_stream_mode(&response)
+        != ObjectRpcResponseStreamMode::RawStreamedDaemonBody
+    {
+        return Ok(response_frame);
+    }
+    let mut body = Vec::new();
+    read_raw_byte_stream_chunks_to_vec_async(
+        reader,
+        &mut body,
+        RawByteStreamChunkOptions {
+            chunk_bytes: OBJECT_STREAM_MAX_CHUNK_BYTES,
+            max_total_bytes: u64::try_from(IROH_DAEMON_COMMAND_MAX_BYTES).ok(),
+            idle_timeout: timeouts.idle_timeout,
+        },
+    )
+    .await?;
+    response.body = body;
+    encode_object_frame_to_vec(&response)
 }
 
 fn iroh_daemon_connection_cache_key(record: &IrohEndpointRecord) -> String {
@@ -506,6 +552,60 @@ mod tests {
                 detail: "peer closed before object frame length (4 bytes expected)".to_string(),
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn streamed_response_body_is_collected_for_module_dial_abi() {
+        use sinomo_core::network::{
+            ObjectRpcResponseStreamMode, set_object_rpc_response_stream_mode,
+        };
+        use tokio::io::AsyncWriteExt;
+
+        let mut response = ObjectRpcResponse::from_encoded_body("/test/stream", Vec::new());
+        set_object_rpc_response_stream_mode(
+            &mut response,
+            ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
+        );
+        let response_frame = encode_object_frame_to_vec(&response).expect("response frame");
+
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        let writer_task = tokio::spawn(async move {
+            writer
+                .write_all(&5_u64.to_be_bytes())
+                .await
+                .expect("first chunk length");
+            writer.write_all(b"hello").await.expect("first chunk body");
+            writer
+                .write_all(&6_u64.to_be_bytes())
+                .await
+                .expect("second chunk length");
+            writer
+                .write_all(b" world")
+                .await
+                .expect("second chunk body");
+            writer
+                .write_all(&0_u64.to_be_bytes())
+                .await
+                .expect("end chunk length");
+        });
+
+        let collected = collect_streamed_response_body_if_needed(
+            &mut reader,
+            response_frame,
+            DaemonRpcTimeouts::default(),
+        )
+        .await
+        .expect("collect streamed body");
+        writer_task.await.expect("writer task");
+        let collected_response: ObjectRpcResponse =
+            decode_single_object_frame_from_slice(&collected, IROH_DAEMON_COMMAND_MAX_BYTES)
+                .expect("decode collected response");
+
+        assert_eq!(collected_response.body, b"hello world");
+        assert_eq!(
+            object_rpc_response_stream_mode(&collected_response),
+            ObjectRpcResponseStreamMode::RawStreamedDaemonBody
+        );
     }
 
     #[test]

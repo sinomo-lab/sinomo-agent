@@ -18,8 +18,10 @@ use crate::{
 };
 use fs2::FileExt;
 use sinomo_core::network::{
-    ClusterPaths, DaemonControlRequest, DaemonRpcTimeouts, NetworkError, ObjectRpcResponse,
-    decode_single_object_frame_from_slice, encode_object_frame_to_vec, read_object_file,
+    ClusterPaths, DaemonControlRequest, DaemonRpcTimeouts, NetworkError,
+    OBJECT_STREAM_MAX_CHUNK_BYTES, ObjectRpcResponse, ObjectRpcResponseStreamMode,
+    RawByteStreamChunkOptions, decode_single_object_frame_from_slice, encode_object_frame_to_vec,
+    forward_raw_byte_stream_chunks_async, object_rpc_response_stream_mode, read_object_file,
     read_optional_object_file, write_object_file_create_new_serialized,
 };
 use sinomo_core::node::{ClusterId, NodeId};
@@ -333,14 +335,22 @@ where
     .await
 }
 
+struct ForwardedDaemonControlPayload {
+    response_frame: Vec<u8>,
+    response_budget_permit: IrohProxyByteBudgetPermit,
+    streamed_body: Option<tokio::net::TcpStream>,
+}
+
 /// Forwards one command frame to the daemon control address over TCP and
-/// reads the daemon's response frame.
+/// reads the daemon's response frame. If the response announces a generic
+/// streamed object-RPC body, the TCP stream is returned so the caller can
+/// forward the raw body chunks without collecting them.
 async fn forward_daemon_control_payload_async(
     address: &str,
     payload: &[u8],
     timeouts: DaemonRpcTimeouts,
     budget: &IrohProxyByteBudget,
-) -> Result<(Vec<u8>, IrohProxyByteBudgetPermit), NetworkError> {
+) -> Result<ForwardedDaemonControlPayload, NetworkError> {
     use tokio::io::AsyncWriteExt;
 
     let connect = tokio::net::TcpStream::connect(address);
@@ -380,13 +390,30 @@ async fn forward_daemon_control_payload_async(
         operation: format!("finish daemon control address {address}"),
         detail: source.to_string(),
     })?;
-    read_proxy_frame_async(
+    let (response_frame, response_budget_permit) = read_proxy_frame_async(
         &mut stream,
         budget,
         "command response",
         timeouts.idle_timeout,
     )
-    .await
+    .await?;
+    let streamed_body = match decode_single_object_frame_from_slice::<ObjectRpcResponse>(
+        &response_frame,
+        IROH_DAEMON_COMMAND_MAX_BYTES,
+    ) {
+        Ok(response)
+            if object_rpc_response_stream_mode(&response)
+                == ObjectRpcResponseStreamMode::RawStreamedDaemonBody =>
+        {
+            Some(stream)
+        }
+        _ => None,
+    };
+    Ok(ForwardedDaemonControlPayload {
+        response_frame,
+        response_budget_permit,
+        streamed_body,
+    })
 }
 
 async fn accept_iroh_proxy_command_stream_with_idle_timeout<F, T, E>(
@@ -883,7 +910,7 @@ async fn run_iroh_daemon_proxy(
                         &forward_budget,
                     )
                     .await;
-                    let (response, response_budget_permit) = match response_result {
+                    let forwarded = match response_result {
                         Ok(result) => result,
                         Err(error) => {
                             let detail = format!("iroh daemon proxy command failed: {error}");
@@ -906,16 +933,32 @@ async fn run_iroh_daemon_proxy(
                     drop(request_budget_permit);
                     if write_all_frame_async(
                         &mut send,
-                        &response,
+                        &forwarded.response_frame,
                         "write iroh daemon proxy frame",
                         Some(IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT),
                     )
                     .await
-                    .is_ok()
+                    .is_err()
                     {
-                        let _ = send.finish();
+                        return;
                     }
-                    drop(response_budget_permit);
+                    drop(forwarded.response_budget_permit);
+                    if let Some(mut streamed_body) = forwarded.streamed_body
+                        && let Err(error) = forward_raw_byte_stream_chunks_async(
+                            &mut streamed_body,
+                            &mut send,
+                            RawByteStreamChunkOptions {
+                                chunk_bytes: OBJECT_STREAM_MAX_CHUNK_BYTES,
+                                max_total_bytes: u64::try_from(IROH_DAEMON_COMMAND_MAX_BYTES).ok(),
+                                idle_timeout: Some(IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT),
+                            },
+                        )
+                        .await
+                    {
+                        eprintln!("sinomo iroh daemon proxy streamed response failed: {error}");
+                        return;
+                    }
+                    let _ = send.finish();
                 });
             }
             abort_and_drain_iroh_daemon_proxy_tasks(&mut command_tasks, "command").await;
@@ -930,7 +973,11 @@ async fn run_iroh_daemon_proxy(
 mod tests {
     use super::*;
     use sinomo_core::local::SinomoDataDir;
-    use sinomo_core::network::{ObjectFrameIoOptions, ObjectRpcRequest, read_object_frame_async};
+    use sinomo_core::network::{
+        ObjectFrameIoOptions, ObjectRpcRequest, ObjectRpcResponseStreamMode,
+        RawByteStreamChunkOptions, object_rpc_response_stream_mode, read_object_frame_async,
+        read_raw_byte_stream_chunks_to_vec_async, set_object_rpc_response_stream_mode,
+    };
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1096,6 +1143,101 @@ mod tests {
             iroh_proxy_route_hint(b"not-a-control-frame"),
             IROH_DAEMON_PROXY_ERROR_ROUTE
         );
+    }
+
+    #[tokio::test]
+    async fn forwarded_daemon_payload_preserves_streamed_response_body() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind daemon fixture");
+        let daemon_address = listener
+            .local_addr()
+            .expect("daemon fixture address")
+            .to_string();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept daemon fixture");
+            let request: sinomo_core::network::DaemonControlRequest = read_object_frame_async(
+                &mut stream,
+                IROH_DAEMON_COMMAND_MAX_BYTES,
+                ObjectFrameIoOptions::none(),
+            )
+            .await
+            .expect("read daemon fixture request");
+            assert_eq!(request.route, "/test/stream");
+
+            let mut response = ObjectRpcResponse::from_encoded_body("/test/stream", Vec::new());
+            set_object_rpc_response_stream_mode(
+                &mut response,
+                ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
+            );
+            let frame = encode_object_frame_to_vec(&response).expect("response frame");
+            stream
+                .write_all(&frame)
+                .await
+                .expect("write daemon fixture response frame");
+            stream
+                .write_all(&4_u64.to_be_bytes())
+                .await
+                .expect("write first chunk length");
+            stream
+                .write_all(b"mesh")
+                .await
+                .expect("write first chunk body");
+            stream
+                .write_all(&7_u64.to_be_bytes())
+                .await
+                .expect("write second chunk length");
+            stream
+                .write_all(b" stream")
+                .await
+                .expect("write second chunk body");
+            stream
+                .write_all(&0_u64.to_be_bytes())
+                .await
+                .expect("write end chunk");
+        });
+
+        let request =
+            ObjectRpcRequest::encode_body("/test/stream", "test", &()).expect("rpc request");
+        let payload = encode_object_frame_to_vec(&request).expect("request frame");
+        let budget = IrohProxyByteBudget::new(4096);
+        let mut forwarded = forward_daemon_control_payload_async(
+            &daemon_address,
+            &payload,
+            DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
+            &budget,
+        )
+        .await
+        .expect("forward daemon payload");
+        let response: ObjectRpcResponse = decode_single_object_frame_from_slice(
+            &forwarded.response_frame,
+            IROH_DAEMON_COMMAND_MAX_BYTES,
+        )
+        .expect("decode response frame");
+        assert_eq!(
+            object_rpc_response_stream_mode(&response),
+            ObjectRpcResponseStreamMode::RawStreamedDaemonBody
+        );
+        drop(forwarded.response_budget_permit);
+        let mut body = Vec::new();
+        read_raw_byte_stream_chunks_to_vec_async(
+            forwarded
+                .streamed_body
+                .as_mut()
+                .expect("streamed body reader"),
+            &mut body,
+            RawByteStreamChunkOptions {
+                chunk_bytes: OBJECT_STREAM_MAX_CHUNK_BYTES,
+                max_total_bytes: Some(64),
+                idle_timeout: Some(Duration::from_secs(1)),
+            },
+        )
+        .await
+        .expect("read streamed body chunks");
+        assert_eq!(body, b"mesh stream");
+        fixture.await.expect("fixture task");
     }
 
     #[test]

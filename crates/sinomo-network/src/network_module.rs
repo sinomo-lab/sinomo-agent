@@ -83,9 +83,8 @@ pub fn network_modules_rpc_route_policy(route: &str) -> Option<&'static NetworkM
 pub type NetworkFuture<T> = Pin<Box<dyn Future<Output = Result<T, NetworkError>> + Send + 'static>>;
 
 /// Static description of one network module: which transports and address
-/// schemes it serves and which dial modes it supports. Serialized as a
-/// name-keyed SOBJ document across the module ABI, so fields can be added
-/// without breaking older modules.
+/// schemes it serves. Serialized as a name-keyed SOBJ document across the
+/// module ABI, so fields can be added without breaking older modules.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct NetworkModuleDescriptor {
     /// Stable module id, e.g. `"mesh"`, `"serial"`, `"lora"`.
@@ -103,10 +102,6 @@ pub struct NetworkModuleDescriptor {
     pub listener: bool,
     /// Whether the module tolerates repeated `stop()`/`start()` cycles.
     pub supports_runtime_toggle: bool,
-    /// Whether `dial_rpc` responses may use the daemon's raw/streamed response
-    /// framing. When `false` the dispatch layer must not route raw or
-    /// streamed requests through this module.
-    pub supports_raw_response: bool,
 }
 
 /// Protocol-specific role classification for an endpoint owned by a network
@@ -165,23 +160,23 @@ pub trait NetworkModule: Send + Sync {
     /// Dial a daemon RPC whose response may use raw streamed daemon-response
     /// framing.
     ///
-    /// The default is an explicit unsupported-transport error. Transports that
-    /// can preserve or safely collect the streamed response override this
-    /// method; callers dispatch by request stream mode instead of by
-    /// route-specific rules.
+    /// The default decodes the module's normal response frame. Modules that
+    /// cross a proxy boundary must preserve any raw response body before
+    /// returning that frame so callers can dispatch by generic stream mode
+    /// instead of route-specific rules.
     fn dial_rpc_raw_response(
         &self,
         endpoint: &ClusterEndpointRecord,
-        _request: &[u8],
-        _timeouts: DaemonRpcTimeouts,
+        request: &[u8],
+        timeouts: DaemonRpcTimeouts,
     ) -> NetworkFuture<crate::ObjectRpcResponse> {
-        let transport = endpoint.transport.clone();
-        let address = endpoint.address.clone();
+        let dial = self.dial_rpc(endpoint, request, timeouts);
         Box::pin(async move {
-            Err(NetworkError::Io {
-                operation: format!("send streamed daemon rpc to {address}"),
-                detail: format!("streamed raw RPC responses are not supported over {transport:?}"),
-            })
+            let bytes = dial.await?;
+            crate::object::decode_single_object_frame_from_slice(
+                &bytes,
+                crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
+            )
         })
     }
 
@@ -610,7 +605,6 @@ mod tests {
                     dialer: true,
                     listener: true,
                     supports_runtime_toggle: true,
-                    supports_raw_response: false,
                 },
                 starts: AtomicUsize::new(0),
                 stops: AtomicUsize::new(0),

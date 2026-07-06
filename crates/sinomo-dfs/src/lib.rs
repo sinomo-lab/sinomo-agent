@@ -140,8 +140,7 @@ pub(crate) use direct_read::{
 pub use direct_read::{
     DFS_DIRECT_READ_STREAM_CHUNK_BYTES, DfsDirectReadStreamResponse,
     dfs_direct_read_response_from_rpc_response, dfs_direct_read_rpc_request,
-    dfs_direct_read_rpc_request_accepts_streamed_response, handle_dfs_direct_read_rpc_request,
-    handle_dfs_direct_read_stream_rpc_request,
+    handle_dfs_direct_read_rpc_request, handle_dfs_direct_read_stream_rpc_request,
 };
 pub(crate) use direct_read::{
     DFS_DIRECT_REMOTE_READ_MAX_BYTES, dfs_direct_read_request_from_read_request,

@@ -162,7 +162,6 @@ pub struct NetworkModuleDescriptor {
     pub dialer: bool,
     pub listener: bool,
     pub supports_runtime_toggle: bool,
-    pub supports_raw_response: bool,         // review: response mode branches per transport
 }
 
 pub trait NetworkModule: Send + Sync {
@@ -171,6 +170,8 @@ pub trait NetworkModule: Send + Sync {
     fn stop(&self) -> Result<(), NetworkError>;
     fn dial_rpc(&self, endpoint: &ClusterEndpointRecord, request: &[u8],
                 timeouts: DaemonRpcTimeouts) -> NetworkFuture<Vec<u8>>;
+    fn dial_rpc_raw_response(&self, endpoint: &ClusterEndpointRecord, request: &[u8],
+                timeouts: DaemonRpcTimeouts) -> NetworkFuture<ObjectRpcResponse>;
     fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError>;
 }
 
@@ -257,11 +258,11 @@ Status codes mirror sinomo-module-api (0 ok, 1 invalid arg, 2 unsupported ABI,
 3 runtime error). The host-side adapter (`sinomo-daemon::registry`) wraps the
 vtable in the safe `NetworkModule` trait, holds the `libloading::Library`
 alive for the registry's lifetime (disable = `stop()`, never unload), and
-converts the descriptor/endpoint SOBJ payloads. Dial-mode capability flags in
-`NetworkModuleDescriptor` (`supports_raw_response`) let the dispatch layer keep
-the LanTcp pooled/streamed raw paths inside the built-in module (the review's
-dial-matrix concern): the registry consults flags before routing a raw or
-streamed request to a module and falls back to error otherwise.
+converts the descriptor/endpoint SOBJ payloads. Streamed object-RPC transfer is
+a generic `sinomo-network` capability: the built-in LanTcp path can forward raw
+chunks without buffering, while dynamic modules preserve or collect the same
+generic raw body stream through `dial_rpc_raw_response` instead of advertising a
+route- or DFS-specific capability flag.
 
 ### modules/network/iroh
 
