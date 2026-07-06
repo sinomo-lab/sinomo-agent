@@ -90,10 +90,11 @@ A package carries:
 - optional runtime caps;
 - output format.
 
-Built-in packages use built-in provenance. File-backed custom packages are stored
-under `$SINOMO_DATA_DIR/agents/*.json`. Imported package JSON receives imported
-provenance with the source path. Module-projected packages receive module
-provenance from the module registration id and version.
+Built-in packages use built-in provenance. Custom and imported package
+definitions are cluster-wide agent configuration and are stored in SIFS under
+`/services/sinomo/agents/*.json`; the importing node only contributes the source
+path recorded in provenance. Module-projected packages receive module provenance
+from the module registration id and version.
 
 Package validation rejects malformed ids, package versions, duplicate tools,
 invalid tool names, invalid tool-surface entries, invalid skills, invalid

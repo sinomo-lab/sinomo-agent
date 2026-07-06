@@ -7,6 +7,7 @@
 //! goes through daemon services.
 //! App-only UI preferences live locally under the Sinomo data directory.
 
+pub mod agents;
 pub mod app_config;
 pub mod chat_engine;
 pub mod cluster;

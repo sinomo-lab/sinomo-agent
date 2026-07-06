@@ -21,7 +21,8 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use serde_json::Value;
-use sinomo_cli::app_api::{SkillDetail, SkillMutationResult, SkillSummary};
+use sinomo_agent::{AgentDefinition, AgentOutputFormat, AgentPackageDefinition, AgentRole};
+use sinomo_cli::app_api::{SkillDetail, SkillMutationResult, SkillSummary, agent_summaries};
 use sui::{
     Alignment, ArrangeCtx, Color, Constraints, DefaultTheme, Event, EventCtx, FieldGroup,
     FontWeight, FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx,
@@ -36,6 +37,10 @@ use sinomo_runtime::config::{
 use sinomo_runtime::local::SinomoDataDir;
 
 use crate::backend::Backend;
+use crate::backend::agents::{
+    AgentConfigSnapshot, AgentConfigSummary, agent_definition_is_editable, agent_role_label,
+    agent_source_label,
+};
 use crate::backend::cluster::{AppClusterInvite, AppClusterStatus};
 use crate::backend::config::{
     CONFIGURABLE_PROVIDERS, ConfigEditKind, ConfigItem, ProviderForm, REASONING_EFFORT_OPTIONS,
@@ -71,6 +76,7 @@ pub enum SettingsSection {
     Node,
     Cluster,
     Providers,
+    Agents,
     Modules,
     Skills,
     Configuration,
@@ -78,12 +84,13 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 9] = [
+    pub const ALL: [SettingsSection; 10] = [
         SettingsSection::Appearance,
         SettingsSection::Connection,
         SettingsSection::Node,
         SettingsSection::Cluster,
         SettingsSection::Providers,
+        SettingsSection::Agents,
         SettingsSection::Modules,
         SettingsSection::Skills,
         SettingsSection::Configuration,
@@ -97,6 +104,7 @@ impl SettingsSection {
             SettingsSection::Node => "Node",
             SettingsSection::Cluster => "Cluster",
             SettingsSection::Providers => "Providers",
+            SettingsSection::Agents => "Agents",
             SettingsSection::Modules => "Modules",
             SettingsSection::Skills => "Skills",
             SettingsSection::Configuration => "Advanced",
@@ -149,6 +157,12 @@ pub struct SettingsState {
     pub provider_add_error: Option<String>,
     pub provider_action_error: Option<String>,
     pub provider_action_status: Option<ProviderActionStatus>,
+    pub agent_snapshot: AgentConfigSnapshot,
+    pub agent_selected_id: Option<String>,
+    pub agent_form: AgentForm,
+    pub agent_action_error: Option<String>,
+    pub agent_action_status: Option<String>,
+    pub agent_delete_confirming: Option<String>,
     pub module_snapshot: ModuleConfigSnapshot,
     pub module_selected_node_id: Option<String>,
     pub module_action_error: Option<String>,
@@ -168,6 +182,30 @@ pub struct SettingsState {
     provider_detail_expanded: Vec<String>,
     provider_storage_detail_expanded: bool,
     provider_remove_confirming: Option<(String, String)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentForm {
+    previous_id: Option<String>,
+    definition: AgentDefinition,
+    id: String,
+    name: String,
+    description: String,
+    role_index: usize,
+    system_prompt: String,
+    skills_text: String,
+    visible_toolsets_text: String,
+    allow_tools_text: String,
+    deny_tools_text: String,
+    provider: String,
+    model: String,
+    temperature: String,
+    max_output_tokens: String,
+    max_steps: String,
+    max_tool_calls_per_step: String,
+    max_model_repair_attempts: String,
+    sandbox_node_id: String,
+    output_format_index: usize,
 }
 
 /// A text-editable field of a provider in the Providers section.
@@ -219,6 +257,129 @@ enum DeviceLoginEvent {
     Failed(String),
 }
 
+const AGENT_ROLE_OPTIONS: &[&str] = &["Main", "Background", "Deliberation", "Evolution"];
+const AGENT_OUTPUT_FORMAT_OPTIONS: &[&str] = &["JSON decision", "Plain text"];
+
+impl AgentForm {
+    fn from_definition(definition: AgentDefinition) -> Self {
+        let previous_id = Some(definition.key().to_string());
+        Self::from_definition_with_previous(definition, previous_id)
+    }
+
+    fn new_custom(id: String) -> Self {
+        let definition = AgentDefinition::custom(
+            id.clone(),
+            AgentRole::Main,
+            "You are a helpful Sinomo agent.",
+        );
+        Self::from_definition_with_previous(definition, None)
+    }
+
+    fn duplicate_from(mut definition: AgentDefinition, id: String) -> Self {
+        definition.package = AgentPackageDefinition::local();
+        definition.id = id.clone();
+        definition.name = id;
+        Self::from_definition_with_previous(definition, None)
+    }
+
+    fn from_definition_with_previous(
+        definition: AgentDefinition,
+        previous_id: Option<String>,
+    ) -> Self {
+        let temperature = definition
+            .model_policy
+            .temperature
+            .or(definition.temperature)
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let max_output_tokens = definition
+            .model_policy
+            .max_output_tokens
+            .or(definition.max_output_tokens)
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let provider = definition.model_policy.provider.clone().unwrap_or_default();
+        let model = definition.model_policy.model.clone().unwrap_or_default();
+        let role_index = role_index(&definition.role);
+        let output_format_index = output_format_index(&definition.output_format);
+        Self {
+            previous_id,
+            id: definition.key().to_string(),
+            name: definition.name.clone(),
+            description: definition.description.clone(),
+            role_index,
+            system_prompt: definition.system_prompt.clone(),
+            skills_text: definition.skills.join("\n"),
+            visible_toolsets_text: definition.tool_surface.visible_toolsets.join("\n"),
+            allow_tools_text: definition.tool_surface.allow_tools.join("\n"),
+            deny_tools_text: definition.tool_surface.deny_tools.join("\n"),
+            provider,
+            model,
+            temperature,
+            max_output_tokens,
+            max_steps: definition
+                .runtime_limits
+                .max_steps
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            max_tool_calls_per_step: definition
+                .runtime_limits
+                .max_tool_calls_per_step
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            max_model_repair_attempts: definition
+                .runtime_limits
+                .max_model_repair_attempts
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            sandbox_node_id: definition
+                .tool_runtime
+                .sandbox_node_id
+                .clone()
+                .unwrap_or_default(),
+            output_format_index,
+            definition,
+        }
+    }
+
+    fn to_definition(&self) -> Result<AgentDefinition, String> {
+        let mut definition = self.definition.clone();
+        definition.package = AgentPackageDefinition::local();
+        definition.id = self.id.trim().to_string();
+        definition.name = self.name.trim().to_string();
+        definition.description = self.description.trim().to_string();
+        definition.role = role_for_index(self.role_index);
+        definition.system_prompt = self.system_prompt.clone();
+        definition.skills = parse_agent_list(&self.skills_text);
+        definition.tool_surface.visible_toolsets = parse_agent_list(&self.visible_toolsets_text);
+        definition.tool_surface.allow_tools = parse_agent_list(&self.allow_tools_text);
+        definition.tool_surface.deny_tools = parse_agent_list(&self.deny_tools_text);
+        definition.model_policy.provider = optional_trimmed_string(&self.provider);
+        definition.model_policy.model = optional_trimmed_string(&self.model);
+        let temperature = parse_optional_f32("temperature", &self.temperature)?;
+        definition.temperature = temperature;
+        definition.model_policy.temperature = temperature;
+        let max_output_tokens = parse_optional_u32("max output tokens", &self.max_output_tokens)?;
+        definition.max_output_tokens = max_output_tokens;
+        definition.model_policy.max_output_tokens = max_output_tokens;
+        definition.runtime_limits.max_steps = parse_optional_usize("max steps", &self.max_steps)?;
+        definition.runtime_limits.max_tool_calls_per_step =
+            parse_optional_usize("max tool calls per step", &self.max_tool_calls_per_step)?;
+        definition.runtime_limits.max_model_repair_attempts =
+            parse_optional_usize("max model repair attempts", &self.max_model_repair_attempts)?;
+        definition.tool_runtime.sandbox_node_id = optional_trimmed_string(&self.sandbox_node_id);
+        definition.output_format = output_format_for_index(self.output_format_index);
+        definition.validate().map_err(|error| error.to_string())?;
+        Ok(definition)
+    }
+
+    fn can_save(&self) -> bool {
+        !self.id.trim().is_empty()
+            && !self.name.trim().is_empty()
+            && !self.system_prompt.trim().is_empty()
+    }
+}
+
 impl SettingsState {
     pub fn new(backend: &Backend) -> Self {
         let config = backend.config.clone();
@@ -231,6 +392,16 @@ impl SettingsState {
         let skills_include_all = true;
         let (skills, skill_selected, skill_detail, skill_action_error) =
             load_initial_skill_state(data_dir.as_ref(), skills_include_all);
+        let agent_snapshot = backend.agent_config_snapshot(None);
+        let agent_selected_id = agent_snapshot
+            .selected_agent
+            .as_ref()
+            .map(|agent| agent.key().to_string());
+        let agent_form = agent_snapshot
+            .selected_agent
+            .clone()
+            .map(AgentForm::from_definition)
+            .unwrap_or_else(|| AgentForm::new_custom("custom-agent".to_string()));
         let module_snapshot = backend.module_config_snapshot(None);
         let module_selected_node_id = module_snapshot
             .selected_node
@@ -289,6 +460,12 @@ impl SettingsState {
             provider_add_error: None,
             provider_action_error: None,
             provider_action_status: None,
+            agent_snapshot,
+            agent_selected_id,
+            agent_form,
+            agent_action_error: None,
+            agent_action_status: None,
+            agent_delete_confirming: None,
             module_snapshot,
             module_selected_node_id,
             module_action_error: None,
@@ -407,6 +584,238 @@ impl SettingsState {
 
     fn toggle_provider_storage_detail(&mut self) {
         self.provider_storage_detail_expanded = !self.provider_storage_detail_expanded;
+    }
+
+    fn selected_agent_index(&self) -> Option<usize> {
+        let selected = self.agent_selected_id.as_ref()?;
+        self.agent_snapshot
+            .agents
+            .iter()
+            .position(|agent| &agent.id == selected)
+    }
+
+    fn select_agent_index(&mut self, backend: &Backend, index: usize) {
+        let Some(agent) = self.agent_snapshot.agents.get(index) else {
+            return;
+        };
+        self.agent_selected_id = Some(agent.id.clone());
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+        self.agent_delete_confirming = None;
+        self.reload_agents(backend);
+    }
+
+    fn reload_agents(&mut self, backend: &Backend) {
+        self.agent_snapshot = backend.agent_config_snapshot(self.agent_selected_id.as_deref());
+        self.agent_selected_id = self
+            .agent_snapshot
+            .selected_agent
+            .as_ref()
+            .map(|agent| agent.key().to_string());
+        if let Some(definition) = self.agent_snapshot.selected_agent.clone() {
+            self.agent_form = AgentForm::from_definition(definition);
+        }
+    }
+
+    fn create_agent(&mut self) {
+        let id = unique_agent_id(&self.agent_snapshot, "custom-agent");
+        self.agent_form = AgentForm::new_custom(id.clone());
+        self.agent_selected_id = Some(id);
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+        self.agent_delete_confirming = None;
+    }
+
+    fn duplicate_selected_agent(&mut self) {
+        let Some(definition) = self.agent_snapshot.selected_agent.clone() else {
+            self.agent_action_error = Some("select an agent to duplicate".to_string());
+            self.agent_action_status = None;
+            return;
+        };
+        let id = unique_agent_id(
+            &self.agent_snapshot,
+            &format!("{}-custom", definition.key()),
+        );
+        self.agent_form = AgentForm::duplicate_from(definition, id.clone());
+        self.agent_selected_id = Some(id);
+        self.agent_action_error = None;
+        self.agent_action_status = Some("Editing duplicated custom agent".to_string());
+        self.agent_delete_confirming = None;
+    }
+
+    fn set_agent_id(&mut self, value: String) {
+        self.agent_form.id = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_name(&mut self, value: String) {
+        self.agent_form.name = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_description(&mut self, value: String) {
+        self.agent_form.description = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_role_index(&mut self, index: usize) {
+        self.agent_form.role_index = index.min(AGENT_ROLE_OPTIONS.len().saturating_sub(1));
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_system_prompt(&mut self, value: String) {
+        self.agent_form.system_prompt = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_provider(&mut self, value: String) {
+        self.agent_form.provider = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_model(&mut self, value: String) {
+        self.agent_form.model = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_temperature(&mut self, value: String) {
+        self.agent_form.temperature = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_max_output_tokens(&mut self, value: String) {
+        self.agent_form.max_output_tokens = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_max_steps(&mut self, value: String) {
+        self.agent_form.max_steps = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_max_tool_calls_per_step(&mut self, value: String) {
+        self.agent_form.max_tool_calls_per_step = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_max_model_repair_attempts(&mut self, value: String) {
+        self.agent_form.max_model_repair_attempts = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_sandbox_node_id(&mut self, value: String) {
+        self.agent_form.sandbox_node_id = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_output_format_index(&mut self, index: usize) {
+        self.agent_form.output_format_index =
+            index.min(AGENT_OUTPUT_FORMAT_OPTIONS.len().saturating_sub(1));
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_skills_text(&mut self, value: String) {
+        self.agent_form.skills_text = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_visible_toolsets_text(&mut self, value: String) {
+        self.agent_form.visible_toolsets_text = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_allow_tools_text(&mut self, value: String) {
+        self.agent_form.allow_tools_text = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn set_agent_deny_tools_text(&mut self, value: String) {
+        self.agent_form.deny_tools_text = value;
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn agent_form_can_save(&self) -> bool {
+        self.agent_form.can_save() && agent_definition_is_editable(&self.agent_form.definition)
+    }
+
+    fn save_agent_form(&mut self, backend: &Backend) -> bool {
+        let definition = match self.agent_form.to_definition() {
+            Ok(definition) => definition,
+            Err(error) => {
+                self.agent_action_error = Some(error);
+                self.agent_action_status = None;
+                return false;
+            }
+        };
+        let previous_id = self.agent_form.previous_id.clone();
+        match backend.save_custom_agent_definition(&definition, previous_id.as_deref()) {
+            Ok(()) => {
+                self.agent_action_error = None;
+                self.agent_action_status = Some(format!("Saved custom agent {}", definition.key()));
+                self.agent_selected_id = Some(definition.key().to_string());
+                self.reload_agents(backend);
+                true
+            }
+            Err(error) => {
+                self.agent_action_error = Some(error);
+                self.agent_action_status = None;
+                false
+            }
+        }
+    }
+
+    fn confirm_agent_delete(&mut self) {
+        if let Some(id) = self.agent_selected_id.clone() {
+            self.agent_delete_confirming = Some(id);
+            self.agent_action_error = None;
+            self.agent_action_status = None;
+        }
+    }
+
+    fn cancel_agent_delete(&mut self) {
+        self.agent_delete_confirming = None;
+        self.agent_action_error = None;
+    }
+
+    fn delete_selected_agent(&mut self, backend: &Backend) -> bool {
+        let Some(id) = self.agent_selected_id.clone() else {
+            self.agent_action_error = Some("select a custom agent first".to_string());
+            self.agent_action_status = None;
+            return false;
+        };
+        match backend.delete_custom_agent_definition(&id) {
+            Ok(_) => {
+                self.agent_action_error = None;
+                self.agent_action_status = Some(format!("Deleted custom agent {id}"));
+                self.agent_delete_confirming = None;
+                self.agent_selected_id = None;
+                self.reload_agents(backend);
+                true
+            }
+            Err(error) => {
+                self.agent_action_error = Some(error);
+                self.agent_action_status = None;
+                false
+            }
+        }
     }
 
     fn selected_module_node_index(&self) -> Option<usize> {
@@ -1330,6 +1739,175 @@ fn provider_sidebar_preview(forms: &[ProviderForm]) -> String {
     }
 }
 
+fn role_index(role: &AgentRole) -> usize {
+    match role {
+        AgentRole::Main => 0,
+        AgentRole::Background => 1,
+        AgentRole::Deliberation => 2,
+        AgentRole::Evolution => 3,
+    }
+}
+
+fn role_for_index(index: usize) -> AgentRole {
+    match index {
+        1 => AgentRole::Background,
+        2 => AgentRole::Deliberation,
+        3 => AgentRole::Evolution,
+        _ => AgentRole::Main,
+    }
+}
+
+fn output_format_index(output_format: &AgentOutputFormat) -> usize {
+    match output_format {
+        AgentOutputFormat::JsonDecision => 0,
+        AgentOutputFormat::Text => 1,
+    }
+}
+
+fn output_format_for_index(index: usize) -> AgentOutputFormat {
+    match index {
+        1 => AgentOutputFormat::Text,
+        _ => AgentOutputFormat::JsonDecision,
+    }
+}
+
+fn optional_trimmed_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn parse_agent_list(value: &str) -> Vec<String> {
+    value
+        .split(|ch| ch == '\n' || ch == ',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_optional_f32(label: &str, value: &str) -> Result<Option<f32>, String> {
+    let Some(value) = optional_trimmed_string(value) else {
+        return Ok(None);
+    };
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|error| format!("invalid {label}: {error}"))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(format!(
+            "{label} must be a finite value greater than or equal to 0"
+        ));
+    }
+    Ok(Some(parsed))
+}
+
+fn parse_optional_u32(label: &str, value: &str) -> Result<Option<u32>, String> {
+    let Some(value) = optional_trimmed_string(value) else {
+        return Ok(None);
+    };
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|error| format!("invalid {label}: {error}"))?;
+    if parsed == 0 {
+        return Err(format!("{label} must be greater than 0"));
+    }
+    Ok(Some(parsed))
+}
+
+fn parse_optional_usize(label: &str, value: &str) -> Result<Option<usize>, String> {
+    let Some(value) = optional_trimmed_string(value) else {
+        return Ok(None);
+    };
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid {label}: {error}"))?;
+    if parsed == 0 {
+        return Err(format!("{label} must be greater than 0"));
+    }
+    Ok(Some(parsed))
+}
+
+fn unique_agent_id(snapshot: &AgentConfigSnapshot, base: &str) -> String {
+    let mut candidate = sanitize_agent_id(base);
+    if candidate.is_empty() {
+        candidate = "custom-agent".to_string();
+    }
+    if !snapshot.agents.iter().any(|agent| agent.id == candidate) {
+        return candidate;
+    }
+    for index in 2..1000 {
+        let next = format!("{candidate}-{index}");
+        if !snapshot.agents.iter().any(|agent| agent.id == next) {
+            return next;
+        }
+    }
+    format!("{candidate}-{}", snapshot.agents.len() + 1)
+}
+
+fn sanitize_agent_id(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn agent_custom_count(snapshot: &AgentConfigSnapshot) -> usize {
+    snapshot
+        .agents
+        .iter()
+        .filter(|agent| agent.editable)
+        .count()
+}
+
+fn agent_sidebar_preview(snapshot: &AgentConfigSnapshot) -> String {
+    if snapshot.agents.is_empty() {
+        return "No agents".to_string();
+    }
+    let custom = agent_custom_count(snapshot);
+    if custom == 0 {
+        format!("{} built-ins", snapshot.agents.len())
+    } else {
+        format!("{custom} custom · {} total", snapshot.agents.len())
+    }
+}
+
+fn agent_summary_line(agent: &AgentConfigSummary) -> String {
+    let mut parts = vec![agent.role.clone(), agent.source.clone()];
+    if agent.tool_count == 1 {
+        parts.push("1 tool".to_string());
+    } else if agent.tool_count > 1 {
+        parts.push(format!("{} tools", agent.tool_count));
+    }
+    if agent.skill_count == 1 {
+        parts.push("1 skill".to_string());
+    } else if agent.skill_count > 1 {
+        parts.push(format!("{} skills", agent.skill_count));
+    }
+    if let Some(node_id) = agent.sandbox_node_id.as_ref()
+        && !node_id.trim().is_empty()
+    {
+        parts.push(format!("sandbox {}", short(node_id, 12)));
+    }
+    parts.join(" · ")
+}
+
+fn agent_list_item(agent: &AgentConfigSummary) -> ListItem {
+    let title = if agent.name.trim().is_empty() {
+        agent.id.clone()
+    } else {
+        agent.name.clone()
+    };
+    ListItem::new(title).detail(agent_summary_line(agent))
+}
+
 fn module_sidebar_preview(snapshot: &ModuleConfigSnapshot) -> String {
     if snapshot.modules.is_empty() {
         return "No modules".to_string();
@@ -1456,6 +2034,10 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
         SettingsSection::Providers => {
             let settings = shared.settings();
             provider_sidebar_preview(&settings.provider_forms)
+        }
+        SettingsSection::Agents => {
+            let settings = shared.settings();
+            agent_sidebar_preview(&settings.agent_snapshot)
         }
         SettingsSection::Modules => {
             let settings = shared.settings();
@@ -1865,6 +2447,14 @@ fn refresh_chat_provider_summaries(shared: &Shared) {
     if let Some(ready) = app.ready.as_mut() {
         let providers = cluster_provider_summaries(ready.settings.config.as_ref());
         ready.chat.refresh_providers(providers);
+    }
+}
+
+fn refresh_chat_agent_summaries(shared: &Shared) {
+    let mut app = shared.borrow_mut();
+    if let Some(ready) = app.ready.as_mut() {
+        let agents = agent_summaries(ready.settings.data_dir.as_ref());
+        ready.chat.refresh_agents(agents);
     }
 }
 
@@ -3175,6 +3765,661 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
             "Add an account, then adjust low-level defaults from the provider card when needed.",
         )
         .theme_when(clone_reader(reader))
+}
+
+fn section_agents(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || agents_section_key(&s)
+        },
+        move |_key| WidgetPod::new(section_agents_body(&s, &r)),
+    )
+}
+
+fn agents_section_key(shared: &Shared) -> String {
+    let settings = shared.settings();
+    let agents = settings
+        .agent_snapshot
+        .agents
+        .iter()
+        .map(|agent| {
+            format!(
+                "{}:{}:{}:{}:{}:{}:{:?}",
+                agent.id,
+                agent.name,
+                agent.role,
+                agent.source,
+                agent.editable,
+                agent_summary_line(agent),
+                agent.sandbox_node_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "selected:{:?};error:{:?};status:{:?};delete:{:?};form:{}\n{agents}",
+        settings.agent_selected_id,
+        settings.agent_action_error,
+        settings.agent_action_status,
+        settings.agent_delete_confirming,
+        agent_form_signature(&settings.agent_form)
+    )
+}
+
+fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let (snapshot, action_error, action_status) = {
+        let settings = shared.settings();
+        (
+            settings.agent_snapshot.clone(),
+            settings.agent_action_error.clone(),
+            settings.agent_action_status.clone(),
+        )
+    };
+    let list = {
+        let s = shared.clone();
+        ListView::new("agent-config-list")
+            .items(
+                snapshot
+                    .agents
+                    .iter()
+                    .map(agent_list_item)
+                    .collect::<Vec<_>>(),
+            )
+            .row_height(MENU_ROW_H)
+            .selected_when({
+                let s = s.clone();
+                move || s.settings().selected_agent_index()
+            })
+            .theme_when(clone_reader(reader))
+            .on_change(move |index, _| {
+                if let Some(backend) = ready_backend(&s) {
+                    s.settings_mut().select_agent_index(&backend, index);
+                }
+            })
+    };
+    let new_agent = {
+        let s = shared.clone();
+        sui::Button::new("New agent")
+            .icon(sui::IconGlyph::Add)
+            .theme_when(clone_reader(reader))
+            .on_press(move || s.settings_mut().create_agent())
+    };
+    let duplicate = {
+        let s = shared.clone();
+        sui::Button::new("Duplicate")
+            .icon(sui::IconGlyph::Restore)
+            .theme_when(secondary_button_theme(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || s.settings().agent_snapshot.selected_agent.is_some()
+            })
+            .on_press(move || s.settings_mut().duplicate_selected_agent())
+    };
+    let refresh = {
+        let s = shared.clone();
+        sui::Button::new("Refresh")
+            .icon(sui::IconGlyph::Redo)
+            .theme_when(secondary_button_theme(reader))
+            .on_press(move || {
+                if let Some(backend) = ready_backend(&s) {
+                    s.settings_mut().reload_agents(&backend);
+                }
+            })
+    };
+
+    let mut summary_body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(value_row(
+            shared,
+            reader,
+            "Catalog",
+            agent_sidebar_preview(&snapshot),
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Custom agents",
+            format!("{}", agent_custom_count(&snapshot)),
+        ))
+        .with_child(
+            FormRow::new("Agents", SizedBox::new().height(230.0).with_child(list))
+                .stacked()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormRow::new(
+                "Actions",
+                Stack::horizontal()
+                    .spacing(8.0)
+                    .alignment(Alignment::Start)
+                    .with_child(new_agent)
+                    .with_child(duplicate)
+                    .with_child(refresh),
+            )
+            .inline()
+            .theme_when(clone_reader(reader)),
+        );
+    if let Some(error) = snapshot.error {
+        summary_body = summary_body.with_child(value_row(shared, reader, "Catalog error", error));
+    }
+    if let Some(error) = action_error {
+        summary_body = summary_body.with_child(value_row(shared, reader, "Error", error));
+    } else if let Some(status) = action_status {
+        summary_body = summary_body.with_child(value_row(shared, reader, "Status", status));
+    }
+
+    let mut stack = Stack::vertical()
+        .spacing(14.0)
+        .alignment(Alignment::Stretch)
+        .with_child(
+            FormSection::new("Agents", summary_body)
+                .description(
+                    "Create local custom agents and inspect agents supplied by the runtime.",
+                )
+                .theme_when(clone_reader(reader)),
+        );
+
+    let editing_unsaved = shared.settings().agent_form.previous_id.is_none();
+    let selected = shared.settings().agent_snapshot.selected_agent.clone();
+    let editor_visible =
+        editing_unsaved || selected.as_ref().is_some_and(agent_definition_is_editable);
+    if editor_visible {
+        stack = stack.with_child(agent_editor_section(shared, reader));
+    } else if let Some(definition) = selected {
+        stack = stack.with_child(agent_readonly_section(shared, reader, definition));
+    }
+    stack
+}
+
+fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let form = shared.settings().agent_form.clone();
+    let role_select = {
+        let s = shared.clone();
+        Select::new("agent-role")
+            .options(AGENT_ROLE_OPTIONS.iter().copied())
+            .selected_when({
+                let s = s.clone();
+                move || Some(s.settings().agent_form.role_index)
+            })
+            .theme_when(clone_reader(reader))
+            .on_change(move |index, _label| s.settings_mut().set_agent_role_index(index))
+    };
+    let output_format_select = {
+        let s = shared.clone();
+        Select::new("agent-output-format")
+            .options(AGENT_OUTPUT_FORMAT_OPTIONS.iter().copied())
+            .selected_when({
+                let s = s.clone();
+                move || Some(s.settings().agent_form.output_format_index)
+            })
+            .theme_when(clone_reader(reader))
+            .on_change(move |index, _label| s.settings_mut().set_agent_output_format_index(index))
+    };
+
+    let mut body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(agent_text_row(
+            shared,
+            reader,
+            "agent-id",
+            "Agent ID",
+            form.id.clone(),
+            "custom-agent",
+            |settings, value| settings.set_agent_id(value),
+        ))
+        .with_child(agent_text_row(
+            shared,
+            reader,
+            "agent-name",
+            "Display name",
+            form.name.clone(),
+            "Custom agent",
+            |settings, value| settings.set_agent_name(value),
+        ))
+        .with_child(
+            FormRow::new("Role", role_select)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(agent_text_row(
+            shared,
+            reader,
+            "agent-description",
+            "Description",
+            form.description.clone(),
+            "What this agent is for",
+            |settings, value| settings.set_agent_description(value),
+        ))
+        .with_child(agent_area_row(
+            shared,
+            reader,
+            "agent-system-prompt",
+            "System prompt",
+            form.system_prompt.clone(),
+            "Describe the agent behavior",
+            140.0,
+            |settings, value| settings.set_agent_system_prompt(value),
+        ))
+        .with_child(agent_text_row(
+            shared,
+            reader,
+            "agent-provider",
+            "Provider",
+            form.provider.clone(),
+            "Cluster default",
+            |settings, value| settings.set_agent_provider(value),
+        ))
+        .with_child(agent_text_row(
+            shared,
+            reader,
+            "agent-model",
+            "Model",
+            form.model.clone(),
+            "Provider default",
+            |settings, value| settings.set_agent_model(value),
+        ))
+        .with_child(agent_text_row(
+            shared,
+            reader,
+            "agent-temperature",
+            "Temperature",
+            form.temperature.clone(),
+            "0.2",
+            |settings, value| settings.set_agent_temperature(value),
+        ))
+        .with_child(agent_text_row(
+            shared,
+            reader,
+            "agent-max-output",
+            "Max output tokens",
+            form.max_output_tokens.clone(),
+            "Provider default",
+            |settings, value| settings.set_agent_max_output_tokens(value),
+        ))
+        .with_child(
+            FormRow::new("Output", output_format_select)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(agent_text_row(
+            shared,
+            reader,
+            "agent-max-steps",
+            "Max steps",
+            form.max_steps.clone(),
+            "Runtime default",
+            |settings, value| settings.set_agent_max_steps(value),
+        ))
+        .with_child(agent_text_row(
+            shared,
+            reader,
+            "agent-max-tool-calls",
+            "Max tool calls",
+            form.max_tool_calls_per_step.clone(),
+            "Runtime default",
+            |settings, value| settings.set_agent_max_tool_calls_per_step(value),
+        ))
+        .with_child(agent_text_row(
+            shared,
+            reader,
+            "agent-max-repairs",
+            "Repair attempts",
+            form.max_model_repair_attempts.clone(),
+            "Runtime default",
+            |settings, value| settings.set_agent_max_model_repair_attempts(value),
+        ))
+        .with_child(agent_text_row(
+            shared,
+            reader,
+            "agent-sandbox-node",
+            "Sandbox node",
+            form.sandbox_node_id.clone(),
+            "Local runtime",
+            |settings, value| settings.set_agent_sandbox_node_id(value),
+        ))
+        .with_child(agent_area_row(
+            shared,
+            reader,
+            "agent-skills",
+            "Skills",
+            form.skills_text.clone(),
+            "skill-id per line",
+            74.0,
+            |settings, value| settings.set_agent_skills_text(value),
+        ))
+        .with_child(agent_area_row(
+            shared,
+            reader,
+            "agent-visible-toolsets",
+            "Visible toolsets",
+            form.visible_toolsets_text.clone(),
+            "toolset id per line",
+            70.0,
+            |settings, value| settings.set_agent_visible_toolsets_text(value),
+        ))
+        .with_child(agent_area_row(
+            shared,
+            reader,
+            "agent-allow-tools",
+            "Allowed tools",
+            form.allow_tools_text.clone(),
+            "tool id per line",
+            70.0,
+            |settings, value| settings.set_agent_allow_tools_text(value),
+        ))
+        .with_child(agent_area_row(
+            shared,
+            reader,
+            "agent-deny-tools",
+            "Denied tools",
+            form.deny_tools_text.clone(),
+            "tool id per line",
+            70.0,
+            |settings, value| settings.set_agent_deny_tools_text(value),
+        ));
+
+    body = body.with_child(agent_actions_row(shared, reader));
+    let title = if form.previous_id.is_some() {
+        format!("Edit {}", short_one_line(&form.id, 48))
+    } else {
+        "New custom agent".to_string()
+    };
+    FormSection::new(title, body)
+        .description("Saved agents are stored under the local Sinomo data directory and become available in chat agent selection.")
+        .theme_when(clone_reader(reader))
+}
+
+fn agent_actions_row(shared: &Shared, reader: &ThemeReader) -> FormRow {
+    let save = {
+        let s = shared.clone();
+        sui::Button::new("Save agent")
+            .icon(sui::IconGlyph::Check)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || s.settings().agent_form_can_save()
+            })
+            .on_press(move || {
+                let saved = if let Some(backend) = ready_backend(&s) {
+                    s.settings_mut().save_agent_form(&backend)
+                } else {
+                    s.settings_mut().agent_action_error = Some("backend is not ready".to_string());
+                    false
+                };
+                if saved {
+                    refresh_chat_agent_summaries(&s);
+                }
+            })
+    };
+    let duplicate = {
+        let s = shared.clone();
+        sui::Button::new("Duplicate")
+            .icon(sui::IconGlyph::Restore)
+            .theme_when(secondary_button_theme(reader))
+            .on_press(move || s.settings_mut().duplicate_selected_agent())
+    };
+    let delete_controls = agent_delete_controls(shared, reader);
+    FormRow::new(
+        "Actions",
+        Stack::horizontal()
+            .spacing(8.0)
+            .alignment(Alignment::Start)
+            .with_child(save)
+            .with_child(duplicate)
+            .with_child(delete_controls),
+    )
+    .inline()
+    .theme_when(clone_reader(reader))
+}
+
+fn agent_delete_controls(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let (previous_id, confirming) = {
+        let settings = shared.settings();
+        let previous_id = settings.agent_form.previous_id.clone();
+        let confirming = previous_id
+            .as_ref()
+            .is_some_and(|id| settings.agent_delete_confirming.as_ref() == Some(id));
+        (previous_id, confirming)
+    };
+    if confirming {
+        let confirm = {
+            let s = shared.clone();
+            sui::Button::new("Confirm delete")
+                .icon(sui::IconGlyph::Trash)
+                .theme_when(danger_button_theme(reader))
+                .on_press(move || {
+                    let deleted = if let Some(backend) = ready_backend(&s) {
+                        s.settings_mut().delete_selected_agent(&backend)
+                    } else {
+                        s.settings_mut().agent_action_error =
+                            Some("backend is not ready".to_string());
+                        false
+                    };
+                    if deleted {
+                        refresh_chat_agent_summaries(&s);
+                    }
+                })
+        };
+        let cancel = {
+            let s = shared.clone();
+            sui::Button::new("Cancel")
+                .icon(sui::IconGlyph::Close)
+                .theme_when(secondary_button_theme(reader))
+                .on_press(move || s.settings_mut().cancel_agent_delete())
+        };
+        return Stack::horizontal()
+            .spacing(8.0)
+            .alignment(Alignment::Start)
+            .with_child(confirm)
+            .with_child(cancel);
+    }
+    let s = shared.clone();
+    Stack::horizontal()
+        .spacing(8.0)
+        .alignment(Alignment::Start)
+        .with_child(
+            sui::Button::new("Delete agent")
+                .icon(sui::IconGlyph::Trash)
+                .theme_when(danger_button_theme(reader))
+                .enabled_when(move || previous_id.is_some())
+                .on_press(move || s.settings_mut().confirm_agent_delete()),
+        )
+}
+
+fn agent_readonly_section(
+    shared: &Shared,
+    reader: &ThemeReader,
+    definition: AgentDefinition,
+) -> impl Widget + use<> {
+    let duplicate = {
+        let s = shared.clone();
+        sui::Button::new("Duplicate")
+            .icon(sui::IconGlyph::Restore)
+            .theme_when(clone_reader(reader))
+            .on_press(move || s.settings_mut().duplicate_selected_agent())
+    };
+    let mut body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(value_row(shared, reader, "Agent ID", definition.key()))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Source",
+            agent_source_label(&definition.package.provenance.source),
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Role",
+            agent_role_label(&definition.role),
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Description",
+            if definition.description.trim().is_empty() {
+                "No description".to_string()
+            } else {
+                definition.description.clone()
+            },
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Tools",
+            agent_tools_summary(&definition),
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Model policy",
+            agent_model_summary(&definition),
+        ))
+        .with_child(copyable_area_row(
+            reader,
+            "agent-readonly-system-prompt",
+            "System prompt",
+            definition.system_prompt.clone(),
+        ))
+        .with_child(
+            FormRow::new("Actions", duplicate)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        );
+    if let Some(node_id) = definition.tool_runtime.sandbox_node_id.as_ref() {
+        body = body.with_child(value_row(shared, reader, "Sandbox node", node_id.clone()));
+    }
+    FormSection::new(definition.name.clone(), body)
+        .description("This agent is supplied by the runtime. Duplicate it to create an editable custom agent.")
+        .theme_when(clone_reader(reader))
+}
+
+fn agent_text_row<F>(
+    shared: &Shared,
+    reader: &ThemeReader,
+    name: &str,
+    label: &str,
+    value: impl Into<String>,
+    placeholder: &str,
+    mut on_change: F,
+) -> FormRow
+where
+    F: FnMut(&mut SettingsState, String) + 'static,
+{
+    let s = shared.clone();
+    let input = TextInput::new(name)
+        .value(value)
+        .placeholder(placeholder)
+        .theme_when(clone_reader(reader))
+        .on_change(move |value| {
+            let mut settings = s.settings_mut();
+            on_change(&mut *settings, value);
+        });
+    FormRow::new(label, input)
+        .inline()
+        .theme_when(clone_reader(reader))
+}
+
+fn agent_area_row<F>(
+    shared: &Shared,
+    reader: &ThemeReader,
+    name: &str,
+    label: &str,
+    value: impl Into<String>,
+    placeholder: &str,
+    height: f32,
+    mut on_change: F,
+) -> FormRow
+where
+    F: FnMut(&mut SettingsState, String) + 'static,
+{
+    let s = shared.clone();
+    let area = SizedBox::new().height(height).with_child(
+        TextArea::new(name)
+            .value(value)
+            .placeholder(placeholder)
+            .theme_when(clone_reader(reader))
+            .on_change(move |value| {
+                let mut settings = s.settings_mut();
+                on_change(&mut *settings, value);
+            }),
+    );
+    FormRow::new(label, area)
+        .stacked()
+        .theme_when(clone_reader(reader))
+}
+
+fn agent_form_signature(form: &AgentForm) -> String {
+    format!(
+        "{:?}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        form.previous_id,
+        form.id,
+        form.name,
+        form.description,
+        form.role_index,
+        form.system_prompt,
+        form.provider,
+        form.model,
+        form.temperature,
+        form.max_output_tokens,
+        form.max_steps,
+        form.max_tool_calls_per_step,
+        form.max_model_repair_attempts,
+        form.sandbox_node_id,
+        form.output_format_index,
+        form.skills_text,
+        form.allow_tools_text
+    )
+}
+
+fn agent_tools_summary(definition: &AgentDefinition) -> String {
+    let tools = definition.tools.len();
+    let visible = definition.tool_surface.visible_toolsets.len();
+    let allow = definition.tool_surface.allow_tools.len();
+    let deny = definition.tool_surface.deny_tools.len();
+    let skills = definition.skills.len();
+    let mut parts = Vec::new();
+    parts.push(match tools {
+        0 => "no packaged tools".to_string(),
+        1 => "1 packaged tool".to_string(),
+        _ => format!("{tools} packaged tools"),
+    });
+    if visible > 0 {
+        parts.push(format!("{visible} visible toolsets"));
+    }
+    if allow > 0 {
+        parts.push(format!("{allow} allowed tools"));
+    }
+    if deny > 0 {
+        parts.push(format!("{deny} denied tools"));
+    }
+    if skills > 0 {
+        parts.push(format!("{skills} skills"));
+    }
+    parts.join(" · ")
+}
+
+fn agent_model_summary(definition: &AgentDefinition) -> String {
+    let provider = definition
+        .model_policy
+        .provider
+        .as_deref()
+        .unwrap_or("cluster default");
+    let model = definition
+        .model_policy
+        .model
+        .as_deref()
+        .unwrap_or("provider default");
+    let temperature = definition
+        .model_policy
+        .temperature
+        .or(definition.temperature)
+        .map(|value| format!("temperature {value}"))
+        .unwrap_or_else(|| "default temperature".to_string());
+    format!("{provider} / {model} · {temperature}")
 }
 
 const MODULE_OVERRIDE_OPTIONS: &[&str] = &["Inherit", "Enable", "Disable"];
@@ -4822,6 +6067,7 @@ fn section_body(
         .with_child(section_node(shared, reader))
         .with_child(section_cluster(shared, reader))
         .with_child(section_providers(shared, reader))
+        .with_child(section_agents(shared, reader))
         .with_child(section_modules(shared, reader))
         .with_child(section_skills(shared, reader))
         .with_child(section_configuration(shared, reader))
@@ -5892,6 +7138,119 @@ mod tests {
             )?;
 
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn agent_settings_state_saves_renames_and_deletes_custom_agent() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+
+        state.create_agent();
+        state.set_agent_id("docs-agent".to_string());
+        state.set_agent_name("Docs agent".to_string());
+        state.set_agent_description("Writes project documentation".to_string());
+        state.set_agent_role_index(2);
+        state.set_agent_system_prompt("Write concise docs for the current project.".to_string());
+        state.set_agent_provider("openai".to_string());
+        state.set_agent_model("gpt-5".to_string());
+        state.set_agent_temperature("0.1".to_string());
+        state.set_agent_max_steps("4".to_string());
+        state.set_agent_skills_text("docs.skill\nreview.skill".to_string());
+
+        assert!(state.save_agent_form(&backend));
+        assert_eq!(
+            state.agent_action_status.as_deref(),
+            Some("Saved custom agent docs-agent")
+        );
+        assert!(
+            state
+                .agent_snapshot
+                .agents
+                .iter()
+                .any(|agent| agent.id == "docs-agent" && agent.editable),
+            "saved custom agent should appear in the settings catalog"
+        );
+        let summaries = agent_summaries(backend.data_dir.as_ref());
+        assert!(
+            summaries.iter().any(|agent| {
+                agent.key == "docs-agent" && agent.description == "Writes project documentation"
+            }),
+            "saved custom agent should feed the chat agent catalog"
+        );
+
+        state.set_agent_id("docs-agent-v2".to_string());
+        assert!(state.save_agent_form(&backend));
+        let summaries = agent_summaries(backend.data_dir.as_ref());
+        assert!(summaries.iter().any(|agent| agent.key == "docs-agent-v2"));
+        assert!(
+            !summaries.iter().any(|agent| agent.key == "docs-agent"),
+            "renaming a custom agent should remove the previous JSON definition"
+        );
+
+        state.confirm_agent_delete();
+        assert!(state.delete_selected_agent(&backend));
+        let summaries = agent_summaries(backend.data_dir.as_ref());
+        assert!(!summaries.iter().any(|agent| agent.key == "docs-agent-v2"));
+    }
+
+    #[test]
+    fn settings_agents_section_renders_management_controls() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let mut definition =
+            AgentDefinition::custom("render-agent", AgentRole::Main, "Render settings detail.");
+        definition.description = "Rendered custom agent".to_string();
+        backend
+            .save_custom_agent_definition(&definition, None)
+            .expect("seed custom agent");
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            app.ready
+                .as_mut()
+                .expect("ready state")
+                .settings
+                .open(SettingsSection::Agents);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings agents")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window.get_by_text("Agents").expect().to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("agent-id")
+            .expect()
+            .to_have_value("render-agent")?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("agent-description")
+            .expect()
+            .to_have_value("Rendered custom agent")?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("New agent")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Duplicate")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Refresh")
+            .expect()
+            .to_be_visible()?;
+
         Ok(())
     }
 

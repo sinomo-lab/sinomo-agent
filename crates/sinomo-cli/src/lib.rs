@@ -32,21 +32,22 @@ use sinomo_agent::{
     AGENT_RPC_CATEGORY, AGENT_SESSION_FOLLOW_UP_ROUTE, AGENT_SESSION_INSPECT_ROUTE,
     AGENT_SESSION_INTERRUPT_ROUTE, AGENT_SESSION_PROGRESS_ROUTE, AGENT_SESSION_RESUME_ROUTE,
     AGENT_SESSION_STEER_ROUTE, AGENT_SESSION_TERMINAL_RESULTS_ROUTE, Agent, AgentCatalog,
-    AgentDefinition, AgentDefinitionStore, AgentEventPayload, AgentLoopDecision, AgentLoopInput,
-    AgentModelEvent, AgentOp, AgentPackageProvenance, AgentPackageSource,
-    AgentReadinessCheckStatus, AgentReadinessReport, AgentRole, AgentRuntimeEvent,
-    AgentRuntimeEventCursor, AgentRuntimeEventPayload, AgentRuntimeStorage, AgentSession,
-    AgentSessionControlEventCursor, AgentSessionControlResponse, AgentSessionFollowUpRequest,
-    AgentSessionInspectRequest, AgentSessionInspectResponse, AgentSessionInterruptRequest,
-    AgentSessionProgressRequest, AgentSessionProgressResponse, AgentSessionResumeRequest,
-    AgentSessionResumeResponse, AgentSessionRuntime, AgentSessionSteerRequest,
-    AgentSessionTerminalResultsRequest, AgentSessionTerminalResultsResponse,
-    AgentTaskTerminalResult, AgentToolProgressEvent, AgentToolRegistry, ConfigAgentToolConfig,
-    EventEnvelopeExt, FileAgentDefinitionStore, InteractionModel, InteractionOutput,
-    InteractionSession, InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
-    SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore, SkillCatalogSource,
-    SkillCatalogSourceKind, SkillCatalogStore, SkillCatalogWrite, TaskId, interaction_event,
-    render_common_skill_markdown, run_local_agent_readiness_gate, user_interaction_input_event,
+    AgentDefinition, AgentDefinitionSifsStore, AgentDefinitionStore, AgentEventPayload,
+    AgentLoopDecision, AgentLoopInput, AgentModelEvent, AgentOp, AgentPackageProvenance,
+    AgentPackageSource, AgentReadinessCheckStatus, AgentReadinessReport, AgentRole,
+    AgentRuntimeEvent, AgentRuntimeEventCursor, AgentRuntimeEventPayload, AgentRuntimeStorage,
+    AgentSession, AgentSessionControlEventCursor, AgentSessionControlResponse,
+    AgentSessionFollowUpRequest, AgentSessionInspectRequest, AgentSessionInspectResponse,
+    AgentSessionInterruptRequest, AgentSessionProgressRequest, AgentSessionProgressResponse,
+    AgentSessionResumeRequest, AgentSessionResumeResponse, AgentSessionRuntime,
+    AgentSessionSteerRequest, AgentSessionTerminalResultsRequest,
+    AgentSessionTerminalResultsResponse, AgentTaskTerminalResult, AgentToolProgressEvent,
+    AgentToolRegistry, ConfigAgentToolConfig, EventEnvelopeExt, InteractionModel,
+    InteractionOutput, InteractionSession, InteractionSurface, InteractionSurfaceKind,
+    LocalWorkspaceAgentConfig, SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore,
+    SkillCatalogSource, SkillCatalogSourceKind, SkillCatalogStore, SkillCatalogWrite, TaskId,
+    interaction_event, render_common_skill_markdown, run_local_agent_readiness_gate,
+    user_interaction_input_event,
 };
 use sinomo_lm::{
     AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, ClaudeProvider, CurrentDefaultModel,
@@ -3479,7 +3480,8 @@ pub(crate) fn import_agent_package(options: AgentImportOptions) -> Result<(), Cl
         detail: source.to_string(),
     })?;
     let data_dir = SinomoDataDir::from_env_or_home()?;
-    let store = FileAgentDefinitionStore::for_data_dir(&data_dir);
+    let store = AgentDefinitionSifsStore::open(Some(data_dir.root()))
+        .map_err(agent_definition_store_cli_error)?;
     let saved_path = store
         .save_definition(&definition)
         .map_err(agent_definition_store_cli_error)?;
@@ -3502,7 +3504,7 @@ pub(crate) fn import_agent_package(options: AgentImportOptions) -> Result<(), Cl
         println!(
             "imported agent package `{}` to {}",
             definition.key(),
-            saved_path.display()
+            saved_path
         );
     }
     Ok(())
