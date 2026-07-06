@@ -2188,8 +2188,11 @@ where
                 };
                 let final_hop = &route_plan.next_hop == target_node_id;
                 let endpoints_left = route_endpoint_count.saturating_sub(endpoint_index).max(1);
-                let endpoint_attempt_budget =
-                    cluster_target_endpoint_attempt_budget(remaining, endpoints_left);
+                let endpoint_attempt_budget = cluster_target_endpoint_attempt_budget(
+                    remaining,
+                    endpoints_left,
+                    route_endpoint_count,
+                );
                 let hop_timeouts = if final_hop {
                     cluster_target_final_hop_transport_timeouts(
                         options.timeouts,
@@ -2530,20 +2533,25 @@ fn cluster_relay_hop_transport_timeouts(
 
 fn cluster_target_final_hop_transport_timeouts(
     timeouts: DaemonRpcTimeouts,
-    connect_budget: Option<Duration>,
+    endpoint_attempt_budget: Option<Duration>,
     remaining_route_budget: Option<Duration>,
 ) -> DaemonRpcTimeouts {
-    let connect_timeout = match (timeouts.connect_timeout, connect_budget) {
+    let connect_timeout = match (timeouts.connect_timeout, endpoint_attempt_budget) {
         (Some(connect_timeout), Some(remaining)) => Some(connect_timeout.min(remaining)),
         (Some(connect_timeout), None) => Some(connect_timeout),
         (None, Some(remaining)) => Some(remaining),
         (None, None) => None,
     };
-    let idle_timeout = match (timeouts.idle_timeout, remaining_route_budget) {
-        (Some(idle_timeout), Some(remaining)) => Some(idle_timeout.min(remaining)),
-        (Some(idle_timeout), None) => Some(idle_timeout),
-        (None, _) => None,
-    };
+    let idle_timeout = timeouts.idle_timeout.map(|idle_timeout| {
+        let mut capped = idle_timeout;
+        if let Some(remaining) = remaining_route_budget {
+            capped = capped.min(remaining);
+        }
+        if let Some(endpoint_attempt_budget) = endpoint_attempt_budget {
+            capped = capped.min(endpoint_attempt_budget);
+        }
+        capped
+    });
     timeouts
         .with_connect_timeout(connect_timeout)
         .with_idle_timeout(idle_timeout)
@@ -2552,8 +2560,9 @@ fn cluster_target_final_hop_transport_timeouts(
 fn cluster_target_endpoint_attempt_budget(
     remaining_route_budget: Option<Duration>,
     endpoints_left: usize,
+    endpoint_count: usize,
 ) -> Option<Duration> {
-    if endpoints_left <= 1 {
+    if endpoint_count <= 1 {
         return remaining_route_budget;
     }
     remaining_route_budget.map(|remaining| {
@@ -3687,8 +3696,47 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingSignedHost {
+        target_sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
+        fail_first_send: bool,
+    }
+
+    impl ClusterSignedEndpointRpcAsyncHost for RecordingSignedHost {
+        fn sign_endpoint_rpc_request_async<'a>(
+            &'a mut self,
+            _request: &'a ObjectRpcRequest,
+        ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+            Box::pin(async { Ok(b"test-auth".to_vec()) })
+        }
+
+        fn send_signed_endpoint_rpc_async<'a>(
+            &'a mut self,
+            endpoint: &'a ClusterEndpointRecord,
+            _auth: &'a [u8],
+            request: &'a ObjectRpcRequest,
+            timeouts: DaemonRpcTimeouts,
+        ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
+            let endpoint = endpoint.clone();
+            let request = request.clone();
+            let should_fail = self.fail_first_send && self.target_sends.is_empty();
+            let sends = &mut self.target_sends;
+            Box::pin(async move {
+                sends.push((endpoint, request, timeouts));
+                if should_fail {
+                    Err(NetworkError::Io {
+                        operation: "test target send".to_string(),
+                        detail: "first endpoint stalled".to_string(),
+                    })
+                } else {
+                    ObjectRpcResponse::encode_body("/test/target", &"ok")
+                }
+            })
+        }
+    }
+
     #[test]
-    fn cluster_target_final_hop_transport_timeouts_keep_response_budget() {
+    fn cluster_target_final_hop_transport_timeouts_cap_response_budget_per_endpoint() {
         let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(15));
         let shaped = cluster_target_final_hop_transport_timeouts(
             base,
@@ -3697,7 +3745,79 @@ mod tests {
         );
 
         assert_eq!(shaped.connect_timeout, Some(Duration::from_secs(2)));
-        assert_eq!(shaped.idle_timeout, Some(Duration::from_secs(12)));
+        assert_eq!(shaped.idle_timeout, Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn cluster_target_rpc_caps_final_hop_idle_timeout_per_endpoint_attempt() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-target-endpoint-attempt-budget");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_target_endpoint_attempt_budget")
+            .expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_target_endpoint_budget_local").expect("local node");
+        let target_node =
+            NodeId::from_legacy_named("node_target_endpoint_budget_target").expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "target endpoint attempt budget",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut target_member =
+            ClusterMemberRecord::local_voter(cluster_id, target_node.clone(), "target", "pk", now);
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![
+            crate::endpoint_advertisement::daemon_lan_endpoint(
+                &target_node,
+                "10.0.0.41:21353".to_string(),
+                0,
+            ),
+            crate::endpoint_advertisement::daemon_lan_endpoint(
+                &target_node,
+                "129.146.106.76:21353".to_string(),
+                10,
+            ),
+        ];
+        state.members.push(target_member);
+
+        let request =
+            ObjectRpcRequest::encode_body("/test/target", "test", &"ping").expect("request");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut host = RecordingSignedHost {
+            fail_first_send: true,
+            ..RecordingSignedHost::default()
+        };
+        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
+
+        runtime
+            .block_on(client.call_target(
+                &state,
+                &target_node,
+                &request,
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
+                    Duration::from_secs(15),
+                )),
+            ))
+            .expect("second endpoint should be attempted");
+
+        assert_eq!(host.target_sends.len(), 2);
+        assert_eq!(host.target_sends[0].0.address, "10.0.0.41:21353");
+        assert_eq!(host.target_sends[1].0.address, "129.146.106.76:21353");
+        for (_, _, timeouts) in &host.target_sends {
+            assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(5)));
+            assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(5)));
+        }
     }
 
     #[test]
