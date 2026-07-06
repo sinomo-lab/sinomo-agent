@@ -301,7 +301,7 @@ fn cluster_endpoint_record_for_module_address_dial(
     }
 }
 
-async fn send_daemon_control_rpc_request_raw_response_to_cluster_endpoint_async(
+pub(crate) async fn send_daemon_control_rpc_request_raw_response_to_cluster_endpoint_async(
     endpoint: &ClusterEndpointRecord,
     request: &crate::DaemonControlRequest,
     timeouts: DaemonRpcTimeouts,
@@ -319,17 +319,11 @@ async fn send_daemon_control_rpc_request_raw_response_to_cluster_endpoint_async(
         ref transport => {
             if let Some(module) =
                 crate::network_module::registered_network_module_for_transport(transport)
-                && module.descriptor().supports_raw_response
             {
-                // DaemonControlResponse == ObjectRpcResponse, so the module
-                // frame decode is identical to the non-raw path.
-                return dial_daemon_control_request_via_network_module(
-                    module.as_ref(),
-                    endpoint,
-                    request,
-                    timeouts,
-                )
-                .await;
+                let frame = crate::object::encode_object_frame_to_vec(request)?;
+                return module
+                    .dial_rpc_raw_response(endpoint, &frame, timeouts)
+                    .await;
             }
             Err(NetworkError::Io {
                 operation: format!("send streamed daemon rpc to {}", endpoint.address),

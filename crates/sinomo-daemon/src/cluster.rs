@@ -7004,19 +7004,6 @@ async fn send_cluster_relay_request_to_next_hop_streaming_collect_async(
     runtime: &tokio::runtime::Handle,
     paths: &DaemonPaths,
 ) -> Result<ClusterRelayStreamCollectResult, DaemonError> {
-    if !matches!(
-        endpoint.transport,
-        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
-    ) {
-        return Err(DaemonError::Network {
-            address: format!("cluster relay {}", endpoint.address),
-            detail: format!(
-                "streaming relay forwarding supports TCP daemon-control endpoints, got {:?}",
-                endpoint.transport
-            ),
-        });
-    }
-
     let (mut request, request_auth) = tokio::task::spawn_blocking(move || {
         let request_auth = crate::sign_daemon_rpc_request_for_local_node(&request)?;
         Ok::<_, DaemonError>((request, request_auth))
@@ -7044,14 +7031,25 @@ async fn send_cluster_relay_request_to_next_hop_streaming_collect_async(
     }
 
     request.auth = Some(request_auth);
-    let response = sinomo_core::network::send_daemon_control_rpc_request_async(
-        &endpoint.address,
-        &request,
-        timeouts,
-        crate::control::DAEMON_COMMAND_MAX_BYTES,
-    )
-    .await
-    .map_err(DaemonError::from)?;
+    let response = if matches!(
+        endpoint.transport,
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+    ) {
+        sinomo_core::network::send_daemon_control_rpc_request_async(
+            &endpoint.address,
+            &request,
+            timeouts,
+            crate::control::DAEMON_COMMAND_MAX_BYTES,
+        )
+        .await
+        .map_err(DaemonError::from)?
+    } else {
+        sinomo_core::network::send_daemon_rpc_to_cluster_endpoint_async(
+            endpoint, None, &request, timeouts,
+        )
+        .await
+        .map_err(DaemonError::from)?
+    };
     Ok(ClusterRelayStreamCollectResult::Forwarded(response))
 }
 
@@ -7062,19 +7060,6 @@ async fn send_cluster_relay_request_to_next_hop_streaming_async(
     stream: &mut sinomo_core::network::AsyncDaemonControlStream,
     stream_address: &str,
 ) -> Result<ClusterRelayStreamForwardResult, DaemonError> {
-    if !matches!(
-        endpoint.transport,
-        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
-    ) {
-        return Err(DaemonError::Network {
-            address: format!("cluster relay {}", endpoint.address),
-            detail: format!(
-                "streaming relay forwarding supports TCP daemon-control endpoints, got {:?}",
-                endpoint.transport
-            ),
-        });
-    }
-
     let (mut request, request_auth) = tokio::task::spawn_blocking(move || {
         let request_auth = crate::sign_daemon_rpc_request_for_local_node(&request)?;
         Ok::<_, DaemonError>((request, request_auth))
@@ -7103,63 +7088,27 @@ async fn send_cluster_relay_request_to_next_hop_streaming_async(
         return Ok(ClusterRelayStreamForwardResult::Forwarded);
     }
     request.auth = Some(request_auth);
-
-    let frame_options =
-        sinomo_core::network::ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
-    let mut downstream = sinomo_core::network::AsyncDaemonControlStream::connect_with_options(
-        &endpoint.address,
+    match sinomo_core::network::forward_streamed_daemon_rpc_to_cluster_endpoint_async(
+        endpoint,
+        &request,
         timeouts,
+        stream,
+        stream_address,
+        crate::control::DAEMON_COMMAND_MAX_BYTES,
     )
     .await
-    .map_err(DaemonError::from)?;
-    downstream
-        .write_request(&endpoint.address, &request, frame_options)
-        .await
-        .map_err(DaemonError::from)?;
-    let response = downstream
-        .read_rpc_response(
-            &endpoint.address,
-            crate::control::DAEMON_COMMAND_MAX_BYTES,
-            frame_options,
-        )
-        .await
-        .map_err(DaemonError::from)?;
-    if sinomo_core::network::relay_response_is_routing_error(&response) {
-        return Ok(ClusterRelayStreamForwardResult::RoutingError(response));
-    }
-
-    stream
-        .write_rpc_response(stream_address, &response, frame_options)
-        .await
-        .map_err(DaemonError::from)?;
-    if sinomo_core::network::object_rpc_response_stream_mode(&response)
-        == sinomo_core::network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
+    .map_err(DaemonError::from)?
     {
-        if let Err(error) = downstream
-            .forward_raw_byte_stream_chunks_to(
-                &endpoint.address,
-                stream,
-                stream_address,
-                sinomo_core::network::RawByteStreamChunkOptions {
-                    chunk_bytes: sinomo_core::network::OBJECT_STREAM_MAX_CHUNK_BYTES,
-                    max_total_bytes: u64::try_from(crate::control::DAEMON_COMMAND_MAX_BYTES).ok(),
-                    idle_timeout: timeouts.idle_timeout,
-                },
-            )
-            .await
-        {
-            return Ok(ClusterRelayStreamForwardResult::StreamStartedThenFailed(
-                DaemonError::Network {
-                    address: format!("cluster relay {}", endpoint.address),
-                    detail: format!(
-                        "stream chunk forward failed after response route={} metadata={:?}: {}",
-                        response.route, response.metadata, error
-                    ),
-                },
-            ));
+        sinomo_core::network::ClusterRelayStreamSendOutcome::Forwarded => {
+            Ok(ClusterRelayStreamForwardResult::Forwarded)
         }
+        sinomo_core::network::ClusterRelayStreamSendOutcome::RoutingError(response) => {
+            Ok(ClusterRelayStreamForwardResult::RoutingError(response))
+        }
+        sinomo_core::network::ClusterRelayStreamSendOutcome::StreamStartedThenFailed(error) => Ok(
+            ClusterRelayStreamForwardResult::StreamStartedThenFailed(DaemonError::from(error)),
+        ),
     }
-    Ok(ClusterRelayStreamForwardResult::Forwarded)
 }
 
 async fn write_cluster_relay_stream_response_to_upstream(

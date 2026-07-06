@@ -162,6 +162,29 @@ pub trait NetworkModule: Send + Sync {
         timeouts: DaemonRpcTimeouts,
     ) -> NetworkFuture<Vec<u8>>;
 
+    /// Dial a daemon RPC whose response may use raw streamed daemon-response
+    /// framing.
+    ///
+    /// The default is an explicit unsupported-transport error. Transports that
+    /// can preserve or safely collect the streamed response override this
+    /// method; callers dispatch by request stream mode instead of by
+    /// route-specific rules.
+    fn dial_rpc_raw_response(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        _request: &[u8],
+        _timeouts: DaemonRpcTimeouts,
+    ) -> NetworkFuture<crate::ObjectRpcResponse> {
+        let transport = endpoint.transport.clone();
+        let address = endpoint.address.clone();
+        Box::pin(async move {
+            Err(NetworkError::Io {
+                operation: format!("send streamed daemon rpc to {address}"),
+                detail: format!("streamed raw RPC responses are not supported over {transport:?}"),
+            })
+        })
+    }
+
     /// Endpoint records the module currently advertises (empty when the
     /// module is not listening).
     fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError>;

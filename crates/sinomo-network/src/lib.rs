@@ -215,8 +215,9 @@ pub use route::{
     ClusterRelayStreamRequestAction, ClusterRelayStreamSendOutcome,
     ClusterSignedEndpointRpcAsyncHost, ClusterSignedEndpointRpcFuture,
     ClusterSignedEndpointRpcObservation, cluster_relay_stream_request_action,
-    handle_cluster_relay_async_with_host, handle_cluster_relay_stream_forward_async_with_host,
-    relay_request_inner_route, relay_response_is_routing_error,
+    forward_streamed_daemon_rpc_to_cluster_endpoint_async, handle_cluster_relay_async_with_host,
+    handle_cluster_relay_stream_forward_async_with_host, relay_request_inner_route,
+    relay_response_is_routing_error,
 };
 pub use rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_RPC_ROUTE_METADATA,

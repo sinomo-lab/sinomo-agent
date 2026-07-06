@@ -435,6 +435,34 @@ impl NetworkModule for FfiNetworkModule {
         })
     }
 
+    fn dial_rpc_raw_response(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        request: &[u8],
+        timeouts: DaemonRpcTimeouts,
+    ) -> NetworkFuture<crate::ObjectRpcResponse> {
+        if !self.descriptor.supports_raw_response {
+            let transport = endpoint.transport.clone();
+            let address = endpoint.address.clone();
+            return Box::pin(async move {
+                Err(NetworkError::Io {
+                    operation: format!("send streamed daemon rpc to {address}"),
+                    detail: format!(
+                        "streamed raw RPC responses are not supported over {transport:?}"
+                    ),
+                })
+            });
+        }
+        let dial = self.dial_rpc(endpoint, request, timeouts);
+        Box::pin(async move {
+            let bytes = dial.await?;
+            crate::object::decode_single_object_frame_from_slice(
+                &bytes,
+                crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
+            )
+        })
+    }
+
     fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
         let mut buffer = SinomoNetworkByteBuffer::null();
         // SAFETY: instance/vtable are valid per the entry contract.

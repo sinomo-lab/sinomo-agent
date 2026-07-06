@@ -1856,6 +1856,133 @@ pub trait ClusterRelayStreamForwardAsyncHost {
     >;
 }
 
+/// Forwards an already-authenticated streamed object-RPC request to one
+/// concrete cluster endpoint and writes the streamed response to `upstream`.
+///
+/// This is the protocol-generic data-plane primitive used by relay code:
+/// built-in TCP/loopback endpoints preserve the raw byte stream without
+/// buffering the body, while network modules are dispatched through their
+/// raw-response hook.
+pub async fn forward_streamed_daemon_rpc_to_cluster_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    request: &DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+    upstream: &mut crate::object::AsyncDaemonControlStream,
+    upstream_address: &str,
+    max_response_bytes: usize,
+) -> Result<ClusterRelayStreamSendOutcome, NetworkError> {
+    match endpoint.transport {
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
+            forward_streamed_daemon_rpc_to_tcp_endpoint_async(
+                endpoint,
+                request,
+                timeouts,
+                upstream,
+                upstream_address,
+                max_response_bytes,
+            )
+            .await
+        }
+        _ => {
+            let response =
+                crate::roaming::send_daemon_control_rpc_request_raw_response_to_cluster_endpoint_async(
+                    endpoint, request, timeouts,
+                )
+                .await?;
+            if relay_response_is_routing_error(&response) {
+                return Ok(ClusterRelayStreamSendOutcome::RoutingError(response));
+            }
+            write_streamed_daemon_rpc_response_to_upstream(
+                response,
+                upstream,
+                upstream_address,
+                timeouts,
+            )
+            .await?;
+            Ok(ClusterRelayStreamSendOutcome::Forwarded)
+        }
+    }
+}
+
+async fn forward_streamed_daemon_rpc_to_tcp_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    request: &DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+    upstream: &mut crate::object::AsyncDaemonControlStream,
+    upstream_address: &str,
+    max_response_bytes: usize,
+) -> Result<ClusterRelayStreamSendOutcome, NetworkError> {
+    let frame_options =
+        crate::object::ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
+    let mut downstream =
+        crate::object::AsyncDaemonControlStream::connect_with_options(&endpoint.address, timeouts)
+            .await?;
+    downstream
+        .write_request(&endpoint.address, request, frame_options)
+        .await?;
+    let response = downstream
+        .read_rpc_response(&endpoint.address, max_response_bytes, frame_options)
+        .await?;
+    if relay_response_is_routing_error(&response) {
+        return Ok(ClusterRelayStreamSendOutcome::RoutingError(response));
+    }
+
+    upstream
+        .write_rpc_response(upstream_address, &response, frame_options)
+        .await?;
+    if crate::object_rpc_response_stream_mode(&response)
+        == crate::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
+        && let Err(error) = downstream
+            .forward_raw_byte_stream_chunks_to(
+                &endpoint.address,
+                upstream,
+                upstream_address,
+                crate::object::RawByteStreamChunkOptions {
+                    chunk_bytes: crate::OBJECT_STREAM_MAX_CHUNK_BYTES,
+                    max_total_bytes: u64::try_from(max_response_bytes).ok(),
+                    idle_timeout: timeouts.idle_timeout,
+                },
+            )
+            .await
+    {
+        return Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
+            error,
+        ));
+    }
+    Ok(ClusterRelayStreamSendOutcome::Forwarded)
+}
+
+async fn write_streamed_daemon_rpc_response_to_upstream(
+    mut response: ObjectRpcResponse,
+    upstream: &mut crate::object::AsyncDaemonControlStream,
+    upstream_address: &str,
+    timeouts: DaemonRpcTimeouts,
+) -> Result<(), NetworkError> {
+    let frame_options =
+        crate::object::ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
+    let raw_body = if crate::object_rpc_response_stream_mode(&response)
+        == crate::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
+    {
+        Some(std::mem::take(&mut response.body))
+    } else {
+        None
+    };
+    upstream
+        .write_rpc_response(upstream_address, &response, frame_options)
+        .await?;
+    if let Some(body) = raw_body {
+        for chunk in body.chunks(crate::OBJECT_STREAM_MAX_CHUNK_BYTES) {
+            upstream
+                .write_raw_byte_stream_chunk(upstream_address, chunk, frame_options)
+                .await?;
+        }
+        upstream
+            .write_raw_byte_stream_chunk(upstream_address, &[], frame_options)
+            .await?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterObjectRpcOptions {
     timeouts: DaemonRpcTimeouts,
@@ -3736,6 +3863,124 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn streamed_endpoint_forward_preserves_raw_body_chunks() {
+        let downstream_listener = crate::object::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("downstream listener");
+        let downstream_address = downstream_listener
+            .local_addr_string()
+            .expect("downstream address");
+        let downstream_server = tokio::spawn(async move {
+            let mut stream = downstream_listener
+                .accept()
+                .await
+                .expect("accept downstream");
+            let request = stream
+                .read_request(
+                    "downstream",
+                    1024,
+                    crate::object::ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
+                )
+                .await
+                .expect("downstream request");
+            assert_eq!(request.route, "/test/stream-forward");
+            assert_eq!(
+                crate::object_rpc_request_stream_mode(&request),
+                crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse
+            );
+            let mut response =
+                ObjectRpcResponse::from_encoded_body("/test/stream-forward", Vec::new());
+            crate::set_object_rpc_response_stream_mode(
+                &mut response,
+                crate::ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
+            );
+            let frame_options =
+                crate::object::ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1));
+            stream
+                .write_rpc_response("downstream", &response, frame_options)
+                .await
+                .expect("downstream response");
+            for chunk in [b"alpha".as_slice(), b"beta".as_slice()] {
+                stream
+                    .write_raw_byte_stream_chunk("downstream", chunk, frame_options)
+                    .await
+                    .expect("downstream chunk");
+            }
+            stream
+                .write_raw_byte_stream_chunk("downstream", &[], frame_options)
+                .await
+                .expect("downstream final chunk");
+        });
+
+        let upstream_listener = crate::object::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener");
+        let upstream_address = upstream_listener
+            .local_addr_string()
+            .expect("upstream address");
+        let upstream_client = tokio::spawn(async move {
+            let mut stream = crate::object::AsyncDaemonControlStream::connect(&upstream_address)
+                .await
+                .expect("connect upstream");
+            let frame_options =
+                crate::object::ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1));
+            let response = stream
+                .read_rpc_response("upstream", 1024, frame_options)
+                .await
+                .expect("upstream response");
+            assert_eq!(
+                crate::object_rpc_response_stream_mode(&response),
+                crate::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
+            );
+            assert!(response.body.is_empty());
+            let mut body = Vec::new();
+            let mut raw = stream.into_inner();
+            crate::object::read_raw_byte_stream_chunks_to_vec_async(
+                &mut raw,
+                &mut body,
+                crate::object::RawByteStreamChunkOptions {
+                    chunk_bytes: crate::OBJECT_STREAM_MAX_CHUNK_BYTES,
+                    max_total_bytes: Some(1024),
+                    idle_timeout: Some(Duration::from_secs(1)),
+                },
+            )
+            .await
+            .expect("upstream chunks");
+            body
+        });
+        let mut upstream = upstream_listener.accept().await.expect("accept upstream");
+
+        let target_node =
+            NodeId::from_legacy_named("node_stream_forward_target").expect("target node id");
+        let endpoint =
+            crate::endpoint_advertisement::daemon_lan_endpoint(&target_node, downstream_address, 0);
+        let mut request =
+            ObjectRpcRequest::from_encoded_body("/test/stream-forward", "test", Vec::new());
+        crate::set_object_rpc_request_stream_mode(
+            &mut request,
+            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+        );
+
+        let outcome = forward_streamed_daemon_rpc_to_cluster_endpoint_async(
+            &endpoint,
+            &request,
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
+            &mut upstream,
+            "upstream",
+            1024,
+        )
+        .await
+        .expect("stream forward");
+
+        assert!(matches!(outcome, ClusterRelayStreamSendOutcome::Forwarded));
+        assert_eq!(
+            upstream_client.await.expect("upstream client"),
+            b"alphabeta"
+        );
+        downstream_server.await.expect("downstream server");
     }
 
     #[test]
