@@ -325,7 +325,9 @@ impl LocalShardedMetadataBackend {
         if !self.shards.contains_key(&index.shard_id) || index.shard_id == *shard_id {
             return Ok(true);
         }
-        let Some(current_object) = self.shard_backend(&index.shard_id)?.get_object(&intent.object_id)?
+        let Some(current_object) = self
+            .shard_backend(&index.shard_id)?
+            .get_object(&intent.object_id)?
         else {
             return Ok(true);
         };
