@@ -407,10 +407,21 @@ fn dfs_message_repair_progress_is_only_inline_for_explicit_foreground_repair_wri
             },
         ),
     );
-    let read = test_dfs_message_command_from_message(
+    let sync_path = test_dfs_message_command_from_message(
         &source,
         &target,
         3,
+        namespace_command(
+            "dfs_sync_path_no_inline_repair",
+            DfsNamespaceOperation::SyncPath {
+                path: "/services/no-inline-repair".to_string(),
+            },
+        ),
+    );
+    let read = test_dfs_message_command_from_message(
+        &source,
+        &target,
+        4,
         DfsNetworkMessage::ReadRequest(DfsReadRequest {
             request_id: "dfs_read_no_inline_repair".to_string(),
             object_id: DfsObjectId::from_legacy_named("obj_no_inline_repair").expect("object"),
@@ -430,13 +441,13 @@ fn dfs_message_repair_progress_is_only_inline_for_explicit_foreground_repair_wri
     let background_write = test_dfs_message_command_from_message(
         &source,
         &target,
-        4,
+        5,
         DfsNetworkMessage::DistributedWriteRequest(background_write),
     );
     let foreground_repair_write = test_dfs_message_command_from_message(
         &source,
         &target,
-        5,
+        6,
         DfsNetworkMessage::DistributedWriteRequest(test_routed_write_command(
             "dfs_foreground_repair_write",
             &source,
@@ -446,6 +457,7 @@ fn dfs_message_repair_progress_is_only_inline_for_explicit_foreground_repair_wri
 
     assert!(!dfs_message_allows_write_repair_progress(&lookup));
     assert!(!dfs_message_allows_write_repair_progress(&mkdir));
+    assert!(!dfs_message_allows_write_repair_progress(&sync_path));
     assert!(!dfs_message_allows_write_repair_progress(&read));
     assert!(!dfs_message_allows_write_repair_progress(&background_write));
     assert!(dfs_message_allows_write_repair_progress(
@@ -3406,8 +3418,8 @@ fn served_foreground_write_returns_committed_response_before_replica_repair_comp
 }
 
 #[test]
-fn served_message_reports_repair_retry_failure_without_failing_request() {
-    let root = temp_root("served-message-repair-retry-best-effort");
+fn served_sync_path_does_not_retry_repairs_inline() {
+    let root = temp_root("served-sync-path-skips-inline-repair");
     let requester =
         NodeId::from_legacy_named("node_served_frame_repair_requester").expect("requester");
     let primary = NodeId::from_legacy_named("node_served_frame_repair_primary").expect("primary");
@@ -3520,16 +3532,15 @@ fn served_message_reports_repair_retry_failure_without_failing_request() {
             "dfs_served_repair_retry_message_rpc",
             routed_message,
         ))
-        .expect("foreground message should not fail on repair retry error");
+        .expect("sync path should not fail on queued repair backlog");
 
     assert_eq!(*send_attempts.lock().expect("send attempts"), 0);
     assert!(
-        result.events.iter().any(|event| matches!(
-            event,
-            NetworkedDfsServiceEvent::RepairRetryFailed { reason }
-                if reason.contains("failed to open DFS patch blob")
-        )),
-        "repair retry failure should be reported as an event: {:?}",
+        !result
+            .events
+            .iter()
+            .any(|event| matches!(event, NetworkedDfsServiceEvent::RepairRetryFailed { .. })),
+        "sync path should not run or report inline repair retry work: {:?}",
         result.events
     );
 
