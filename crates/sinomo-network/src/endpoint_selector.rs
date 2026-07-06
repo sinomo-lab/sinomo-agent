@@ -1424,9 +1424,12 @@ pub(crate) fn try_cluster_rollout_endpoint_targets_impl(
         }
         for endpoint in member.endpoints.iter().filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+                && cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
                 && matches!(
                     endpoint.transport,
-                    ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+                    ClusterTransportKind::LanTcp
+                        | ClusterTransportKind::Loopback
+                        | ClusterTransportKind::Iroh
                 )
         }) {
             if !endpoint_ids.try_insert_clone(&endpoint.endpoint_id, "collect rollout endpoints")? {
@@ -1705,9 +1708,12 @@ pub(crate) fn try_cluster_network_probe_targets_impl(
         }
         for endpoint in member.endpoints.iter().filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+                && cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
                 && matches!(
                     endpoint.transport,
-                    ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+                    ClusterTransportKind::LanTcp
+                        | ClusterTransportKind::Loopback
+                        | ClusterTransportKind::Iroh
                 )
         }) {
             if !endpoint_ids
@@ -1897,6 +1903,7 @@ fn cluster_sync_endpoint_cmp(
 mod tests {
     use super::*;
     use crate::ClusterEndpointId;
+    use crate::IrohEndpointRecord;
     use sinomo_base::ClusterEndpointSource;
     use sinomo_local::SinomoDataDir;
     use sinomo_node::ClusterId;
@@ -1990,6 +1997,109 @@ mod tests {
                 .iter()
                 .any(|endpoint| endpoint.address == "129.146.106.76:21353"),
             "the static public endpoint remains available as a fallback"
+        );
+    }
+
+    #[test]
+    fn network_probe_targets_include_iroh_main_daemon_endpoints() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_probe_targets_iroh").expect("cluster id");
+        let local = NodeId::from_legacy_named("node_probe_targets_local").expect("local node");
+        let remote = NodeId::from_legacy_named("node_probe_targets_remote").expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "probe targets iroh",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let iroh_endpoint = IrohEndpointRecord::from_relay_url(
+            cluster_id.clone(),
+            remote.clone(),
+            "probe-targets-remote-key",
+            "https://relay.example/",
+        )
+        .endpoint();
+        let tcp_endpoint =
+            selector_test_endpoint(&remote, "10.0.0.41:21353", ClusterEndpointPrivacy::Lan, 0);
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
+        member.endpoints = vec![tcp_endpoint, iroh_endpoint.clone()];
+        state.members.push(member);
+
+        let targets = try_cluster_network_probe_targets_impl(&state).expect("probe targets");
+
+        assert!(
+            targets
+                .iter()
+                .any(|endpoint| endpoint.endpoint_id == iroh_endpoint.endpoint_id),
+            "Iroh endpoints need active probing so route choice can use them when TCP is unreachable"
+        );
+    }
+
+    #[test]
+    fn network_probe_targets_skip_iroh_shadow_daemon_endpoints() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_probe_targets_shadow").expect("cluster id");
+        let local =
+            NodeId::from_legacy_named("node_probe_targets_shadow_local").expect("local node");
+        let remote =
+            NodeId::from_legacy_named("node_probe_targets_shadow_remote").expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "probe targets shadow",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let main_endpoint = IrohEndpointRecord::from_relay_url(
+            cluster_id.clone(),
+            remote.clone(),
+            "probe-targets-main-key",
+            "https://relay.example/",
+        )
+        .endpoint();
+        let mut shadow_endpoint = IrohEndpointRecord::from_relay_url(
+            cluster_id.clone(),
+            shadow_daemon_node_id(&remote),
+            "probe-targets-shadow-key",
+            "https://relay.example/",
+        )
+        .endpoint();
+        shadow_endpoint.node_id = remote.clone();
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
+        member.endpoints = vec![main_endpoint.clone(), shadow_endpoint.clone()];
+        state.members.push(member);
+
+        let targets = try_cluster_network_probe_targets_impl(&state).expect("probe targets");
+
+        assert!(
+            targets
+                .iter()
+                .any(|endpoint| endpoint.endpoint_id == main_endpoint.endpoint_id)
+        );
+        assert!(
+            !targets
+                .iter()
+                .any(|endpoint| endpoint.endpoint_id == shadow_endpoint.endpoint_id),
+            "shadow Iroh endpoints must not be probed as main daemon targets"
         );
     }
 
