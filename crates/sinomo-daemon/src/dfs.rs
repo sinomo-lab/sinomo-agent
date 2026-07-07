@@ -705,7 +705,7 @@ fn open_daemon_dfs_message_service_lane(
     Ok(Arc::new(Mutex::new(DaemonDfsMessageServiceLane {
         service,
         last_metadata_refresh: Instant::now(),
-        metadata_hydrated: true,
+        metadata_hydrated: false,
     })))
 }
 
