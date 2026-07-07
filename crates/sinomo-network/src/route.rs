@@ -2382,14 +2382,17 @@ where
             &traced_request
         };
         let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
-        self.host
-            .send_signed_endpoint_rpc_async(
+        cluster_object_rpc_attempt_with_timeout(
+            self.host.send_signed_endpoint_rpc_async(
                 endpoint,
                 &request_auth,
                 request,
                 cluster_endpoint_transport_timeouts(options.timeouts, remaining),
-            )
-            .await
+            ),
+            remaining,
+            endpoint,
+        )
+        .await
     }
 
     async fn call_endpoint_stream_direct(
@@ -2410,14 +2413,17 @@ where
             &traced_request
         };
         let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
-        self.host
-            .send_signed_endpoint_stream_response_rpc_async(
+        cluster_object_rpc_attempt_with_timeout(
+            self.host.send_signed_endpoint_stream_response_rpc_async(
                 endpoint,
                 &request_auth,
                 request,
                 cluster_endpoint_transport_timeouts(options.timeouts, remaining),
-            )
-            .await
+            ),
+            remaining,
+            endpoint,
+        )
+        .await
     }
 
     pub(crate) async fn call_target_from_paths(
@@ -2532,15 +2538,17 @@ where
                 };
                 let (outer_build_us, outer_sign_us, send_us, response) = if final_hop {
                     let send_started_at = Instant::now();
-                    let response = self
-                        .host
-                        .send_signed_endpoint_rpc_async(
+                    let response = cluster_object_rpc_attempt_with_timeout(
+                        self.host.send_signed_endpoint_rpc_async(
                             &endpoint,
                             &request_auth,
                             request,
                             hop_timeouts,
-                        )
-                        .await;
+                        ),
+                        endpoint_attempt_budget,
+                        &endpoint,
+                    )
+                    .await;
                     (
                         0,
                         0,
@@ -2566,15 +2574,17 @@ where
                     let outer_auth = self.host.sign_endpoint_rpc_request_async(&outer).await?;
                     let outer_sign_us = cluster_object_rpc_elapsed_us(outer_sign_started_at);
                     let send_started_at = Instant::now();
-                    let response = self
-                        .host
-                        .send_signed_endpoint_rpc_async(
+                    let response = cluster_object_rpc_attempt_with_timeout(
+                        self.host.send_signed_endpoint_rpc_async(
                             &endpoint,
                             &outer_auth,
                             &outer,
                             hop_timeouts,
-                        )
-                        .await;
+                        ),
+                        endpoint_attempt_budget,
+                        &endpoint,
+                    )
+                    .await;
                     (
                         outer_build_us,
                         outer_sign_us,
@@ -2875,15 +2885,17 @@ where
                 };
                 let (outer_build_us, outer_sign_us, send_us, response) = if final_hop {
                     let send_started_at = Instant::now();
-                    let response = self
-                        .host
-                        .send_signed_endpoint_stream_response_rpc_async(
+                    let response = cluster_object_rpc_attempt_with_timeout(
+                        self.host.send_signed_endpoint_stream_response_rpc_async(
                             &endpoint,
                             &request_auth,
                             request,
                             hop_timeouts,
-                        )
-                        .await;
+                        ),
+                        endpoint_attempt_budget,
+                        &endpoint,
+                    )
+                    .await;
                     (
                         0,
                         0,
@@ -2909,15 +2921,17 @@ where
                     let outer_auth = self.host.sign_endpoint_rpc_request_async(&outer).await?;
                     let outer_sign_us = cluster_object_rpc_elapsed_us(outer_sign_started_at);
                     let send_started_at = Instant::now();
-                    let response = self
-                        .host
-                        .send_signed_endpoint_stream_response_rpc_async(
+                    let response = cluster_object_rpc_attempt_with_timeout(
+                        self.host.send_signed_endpoint_stream_response_rpc_async(
                             &endpoint,
                             &outer_auth,
                             &outer,
                             hop_timeouts,
-                        )
-                        .await;
+                        ),
+                        endpoint_attempt_budget,
+                        &endpoint,
+                    )
+                    .await;
                     (
                         outer_build_us,
                         outer_sign_us,
@@ -3259,6 +3273,38 @@ fn duration_div_ceil(duration: Duration, divisor: usize) -> Duration {
         .saturating_div(divisor)
         .clamp(1, u128::from(u64::MAX));
     Duration::from_nanos(per_endpoint as u64)
+}
+
+async fn cluster_object_rpc_attempt_with_timeout<T, F>(
+    send: F,
+    timeout: Option<Duration>,
+    endpoint: &ClusterEndpointRecord,
+) -> Result<T, NetworkError>
+where
+    F: Future<Output = Result<T, NetworkError>>,
+{
+    let Some(timeout) = timeout else {
+        return send.await;
+    };
+    match tokio::time::timeout(timeout, send).await {
+        Ok(result) => result,
+        Err(_) => Err(cluster_object_rpc_attempt_timeout_error(endpoint, timeout)),
+    }
+}
+
+fn cluster_object_rpc_attempt_timeout_error(
+    endpoint: &ClusterEndpointRecord,
+    timeout: Duration,
+) -> NetworkError {
+    NetworkError::Io {
+        operation: "cluster endpoint rpc attempt".to_string(),
+        detail: format!(
+            "timed out sending to {} ({:?}) after {}ms",
+            endpoint.address,
+            endpoint.transport,
+            timeout.as_millis()
+        ),
+    }
 }
 
 pub(crate) fn relay_envelope_hop_transport_timeouts(
@@ -4383,6 +4429,7 @@ mod tests {
         target_sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
         stream_target_sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
         fail_first_send: bool,
+        stall_first_send: Option<Duration>,
     }
 
     impl ClusterSignedEndpointRpcAsyncHost for RecordingSignedHost {
@@ -4403,9 +4450,15 @@ mod tests {
             let endpoint = endpoint.clone();
             let request = request.clone();
             let should_fail = self.fail_first_send && self.target_sends.is_empty();
+            let stall = self
+                .stall_first_send
+                .filter(|_| self.target_sends.is_empty());
             let sends = &mut self.target_sends;
             Box::pin(async move {
                 sends.push((endpoint, request, timeouts));
+                if let Some(stall) = stall {
+                    tokio::time::sleep(stall).await;
+                }
                 if should_fail {
                     Err(NetworkError::Io {
                         operation: "test target send".to_string(),
@@ -4663,6 +4716,79 @@ mod tests {
             assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(5)));
             assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(5)));
         }
+    }
+
+    #[test]
+    fn cluster_target_rpc_hard_times_out_endpoint_attempts() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-target-hard-attempt-timeout");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_target_hard_attempt_timeout")
+            .expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_target_hard_timeout_local").expect("local node");
+        let target_node =
+            NodeId::from_legacy_named("node_target_hard_timeout_target").expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "target hard attempt timeout",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut target_member =
+            ClusterMemberRecord::local_voter(cluster_id, target_node.clone(), "target", "pk", now);
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![
+            crate::endpoint_advertisement::daemon_lan_endpoint(
+                &target_node,
+                "stall-target.test:21353".to_string(),
+                0,
+            ),
+            crate::endpoint_advertisement::daemon_lan_endpoint(
+                &target_node,
+                "fast-target.test:21353".to_string(),
+                10,
+            ),
+        ];
+        state.members.push(target_member);
+
+        let request =
+            ObjectRpcRequest::encode_body("/test/target", "test", &"ping").expect("request");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut host = RecordingSignedHost {
+            stall_first_send: Some(Duration::from_millis(200)),
+            ..RecordingSignedHost::default()
+        };
+        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
+        let started = Instant::now();
+
+        runtime
+            .block_on(client.call_target(
+                &state,
+                &target_node,
+                &request,
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
+                    Duration::from_millis(120),
+                )),
+            ))
+            .expect("second endpoint should be attempted after hard timeout");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(180),
+            "hard endpoint timeout should abort the stalled send before it sleeps fully"
+        );
+        assert_eq!(host.target_sends.len(), 2);
+        assert_eq!(host.target_sends[0].0.address, "stall-target.test:21353");
+        assert_eq!(host.target_sends[1].0.address, "fast-target.test:21353");
     }
 
     #[test]
