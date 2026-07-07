@@ -1319,6 +1319,147 @@ fn test_endpoint(node_id: &NodeId, address: &str) -> ClusterEndpointRecord {
 }
 
 #[test]
+fn served_message_transport_sends_nested_return_node_requests_synchronously() {
+    let primary = NodeId::from_legacy_named("node_served_nested_primary").expect("primary");
+    let requester = NodeId::from_legacy_named("node_served_nested_requester").expect("requester");
+    let sent_requests = Arc::new(Mutex::new(Vec::new()));
+    let sender_requests = Arc::clone(&sent_requests);
+    let sender_primary = primary.clone();
+    let sender_requester = requester.clone();
+    let sender: DfsMessageSender = Arc::new(move |target, command, _timeout| {
+        assert_eq!(target, &sender_requester);
+        sender_requests
+            .lock()
+            .expect("sent requests")
+            .push(command.request_id.clone());
+        let DfsNetworkMessage::NamespaceRequest(nested) = &command.routed_message.message else {
+            panic!(
+                "expected nested namespace request, got {:?}",
+                command.routed_message.message
+            );
+        };
+        Ok(DfsMessageResponse {
+            request_id: command.request_id.clone(),
+            outbound_messages: vec![build_dfs_routed_message(
+                &sender_requester,
+                &sender_primary,
+                command.routed_message.frame_id + 100,
+                command.routed_message.message_id + 100,
+                DfsNetworkMessage::NamespaceResponse(DfsNamespaceResponse {
+                    request_id: nested.request_id.clone(),
+                    result: DfsNamespaceResult::Applied,
+                    synced_path_object: None,
+                    synced_path_objects: Vec::new(),
+                    metadata_journal_batches: Vec::new(),
+                }),
+            )],
+        })
+    });
+    let mut transport = DfsEndpointServedMessageTransport::new_with_message_sender(
+        primary.clone(),
+        vec![test_endpoint(&requester, "192.0.2.68:21353")],
+        sender,
+        DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+    );
+    let served = test_dfs_lookup_routed_message(&requester, &primary, 1, "/services/served");
+    transport
+        .begin_message(&served)
+        .expect("begin served message");
+
+    transport
+        .send_routed_message(
+            &requester,
+            build_dfs_routed_message(
+                &primary,
+                &requester,
+                2,
+                2,
+                DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                    request_id: "dfs_net_req_nested_return_node".to_string(),
+                    file_system_id: sifs_file_system_id(),
+                    requesting_node_id: primary.clone(),
+                    include_metadata_journal_batches: false,
+                    metadata_journal_after_sequences: Vec::new(),
+                    operation: DfsNamespaceOperation::TouchDirectoryModified {
+                        path: "/services".to_string(),
+                    },
+                }),
+            ),
+        )
+        .expect("nested return-node request should be sent synchronously");
+
+    assert_eq!(
+        sent_requests.lock().expect("sent requests").as_slice(),
+        ["dfs_message_2"],
+        "nested return-node requests must not be buffered as inline responses"
+    );
+    let incoming = transport
+        .drain_incoming_messages()
+        .expect("returned nested response");
+    assert_eq!(incoming.len(), 1);
+    assert!(matches!(
+        incoming[0].message,
+        DfsNetworkMessage::NamespaceResponse(_)
+    ));
+    assert!(
+        transport.finish_message().is_empty(),
+        "nested request responses are processed as incoming work, not returned as original RPC outbound messages"
+    );
+}
+
+#[test]
+fn served_message_transport_returns_response_frames_inline() {
+    let primary = NodeId::from_legacy_named("node_served_inline_primary").expect("primary");
+    let requester = NodeId::from_legacy_named("node_served_inline_requester").expect("requester");
+    let sent_requests = Arc::new(AtomicUsize::new(0));
+    let sender_count = Arc::clone(&sent_requests);
+    let sender: DfsMessageSender = Arc::new(move |_target, _command, _timeout| {
+        sender_count.fetch_add(1, Ordering::SeqCst);
+        Ok(DfsMessageResponse {
+            request_id: "unexpected".to_string(),
+            outbound_messages: Vec::new(),
+        })
+    });
+    let mut transport = DfsEndpointServedMessageTransport::new_with_message_sender(
+        primary.clone(),
+        vec![test_endpoint(&requester, "192.0.2.69:21353")],
+        sender,
+        DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+    );
+    let served = test_dfs_lookup_routed_message(&requester, &primary, 3, "/services/served");
+    transport
+        .begin_message(&served)
+        .expect("begin served message");
+
+    transport
+        .send_routed_message(
+            &requester,
+            build_dfs_routed_message(
+                &primary,
+                &requester,
+                4,
+                4,
+                DfsNetworkMessage::NamespaceResponse(DfsNamespaceResponse {
+                    request_id: "dfs_net_req_inline_response".to_string(),
+                    result: DfsNamespaceResult::Applied,
+                    synced_path_object: None,
+                    synced_path_objects: Vec::new(),
+                    metadata_journal_batches: Vec::new(),
+                }),
+            ),
+        )
+        .expect("response frame should return inline");
+
+    assert_eq!(sent_requests.load(Ordering::SeqCst), 0);
+    let outbound = transport.finish_message();
+    assert_eq!(outbound.len(), 1);
+    assert!(matches!(
+        outbound[0].message,
+        DfsNetworkMessage::NamespaceResponse(_)
+    ));
+}
+
+#[test]
 fn dfs_service_endpoint_for_member_ignores_shadow_daemon_endpoints() {
     let now = OffsetDateTime::now_utc();
     let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(
