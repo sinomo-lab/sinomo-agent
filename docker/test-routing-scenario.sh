@@ -28,6 +28,7 @@ NETWORK_PAYLOAD_REQUEST_BYTES="${SINOMO_SCENARIO_NETWORK_PAYLOAD_REQUEST_BYTES:-
 NETWORK_PAYLOAD_RESPONSE_BYTES="${SINOMO_SCENARIO_NETWORK_PAYLOAD_RESPONSE_BYTES:-262144}"
 NETWORK_PAYLOAD_MIN_BYTES_PER_SEC="${SINOMO_SCENARIO_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC:-8388608}"
 NETWORK_READY_WAIT="${SINOMO_SCENARIO_NETWORK_READY_WAIT:-20}"
+ENDPOINT_FALLBACK_TIMEOUT_MS="${SINOMO_SCENARIO_ENDPOINT_FALLBACK_TIMEOUT_MS:-5000}"
 LARGE_BYTES="${SINOMO_SCENARIO_LARGE_BYTES:-16777216}"
 LARGE_TIMEOUT="${SINOMO_SCENARIO_LARGE_TIMEOUT:-180}"
 LARGE_MIN_WRITE_BYTES_PER_SEC="${SINOMO_SCENARIO_LARGE_MIN_WRITE_BYTES_PER_SEC:-4194304}"
@@ -104,7 +105,8 @@ main_online_count() {
 
 doctor_connectivity_warnings() {
   compose exec -T node1 sinomo cluster doctor 2>/dev/null \
-    | grep -E "endpoint-unreachable|node-offline" || true
+    | grep -E "endpoint-unreachable|node-offline" \
+    | grep -Fv "foreign:21353" || true
 }
 
 wait_for_cluster_ready() {
@@ -282,6 +284,14 @@ assert_forwarded_endpoint_active() {
   done
 }
 
+assert_endpoint_error_fallback() {
+  log "checking routed RPC fallback after reachable auth-error endpoint"
+  run_probe node1 cluster.network.endpoint-error-fallback \
+    --param target-name=node3 \
+    --param bad-endpoint-address=foreign:21353 \
+    --param "timeout-ms=$ENDPOINT_FALLBACK_TIMEOUT_MS"
+}
+
 run_cross_segment_dfs() {
   local path_a path_b payload_a payload_b
   path_a="/services/routing-scenario/$RUN_ID/node2-to-node3.txt"
@@ -346,6 +356,8 @@ log "starting compose project $PROJECT"
 compose up --build -d
 wait_for_cluster_ready
 assert_forwarded_endpoint_configured
+wait_for_network_ready
+assert_endpoint_error_fallback
 wait_for_network_ready
 run_network_probe node1
 run_network_probe node2

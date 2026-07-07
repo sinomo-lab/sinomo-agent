@@ -69,7 +69,7 @@ services:
   node3:
     <<: *node-defaults
     hostname: node3
-    depends_on: [node1]
+    depends_on: [node1, foreign]
     environment:
       ROLE: joiner
       NODE_NAME: node3
@@ -79,6 +79,7 @@ services:
       SINOMO_CLUSTER_JOIN_TRACE: "${SINOMO_CLUSTER_JOIN_TRACE:-0}"
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
+      SINOMO_MANUAL_ENDPOINTS_JSON: '{"main":[{"address":"tcp://foreign:21353","scope":"internet-direct","priority":0}]}'
       INTRODUCER: host.docker.internal:${SINOMO_SCENARIO_PUBLIC_PORT:-32166}
       JOIN_INVITE: /shared/forwarded-invite.json
     volumes:
@@ -87,6 +88,22 @@ services:
       - ../target/debug/sinomo:/usr/local/bin/sinomo:ro
       - ./entrypoint.sh:/usr/local/bin/sinomo-node-entrypoint:ro
     networks: [lan_b, routed_lan]
+
+  foreign:
+    <<: *node-defaults
+    hostname: foreign
+    environment:
+      ROLE: seed
+      NODE_NAME: foreign
+      CLUSTER_NAME: foreign-routing-scenario
+      SINOMO_DISABLE_IROH: "1"
+      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "0"
+      SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-4}"
+    volumes:
+      - foreign-data:/data
+      - ../target/debug/sinomo:/usr/local/bin/sinomo:ro
+      - ./entrypoint.sh:/usr/local/bin/sinomo-node-entrypoint:ro
+    networks: [routed_lan]
 
 networks:
   lan_a:
@@ -100,4 +117,5 @@ volumes:
   node1-data:
   node2-data:
   node3-data:
+  foreign-data:
   invite:

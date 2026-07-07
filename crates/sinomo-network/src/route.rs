@@ -2631,6 +2631,35 @@ where
                         break;
                     }
                     Ok(response) => {
+                        if let Some(detail) =
+                            cluster_object_rpc_retryable_endpoint_error_detail(&response)
+                        {
+                            metrics::histogram!(
+                                "sinomo.object_rpc.target.attempt.us",
+                                "route" => request.route.clone(),
+                                "category" => request.category.clone(),
+                                "outcome" => "endpoint_error"
+                            )
+                            .record(cluster_object_rpc_elapsed_us(attempt_started_at) as f64);
+                            tracing::debug!(
+                                target: "sinomo.network.object_rpc",
+                                %traceparent,
+                                route = %request.route,
+                                category = %request.category,
+                                %target_node_id,
+                                next_hop = %route_plan.next_hop,
+                                endpoint = %endpoint.address,
+                                transport = ?endpoint.transport,
+                                final_hop,
+                                error = %detail,
+                                "cluster object rpc endpoint returned retryable error"
+                            );
+                            failures.push(format!(
+                                "{} ({:?}) returned endpoint error: {detail}",
+                                endpoint.address, endpoint.transport
+                            ));
+                            continue;
+                        }
                         if let Some(responder_node_id) =
                             cluster_object_rpc_wrong_responder_node_id(&response, target_node_id)
                         {
@@ -2979,6 +3008,36 @@ where
                         break;
                     }
                     Ok(response) => {
+                        if let Some(detail) =
+                            cluster_object_rpc_retryable_endpoint_error_detail(&response.response)
+                        {
+                            metrics::histogram!(
+                                "sinomo.object_rpc.target.attempt.us",
+                                "route" => request.route.clone(),
+                                "category" => request.category.clone(),
+                                "outcome" => "endpoint_error"
+                            )
+                            .record(cluster_object_rpc_elapsed_us(attempt_started_at) as f64);
+                            tracing::debug!(
+                                target: "sinomo.network.object_rpc",
+                                %traceparent,
+                                route = %request.route,
+                                category = %request.category,
+                                %target_node_id,
+                                next_hop = %route_plan.next_hop,
+                                endpoint = %endpoint.address,
+                                transport = ?endpoint.transport,
+                                final_hop,
+                                stream = true,
+                                error = %detail,
+                                "cluster object rpc stream endpoint returned retryable error"
+                            );
+                            failures.push(format!(
+                                "{} ({:?}) returned endpoint error: {detail}",
+                                endpoint.address, endpoint.transport
+                            ));
+                            continue;
+                        }
                         if let Some(responder_node_id) = cluster_object_rpc_wrong_responder_node_id(
                             &response.response,
                             target_node_id,
@@ -3146,6 +3205,16 @@ fn cluster_object_rpc_wrong_responder_node_id<'a>(
     response
         .responder_node_id()
         .filter(|responder_node_id| *responder_node_id != expected.as_str())
+}
+
+fn cluster_object_rpc_retryable_endpoint_error_detail(
+    response: &ObjectRpcResponse,
+) -> Option<String> {
+    match response.error_detail() {
+        Ok(()) => None,
+        Err(NetworkError::AuthDenied) => Some(NetworkError::AuthDenied.to_string()),
+        Err(_) => None,
+    }
 }
 
 fn cluster_object_rpc_endpoint_trace_list(endpoints: &[ClusterEndpointRecord]) -> String {
@@ -4439,6 +4508,8 @@ mod tests {
         target_sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
         stream_target_sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
         fail_first_send: bool,
+        error_first_send: bool,
+        stream_error_first_send: bool,
         stall_first_send: Option<Duration>,
     }
 
@@ -4460,6 +4531,7 @@ mod tests {
             let endpoint = endpoint.clone();
             let request = request.clone();
             let should_fail = self.fail_first_send && self.target_sends.is_empty();
+            let should_error = self.error_first_send && self.target_sends.is_empty();
             let stall = self
                 .stall_first_send
                 .filter(|_| self.target_sends.is_empty());
@@ -4474,6 +4546,11 @@ mod tests {
                         operation: "test target send".to_string(),
                         detail: "first endpoint stalled".to_string(),
                     })
+                } else if should_error {
+                    ObjectRpcResponse::encode_error(
+                        "/test/target",
+                        "device authorization was denied",
+                    )
                 } else {
                     ObjectRpcResponse::encode_body("/test/target", &"ok")
                 }
@@ -4489,9 +4566,24 @@ mod tests {
         ) -> ClusterSignedEndpointRpcFuture<'a, crate::ObjectRpcStreamResponse> {
             let endpoint = endpoint.clone();
             let request = request.clone();
+            let should_error = self.stream_error_first_send && self.stream_target_sends.is_empty();
             let sends = &mut self.stream_target_sends;
             Box::pin(async move {
                 sends.push((endpoint, request, timeouts));
+                if should_error {
+                    let response = ObjectRpcResponse::encode_error(
+                        "/test/stream-target",
+                        "device authorization was denied",
+                    )?;
+                    return Ok(crate::ObjectRpcStreamResponse::from_buffered_response(
+                        response,
+                        crate::RawByteStreamChunkOptions {
+                            chunk_bytes: 4,
+                            max_total_bytes: Some(1024),
+                            idle_timeout: Some(Duration::from_secs(1)),
+                        },
+                    ));
+                }
                 let mut response = ObjectRpcResponse::from_encoded_body(
                     "/test/stream-target",
                     b"stream-body".to_vec(),
@@ -4729,6 +4821,81 @@ mod tests {
     }
 
     #[test]
+    fn cluster_target_rpc_retries_after_endpoint_error_response() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-target-endpoint-error-retry");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_target_endpoint_error_retry")
+            .expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_target_endpoint_error_local").expect("local node");
+        let target_node =
+            NodeId::from_legacy_named("node_target_endpoint_error_target").expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "target endpoint error retry",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut target_member =
+            ClusterMemberRecord::local_voter(cluster_id, target_node.clone(), "target", "pk", now);
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![
+            crate::endpoint_advertisement::daemon_lan_endpoint(
+                &target_node,
+                "auth-error-target.test:21353".to_string(),
+                0,
+            ),
+            crate::endpoint_advertisement::daemon_lan_endpoint(
+                &target_node,
+                "retry-target.test:21353".to_string(),
+                10,
+            ),
+        ];
+        state.members.push(target_member);
+
+        let request =
+            ObjectRpcRequest::encode_body("/test/target", "test", &"ping").expect("request");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut host = RecordingSignedHost {
+            error_first_send: true,
+            ..RecordingSignedHost::default()
+        };
+        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
+
+        let response = runtime
+            .block_on(client.call_target(
+                &state,
+                &target_node,
+                &request,
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
+                    Duration::from_secs(15),
+                )),
+            ))
+            .expect("second endpoint should be attempted");
+
+        assert_eq!(
+            response.decode_body::<String>().expect("response body"),
+            "ok"
+        );
+        assert_eq!(host.target_sends.len(), 2);
+        assert_eq!(
+            host.target_sends[0].0.address,
+            "auth-error-target.test:21353"
+        );
+        assert_eq!(host.target_sends[1].0.address, "retry-target.test:21353");
+    }
+
+    #[test]
     fn cluster_target_rpc_hard_times_out_endpoint_attempts() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-target-hard-attempt-timeout");
         let data_dir = SinomoDataDir::new(&root);
@@ -4867,6 +5034,89 @@ mod tests {
         assert_eq!(
             host.stream_target_sends[0].0.address,
             "stream-target.test:21353"
+        );
+    }
+
+    #[test]
+    fn cluster_target_stream_retries_after_endpoint_error_response() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-target-stream-error-retry");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_target_stream_error_retry").expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_target_stream_error_local").expect("local node");
+        let target_node =
+            NodeId::from_legacy_named("node_target_stream_error_target").expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "target stream endpoint error retry",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut target_member =
+            ClusterMemberRecord::local_voter(cluster_id, target_node.clone(), "target", "pk", now);
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![
+            crate::endpoint_advertisement::daemon_lan_endpoint(
+                &target_node,
+                "stream-auth-error-target.test:21353".to_string(),
+                0,
+            ),
+            crate::endpoint_advertisement::daemon_lan_endpoint(
+                &target_node,
+                "stream-retry-target.test:21353".to_string(),
+                10,
+            ),
+        ];
+        state.members.push(target_member);
+
+        let mut request =
+            ObjectRpcRequest::encode_body("/test/stream-target", "test", &"ping").expect("request");
+        crate::set_object_rpc_request_stream_mode(
+            &mut request,
+            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut host = RecordingSignedHost {
+            stream_error_first_send: true,
+            ..RecordingSignedHost::default()
+        };
+        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
+
+        let mut response = runtime
+            .block_on(client.call_target_stream(
+                &state,
+                &target_node,
+                &request,
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
+                    Duration::from_secs(15),
+                )),
+            ))
+            .expect("second stream endpoint should be attempted");
+        let body = runtime
+            .block_on(response.body.collect_to_vec())
+            .expect("stream body");
+
+        assert_eq!(response.response.route, "/test/stream-target");
+        assert_eq!(body, b"stream-body");
+        assert_eq!(host.stream_target_sends.len(), 2);
+        assert_eq!(
+            host.stream_target_sends[0].0.address,
+            "stream-auth-error-target.test:21353"
+        );
+        assert_eq!(
+            host.stream_target_sends[1].0.address,
+            "stream-retry-target.test:21353"
         );
     }
 

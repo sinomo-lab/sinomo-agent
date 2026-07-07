@@ -14,9 +14,10 @@ use sinomo_runtime::test::{
     SinomoTestContext, SinomoTestError, SinomoTestOutcome, SinomoTestRegistryBuilder,
     SinomoTestRequirement, SinomoTestResult,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
 
 const DEFAULT_REQUESTS_PER_TARGET: usize = 20;
 const DEFAULT_CONCURRENCY: usize = 32;
@@ -33,7 +34,9 @@ const DEFAULT_MIN_PAYLOAD_BYTES_PER_SECOND: f64 = 0.0;
 pub fn register_network_cluster_test_cases(
     builder: SinomoTestRegistryBuilder,
 ) -> SinomoTestRegistryBuilder {
-    builder.register(network_ping_benchmark())
+    builder
+        .register(network_ping_benchmark())
+        .register(network_endpoint_error_fallback())
 }
 
 sinomo_runtime::test::sinomo_test_case! {
@@ -44,6 +47,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_network_ping_benchmark(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn network_endpoint_error_fallback(ctx) {
+        id: "cluster.network.endpoint-error-fallback",
+        summary: "Routed daemon RPC retries a reachable endpoint that returns an auth error",
+        tags: ["cluster-network", "probe", "routing", "failure-mode"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_network_endpoint_error_fallback(ctx)
         }
     }
 }
@@ -390,6 +405,272 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         "network ping completed {success_count}/{total_requests} RPCs in {}ms ({requests_per_second:.2} req/s, {payload_bytes_per_second:.2} payload bytes/s, p50={p50_ms}ms/{p50_us}us p95={p95_ms}ms/{p95_us}us)",
         elapsed.as_millis()
     )))
+}
+
+fn run_network_endpoint_error_fallback(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let target_name = ctx.required_parameter("target-name")?.trim().to_string();
+    let bad_endpoint_address = ctx
+        .required_parameter("bad-endpoint-address")?
+        .trim()
+        .to_string();
+    if target_name.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "target-name".to_string(),
+            detail: "must not be empty".to_string(),
+        });
+    }
+    if bad_endpoint_address.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "bad-endpoint-address".to_string(),
+            detail: "must not be empty".to_string(),
+        });
+    }
+    let timeout_ms = optional_u64_parameter(ctx, "timeout-ms", DEFAULT_TIMEOUT_MS)?;
+
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot refresh cluster snapshot before endpoint fallback probe: {error}"
+        ))
+    })?;
+    let cluster_state = cluster::read_cluster_state(&cluster_paths)
+        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+    let target = cluster_state
+        .members
+        .iter()
+        .find(|member| {
+            member.display_name == target_name
+                && member.state.is_authorized()
+                && member_has_main_daemon(member)
+        })
+        .ok_or_else(|| {
+            SinomoTestError::failed(format!(
+                "cannot find authorized main daemon target named {target_name}"
+            ))
+        })?;
+    let bad_endpoint = target
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.address == bad_endpoint_address)
+        .cloned()
+        .ok_or_else(|| {
+            let addresses = target
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.address.clone())
+                .collect::<Vec<_>>();
+            SinomoTestError::failed(format!(
+                "target {target_name} does not advertise bad endpoint {bad_endpoint_address}; addresses={addresses:?}"
+            ))
+        })?;
+
+    let original_connectivity = network::read_local_cluster_connectivity_records_for_source(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+    )
+    .map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot snapshot local connectivity before endpoint fallback probe: {error}"
+        ))
+    })?;
+    let seed_records = endpoint_error_fallback_seed_records(
+        &cluster_state,
+        target,
+        &bad_endpoint,
+        original_connectivity.clone(),
+    );
+    network::write_local_cluster_connectivity_record_set(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+        &seed_records,
+    )
+    .map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot seed deterministic bad endpoint preference: {error}"
+        ))
+    })?;
+
+    let probe_result =
+        run_network_endpoint_error_fallback_probe(target, &bad_endpoint_address, timeout_ms);
+
+    let restore_result = network::write_local_cluster_connectivity_record_set(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+        &original_connectivity,
+    );
+    if let Err(error) = restore_result {
+        return Err(SinomoTestError::failed(format!(
+            "cannot restore local connectivity after endpoint fallback probe: {error}"
+        )));
+    }
+    let probe_outcome = probe_result?;
+    if !matches!(
+        probe_outcome.status,
+        sinomo_runtime::test::SinomoTestStatus::Passed
+    ) {
+        return Ok(probe_outcome);
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let mut identity_mismatch = network::cluster_connectivity_record(
+        &cluster_state,
+        &bad_endpoint,
+        network::ClusterConnectivityState::Unreachable,
+        None,
+        network::CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
+        None,
+        Some(now.to_string()),
+        now,
+        network::CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
+    );
+    identity_mismatch.failure_reason =
+        Some(network::ClusterConnectivityFailureReason::IdentityMismatch);
+    network::write_local_cluster_connectivity_records(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+        std::slice::from_ref(&identity_mismatch),
+    )
+    .map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot mark bad endpoint as identity-mismatch after fallback probe: {error}"
+        ))
+    })?;
+
+    ctx.record("target_name", target_name);
+    ctx.record("target_node_id", target.node_id.to_string());
+    ctx.record("bad_endpoint_address", bad_endpoint_address);
+    ctx.record(
+        "seeded_bad_endpoint_id",
+        bad_endpoint.endpoint_id.to_string(),
+    );
+    Ok(SinomoTestOutcome::passed(
+        "routed RPC retried the auth-error endpoint and reached the requested target",
+    ))
+}
+
+fn endpoint_error_fallback_seed_records(
+    cluster_state: &ClusterBootstrapState,
+    target: &ClusterMemberRecord,
+    bad_endpoint: &sinomo_runtime::core::ClusterEndpointRecord,
+    original_connectivity: Vec<network::ClusterConnectivityRecord>,
+) -> Vec<network::ClusterConnectivityRecord> {
+    let now = OffsetDateTime::now_utc();
+    let mut records = original_connectivity;
+    let mut covered_endpoint_ids = records
+        .iter()
+        .filter(|record| {
+            record.source_node_id == cluster_state.local_node_id
+                && record.target_node_id == target.node_id
+        })
+        .map(|record| record.endpoint_id.clone())
+        .collect::<BTreeSet<_>>();
+    for record in &mut records {
+        if record.source_node_id == cluster_state.local_node_id
+            && record.target_node_id == target.node_id
+            && record.endpoint_id != bad_endpoint.endpoint_id
+        {
+            record.state = network::ClusterConnectivityState::Degraded;
+            record.latency_ms = None;
+            record.consecutive_failures =
+                network::CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD.saturating_sub(1);
+            record.last_failure_at = Some(now.to_string());
+            record.failure_reason = None;
+            record.observed_at = now;
+            record.expires_at =
+                now + time::Duration::seconds(network::CLUSTER_CONNECTIVITY_TTL_SECONDS as i64);
+        }
+    }
+    for endpoint in &target.endpoints {
+        if endpoint.endpoint_id == bad_endpoint.endpoint_id
+            || covered_endpoint_ids.contains(&endpoint.endpoint_id)
+        {
+            continue;
+        }
+        let degraded = network::cluster_connectivity_record(
+            cluster_state,
+            endpoint,
+            network::ClusterConnectivityState::Degraded,
+            None,
+            network::CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD.saturating_sub(1),
+            None,
+            Some(now.to_string()),
+            now,
+            network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        records.push(degraded);
+        covered_endpoint_ids.insert(endpoint.endpoint_id.clone());
+    }
+    let bad_preference = network::cluster_connectivity_record(
+        cluster_state,
+        bad_endpoint,
+        network::ClusterConnectivityState::Healthy,
+        Some(0),
+        0,
+        Some(now.to_string()),
+        None,
+        now,
+        network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+    );
+    records.retain(|record| {
+        !(record.source_node_id == cluster_state.local_node_id
+            && record.target_node_id == target.node_id
+            && record.endpoint_id == bad_endpoint.endpoint_id)
+    });
+    records.push(bad_preference);
+    records
+}
+
+fn run_network_endpoint_error_fallback_probe(
+    target: &ClusterMemberRecord,
+    bad_endpoint_address: &str,
+    timeout_ms: u64,
+) -> SinomoTestResult {
+    let nonce = format!(
+        "endpoint-error-fallback-{}-{}",
+        current_millis(),
+        std::process::id()
+    );
+    let request = cluster::cluster_network_ping_rpc_request_with_response_payload(&nonce, 0, 0)
+        .map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot prepare endpoint fallback ping request: {source}"
+            ))
+        })?;
+    let daemon_client = DaemonApiClient::connect()
+        .map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot connect to local daemon for endpoint fallback probe: {source}"
+            ))
+        })?
+        .with_timeout(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1)));
+    let response = daemon_client
+        .object_rpc_to_target(
+            &target.node_id,
+            &request,
+            Duration::from_millis(timeout_ms),
+            true,
+        )
+        .map_err(|source| {
+            SinomoTestError::failed(format!(
+                "endpoint fallback routed RPC failed after seeding {bad_endpoint_address}: {source}"
+            ))
+        })?;
+    let response = cluster::decode_cluster_network_ping_rpc_response(&response)
+        .map_err(|source| SinomoTestError::failed(source.to_string()))?;
+    if response.nonce != nonce {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "nonce mismatch: got {}, expected {}",
+            response.nonce, nonce
+        )));
+    }
+    if response.responder_node_id != target.node_id {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "responder mismatch: got {}, expected {}",
+            response.responder_node_id, target.node_id
+        )));
+    }
+    Ok(SinomoTestOutcome::passed(""))
 }
 
 fn network_ping_targets_from_state(
