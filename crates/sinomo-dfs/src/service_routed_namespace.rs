@@ -245,9 +245,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .find(|cursor| &cursor.shard_id == shard_id)
                     .map(|cursor| cursor.after_sequence)
                     .unwrap_or(0);
-                batches.extend(
-                    self.metadata_journal_batches_for_shard_since(shard_id, after_sequence)?,
-                );
+                batches.extend(self.metadata_journal_batches_for_shard_since_limited(
+                    shard_id,
+                    after_sequence,
+                    DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT,
+                )?);
             }
             batches
         } else {
@@ -368,6 +370,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             },
                             synced_path_object: None,
                             synced_path_objects: Vec::new(),
+                            journal_batch_limit_reached: false,
                         });
                     }
                     return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
@@ -396,6 +399,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     },
                     synced_path_object: None,
                     synced_path_objects: Vec::new(),
+                    journal_batch_limit_reached: false,
                 });
             }
             return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
@@ -423,6 +427,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             },
                             synced_path_object: None,
                             synced_path_objects: Vec::new(),
+                            journal_batch_limit_reached: false,
                         });
                     }
                     return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
@@ -441,6 +446,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             result: response.result.clone(),
             synced_path_object: response.synced_path_object.clone(),
             synced_path_objects: response.synced_path_objects.clone(),
+            journal_batch_limit_reached: response.metadata_journal_batches.len()
+                >= DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT,
         });
         Ok(NetworkedDfsServiceEvent::RemoteNamespaceCompleted {
             request_id: response.request_id,
@@ -466,24 +473,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 after_sequence: status.journal_last_sequence,
             })
             .collect())
-    }
-
-    /// Routes a namespace mutation to the metadata-shard primary and blocks
-    /// until the primary answers (or the timeout elapses). On `Applied`, the
-    /// response journal batches have already been replayed locally, so the
-    /// caller immediately reads its own namespace write.
-    pub(crate) fn route_namespace_operation_to_metadata_primary(
-        &mut self,
-        file_system_id: DfsFileSystemId,
-        primary_node_id: NodeId,
-        operation: DfsNamespaceOperation,
-    ) -> Result<DfsNamespaceResult, DfsError> {
-        self.route_namespace_operation_to_metadata_primary_with_timeout(
-            file_system_id,
-            primary_node_id,
-            operation,
-            DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
-        )
     }
 
     pub(crate) fn route_namespace_operation_to_metadata_primary_with_timeout(
@@ -675,7 +664,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    fn route_namespace_operation_to_metadata_primary_with_timeout_and_options(
+    pub(crate) fn route_namespace_operation_to_metadata_primary_with_timeout_and_options(
         &mut self,
         file_system_id: DfsFileSystemId,
         primary_node_id: NodeId,

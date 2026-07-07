@@ -42,6 +42,11 @@ pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH: usize = 8;
 /// Journal batches a primary ships in one routed-operation response.
 pub const DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT: usize = 16;
+/// Journal batches a namespace primary ships in one foreground namespace
+/// response. Namespace mutations also carry synced path objects and can pull
+/// additional journal batches with bounded SyncPath rounds, so keep the first
+/// response small enough to return promptly on deep real-cluster journals.
+pub const DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT: usize = 1;
 pub(crate) const DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT: usize = 3;
 pub(crate) const DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT: u64 = DFS_BLOB_INLINE_LIMIT_BYTES as u64;
 pub(crate) const DFS_ROUTED_NAMESPACE_IDLE_WAIT: Duration = Duration::from_millis(10);
@@ -351,6 +356,7 @@ pub(crate) struct PendingRoutedNamespaceResult {
     pub(crate) result: DfsNamespaceResult,
     pub(crate) synced_path_object: Option<DfsObjectMetadata>,
     pub(crate) synced_path_objects: Vec<DfsObjectMetadata>,
+    pub(crate) journal_batch_limit_reached: bool,
 }
 
 #[derive(Clone, Debug)]

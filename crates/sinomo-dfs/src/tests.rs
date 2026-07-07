@@ -30296,7 +30296,7 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
         wait_for_commit: true,
         foreground_replica_repair: true,
     };
-    for index in 0..150 {
+    for index in 0..700 {
         users_primary
             .posix_write_file(
                 &format!("/users/bulk-{index:03}.txt"),
@@ -30332,7 +30332,7 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
         "earliest backlog entry must be visible after the routed op"
     );
     assert!(
-        replica.posix_stat("/users/bulk-149.txt").is_ok(),
+        replica.posix_stat("/users/bulk-699.txt").is_ok(),
         "latest backlog entry must be visible after the routed op"
     );
     assert!(replica.posix_stat("/users/deep-sync-marker").is_ok());
@@ -30365,7 +30365,7 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
         wait_for_commit: true,
         foreground_replica_repair: true,
     };
-    for index in 0..150 {
+    for index in 0..700 {
         users_primary
             .posix_write_file(
                 &format!("/users/mkdir-all-backlog-{index:03}.txt"),
@@ -30402,7 +30402,7 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
     );
     assert!(
         replica
-            .posix_stat("/users/mkdir-all-backlog-149.txt")
+            .posix_stat("/users/mkdir-all-backlog-699.txt")
             .is_ok(),
         "latest backlog entry must be visible after routed mkdir_all"
     );

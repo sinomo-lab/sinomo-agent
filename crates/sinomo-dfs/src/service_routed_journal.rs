@@ -47,10 +47,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn metadata_journal_batches_for_shard_since(
         &self,
         shard_id: &DfsMetadataShardId,
+        after_sequence: u64,
+    ) -> Result<Vec<DfsMetadataJournalBatch>, DfsError> {
+        self.metadata_journal_batches_for_shard_since_limited(
+            shard_id,
+            after_sequence,
+            DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT,
+        )
+    }
+
+    pub(crate) fn metadata_journal_batches_for_shard_since_limited(
+        &self,
+        shard_id: &DfsMetadataShardId,
         mut after_sequence: u64,
+        max_batches: usize,
     ) -> Result<Vec<DfsMetadataJournalBatch>, DfsError> {
         let mut batches = Vec::new();
-        for _ in 0..DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT {
+        for _ in 0..max_batches {
             let Some(batch) =
                 self.metadata_journal_batch_for_shard_since(shard_id, after_sequence)?
             else {

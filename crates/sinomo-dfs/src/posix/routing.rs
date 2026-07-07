@@ -12,9 +12,10 @@ use crate::posix_path::{
     normalized_posix_path_key, parent_posix_path, posix_path_is_at_or_under_prefix,
 };
 use crate::{
-    DfsControlPlaneStore, DfsError, DfsMessageTransport, DfsMetadataShardConfig,
-    DfsMetadataShardId, DfsNamespaceJobKind, DfsNamespaceOperation, DfsNamespaceResult,
-    DfsObjectKind, DfsObjectMetadata, NetworkedDfsService, sifs_file_system_id,
+    DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DfsControlPlaneStore, DfsError, DfsMessageTransport,
+    DfsMetadataShardConfig, DfsMetadataShardId, DfsNamespaceJobKind, DfsNamespaceOperation,
+    DfsNamespaceResult, DfsObjectKind, DfsObjectMetadata, NetworkedDfsService,
+    PendingRoutedNamespaceResult, sifs_file_system_id,
 };
 use sinomo_core::node::NodeId;
 use std::time::{Duration, Instant};
@@ -23,6 +24,7 @@ const POSIX_SIFS_METADATA_SHARD_CACHE_TTL: Duration = Duration::from_secs(1);
 /// Routed-operation attempts when authority rejections redirect to the
 /// current shard primary (a stale local shard view names a former primary).
 const POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT: usize = 3;
+const POSIX_ROUTED_DEEP_SYNC_ROUNDS: usize = 16;
 const POSIX_READ_FRESHNESS_SYNC_CACHE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -343,11 +345,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let file_system_id = sifs_file_system_id();
         let mut primary = primary_node_id;
         for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
-            let routed = match self.route_namespace_operation_to_metadata_primary(
-                file_system_id.clone(),
-                primary.clone(),
-                operation.clone(),
-            ) {
+            let routed = match self
+                .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
+                    file_system_id.clone(),
+                    primary.clone(),
+                    operation.clone(),
+                    DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                    true,
+                    true,
+                ) {
                 Ok(result) => result,
                 Err(error @ DfsError::Network { .. }) => {
                     match self.refresh_routed_namespace_primary_after_network_error(
@@ -363,8 +369,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 Err(error) => return Err(DfsPosixError::Dfs(error)),
             };
-            match routed {
-                DfsNamespaceResult::Applied => return Ok(()),
+            match routed.result.clone() {
+                DfsNamespaceResult::Applied => {
+                    self.finish_routed_namespace_catch_up_if_needed(&operation, &routed)?;
+                    return Ok(());
+                }
                 DfsNamespaceResult::Rejected {
                     reason,
                     posix_error,
@@ -396,6 +405,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "routed namespace operation exceeded {POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT} authority redirects"
             ),
         }))
+    }
+
+    fn finish_routed_namespace_catch_up_if_needed(
+        &mut self,
+        operation: &DfsNamespaceOperation,
+        routed: &PendingRoutedNamespaceResult,
+    ) -> Result<()> {
+        if !routed.journal_batch_limit_reached
+            || matches!(
+                operation,
+                DfsNamespaceOperation::SyncPath { .. }
+                    | DfsNamespaceOperation::LookupPath { .. }
+                    | DfsNamespaceOperation::LookupPaths { .. }
+            )
+        {
+            return Ok(());
+        }
+        let Some(path) = namespace_operation_routing_path(operation) else {
+            return Ok(());
+        };
+        self.sync_remote_namespace_path_until_quiet(path)
     }
 
     pub(super) fn route_namespace_operation_without_local_replay(
@@ -658,6 +688,64 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     path: path.to_string(),
                 },
             )?;
+        }
+        Ok(())
+    }
+
+    fn sync_remote_namespace_path_until_quiet(&mut self, path: &str) -> Result<()> {
+        let operation = DfsNamespaceOperation::SyncPath {
+            path: path.to_string(),
+        };
+        let file_system_id = sifs_file_system_id();
+        let mut primary = match self.routed_namespace_primary_for_path(path)? {
+            Some(primary) => primary,
+            None => return Ok(()),
+        };
+        for _ in 0..POSIX_ROUTED_DEEP_SYNC_ROUNDS {
+            let routed = self
+                .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
+                    file_system_id.clone(),
+                    primary.clone(),
+                    operation.clone(),
+                    POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                    true,
+                    true,
+                )
+                .map_err(DfsPosixError::Dfs)?;
+            match routed.result {
+                DfsNamespaceResult::Applied => {
+                    if !routed.journal_batch_limit_reached {
+                        return Ok(());
+                    }
+                }
+                DfsNamespaceResult::Rejected {
+                    current_primary_node_id: Some(current),
+                    ..
+                } if current != primary => {
+                    primary = self
+                        .refreshed_primary_after_authority_redirect(
+                            &file_system_id,
+                            &operation,
+                            &primary,
+                            current,
+                        )
+                        .map_err(DfsPosixError::Dfs)?;
+                    if primary == self.node_id {
+                        return self.execute_namespace_operation_local(&operation);
+                    }
+                }
+                DfsNamespaceResult::Rejected {
+                    current_primary_node_id: Some(current),
+                    ..
+                } if current == self.node_id => {
+                    return self.execute_namespace_operation_local(&operation);
+                }
+                DfsNamespaceResult::Rejected {
+                    reason,
+                    posix_error,
+                    ..
+                } => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
+            }
         }
         Ok(())
     }

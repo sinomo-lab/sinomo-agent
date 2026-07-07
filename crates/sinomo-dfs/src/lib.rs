@@ -433,11 +433,12 @@ pub(crate) use service_state::{
     DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE, DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
     DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE, DFS_METADATA_OBJECT_VERSION_PAGE_SIZE,
     DFS_REMOTE_READ_RETRY_DELAY, DFS_ROUTED_NAMESPACE_IDLE_WAIT,
-    DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT, DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT,
-    NetworkedDfsRangeReadStream, NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadStream,
-    NetworkedDfsReadStreamOutcome, PendingMetadataReplication, PendingRemoteWriteResponse,
-    PendingRoutedNamespaceOp, PendingRoutedNamespaceResult, PendingRoutedWrite,
-    StageBlobSendOutcome, retained_networked_dfs_service_events,
+    DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT, DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
+    DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT, NetworkedDfsRangeReadStream,
+    NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadStream, NetworkedDfsReadStreamOutcome,
+    PendingMetadataReplication, PendingRemoteWriteResponse, PendingRoutedNamespaceOp,
+    PendingRoutedNamespaceResult, PendingRoutedWrite, StageBlobSendOutcome,
+    retained_networked_dfs_service_events,
 };
 pub use service_state::{
     DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT,
