@@ -6269,6 +6269,71 @@ fn rollout_target_selection_keeps_transient_public_tcp_before_iroh() {
 }
 
 #[test]
+fn rollout_target_selection_prefers_healthy_public_tcp_over_degraded_private_tcp() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-rollout-healthy-public");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_rollout_healthy_public").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_network_rollout_healthy_public_local").expect("local");
+    let main = NodeId::from_legacy_named("node_network_rollout_healthy_public_main").expect("main");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "network rollout healthy public",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    let private = daemon_lan_endpoint(&main, "192.168.254.41:21353".to_string(), 10);
+    let public = daemon_lan_endpoint(&main, "203.0.113.41:21353".to_string(), 20);
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local,
+        vec![
+            cluster_connectivity_record(
+                &state,
+                &private,
+                ClusterConnectivityState::Degraded,
+                None,
+                1,
+                None,
+                Some("transient private route failure".to_string()),
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &public,
+                ClusterConnectivityState::Healthy,
+                Some(87),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            ),
+        ],
+    )
+    .expect("connectivity records");
+
+    let ordered = ClusterEndpointSelector::new(&paths, &state)
+        .rollout_targets_for_main_with_command_endpoint(
+            &main,
+            None,
+            &[private.clone(), public.clone()],
+        );
+
+    assert_eq!(ordered[0].endpoint_id, public.endpoint_id);
+    assert_eq!(ordered[1].endpoint_id, private.endpoint_id);
+}
+
+#[test]
 fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-rollout-shadow-context");
     let data_dir = SinomoDataDir::new(&root);
