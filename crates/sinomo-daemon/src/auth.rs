@@ -1419,6 +1419,88 @@ mod tests {
     }
 
     #[test]
+    fn signed_dfs_status_rpc_authenticates_cluster_member() {
+        let target_root = unique_auth_test_root("sinomo-daemon-auth-dfs-status-target");
+        let target_data_dir = SinomoDataDir::new(&target_root);
+        let target_daemon_paths = DaemonPaths::with_root(target_root.join("daemon"));
+        let target_identity =
+            load_or_create_main_node_identity(&target_root).expect("target identity");
+        let peer_root = unique_auth_test_root("sinomo-daemon-auth-dfs-status-peer");
+        let peer_data_dir = SinomoDataDir::new(&peer_root);
+        let peer_identity = load_or_create_main_node_identity(&peer_root).expect("peer identity");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_auth_dfs_status")
+                .expect("cluster id");
+        let target_node = sinomo_core::Id::from_legacy_named("node_daemon_auth_dfs_status_target")
+            .expect("target node");
+        let peer_node = sinomo_core::Id::from_legacy_named("node_daemon_auth_dfs_status_peer")
+            .expect("peer node");
+        let now = OffsetDateTime::now_utc();
+
+        let mut target_state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "auth-dfs-status",
+            target_node.clone(),
+            "target",
+            target_identity.public_key.clone(),
+            now,
+        );
+        target_state
+            .members
+            .push(ClusterMemberRecord::local_non_voting(
+                cluster_id.clone(),
+                peer_node.clone(),
+                "peer",
+                peer_identity.public_key.clone(),
+                now,
+            ));
+        sinomo_core::cluster::write_cluster_state(
+            &ClusterPaths::new(&target_data_dir),
+            &target_state,
+        )
+        .expect("write target state");
+
+        let mut peer_state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "auth-dfs-status",
+            peer_node.clone(),
+            "peer",
+            peer_identity.public_key.clone(),
+            now,
+        );
+        peer_state.members.push(ClusterMemberRecord::local_voter(
+            cluster_id,
+            target_node,
+            "target",
+            target_identity.public_key,
+            now,
+        ));
+        sinomo_core::cluster::write_cluster_state(&ClusterPaths::new(&peer_data_dir), &peer_state)
+            .expect("write peer state");
+
+        let request = sinomo_dfs::dfs_status_rpc_request()
+            .expect("dfs status request")
+            .with_trace_context_if_missing();
+        let signed =
+            sign_daemon_rpc_request_from_data_dir(&peer_data_dir, &request).expect("signed rpc");
+        let signed_envelope: SignedDaemonCommand =
+            sinomo_core::network::SinomoObjectCodec::default()
+                .decode(&signed)
+                .expect("decode signed envelope");
+        assert_eq!(signed_envelope.node_id, peer_node.to_string());
+
+        let authenticated = authenticate_daemon_control_request(
+            &target_daemon_paths,
+            &request.clone().with_auth(signed),
+        )
+        .expect("dfs status member auth");
+        assert_eq!(authenticated.route, sinomo_dfs::DFS_STATUS_ROUTE);
+        assert_eq!(authenticated.signer, DaemonSignerAuthority::Member);
+        assert_eq!(authenticated.signer_node_id, peer_node.to_string());
+        assert_eq!(authenticated.signer_public_key, peer_identity.public_key);
+    }
+
+    #[test]
     fn cluster_kv_watch_routes_authorize_cluster_members() {
         for route in [
             CLUSTER_KV_WATCH_PREFIX_ROUTE,

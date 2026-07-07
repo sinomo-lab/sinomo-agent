@@ -29,7 +29,7 @@ use sinomo_rollout::{
     ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
     ROLLOUT_RPC_CATEGORY,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const OBJECT_RPC_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -781,7 +781,8 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEnd
     > {
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            if self.use_tcp_tunnel
+            let started = Instant::now();
+            let result = if self.use_tcp_tunnel
                 && let Some(result) = crate::tcp_tunnel::send_signed_endpoint_rpc_via_tcp_tunnel(
                     endpoint,
                     auth,
@@ -792,15 +793,21 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEnd
                 )
                 .await
             {
-                return result;
-            }
-            sinomo_core::network::send_daemon_rpc_to_cluster_endpoint_async(
-                endpoint,
-                Some(auth),
-                request,
-                timeouts,
-            )
-            .await
+                result
+            } else {
+                sinomo_core::network::send_daemon_rpc_to_cluster_endpoint_async(
+                    endpoint,
+                    Some(auth),
+                    request,
+                    timeouts,
+                )
+                .await
+            };
+            let observation = daemon_signed_endpoint_rpc_observation(result.as_ref(), started);
+            let _ = self
+                .observe_signed_endpoint_rpc_async(endpoint, observation)
+                .await;
+            result
         })
     }
 
@@ -816,7 +823,8 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEnd
     > {
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            if self.use_tcp_tunnel
+            let started = Instant::now();
+            let result = if self.use_tcp_tunnel
                 && let Some(result) = crate::tcp_tunnel::send_signed_endpoint_rpc_via_tcp_tunnel(
                     endpoint,
                     auth,
@@ -827,7 +835,7 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEnd
                 )
                 .await
             {
-                return result.map(|response| {
+                result.map(|response| {
                     sinomo_core::network::ObjectRpcStreamResponse::from_buffered_response(
                         response,
                         sinomo_core::network::RawByteStreamChunkOptions {
@@ -839,15 +847,21 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEnd
                             idle_timeout: timeouts.idle_timeout,
                         },
                     )
-                });
-            }
-            sinomo_core::network::send_daemon_rpc_stream_response_to_cluster_endpoint_async(
-                endpoint,
-                Some(auth),
-                request,
-                timeouts,
-            )
-            .await
+                })
+            } else {
+                sinomo_core::network::send_daemon_rpc_stream_response_to_cluster_endpoint_async(
+                    endpoint,
+                    Some(auth),
+                    request,
+                    timeouts,
+                )
+                .await
+            };
+            let observation = daemon_signed_endpoint_rpc_observation(result.as_ref(), started);
+            let _ = self
+                .observe_signed_endpoint_rpc_async(endpoint, observation)
+                .await;
+            result
         })
     }
 
@@ -873,7 +887,8 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEnd
     > {
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            if self.use_tcp_tunnel
+            let started = Instant::now();
+            let result = if self.use_tcp_tunnel
                 && let Some(result) = crate::tcp_tunnel::forward_signed_endpoint_rpc_via_tcp_tunnel(
                     endpoint,
                     auth,
@@ -887,19 +902,26 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEnd
                 )
                 .await
             {
-                return result;
-            }
-            let mut signed = request.clone();
-            signed.auth = Some(auth.to_vec());
-            sinomo_core::network::forward_streamed_daemon_rpc_to_cluster_endpoint_async(
-                endpoint,
-                &signed,
-                timeouts,
-                upstream,
-                upstream_address,
-                max_response_bytes,
-            )
-            .await
+                result
+            } else {
+                let mut signed = request.clone();
+                signed.auth = Some(auth.to_vec());
+                sinomo_core::network::forward_streamed_daemon_rpc_to_cluster_endpoint_async(
+                    endpoint,
+                    &signed,
+                    timeouts,
+                    upstream,
+                    upstream_address,
+                    max_response_bytes,
+                )
+                .await
+            };
+            let observation =
+                daemon_signed_endpoint_stream_send_observation(result.as_ref(), started);
+            let _ = self
+                .observe_signed_endpoint_rpc_async(endpoint, observation)
+                .await;
+            result
         })
     }
 }
@@ -945,6 +967,53 @@ fn daemon_rpc_connectivity_observation(
             false,
         )
     }
+}
+
+fn daemon_signed_endpoint_rpc_observation<T>(
+    result: Result<&T, &sinomo_core::network::NetworkError>,
+    started: Instant,
+) -> sinomo_core::network::ClusterSignedEndpointRpcObservation {
+    match result {
+        Ok(_) => sinomo_core::network::ClusterSignedEndpointRpcObservation::success(Some(
+            daemon_signed_endpoint_rpc_elapsed_latency_ms(started),
+        )),
+        Err(sinomo_core::network::NetworkError::AuthDenied) => {
+            sinomo_core::network::ClusterSignedEndpointRpcObservation::auth_denied()
+        }
+        Err(_) => sinomo_core::network::ClusterSignedEndpointRpcObservation::io_failure(),
+    }
+}
+
+fn daemon_signed_endpoint_stream_send_observation(
+    result: Result<
+        &sinomo_core::network::ClusterRelayStreamSendOutcome,
+        &sinomo_core::network::NetworkError,
+    >,
+    started: Instant,
+) -> sinomo_core::network::ClusterSignedEndpointRpcObservation {
+    match result {
+        Ok(sinomo_core::network::ClusterRelayStreamSendOutcome::Forwarded)
+        | Ok(sinomo_core::network::ClusterRelayStreamSendOutcome::RoutingError(_)) => {
+            sinomo_core::network::ClusterSignedEndpointRpcObservation::success(Some(
+                daemon_signed_endpoint_rpc_elapsed_latency_ms(started),
+            ))
+        }
+        Ok(sinomo_core::network::ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
+            sinomo_core::network::NetworkError::AuthDenied,
+        )) => sinomo_core::network::ClusterSignedEndpointRpcObservation::auth_denied(),
+        Ok(sinomo_core::network::ClusterRelayStreamSendOutcome::StreamStartedThenFailed(_)) => {
+            sinomo_core::network::ClusterSignedEndpointRpcObservation::io_failure()
+        }
+        Err(sinomo_core::network::NetworkError::AuthDenied) => {
+            sinomo_core::network::ClusterSignedEndpointRpcObservation::auth_denied()
+        }
+        Err(_) => sinomo_core::network::ClusterSignedEndpointRpcObservation::io_failure(),
+    }
+}
+
+fn daemon_signed_endpoint_rpc_elapsed_latency_ms(started: Instant) -> u64 {
+    let elapsed = started.elapsed().as_millis();
+    elapsed.min(u128::from(u64::MAX)) as u64
 }
 
 async fn remember_endpoint_command_connectivity_async(
@@ -1721,6 +1790,134 @@ mod tests {
     }
 
     #[test]
+    fn daemon_signed_endpoint_send_records_auth_denied_connectivity() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-client-auth-denied-observation");
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
+        let daemon_paths = crate::DaemonPaths::with_root(root.join("daemon"));
+        let local_identity =
+            sinomo_core::node::load_or_create_main_node_identity(&root).expect("identity");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_client_auth_denied")
+                .expect("cluster id");
+        let local_node =
+            sinomo_core::node::NodeId::from_legacy_named("node_client_auth_denied_local")
+                .expect("local node");
+        let target_node =
+            sinomo_core::node::NodeId::from_legacy_named("node_client_auth_denied_target")
+                .expect("target node");
+        let now = time::OffsetDateTime::now_utc();
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "client-auth-denied",
+            local_node.clone(),
+            "local",
+            local_identity.public_key,
+            now,
+        );
+        state
+            .members
+            .push(sinomo_core::ClusterMemberRecord::local_non_voting(
+                cluster_id,
+                target_node.clone(),
+                "target",
+                "target-public-key",
+                now,
+            ));
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let endpoint_id =
+            sinomo_core::network::ClusterEndpointId::from_legacy_named("endpoint_auth_denied")
+                .expect("endpoint");
+        let result = runtime.block_on(async {
+            let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            let address = listener.local_addr_string().expect("listener address");
+            let server = tokio::spawn(async move {
+                let mut stream = listener.accept().await.expect("accept");
+                let request = stream
+                    .read_request(
+                        "auth-denied-test",
+                        sinomo_core::network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
+                        sinomo_core::network::ObjectFrameIoOptions::idle_timeout(
+                            Duration::from_secs(1),
+                        ),
+                    )
+                    .await
+                    .expect("request");
+                let response = sinomo_core::network::ObjectRpcResponse::encode_error(
+                    request.route,
+                    "network authorization was denied",
+                )
+                .expect("auth denied response");
+                stream
+                    .write_response(
+                        "auth-denied-test",
+                        &response,
+                        sinomo_core::network::ObjectFrameIoOptions::idle_timeout(
+                            Duration::from_secs(1),
+                        ),
+                    )
+                    .await
+                    .expect("response");
+            });
+
+            let endpoint = sinomo_core::ClusterEndpointRecord {
+                endpoint_id: endpoint_id.clone(),
+                node_id: target_node.clone(),
+                transport: sinomo_core::ClusterTransportKind::Loopback,
+                address,
+                source: sinomo_core::ClusterEndpointSource::Static,
+                privacy: sinomo_core::ClusterEndpointPrivacy::LocalOnly,
+                priority: 0,
+                last_observed_latency_ms: None,
+            };
+            let mut host = super::DaemonSignedEndpointRpcAsyncHost::new(runtime.handle(), true)
+                .with_paths(&daemon_paths);
+            let request = ObjectRpcRequest::encode_body("/test/auth-denied", "test", &())
+                .expect("request");
+            let result =
+                sinomo_core::network::ClusterSignedEndpointRpcAsyncHost::send_signed_endpoint_rpc_async(
+                    &mut host,
+                    &endpoint,
+                    b"invalid-auth",
+                    &request,
+                    sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(
+                        Duration::from_secs(1),
+                    ),
+                )
+                .await;
+            server.await.expect("server");
+            result
+        });
+        assert!(matches!(
+            result,
+            Err(sinomo_core::network::NetworkError::AuthDenied)
+        ));
+
+        let records = sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+            &cluster_paths,
+            &local_node,
+        )
+        .expect("connectivity records");
+        let record = records
+            .iter()
+            .find(|record| {
+                record.target_node_id == target_node && record.endpoint_id == endpoint_id
+            })
+            .expect("auth-denied endpoint record");
+        assert_eq!(
+            record.state,
+            sinomo_core::network::ClusterConnectivityState::Unreachable
+        );
+    }
+
+    #[test]
     fn daemon_rpc_connectivity_observation_classifies_endpoint_failures() {
         let healthy = super::daemon_rpc_connectivity_observation(
             sinomo_core::network::ClusterSignedEndpointRpcObservation::success(Some(5)),
@@ -1754,6 +1951,53 @@ mod tests {
                 false
             )
         );
+    }
+
+    #[test]
+    fn daemon_signed_endpoint_rpc_observation_preserves_auth_denied() {
+        let started = std::time::Instant::now();
+        let response =
+            sinomo_core::network::ObjectRpcResponse::encode_body("/test", &()).expect("response");
+        let success = super::daemon_signed_endpoint_rpc_observation(Ok(&response), started);
+        assert!(success.is_success());
+
+        let auth_denied = super::daemon_signed_endpoint_rpc_observation::<
+            sinomo_core::network::ObjectRpcResponse,
+        >(
+            Err(&sinomo_core::network::NetworkError::AuthDenied),
+            std::time::Instant::now(),
+        );
+        assert!(auth_denied.is_auth_denied());
+
+        let io = super::daemon_signed_endpoint_rpc_observation::<
+            sinomo_core::network::ObjectRpcResponse,
+        >(
+            Err(&sinomo_core::network::NetworkError::Io {
+                operation: "connect".to_string(),
+                detail: "refused".to_string(),
+            }),
+            std::time::Instant::now(),
+        );
+        assert!(io.is_io_failure());
+    }
+
+    #[test]
+    fn daemon_signed_endpoint_stream_observation_preserves_late_auth_denied() {
+        let auth_denied = super::daemon_signed_endpoint_stream_send_observation(
+            Ok(
+                &sinomo_core::network::ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
+                    sinomo_core::network::NetworkError::AuthDenied,
+                ),
+            ),
+            std::time::Instant::now(),
+        );
+        assert!(auth_denied.is_auth_denied());
+
+        let forwarded = super::daemon_signed_endpoint_stream_send_observation(
+            Ok(&sinomo_core::network::ClusterRelayStreamSendOutcome::Forwarded),
+            std::time::Instant::now(),
+        );
+        assert!(forwarded.is_success());
     }
 
     #[test]
