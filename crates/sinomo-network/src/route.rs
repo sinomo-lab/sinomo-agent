@@ -760,6 +760,7 @@ struct ClusterDeliveryRoutingTableCacheEntry {
 pub struct ClusterDeliveryRoutingTableCacheMark {
     state: ClusterFileMark,
     pub directory_version: Option<crate::directory::DirectoryVersion>,
+    local_connectivity: ClusterFileMark,
     local_connectivity_generation: u64,
     module_dialer_transports: Vec<String>,
 }
@@ -1095,13 +1096,9 @@ fn cluster_delivery_routing_table_earliest_expires_at(
     state: &ClusterBootstrapState,
 ) -> Option<OffsetDateTime> {
     let now = OffsetDateTime::now_utc();
-    crate::connectivity_store::read_local_cluster_connectivity_records(paths)
+    crate::route_graph_read_model::read_cluster_connectivity_graph_for_state(paths, state)
         .unwrap_or_default()
         .into_iter()
-        .chain(
-            crate::route_graph_read_model::read_cluster_connectivity_graph_for_state(paths, state)
-                .unwrap_or_default(),
-        )
         .filter(|record| {
             record.cluster_id == state.cluster_id
                 && crate::connectivity::cluster_network_record_live(record.expires_at, now)
@@ -1133,6 +1130,7 @@ pub fn cluster_delivery_routing_table_cache_mark(
                 .version()
                 .ok()?,
         ),
+        local_connectivity: cluster_file_mark(&paths.connectivity_local)?,
         local_connectivity_generation:
             crate::connectivity_store::local_cluster_connectivity_content_generation(paths),
         module_dialer_transports,
@@ -5849,6 +5847,123 @@ mod tests {
         assert_eq!(
             addresses,
             vec!["lan-main.test:21353", "198.51.100.76:21353"]
+        );
+    }
+
+    #[test]
+    fn route_plan_keeps_degraded_main_endpoint_fallbacks_after_preferred_endpoint() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-route-degraded-fallbacks");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_route_degraded_fallbacks").expect("cluster");
+        let local_node =
+            NodeId::from_legacy_named("node_route_degraded_fallbacks_local").expect("local");
+        let target_node =
+            NodeId::from_legacy_named("node_route_degraded_fallbacks_target").expect("target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "route degraded fallbacks",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut target_member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            target_node.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        let preferred_bad = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "foreign:21353".to_string(),
+            0,
+        );
+        let degraded_hostname = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "node3:21353".to_string(),
+            10,
+        );
+        let degraded_lan = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "172.26.0.4:21353".to_string(),
+            20,
+        );
+        target_member.endpoints = vec![
+            preferred_bad.clone(),
+            degraded_hostname.clone(),
+            degraded_lan.clone(),
+        ];
+        state.members.push(target_member);
+
+        let records = [
+            crate::connectivity::cluster_connectivity_record(
+                &state,
+                &preferred_bad,
+                ClusterConnectivityState::Healthy,
+                Some(0),
+                0,
+                Some(now.to_string()),
+                None,
+                now,
+                60,
+            ),
+            crate::connectivity::cluster_connectivity_record(
+                &state,
+                &degraded_hostname,
+                ClusterConnectivityState::Degraded,
+                None,
+                crate::CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD.saturating_sub(1),
+                None,
+                Some(now.to_string()),
+                now,
+                60,
+            ),
+            crate::connectivity::cluster_connectivity_record(
+                &state,
+                &degraded_lan,
+                ClusterConnectivityState::Degraded,
+                None,
+                crate::CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD.saturating_sub(1),
+                None,
+                Some(now.to_string()),
+                now,
+                60,
+            ),
+        ];
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &records,
+        )
+        .expect("write local connectivity");
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local_node,
+            &target_node,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
+
+        assert_eq!(plan.next_hop, target_node);
+        let addresses = plan
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.address.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            addresses,
+            vec!["foreign:21353", "node3:21353", "172.26.0.4:21353"]
         );
     }
 

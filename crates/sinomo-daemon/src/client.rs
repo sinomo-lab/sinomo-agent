@@ -14,7 +14,7 @@ use sinomo_core::kv::{
     ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, ClusterRaftAppendRequest,
     ClusterRaftAppendResponse, ClusterRaftVoteRequest, ClusterRaftVoteResponse, KvSnapshot,
 };
-use sinomo_core::network::{AsyncDaemonControlStream, ObjectRpcRequest};
+use sinomo_core::network::{AsyncDaemonControlStream, NetworkError, ObjectRpcRequest};
 use sinomo_core::node::NodeId;
 use sinomo_dfs::{
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
@@ -515,6 +515,50 @@ impl DaemonSignedEndpointRpcAsyncHost {
         self.paths = daemon_paths_from_cluster_paths(paths);
         self
     }
+
+    fn signing_data_dir(&self) -> Result<sinomo_core::local::SinomoDataDir, NetworkError> {
+        if let Some(paths) = self.paths.as_ref() {
+            return daemon_data_dir_from_paths(paths);
+        }
+        sinomo_core::local::SinomoDataDir::from_env_or_home().map_err(|source| NetworkError::Io {
+            operation: "cluster endpoint signing data directory".to_string(),
+            detail: source.to_string(),
+        })
+    }
+
+    fn tcp_tunnel_available(&self) -> bool {
+        self.use_tcp_tunnel
+            && self
+                .paths
+                .as_ref()
+                .is_some_and(daemon_paths_have_settled_cluster_state)
+    }
+}
+
+fn daemon_data_dir_from_paths(
+    paths: &DaemonPaths,
+) -> Result<sinomo_core::local::SinomoDataDir, NetworkError> {
+    let Some(data_dir) = paths.root.parent() else {
+        return Err(NetworkError::Io {
+            operation: "daemon data directory".to_string(),
+            detail: format!(
+                "daemon path {} has no parent data directory",
+                paths.root.display()
+            ),
+        });
+    };
+    Ok(sinomo_core::local::SinomoDataDir::new(data_dir))
+}
+
+fn daemon_paths_have_settled_cluster_state(paths: &DaemonPaths) -> bool {
+    let Ok(data_dir) = daemon_data_dir_from_paths(paths) else {
+        return false;
+    };
+    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+    let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) else {
+        return false;
+    };
+    state.cluster_id.as_str() != sinomo_core::cluster::PENDING_INVITE_CLUSTER_ID
 }
 
 fn send_daemon_rpc_body<Req, Resp>(
@@ -726,17 +770,23 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEnd
         let category = request.category.clone();
         let body_sha256 = daemon_rpc_body_sha256(request);
         let runtime = self.runtime.clone();
+        let data_dir = self.signing_data_dir();
         Box::pin(async move {
+            let data_dir = data_dir?;
             runtime
                 .spawn_blocking(move || {
-                    sign_daemon_rpc_request_digest_for_local_node(&route, &category, body_sha256)
+                    sinomo_core::network::sign_daemon_rpc_request_digest_from_data_dir(
+                        &data_dir,
+                        &route,
+                        &category,
+                        body_sha256,
+                    )
                 })
                 .await
                 .map_err(|source| sinomo_core::network::NetworkError::Io {
                     operation: "cluster endpoint signing".to_string(),
                     detail: format!("endpoint signing task failed: {source}"),
                 })?
-                .map_err(|error| daemon_client_network_error("cluster endpoint signing", error))
         })
     }
 
@@ -780,9 +830,10 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEnd
         sinomo_core::network::ObjectRpcResponse,
     > {
         let runtime = self.runtime.clone();
+        let use_tcp_tunnel = self.tcp_tunnel_available();
         Box::pin(async move {
             let started = Instant::now();
-            let result = if self.use_tcp_tunnel
+            let result = if use_tcp_tunnel
                 && let Some(result) = crate::tcp_tunnel::send_signed_endpoint_rpc_via_tcp_tunnel(
                     endpoint,
                     auth,
@@ -822,9 +873,10 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEnd
         sinomo_core::network::ObjectRpcStreamResponse,
     > {
         let runtime = self.runtime.clone();
+        let use_tcp_tunnel = self.tcp_tunnel_available();
         Box::pin(async move {
             let started = Instant::now();
-            let result = if self.use_tcp_tunnel
+            let result = if use_tcp_tunnel
                 && let Some(result) = crate::tcp_tunnel::send_signed_endpoint_rpc_via_tcp_tunnel(
                     endpoint,
                     auth,
@@ -886,9 +938,10 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEnd
         >,
     > {
         let runtime = self.runtime.clone();
+        let use_tcp_tunnel = self.tcp_tunnel_available();
         Box::pin(async move {
             let started = Instant::now();
-            let result = if self.use_tcp_tunnel
+            let result = if use_tcp_tunnel
                 && let Some(result) = crate::tcp_tunnel::forward_signed_endpoint_rpc_via_tcp_tunnel(
                     endpoint,
                     auth,
@@ -1060,6 +1113,7 @@ pub(crate) fn cluster_paths_from_env() -> Option<sinomo_core::network::ClusterPa
     Some(sinomo_core::network::ClusterPaths::new(&data_dir))
 }
 
+#[cfg(test)]
 fn daemon_client_network_error(
     operation: &str,
     error: DaemonError,
@@ -1783,10 +1837,44 @@ mod tests {
         let direct = super::DaemonSignedEndpointRpcAsyncHost::direct_only(runtime.handle());
         assert!(!direct.observe_connectivity);
         assert!(!direct.use_tcp_tunnel);
+        assert!(!direct.tcp_tunnel_available());
 
         let routed = super::DaemonSignedEndpointRpcAsyncHost::new(runtime.handle(), true);
         assert!(routed.observe_connectivity);
         assert!(routed.use_tcp_tunnel);
+        assert!(!routed.tcp_tunnel_available());
+
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-client-tcp-tunnel-availability");
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let daemon_paths = crate::DaemonPaths::new(&data_dir);
+        daemon_paths.ensure().expect("daemon paths");
+
+        let pre_cluster = super::DaemonSignedEndpointRpcAsyncHost::new(runtime.handle(), true)
+            .with_paths(&daemon_paths);
+        assert!(!pre_cluster.tcp_tunnel_available());
+
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_client_tunnel_available")
+                .expect("cluster id");
+        let local_node =
+            sinomo_core::node::NodeId::from_legacy_named("node_client_tunnel_available")
+                .expect("local node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "client tunnel available",
+            local_node,
+            "local",
+            "pk-local",
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("state");
+
+        let clustered = super::DaemonSignedEndpointRpcAsyncHost::new(runtime.handle(), true)
+            .with_paths(&daemon_paths);
+        assert!(clustered.tcp_tunnel_available());
     }
 
     #[test]

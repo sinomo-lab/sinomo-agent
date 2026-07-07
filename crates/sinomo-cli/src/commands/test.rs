@@ -654,6 +654,8 @@ mod tests {
             .collect();
         for id in [
             "cluster.network.ping-benchmark",
+            "cluster.network.hygiene",
+            "cluster.network.hygiene-dirty-fixture",
             "cluster.migration.seed-source",
             "cluster.migration.verify-joined",
             "cluster.dfs.lightweight-latency",
@@ -673,6 +675,37 @@ mod tests {
             "cluster.dfs.large-expect",
         ] {
             assert!(ids.iter().any(|candidate| candidate == id), "missing {id}");
+        }
+    }
+
+    #[test]
+    fn registry_includes_network_dfs_acceptance_suite() {
+        let registry = test_registry().expect("registry");
+        let acceptance = registry
+            .metadata()
+            .into_iter()
+            .filter(|case| {
+                case.tags
+                    .iter()
+                    .any(|tag| tag == "cluster-network-dfs-acceptance")
+            })
+            .map(|case| case.id)
+            .collect::<Vec<_>>();
+        for id in [
+            "cluster.network.ping-benchmark",
+            "cluster.network.hygiene",
+            "cluster.dfs.routed-status",
+            "cluster.dfs.read-your-write",
+            "cluster.dfs.concurrent-file-race",
+            "cluster.dfs.concurrent-dir-race",
+            "cluster.dfs.failover-current-read",
+            "cluster.dfs.invariants",
+            "cluster.dfs.lightweight-latency",
+        ] {
+            assert!(
+                acceptance.iter().any(|candidate| candidate == id),
+                "missing {id} from cluster-network-dfs-acceptance"
+            );
         }
     }
 

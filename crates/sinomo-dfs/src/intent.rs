@@ -3,8 +3,8 @@ use time::OffsetDateTime;
 
 use crate::{
     DfsConflictReadView, DfsConflictRecord, DfsDistributedError, DfsDistributedWriteCommand,
-    DfsObjectId, DfsObjectMetadata, DfsVersion, DfsWriteIntentRecord, DfsWriteIntentState,
-    DfsWriteIntentStatus, DistributedWriteIntent, content_hash,
+    DfsObjectMetadata, DfsWriteIntentRecord, DfsWriteIntentState, DfsWriteIntentStatus,
+    DistributedWriteIntent, content_hash,
 };
 
 pub(crate) fn routed_write_command_content_hash(command: &DfsDistributedWriteCommand) -> String {
@@ -140,29 +140,13 @@ pub(crate) fn write_intent_status_requires_hydrate_restore(status: &DfsWriteInte
     )
 }
 
-pub(crate) fn distributed_error_creates_conflict(error: &DfsDistributedError) -> bool {
+pub(crate) fn distributed_error_is_stale_or_concurrent_write(error: &DfsDistributedError) -> bool {
     matches!(
         error,
         DfsDistributedError::BaseVersionConflict { .. }
             | DfsDistributedError::DuplicateIntent { .. }
             | DfsDistributedError::PendingIntentConflict { .. }
     )
-}
-
-pub(crate) fn conflict_id_for(
-    object_id: &DfsObjectId,
-    local_version: &DfsVersion,
-    local_content_hash: Option<&str>,
-    detected_by_node_id: &NodeId,
-) -> String {
-    let hash_input = format!(
-        "{}\0{}\0{}\0{}",
-        object_id,
-        local_version,
-        local_content_hash.unwrap_or(""),
-        detected_by_node_id
-    );
-    format!("conflict_{}", blake3::hash(hash_input.as_bytes()).to_hex())
 }
 
 impl From<DfsConflictRecord> for DfsConflictReadView {

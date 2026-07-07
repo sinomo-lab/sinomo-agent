@@ -125,33 +125,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let intent = distributed_intent_from_record(&intent_record);
                 match self.coordinator.restore_intent(intent) {
                     Ok(()) => {}
-                    Err(error @ DfsDistributedError::PendingIntentConflict { .. })
+                    Err(DfsDistributedError::PendingIntentConflict { .. })
                         if matches!(
                             intent_record.status,
                             DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
                         ) =>
                     {
-                        let object = self.current_read_object_metadata(&intent_record.object_id)?;
-                        self.create_write_conflict(
-                            &object,
-                            intent_record.base_version.clone(),
-                            intent_record.target_version.clone(),
-                            intent_record.coordinator_node_id.clone(),
-                            intent_record.content_hash.clone(),
-                            error.to_string(),
-                            Some(intent_record.intent_id.clone()),
-                        )?;
-                        let mut conflict_record = intent_record.clone();
-                        conflict_record.status = DfsWriteIntentStatus::Conflict;
-                        conflict_record.updated_at = Some(OffsetDateTime::now_utc());
-                        if let Some(backend) = self.metadata_backend.as_mut() {
-                            backend.put_intent(&conflict_record)?;
-                        }
-                        self.coordinator
-                            .restore_intent(distributed_intent_from_record(&conflict_record))?;
+                        self.mark_replayed_intent_as_rejected(&intent_record)?;
                         continue;
                     }
-                    Err(error @ DfsDistributedError::DuplicateIntentId { .. }) => {
+                    Err(DfsDistributedError::DuplicateIntentId { .. }) => {
                         if matches!(intent_record.status, DfsWriteIntentStatus::Committed)
                             && self
                                 .current_read_object_metadata(&intent_record.object_id)
@@ -169,22 +152,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             )?;
                             continue;
                         }
-                        let object = self.current_read_object_metadata(&intent_record.object_id)?;
-                        self.create_write_conflict(
-                            &object,
-                            intent_record.base_version.clone(),
-                            intent_record.target_version.clone(),
-                            intent_record.coordinator_node_id.clone(),
-                            intent_record.content_hash.clone(),
-                            error.to_string(),
-                            Some(intent_record.intent_id.clone()),
-                        )?;
-                        let mut conflict_record = intent_record.clone();
-                        conflict_record.status = DfsWriteIntentStatus::Conflict;
-                        conflict_record.updated_at = Some(OffsetDateTime::now_utc());
-                        if let Some(backend) = self.metadata_backend.as_mut() {
-                            backend.put_intent(&conflict_record)?;
-                        }
+                        self.mark_replayed_intent_as_rejected(&intent_record)?;
                         continue;
                     }
                     Err(error) => return Err(DfsError::from(error)),
@@ -773,11 +741,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let intent = distributed_intent_from_record(intent_record);
         match self.coordinator.restore_intent(intent) {
             Ok(()) => {}
-            Err(error @ DfsDistributedError::PendingIntentConflict { .. }) => {
-                self.mark_replayed_intent_as_conflict(intent_record, error.to_string(), true)?;
+            Err(DfsDistributedError::PendingIntentConflict { .. }) => {
+                self.mark_replayed_intent_as_rejected(intent_record)?;
                 return Ok(());
             }
-            Err(error @ DfsDistributedError::DuplicateIntentId { .. }) => {
+            Err(DfsDistributedError::DuplicateIntentId { .. }) => {
                 if self
                     .coordinator
                     .intent(&intent_record.intent_id)
@@ -798,11 +766,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 {
                     self.restore_visible_committed_object_location_receipts(intent_record)?;
                 } else {
-                    self.mark_replayed_intent_as_conflict(intent_record, error.to_string(), false)?;
+                    self.mark_replayed_intent_as_rejected(intent_record)?;
                     return Ok(());
                 }
             }
-            Err(error @ DfsDistributedError::BaseVersionConflict { .. }) => {
+            Err(DfsDistributedError::BaseVersionConflict { .. }) => {
                 if self
                     .current_read_object_metadata(&intent_record.object_id)
                     .is_ok_and(|object| {
@@ -833,7 +801,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )? {
                     return Ok(());
                 }
-                return Err(error.into());
+                self.mark_replayed_intent_as_rejected(intent_record)?;
+                return Ok(());
             }
             Err(error) => return Err(error.into()),
         }
@@ -866,40 +835,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    fn mark_replayed_intent_as_conflict(
+    fn mark_replayed_intent_as_rejected(
         &mut self,
         intent_record: &DfsWriteIntentRecord,
-        reason: String,
-        restore_conflict_intent: bool,
     ) -> Result<(), DfsError> {
-        let object = match self.current_read_object_metadata(&intent_record.object_id) {
-            Ok(object) => object,
-            Err(DfsError::UnknownObject { .. }) => {
-                self.apply_backend_object_to_service_state(&intent_record.object_id)?;
-                self.current_read_object_metadata(&intent_record.object_id)?
-            }
-            Err(error) => return Err(error),
-        };
-        self.create_write_conflict(
-            &object,
-            intent_record.base_version.clone(),
-            intent_record.target_version.clone(),
-            intent_record.coordinator_node_id.clone(),
-            intent_record.content_hash.clone(),
-            reason,
-            Some(intent_record.intent_id.clone()),
-        )?;
-        let mut conflict_record = intent_record.clone();
-        conflict_record.status = DfsWriteIntentStatus::Conflict;
-        conflict_record.updated_at = Some(OffsetDateTime::now_utc());
+        let mut rejected_record = intent_record.clone();
+        rejected_record.status = DfsWriteIntentStatus::Rejected;
+        rejected_record.updated_at = Some(OffsetDateTime::now_utc());
         if let Some(backend) = self.metadata_backend.as_mut() {
-            backend.put_intent(&conflict_record)?;
+            backend.put_intent(&rejected_record)?;
         }
-        self.remove_pending_write_state(&conflict_record.intent_id);
-        if restore_conflict_intent {
-            self.coordinator
-                .restore_intent(distributed_intent_from_record(&conflict_record))?;
-        }
+        self.remove_pending_write_state(&rejected_record.intent_id);
         Ok(())
     }
 

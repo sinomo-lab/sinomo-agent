@@ -295,7 +295,8 @@ fn test_iroh_endpoint(
 
 /// Installs the KV-backed cluster directory provider once for the whole test
 /// process. Stable cluster facts still come from KV through the registered
-/// directory; active connectivity is supplied by local network-plane records.
+/// directory; cluster connectivity is supplied by KV when present and local
+/// connectivity files are used only as bootstrap fallback.
 /// Tests own distinct data roots, so the per-paths factory keeps them isolated.
 fn install_kv_directory_for_tests() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
@@ -4717,17 +4718,17 @@ fn connectivity_graph_reads_kv_records_through_query_boundary() {
     };
     let merged =
         read_cluster_connectivity_graph_with_query(&paths, &query).expect("read queried graph");
-    assert!(merged.contains(&local_self_record));
     assert!(merged.contains(&kv_remote_record));
+    assert!(merged.contains(&kv_self_record));
     assert!(
-        !merged.contains(&kv_self_record),
-        "local self-observations remain authoritative over KV-backed stale self edges"
+        !merged.contains(&local_self_record),
+        "KV-backed connectivity is authoritative when the directory graph is present"
     );
 
     let graph = ClusterConnectivityGraph::read_for_local_with_query(&paths, &state, &query);
     assert_eq!(
         graph.state_for_endpoint(&endpoint_b),
-        Some(&ClusterConnectivityState::Unreachable)
+        Some(&ClusterConnectivityState::Healthy)
     );
     assert_eq!(
         graph.healthy_target_refs(&node_b).collect::<Vec<_>>(),
@@ -4736,19 +4737,131 @@ fn connectivity_graph_reads_kv_records_through_query_boundary() {
 }
 
 #[test]
-fn kv_cluster_directory_does_not_serve_active_connectivity_records() {
-    install_kv_directory_for_tests();
-    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-kv-not-active");
+fn connectivity_graph_falls_back_to_local_records_when_directory_graph_empty() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-local-bootstrap");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
     let now = OffsetDateTime::now_utc();
-    let cluster_id = ClusterId::from_legacy_named("cluster_conn_kv_not_active").expect("cluster");
-    let node_a = NodeId::from_legacy_named("node_conn_kv_not_active_a").expect("node a");
-    let node_b = NodeId::from_legacy_named("node_conn_kv_not_active_b").expect("node b");
+    let cluster_id = ClusterId::from_legacy_named("cluster_conn_local_bootstrap").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_local_bootstrap_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_conn_local_bootstrap_b").expect("node b");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity local bootstrap",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.1.21:21353".to_string(), 10);
+    let local_record = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Healthy,
+        Some(3),
+        0,
+        Some("bootstrap success".to_string()),
+        None,
+        now,
+        600,
+    );
+    write_local_cluster_connectivity_records(&paths, &node_a, std::slice::from_ref(&local_record))
+        .expect("write local connectivity");
+
+    let query = FixedConnectivityRecordQuery {
+        records: Vec::new(),
+    };
+    let merged =
+        read_cluster_connectivity_graph_with_query(&paths, &query).expect("read queried graph");
+    assert_eq!(
+        merged,
+        vec![local_record],
+        "local connectivity remains available for bootstrap when the directory graph is empty"
+    );
+}
+
+#[test]
+fn connectivity_graph_uses_local_bootstrap_for_sources_missing_from_kv() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-missing-source-bootstrap");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_conn_missing_source_bootstrap").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_missing_source_bootstrap_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_conn_missing_source_bootstrap_b").expect("node b");
+    let node_c = NodeId::from_legacy_named("node_conn_missing_source_bootstrap_c").expect("node c");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity missing source bootstrap",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.1.22:21353".to_string(), 10);
+    let endpoint_c = daemon_lan_endpoint(&node_c, "10.0.1.23:21353".to_string(), 10);
+    let local_a_record = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Healthy,
+        Some(3),
+        0,
+        Some("local bootstrap success".to_string()),
+        None,
+        now,
+        600,
+    );
+    write_local_cluster_connectivity_records(
+        &paths,
+        &node_a,
+        std::slice::from_ref(&local_a_record),
+    )
+    .expect("write local connectivity");
+
+    let mut state_b = state.clone();
+    state_b.local_node_id = node_b.clone();
+    let kv_b_record = cluster_connectivity_record(
+        &state_b,
+        &endpoint_c,
+        ClusterConnectivityState::Healthy,
+        Some(5),
+        0,
+        Some("kv source success".to_string()),
+        None,
+        now,
+        600,
+    );
+    let query = FixedConnectivityRecordQuery {
+        records: vec![kv_b_record.clone()],
+    };
+    let merged =
+        read_cluster_connectivity_graph_with_query(&paths, &query).expect("read queried graph");
+
+    assert!(merged.contains(&kv_b_record));
+    assert!(
+        merged.contains(&local_a_record),
+        "local bootstrap records are retained for sources missing from the KV graph"
+    );
+}
+
+#[test]
+fn kv_cluster_directory_serves_authoritative_connectivity_records() {
+    install_kv_directory_for_tests();
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-kv-authoritative");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_conn_kv_authoritative").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_kv_authoritative_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_conn_kv_authoritative_b").expect("node b");
     let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id.clone(),
-        "connectivity kv not active",
+        "connectivity kv authoritative",
         node_a.clone(),
         "node a",
         "pk-a",
@@ -4770,26 +4883,25 @@ fn kv_cluster_directory_does_not_serve_active_connectivity_records() {
         ClusterConnectivityState::Healthy,
         Some(5),
         0,
-        Some("legacy kv success".to_string()),
+        Some("kv success".to_string()),
         None,
         now,
         600,
     );
     sync_cluster_connectivity_records_to_kv(&paths, &node_a, vec![record.clone()])
-        .expect("sync legacy kv connectivity");
+        .expect("sync kv connectivity");
     write_local_cluster_connectivity_record_set(&paths, &node_a, &[])
         .expect("clear active local connectivity");
 
     assert_eq!(
         read_cluster_connectivity_graph_from_kv(&paths).expect("legacy kv graph"),
-        vec![record],
-        "legacy KV diagnostics should still expose stored connectivity rows"
+        vec![record.clone()],
+        "KV should expose stored connectivity rows"
     );
-    assert!(
-        read_cluster_connectivity_graph(&paths)
-            .expect("active connectivity graph")
-            .is_empty(),
-        "production route truth must come from network-plane local/peer records, not KV"
+    assert_eq!(
+        read_cluster_connectivity_graph(&paths).expect("active connectivity graph"),
+        vec![record],
+        "production route truth should come from cluster KV when available"
     );
 }
 
@@ -9238,7 +9350,7 @@ struct RecordingKvTxnForwardHost {
     known_authority: Option<NodeId>,
     snapshot: KvSnapshot,
     txn_response: KvTxnResponse,
-    endpoint_rpcs: Vec<(NodeId, String)>,
+    rpcs: Vec<(NodeId, String)>,
 }
 
 impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
@@ -9250,15 +9362,15 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
         Ok(self.known_authority.clone())
     }
 
-    fn call_endpoint_object_rpc(
+    fn call_node_object_rpc(
         &mut self,
         _state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         request: &ObjectRpcRequest,
         _timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        self.endpoint_rpcs
-            .push((endpoint.node_id.clone(), request.route.clone()));
+        self.rpcs
+            .push((target_node_id.clone(), request.route.clone()));
         match request.route.as_str() {
             CLUSTER_KV_TXN_ROUTE => {
                 let payload = sinomo_kv::cluster_kv_txn_response_rpc_payload(&self.txn_response)
@@ -9272,86 +9384,6 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
             }
             route => ObjectRpcResponse::encode_error(route, "unexpected route"),
         }
-    }
-
-    fn call_node_object_rpc(
-        &mut self,
-        _state: &ClusterBootstrapState,
-        target_node_id: &NodeId,
-        request: &ObjectRpcRequest,
-        _timeout: Duration,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        panic!(
-            "KV forwarding must use selected endpoint RPC, not routed node RPC to {target_node_id} for {}",
-            request.route
-        )
-    }
-}
-
-struct AddressSensitiveKvTxnForwardHost {
-    known_authority: Option<NodeId>,
-    failing_addresses: BTreeSet<String>,
-    snapshot: KvSnapshot,
-    txn_response: KvTxnResponse,
-    endpoint_rpcs: Vec<(NodeId, String, String)>,
-    endpoint_timeouts: Vec<(String, String, Duration)>,
-}
-
-impl ClusterKvTxnForwardHost for AddressSensitiveKvTxnForwardHost {
-    fn known_kv_state_authority_id(
-        &mut self,
-        _paths: &ClusterPaths,
-        _state: &ClusterBootstrapState,
-    ) -> Result<Option<NodeId>, NetworkError> {
-        Ok(self.known_authority.clone())
-    }
-
-    fn call_endpoint_object_rpc(
-        &mut self,
-        _state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
-        request: &ObjectRpcRequest,
-        _timeout: Duration,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        self.endpoint_rpcs.push((
-            endpoint.node_id.clone(),
-            endpoint.address.clone(),
-            request.route.clone(),
-        ));
-        self.endpoint_timeouts
-            .push((endpoint.address.clone(), request.route.clone(), _timeout));
-        if self.failing_addresses.contains(&endpoint.address) {
-            return Err(NetworkError::Io {
-                operation: "test endpoint rpc".to_string(),
-                detail: format!("simulated stale endpoint {}", endpoint.address),
-            });
-        }
-        match request.route.as_str() {
-            CLUSTER_KV_TXN_ROUTE => {
-                let payload = sinomo_kv::cluster_kv_txn_response_rpc_payload(&self.txn_response)
-                    .map_err(kv_err)?;
-                Ok(object_rpc_response_from_kv_payload(payload))
-            }
-            CLUSTER_KV_SNAPSHOT_ROUTE => {
-                let payload = sinomo_kv::cluster_kv_snapshot_response_rpc_payload(&self.snapshot)
-                    .map_err(kv_err)?;
-                Ok(object_rpc_response_from_kv_payload(payload))
-            }
-            route => ObjectRpcResponse::encode_error(route, "unexpected route"),
-        }
-    }
-
-    fn call_node_object_rpc(
-        &mut self,
-        _state: &ClusterBootstrapState,
-        target_node_id: &NodeId,
-        request: &ObjectRpcRequest,
-        _timeout: Duration,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        panic!(
-            "KV forwarding must use selected endpoint RPC, not routed node RPC to {target_node_id} for {}",
-            request.route
-        )
     }
 }
 
@@ -9370,7 +9402,7 @@ impl ClusterSignedEndpointRpcAsyncHost for RecordingKvTxnForwardHost {
         request: &'a ObjectRpcRequest,
         _timeouts: DaemonRpcTimeouts,
     ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
-        self.endpoint_rpcs
+        self.rpcs
             .push((endpoint.node_id.clone(), request.route.clone()));
         let response: Result<ObjectRpcResponse, NetworkError> = match request.route.as_str() {
             CLUSTER_KV_TXN_ROUTE => {
@@ -11441,7 +11473,7 @@ fn cluster_raft_leader_election_retries_next_endpoint_for_same_remote_voter() {
 }
 
 #[test]
-fn cluster_kv_txn_forward_driver_uses_endpoint_rpc_for_known_state_authority() {
+fn cluster_kv_txn_forward_driver_uses_routed_node_rpc_for_known_state_authority() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-direct");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -11469,7 +11501,7 @@ fn cluster_kv_txn_forward_driver_uses_endpoint_rpc_for_known_state_authority() {
         known_authority: Some(peer_node_id.clone()),
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
-        endpoint_rpcs: Vec::new(),
+        rpcs: Vec::new(),
     };
 
     let result = forward_cluster_kv_txn_to_state_authority_with_host(
@@ -11493,7 +11525,7 @@ fn cluster_kv_txn_forward_driver_uses_endpoint_rpc_for_known_state_authority() {
     assert_eq!(result.snapshot, snapshot);
     assert_eq!(result.txn_response, Some(txn_response));
     assert_eq!(
-        host.endpoint_rpcs,
+        host.rpcs,
         vec![
             (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
             (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
@@ -11529,7 +11561,7 @@ fn cluster_kv_txn_forward_driver_deduplicates_state_authority_endpoints() {
         known_authority: Some(peer_node_id.clone()),
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
-        endpoint_rpcs: Vec::new(),
+        rpcs: Vec::new(),
     };
 
     let result = forward_cluster_kv_txn_to_state_authority_with_host(
@@ -11553,167 +11585,11 @@ fn cluster_kv_txn_forward_driver_deduplicates_state_authority_endpoints() {
     assert_eq!(result.snapshot, snapshot);
     assert_eq!(result.txn_response, Some(txn_response));
     assert_eq!(
-        host.endpoint_rpcs,
+        host.rpcs,
         vec![
             (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
             (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
         ]
-    );
-}
-
-#[test]
-fn cluster_kv_txn_forward_driver_retries_next_endpoint_for_same_state_authority() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-same-node-retry");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let (mut state, _local_node_id, peer_node_id) = cluster_raft_handler_test_state(
-        "cluster_kv_forward_same_node_retry",
-        "node_kv_forward_same_node_retry_local",
-        "node_kv_forward_same_node_retry_peer",
-    );
-    let private_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.41:21353".to_string(), 10);
-    let mut public_endpoint =
-        daemon_lan_endpoint(&peer_node_id, "198.51.100.76:21353".to_string(), 20);
-    public_endpoint.privacy = ClusterEndpointPrivacy::InternetDirect;
-    state
-        .members
-        .iter_mut()
-        .find(|member| member.node_id == peer_node_id)
-        .expect("peer member")
-        .endpoints
-        .extend([private_endpoint.clone(), public_endpoint.clone()]);
-    write_cluster_state(&paths, &state).expect("write state");
-    let snapshot = forward_test_snapshot("/forward/same-node-retry", b"same-node-retry");
-    let txn_response = forward_test_txn_response(snapshot.revision);
-    let mut host = AddressSensitiveKvTxnForwardHost {
-        known_authority: Some(peer_node_id.clone()),
-        failing_addresses: BTreeSet::from([private_endpoint.address.clone()]),
-        snapshot: snapshot.clone(),
-        txn_response: txn_response.clone(),
-        endpoint_rpcs: Vec::new(),
-        endpoint_timeouts: Vec::new(),
-    };
-
-    let result = forward_cluster_kv_txn_to_state_authority_with_host(
-        &paths,
-        &state,
-        &KvTxn {
-            compares: Vec::new(),
-            success: Vec::new(),
-            failure: Vec::new(),
-        },
-        ClusterKvTxnForwardOptions {
-            timeout: Duration::from_secs(5),
-            tcp_command_timeout: Duration::from_secs(5),
-            iroh_command_timeout: Duration::from_secs(3),
-        },
-        &mut host,
-    )
-    .expect("forward")
-    .expect("targeted voter");
-
-    assert_eq!(result.snapshot, snapshot);
-    assert_eq!(result.txn_response, Some(txn_response));
-    assert_eq!(
-        host.endpoint_rpcs,
-        vec![
-            (
-                peer_node_id.clone(),
-                private_endpoint.address,
-                CLUSTER_KV_TXN_ROUTE.to_string()
-            ),
-            (
-                peer_node_id.clone(),
-                public_endpoint.address.clone(),
-                CLUSTER_KV_TXN_ROUTE.to_string()
-            ),
-            (
-                peer_node_id,
-                public_endpoint.address,
-                CLUSTER_KV_SNAPSHOT_ROUTE.to_string()
-            )
-        ]
-    );
-}
-
-#[test]
-fn cluster_kv_txn_forward_driver_bounds_attempt_budget_so_later_endpoints_run() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-fair-budget");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let (mut state, _local_node_id, peer_node_id) = cluster_raft_handler_test_state(
-        "cluster_kv_forward_fair_budget",
-        "node_kv_forward_fair_budget_local",
-        "node_kv_forward_fair_budget_peer",
-    );
-    let private_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.41:21353".to_string(), 10);
-    let stale_lan_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.42:21353".to_string(), 20);
-    let mut public_endpoint =
-        daemon_lan_endpoint(&peer_node_id, "198.51.100.76:21353".to_string(), 30);
-    public_endpoint.privacy = ClusterEndpointPrivacy::InternetDirect;
-    state
-        .members
-        .iter_mut()
-        .find(|member| member.node_id == peer_node_id)
-        .expect("peer member")
-        .endpoints
-        .extend([
-            private_endpoint.clone(),
-            stale_lan_endpoint.clone(),
-            public_endpoint.clone(),
-        ]);
-    write_cluster_state(&paths, &state).expect("write state");
-    let snapshot = forward_test_snapshot("/forward/fair-budget", b"fair-budget");
-    let txn_response = forward_test_txn_response(snapshot.revision);
-    let mut host = AddressSensitiveKvTxnForwardHost {
-        known_authority: Some(peer_node_id.clone()),
-        failing_addresses: BTreeSet::from([
-            private_endpoint.address.clone(),
-            stale_lan_endpoint.address.clone(),
-        ]),
-        snapshot: snapshot.clone(),
-        txn_response: txn_response.clone(),
-        endpoint_rpcs: Vec::new(),
-        endpoint_timeouts: Vec::new(),
-    };
-
-    let result = forward_cluster_kv_txn_to_state_authority_with_host(
-        &paths,
-        &state,
-        &KvTxn {
-            compares: Vec::new(),
-            success: Vec::new(),
-            failure: Vec::new(),
-        },
-        ClusterKvTxnForwardOptions {
-            timeout: Duration::from_secs(8),
-            tcp_command_timeout: Duration::from_secs(8),
-            iroh_command_timeout: Duration::from_secs(8),
-        },
-        &mut host,
-    )
-    .expect("forward")
-    .expect("targeted voter");
-
-    assert_eq!(result.snapshot, snapshot);
-    assert_eq!(result.txn_response, Some(txn_response));
-    assert!(
-        host.endpoint_rpcs.iter().any(|(_, address, route)| {
-            address == &public_endpoint.address && route == CLUSTER_KV_TXN_ROUTE
-        }),
-        "public endpoint should still be attempted after stale endpoints"
-    );
-    assert!(
-        host.endpoint_timeouts
-            .iter()
-            .any(|(address, route, timeout)| {
-                address == &stale_lan_endpoint.address
-                    && route == CLUSTER_KV_TXN_ROUTE
-                    && *timeout <= Duration::from_secs(4)
-            }),
-        "a stale endpoint must not consume the whole command budget"
     );
 }
 
@@ -11776,7 +11652,7 @@ fn cluster_node_blocks_leader_preference_when_local_probe_marks_member_unreachab
 }
 
 #[test]
-fn cluster_kv_txn_forward_driver_uses_endpoint_rpc_without_known_state_authority() {
+fn cluster_kv_txn_forward_driver_uses_routed_node_rpc_without_known_state_authority() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-node-rpc");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -11810,7 +11686,7 @@ fn cluster_kv_txn_forward_driver_uses_endpoint_rpc_without_known_state_authority
         known_authority: None,
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
-        endpoint_rpcs: Vec::new(),
+        rpcs: Vec::new(),
     };
 
     let result = forward_cluster_kv_txn_to_state_authority_with_host(
@@ -11834,7 +11710,7 @@ fn cluster_kv_txn_forward_driver_uses_endpoint_rpc_without_known_state_authority
     assert_eq!(result.snapshot, snapshot);
     assert_eq!(result.txn_response, Some(txn_response));
     assert_eq!(
-        host.endpoint_rpcs,
+        host.rpcs,
         vec![
             (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
             (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
@@ -11843,7 +11719,7 @@ fn cluster_kv_txn_forward_driver_uses_endpoint_rpc_without_known_state_authority
 }
 
 #[test]
-fn cluster_kv_txn_async_forward_driver_uses_endpoint_rpc_client() {
+fn cluster_kv_txn_async_forward_driver_uses_routed_rpc_client() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-async-forward-node-rpc");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -11896,7 +11772,7 @@ fn cluster_kv_txn_async_forward_driver_uses_endpoint_rpc_client() {
         known_authority: None,
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
-        endpoint_rpcs: Vec::new(),
+        rpcs: Vec::new(),
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -11928,7 +11804,7 @@ fn cluster_kv_txn_async_forward_driver_uses_endpoint_rpc_client() {
     assert_eq!(result.snapshot, snapshot);
     assert_eq!(result.txn_response, Some(txn_response));
     assert_eq!(
-        host.endpoint_rpcs,
+        host.rpcs,
         vec![
             (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
             (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
@@ -14112,6 +13988,7 @@ struct RecordingJoinReconciliationHost {
     snapshots: Vec<ClusterEndpointRecord>,
     observed: Vec<ClusterEndpointRecord>,
     response: Option<ClusterJoinRegistrationResponse>,
+    snapshot: Option<KvSnapshot>,
 }
 
 impl ClusterJoinReconciliationHost for RecordingJoinReconciliationHost {
@@ -14132,7 +14009,7 @@ impl ClusterJoinReconciliationHost for RecordingJoinReconciliationHost {
         _timeout: Duration,
     ) -> Result<KvSnapshot, NetworkError> {
         self.snapshots.push(endpoint.clone());
-        Err(NetworkError::Io {
+        self.snapshot.clone().ok_or_else(|| NetworkError::Io {
             operation: "test snapshot fetch".to_string(),
             detail: "no snapshot configured".to_string(),
         })
@@ -14253,6 +14130,115 @@ fn cluster_join_reconciliation_driver_merges_acceptance_through_host() {
         pending.members.iter().any(|member| {
             member.node_id == joined && member.state == ClusterMemberState::Learner
         })
+    );
+}
+
+#[test]
+fn cluster_join_reconciliation_fetches_snapshot_after_unverified_acceptance() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-join-reconcile-unverified-acceptance");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_join_reconcile_snapshot").expect("cluster");
+    let joined =
+        NodeId::from_legacy_named("node_network_join_reconcile_snapshot_joined").expect("joined");
+    let issuer =
+        NodeId::from_legacy_named("node_network_join_reconcile_snapshot_issuer").expect("issuer");
+    let endpoint = daemon_lan_endpoint(&issuer, "node4:21353".to_string(), 0);
+    let mut pending = ClusterBootstrapState::pending_join(
+        cluster_id.clone(),
+        "join reconcile snapshot",
+        joined.clone(),
+        "joined",
+        "pk-joined",
+        now,
+    );
+    let mut accepted = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "join reconcile snapshot",
+        issuer.clone(),
+        "issuer",
+        "pk-issuer",
+        now,
+    );
+    let mut joined_member = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        joined.clone(),
+        "joined",
+        "pk-joined",
+        now,
+    );
+    apply_cluster_raft_role(&mut joined_member, ClusterMemberRole::Learner, now);
+    upsert_member_record(&mut accepted, joined_member);
+    let snapshot =
+        sync_cluster_state_to_local_raft_unchecked(&paths, &accepted).expect("accepted snapshot");
+    let invite = ClusterJoinInvite {
+        invite_id: ClusterInviteId::from_legacy_named("invite_network_join_reconcile_snapshot")
+            .expect("invite"),
+        cluster_id: cluster_id.clone(),
+        cluster_name: Some("join reconcile snapshot".to_string()),
+        cluster_public_key: "pk-issuer".to_string(),
+        invitation_secret: "secret".to_string(),
+        communication_channels: vec![ClusterInvitationChannel {
+            endpoint: endpoint.clone(),
+            node_public_key: "pk-issuer".to_string(),
+        }],
+        introducers: Vec::new(),
+        token_id: "token".to_string(),
+        expires_at: now + time::Duration::hours(1),
+        trust_domain: TrustDomain::new("trust.local").expect("trust"),
+        allowed_member_roles: vec![ClusterMemberRole::Learner],
+        issuer_node_id: issuer.clone(),
+        issuer_public_key: "pk-issuer".to_string(),
+        signature: String::new(),
+    };
+    let stale_response_state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "join reconcile snapshot stale",
+        issuer,
+        "issuer",
+        "pk-issuer",
+        now,
+    );
+    let mut host = RecordingJoinReconciliationHost {
+        response: Some(ClusterJoinRegistrationResponse {
+            accepted: true,
+            detail: "join registered".to_string(),
+            state: stale_response_state,
+            kv_snapshot: None,
+            responder_node_id: None,
+        }),
+        snapshot: Some(snapshot),
+        ..Default::default()
+    };
+
+    let reconciliation = reconcile_cluster_join_with_introducers_with_host(
+        &mut pending,
+        &invite,
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Some(&paths),
+        &mut host,
+    )
+    .expect("reconcile join");
+
+    assert_eq!(host.sends, vec![endpoint.clone()]);
+    assert_eq!(host.snapshots, vec![endpoint.clone()]);
+    assert_eq!(
+        reconciliation
+            .accepted_endpoint
+            .as_ref()
+            .expect("accepted endpoint")
+            .address,
+        endpoint.address
+    );
+    assert!(
+        pending.members.iter().any(|member| {
+            member.node_id == joined && member.state == ClusterMemberState::Learner
+        }),
+        "fallback snapshot should prove the accepted local member"
     );
 }
 
@@ -17503,14 +17489,14 @@ fn cluster_member_publish_ignores_stable_endpoint_order() {
             last_observed_latency_ms: None,
         },
         ClusterEndpointRecord {
-            endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_publish_order_loopback")
+            endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_publish_order_lan_alt")
                 .expect("endpoint"),
             node_id: node_id.clone(),
-            transport: ClusterTransportKind::Loopback,
-            address: "127.0.0.1:21353".to_string(),
-            source: ClusterEndpointSource::Static,
-            privacy: ClusterEndpointPrivacy::LocalOnly,
-            priority: 0,
+            transport: ClusterTransportKind::LanTcp,
+            address: "node.example.test:21353".to_string(),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 30,
             last_observed_latency_ms: None,
         },
     ];

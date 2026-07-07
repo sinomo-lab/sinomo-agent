@@ -55,6 +55,8 @@ pub enum DfsError {
     /// boundary.
     #[error("path {path} is moving between metadata shards; retry the operation")]
     Busy { path: String },
+    #[error("directory is not empty: {path}")]
+    DirectoryNotEmpty { path: String },
 }
 
 impl DfsError {
@@ -121,8 +123,11 @@ impl From<DfsDistributedError> for DfsError {
 
 impl From<MetadataBackendError> for DfsError {
     fn from(error: MetadataBackendError) -> Self {
-        Self::Metadata {
-            message: error.to_string(),
+        match error {
+            MetadataBackendError::DirectoryNotEmpty { path } => Self::DirectoryNotEmpty { path },
+            error => Self::Metadata {
+                message: error.to_string(),
+            },
         }
     }
 }

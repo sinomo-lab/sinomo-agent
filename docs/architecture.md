@@ -85,7 +85,7 @@ Node operation is cluster-based. A machine that starts alone is represented as a
 
 User-facing node operations are cluster-centered and daemon-owned. Normal cluster operations — `cluster init`, `join`, `invite`, `rename`, `role`, `remove`, and `leave` — reach the daemon through one typed daemon API client shared by the CLI and the app, backed by the `/cluster/control/{init,join,invite,rename,role,remove,leave}` object-RPC routes that `sinomo-cluster` registers; they require a running daemon. Documented debug/repair commands stay direct against local state: `cluster doctor`, `cluster connectivity`, `cluster repair-members`, `cluster cleanup-legacy-shadow-members`, `cluster state-authority-role`, `cluster migrate` planning, the `debug *` commands, and local daemon/install/rollout lifecycle. Local degraded-mode helpers remain internal fallback plumbing for commands that can read local state when the daemon or quorum is unavailable.
 
-The daemon hosts an internal cluster KV service adapter. The service is not exposed as a public API; Sinomo components use binary object RPC routes to read snapshots, submit KV transactions, range over prefixes, and create/drain local prefix watches. `sinomo-kv` owns KV storage semantics, Raft participant state, leader/election state, term/vote/log/snapshot behavior, and durable KV files under `$SINOMO_DATA_DIR/cluster/kv-raft/<node_id>/` plus the materialized snapshot at `$SINOMO_DATA_DIR/cluster/kv-snapshot.sobj`. `sinomo-network` owns the cluster network and routing layer: routes, endpoint selection, connectivity graph interpretation, relay decisions, and peer transport selection. The two crates do not know each other: `sinomo-network` has no dependency on `sinomo-kv`, and `sinomo-kv` has no dependency on `sinomo-network` (the workspace boundary test enforces both directions). `sinomo-cluster` is the bridge. It owns the transport-coupled control plane — membership, invites, joins, stable member/state/network-info/status publishing, and the KV/Raft replication drivers that move consensus traffic over network-selected routes — and it implements the network crate's `ClusterDirectory` provider by reading stable cluster KV (`install_kv_cluster_directory()`), so routing and endpoint selection can see durable cluster facts such as members, advertised endpoints, node statuses, and configured network information without a network-to-KV dependency. Active connectivity is not a KV ground truth: each daemon records live probe results locally under the network plane and imports peer-owned connectivity records over authenticated network RPC from reachable nodes. `sinomo-network` interprets that active local/peer connectivity graph for route choice, relay decisions, and stale-route pruning. KV may retain legacy or diagnostic connectivity rows, but quorum formation and live route choice must not depend on committing fresh connectivity into KV. No crate absorbs another's domain rules. The daemon supplies host-local authentication, process identity, and peer transport callbacks for those crates. Cluster init, daemon registration, and join registration store cluster identity, Raft role config, member records, endpoint records, capability policy, invitations, and rollout desired/node state under the `/cluster/...` keyspace, so cluster status and peer views can report the KV-backed view rather than only local state. Cluster maintenance sends Raft append heartbeats from the current leader, asks authorized voters for votes when the leader is unreachable, persists a new leader only after quorum, clears local leadership when quorum is lost, and fans out committed watch events with signed daemon messages. Daemons also publish runtime heartbeats under `/cluster/node-status/<node_id>`. Those records include online observation time, daemon version, platform, PID, control address, executable path, and rollout state summary.
+The daemon hosts an internal cluster KV service adapter. The service is not exposed as a public API; Sinomo components use binary object RPC routes to read snapshots, submit KV transactions, range over prefixes, and create/drain local prefix watches. `sinomo-kv` owns KV storage semantics, Raft participant state, leader/election state, term/vote/log/snapshot behavior, and durable KV files under `$SINOMO_DATA_DIR/cluster/kv-raft/<node_id>/` plus the materialized snapshot at `$SINOMO_DATA_DIR/cluster/kv-snapshot.sobj`. `sinomo-network` owns the cluster network and routing layer: routes, endpoint selection, connectivity graph interpretation, relay decisions, and peer transport selection. The two crates do not know each other: `sinomo-network` has no dependency on `sinomo-kv`, and `sinomo-kv` has no dependency on `sinomo-network` (the workspace boundary test enforces both directions). `sinomo-cluster` is the bridge. It owns the transport-coupled control plane — membership, invites, joins, stable member/state/network-info/status publishing, connectivity publication, and the KV/Raft replication drivers that move consensus traffic over network-selected routes — and it implements the network crate's `ClusterDirectory` provider by reading cluster KV (`install_kv_cluster_directory()`), so routing and endpoint selection can see durable cluster facts such as members, advertised endpoints, node statuses, configured network information, and the authoritative cluster connectivity graph without a network-to-KV dependency. Each daemon records live probe results locally and publishes the current source-owned connectivity set through the cluster control plane when quorum is available. `sinomo-network` uses the local connectivity file only as a bootstrap cache when the KV-backed directory graph is unavailable or empty, plus the narrow cold-join case where the current node's own source-owned probe records may seed routing until that source appears in KV. Local records from other sources never extend or override a non-empty KV graph. `sinomo-network` interprets the directory connectivity graph for route choice, relay decisions, and stale-route pruning; it does not commit KV transactions itself. No crate absorbs another's domain rules. The daemon supplies host-local authentication, process identity, and peer transport callbacks for those crates. Cluster init, daemon registration, and join registration store cluster identity, Raft role config, member records, endpoint records, capability policy, invitations, connectivity, and rollout desired/node state under the `/cluster/...` keyspace, so cluster status and peer views can report the KV-backed view rather than only local state. Cluster maintenance sends Raft append heartbeats from the current leader, asks authorized voters for votes when the leader is unreachable, persists a new leader only after quorum, clears local leadership when quorum is lost, and fans out committed watch events with signed daemon messages. Daemons also publish runtime heartbeats under `/cluster/node-status/<node_id>`. Those records include online observation time, daemon version, platform, PID, control address, executable path, and rollout state summary.
 
 `sinomo cluster health` reads the KV-backed member and node-status records, then probes reachable daemon endpoints for a fresh live view. The report shows each cluster member with online/offline/unknown health, version, platform, PID, address, last-seen time, and rollout status. Shadow reachability is represented through the main member's alternate daemon endpoints rather than a separate member row. `sinomo cluster status` includes online/offline counts from the same health rows. A node is treated as offline when it has a probeable endpoint but its last online heartbeat is stale; nodes without a usable endpoint remain unknown rather than falsely offline.
 
@@ -280,7 +280,7 @@ Initial object policies:
 |---|---|---|---|
 | `local-owned` | Writes route to the owning node | Remote reads use cached copies or fetch from owner | Local checkouts, device-private staging, sensitive evidence |
 | `replicated-confirmed` | Writes commit after configured replicas confirm | Reads can use any confirmed replica | Shared workspaces, important generated artifacts |
-| `replicated-eventual` | Writes commit locally and replicate asynchronously | Reads may tolerate stale replicas with version metadata | Large artifacts, low-risk generated outputs |
+| `replicated-eventual` | Writes serialize through the DFS metadata authority at the commit threshold, then repair asynchronously | Reads may tolerate stale replicas with version metadata | Large artifacts, low-risk generated outputs |
 | `append-only` | New versions or chunks only; no in-place overwrite | Reads use immutable versions | Logs, evidence bundles, audit traces |
 | `ephemeral-local` | Writes stay local and may be discarded | Local reads only unless explicitly exported | Scratch space, temporary build products |
 
@@ -289,7 +289,7 @@ Policy should also include:
 - Minimum replica count.
 - Preferred nodes.
 - Allowed nodes or trust domains.
-- Conflict strategy.
+- Write serialization and split-cluster recovery strategy.
 - Encryption requirement.
 - Retention and garbage collection.
 - Maximum object size.
@@ -303,25 +303,17 @@ Rules:
 
 - `local-owned` writes are routed to `owner_node_id`; remote nodes submit write requests instead of mutating cached copies.
 - `replicated-confirmed` writes are coordinated by the owner or elected coordinator and are visible after required confirmations.
-- `replicated-eventual` writes are locally accepted with version metadata and reconciled asynchronously.
+- `replicated-eventual` writes are coordinated through the responsible DFS metadata authority. When quorum and the metadata authority are available, stale-base and concurrent writes are rejected or retried before visible commit; they must not create normal conflict records.
 - `append-only` writes create new immutable versions or chunks.
 - `ephemeral-local` writes are never synchronized unless promoted by an explicit event.
 
 All write operations should emit structured `dfs.*` events with node, workspace, object, version, policy, and outcome metadata.
 
-#### Conflict Handling
+#### Write Serialization And Split Recovery
 
-The DFS should prefer explicit conflict objects over silent overwrite.
+Normal DFS operation is strongly eventually consistent. When KV quorum is available and the responsible owner or metadata-shard primary is reachable through `sinomo-network`, DFS writes serialize through that authority. The visible version is advanced with a compare-and-append metadata transaction, so normal operation must not fork an object or create conflict records. Stale-base writes are rejected or retried, pending writes remain pending until the required receipt policy is met, and unavailable authorities cause writes to queue or fail fast. A normal quorum-backed DFS operation that creates a conflict record is a correctness bug.
 
-Conflict strategy options:
-
-- Reject concurrent writes.
-- Route all writes through owner.
-- Last-writer-wins for low-risk objects.
-- Create branch/conflict versions.
-- Merge through a domain-specific resolver.
-
-For coding workspaces, conflict versions should be visible to the agent and can be reconciled using ordinary code review, diff, and test workflows.
+Conflict records are reserved for future split-cluster and disconnected-write recovery, where two sides of a partition may have accepted independent authority decisions. That mode is not part of normal DFS operation and requires an explicit reconciliation algorithm before it can be enabled. Silent overwrite is still forbidden; future split recovery should expose divergent branches for human or agent resolution.
 
 #### Workspace Mounts
 
@@ -745,7 +737,7 @@ Responsibilities:
 - Own the Sinomo Object wire codec dependency for cluster framing.
 - Host the runtime network-module registry so transports can be added, enabled, and disabled as modules, including non-TCP/IP transports.
 - Read stable cluster facts (members, advertised endpoints, node statuses, and configured network information) only through the `ClusterDirectory` provider registered by `sinomo-cluster`; the crate has no dependency on `sinomo-kv` or `sinomo-cluster`.
-- Own active connectivity records as network-plane state: local probe results plus peer-owned records fetched over authenticated network RPC.
+- Own connectivity graph interpretation for routing. The authoritative published connectivity graph is supplied through the `ClusterDirectory` provider from cluster KV; local probe files are a bootstrap cache before that graph is available, plus the current node's own cold-join records until that source reaches KV.
 
 ### `sinomo-kv`
 
@@ -795,7 +787,7 @@ Responsibilities:
 - Apply object-level ownership, replication, retention, and write policies.
 - Route writes to owning nodes when required.
 - Coordinate confirmed replication for selected objects.
-- Emit `dfs.*` events for writes, reads, conflicts, replication, promotion, and cleanup.
+- Emit `dfs.*` events for writes, reads, replication, promotion, cleanup, and future split-cluster conflicts.
 - Provide workspace snapshots to action, coding, and generation workflows.
 
 ### `sinomo-policy`
@@ -1204,7 +1196,7 @@ Durable DFS metadata should track:
 - Versions and content hashes.
 - Object policies and inherited directory policies.
 - Node locations and replica state.
-- Write intents, leases, receipts, and conflicts.
+- Write intents, leases, receipts, and future split-cluster conflicts.
 - Retention and cleanup state.
 
 Content should remain on local node storage by default. Replication copies content between nodes according to object policy, while durable metadata records what should exist and what has been confirmed.
@@ -1312,7 +1304,7 @@ Merge guidance:
 
 - Prefer append-only event history over destructive updates.
 - Track provenance for every state assertion.
-- Represent uncertainty and conflicts explicitly.
+- Represent uncertainty and non-DFS merge conflicts explicitly; DFS normal-operation writes are serialized by metadata authority and do not create conflict records.
 - Let newer local device state override stale remote state for that device.
 - Use deterministic reducers for replayable state where possible.
 - Use CRDT-style structures for simple shared collections when concurrent edits are expected.
@@ -1340,10 +1332,10 @@ Default behavior:
 - Durable workspace metadata is recorded in Sinomo durable storage.
 - `local-owned` objects route writes to the owner node.
 - `replicated-confirmed` objects require configured write receipts before becoming the visible current version.
-- `replicated-eventual` objects may be visible immediately with pending replica state.
-- Conflict objects are surfaced as first-class workspace entries.
+- `replicated-eventual` objects may be visible after the metadata authority commits the version at the policy threshold, with pending replica state until anti-entropy repair catches up.
+- Future split-cluster conflict objects are surfaced as first-class workspace entries after a reconciliation algorithm exists; normal quorum-backed operation must not create them.
 
-The synchronization layer should keep enough metadata for an agent to know whether a file is local, stale, pending replication, conflicted, or unavailable because another node is offline.
+The synchronization layer should keep enough metadata for an agent to know whether a file is local, stale, pending replication, future split-conflicted, or unavailable because another node is offline.
 
 ### Artifact and Rollout Synchronization
 

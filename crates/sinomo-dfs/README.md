@@ -27,7 +27,7 @@ DFS metadata records the stable identity and visible state of filesystem objects
 - current content hash,
 - current replica locations,
 - policy,
-- conflicts,
+- future split-cluster conflict records,
 - write intents and receipts.
 
 Object identity is stable across path moves. Path operations update namespace metadata, not content identity.
@@ -63,7 +63,7 @@ Large objects are represented as manifests over extents. Full-object writes rema
 - version records,
 - write-intent records,
 - replica receipts,
-- conflict records,
+- future split-cluster conflict records,
 - namespace transactions,
 - recoverable visible-version commits.
 
@@ -112,6 +112,8 @@ Namespace-load and metadata-replication setup use grouped metadata commits by de
 - data-plane DFS network messages.
 
 Distributed writes are coordinated by the responsible metadata-shard primary. A node that receives a write for a shard it does not currently primary routes the request to that primary instead of creating a local intent. The primary creates the persisted intent, stages content to desired replicas, records durable receipts, commits the visible version after the policy threshold, and keeps repair jobs until the desired replica set converges.
+
+Normal quorum-backed DFS operation must not create conflict records. Base-version races and stale writers are serialized at the owner or metadata-shard primary and must retry, reject, remain pending, or fail fast; a conflict record in this path is a correctness bug. Conflict records are reserved for future split-cluster or disconnected-authority recovery and need an explicit reconciliation algorithm before that mode can be enabled.
 
 Replica-side commands are authorized against object ownership, metadata-shard primary state when available, desired replica membership, persisted intent records, and content hashes. Rejected replica commands do not create replica metadata.
 
@@ -328,5 +330,5 @@ Ok(())
 - Treat metadata backend records as the source of restart recovery.
 - Use SOBJ or packed binary formats for internal DFS storage; JSON/JSONL is reserved for CLI output, service display, benchmark artifacts, and legacy migration.
 - Use SIFS path APIs for filesystem-like workflows and object/version APIs for replication, repair, audit, and operator tooling.
-- Prefer explicit conflict records over silent overwrite when base versions do not match.
+- Never create conflict records for normal quorum-backed write races. Reject, retry, keep pending, or fail fast instead. Conflict records are future split-cluster recovery metadata only.
 - Local-owned subtrees remain useful for sensitive or node-specific files even inside the cluster root filesystem.

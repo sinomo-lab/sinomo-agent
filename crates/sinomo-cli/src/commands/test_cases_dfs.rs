@@ -102,7 +102,7 @@ sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_read_your_write(ctx) {
         id: "cluster.dfs.read-your-write",
         summary: "SIFS write/read/rename/delete roundtrip with immediate read-your-write on this node",
-        tags: ["cluster-dfs"],
+        tags: ["cluster-dfs", "cluster-network-dfs-acceptance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_read_your_write(ctx)
@@ -114,7 +114,7 @@ sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_routed_status(ctx) {
         id: "cluster.dfs.routed-status",
         summary: "Route signed DFS status RPCs to every remote main daemon",
-        tags: ["cluster-dfs", "probe", "routing"],
+        tags: ["cluster-dfs", "probe", "routing", "cluster-network-dfs-acceptance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_routed_status(ctx)
@@ -126,7 +126,7 @@ sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_concurrent_file_race(ctx) {
         id: "cluster.dfs.concurrent-file-race",
         summary: "Race two SIFS file writers and verify the final current read is one complete payload",
-        tags: ["cluster-dfs", "probe", "correctness"],
+        tags: ["cluster-dfs", "probe", "correctness", "cluster-network-dfs-acceptance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_concurrent_file_race(ctx)
@@ -138,7 +138,7 @@ sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_concurrent_dir_race(ctx) {
         id: "cluster.dfs.concurrent-dir-race",
         summary: "Race child creation with parent rmdir and verify no orphan child remains",
-        tags: ["cluster-dfs", "probe", "correctness"],
+        tags: ["cluster-dfs", "probe", "correctness", "cluster-network-dfs-acceptance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_concurrent_dir_race(ctx)
@@ -150,7 +150,7 @@ sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_failover_current_read(ctx) {
         id: "cluster.dfs.failover-current-read",
         summary: "Verify a current SIFS read refreshes after another writer advances the visible version",
-        tags: ["cluster-dfs", "probe", "correctness"],
+        tags: ["cluster-dfs", "probe", "correctness", "cluster-network-dfs-acceptance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_failover_current_read(ctx)
@@ -162,7 +162,7 @@ sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_invariants(ctx) {
         id: "cluster.dfs.invariants",
         summary: "SIFS operational invariants: no open conflicts, stuck routed ops, or leaked cross-shard locks",
-        tags: ["cluster-dfs"],
+        tags: ["cluster-dfs", "cluster-network-dfs-acceptance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_invariants(ctx)
@@ -174,7 +174,7 @@ sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_lightweight_latency(ctx) {
         id: "cluster.dfs.lightweight-latency",
         summary: "Measure warmed SIFS stat/list/read-prefix latency for lightweight file-browser operations",
-        tags: ["cluster-dfs", "probe", "performance"],
+        tags: ["cluster-dfs", "probe", "performance", "cluster-network-dfs-acceptance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_lightweight_latency(ctx)
@@ -394,7 +394,14 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
 fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let timeout_ms = optional_u64_parameter(ctx, "timeout-ms")?.unwrap_or(5_000);
+    let timeout = expect_timeout(ctx)?;
     let expected_targets = optional_usize_parameter(ctx, "expected-targets", 1)?;
+    let max_remote_open_conflicts =
+        optional_usize_parameter(ctx, "max-remote-open-conflicts", usize::MAX)?;
+    let max_remote_pending_writes =
+        optional_usize_parameter(ctx, "max-remote-pending-writes", usize::MAX)?;
+    let max_remote_pending_repairs =
+        optional_usize_parameter(ctx, "max-remote-pending-repairs", usize::MAX)?;
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let cluster_paths = ClusterPaths::new(&data_dir);
     super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
@@ -426,38 +433,66 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .with_timeout(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1)));
     let request = dfs::dfs_status_rpc_request()
         .map_err(|source| SinomoTestError::failed(source.to_string()))?;
-    let mut statuses = BTreeMap::new();
-    let mut failures = Vec::new();
-    for target in &targets {
-        match daemon_client.object_rpc_to_target(
-            target,
-            &request,
-            Duration::from_millis(timeout_ms),
-            true,
-        ) {
-            Ok(response) => match dfs::decode_dfs_status_rpc_response(&response) {
-                Ok(status) => {
-                    statuses.insert(target.to_string(), dfs_status_probe_summary(&status));
-                }
-                Err(error) => failures.push(format!("{target}: decode failed: {error}")),
-            },
-            Err(error) => failures.push(format!("{target}: {error}")),
-        }
-    }
-    ctx.record("statuses", statuses);
-    if !failures.is_empty() {
-        ctx.record("failures", failures.clone());
-        return Ok(SinomoTestOutcome::failed(format!(
-            "DFS routed status failed for {}/{} targets",
-            failures.len(),
-            targets.len()
-        )));
-    }
 
-    Ok(SinomoTestOutcome::passed(format!(
-        "DFS routed status succeeded for {} remote main daemon(s)",
-        targets.len()
-    )))
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut attempts = 0usize;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let mut statuses = BTreeMap::new();
+        let mut failures = Vec::new();
+        for target in &targets {
+            match daemon_client.object_rpc_to_target(
+                target,
+                &request,
+                Duration::from_millis(timeout_ms),
+                true,
+            ) {
+                Ok(response) => match dfs::decode_dfs_status_rpc_response(&response) {
+                    Ok(status) => {
+                        statuses.insert(target.to_string(), dfs_status_probe_summary(&status));
+                    }
+                    Err(error) => failures.push(format!("{target}: decode failed: {error}")),
+                },
+                Err(error) => failures.push(format!("{target}: {error}")),
+            }
+        }
+        let dirty_statuses = routed_status_dirty_summaries(
+            &statuses,
+            max_remote_open_conflicts,
+            max_remote_pending_writes,
+            max_remote_pending_repairs,
+        );
+        if failures.is_empty() && dirty_statuses.is_empty() {
+            ctx.record("statuses", &statuses);
+            ctx.record("attempts", attempts);
+            ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+            return Ok(SinomoTestOutcome::passed(format!(
+                "DFS routed status succeeded for {} remote main daemon(s)",
+                targets.len()
+            )));
+        }
+        if Instant::now() >= deadline {
+            ctx.record("statuses", &statuses);
+            ctx.record("attempts", attempts);
+            ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+            if !failures.is_empty() {
+                ctx.record("failures", failures.clone());
+                return Ok(SinomoTestOutcome::failed(format!(
+                    "DFS routed status failed for {}/{} targets",
+                    failures.len(),
+                    targets.len()
+                )));
+            }
+            ctx.record("dirty_statuses", dirty_statuses.clone());
+            return Ok(SinomoTestOutcome::failed(format!(
+                "DFS routed status found dirty status on {}/{} target(s)",
+                dirty_statuses.len(),
+                targets.len()
+            )));
+        }
+        std::thread::sleep(EXPECT_POLL_INTERVAL);
+    }
 }
 
 fn dfs_routed_status_targets_from_state(
@@ -489,6 +524,32 @@ fn dfs_status_probe_summary(status: &DfsOperatorStatus) -> BTreeMap<&'static str
     ])
 }
 
+fn routed_status_dirty_summaries(
+    statuses: &BTreeMap<String, BTreeMap<&'static str, u64>>,
+    max_remote_open_conflicts: usize,
+    max_remote_pending_writes: usize,
+    max_remote_pending_repairs: usize,
+) -> Vec<String> {
+    statuses
+        .iter()
+        .filter_map(|(target, status)| {
+            let open_conflicts = *status.get("open_conflicts").unwrap_or(&0);
+            let pending_writes = *status.get("pending_writes").unwrap_or(&0);
+            let pending_repairs = *status.get("pending_repairs").unwrap_or(&0);
+            if open_conflicts > max_remote_open_conflicts as u64
+                || pending_writes > max_remote_pending_writes as u64
+                || pending_repairs > max_remote_pending_repairs as u64
+            {
+                Some(format!(
+                    "{target}: open_conflicts={open_conflicts}, pending_writes={pending_writes}, pending_repairs={pending_repairs}"
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn run_concurrent_file_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let base = ctx
         .parameter("base")
@@ -504,6 +565,9 @@ fn run_concurrent_file_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let seed = vec![b'A'; 4096];
     let writer_a = vec![b'B'; 4096];
     let writer_b = vec![b'C'; 4096];
+    backend
+        .create_dir_all(&base)
+        .map_err(SinomoTestError::failed)?;
     backend
         .write_file(&path, &seed)
         .map_err(SinomoTestError::failed)?;
@@ -543,9 +607,35 @@ fn run_concurrent_file_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             })
             .collect::<Vec<_>>(),
     );
+    let successful_writers = results
+        .iter()
+        .filter(|(_, result, _)| result.is_ok())
+        .count();
+    let writer_errors = results
+        .iter()
+        .filter_map(|(label, result, _)| {
+            result
+                .as_ref()
+                .err()
+                .map(|error| format!("{label}: {error}"))
+        })
+        .collect::<Vec<_>>();
+    ctx.record("successful_writers", successful_writers);
+    if !writer_errors.is_empty() {
+        ctx.record("writer_errors", writer_errors.clone());
+        return Ok(SinomoTestOutcome::failed(format!(
+            "concurrent file race on {node} hit writer errors at {path}"
+        )));
+    }
+    if successful_writers != results.len() {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "concurrent file race on {node} committed {successful_writers}/{} writers at {path}",
+            results.len()
+        )));
+    }
 
     let deadline = started + timeout;
-    let valid = [&seed, &writer_a, &writer_b];
+    let valid = [&writer_a, &writer_b];
     loop {
         let read = backend.read_file(&path).map_err(SinomoTestError::failed)?;
         if valid
@@ -554,13 +644,6 @@ fn run_concurrent_file_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         {
             ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
             ctx.record("final_bytes", read.len());
-            ctx.record(
-                "successful_writers",
-                results
-                    .iter()
-                    .filter(|(_, result, _)| result.is_ok())
-                    .count(),
-            );
             return Ok(SinomoTestOutcome::passed(format!(
                 "concurrent file race on {node} ended with one complete payload at {path}"
             )));
@@ -587,6 +670,9 @@ fn run_concurrent_dir_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let nonce = probe_nonce();
     let dir = format!("{base}/dir-race-{nonce}");
     let child = format!("{dir}/child.txt");
+    backend
+        .create_dir_all(&base)
+        .map_err(SinomoTestError::failed)?;
     backend.create_dir(&dir).map_err(SinomoTestError::failed)?;
     ctx.record("node", &node);
     ctx.record("dir", &dir);

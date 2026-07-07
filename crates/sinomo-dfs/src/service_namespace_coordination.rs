@@ -66,6 +66,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         operation: &DfsNamespaceOperation,
     ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
+        match operation {
+            DfsNamespaceOperation::LookupPath { path }
+            | DfsNamespaceOperation::SyncPath { path } => {
+                return self.namespace_shards_for_exact_paths(file_system_id, [path.as_str()]);
+            }
+            DfsNamespaceOperation::LookupPaths { paths } => {
+                return self.namespace_shards_for_exact_paths(
+                    file_system_id,
+                    paths.iter().map(String::as_str),
+                );
+            }
+            _ => {}
+        }
         if let DfsNamespaceOperation::ApplyTransaction { transaction } = operation {
             return self.affected_namespace_transaction_shards(file_system_id, transaction);
         }
@@ -78,6 +91,50 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 {
                     shards.push(shard);
                 }
+            }
+        }
+        Ok(shards)
+    }
+
+    /// The shard(s) directly covering read-only namespace paths.
+    ///
+    /// Lookup and sync operations do not mutate parent directory records. If a
+    /// split-prefix path and its parent are owned by different primaries, using
+    /// the broader mutation shard set can make primaries redirect a read-only
+    /// request back and forth forever.
+    fn namespace_shards_for_exact_paths<'a>(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
+        if self.control_plane.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut shards: Vec<DfsMetadataShardConfig> = Vec::new();
+        for path in paths {
+            let normalized = posix_path::normalized_posix_path_key(path).ok_or_else(|| {
+                DfsError::Distributed {
+                    message: format!("invalid namespace operation path: {path}"),
+                }
+            })?;
+            let kv = self
+                .control_plane
+                .as_mut()
+                .expect("control plane checked above");
+            let Some(shard) = DfsControlPlaneStore::new(kv.as_mut())
+                .select_metadata_shard_for_path_strict_default_sifs_split(
+                    file_system_id,
+                    &normalized,
+                )
+                .map_err(DfsError::from)?
+            else {
+                continue;
+            };
+            if !shards
+                .iter()
+                .any(|existing| existing.shard_id == shard.shard_id)
+            {
+                shards.push(shard);
             }
         }
         Ok(shards)

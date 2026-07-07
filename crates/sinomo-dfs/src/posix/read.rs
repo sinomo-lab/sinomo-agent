@@ -212,10 +212,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut results = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
         let mut grouped = BTreeMap::<NodeId, Vec<PosixPendingBulkRead>>::new();
 
-        self.prefetch_sifs_paths_for_bulk_read(paths);
+        let prefetched_objects = self.prefetch_sifs_paths_for_bulk_read(paths);
 
         for (index, input_path) in paths.iter().enumerate() {
-            match self.prepare_posix_bulk_read(input_path, index) {
+            match self.prepare_posix_bulk_read(input_path, index, &prefetched_objects) {
                 Ok(PosixBulkReadPlan::Local(bytes)) => {
                     results[index] = Some(Ok(bytes));
                 }
@@ -267,13 +267,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .collect()
     }
 
-    fn prefetch_sifs_paths_for_bulk_read(&mut self, paths: &[String]) {
+    fn prefetch_sifs_paths_for_bulk_read(
+        &mut self,
+        paths: &[String],
+    ) -> BTreeMap<String, DfsObjectMetadata> {
         if paths.len() <= 1 {
-            return;
+            return BTreeMap::new();
         }
         let trace_started = Instant::now();
         let mut grouped = BTreeMap::<NodeId, Vec<String>>::new();
         let mut seen = BTreeSet::<(NodeId, String)>::new();
+        let mut prefetched = BTreeMap::new();
         for input_path in paths {
             let resolved = match self.resolve_existing_posix_path_distributed(input_path, true) {
                 Ok(resolved) => resolved,
@@ -303,7 +307,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         if grouped.is_empty() {
-            return;
+            return prefetched;
         }
         let mut requested_paths = 0_usize;
         let mut returned_objects = 0_usize;
@@ -317,7 +321,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ) {
                 returned_objects = returned_objects.saturating_add(objects.len());
                 for object in objects {
-                    let _ = self.metadata.add_object(object);
+                    prefetched.insert(object.path.clone(), object);
                 }
             }
         }
@@ -327,14 +331,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             returned_objects,
             trace_started.elapsed().as_millis()
         ));
+        prefetched
     }
 
     fn prepare_posix_bulk_read(
         &mut self,
         input_path: &str,
         index: usize,
+        prefetched_objects: &BTreeMap<String, DfsObjectMetadata>,
     ) -> Result<PosixBulkReadPlan> {
-        let (path, object) = self.distributed_posix_file_content_object(input_path, true)?;
+        let resolved = self.resolve_existing_posix_path_distributed(input_path, true)?;
+        let (path, object) = match prefetched_objects.get(&resolved) {
+            Some(object) => self.posix_file_content_object(resolved, object.clone())?,
+            None => self.distributed_posix_file_content_object(input_path, true)?,
+        };
+        self.prepare_posix_bulk_read_for_object(path, object, index)
+    }
+
+    fn prepare_posix_bulk_read_for_object(
+        &mut self,
+        path: String,
+        object: DfsObjectMetadata,
+        index: usize,
+    ) -> Result<PosixBulkReadPlan> {
         match self.read_object_metadata_local_if_current_location(&object)? {
             NetworkedDfsReadOutcome::Found {
                 data: DfsReadData { bytes, .. },

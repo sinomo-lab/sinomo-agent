@@ -150,16 +150,6 @@ where
         ClusterKvTxnQuorumHost::known_kv_state_authority_id(self, paths, state)
     }
 
-    fn call_endpoint_object_rpc(
-        &mut self,
-        state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
-        request: &ObjectRpcRequest,
-        timeout: Duration,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        ClusterKvTxnQuorumHost::call_endpoint_object_rpc(self, state, endpoint, request, timeout)
-    }
-
     fn call_node_object_rpc(
         &mut self,
         state: &ClusterBootstrapState,

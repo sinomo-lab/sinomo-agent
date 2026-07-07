@@ -274,6 +274,8 @@ pub enum DfsConfirmedTimeoutOutcome {
 pub struct DfsReconnectReconciliation {
     pub object_id: DfsObjectId,
     pub refreshed_receipts: usize,
+    #[serde(default)]
+    pub ignored_divergent_manifests: usize,
     pub conflicts: Vec<DfsConflictRecord>,
     pub missing_current: bool,
 }

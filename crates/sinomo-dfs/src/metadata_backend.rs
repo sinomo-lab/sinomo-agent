@@ -32,6 +32,7 @@ use crate::metadata_lock::{MetadataWriteLock, metadata_write_lock};
 use crate::metadata_namespace_transaction::{
     plan_namespace_transaction_recovery_table_ops,
     plan_namespace_transaction_table_ops as namespace_transaction_table_ops,
+    validate_namespace_transaction_preconditions,
 };
 use crate::metadata_object_index::object_index_table_ops_with_previous as plan_object_index_table_ops_with_previous;
 use crate::metadata_pages::{
@@ -1868,6 +1869,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         }
 
         let transaction = normalized_namespace_transaction(transaction);
+        validate_namespace_transaction_preconditions(&self.tables, &transaction)?;
         let table_ops = namespace_transaction_table_ops(&self.tables, &transaction);
         self.write_journal_entry_and_apply_table_ops_unlocked(
             DfsMetadataMutation::ApplyNamespaceTransaction {

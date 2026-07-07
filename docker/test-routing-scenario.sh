@@ -82,10 +82,10 @@ require_no_other_sinomo_projects() {
 collect_artifacts() {
   log "collecting artifacts in $ARTIFACTS"
   compose ps > "$ARTIFACTS/compose-ps.txt" 2>&1 || true
-  compose exec -T node1 sinomo cluster health > "$ARTIFACTS/cluster-health-node1.txt" 2>&1 || true
-  compose exec -T node1 sinomo cluster doctor > "$ARTIFACTS/cluster-doctor-node1.txt" 2>&1 || true
-  compose exec -T node1 sinomo cluster connectivity > "$ARTIFACTS/cluster-connectivity-node1.txt" 2>&1 || true
   for node in $NODES; do
+    compose exec -T "$node" sinomo cluster health > "$ARTIFACTS/cluster-health-$node.txt" 2>&1 || true
+    compose exec -T "$node" sinomo cluster doctor > "$ARTIFACTS/cluster-doctor-$node.txt" 2>&1 || true
+    compose exec -T "$node" sinomo cluster connectivity > "$ARTIFACTS/cluster-connectivity-$node.txt" 2>&1 || true
     compose logs --no-color "$node" > "$ARTIFACTS/$node.log" 2>&1 || true
   done
 }
@@ -230,6 +230,22 @@ run_probe() {
   return 1
 }
 
+run_tag_probe() {
+  local node="$1" tag="$2" slug probe_log
+  shift 2
+  PROBE_INDEX=$((PROBE_INDEX + 1))
+  slug="$(printf '%03d' "$PROBE_INDEX")-$node-tag-${tag//[^a-zA-Z0-9._-]/_}"
+  probe_log="$ARTIFACTS/probe-$slug.json"
+  if compose exec -T "$node" sinomo test run --tag "$tag" --require-cluster --json "$@" \
+      >"$probe_log" 2>&1; then
+    log "  ok: $node tag:$tag"
+    return 0
+  fi
+  log "  FAILED: $node tag:$tag $*"
+  sed 's/^/[routing-scenario]   /' "$probe_log"
+  return 1
+}
+
 run_network_probe() {
   local node="$1"
   run_probe "$node" cluster.network.ping-benchmark \
@@ -265,10 +281,51 @@ run_network_payload_probe() {
     --param "min-payload-bytes-per-second=$NETWORK_PAYLOAD_MIN_BYTES_PER_SEC"
 }
 
+run_network_hygiene_probe() {
+  local node="$1"
+  run_probe "$node" cluster.network.hygiene \
+    --param expected-targets=2 \
+    --param max-findings=0 \
+    --param require-active-routes=true
+}
+
+run_network_hygiene_dirty_fixture_probe() {
+  local node="$1"
+  run_probe "$node" cluster.network.hygiene-dirty-fixture \
+    --param expected-targets=2
+}
+
+run_network_dfs_acceptance_probe() {
+  local node="$1"
+  run_tag_probe "$node" cluster-network-dfs-acceptance \
+    --param expected-targets=2 \
+    --param max-findings=0 \
+    --param require-active-routes=true \
+    --param max-remote-open-conflicts=0 \
+    --param max-remote-pending-writes=0 \
+    --param max-remote-pending-repairs=0 \
+    --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT" \
+    --param "requests-per-target=$NETWORK_REQUESTS_PER_TARGET" \
+    --param "warmup-requests-per-target=$NETWORK_WARMUP_REQUESTS_PER_TARGET" \
+    --param "concurrency=$NETWORK_CONCURRENCY" \
+    --param max-failures=0 \
+    --param max-p50-ms=1000 \
+    --param max-p95-ms=3000 \
+    --param max-p50-us=0 \
+    --param max-p95-us=0 \
+    --param "iterations=$CONCURRENT_DFS_LATENCY_ITERATIONS" \
+    --param warmup-iterations=8 \
+    --param min-requests-per-second=1
+}
+
 run_dfs_routed_status_probe() {
   local node="$1"
   run_probe "$node" cluster.dfs.routed-status \
     --param expected-targets=2 \
+    --param max-remote-open-conflicts=0 \
+    --param max-remote-pending-writes=0 \
+    --param max-remote-pending-repairs=0 \
     --param "timeout-ms=$NETWORK_TIMEOUT_MS"
 }
 
@@ -500,11 +557,15 @@ run_network_probe node3
 run_network_payload_probe node1
 run_network_payload_probe node2
 run_network_payload_probe node3
+run_network_hygiene_dirty_fixture_probe node1
+wait_for_dfs_ready
+run_network_dfs_acceptance_probe node1
+run_network_dfs_acceptance_probe node2
+run_network_dfs_acceptance_probe node3
 run_dfs_routed_status_probe node1
 run_dfs_routed_status_probe node2
 run_dfs_routed_status_probe node3
 assert_forwarded_endpoint_active
-wait_for_dfs_ready
 run_concurrent_duplex_dfs_probe
 run_cross_segment_dfs
 run_large_routed_dfs

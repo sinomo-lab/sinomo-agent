@@ -55,6 +55,10 @@ const CROSS_SHARD_MOVE_VERSION_HISTORY_LIMIT: usize = 32;
 /// Follow-up sync rounds a routed-operation wrapper performs when bounded
 /// response replay has not yet surfaced the mutation locally.
 const POSIX_ROUTED_SYNC_RETRY_ROUNDS: usize = 4;
+/// Whole-file POSIX writes are blind overwrites, not user-supplied CAS writes.
+/// If another local service instance advanced the metadata between lookup and
+/// commit, refresh from the backend and retry against the current version.
+const POSIX_WRITE_STALE_BASE_RETRY_ROUNDS: usize = 4;
 /// Budget for the best-effort freshness pull a distributed read performs on
 /// foreign-shard paths; reads fall back to the local mirror when it elapses.
 const POSIX_READ_FRESHNESS_SYNC_TIMEOUT: Duration = Duration::from_secs(3);
@@ -74,6 +78,14 @@ struct PosixBulkLocalWrite<'a> {
 struct PosixBulkParentTouch {
     path: String,
     metadata_primary: Option<NodeId>,
+}
+
+fn posix_error_is_stale_write_base(error: &DfsPosixError) -> bool {
+    matches!(
+        error,
+        DfsPosixError::Dfs(DfsError::Distributed { message })
+            if message.contains("stale DFS write base")
+    )
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -700,6 +712,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn posix_write_file_bytes_checked_parent(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        check_parent: bool,
+        touch_parent_on_create: bool,
+        replay_response_journal: bool,
+    ) -> Result<DfsStat> {
+        let mut last_stale_base = None;
+        for attempt in 0..=POSIX_WRITE_STALE_BASE_RETRY_ROUNDS {
+            match self.posix_write_file_bytes_checked_parent_once(
+                path,
+                bytes,
+                options.clone(),
+                check_parent,
+                touch_parent_on_create,
+                replay_response_journal,
+            ) {
+                Ok(stat) => return Ok(stat),
+                Err(error)
+                    if attempt < POSIX_WRITE_STALE_BASE_RETRY_ROUNDS
+                        && posix_error_is_stale_write_base(&error) =>
+                {
+                    last_stale_base = Some(error);
+                    self.hydrate_from_metadata_backend()?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_stale_base.unwrap_or_else(|| {
+            DfsPosixError::Dfs(DfsError::Distributed {
+                message: "stale DFS write base retry exhausted".to_string(),
+            })
+        }))
+    }
+
+    fn posix_write_file_bytes_checked_parent_once(
         &mut self,
         path: &str,
         bytes: &[u8],
@@ -1394,11 +1444,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } => bytes,
             NetworkedDfsReadOutcome::PendingReplication { .. }
             | NetworkedDfsReadOutcome::NotConfirmed { .. } => {
-                return Err(DfsPosixError::Conflict {
-                    path,
-                    reason: "current file content is not locally available for ranged write; retry"
-                        .to_string(),
-                });
+                return Err(DfsError::Busy { path }.into());
             }
             NetworkedDfsReadOutcome::NotFound => return Err(DfsPosixError::NotFound { path }),
             NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
@@ -1501,11 +1547,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } => bytes,
             NetworkedDfsReadOutcome::PendingReplication { .. }
             | NetworkedDfsReadOutcome::NotConfirmed { .. } => {
-                return Err(DfsPosixError::Conflict {
-                    path,
-                    reason: "current file content is not locally available for truncate; retry"
-                        .to_string(),
-                });
+                return Err(DfsError::Busy { path }.into());
             }
             NetworkedDfsReadOutcome::NotFound => return Err(DfsPosixError::NotFound { path }),
             NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {

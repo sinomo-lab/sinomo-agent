@@ -1,14 +1,13 @@
-//! Conflict records and reconnect reconciliation for DFS services.
+//! Future split-recovery conflict records and reconnect reconciliation for DFS services.
 //!
-//! This module keeps conflict publication, conflict lookup, and reconnect-time
-//! local manifest reconciliation together. Conflict records are part of DFS
-//! metadata, so the service always merges the in-memory view with backend pages
-//! through one bounded collector.
+//! This module keeps future split-recovery conflict metadata, conflict lookup,
+//! and reconnect-time local manifest reconciliation together. Normal
+//! quorum-backed DFS operation must not mint conflict records; reconnect only
+//! trusts authoritative metadata and ignores divergent local manifests.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use sinomo_core::node::NodeId;
 use time::OffsetDateTime;
 
 use crate::intent::write_intent_status_is_active;
@@ -337,10 +336,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Reconciles locally stored manifests for an object after reconnect.
     ///
-    /// Matching current-version content refreshes local replica receipts. Local
-    /// manifests that do not match the authoritative current or historical
-    /// backend version become open conflict records instead of overwriting the
-    /// visible object.
+    /// Matching current-version content refreshes local replica receipts.
+    /// Local manifests that do not match the authoritative current or
+    /// historical backend version are ignored as divergent local content. They
+    /// do not overwrite the visible object and do not become DFS conflicts
+    /// during normal quorum-backed operation.
     pub fn reconcile_local_manifests(
         &mut self,
         object_id: &DfsObjectId,
@@ -350,7 +350,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .content
             .manifests_for_object(object.object_id.as_str())?;
         let mut refreshed_receipts = 0;
-        let mut conflicts = Vec::new();
+        let mut ignored_divergent_manifests = 0usize;
         let mut has_current_manifest = false;
 
         for manifest in manifests {
@@ -391,83 +391,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         }
                     }
                 } else {
-                    conflicts.push(self.create_write_conflict(
-                        &object,
-                        Some(object.version.clone()),
-                        manifest_version,
-                        self.node_id.clone(),
-                        Some(manifest.content_hash),
-                        "local current-version manifest hash diverged during reconnect".to_string(),
-                        None,
-                    )?);
+                    ignored_divergent_manifests = ignored_divergent_manifests.saturating_add(1);
                 }
             } else if !self.local_manifest_is_known_historical_version(
                 &object.object_id,
                 &manifest_version,
                 &manifest.content_hash,
             )? {
-                conflicts.push(self.create_write_conflict(
-                    &object,
-                    Some(object.version.clone()),
-                    manifest_version,
-                    self.node_id.clone(),
-                    Some(manifest.content_hash),
-                    "local non-visible manifest diverged during reconnect".to_string(),
-                    None,
-                )?);
+                ignored_divergent_manifests = ignored_divergent_manifests.saturating_add(1);
             }
         }
 
         Ok(DfsReconnectReconciliation {
             object_id: object.object_id.clone(),
             refreshed_receipts,
-            conflicts,
+            ignored_divergent_manifests,
+            conflicts: Vec::new(),
             missing_current: object.content_hash.is_some() && !has_current_manifest,
         })
     }
 
-    pub(crate) fn create_write_conflict(
-        &mut self,
-        object: &DfsObjectMetadata,
-        base_version: Option<DfsVersion>,
-        local_version: DfsVersion,
-        detected_by_node_id: NodeId,
-        local_content_hash: Option<String>,
-        reason: String,
-        created_by_intent_id: Option<String>,
-    ) -> Result<DfsConflictRecord, DfsError> {
-        let conflict_id = conflict_id_for(
-            &object.object_id,
-            &local_version,
-            local_content_hash.as_deref(),
-            &detected_by_node_id,
-        );
-        if let Some(existing) =
-            self.get_conflict_from_memory_or_backend(&object.object_id, &conflict_id)?
-        {
-            return Ok(existing);
-        }
-        let conflict = DfsConflictRecord {
-            conflict_id,
-            file_system_id: object.file_system_id.clone(),
-            object_id: object.object_id.clone(),
-            path: object.path.clone(),
-            base_version,
-            local_version,
-            remote_version: object.version.clone(),
-            detected_by_node_id,
-            reason,
-            local_content_hash,
-            remote_content_hash: object.content_hash.clone(),
-            created_by_intent_id,
-            strategy: Some("branch".to_string()),
-            status: DfsConflictStatus::Open,
-            detected_at: OffsetDateTime::now_utc(),
-        };
-        self.put_conflict_record(&conflict)?;
-        Ok(conflict)
-    }
-
+    #[cfg(test)]
     pub(crate) fn put_conflict_record(
         &mut self,
         conflict: &DfsConflictRecord,
@@ -539,23 +483,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         Ok(conflicts.into_values().collect())
-    }
-
-    fn get_conflict_from_memory_or_backend(
-        &self,
-        object_id: &DfsObjectId,
-        conflict_id: &str,
-    ) -> Result<Option<DfsConflictRecord>, DfsError> {
-        if let Some(backend) = self.metadata_backend.as_ref()
-            && let Some(conflict) = backend.get_conflict(object_id, conflict_id)?
-        {
-            return Ok(Some(conflict));
-        }
-        Ok(self
-            .metadata
-            .conflicts_for_object(object_id)
-            .into_iter()
-            .find(|conflict| conflict.conflict_id == conflict_id))
     }
 
     fn local_manifest_is_known_historical_version(

@@ -18,6 +18,19 @@ use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use crate::transfer::{PendingNetworkedWrite, PendingNetworkedWritePatch};
 use crate::*;
 
+fn stale_write_base_error(
+    object: &DfsObjectMetadata,
+    expected_base_version: &DfsVersion,
+    target_version: &DfsVersion,
+) -> DfsError {
+    DfsError::Distributed {
+        message: format!(
+            "stale DFS write base for {}: expected {}, current {}, command {}",
+            object.object_id, expected_base_version, object.version, target_version
+        ),
+    }
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn plan_distributed_eventual_replicas(
         &self,
@@ -387,19 +400,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Ok(intent) => intent,
             Err(error)
                 if object.policy == DfsObjectPolicy::ReplicatedEventual
-                    && distributed_error_creates_conflict(&error) =>
+                    && distributed_error_is_stale_or_concurrent_write(&error) =>
             {
-                let conflict_content_hash = manifest.content_hash.clone();
-                let conflict = self.create_write_conflict(
-                    &object,
-                    Some(expected_base_version),
-                    request.target_version.clone(),
-                    request.requesting_node_id.clone(),
-                    Some(conflict_content_hash),
-                    error.to_string(),
-                    None,
-                )?;
-                return Ok(Some(NetworkedDfsWriteOutcome::Conflict { conflict }));
+                return Ok(None);
             }
             Err(error) => return Err(error.into()),
         };
@@ -577,19 +580,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Ok(intent) => intent,
             Err(error)
                 if object.policy == DfsObjectPolicy::ReplicatedEventual
-                    && distributed_error_creates_conflict(&error) =>
+                    && distributed_error_is_stale_or_concurrent_write(&error) =>
             {
-                let conflict_content_hash = manifest.content_hash.clone();
-                let conflict = self.create_write_conflict(
-                    &object,
-                    Some(expected_base_version),
-                    request.target_version.clone(),
-                    request.requesting_node_id.clone(),
-                    Some(conflict_content_hash),
-                    error.to_string(),
-                    None,
-                )?;
-                return Ok(Some(NetworkedDfsWriteOutcome::Conflict { conflict }));
+                return Ok(None);
             }
             Err(error) => return Err(error.into()),
         };
@@ -940,18 +933,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .as_ref()
             .is_some_and(|expected| expected != &object.version)
         {
-            let local_content_hash =
-                self.store_conflicting_write_reader_content_hash(&request, reader)?;
-            let conflict = self.create_write_conflict(
+            let expected = expected_base_version
+                .as_ref()
+                .expect("checked expected base");
+            return Err(stale_write_base_error(
                 &object,
-                expected_base_version,
-                request.target_version.clone(),
-                request.requesting_node_id.clone(),
-                local_content_hash,
-                "base version conflict for distributed write".to_string(),
-                None,
-            )?;
-            return Ok(NetworkedDfsWriteOutcome::Conflict { conflict });
+                expected,
+                &request.target_version,
+            ));
         }
 
         if let Err(error) = self.ensure_no_backend_pending_write_intent(
@@ -959,22 +948,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &request.target_version,
             None,
         ) {
-            if object.policy == DfsObjectPolicy::ReplicatedEventual
-                && distributed_error_creates_conflict(&error)
-            {
-                let local_content_hash =
-                    self.store_conflicting_write_reader_content_hash(&request, reader)?;
-                let conflict = self.create_write_conflict(
-                    &object,
-                    expected_base_version,
-                    request.target_version.clone(),
-                    request.requesting_node_id.clone(),
-                    local_content_hash,
-                    error.to_string(),
-                    None,
-                )?;
-                return Ok(NetworkedDfsWriteOutcome::Conflict { conflict });
-            }
             return Err(error.into());
         }
 
@@ -986,22 +959,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &desired_replica_nodes,
             &policy,
         ) {
-            if object.policy == DfsObjectPolicy::ReplicatedEventual
-                && distributed_error_creates_conflict(&error)
-            {
-                let local_content_hash =
-                    self.store_conflicting_write_reader_content_hash(&request, reader)?;
-                let conflict = self.create_write_conflict(
-                    &object,
-                    expected_base_version,
-                    request.target_version.clone(),
-                    request.requesting_node_id.clone(),
-                    local_content_hash,
-                    error.to_string(),
-                    None,
-                )?;
-                return Ok(NetworkedDfsWriteOutcome::Conflict { conflict });
-            }
             return Err(error.into());
         }
 
@@ -1061,18 +1018,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Ok(intent) => intent,
             Err(error)
                 if object.policy == DfsObjectPolicy::ReplicatedEventual
-                    && distributed_error_creates_conflict(&error) =>
+                    && distributed_error_is_stale_or_concurrent_write(&error) =>
             {
-                let conflict = self.create_write_conflict(
-                    &object,
-                    expected_base_version,
-                    request.target_version.clone(),
-                    request.requesting_node_id.clone(),
-                    Some(manifest.content_hash.clone()),
-                    error.to_string(),
-                    None,
-                )?;
-                return Ok(NetworkedDfsWriteOutcome::Conflict { conflict });
+                return Err(error.into());
             }
             Err(error) => return Err(error.into()),
         };
@@ -1203,16 +1151,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .as_ref()
             .is_some_and(|expected| expected != &object.version)
         {
-            let conflict = self.create_write_conflict(
+            let expected = expected_base_version
+                .as_ref()
+                .expect("checked expected base");
+            return Err(stale_write_base_error(
                 &object,
-                expected_base_version,
-                request.target_version.clone(),
-                request.requesting_node_id.clone(),
-                Some(content_hash),
-                "base version conflict for distributed write".to_string(),
-                None,
-            )?;
-            return Ok(NetworkedDfsWriteOutcome::Conflict { conflict });
+                expected,
+                &request.target_version,
+            ));
         }
 
         if let Err(error) = self.ensure_no_backend_pending_write_intent(
@@ -1220,20 +1166,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &request.target_version,
             None,
         ) {
-            if object.policy == DfsObjectPolicy::ReplicatedEventual
-                && distributed_error_creates_conflict(&error)
-            {
-                let conflict = self.create_write_conflict(
-                    &object,
-                    expected_base_version,
-                    request.target_version.clone(),
-                    request.requesting_node_id.clone(),
-                    Some(content_hash),
-                    error.to_string(),
-                    None,
-                )?;
-                return Ok(NetworkedDfsWriteOutcome::Conflict { conflict });
-            }
             return Err(error.into());
         }
 
@@ -1245,20 +1177,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &desired_replica_nodes,
             &policy,
         ) {
-            if object.policy == DfsObjectPolicy::ReplicatedEventual
-                && distributed_error_creates_conflict(&error)
-            {
-                let conflict = self.create_write_conflict(
-                    &object,
-                    expected_base_version,
-                    request.target_version.clone(),
-                    request.requesting_node_id.clone(),
-                    Some(content_hash),
-                    error.to_string(),
-                    None,
-                )?;
-                return Ok(NetworkedDfsWriteOutcome::Conflict { conflict });
-            }
             return Err(error.into());
         }
 
@@ -1276,18 +1194,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Ok(intent) => intent,
             Err(error)
                 if object.policy == DfsObjectPolicy::ReplicatedEventual
-                    && distributed_error_creates_conflict(&error) =>
+                    && distributed_error_is_stale_or_concurrent_write(&error) =>
             {
-                let conflict = self.create_write_conflict(
-                    &object,
-                    expected_base_version,
-                    request.target_version.clone(),
-                    request.requesting_node_id.clone(),
-                    Some(content_hash),
-                    error.to_string(),
-                    None,
-                )?;
-                return Ok(NetworkedDfsWriteOutcome::Conflict { conflict });
+                return Err(error.into());
             }
             Err(error) => return Err(error.into()),
         };
@@ -1483,17 +1392,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .as_ref()
             .is_some_and(|expected| expected != &object.version)
         {
-            let local_content_hash = self.store_conflicting_write_content_hash(&request, &bytes)?;
-            let conflict = self.create_write_conflict(
+            let expected = expected_base_version
+                .as_ref()
+                .expect("checked expected base");
+            return Err(stale_write_base_error(
                 &object,
-                expected_base_version,
-                request.target_version.clone(),
-                request.requesting_node_id.clone(),
-                local_content_hash,
-                "base version conflict for distributed write".to_string(),
-                None,
-            )?;
-            return Ok(NetworkedDfsWriteOutcome::Conflict { conflict });
+                expected,
+                &request.target_version,
+            ));
         }
 
         if let Err(error) = self.ensure_no_backend_pending_write_intent(
@@ -1501,22 +1407,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &request.target_version,
             None,
         ) {
-            if object.policy == DfsObjectPolicy::ReplicatedEventual
-                && distributed_error_creates_conflict(&error)
-            {
-                let local_content_hash =
-                    self.store_conflicting_write_content_hash(&request, &bytes)?;
-                let conflict = self.create_write_conflict(
-                    &object,
-                    expected_base_version,
-                    request.target_version.clone(),
-                    request.requesting_node_id.clone(),
-                    local_content_hash,
-                    error.to_string(),
-                    None,
-                )?;
-                return Ok(NetworkedDfsWriteOutcome::Conflict { conflict });
-            }
             return Err(error.into());
         }
 
@@ -1528,22 +1418,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &desired_replica_nodes,
             &policy,
         ) {
-            if object.policy == DfsObjectPolicy::ReplicatedEventual
-                && distributed_error_creates_conflict(&error)
-            {
-                let local_content_hash =
-                    self.store_conflicting_write_content_hash(&request, &bytes)?;
-                let conflict = self.create_write_conflict(
-                    &object,
-                    expected_base_version,
-                    request.target_version.clone(),
-                    request.requesting_node_id.clone(),
-                    local_content_hash,
-                    error.to_string(),
-                    None,
-                )?;
-                return Ok(NetworkedDfsWriteOutcome::Conflict { conflict });
-            }
             return Err(error.into());
         }
 
@@ -1617,18 +1491,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Ok(intent) => intent,
             Err(error)
                 if object.policy == DfsObjectPolicy::ReplicatedEventual
-                    && distributed_error_creates_conflict(&error) =>
+                    && distributed_error_is_stale_or_concurrent_write(&error) =>
             {
-                let conflict = self.create_write_conflict(
-                    &object,
-                    expected_base_version,
-                    request.target_version.clone(),
-                    request.requesting_node_id.clone(),
-                    Some(manifest.content_hash.clone()),
-                    error.to_string(),
-                    None,
-                )?;
-                return Ok(NetworkedDfsWriteOutcome::Conflict { conflict });
+                return Err(error.into());
             }
             Err(error) => return Err(error.into()),
         };

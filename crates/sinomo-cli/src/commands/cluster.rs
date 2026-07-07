@@ -2049,12 +2049,12 @@ pub(crate) fn cluster_connectivity() -> Result<(), CliError> {
     let state = read_cluster_state(&paths)?;
     let local = network::read_local_cluster_connectivity_records(&paths)?;
     let active = network::read_cluster_connectivity_graph(&paths)?;
-    let legacy_kv = cluster::read_cluster_connectivity_graph_from_kv(&paths).unwrap_or_default();
+    let kv = cluster::read_cluster_connectivity_graph_from_kv(&paths).unwrap_or_default();
     println!("cluster: {}", state.cluster_id);
     println!("local node: {}", state.local_node_id);
     print_connectivity_records("local", local);
     print_connectivity_records("active", active);
-    print_connectivity_records("legacy-kv", legacy_kv);
+    print_connectivity_records("kv", kv);
     Ok(())
 }
 

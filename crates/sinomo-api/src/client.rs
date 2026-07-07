@@ -370,9 +370,23 @@ impl DaemonApiClient {
             .map_err(DaemonApiError::from)
     }
 
-    /// Fetches cluster health rows through the daemon's `/cluster/health`
-    /// route.
+    /// Fetches cluster health rows from the daemon's KV-backed `/cluster/health`
+    /// view.
+    ///
+    /// Background connectivity probes publish node status and reachability into
+    /// cluster KV. Foreground status readers should use that source of truth
+    /// rather than spending their command budget on a live network sweep.
     pub fn cluster_health(&self) -> Result<Vec<ClusterHealthRow>, DaemonApiError> {
+        let request = sinomo_core::cluster::cluster_health_rpc_request_without_peer_views()?;
+        let response = self.call_request(&request)?;
+        sinomo_core::cluster::decode_cluster_health_rpc_response(&response)
+            .map_err(DaemonApiError::from)
+    }
+
+    /// Fetches cluster health rows with live member probes and peer-local view
+    /// merging. This is useful for diagnostics but can be slower than the
+    /// KV-backed snapshot used by [`Self::cluster_health`].
+    pub fn cluster_health_with_peer_views(&self) -> Result<Vec<ClusterHealthRow>, DaemonApiError> {
         let request = sinomo_core::cluster::cluster_health_rpc_request()?;
         let response = self.call_request(&request)?;
         sinomo_core::cluster::decode_cluster_health_rpc_response(&response)

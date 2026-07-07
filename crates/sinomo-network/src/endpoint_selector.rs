@@ -1,7 +1,9 @@
 use crate::ClusterPaths;
 use crate::NetworkError;
 use crate::directory::cluster_directory_for;
-use crate::endpoint_records::locally_learned_bridge_route_endpoint;
+use crate::endpoint_records::{
+    cluster_endpoint_uses_tcp_tunnel_address, locally_learned_bridge_route_endpoint,
+};
 use crate::is_loopback_connect_address;
 use crate::lan::{
     discover_local_ip_candidates_for_targets, discover_local_ip_candidates_for_targets_async,
@@ -273,9 +275,14 @@ fn cluster_endpoint_transport_is_currently_dialable(transport: &ClusterTransport
     cluster_endpoint_transport_is_dialable(transport, module_transports.as_deref())
 }
 
+fn cluster_endpoint_is_currently_dialable(endpoint: &ClusterEndpointRecord) -> bool {
+    cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
+        && !cluster_endpoint_uses_tcp_tunnel_address(endpoint)
+}
+
 fn cluster_endpoint_is_probeable(endpoint: &ClusterEndpointRecord) -> bool {
     endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
-        && cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
+        && cluster_endpoint_is_currently_dialable(endpoint)
 }
 
 fn cluster_endpoint_is_builtin_probe_target(endpoint: &ClusterEndpointRecord) -> bool {
@@ -1017,7 +1024,7 @@ fn main_daemon_data_plane_endpoint_is_usable(
     endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
         && main_daemon_node_ids.contains(&endpoint.node_id)
         && cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
-        && cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
+        && cluster_endpoint_is_currently_dialable(endpoint)
 }
 
 fn append_cluster_kv_main_daemon_endpoints(
@@ -1372,7 +1379,7 @@ fn try_cluster_member_daemon_status_targets_with_graph(
         if member_runs_main_daemon && cluster_endpoint_identifies_shadow_daemon_for_node(endpoint) {
             continue;
         }
-        if !cluster_endpoint_transport_is_currently_dialable(&endpoint.transport) {
+        if !cluster_endpoint_is_currently_dialable(endpoint) {
             continue;
         }
         crate::object::try_reserve_vec(
@@ -1423,7 +1430,7 @@ pub(crate) fn try_cluster_rollout_endpoint_targets_impl(
         }
         for endpoint in member.endpoints.iter().filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
-                && cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
+                && cluster_endpoint_is_currently_dialable(endpoint)
         }) {
             if !endpoint_ids.try_insert_clone(&endpoint.endpoint_id, "collect rollout endpoints")? {
                 continue;
@@ -1439,7 +1446,7 @@ pub(crate) fn try_cluster_rollout_endpoint_targets_impl(
         Ok(kv_endpoints) => {
             for endpoint in kv_endpoints {
                 if endpoint.privacy == ClusterEndpointPrivacy::LocalOnly
-                    || !cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
+                    || !cluster_endpoint_is_currently_dialable(&endpoint)
                     || !endpoint_ids
                         .try_insert_clone(&endpoint.endpoint_id, "collect rollout kv endpoints")?
                 {
@@ -1856,7 +1863,7 @@ pub(crate) fn try_cluster_sync_targets(
         for endpoint in member.endpoints.iter().filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
                 && !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
-                && cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
+                && cluster_endpoint_is_currently_dialable(endpoint)
         }) {
             crate::object::try_reserve_vec(&mut endpoints, 1, "collect cluster sync endpoints")?;
             endpoints.push(try_clone_selector_endpoint(
@@ -2069,6 +2076,48 @@ mod tests {
                 .iter()
                 .any(|endpoint| endpoint.address == "lan-remote.test:21353"),
             "the static LAN endpoint remains available as a fallback"
+        );
+    }
+
+    #[test]
+    fn member_publish_targets_do_not_directly_select_synthetic_tcp_tunnel() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-member-publish-skip-tunnel");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_member_publish_skip_tunnel").expect("cluster id");
+        let local =
+            NodeId::from_legacy_named("node_member_publish_skip_tunnel_local").expect("local node");
+        let remote = NodeId::from_legacy_named("node_member_publish_skip_tunnel_remote")
+            .expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "member publish synthetic tunnel skip",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        let tunnel_endpoint = selector_test_endpoint(
+            &remote,
+            "tcp-tunnel://node-member-publish-skip-tunnel-remote",
+            ClusterEndpointPrivacy::Lan,
+            0,
+        );
+        let mut member =
+            ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
+        member.endpoints = vec![tunnel_endpoint];
+        state.members.push(member);
+
+        let targets = try_cluster_member_publish_targets_impl(&paths, &state)
+            .expect("member publish targets");
+
+        assert!(
+            targets.is_empty(),
+            "synthetic tcp-tunnel route endpoints are route-layer evidence, not raw bootstrap sockets"
         );
     }
 }

@@ -310,8 +310,15 @@ fn metadata_backend_pending_intent_blocks_second_write() {
         DfsReplicationPolicy::new(2, 2).expect("policy"),
     );
     assert!(
-        matches!(second, Ok(NetworkedDfsWriteOutcome::Conflict { .. })),
-        "second write should conflict while backend still records the first intent, got {second:?}"
+        second.is_err(),
+        "second write should reject while backend still records the first intent, got {second:?}"
+    );
+    assert!(
+        owner_dfs
+            .open_conflicts_for_object(&object_id)
+            .expect("open conflicts")
+            .is_empty(),
+        "pending-intent rejection must not create a DFS conflict"
     );
     assert_eq!(
         visible_version(&owner_dfs, &object_id),
@@ -362,14 +369,25 @@ fn stale_base_version_write_is_rejected_without_metadata_advance() {
             vec![owner.clone()],
             DfsReplicationPolicy::new(1, 1).expect("policy"),
         )
-        .expect("stale write");
+        .expect_err("stale write must reject");
 
     match stale {
-        NetworkedDfsWriteOutcome::Conflict { conflict } => {
-            assert_eq!(conflict.base_version.as_ref(), Some(&version_1));
+        sinomo_dfs::DfsError::Distributed { message } => {
+            assert!(
+                message.contains("stale DFS write base"),
+                "unexpected stale write error: {message}"
+            );
         }
-        other => panic!("expected conflict for stale base write, got {other:?}"),
+        other => panic!("expected stale base rejection, got {other:?}"),
     }
+    assert!(
+        fixture
+            .service(&owner)
+            .open_conflicts_for_object(&object_id)
+            .expect("open conflicts")
+            .is_empty(),
+        "stale base rejection must not create a DFS conflict"
+    );
     assert_consistent_committed_metadata(
         fixture.service(&owner),
         &object_id,

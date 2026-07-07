@@ -4,9 +4,11 @@
 //! Staying network code must not read cluster KV directly. Everything it needs
 //! from cluster state arrives through [`ClusterDirectory`]: membership records,
 //! endpoint records, node statuses, the raft voter check, and a monotonic
-//! version stamp used to invalidate routing caches. Active connectivity is
-//! network-plane state persisted locally and imported from reachable peers over
-//! network RPC; it is not a KV ground truth.
+//! version stamp used to invalidate routing caches. Cluster connectivity is
+//! supplied by this directory when a cluster KV-backed provider is available.
+//! The local connectivity file is only a bootstrap fallback before that graph
+//! can be read, or for the current node's own source-owned probe records until
+//! those records have replicated into the directory graph.
 
 use crate::connectivity::ClusterConnectivityRecord;
 use crate::error::NetworkError;
@@ -37,10 +39,13 @@ pub trait ClusterDirectory: Send + Sync {
     /// Latest node status record per node id.
     fn node_statuses(&self) -> Result<BTreeMap<NodeId, ClusterNodeStatusRecord>, NetworkError>;
 
-    /// Supplemental connectivity records from the backing directory.
+    /// Connectivity records from the backing directory.
     ///
-    /// Production KV-backed directories return no active records here; route
-    /// truth comes from the local network-plane connectivity store.
+    /// Production KV-backed directories return the authoritative cluster
+    /// connectivity graph. The local connectivity file is used only when the
+    /// directory graph is unavailable or empty during bootstrap, or for the
+    /// current node's own source-owned records until that source appears in
+    /// the directory graph.
     fn connectivity_records(&self) -> Result<Vec<ClusterConnectivityRecord>, NetworkError>;
 
     /// Monotonic stamp of the backing store used for routing-cache
@@ -50,8 +55,8 @@ pub trait ClusterDirectory: Send + Sync {
 
 /// Directory with no cluster state: empty results and version 0.
 ///
-/// Useful for tests and pre-cluster code paths that route purely from the
-/// bootstrap state and local observations.
+/// Useful for tests and pre-cluster code paths that do not have a KV-backed
+/// directory yet.
 pub struct EmptyClusterDirectory;
 
 impl ClusterDirectory for EmptyClusterDirectory {
@@ -88,7 +93,7 @@ static CLUSTER_DIRECTORY_PROVIDER: LazyLock<ArcSwap<Option<ClusterDirectoryFacto
 /// Registers the process-wide cluster directory provider. Routing, endpoint
 /// selection, and cache invalidation consult directories produced by this
 /// factory; without a registered provider they see an empty directory and
-/// route purely from bootstrap state and local observations.
+/// may use local bootstrap caches until the KV-backed directory is available.
 pub fn set_cluster_directory_provider(factory: ClusterDirectoryFactory) {
     CLUSTER_DIRECTORY_PROVIDER.store(Arc::new(Some(factory)));
 }
