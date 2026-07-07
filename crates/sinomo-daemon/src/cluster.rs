@@ -7692,6 +7692,212 @@ mod tests {
         assert_eq!(cache.get("c"), Some(&3));
     }
 
+    struct CachedHitPublishHost {
+        store: InProcessKvStore,
+        commits: usize,
+        remembered_statuses: usize,
+        remembered_connectivity: usize,
+    }
+
+    impl CachedHitPublishHost {
+        fn from_paths(paths: &ClusterPaths) -> Self {
+            let snapshot = sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(paths)
+                .expect("seed kv snapshot");
+            Self {
+                store: InProcessKvStore::restore(snapshot).expect("restore kv store"),
+                commits: 0,
+                remembered_statuses: 0,
+                remembered_connectivity: 0,
+            }
+        }
+
+        fn commit(&mut self, txn: KvTxn) -> Result<KvSnapshot, sinomo_core::network::NetworkError> {
+            self.commits = self.commits.saturating_add(1);
+            self.store.txn(txn).map_err(test_kv_network_error)?;
+            self.store.try_snapshot().map_err(test_kv_network_error)
+        }
+    }
+
+    impl sinomo_core::cluster::ClusterNodeStatusPublishHost for CachedHitPublishHost {
+        type Error = sinomo_core::network::NetworkError;
+
+        fn published_node_status_matches(
+            &mut self,
+            _paths: &ClusterPaths,
+            _status: &ClusterNodeStatusRecord,
+        ) -> bool {
+            true
+        }
+
+        fn remember_published_node_status(
+            &mut self,
+            _paths: &ClusterPaths,
+            _status: &ClusterNodeStatusRecord,
+        ) {
+            self.remembered_statuses = self.remembered_statuses.saturating_add(1);
+        }
+
+        fn commit_cluster_kv_txn_with_quorum(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &mut ClusterBootstrapState,
+            txn: KvTxn,
+        ) -> Result<KvSnapshot, Self::Error> {
+            self.commit(txn)
+        }
+    }
+
+    impl sinomo_core::cluster::ClusterConnectivityPublishHost for CachedHitPublishHost {
+        type Error = sinomo_core::network::NetworkError;
+
+        fn published_connectivity_record_set_matches(
+            &mut self,
+            _paths: &ClusterPaths,
+            _source_node_id: &NodeId,
+            _records: &[ClusterConnectivityRecord],
+        ) -> bool {
+            true
+        }
+
+        fn remember_published_connectivity_record_set(
+            &mut self,
+            _paths: &ClusterPaths,
+            _source_node_id: &NodeId,
+            _records: &[ClusterConnectivityRecord],
+        ) {
+            self.remembered_connectivity = self.remembered_connectivity.saturating_add(1);
+        }
+
+        fn commit_cluster_kv_txn_with_quorum(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &mut ClusterBootstrapState,
+            txn: KvTxn,
+        ) -> Result<KvSnapshot, Self::Error> {
+            self.commit(txn)
+        }
+    }
+
+    fn test_kv_network_error(
+        source: sinomo_core::kv::KvError,
+    ) -> sinomo_core::network::NetworkError {
+        sinomo_core::network::NetworkError::Io {
+            operation: "test kv txn".to_string(),
+            detail: source.to_string(),
+        }
+    }
+
+    fn seeded_single_node_cluster_for_publish_cache_test(
+        name: &str,
+    ) -> (sinomo_testdir::TestDir, ClusterPaths, ClusterBootstrapState) {
+        let root = unique_cluster_test_root(name);
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named(&format!("cluster_{name}")).expect("cluster id");
+        let node_id = NodeId::from_legacy_named(&format!("node_{name}")).expect("node id");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id, name, node_id, "local", "pk-local", now,
+        );
+        let capabilities = sinomo_core::node::main_daemon_capabilities(&ClusterMemberRole::Voter);
+        state.members[0].capabilities = capabilities.clone();
+        state.members[0].allowed_capabilities = capabilities;
+        sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+            .expect("sync state to raft");
+        (root, paths, state)
+    }
+
+    #[test]
+    fn node_status_publish_cache_hit_does_not_mask_missing_kv_row() {
+        let (_root, paths, state) =
+            seeded_single_node_cluster_for_publish_cache_test("publish_cache_status_keepup");
+        let status = test_cluster_node_status(
+            &state.cluster_id,
+            &state.local_node_id,
+            "daemon-main",
+            Some("keepup"),
+            OffsetDateTime::now_utc(),
+        );
+        let mut host = CachedHitPublishHost::from_paths(&paths);
+
+        let snapshot = sinomo_core::cluster::publish_cluster_node_status_to_quorum_with_host(
+            &paths,
+            status.clone(),
+            &mut host,
+        )
+        .expect("publish status")
+        .expect("status commit");
+
+        assert_eq!(host.commits, 1);
+        assert_eq!(host.remembered_statuses, 1);
+        let key = sinomo_core::node::cluster_node_status_key_for_record(&status);
+        assert!(
+            snapshot.get(&key).is_some(),
+            "status row should be committed"
+        );
+    }
+
+    #[test]
+    fn connectivity_publish_cache_hit_does_not_mask_missing_kv_rows() {
+        let (_root, paths, mut state) =
+            seeded_single_node_cluster_for_publish_cache_test("publish_cache_connectivity_keepup");
+        let now = OffsetDateTime::now_utc();
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: sinomo_core::network::ClusterEndpointId::derived(
+                "sinomo.test.connectivity.cache",
+                state.local_node_id.as_str(),
+            ),
+            node_id: state.local_node_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "127.0.0.1:32153".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 10,
+            last_observed_latency_ms: None,
+        };
+        state.members[0].endpoints.push(endpoint.clone());
+        sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+            .expect("sync state to raft");
+        let record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(now.format(&Rfc3339).expect("timestamp")),
+            None,
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let mut host = CachedHitPublishHost::from_paths(&paths);
+
+        let snapshot = sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_with_host(
+            &paths,
+            &state.local_node_id,
+            vec![record.clone()],
+            &mut host,
+        )
+        .expect("publish connectivity")
+        .expect("connectivity commit");
+
+        assert_eq!(host.commits, 1);
+        assert_eq!(host.remembered_connectivity, 1);
+        let key = cluster_connectivity_key(
+            &record.source_node_id,
+            &record.target_node_id,
+            &record.endpoint_id,
+        );
+        assert!(
+            snapshot.get(&key).is_some(),
+            "connectivity row should be committed"
+        );
+    }
+
     #[test]
     fn relay_local_delivery_address_routes_between_colocated_main_and_shadow() {
         let root = unique_cluster_test_root("relay-local-main-shadow");

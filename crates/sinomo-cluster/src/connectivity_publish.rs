@@ -191,22 +191,34 @@ where
     H: ClusterConnectivityPublishHost,
 {
     write_local_cluster_connectivity_record_set(paths, source_node_id, &records)?;
-    if host.published_connectivity_record_set_matches(paths, source_node_id, &records) {
-        return Ok(None);
-    }
     let mut state = None;
     let mut latest = None;
+    let mut previous_ops: Option<Vec<KvOp>> = None;
     loop {
-        let success = cluster_connectivity_full_sync_batch_ops(
-            paths,
-            source_node_id,
-            &records,
-            sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-        )?;
+        let success = match latest.as_ref() {
+            Some(snapshot) => cluster_connectivity_full_sync_batch_ops_from_snapshot(
+                snapshot,
+                source_node_id,
+                &records,
+                OffsetDateTime::now_utc(),
+                sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+            )?,
+            None => cluster_connectivity_full_sync_batch_ops(
+                paths,
+                source_node_id,
+                &records,
+                sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+            )?,
+        };
         if success.is_empty() {
             host.remember_published_connectivity_record_set(paths, source_node_id, &records);
             return Ok(latest);
         }
+        if previous_ops.as_ref() == Some(&success) {
+            host.remember_published_connectivity_record_set(paths, source_node_id, &records);
+            return Ok(latest);
+        }
+        previous_ops = Some(success.clone());
         if state.is_none() {
             state = Some(read_cluster_state(paths)?);
         }
@@ -299,13 +311,6 @@ where
             })
         })?
         .map_err(H::Error::from)?;
-
-    if host
-        .published_connectivity_record_set_matches_async(paths, source_node_id, &records)
-        .await?
-    {
-        return Ok(None);
-    }
 
     let mut state = initial_state;
     let mut latest: Option<KvSnapshot> = None;
