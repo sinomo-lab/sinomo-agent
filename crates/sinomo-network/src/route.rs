@@ -38,7 +38,10 @@ const CLUSTER_DELIVERY_DEGRADED_LINK_COST: u64 = 50_000;
 const CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST: u64 = CLUSTER_DELIVERY_DEGRADED_LINK_COST / 2;
 const CLUSTER_DELIVERY_UNOBSERVED_NEIGHBOR_COST: u64 = 75_000;
 const CLUSTER_DELIVERY_UNREACHABLE_LINK_COST: u64 = 500_000;
-const CLUSTER_DELIVERY_TCP_TUNNEL_PATH_COST: u64 = 90;
+// Synthetic TCP tunnels are persistent fallback channels. Prefer any healthy or
+// configured direct target endpoint first, but keep tunnels ahead of degraded
+// links so segmented clusters can still route when direct probing fails.
+const CLUSTER_DELIVERY_TCP_TUNNEL_PATH_COST: u64 = CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST + 5_000;
 const MAX_CLUSTER_DELIVERY_ROUTING_TABLE_CACHE_ENTRIES: usize = 128;
 
 static CLUSTER_DELIVERY_ROUTING_TABLE_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
@@ -5066,7 +5069,7 @@ mod tests {
                     &state,
                     &direct_endpoint,
                     ClusterConnectivityState::Healthy,
-                    Some(12),
+                    Some(480),
                     0,
                     Some(now.to_string()),
                     None,
