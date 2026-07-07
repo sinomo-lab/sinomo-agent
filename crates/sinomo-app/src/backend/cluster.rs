@@ -613,7 +613,7 @@ fn connection_source(connection: &Connection) -> String {
     match connection {
         Connection::Daemon(status) => format!("daemon {}", status.address),
         Connection::InProcessDaemon(status) => format!("in-process daemon {}", status.address),
-        Connection::LocalFallback => "local files".to_string(),
+        Connection::LocalFallback { .. } => "local files".to_string(),
     }
 }
 

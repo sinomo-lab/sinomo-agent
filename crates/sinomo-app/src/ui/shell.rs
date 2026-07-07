@@ -484,7 +484,14 @@ impl Widget for Shell {
                 let (changed, became_ready) = self.shared.pump_connect();
                 if became_ready {
                     self.build_content();
-                    let waker = { self.shared.borrow().waker.clone() };
+                    let (backend, waker) = {
+                        let app = self.shared.borrow();
+                        let ready = app.ready.as_ref().expect("ready after connect");
+                        (ready.backend.clone(), app.waker.clone())
+                    };
+                    self.shared
+                        .settings_mut()
+                        .begin_initial_load(backend, waker.clone());
                     self.shared.chat_mut().start_session_list_load(waker);
                     self.schedule_chat_session_timer(ctx);
                     self.start_cluster_refresh_if_active();
@@ -495,6 +502,11 @@ impl Widget for Shell {
                 // Drain any in-progress provider device-login (Settings tab).
                 let device_changed = if self.shared.is_ready() {
                     self.shared.settings_mut().pump_device_login()
+                } else {
+                    false
+                };
+                let settings_changed = if self.shared.is_ready() {
+                    self.shared.settings_mut().pump_initial_load()
                 } else {
                     false
                 };
@@ -514,12 +526,18 @@ impl Widget for Shell {
                     false
                 };
                 self.schedule_chat_session_timer(ctx);
-                if files_changed || cluster_changed || chat_changed {
+                if files_changed || cluster_changed || chat_changed || settings_changed {
                     ctx.request_measure();
                     ctx.request_arrange();
                     ctx.request_semantics();
                 }
-                if changed || device_changed || files_changed || cluster_changed || chat_changed {
+                if changed
+                    || device_changed
+                    || settings_changed
+                    || files_changed
+                    || cluster_changed
+                    || chat_changed
+                {
                     ctx.request_paint();
                 }
                 self.sync_active_tab(ctx);
@@ -539,8 +557,13 @@ impl Widget for Shell {
             } else {
                 false
             };
+            let settings_changed = if self.shared.is_ready() {
+                self.shared.settings_mut().pump_initial_load()
+            } else {
+                false
+            };
             self.schedule_chat_session_timer(ctx);
-            if cluster_changed || chat_changed {
+            if cluster_changed || chat_changed || settings_changed {
                 ctx.request_measure();
                 ctx.request_arrange();
                 ctx.request_semantics();
@@ -819,11 +842,15 @@ fn shell_status(shared: &Shared) -> ShellStatus {
     };
 
     let mut issues = Vec::new();
-    if let Some(detail) = ready.chat.connection_attention_detail() {
+    if let Some(detail) = ready.backend.connection_issue_detail() {
         issues.push(detail);
-    }
-    if let Some(error) = ready.files.error.as_deref().filter(|text| !text.is_empty()) {
-        issues.push(format!("SIFS unavailable: {error}"));
+    } else {
+        if let Some(detail) = ready.chat.connection_attention_detail() {
+            issues.push(detail);
+        }
+        if let Some(error) = ready.files.error.as_deref().filter(|text| !text.is_empty()) {
+            issues.push(format!("SIFS unavailable: {error}"));
+        }
     }
 
     if issues.is_empty() {
@@ -858,7 +885,7 @@ fn shell_status(shared: &Shared) -> ShellStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Backend;
+    use crate::backend::{Backend, Connection};
     use crate::state::AppState;
     use crate::ui::chat::{ActivityTone, ChatActivityEntry};
     use crate::ui::settings::SettingsSection;
@@ -1097,6 +1124,24 @@ mod tests {
         let status = shell_status(&shared);
         assert_eq!(status.label, "Needs attention");
         assert!(status.detail.contains("SIFS store failed"));
+    }
+
+    #[test]
+    fn embedded_daemon_failure_sets_attention_status() {
+        let mut backend = Backend::local_fallback();
+        backend.connection = Connection::LocalFallback {
+            reason: Some("embedded daemon exited before ready: duplicate config key".to_string()),
+        };
+        let shared = Shared::new(AppState::ready(backend));
+
+        let status = shell_status(&shared);
+
+        assert_eq!(status.label, "Needs attention");
+        assert!(status.degraded);
+        assert!(!status.connected_daemon);
+        assert!(status.detail.contains("embedded daemon failed"));
+        assert!(status.detail.contains("duplicate config key"));
+        assert_eq!(shared.borrow().status, "Local (daemon failed)");
     }
 
     #[test]

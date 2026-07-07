@@ -1006,6 +1006,10 @@ impl ChatState {
             state.notice = Some(format!("chat list failed: {detail}"));
             state.replace_activity("chat list", detail, ActivityTone::Warn);
         }
+        if let Some(detail) = backend.connection_issue_detail() {
+            state.notice = Some(detail.clone());
+            state.replace_activity("connection", detail, ActivityTone::Warn);
+        }
         // Eagerly fetch the default/initial provider's models so the model picker is populated
         // without requiring a manual provider toggle. (Results arrive async via `ChatEvent::Models`;
         // a no-op if there is no provider or the list is already populated.)
@@ -12348,7 +12352,7 @@ pub fn view(shared: Shared) -> impl Widget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Backend;
+    use crate::backend::{Backend, Connection};
     use crate::state::AppState;
     use std::time::{Duration, Instant};
 
@@ -15495,6 +15499,31 @@ mod tests {
         assert_eq!(
             state.recovery_empty_title(RuntimeRecoveryTarget::Connection),
             "Chat list needs connection attention"
+        );
+    }
+
+    #[test]
+    fn embedded_daemon_failure_initializes_chat_attention() {
+        let mut backend = Backend::local_fallback();
+        backend.connection = Connection::LocalFallback {
+            reason: Some("embedded daemon exited before ready: duplicate config key".to_string()),
+        };
+
+        let state = ChatState::new(&backend);
+
+        assert_eq!(
+            state.notice.as_deref(),
+            Some(
+                "embedded daemon failed: embedded daemon exited before ready: duplicate config key; daemon-backed chat and SIFS are unavailable"
+            )
+        );
+        assert_eq!(
+            state.connection_attention_detail_full().as_deref(),
+            state.notice.as_deref()
+        );
+        assert_eq!(
+            state.runtime_recovery_target(),
+            Some(RuntimeRecoveryTarget::Connection)
         );
     }
 

@@ -18,7 +18,7 @@ pub mod sifs;
 
 #[cfg(test)]
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -56,7 +56,7 @@ pub enum Connection {
     /// attached to it as a desktop app surface.
     InProcessDaemon(Box<DaemonStatus>),
     /// Degraded: no daemon could be reached or started; reading local config directly.
-    LocalFallback,
+    LocalFallback { reason: Option<String> },
 }
 
 impl Connection {
@@ -78,7 +78,14 @@ impl Connection {
             Connection::Daemon(status) | Connection::InProcessDaemon(status) => {
                 Some(status.address.as_str())
             }
-            Connection::LocalFallback => None,
+            Connection::LocalFallback { .. } => None,
+        }
+    }
+
+    pub fn local_fallback_reason(&self) -> Option<&str> {
+        match self {
+            Connection::LocalFallback { reason } => reason.as_deref(),
+            Connection::Daemon(_) | Connection::InProcessDaemon(_) => None,
         }
     }
 }
@@ -136,11 +143,20 @@ impl Backend {
             DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
                 progress("Starting a local daemon…");
                 match start_in_process_daemon(&paths, &progress, agent_runtime_control.clone()) {
-                    Some((status, handle)) => (
+                    Ok((status, handle)) => (
                         Connection::InProcessDaemon(Box::new(status)),
                         Some(Arc::new(handle)),
                     ),
-                    None => (Connection::LocalFallback, None),
+                    Err(error) => {
+                        tracing::warn!(%error, "sinomo-app could not start embedded daemon");
+                        progress(&format!("Local daemon failed: {error}"));
+                        (
+                            Connection::LocalFallback {
+                                reason: Some(error),
+                            },
+                            None,
+                        )
+                    }
                 }
             }
         };
@@ -191,7 +207,7 @@ impl Backend {
         let node = NodeProfile::local("Sinomo App")
             .unwrap_or_else(|_| panic!("local node profile uses a valid trust domain"));
 
-        let connection = Connection::LocalFallback;
+        let connection = Connection::LocalFallback { reason: None };
         let config = build_config_client(&connection, &data_dir, app_runtime.handle());
 
         Backend {
@@ -224,7 +240,8 @@ impl Backend {
                     "Local · mobile".to_string()
                 }
             }
-            Connection::LocalFallback => "Local (no daemon)".to_string(),
+            Connection::LocalFallback { reason: Some(_) } => "Local (daemon failed)".to_string(),
+            Connection::LocalFallback { reason: None } => "Local (no daemon)".to_string(),
         }
     }
 
@@ -252,10 +269,21 @@ impl Backend {
                     }
                 }
             }
-            Connection::LocalFallback => {
+            Connection::LocalFallback {
+                reason: Some(reason),
+            } => {
+                format!("No daemon available · embedded daemon failed: {reason}")
+            }
+            Connection::LocalFallback { reason: None } => {
                 "No daemon available · reading local config directly".to_string()
             }
         }
+    }
+
+    pub fn connection_issue_detail(&self) -> Option<String> {
+        self.connection.local_fallback_reason().map(|reason| {
+            format!("embedded daemon failed: {reason}; daemon-backed chat and SIFS are unavailable")
+        })
     }
 
     /// Whether the runtime is healthy enough to talk to.
@@ -316,7 +344,7 @@ fn ensure_app_cluster(
             } => match connection {
                 Connection::Daemon(_) => Connection::Daemon(Box::new(status)),
                 Connection::InProcessDaemon(_) => Connection::InProcessDaemon(Box::new(status)),
-                Connection::LocalFallback => Connection::LocalFallback,
+                Connection::LocalFallback { reason } => Connection::LocalFallback { reason },
             },
             DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
                 connection
@@ -389,16 +417,16 @@ fn build_app_runtime() -> Arc<tokio::runtime::Runtime> {
 }
 
 /// Start an in-process daemon on a background thread and wait for it to become reachable. Returns
-/// `None` — leaving the app on the daemonless fallback — if it can't be started or doesn't come up
-/// within [`IN_PROCESS_DAEMON_READY_TIMEOUT`].
+/// An error leaves the app on the daemonless fallback with a concrete reason to show in the UI.
 fn start_in_process_daemon(
     paths: &DaemonPaths,
     progress: &impl Fn(&str),
     agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry,
-) -> Option<(DaemonStatus, InProcessDaemon)> {
+) -> Result<(DaemonStatus, InProcessDaemon), String> {
     let options = DaemonRunOptions::default();
     let loop_paths = paths.clone();
     let control_host = agent_runtime_control.clone();
+    let (exit_tx, exit_rx) = mpsc::channel::<String>();
     let thread = thread::Builder::new()
         .name("sinomo-app-daemon".to_string())
         .spawn(move || {
@@ -408,22 +436,36 @@ fn start_in_process_daemon(
             if let Err(error) =
                 run_daemon_control_loop_with_services(options, loop_paths, "daemon", None, hooks)
             {
+                let detail = error.to_string();
                 tracing::warn!(%error, "in-process daemon exited");
+                let _ = exit_tx.send(detail);
+            } else {
+                let _ = exit_tx.send("in-process daemon exited before it became ready".to_string());
             }
         })
-        .ok()?;
+        .map_err(|error| format!("failed to spawn embedded daemon thread: {error}"))?;
 
     progress("Waiting for the daemon to come up…");
     let deadline = Instant::now() + IN_PROCESS_DAEMON_READY_TIMEOUT;
     loop {
+        match exit_rx.try_recv() {
+            Ok(detail) => return Err(format!("embedded daemon exited before ready: {detail}")),
+            Err(mpsc::TryRecvError::Disconnected) if thread.is_finished() => {
+                return Err("embedded daemon exited before ready".to_string());
+            }
+            Err(mpsc::TryRecvError::Disconnected) | Err(mpsc::TryRecvError::Empty) => {}
+        }
         if let DaemonProbeStatus::Running(status) =
             probe_daemon_status(paths, Duration::from_millis(300))
         {
-            return Some((status, InProcessDaemon { _thread: thread }));
+            return Ok((status, InProcessDaemon { _thread: thread }));
         }
         if Instant::now() >= deadline {
             tracing::warn!("in-process daemon did not become ready within the timeout");
-            return None;
+            return Err(format!(
+                "embedded daemon did not become ready within {} seconds",
+                IN_PROCESS_DAEMON_READY_TIMEOUT.as_secs()
+            ));
         }
         thread::sleep(Duration::from_millis(200));
     }
@@ -437,7 +479,6 @@ fn agent_runtime_control_service_hook(
         sinomo_agent::register_services_with_runtime_control(builder, host)
     })
     .with_config_definitions(|builder| {
-        let builder = sinomo_runtime::module::register_config_definitions(builder)?;
         sinomo_lm::register_config_definitions(builder).map_err(|error| error.to_string())
     })
 }
@@ -495,8 +536,15 @@ mod tests {
         assert!(
             config_registry
                 .get(sinomo_runtime::module::MODULE_CLUSTER_CONFIG_KEY)
-                .is_ok()
+                .is_err(),
+            "the app hook must not re-register daemon-owned module config definitions"
         );
+        let daemon_owned_builder = sinomo_runtime::module::register_config_definitions(
+            sinomo_runtime::config::ConfigRegistry::builder(),
+        )
+        .expect("register daemon-owned module config definitions");
+        hook.register_config_definitions(daemon_owned_builder)
+            .expect("app hook must compose with daemon-owned config definitions");
 
         let registry = hook.register(ServiceRegistry::builder()).build();
 
