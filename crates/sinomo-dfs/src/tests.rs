@@ -856,8 +856,8 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
     );
     assert!(!dfs_message_is_read_only_request(&lookup));
     assert!(
-        dfs_message_requires_full_metadata_hydrate(&lookup),
-        "lookup requests still require fresh daemon metadata before answering primary path checks"
+        !dfs_message_requires_full_metadata_hydrate(&lookup),
+        "lookup requests use targeted backend path reads instead of full daemon hydration"
     );
 
     let write = test_dfs_message_command_from_message(
@@ -896,8 +896,8 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
     );
     assert!(!dfs_message_is_read_only_request(&lookup_paths));
     assert!(
-        dfs_message_requires_full_metadata_hydrate(&lookup_paths),
-        "batched lookup requests still require fresh daemon metadata before answering primary path checks"
+        !dfs_message_requires_full_metadata_hydrate(&lookup_paths),
+        "batched lookup requests use targeted backend path reads instead of full daemon hydration"
     );
 
     let sync = test_dfs_message_command_from_message(
@@ -916,7 +916,10 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
         }),
     );
     assert!(!dfs_message_is_read_only_request(&sync));
-    assert!(dfs_message_requires_full_metadata_hydrate(&sync));
+    assert!(
+        !dfs_message_requires_full_metadata_hydrate(&sync),
+        "sync requests use targeted backend path reads instead of full daemon hydration"
+    );
 
     let apply = test_dfs_message_command_from_message(
         &local,
@@ -940,7 +943,10 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
         }),
     );
     assert!(!dfs_message_is_read_only_request(&apply));
-    assert!(dfs_message_requires_full_metadata_hydrate(&apply));
+    assert!(
+        !dfs_message_requires_full_metadata_hydrate(&apply),
+        "namespace transactions validate and apply through the namespace path"
+    );
 }
 
 struct FailingSendTransport {
@@ -10053,14 +10059,65 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
 
     let trace = Arc::new(Mutex::new(Vec::new()));
     let staged_chunks = Arc::new(Mutex::new(BTreeMap::<String, Vec<Option<Vec<u8>>>>::new()));
+    let payload = Arc::new(
+        (0..(DFS_BLOB_CHUNK_BYTES + 8192))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+    let payload_hash = content_hash(&payload);
+    let writer_for_sender = writer.clone();
     let replica_for_sender = replica.clone();
     let trace_for_replica_sender = Arc::clone(&trace);
     let staged_chunks_for_replica_sender = Arc::clone(&staged_chunks);
+    let payload_for_sender = Arc::clone(&payload);
+    let payload_hash_for_sender = payload_hash.clone();
     let replica_sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
-        assert_eq!(endpoint, &replica_for_sender);
         let message = command.routed_message.message.clone();
         let response = match message {
+            DfsNetworkMessage::FetchBlob(fetch) => {
+                assert_eq!(endpoint, &writer_for_sender);
+                assert_eq!(fetch.content_hash, payload_hash_for_sender);
+                let total_chunks = blob_chunk_count(&payload_for_sender).expect("chunk count");
+                let start_chunk_index = fetch.start_chunk_index as usize;
+                let max_chunks = if fetch.max_chunks == 0 {
+                    usize::MAX
+                } else {
+                    fetch.max_chunks as usize
+                };
+                let outbound_messages = payload_for_sender
+                    .chunks(DFS_BLOB_CHUNK_BYTES)
+                    .enumerate()
+                    .skip(start_chunk_index)
+                    .take(max_chunks)
+                    .map(|(chunk_index, bytes)| {
+                        build_dfs_routed_message(
+                            &command.routed_message.target_node_id,
+                            &command.routed_message.source_node_id,
+                            command.routed_message.frame_id + 100 + chunk_index as u64,
+                            command.routed_message.message_id + 100 + chunk_index as u64,
+                            DfsNetworkMessage::FetchBlobResponseChunk(DfsFetchBlobResponseChunk {
+                                request_id: fetch.request_id.clone(),
+                                intent_id: fetch.intent_id.clone(),
+                                object_id: fetch.object_id.clone(),
+                                version: fetch.version.clone(),
+                                source_node_id: command.routed_message.target_node_id.clone(),
+                                content_hash: payload_hash_for_sender.clone(),
+                                total_size_bytes: payload_for_sender.len() as u64,
+                                chunk_index: chunk_index as u32,
+                                total_chunks,
+                                chunk_hash: Some(chunk_hash(bytes)),
+                                bytes: bytes.to_vec(),
+                            }),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(DfsMessageResponse {
+                    request_id: command.request_id.clone(),
+                    outbound_messages,
+                });
+            }
             DfsNetworkMessage::StageBlob(stage) => {
+                assert_eq!(endpoint, &replica_for_sender);
                 trace_for_replica_sender
                     .lock()
                     .expect("trace")
@@ -10078,6 +10135,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
                 }))
             }
             DfsNetworkMessage::StageBlobChunk(chunk) => {
+                assert_eq!(endpoint, &replica_for_sender);
                 trace_for_replica_sender
                     .lock()
                     .expect("trace")
@@ -10123,6 +10181,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
                 }
             }
             DfsNetworkMessage::RepairReplica(repair) => {
+                assert_eq!(endpoint, &replica_for_sender);
                 trace_for_replica_sender
                     .lock()
                     .expect("trace")
@@ -10144,6 +10203,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
                 ))
             }
             DfsNetworkMessage::RepairReplicaChunk(chunk) => {
+                assert_eq!(endpoint, &replica_for_sender);
                 trace_for_replica_sender
                     .lock()
                     .expect("trace")
@@ -10211,7 +10271,10 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
     });
     let primary_transport = DfsEndpointServedMessageTransport::new_with_message_sender(
         primary.clone(),
-        vec![test_endpoint(&replica, "192.0.2.45:21353")],
+        vec![
+            test_endpoint(&writer, "192.0.2.44:21353"),
+            test_endpoint(&replica, "192.0.2.45:21353"),
+        ],
         replica_sender,
         Duration::from_millis(1),
     );
@@ -10295,9 +10358,6 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
     dfs.add_object_metadata(writer_object)
         .expect("writer object");
 
-    let payload = (0..(DFS_BLOB_CHUNK_BYTES + 8192))
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
     let outcome = dfs
         .write_distributed_eventual_from_reader(
             DfsWriteRequest {
@@ -10306,7 +10366,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
                 target_version: version_2.clone(),
                 requesting_node_id: writer.clone(),
             },
-            std::io::Cursor::new(payload),
+            std::io::Cursor::new((*payload).clone()),
             vec![writer.clone(), replica.clone()],
             DfsReplicationPolicy::new(2, 2).expect("policy"),
         )

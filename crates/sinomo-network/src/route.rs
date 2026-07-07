@@ -1516,8 +1516,15 @@ fn cluster_delivery_local_endpoint_cost(
     );
     let endpoint_priority = u64::from(endpoint.priority);
     match graph.record_for_endpoint(endpoint) {
-        Some(record) => cluster_delivery_connectivity_record_cost_with_path(record, path_cost)
-            .map(|cost| cost.saturating_add(endpoint_priority)),
+        Some(record) => {
+            if endpoint.node_id != *target_node_id
+                && matches!(record.state, ClusterConnectivityState::Unreachable)
+            {
+                return None;
+            }
+            cluster_delivery_connectivity_record_cost_with_path(record, path_cost)
+                .map(|cost| cost.saturating_add(endpoint_priority))
+        }
         None if endpoint.node_id == *target_node_id => Some(
             cluster_delivery_unobserved_target_endpoint_cost(path_cost, endpoint_priority),
         ),
@@ -1537,6 +1544,9 @@ fn cluster_delivery_unobserved_target_endpoint_cost(path_cost: u64, endpoint_pri
 }
 
 fn cluster_delivery_connectivity_record_cost(record: &ClusterConnectivityRecord) -> Option<u64> {
+    if matches!(record.state, ClusterConnectivityState::Unreachable) {
+        return None;
+    }
     let path_cost = cluster_delivery_record_path_cost(&record.transport, &record.address);
     cluster_delivery_connectivity_record_cost_with_path(record, path_cost)
 }
@@ -5424,6 +5434,100 @@ mod tests {
         assert_eq!(plan.endpoints.len(), 1);
         assert_eq!(plan.endpoints[0].endpoint_id, stale_endpoint.endpoint_id);
         assert_eq!(plan.endpoints[0].address, "target:21353");
+    }
+
+    #[test]
+    fn route_plan_does_not_use_unreachable_neighbor_as_relay_fallback() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-route-unreachable-relay");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_route_unreachable_relay").expect("cluster");
+        let local_node =
+            NodeId::from_legacy_named("node_route_unreachable_relay_local").expect("local");
+        let target_node =
+            NodeId::from_legacy_named("node_route_unreachable_relay_target").expect("target");
+        let relay_node =
+            NodeId::from_legacy_named("node_route_unreachable_relay_relay").expect("relay");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "route unreachable relay",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut target_member = ClusterMemberRecord::local_voter(
+            state.cluster_id.clone(),
+            target_node.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "target:21353".to_string(),
+            0,
+        )];
+        let mut relay_member = ClusterMemberRecord::local_voter(
+            state.cluster_id.clone(),
+            relay_node.clone(),
+            "relay",
+            "pk-relay",
+            now,
+        );
+        relay_member.capabilities = main_daemon_capabilities(&relay_member.role);
+        relay_member.allowed_capabilities = relay_member.capabilities.clone();
+        let relay_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &relay_node,
+            "relay:21353".to_string(),
+            0,
+        );
+        relay_member.endpoints = vec![relay_endpoint.clone()];
+        state.members.push(target_member);
+        state.members.push(relay_member);
+
+        let relay_failure = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &relay_endpoint,
+            ClusterConnectivityState::Unreachable,
+            None,
+            3,
+            None,
+            Some(now.to_string()),
+            now,
+            7200,
+        );
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[relay_failure],
+        )
+        .expect("write local connectivity");
+
+        let mut failed_edges = ClusterDeliveryFailedEdges::default();
+        failed_edges
+            .try_insert(&local_node, &target_node)
+            .expect("failed target edge");
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local_node,
+            &target_node,
+            &failed_edges,
+            &[],
+        );
+
+        assert!(
+            plan.is_none(),
+            "a known-unreachable neighbor must not become a relay fallback"
+        );
     }
 
     #[test]

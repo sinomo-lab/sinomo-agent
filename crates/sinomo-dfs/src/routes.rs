@@ -269,9 +269,7 @@ pub fn dfs_message_is_read_only_request(command: &DfsMessageCommand) -> bool {
 fn dfs_network_message_requires_full_metadata_hydrate(message: &DfsNetworkMessage) -> bool {
     matches!(
         message,
-        DfsNetworkMessage::ReadRequest(_)
-            | DfsNetworkMessage::BulkReadRequest(_)
-            | DfsNetworkMessage::NamespaceRequest(_)
+        DfsNetworkMessage::ReadRequest(_) | DfsNetworkMessage::BulkReadRequest(_)
     )
 }
 
