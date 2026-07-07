@@ -1256,7 +1256,7 @@ impl DfsMessageTransport for DfsEndpointServedMessageTransport {
             .return_node_id
             .as_ref()
             .is_some_and(|return_node_id| target_node_id == return_node_id)
-            && dfs_network_message_is_inline_served_response(&message.message)
+            && dfs_network_message_can_return_to_served_caller(&message.message)
         {
             self.outbound_messages.push(message);
             return Ok(());
@@ -1309,6 +1309,11 @@ fn dfs_network_message_is_inline_served_response(message: &DfsNetworkMessage) ->
             | DfsNetworkMessage::MetadataJournalBatchResponse(_)
             | DfsNetworkMessage::MetadataSnapshotInstallResponse(_)
     )
+}
+
+fn dfs_network_message_can_return_to_served_caller(message: &DfsNetworkMessage) -> bool {
+    dfs_network_message_is_inline_served_response(message)
+        || matches!(message, DfsNetworkMessage::FetchBlob(_))
 }
 
 impl NetworkedDfsService<DfsEndpointServedMessageTransport> {

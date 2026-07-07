@@ -29,13 +29,22 @@ use std::thread;
 use std::time::Duration;
 
 use sui::{
-    Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, Color, Constraints,
-    DefaultTheme, Event, EventCtx, Flex, FlexItem, FontWeight, IconButton, IconGlyph, MeasureCtx,
-    PaintCtx, Point, PointerButton, PointerEventKind, Rect, ScrollState, ScrollView,
-    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator, Size,
-    SizedBox, Stack, StackHostOptions, Tooltip, TooltipPlacement, VirtualTable, VirtualTableColumn,
-    VirtualTableRowActivationKind, VirtualTableRowContext, VirtualTableSortDirection, Widget,
-    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, draw_glyph,
+    Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, CheckboxIndicatorState, Color,
+    CommandButtonPaint, Constraints, DefaultTheme, Dock, EmptyState, Event, EventCtx,
+    FixedPaneSplit, Flex, FlexItem, FontWeight, HairlineEdge, IconButton, IconGlyph, Insets, Label,
+    LeadingLabelCellPaint, ListItem, ListView, MeasureCtx, PaintCtx, PlacementBadgePaint, Point,
+    PointerButton, PointerEventKind, RebuildOnChange, Rect, ScrollState, ScrollView, SectionLabel,
+    SectionLabelPaint, SectionPanelPaint, SegmentedControl, SegmentedControlItem, SemanticRegion,
+    SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator, Size,
+    SizedBox, Stack, StackHostOptions, StatusBadge, StatusBar, StatusBarSegment, Surface,
+    SwitchView, TextBlockPaint, TextCellPaint, Tooltip, TooltipPlacement, TrailingSlotRow,
+    VirtualTable, VirtualTableColumn, VirtualTableRowActivationKind, VirtualTableRowContext,
+    VirtualTableSortDirection, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    WindowEvent, containers::Padding as WidgetPadding, detail_row_height_for_value,
+    paint_checkbox_indicator, paint_command_button, paint_detail_row_at, paint_hairline,
+    paint_leading_label_cell, paint_placement_badge, paint_placement_badge_with,
+    paint_section_label, paint_section_panel, paint_status_badge, paint_text_block,
+    paint_text_cell,
 };
 
 use sinomo_cli::app_api::{
@@ -55,20 +64,16 @@ use crate::ui::widgets;
 /// Below this content width the tab collapses to a list-only column (the inspector is hidden).
 const WIDE_THRESHOLD: f32 = 640.0;
 const INSPECTOR_W: f32 = 340.0;
-const ROW_H: f32 = 34.0;
-const ROW_SELECT_SIDE: f32 = 22.0;
 const ROW_THUMBNAIL_SIDE: f32 = 20.0;
 const CONTENT_PAD: f32 = 16.0;
-const HEADER_H: f32 = 48.0;
-const HEADER_CONTROL_H: f32 = 30.0;
-const HEADER_COMMAND_GAP: f32 = 6.0;
-const HEADER_PAD_Y: f32 = 9.0;
-const FILES_STATUS_H: f32 = 38.0;
-const LIST_HEADER_H: f32 = 36.0;
+const HEADER_H: f32 = 44.0;
+const HEADER_COMMAND_GAP: f32 = 4.0;
+const HEADER_PAD_Y: f32 = 8.0;
+const FILES_STATUS_H: f32 = 34.0;
 const LIST_TASK_STRIP_H: f32 = 88.0;
 const FILES_LIST_PAGE_SIZE: usize = 512;
 const PLACES_W: f32 = 190.0;
-const PLACE_ROW_H: f32 = 42.0;
+const PLACE_ROW_H: f32 = 38.0;
 const FILE_PREVIEW_MAX_BYTES: u64 = 32 * 1024;
 const FILE_PREVIEW_MAX_LINES: usize = 8;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
@@ -4775,10 +4780,6 @@ fn files_task_detail_display(task: &FilesTask) -> String {
     }
 }
 
-fn files_task_detail_display_for_width(task: &FilesTask, width: f32) -> String {
-    display_name_for_width(&files_task_detail_display(task), width, 6.2)
-}
-
 fn sifs_metadata_status_label(
     loading: bool,
     error: Option<&str>,
@@ -4795,20 +4796,19 @@ fn sifs_metadata_status_label(
     }
 }
 
-fn sifs_metadata_status_color(
-    pal: &Palette,
+fn sifs_metadata_status_tone(
     loading: bool,
     error: Option<&str>,
     details: Option<&SifsObjectDetails>,
-) -> Color {
+) -> SemanticTone {
     if loading {
-        pal.accent
+        SemanticTone::Accent
     } else if error.is_some() {
-        pal.warn
+        SemanticTone::Warning
     } else if details.is_some() {
-        pal.good
+        SemanticTone::Success
     } else {
-        pal.text_muted
+        SemanticTone::Neutral
     }
 }
 
@@ -4828,20 +4828,19 @@ fn local_metadata_status_label(
     }
 }
 
-fn local_metadata_status_color(
-    pal: &Palette,
+fn local_metadata_status_tone(
     loading: bool,
     error: Option<&str>,
     details: Option<&LocalObjectDetails>,
-) -> Color {
+) -> SemanticTone {
     if loading {
-        pal.accent
+        SemanticTone::Accent
     } else if error.is_some() {
-        pal.warn
+        SemanticTone::Warning
     } else if details.is_some() {
-        pal.good
+        SemanticTone::Success
     } else {
-        pal.text_muted
+        SemanticTone::Neutral
     }
 }
 
@@ -4867,6 +4866,136 @@ fn entry_row_meta(entry: &SifsEntry, files: &FilesState, active: bool) -> String
         );
     }
     entry_meta(entry)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileRowPlacementBadge {
+    label: String,
+    tone: SemanticTone,
+    icon: IconGlyph,
+    replicas: Option<(usize, usize)>,
+}
+
+fn file_row_placement_badge(
+    _entry: &SifsEntry,
+    files: &FilesState,
+    row_index: usize,
+) -> FileRowPlacementBadge {
+    if files.source == FilesSourceKind::Local {
+        return FileRowPlacementBadge {
+            label: "this device".to_string(),
+            tone: SemanticTone::Neutral,
+            icon: IconGlyph::Storage,
+            replicas: None,
+        };
+    }
+
+    let active = files.selected == Some(row_index);
+    if active && files.details_loading {
+        return FileRowPlacementBadge {
+            label: "syncing".to_string(),
+            tone: SemanticTone::Accent,
+            icon: IconGlyph::Redo,
+            replicas: None,
+        };
+    }
+    if active && files.details_error.is_some() {
+        return FileRowPlacementBadge {
+            label: "failed".to_string(),
+            tone: SemanticTone::Danger,
+            icon: IconGlyph::Alert,
+            replicas: None,
+        };
+    }
+
+    if active && let Some(details) = files.selected_details.as_ref() {
+        return sifs_details_placement_badge(details);
+    }
+
+    FileRowPlacementBadge {
+        label: if files.clustered {
+            "on mesh".to_string()
+        } else {
+            "this node".to_string()
+        },
+        tone: if files.clustered {
+            SemanticTone::Info
+        } else {
+            SemanticTone::Neutral
+        },
+        icon: IconGlyph::Storage,
+        replicas: None,
+    }
+}
+
+fn sifs_details_placement_badge(details: &SifsObjectDetails) -> FileRowPlacementBadge {
+    let replicas = sifs_details_replica_dots(details);
+    if let Some(health) = details.health.as_ref() {
+        if health.open_conflict_count > 0 {
+            return FileRowPlacementBadge {
+                label: "conflict".to_string(),
+                tone: SemanticTone::Warning,
+                icon: IconGlyph::Alert,
+                replicas,
+            };
+        }
+        if sifs_repair_backlog_count(health) > 0 {
+            return FileRowPlacementBadge {
+                label: "repair".to_string(),
+                tone: SemanticTone::Warning,
+                icon: IconGlyph::Redo,
+                replicas,
+            };
+        }
+    }
+
+    if details.policy == "local-owned" || details.policy == "ephemeral-local" {
+        return FileRowPlacementBadge {
+            label: "this device".to_string(),
+            tone: SemanticTone::Neutral,
+            icon: IconGlyph::Storage,
+            replicas: None,
+        };
+    }
+
+    if details.current_locations.is_empty() {
+        return FileRowPlacementBadge {
+            label: "queued".to_string(),
+            tone: SemanticTone::Neutral,
+            icon: IconGlyph::Storage,
+            replicas,
+        };
+    }
+
+    let (label, tone) = if details.policy.starts_with("replicated") {
+        if details
+            .health
+            .as_ref()
+            .is_some_and(|health| sifs_agent_state_is_current(&health.agent_state))
+        {
+            ("synced", SemanticTone::Success)
+        } else {
+            ("on mesh", SemanticTone::Info)
+        }
+    } else {
+        ("on mesh", SemanticTone::Info)
+    };
+
+    FileRowPlacementBadge {
+        label: label.to_string(),
+        tone,
+        icon: IconGlyph::Storage,
+        replicas,
+    }
+}
+
+fn sifs_details_replica_dots(details: &SifsObjectDetails) -> Option<(usize, usize)> {
+    if !(details.policy.starts_with("replicated")) {
+        return None;
+    }
+    let current = details.current_locations.len();
+    let desired = sifs_replica_desired_count(details).max(current);
+    (desired > 0).then_some((current, desired))
 }
 
 fn sort_file_entries_by(entries: &mut [SifsEntry], sort_mode: FileSortMode) {
@@ -5047,8 +5176,8 @@ fn sifs_replication_summary(details: Option<&SifsObjectDetails>, clustered: bool
         }
         return match count {
             0 => "replication pending; no durable location recorded".to_string(),
-            1 => "one durable location recorded; repair status not loaded".to_string(),
-            count => format!("{count} durable locations recorded; repair status not loaded"),
+            1 => "one replica location recorded; repair status not loaded".to_string(),
+            count => format!("{count} replica locations recorded; repair status not loaded"),
         };
     }
     if count == 0 {
@@ -5077,9 +5206,9 @@ fn sifs_replica_coverage_label(details: &SifsObjectDetails) -> String {
     let current = details.current_locations.len();
     let desired = sifs_replica_desired_count(details);
     if desired > current {
-        format!("{current}/{desired} durable nodes")
+        format!("{current}/{desired} replicas")
     } else {
-        plural(current, "durable node")
+        plural(current, "replica")
     }
 }
 
@@ -5151,12 +5280,12 @@ fn sifs_compact_placement_summary(
             let current = details.current_locations.len();
             let desired = sifs_replica_desired_count(details);
             if desired > current {
-                format!("{current}/{desired} nodes")
+                format!("{current}/{desired} replicas")
             } else {
                 match current {
-                    0 => "no durable nodes".to_string(),
-                    1 => "1 node".to_string(),
-                    count => format!("{count} nodes"),
+                    0 => "no replicas".to_string(),
+                    1 => "1 replica".to_string(),
+                    count => format!("{count} replicas"),
                 }
             }
         }
@@ -5616,7 +5745,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let back = {
         let s = shared.clone();
         IconButton::new(IconGlyph::ChevronLeft, "Back")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
@@ -5631,7 +5759,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let forward = {
         let s = shared.clone();
         IconButton::new(IconGlyph::ChevronRight, "Forward")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
@@ -5646,7 +5773,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let up = {
         let s = shared.clone();
         IconButton::new(IconGlyph::ChevronUp, "Up")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .on_press(move || {
                 s.files_mut().go_up();
@@ -5673,19 +5799,21 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 
     let source = {
         let s = shared.clone();
-        sui::Select::new("files-source")
-            .options(vec!["SIFS".to_string(), "Local".to_string()])
-            .placeholder("Source")
+        let selected = match shared.files().source {
+            FilesSourceKind::Sifs => 0,
+            FilesSourceKind::Local => 1,
+        };
+        SegmentedControl::new("Files source")
+            .items([
+                SegmentedControlItem::new("SIFS")
+                    .semantic_name("Browse SIFS")
+                    .description("Browse distributed SIFS objects"),
+                SegmentedControlItem::new("Local")
+                    .semantic_name("Browse local files")
+                    .description("Browse this node's local filesystem"),
+            ])
+            .selected(selected)
             .theme_when(clone_reader(reader))
-            .selected_when({
-                let s = s.clone();
-                move || {
-                    Some(match s.files().source {
-                        FilesSourceKind::Sifs => 0,
-                        FilesSourceKind::Local => 1,
-                    })
-                }
-            })
             .on_change(move |index, _label| {
                 let source = if index == 1 {
                     FilesSourceKind::Local
@@ -5701,7 +5829,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         let s = shared.clone();
         let label = format!("Refresh {}", shared.files().source.label());
         IconButton::new(IconGlyph::Redo, label)
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .selected_when({
                 let s = s.clone();
@@ -5720,7 +5847,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let go_to = {
         let s = shared.clone();
         IconButton::new(IconGlyph::Search, "Go to path")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
@@ -5735,7 +5861,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let new_file = {
         let s = shared.clone();
         IconButton::new(IconGlyph::File, "New file")
-            .size(HEADER_CONTROL_H)
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
@@ -5751,7 +5876,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let new_folder = {
         let s = shared.clone();
         IconButton::new(IconGlyph::Folder, "New folder")
-            .size(HEADER_CONTROL_H)
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
@@ -5767,7 +5891,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let copy = {
         let s = shared.clone();
         IconButton::new(IconGlyph::Restore, "Copy to")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
@@ -5791,7 +5914,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let move_to = {
         let s = shared.clone();
         IconButton::new(IconGlyph::ChevronRight, "Move to")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
@@ -5815,7 +5937,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let refresh_placement = {
         let s = shared.clone();
         IconButton::new(IconGlyph::Storage, "Refresh placement")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
@@ -5836,7 +5957,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let repair_replicas = {
         let s = shared.clone();
         IconButton::new(IconGlyph::Redo, "Repair replicas")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
@@ -5857,7 +5977,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let rename = {
         let s = shared.clone();
         IconButton::new(IconGlyph::MoreHorizontal, "Rename")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
@@ -5876,7 +5995,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let delete = {
         let s = shared.clone();
         IconButton::new(IconGlyph::Trash, "Delete selected item")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when({
                 let s = s.clone();
@@ -5913,10 +6031,7 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             FlexItem::new().no_shrink(),
         )
         .with_item(
-            SizedBox::new()
-                .width(108.0)
-                .height(HEADER_CONTROL_H)
-                .with_child(source),
+            SizedBox::new().width(108.0).with_child(source),
             FlexItem::fixed(108.0),
         )
         .with_item(breadcrumb, FlexItem::fill().min_width(160.0))
@@ -5992,16 +6107,15 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
 
     if loading {
         let body = centered_note(
-            shared,
-            "▤",
+            reader,
+            IconGlyph::Storage,
             format!("Loading {}", source.label()),
             match source {
                 FilesSourceKind::Sifs => "Opening the distributed filesystem...",
                 FilesSourceKind::Local => "Reading the local directory...",
             },
-        )
-        .glyph(IconGlyph::Storage);
-        return placeholder_with_task_strip(shared, body, has_tasks);
+        );
+        return placeholder_with_task_strip(shared, reader, body, has_tasks);
     }
     if let Some(error) = error {
         let retry = {
@@ -6064,15 +6178,14 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             action_height = 70.0;
         }
         let body = centered_note(
-            shared,
-            "▤",
+            reader,
+            IconGlyph::Storage,
             format!("{} unavailable", source.label()),
             source_unavailable_summary(source, &error),
         )
-        .glyph(IconGlyph::Storage)
         .action(actions)
         .action_height(action_height);
-        return placeholder_with_task_strip(shared, body, has_tasks);
+        return placeholder_with_task_strip(shared, reader, body, has_tasks);
     }
     if is_empty {
         let create_file = {
@@ -6104,10 +6217,14 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             .alignment(Alignment::Center)
             .with_child(create_file)
             .with_child(create_folder);
-        let body = centered_note(shared, "▤", "Empty directory", "Nothing here yet.")
-            .glyph(IconGlyph::Folder)
-            .action(actions);
-        return placeholder_with_task_strip(shared, body, has_tasks);
+        let body = centered_note(
+            reader,
+            IconGlyph::Folder,
+            "Empty directory",
+            "Nothing here yet.",
+        )
+        .action(actions);
+        return placeholder_with_task_strip(shared, reader, body, has_tasks);
     }
 
     let scroll = files_list_body_rebuild(shared, reader, scroll_state);
@@ -6116,25 +6233,30 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         let top = Stack::vertical().alignment(Alignment::Stretch).with_child(
             SizedBox::new()
                 .height(LIST_TASK_STRIP_H)
-                .with_child(FilesTaskStrip::new(shared.clone())),
+                .with_child(files_task_strip(shared, reader)),
         );
-        WidgetPod::new(widgets::Dock::new(scroll).top(top_h, top))
+        WidgetPod::new(Dock::new(scroll).top(top_h, top))
     } else {
         WidgetPod::new(scroll)
     }
 }
 
-fn placeholder_with_task_strip<W>(shared: &Shared, body: W, has_tasks: bool) -> WidgetPod
+fn placeholder_with_task_strip<W>(
+    shared: &Shared,
+    reader: &ThemeReader,
+    body: W,
+    has_tasks: bool,
+) -> WidgetPod
 where
     W: Widget + 'static,
 {
     if has_tasks {
         WidgetPod::new(
-            widgets::Dock::new(body).top(
+            Dock::new(body).top(
                 LIST_TASK_STRIP_H,
                 SizedBox::new()
                     .height(LIST_TASK_STRIP_H)
-                    .with_child(FilesTaskStrip::new(shared.clone())),
+                    .with_child(files_task_strip(shared, reader)),
             ),
         )
     } else {
@@ -6185,15 +6307,12 @@ fn files_list_body_table(
         )
     };
     if entries.is_empty() {
-        return WidgetPod::new(
-            centered_note(
-                shared,
-                "â–¤",
-                "Empty directory",
-                format!("No {} entries to show.", source.label()),
-            )
-            .glyph(IconGlyph::Folder),
-        );
+        return WidgetPod::new(centered_note(
+            reader,
+            IconGlyph::Folder,
+            "Empty directory",
+            format!("No {} entries to show.", source.label()),
+        ));
     }
 
     let row_entries = entries.clone();
@@ -6212,13 +6331,12 @@ fn files_list_body_table(
                 VirtualTableColumn::new("Name")
                     .min_width(180.0)
                     .sort_direction(sort_mode.name_sort_direction()),
+                VirtualTableColumn::new("Placement").width(156.0),
                 VirtualTableColumn::new("Kind / size")
-                    .width(150.0)
+                    .width(128.0)
                     .sort_direction(sort_mode.meta_sort_direction()),
             ])
             .row_count(entries.len())
-            .row_height(ROW_H)
-            .header_height(LIST_HEADER_H)
             .theme_when(clone_reader(reader))
             .selected_when({
                 let s = s.clone();
@@ -6272,10 +6390,10 @@ fn files_list_body_table(
                 s.files_mut().click_row(index, activation);
             })
             .on_header_activate(move |column| {
-                let sort_column = if column == 2 {
-                    FilesSortColumn::KindSize
-                } else {
-                    FilesSortColumn::Name
+                let sort_column = match column {
+                    1 => FilesSortColumn::Name,
+                    3 => FilesSortColumn::KindSize,
+                    _ => return,
                 };
                 header_s.files_mut().toggle_sort_column(sort_column);
             })
@@ -6306,90 +6424,86 @@ fn paint_file_table_row(
     let selected = files.entry_marked(row.row_index);
     let label_color = if active { pal.text } else { pal.text_muted };
     let icon_color = if active { pal.accent } else { pal.text_faint };
-    let title_style = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, label_color);
-    let meta_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
 
     let select_cell = row.column_rects.first().copied().unwrap_or(row.row_rect);
-    let select_side = ROW_SELECT_SIDE.min(select_cell.height() - 6.0).max(0.0);
+    let select_side = theme
+        .metrics
+        .checkbox_indicator_size
+        .min(select_cell.height() - 6.0)
+        .max(0.0);
     let select_rect = Rect::new(
         select_cell.x() + ((select_cell.width() - select_side) * 0.5).max(0.0),
         select_cell.y() + ((select_cell.height() - select_side) * 0.5).max(0.0),
         select_side,
         select_side,
     );
-    let select_border = if selected { pal.accent } else { pal.border };
-    let select_fill = if selected {
-        pal.selected
-    } else {
-        Color::TRANSPARENT
-    };
-    widgets::round_panel(ctx, select_rect, select_fill, select_border, 5.0);
-    if selected || row.hovered {
-        draw_glyph(
-            ctx,
-            IconGlyph::Check,
-            select_rect.inflate(-5.0, -5.0),
-            if selected {
-                pal.accent
-            } else {
-                pal.text_faint.with_alpha(0.55)
-            },
-        );
-    }
+    paint_checkbox_indicator(
+        ctx,
+        &theme,
+        select_rect,
+        CheckboxIndicatorState::new(selected).hovered(row.hovered),
+    );
 
     if let Some(name_cell) = row.column_rects.get(1).copied() {
-        let thumbnail_rect = Rect::new(
-            name_cell.x() + 6.0,
-            name_cell.y() + ((name_cell.height() - ROW_THUMBNAIL_SIDE) * 0.5).max(0.0),
-            ROW_THUMBNAIL_SIDE,
-            ROW_THUMBNAIL_SIDE,
-        );
-        // This slot is intentionally isolated so image/SVG thumbnails can replace the glyph later.
-        draw_glyph(
+        let label_width = (name_cell.width() - ROW_THUMBNAIL_SIDE - 22.0).max(0.0);
+        let display_name = display_name_for_width(&entry.name, label_width, 7.1);
+        paint_leading_label_cell(
             ctx,
-            entry_icon(entry),
-            thumbnail_rect.inflate(-2.0, -2.0),
-            icon_color,
+            &theme,
+            name_cell,
+            &display_name,
+            LeadingLabelCellPaint::new()
+                .icon(entry_icon(entry))
+                .icon_color(icon_color)
+                .label_color(label_color)
+                .label_weight(FontWeight::MEDIUM)
+                .icon_slot_side(ROW_THUMBNAIL_SIDE)
+                .icon_inset(2.0)
+                .gap(8.0)
+                .padding(6.0, 8.0),
         );
-
-        let title_x = thumbnail_rect.max_x() + 8.0;
-        let title_rect = Rect::new(
-            title_x,
-            name_cell.y(),
-            (name_cell.max_x() - title_x - 8.0).max(0.0),
-            name_cell.height(),
-        );
-        let display_name = display_name_for_width(&entry.name, title_rect.width(), 7.1);
-        ctx.push_clip_rect(title_rect);
-        widgets::draw_text_in(ctx, title_rect, &display_name, title_style);
-        ctx.pop_clip();
     }
 
-    if let Some(meta_cell) = row.column_rects.get(2).copied() {
+    if let Some(placement_cell) = row.column_rects.get(2).copied() {
+        let placement = file_row_placement_badge(entry, &files, row.row_index);
+        paint_placement_badge_with(
+            ctx,
+            &theme,
+            placement_cell,
+            &placement.label,
+            Some(placement.icon),
+            placement.tone,
+            placement.replicas,
+            PlacementBadgePaint::new().padding(8.0, 5.0, 8.0, 5.0),
+        );
+    }
+
+    if let Some(meta_cell) = row.column_rects.get(3).copied() {
         let meta_text = entry_row_meta(entry, &files, active);
         let display = display_name_for_width(&meta_text, (meta_cell.width() - 12.0).max(0.0), 6.2);
-        widgets::draw_text_in(
+        paint_text_cell(
             ctx,
-            Rect::new(
-                meta_cell.x() + 8.0,
-                meta_cell.y(),
-                (meta_cell.width() - 16.0).max(0.0),
-                meta_cell.height(),
-            ),
+            &theme,
+            meta_cell,
             &display,
-            meta_style,
+            TextCellPaint::new()
+                .text_token(theme.text.xs)
+                .color(pal.text_faint)
+                .padding(8.0, 8.0),
         );
     }
 }
 
-/// A centered empty/error placeholder (mark, title, subtitle) themed off the chrome palette.
+/// A centered empty/error placeholder themed off the chrome palette.
 fn centered_note(
-    shared: &Shared,
-    mark: impl Into<String>,
+    reader: &ThemeReader,
+    icon: IconGlyph,
     title: impl Into<String>,
     subtitle: impl Into<String>,
-) -> widgets::Placeholder {
-    widgets::Placeholder::new(shared.clone(), mark, title, subtitle)
+) -> EmptyState {
+    EmptyState::new(title, subtitle)
+        .icon(icon)
+        .theme_when(clone_reader(reader))
 }
 
 fn request_files_overlay_rebuild(ctx: &mut EventCtx) {
@@ -6534,6 +6648,37 @@ fn files_source_status(files: &FilesState) -> &'static str {
         FilesSourceKind::Local if files.error.is_some() => "Local unavailable",
         FilesSourceKind::Local if files.loading => "Loading local",
         FilesSourceKind::Local => "Local files",
+    }
+}
+
+fn files_source_tone(files: &FilesState) -> SemanticTone {
+    match files.source {
+        FilesSourceKind::Sifs if files.error.is_some() => SemanticTone::Warning,
+        FilesSourceKind::Sifs if files.loading => SemanticTone::Accent,
+        FilesSourceKind::Sifs if files.sifs_health_error.is_some() => SemanticTone::Warning,
+        FilesSourceKind::Sifs
+            if files
+                .sifs_health
+                .as_ref()
+                .is_some_and(sifs_health_has_attention) =>
+        {
+            SemanticTone::Warning
+        }
+        FilesSourceKind::Sifs
+            if files
+                .sifs_health
+                .as_ref()
+                .is_some_and(sifs_health_has_activity) =>
+        {
+            SemanticTone::Accent
+        }
+        FilesSourceKind::Sifs if files.clustered || files_sifs_daemon_is_remote(files) => {
+            SemanticTone::Success
+        }
+        FilesSourceKind::Local if files.error.is_some() => SemanticTone::Warning,
+        FilesSourceKind::Local if files.loading => SemanticTone::Accent,
+        FilesSourceKind::Local => SemanticTone::Success,
+        FilesSourceKind::Sifs => SemanticTone::Neutral,
     }
 }
 
@@ -6686,11 +6831,12 @@ fn files_task_status(files: &FilesState) -> String {
 fn files_tasks_signature(tasks: &[FilesTask]) -> String {
     tasks
         .iter()
-        .take(6)
         .map(|task| {
             format!(
-                "{}:{:?}:{:.2}:{}",
+                "{:?}:{}:{}:{:?}:{:.2}:{}",
+                task.source,
                 task.id,
+                task.title,
                 task.state,
                 task.progress.unwrap_or(-1.0),
                 task.detail
@@ -7038,740 +7184,590 @@ fn marked_entries_label(count: usize) -> String {
     }
 }
 
-struct FilesStatusBar {
-    shared: Shared,
-}
-
-impl FilesStatusBar {
-    fn new(shared: Shared) -> Self {
-        Self { shared }
-    }
-
-    fn chip_color(files: &FilesState, pal: &Palette) -> Color {
-        if files.error.is_some() {
-            pal.warn
-        } else if files.loading {
-            pal.accent
-        } else if files.source == FilesSourceKind::Local {
-            pal.good
-        } else if files.sifs_health_error.is_some() {
-            pal.warn
-        } else if files
-            .sifs_health
-            .as_ref()
-            .is_some_and(sifs_health_has_attention)
-        {
-            pal.warn
-        } else if files
-            .sifs_health
-            .as_ref()
-            .is_some_and(sifs_health_has_activity)
-        {
-            pal.accent
-        } else if files.clustered {
-            pal.good
-        } else {
-            pal.text_faint
-        }
-    }
-}
-
-impl Widget for FilesStatusBar {
-    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        constraints.clamp(Size::new(280.0, FILES_STATUS_H))
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        let theme = self.shared.theme();
-        let pal = palette(&self.shared);
-        let bounds = ctx.bounds();
-        let files = self.shared.files();
-
-        ctx.fill_rect(bounds, pal.sidebar);
-        widgets::hairline_top(ctx, bounds, pal.border);
-
-        let x = bounds.x() + CONTENT_PAD;
-        let y = bounds.y() + 7.0;
-        let chip = Rect::new(x, y, 112.0_f32.min(bounds.width() * 0.28).max(86.0), 24.0);
-        let chip_tone = Self::chip_color(&files, &pal);
-        widgets::round_panel(ctx, chip, pal.field, chip_tone, 12.0);
-        widgets::fill_round_rect(
-            ctx,
-            Rect::new(chip.x() + 10.0, chip.y() + 9.0, 6.0, 6.0),
-            chip_tone,
-            3.0,
-        );
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(
-                chip.x() + 22.0,
-                chip.y(),
-                chip.width() - 30.0,
-                chip.height(),
-            ),
-            files_source_status(&files),
-            pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text),
-        );
-
-        let right_w = 190.0_f32.min(bounds.width() * 0.28).max(0.0);
-        let right = Rect::new(bounds.max_x() - CONTENT_PAD - right_w, y, right_w, 24.0);
-        widgets::draw_text_in(
-            ctx,
-            right,
-            &files_task_status(&files),
-            pal.text_style(&theme, 11.0, FontWeight::MEDIUM, pal.text_faint),
-        );
-
-        let info_x = chip.max_x() + 12.0;
-        let info_w = (right.x() - info_x - 12.0).max(0.0);
-        let selected = files_status_bar_selection(&files);
-        let info_parts = vec![
-            middle_short(&files.path, 64),
-            files_entry_count_status(&files),
-            selected,
-        ];
-        let info = info_parts.join(" | ");
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(info_x, y, info_w, 24.0),
-            &info,
-            pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_muted),
-        );
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let files = self.shared.files();
-        let summary = files_status_summary(&files);
-        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::Text, ctx.bounds());
-        node.name = Some("Files status".to_string());
-        node.value = Some(SemanticsValue::Text(summary.clone()));
-        node.description = Some(summary);
-        ctx.push(node);
-    }
-}
-
-struct FilesPlacesRail {
-    shared: Shared,
-    hovered: Option<usize>,
-}
-
-impl FilesPlacesRail {
-    fn new(shared: Shared) -> Self {
-        Self {
-            shared,
-            hovered: None,
-        }
-    }
-
-    fn row_rect(bounds: Rect, index: usize) -> Rect {
-        Rect::new(
-            bounds.x() + 8.0,
-            bounds.y() + 40.0 + index as f32 * PLACE_ROW_H,
-            (bounds.width() - 16.0).max(0.0),
-            PLACE_ROW_H - 6.0,
-        )
-    }
-
-    fn place_widget_id(parent: sui::WidgetId, index: usize) -> sui::WidgetId {
-        sui::WidgetId::new(
-            parent
-                .get()
-                .wrapping_mul(43)
-                .wrapping_add(12_401)
-                .wrapping_add(index as u64),
-        )
-    }
-
-    fn content_height(shared: &Shared) -> f32 {
-        let count = {
-            let files = shared.files();
-            files_places(&files).len()
-        };
-        48.0 + count as f32 * PLACE_ROW_H + 8.0
-    }
-
-    fn place_at(&self, bounds: Rect, position: Point) -> Option<usize> {
-        let places = {
-            let files = self.shared.files();
-            files_places(&files)
-        };
-        places
-            .iter()
-            .enumerate()
-            .find(|(index, _)| Self::row_rect(bounds, *index).contains(position))
-            .map(|(index, _)| index)
-    }
-}
-
-impl Widget for FilesPlacesRail {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        match event {
-            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
-                let hovered = self.place_at(ctx.bounds(), pointer.position);
-                if self.hovered != hovered {
-                    self.hovered = hovered;
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                }
-            }
-            Event::Pointer(pointer)
-                if pointer.kind == PointerEventKind::Up
-                    && (pointer.button == Some(PointerButton::Primary)
-                        || pointer.button.is_none()) =>
-            {
-                if let Some(index) = self.place_at(ctx.bounds(), pointer.position) {
-                    let place = {
-                        let files = self.shared.files();
-                        files_places(&files).get(index).cloned()
-                    };
-                    if let Some(place) = place {
-                        open_file_place(&self.shared, place, ctx);
-                        self.hovered = None;
-                        ctx.set_handled();
-                    }
-                }
-            }
-            Event::Pointer(pointer)
-                if matches!(
-                    pointer.kind,
-                    PointerEventKind::Leave | PointerEventKind::Cancel
-                ) =>
-            {
-                if self.hovered.take().is_some() {
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        constraints.clamp(Size::new(PLACES_W, Self::content_height(&self.shared)))
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        let theme = self.shared.theme();
-        let pal = palette(&self.shared);
-        let bounds = ctx.bounds();
-        let files = self.shared.files();
-        let places = files_places(&files);
-
-        ctx.fill_rect(bounds, pal.sidebar);
-        widgets::hairline_right(ctx, bounds, pal.border);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(
-                bounds.x() + CONTENT_PAD,
-                bounds.y() + 14.0,
-                bounds.width(),
-                16.0,
-            ),
-            "PLACES",
-            pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint),
-        );
-
-        for (index, place) in places.iter().enumerate() {
-            let row = Self::row_rect(bounds, index);
-            let active = file_place_active(&files, place);
-            let hovered = self.hovered == Some(index);
-            let fill = if active {
-                pal.selected
-            } else if hovered {
-                pal.hover
-            } else {
-                pal.sidebar
-            };
-            let border = if active { pal.accent } else { fill };
-            widgets::round_panel(ctx, row, fill, border, 7.0);
-            let icon_rect = Rect::new(row.x() + 10.0, row.y() + 9.0, 16.0, 16.0);
-            let icon_color = if active { pal.accent } else { pal.text_muted };
-            draw_glyph(ctx, place.glyph, icon_rect, icon_color);
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(row.x() + 34.0, row.y() + 5.0, row.width() - 42.0, 15.0),
-                &place.label,
-                pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text),
-            );
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(row.x() + 34.0, row.y() + 20.0, row.width() - 42.0, 14.0),
-                &place.detail,
-                pal.text_style(&theme, 10.0, FontWeight::NORMAL, pal.text_faint),
-            );
-        }
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let files = self.shared.files();
-        let places = files_places(&files);
-        let root_id = ctx.widget_id();
-        let mut root = SemanticsNode::new(root_id, SemanticsRole::Text, ctx.bounds());
-        root.name = Some("Files places".to_string());
-        root.description = Some("Pinned SIFS and local filesystem locations".to_string());
-        ctx.push(root);
-
-        for (index, place) in places.iter().enumerate() {
-            let mut node = SemanticsNode::new(
-                Self::place_widget_id(root_id, index),
-                SemanticsRole::Button,
-                Self::row_rect(ctx.bounds(), index),
-            );
-            node.parent = Some(root_id);
-            node.name = Some(format!("Open {}", place.label));
-            node.description = Some(format!("{}: {}", place.source.path_label(), place.path));
-            node.actions = vec![SemanticsAction::Activate];
-            node.state.hovered = self.hovered == Some(index);
-            node.state.selected = file_place_active(&files, place);
-            ctx.push(node);
-        }
-    }
-}
-
-struct FilesTaskStrip {
-    shared: Shared,
-    hovered_cancel: Option<u64>,
-    hovered_recovery: Option<u64>,
-    hovered_clear: bool,
-}
-
-impl FilesTaskStrip {
-    fn new(shared: Shared) -> Self {
-        Self {
-            shared,
-            hovered_cancel: None,
-            hovered_recovery: None,
-            hovered_clear: false,
-        }
-    }
-
-    fn has_finished_tasks(files: &FilesState) -> bool {
-        files.tasks.iter().any(|task| {
-            matches!(
-                task.state,
-                FilesTaskState::Cancelled | FilesTaskState::Completed | FilesTaskState::Failed
+fn files_status_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let badge_label = {
+        let s = shared.clone();
+        move || files_source_status(&s.files()).to_string()
+    };
+    let badge_tone = {
+        let s = shared.clone();
+        move || files_source_tone(&s.files())
+    };
+    let path_summary = {
+        let s = shared.clone();
+        move || {
+            let files = s.files();
+            let selected = files_status_bar_selection(&files);
+            format!(
+                "{} | {} | {}",
+                middle_short(&files.path, 64),
+                files_entry_count_status(&files),
+                selected
             )
+        }
+    };
+    let task_summary = {
+        let s = shared.clone();
+        move || files_task_status(&s.files())
+    };
+    let accessibility_summary = {
+        let s = shared.clone();
+        move || files_status_summary(&s.files())
+    };
+    let status_theme = clone_reader(reader);
+    let body = Background::new(
+        Color::TRANSPARENT,
+        Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
+            .with_child(
+                SizedBox::new().height(FILES_STATUS_H - 1.0).with_child(
+                    Flex::horizontal()
+                        .gap(8.0)
+                        .align_items(Alignment::Center)
+                        .with_child(
+                            SizedBox::new().width(146.0).with_child(
+                                StatusBadge::dynamic("SIFS unknown", badge_label)
+                                    .tone_when(badge_tone)
+                                    .icon(IconGlyph::Storage)
+                                    .theme_when(clone_reader(reader)),
+                            ),
+                        )
+                        .with_item(
+                            StatusBar::new()
+                                .name("Files status")
+                                .description_when(accessibility_summary)
+                                .height(FILES_STATUS_H - 1.0)
+                                .theme_when(status_theme)
+                                .segment(
+                                    StatusBarSegment::dynamic("Path /", path_summary).expand(true),
+                                )
+                                .segment(
+                                    StatusBarSegment::dynamic("idle", task_summary)
+                                        .min_width(144.0),
+                                ),
+                            FlexItem::flex(1.0).min_width(0.0),
+                        ),
+                ),
+            ),
+    )
+    .brush_when({
+        let s = shared.clone();
+        move || palette(&s).sidebar
+    });
+
+    SizedBox::new().height(FILES_STATUS_H).with_child(body)
+}
+
+fn files_places_signature(
+    shared: &Shared,
+) -> (FilesSourceKind, String, String, String, String, String) {
+    let files = shared.files();
+    (
+        files.source,
+        files.path.clone(),
+        files.sifs_path.clone(),
+        files.local_path.clone(),
+        files.node_id.clone(),
+        files.data_dir.root().to_string_lossy().into_owned(),
+    )
+}
+
+fn files_places_content_height(count: usize) -> f32 {
+    48.0 + count as f32 * PLACE_ROW_H + 8.0
+}
+
+fn files_places_rail(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || files_places_signature(&s)
+        },
+        move |_key| files_places_rail_rebuild(&s, &r),
+    )
+}
+
+fn files_places_rail_rebuild(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let places = {
+        let files = shared.files();
+        files_places(&files)
+    };
+    let content_height = files_places_content_height(places.len());
+    let selection_places = places.clone();
+    let action_places = places.clone();
+    let selection_shared = shared.clone();
+    let action_shared = shared.clone();
+    let items = places
+        .iter()
+        .map(|place| {
+            ListItem::new(place.label.clone())
+                .detail(place.detail.clone())
+                .leading_icon(place.glyph)
         })
-    }
+        .collect::<Vec<_>>();
 
-    fn clear_rect(bounds: Rect) -> Rect {
-        Rect::new(
-            bounds.max_x() - CONTENT_PAD - 100.0,
-            bounds.y() + 7.0,
-            100.0,
-            22.0,
+    let list = ListView::new("Files places")
+        .items(items)
+        .row_height(PLACE_ROW_H)
+        .theme_when(clone_reader(reader))
+        .selected_when(move || {
+            let files = selection_shared.files();
+            selection_places
+                .iter()
+                .position(|place| file_place_active(&files, place))
+        })
+        .on_change_with_ctx(move |index, _label, ctx| {
+            if let Some(place) = action_places.get(index).cloned() {
+                open_file_place(&action_shared, place, ctx);
+            }
+        });
+
+    let header = SizedBox::new().height(36.0).with_child(
+        WidgetPadding::horizontal(
+            CONTENT_PAD,
+            Flex::horizontal()
+                .align_items(Alignment::Center)
+                .with_child(SectionLabel::new("Places").theme_when(clone_reader(reader))),
         )
-    }
+        .fill_child_height(),
+    );
 
-    fn cancel_rect(bounds: Rect, row_index: usize) -> Rect {
-        Rect::new(
-            bounds.max_x() - CONTENT_PAD - INSPECTOR_TASK_CANCEL_W,
-            bounds.y() + 34.0 + row_index as f32 * 24.0,
-            INSPECTOR_TASK_CANCEL_W,
-            22.0,
-        )
-    }
+    WidgetPod::new(SizedBox::new().height(content_height).with_child(
+        Background::new(Color::TRANSPARENT, Dock::new(list).top(36.0, header)).brush_when({
+            let s = shared.clone();
+            move || palette(&s).sidebar
+        }),
+    ))
+}
 
-    fn recovery_rect(bounds: Rect, row_index: usize) -> Rect {
-        Rect::new(
-            bounds.max_x() - CONTENT_PAD - 92.0,
-            bounds.y() + 33.0 + row_index as f32 * 24.0,
-            92.0,
-            22.0,
-        )
-    }
+fn task_strip_has_recovery(task: &FilesTask) -> bool {
+    task.source == FilesSourceKind::Sifs && task.state == FilesTaskState::Failed
+}
 
-    fn task_has_recovery(task: &FilesTask) -> bool {
-        task.source == FilesSourceKind::Sifs && task.state == FilesTaskState::Failed
-    }
+fn task_strip_hidden_task_count(tasks: &[FilesTask]) -> usize {
+    tasks.len().saturating_sub(2)
+}
 
-    fn hidden_task_count(tasks: &[FilesTask]) -> usize {
-        tasks.len().saturating_sub(2)
-    }
-
-    fn overflow_label(hidden: usize) -> String {
-        if hidden == 1 {
-            "1 more in inspector".to_string()
-        } else {
-            format!("{hidden} more in inspector")
-        }
-    }
-
-    fn strip_summary(tasks: &[FilesTask]) -> String {
-        let base = files_task_queue_summary(tasks);
-        let hidden = Self::hidden_task_count(tasks);
-        if hidden == 0 {
-            return base;
-        }
-        format!(
-            "{base}; showing 2 of {}; {} in inspector",
-            tasks.len(),
-            plural(hidden, "more task")
-        )
-    }
-
-    fn detail_display(task: &FilesTask, width: f32) -> String {
-        let detail = files_task_detail_display(task);
-        let detail = if Self::task_has_recovery(task) {
-            detail
-                .strip_suffix(" in Connection")
-                .unwrap_or(detail.as_str())
-        } else {
-            detail.as_str()
-        };
-        display_name_for_width(detail, width, 6.2)
-    }
-
-    fn cancel_widget_id(parent: sui::WidgetId, task_id: u64) -> sui::WidgetId {
-        sui::WidgetId::new(
-            parent
-                .get()
-                .wrapping_mul(47)
-                .wrapping_add(10_201)
-                .wrapping_add(task_id),
-        )
-    }
-
-    fn clear_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
-        sui::WidgetId::new(parent.get().wrapping_mul(47).wrapping_add(10_199))
-    }
-
-    fn recovery_widget_id(parent: sui::WidgetId, task_id: u64) -> sui::WidgetId {
-        sui::WidgetId::new(
-            parent
-                .get()
-                .wrapping_mul(47)
-                .wrapping_add(10_301)
-                .wrapping_add(task_id),
-        )
-    }
-
-    fn task_at_cancel(&self, bounds: Rect, position: Point) -> Option<u64> {
-        let files = self.shared.files();
-        files
-            .tasks
-            .iter()
-            .take(2)
-            .enumerate()
-            .find(|(index, task)| {
-                task.state.can_cancel() && Self::cancel_rect(bounds, *index).contains(position)
-            })
-            .map(|(_, task)| task.id)
-    }
-
-    fn task_at_recovery(&self, bounds: Rect, position: Point) -> Option<u64> {
-        let files = self.shared.files();
-        files
-            .tasks
-            .iter()
-            .take(2)
-            .enumerate()
-            .find(|(index, task)| {
-                Self::task_has_recovery(task)
-                    && Self::recovery_rect(bounds, *index).contains(position)
-            })
-            .map(|(_, task)| task.id)
-    }
-
-    fn clear_hit(&self, bounds: Rect, position: Point) -> bool {
-        let files = self.shared.files();
-        Self::has_finished_tasks(&files) && Self::clear_rect(bounds).contains(position)
+fn task_strip_overflow_label(hidden: usize) -> String {
+    if hidden == 1 {
+        "1 more in inspector".to_string()
+    } else {
+        format!("{hidden} more in inspector")
     }
 }
 
-impl Widget for FilesTaskStrip {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        match event {
-            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
-                let hovered = self.task_at_cancel(ctx.bounds(), pointer.position);
-                let hovered_recovery = self.task_at_recovery(ctx.bounds(), pointer.position);
-                let hovered_clear = self.clear_hit(ctx.bounds(), pointer.position);
-                if self.hovered_cancel != hovered
-                    || self.hovered_recovery != hovered_recovery
-                    || self.hovered_clear != hovered_clear
-                {
-                    self.hovered_cancel = hovered;
-                    self.hovered_recovery = hovered_recovery;
-                    self.hovered_clear = hovered_clear;
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                }
-            }
-            Event::Pointer(pointer)
-                if pointer.kind == PointerEventKind::Up
-                    && (pointer.button == Some(PointerButton::Primary)
-                        || pointer.button.is_none()) =>
-            {
-                if self.clear_hit(ctx.bounds(), pointer.position) {
-                    self.shared.files_mut().clear_finished_tasks();
-                    self.hovered_cancel = None;
-                    self.hovered_clear = false;
-                    ctx.request_measure();
-                    ctx.request_arrange();
-                    ctx.request_paint();
-                    ctx.request_hit_test();
-                    ctx.request_semantics();
-                    ctx.set_handled();
-                } else if self
-                    .task_at_recovery(ctx.bounds(), pointer.position)
-                    .is_some()
-                {
-                    open_settings_section(&self.shared, SettingsSection::Connection);
-                    self.hovered_cancel = None;
-                    self.hovered_recovery = None;
-                    self.hovered_clear = false;
-                    ctx.request_measure();
-                    ctx.request_arrange();
-                    ctx.request_paint();
-                    ctx.request_hit_test();
-                    ctx.request_semantics();
-                    ctx.set_handled();
-                } else if let Some(task_id) = self.task_at_cancel(ctx.bounds(), pointer.position) {
-                    self.shared.files_mut().cancel_task(task_id);
-                    self.hovered_cancel = None;
-                    self.hovered_recovery = None;
-                    self.hovered_clear = false;
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                    ctx.set_handled();
-                }
-            }
-            Event::Pointer(pointer)
-                if matches!(
-                    pointer.kind,
-                    PointerEventKind::Leave | PointerEventKind::Cancel
-                ) =>
-            {
-                let changed = self.hovered_cancel.take().is_some()
-                    || self.hovered_recovery.take().is_some()
-                    || self.hovered_clear;
-                self.hovered_clear = false;
-                if changed {
-                    ctx.request_paint();
-                    ctx.request_semantics();
-                }
-            }
-            _ => {}
+fn task_strip_summary(tasks: &[FilesTask]) -> String {
+    let base = files_task_queue_summary(tasks);
+    let hidden = task_strip_hidden_task_count(tasks);
+    if hidden == 0 {
+        return base;
+    }
+    format!(
+        "{base}; showing 2 of {}; {} in inspector",
+        tasks.len(),
+        plural(hidden, "more task")
+    )
+}
+
+fn task_strip_detail_display(task: &FilesTask) -> String {
+    let detail = files_task_detail_display(task);
+    if task_strip_has_recovery(task) {
+        detail
+            .strip_suffix(" in Connection")
+            .unwrap_or(detail.as_str())
+            .to_string()
+    } else {
+        detail
+    }
+}
+
+fn task_strip_button_padding() -> sui::Insets {
+    sui::Insets {
+        left: 8.0,
+        right: 8.0,
+        top: 2.0,
+        bottom: 2.0,
+    }
+}
+
+fn task_strip_clear_button(shared: &Shared, reader: &ThemeReader) -> sui::Button {
+    let s = shared.clone();
+    sui::Button::new("Clear finished")
+        .semantic_name("Clear finished tasks")
+        .description("Dismiss completed, failed, and cancelled file operations")
+        .min_width(108.0)
+        .min_height(22.0)
+        .padding(task_strip_button_padding())
+        .theme_when(secondary_button_theme(reader))
+        .on_press_with_ctx(move |ctx| {
+            s.files_mut().clear_finished_tasks();
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_paint();
+            ctx.request_semantics();
+        })
+}
+
+fn task_strip_cancel_button(
+    shared: &Shared,
+    reader: &ThemeReader,
+    task: &FilesTask,
+) -> sui::Button {
+    let s = shared.clone();
+    let task_id = task.id;
+    sui::Button::new("Cancel")
+        .semantic_name(format!("Cancel {}", task.title))
+        .description(task.detail.clone())
+        .min_width(58.0)
+        .min_height(22.0)
+        .padding(task_strip_button_padding())
+        .theme_when(secondary_button_theme(reader))
+        .on_press_with_ctx(move |ctx| {
+            s.files_mut().cancel_task(task_id);
+            ctx.request_paint();
+            ctx.request_semantics();
+        })
+}
+
+fn task_strip_recovery_button(
+    shared: &Shared,
+    reader: &ThemeReader,
+    task: &FilesTask,
+) -> sui::Button {
+    let s = shared.clone();
+    sui::Button::new("Connection")
+        .icon(IconGlyph::Alert)
+        .icon_size(12.0)
+        .semantic_name(format!("Open Connection settings for {}", task.title))
+        .description(format!("{}: {}", task.title, task.detail))
+        .min_width(92.0)
+        .min_height(22.0)
+        .padding(task_strip_button_padding())
+        .theme_when(secondary_button_theme(reader))
+        .on_press_with_ctx(move |ctx| {
+            open_settings_section(&s, SettingsSection::Connection);
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_paint();
+            ctx.request_semantics();
+        })
+}
+
+fn task_strip_action_slot(
+    shared: &Shared,
+    reader: &ThemeReader,
+    task: &FilesTask,
+) -> (SwitchView, f32) {
+    let action_index = if task.state.can_cancel() {
+        1
+    } else if task_strip_has_recovery(task) {
+        2
+    } else {
+        0
+    };
+    let width = match action_index {
+        1 => 58.0,
+        2 => 92.0,
+        _ => 0.0,
+    };
+    let slot = SwitchView::new()
+        .selected(action_index)
+        .with_child(SizedBox::new())
+        .with_child(task_strip_cancel_button(shared, reader, task))
+        .with_child(task_strip_recovery_button(shared, reader, task));
+    (slot, width)
+}
+
+fn task_strip_row(shared: &Shared, reader: &ThemeReader, task: &FilesTask) -> impl Widget + use<> {
+    let theme = reader();
+    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+    let title_style = pal.text_style(&theme, 11.5, FontWeight::MEDIUM, pal.text);
+    let detail_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
+    let title = format!("{} · {}", task.title, task.state.label());
+    let detail = task_strip_detail_display(task);
+    let progress = task_progress_fraction(task);
+    let tone = task_progress_tone(task);
+    let (action, action_w) = task_strip_action_slot(shared, reader, task);
+
+    let body = Flex::vertical()
+        .main_gap(1.0)
+        .align_items(Alignment::Stretch)
+        .with_child(Label::new(title).style(title_style))
+        .with_child(Label::new(detail).style(detail_style))
+        .with_child(
+            SizedBox::new().height(3.0).with_child(
+                sui::ProgressBar::new(format!("{} progress", task.title))
+                    .value(progress as f64)
+                    .tone(tone)
+                    .height(3.0)
+                    .min_width(80.0)
+                    .theme_when(clone_reader(reader)),
+            ),
+        );
+
+    TrailingSlotRow::new(body, action)
+        .trailing_width(action_w)
+        .trailing_height(22.0)
+        .gap(8.0)
+}
+
+fn task_strip_content(
+    shared: &Shared,
+    reader: &ThemeReader,
+    tasks: &[FilesTask],
+) -> impl Widget + use<> {
+    let theme = reader();
+    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+    let overflow_style = pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text_muted);
+    let hidden = task_strip_hidden_task_count(tasks);
+    let has_finished = files_tasks_have_finished(tasks);
+
+    let mut header_body = Flex::horizontal()
+        .main_gap(8.0)
+        .align_items(Alignment::Center)
+        .with_child(SectionLabel::new("Tasks").theme_when(clone_reader(reader)));
+    if hidden > 0 {
+        header_body = header_body.with_child(
+            Label::new(task_strip_overflow_label(hidden))
+                .style(overflow_style)
+                .semantic_name(task_strip_overflow_label(hidden)),
+        );
+    }
+
+    let clear_slot = SwitchView::new()
+        .selected(if has_finished { 1 } else { 0 })
+        .with_child(SizedBox::new())
+        .with_child(task_strip_clear_button(shared, reader));
+    let header = SizedBox::new().height(24.0).with_child(
+        TrailingSlotRow::new(header_body, clear_slot)
+            .trailing_width(if has_finished { 108.0 } else { 0.0 })
+            .trailing_height(22.0)
+            .gap(8.0),
+    );
+
+    let mut rows = Flex::vertical()
+        .main_gap(4.0)
+        .align_items(Alignment::Stretch)
+        .with_child(header);
+    for task in tasks.iter().take(2) {
+        rows = rows.with_child(
+            SizedBox::new()
+                .height(27.0)
+                .with_child(task_strip_row(shared, reader, task)),
+        );
+    }
+
+    let s = shared.clone();
+    let content = WidgetPadding::symmetric(CONTENT_PAD, 6.0, rows).fill_child_width();
+    let panel =
+        Background::new(Color::TRANSPARENT, content).brush_when(move || palette(&s).sidebar);
+    Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .with_child(
+            SizedBox::new()
+                .height(LIST_TASK_STRIP_H - 1.0)
+                .with_child(panel),
+        )
+        .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
+}
+
+fn files_task_strip(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let tasks = shared.files().tasks.clone();
+    let summary = task_strip_summary(&tasks);
+    SizedBox::new().height(LIST_TASK_STRIP_H).with_child(
+        SemanticRegion::new(
+            "File task strip",
+            task_strip_content(shared, reader, &tasks),
+        )
+        .role(SemanticsRole::Text)
+        .description(summary),
+    )
+}
+
+struct InspectorTaskQueue {
+    shared: Shared,
+    reader: ThemeReader,
+    signature: String,
+    child: WidgetPod,
+}
+
+impl InspectorTaskQueue {
+    fn new(shared: Shared, reader: &ThemeReader) -> Self {
+        let (signature, child) = inspector_task_queue_snapshot(&shared, reader);
+        Self {
+            shared,
+            reader: Rc::clone(reader),
+            signature,
+            child,
         }
     }
 
-    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        constraints.clamp(Size::new(280.0, LIST_TASK_STRIP_H))
+    fn refresh(&mut self) -> bool {
+        let signature = {
+            let files = self.shared.files();
+            files_tasks_signature(&files.tasks)
+        };
+        if signature == self.signature {
+            return false;
+        }
+
+        let (signature, child) = inspector_task_queue_snapshot(&self.shared, &self.reader);
+        self.signature = signature;
+        self.child = child;
+        true
+    }
+}
+
+fn inspector_task_queue_snapshot(shared: &Shared, reader: &ThemeReader) -> (String, WidgetPod) {
+    let tasks = shared.files().tasks.clone();
+    let signature = files_tasks_signature(&tasks);
+    let summary = files_task_queue_summary(&tasks);
+    let child = WidgetPod::new(
+        SemanticRegion::new(
+            "File task queue",
+            inspector_task_queue_content(shared, reader, &tasks),
+        )
+        .role(SemanticsRole::Text)
+        .description(summary),
+    );
+    (signature, child)
+}
+
+fn inspector_task_clear_button(shared: &Shared, reader: &ThemeReader) -> sui::Button {
+    let s = shared.clone();
+    sui::Button::new("Clear finished")
+        .semantic_name("Clear finished file tasks")
+        .description("Dismiss completed, failed, and cancelled file operations")
+        .min_width(108.0)
+        .min_height(22.0)
+        .padding(task_strip_button_padding())
+        .theme_when(secondary_button_theme(reader))
+        .on_press_with_ctx(move |ctx| {
+            s.files_mut().clear_finished_tasks();
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_paint();
+            ctx.request_semantics();
+        })
+}
+
+fn inspector_task_queue_content(
+    shared: &Shared,
+    reader: &ThemeReader,
+    tasks: &[FilesTask],
+) -> impl Widget + use<> {
+    let theme = reader();
+    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+    let summary_style = pal.text_style(&theme, 10.8, FontWeight::MEDIUM, pal.text_muted);
+    let has_finished = files_tasks_have_finished(tasks);
+
+    let header_body = Flex::vertical()
+        .main_gap(1.0)
+        .align_items(Alignment::Stretch)
+        .with_child(SectionLabel::new("File tasks").theme_when(clone_reader(reader)))
+        .with_child(Label::new(files_task_queue_summary(tasks)).style(summary_style));
+    let clear_slot = SwitchView::new()
+        .selected(if has_finished { 1 } else { 0 })
+        .with_child(SizedBox::new())
+        .with_child(inspector_task_clear_button(shared, reader));
+    let header = TrailingSlotRow::new(header_body, clear_slot)
+        .trailing_width(if has_finished { 108.0 } else { 0.0 })
+        .trailing_height(22.0)
+        .gap(8.0);
+
+    let mut rows = Flex::vertical()
+        .main_gap(8.0)
+        .align_items(Alignment::Stretch)
+        .with_child(header);
+
+    if tasks.is_empty() {
+        let idle_body = Flex::vertical()
+            .main_gap(8.0)
+            .align_items(Alignment::Stretch)
+            .with_child(
+                SizedBox::new().height(24.0).with_child(
+                    StatusBadge::new("Idle")
+                        .tone(SemanticTone::Success)
+                        .min_width(68.0)
+                        .theme_when(clone_reader(reader)),
+                ),
+            )
+            .with_child(
+                Label::new("No active file operations").style(pal.text_style(
+                    &theme,
+                    12.0,
+                    FontWeight::MEDIUM,
+                    pal.text,
+                )),
+            )
+            .with_child(Label::new("Worker queue empty").style(pal.text_style(
+                &theme,
+                11.0,
+                FontWeight::NORMAL,
+                pal.text_faint,
+            )));
+        rows = rows.with_child(idle_body);
+    } else {
+        for task in tasks {
+            rows = rows.with_child(
+                SizedBox::new()
+                    .height(31.0)
+                    .with_child(task_strip_row(shared, reader, task)),
+            );
+        }
+    }
+
+    Surface::panel(rows)
+        .padding(sui::Insets {
+            left: 12.0,
+            right: 12.0,
+            top: 10.0,
+            bottom: 12.0,
+        })
+        .fill_width()
+        .theme_when(clone_reader(reader))
+}
+
+impl Widget for InspectorTaskQueue {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        let pointer_up = matches!(
+            event,
+            Event::Pointer(pointer) if matches!(pointer.kind, PointerEventKind::Up)
+        );
+        let redraw = matches!(event, Event::Window(WindowEvent::RedrawRequested));
+        if (pointer_up || redraw) && self.refresh() {
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_paint();
+            ctx.request_semantics();
+        }
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.refresh();
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
-        let theme = self.shared.theme();
-        let pal = palette(&self.shared);
-        let bounds = ctx.bounds();
-        let files = self.shared.files();
-
-        ctx.fill_rect(bounds, pal.sidebar);
-        widgets::hairline_bottom(ctx, bounds, pal.border);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(
-                bounds.x() + CONTENT_PAD,
-                bounds.y() + 10.0,
-                bounds.width(),
-                16.0,
-            ),
-            "TASKS",
-            pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint),
-        );
-        let hidden = Self::hidden_task_count(&files.tasks);
-        if hidden > 0 {
-            let label = Self::overflow_label(hidden);
-            let clear_left = if Self::has_finished_tasks(&files) {
-                Self::clear_rect(bounds).x() - 8.0
-            } else {
-                bounds.max_x() - CONTENT_PAD
-            };
-            let label_x = bounds.x() + CONTENT_PAD + 46.0;
-            let label_w = (clear_left - label_x).max(0.0);
-            if label_w > 36.0 {
-                let label = display_name_for_width(&label, label_w, 5.8);
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(label_x, bounds.y() + 10.0, label_w, 16.0),
-                    &label,
-                    pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text_muted),
-                );
-            }
-        }
-        if Self::has_finished_tasks(&files) {
-            let clear = Self::clear_rect(bounds);
-            let fill = if self.hovered_clear {
-                pal.hover
-            } else {
-                pal.field
-            };
-            widgets::round_panel(ctx, clear, fill, pal.border, 7.0);
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(
-                    clear.x() + 10.0,
-                    clear.y() + 3.0,
-                    clear.width() - 20.0,
-                    16.0,
-                ),
-                "Clear finished",
-                pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text),
-            );
-        }
-
-        let title_style = pal.text_style(&theme, 11.5, FontWeight::MEDIUM, pal.text);
-        let detail_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
-        for (index, task) in files.tasks.iter().take(2).enumerate() {
-            let row_y = bounds.y() + 32.0 + index as f32 * 24.0;
-            let cancel = Self::cancel_rect(bounds, index);
-            let recovery = Self::recovery_rect(bounds, index);
-            let text_right = if task.state.can_cancel() {
-                cancel.x() - 8.0
-            } else if Self::task_has_recovery(task) {
-                recovery.x() - 8.0
-            } else {
-                bounds.max_x() - CONTENT_PAD
-            };
-            let text_w = (text_right - bounds.x() - CONTENT_PAD).max(0.0);
-            let tone = match task.state {
-                FilesTaskState::Running | FilesTaskState::CancelRequested => pal.accent,
-                FilesTaskState::Completed | FilesTaskState::Cancelled => pal.good,
-                FilesTaskState::Failed => pal.warn,
-            };
-            let dot = Rect::new(bounds.x() + CONTENT_PAD, row_y + 5.0, 6.0, 6.0);
-            widgets::fill_round_rect(ctx, dot, tone, 3.0);
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(bounds.x() + CONTENT_PAD + 12.0, row_y, text_w, 14.0),
-                &format!("{} · {}", task.title, task.state.label()),
-                title_style.clone(),
-            );
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(bounds.x() + CONTENT_PAD + 12.0, row_y + 13.0, text_w, 13.0),
-                &Self::detail_display(task, text_w),
-                detail_style.clone(),
-            );
-            let bar = Rect::new(
-                bounds.x() + CONTENT_PAD + 12.0,
-                row_y + 28.0,
-                text_w.min(220.0),
-                3.0,
-            );
-            if bar.width() > 0.0 {
-                widgets::fill_round_rect(ctx, bar, pal.field, 1.5);
-                let fraction = task_progress_fraction(task);
-                widgets::fill_round_rect(
-                    ctx,
-                    Rect::new(bar.x(), bar.y(), bar.width() * fraction, bar.height()),
-                    tone,
-                    1.5,
-                );
-            }
-            if task.state.can_cancel() {
-                let fill = if self.hovered_cancel == Some(task.id) {
-                    pal.hover
-                } else {
-                    pal.field
-                };
-                widgets::round_panel(ctx, cancel, fill, pal.border, 7.0);
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(
-                        cancel.x() + 8.0,
-                        cancel.y() + 3.0,
-                        cancel.width() - 16.0,
-                        16.0,
-                    ),
-                    "Cancel",
-                    pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text),
-                );
-            } else if Self::task_has_recovery(task) {
-                let fill = if self.hovered_recovery == Some(task.id) {
-                    pal.hover
-                } else {
-                    pal.field
-                };
-                widgets::round_panel(ctx, recovery, fill, pal.border, 7.0);
-                draw_glyph(
-                    ctx,
-                    IconGlyph::Alert,
-                    Rect::new(recovery.x() + 8.0, recovery.y() + 5.0, 12.0, 12.0),
-                    pal.warn,
-                );
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(
-                        recovery.x() + 24.0,
-                        recovery.y() + 3.0,
-                        recovery.width() - 30.0,
-                        16.0,
-                    ),
-                    "Connection",
-                    pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text),
-                );
-            }
-        }
+        self.child.paint(ctx);
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let files = self.shared.files();
-        let mut root = SemanticsNode::new(ctx.widget_id(), SemanticsRole::Text, ctx.bounds());
-        root.name = Some("File task strip".to_string());
-        root.description = Some(Self::strip_summary(&files.tasks));
-        ctx.push(root);
+        self.child.semantics(ctx);
+    }
 
-        if Self::has_finished_tasks(&files) {
-            let mut node = SemanticsNode::new(
-                Self::clear_widget_id(ctx.widget_id()),
-                SemanticsRole::Button,
-                Self::clear_rect(ctx.bounds()),
-            );
-            node.parent = Some(ctx.widget_id());
-            node.name = Some("Clear finished tasks".to_string());
-            node.description =
-                Some("Dismiss completed, failed, and cancelled file operations".to_string());
-            node.actions = vec![SemanticsAction::Activate];
-            node.state.hovered = self.hovered_clear;
-            ctx.push(node);
-        }
-        for (index, task) in files
-            .tasks
-            .iter()
-            .take(2)
-            .enumerate()
-            .filter(|(_, task)| Self::task_has_recovery(task))
-        {
-            let mut node = SemanticsNode::new(
-                Self::recovery_widget_id(ctx.widget_id(), task.id),
-                SemanticsRole::Button,
-                Self::recovery_rect(ctx.bounds(), index),
-            );
-            node.parent = Some(ctx.widget_id());
-            node.name = Some(format!("Open Connection settings for {}", task.title));
-            node.description = Some(format!("{}: {}", task.title, task.detail));
-            node.actions = vec![SemanticsAction::Activate];
-            node.state.hovered = self.hovered_recovery == Some(task.id);
-            ctx.push(node);
-        }
-        for (index, task) in files
-            .tasks
-            .iter()
-            .take(2)
-            .enumerate()
-            .filter(|(_, task)| task.state.can_cancel())
-        {
-            let mut node = SemanticsNode::new(
-                Self::cancel_widget_id(ctx.widget_id(), task.id),
-                SemanticsRole::Button,
-                Self::cancel_rect(ctx.bounds(), index),
-            );
-            node.parent = Some(ctx.widget_id());
-            node.name = Some(format!("Cancel {}", task.title));
-            node.description = Some(task.detail.clone());
-            node.actions = vec![SemanticsAction::Activate];
-            ctx.push(node);
-        }
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
     }
 }
 
@@ -7786,8 +7782,16 @@ fn task_progress_fraction(task: &FilesTask) -> f32 {
     }
 }
 
+fn task_progress_tone(task: &FilesTask) -> SemanticTone {
+    match task.state {
+        FilesTaskState::Running | FilesTaskState::CancelRequested => SemanticTone::Accent,
+        FilesTaskState::Completed | FilesTaskState::Cancelled => SemanticTone::Success,
+        FilesTaskState::Failed => SemanticTone::Warning,
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Inspector — a live-reading custom widget (selection changes without a path change).
+// Inspector details — a live-reading custom widget (selection changes without a path change).
 // ---------------------------------------------------------------------------
 
 /// Renders the SIFS inspector for the *currently selected* entry, live-reading
@@ -7795,10 +7799,9 @@ fn task_progress_fraction(task: &FilesTask) -> f32 {
 /// virtual-table selection refreshes the inspector without rebuilding the list. Mirrors the
 /// Settings `StatusReflector` pattern.
 ///
-/// Kept as a bespoke painter (rather than a `PanelSection`/`PropertyRow` tree) because its content
-/// is fully selection-driven and re-reads live: composing it from reactive `Label`s would still
-/// need a per-frame diff to relayout when the *shape* changes (placement note appears/disappears),
-/// so a single self-invalidating painter is simpler and matches `StatusReflector`.
+/// The task queue above it is composed from SUI controls. This painter is kept for the dense
+/// selection-specific metadata body because its shape changes with source, metadata loading,
+/// preview state, and disclosure.
 struct InspectorView {
     shared: Shared,
     last_seen: RefCell<Option<String>>,
@@ -7815,22 +7818,21 @@ impl InspectorView {
     /// A short, single-line summary used for change detection.
     fn summary(&self) -> String {
         let files = self.shared.files();
-        let task_signature = files_tasks_signature(&files.tasks);
         if files.loading {
             return format!(
-                "loading|{:?}|{}|{}|{}",
-                files.source, files.path, files.inspector_details_open, task_signature
+                "loading|{:?}|{}|{}",
+                files.source, files.path, files.inspector_details_open
             );
         }
         if let Some(error) = &files.error {
             return format!(
-                "error|{:?}|{}|{}|{}|{}",
-                files.source, files.path, error, files.inspector_details_open, task_signature
+                "error|{:?}|{}|{}|{}",
+                files.source, files.path, error, files.inspector_details_open
             );
         }
         match files.selected_entry() {
             Some(entry) => format!(
-                "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 files.source,
                 entry.path,
                 entry.is_dir,
@@ -7843,18 +7845,16 @@ impl InspectorView {
                 files.inspector_details_open,
                 sifs_details_signature(files.selected_details.as_ref()),
                 local_details_signature(files.selected_local_details.as_ref()),
-                files_preview_signature(files.selected_preview.as_ref()),
-                task_signature
+                files_preview_signature(files.selected_preview.as_ref())
             ),
             None => format!(
-                "unselected|{:?}|{}|{}|{}|{}|{}|{}",
+                "unselected|{:?}|{}|{}|{}|{}|{}",
                 files.source,
                 files.path,
                 files.clustered,
                 files.entries.len(),
                 files.inspector_details_open,
-                unselected_inspector_health_summary(&files).unwrap_or_default(),
-                task_signature
+                unselected_inspector_health_summary(&files).unwrap_or_default()
             ),
         }
     }
@@ -7862,10 +7862,9 @@ impl InspectorView {
     fn measured_content_height(&self, _ctx: &mut MeasureCtx, width: f32) -> f32 {
         let w = (width - INSPECTOR_PAD * 2.0).max(0.0);
         let files = self.shared.files();
-        let mut y = inspector_state_panel_y(&files.tasks);
+        let mut y = inspector_state_panel_y();
 
-        let finish =
-            |end_y: f32| (end_y + INSPECTOR_BOTTOM_PAD).max(inspector_min_content_h(&files.tasks));
+        let finish = |end_y: f32| (end_y + INSPECTOR_BOTTOM_PAD).max(inspector_min_content_h());
 
         if files.loading {
             let rows = sifs_loading_rows(
@@ -7900,7 +7899,7 @@ impl InspectorView {
 
         let actions = inspector_actions(&files, entry);
         if !actions.is_empty() {
-            let action_start = inspector_state_panel_y(&files.tasks) + 26.0 + 30.0;
+            let action_start = inspector_state_panel_y() + 26.0 + 30.0;
             y = (action_start + inspector_actions_height(actions.len())).max(y) + 12.0;
         }
 
@@ -8055,8 +8054,10 @@ impl InspectorView {
         44.0 + rows
             .iter()
             .map(|(_, value)| {
-                let lines = Self::estimated_line_count(value, value_w, 6.6);
-                15.0 + (lines as f32 * 16.0) + 8.0
+                let lines = Self::estimated_line_count(value, value_w, 7.2)
+                    .min(3)
+                    .max(1);
+                14.0 + 2.0 + (lines as f32 * 17.0) + 6.0
             })
             .sum::<f32>()
     }
@@ -8115,26 +8116,15 @@ const INSPECTOR_DETAIL_BUTTON_W: f32 = 104.0;
 const INSPECTOR_DETAIL_BUTTON_H: f32 = 24.0;
 const INSPECTOR_ACTION_BUTTON_H: f32 = 28.0;
 const INSPECTOR_ACTION_GAP: f32 = 8.0;
-const INSPECTOR_TASK_PANEL_MIN_H: f32 = 160.0;
-const INSPECTOR_TASK_ROW_H: f32 = 29.0;
-const INSPECTOR_TASK_CANCEL_W: f32 = 58.0;
-const INSPECTOR_TASK_PANEL_Y: f32 = INSPECTOR_PAD + 34.0;
 const INSPECTOR_BOTTOM_PAD: f32 = 18.0;
 const INSPECTOR_STATE_PANEL_MIN_EXTRA_H: f32 = 170.0;
 
-fn inspector_task_panel_height(tasks: &[FilesTask]) -> f32 {
-    if tasks.is_empty() {
-        return INSPECTOR_TASK_PANEL_MIN_H;
-    }
-    (46.0 + tasks.len() as f32 * INSPECTOR_TASK_ROW_H + 12.0).max(INSPECTOR_TASK_PANEL_MIN_H)
+fn inspector_state_panel_y() -> f32 {
+    0.0
 }
 
-fn inspector_state_panel_y(tasks: &[FilesTask]) -> f32 {
-    INSPECTOR_TASK_PANEL_Y + inspector_task_panel_height(tasks) + 12.0
-}
-
-fn inspector_min_content_h(tasks: &[FilesTask]) -> f32 {
-    inspector_state_panel_y(tasks) + INSPECTOR_STATE_PANEL_MIN_EXTRA_H
+fn inspector_min_content_h() -> f32 {
+    inspector_state_panel_y() + INSPECTOR_STATE_PANEL_MIN_EXTRA_H
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8403,13 +8393,13 @@ fn inspector_detail_button_label(details_open: bool) -> &'static str {
     }
 }
 
-fn inspector_detail_button_rect(bounds: Rect, tasks: &[FilesTask]) -> Rect {
+fn inspector_detail_button_rect(bounds: Rect) -> Rect {
     let content_x = bounds.x() + INSPECTOR_PAD;
     let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
     let button_w = INSPECTOR_DETAIL_BUTTON_W.min((content_w - 24.0).max(0.0));
     Rect::new(
         content_x + content_w - 12.0 - button_w,
-        bounds.y() + inspector_state_panel_y(tasks) + 8.0,
+        bounds.y() + inspector_state_panel_y() + 8.0,
         button_w,
         INSPECTOR_DETAIL_BUTTON_H,
     )
@@ -8426,11 +8416,11 @@ fn inspector_details_available(files: &FilesState) -> bool {
         || files.source == FilesSourceKind::Sifs
 }
 
-fn inspector_actions_origin_y(bounds: Rect, tasks: &[FilesTask]) -> f32 {
-    bounds.y() + inspector_state_panel_y(tasks) + 26.0 + 30.0
+fn inspector_actions_origin_y(bounds: Rect) -> f32 {
+    bounds.y() + inspector_state_panel_y() + 26.0 + 30.0
 }
 
-fn inspector_action_button_rect(bounds: Rect, tasks: &[FilesTask], index: usize) -> Rect {
+fn inspector_action_button_rect(bounds: Rect, index: usize) -> Rect {
     let content_x = bounds.x() + INSPECTOR_PAD;
     let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
     let col_w = ((content_w - INSPECTOR_ACTION_GAP) * 0.5).max(0.0);
@@ -8438,7 +8428,7 @@ fn inspector_action_button_rect(bounds: Rect, tasks: &[FilesTask], index: usize)
     let row = index / 2;
     Rect::new(
         content_x + col as f32 * (col_w + INSPECTOR_ACTION_GAP),
-        inspector_actions_origin_y(bounds, tasks)
+        inspector_actions_origin_y(bounds)
             + row as f32 * (INSPECTOR_ACTION_BUTTON_H + INSPECTOR_ACTION_GAP),
         col_w,
         INSPECTOR_ACTION_BUTTON_H,
@@ -8447,14 +8437,13 @@ fn inspector_action_button_rect(bounds: Rect, tasks: &[FilesTask], index: usize)
 
 fn root_inspector_action_button_rect(
     bounds: Rect,
-    tasks: &[FilesTask],
     rows: &[(&'static str, String)],
     index: usize,
 ) -> Rect {
     let content_x = bounds.x() + INSPECTOR_PAD;
     let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
     let col_w = ((content_w - INSPECTOR_ACTION_GAP) * 0.5).max(0.0);
-    let panel_y = bounds.y() + inspector_state_panel_y(tasks);
+    let panel_y = bounds.y() + inspector_state_panel_y();
     let action_y = panel_y + InspectorView::state_panel_height(content_w, rows) + 10.0;
     let col = index % 2;
     let row = index / 2;
@@ -8511,92 +8500,12 @@ fn root_inspector_action_button_widget_id(
     sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(salt))
 }
 
-fn inspector_task_panel_rect(bounds: Rect, tasks: &[FilesTask]) -> Rect {
-    let content_x = bounds.x() + INSPECTOR_PAD;
-    let content_w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
-    Rect::new(
-        content_x,
-        bounds.y() + INSPECTOR_TASK_PANEL_Y,
-        content_w,
-        inspector_task_panel_height(tasks),
-    )
-}
-
-fn inspector_task_clear_rect(bounds: Rect, tasks: &[FilesTask]) -> Rect {
-    let panel = inspector_task_panel_rect(bounds, tasks);
-    Rect::new(panel.max_x() - 102.0, panel.y() + 8.0, 90.0, 22.0)
-}
-
-fn inspector_task_cancel_rect(bounds: Rect, tasks: &[FilesTask], row_index: usize) -> Rect {
-    let panel = inspector_task_panel_rect(bounds, tasks);
-    Rect::new(
-        panel.max_x() - INSPECTOR_TASK_CANCEL_W - 10.0,
-        panel.y() + 46.0 + row_index as f32 * INSPECTOR_TASK_ROW_H + 2.0,
-        INSPECTOR_TASK_CANCEL_W,
-        22.0,
-    )
-}
-
-fn inspector_task_clear_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
-    sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(9_099))
-}
-
-fn inspector_task_panel_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
-    sui::WidgetId::new(parent.get().wrapping_mul(43).wrapping_add(9_100))
-}
-
-fn inspector_task_cancel_widget_id(parent: sui::WidgetId, task_id: u64) -> sui::WidgetId {
-    sui::WidgetId::new(
-        parent
-            .get()
-            .wrapping_mul(43)
-            .wrapping_add(9_101)
-            .wrapping_add(task_id),
-    )
-}
-
 impl Widget for InspectorView {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
         if let Event::Pointer(pointer) = event
             && pointer.kind == PointerEventKind::Up
             && pointer.button == Some(PointerButton::Primary)
         {
-            let clear_finished = {
-                let files = self.shared.files();
-                files_tasks_have_finished(&files.tasks)
-                    && inspector_task_clear_rect(ctx.bounds(), &files.tasks)
-                        .contains(pointer.position)
-            };
-            if clear_finished {
-                self.shared.files_mut().clear_finished_tasks();
-                ctx.request_measure();
-                ctx.request_paint();
-                ctx.request_semantics();
-                ctx.set_handled();
-                return;
-            }
-
-            let task_to_cancel = {
-                let files = self.shared.files();
-                files
-                    .tasks
-                    .iter()
-                    .enumerate()
-                    .find(|(index, task)| {
-                        task.state.can_cancel()
-                            && inspector_task_cancel_rect(ctx.bounds(), &files.tasks, *index)
-                                .contains(pointer.position)
-                    })
-                    .map(|(_, task)| task.id)
-            };
-            if let Some(task_id) = task_to_cancel {
-                self.shared.files_mut().cancel_task(task_id);
-                ctx.request_paint();
-                ctx.request_semantics();
-                ctx.set_handled();
-                return;
-            }
-
             let root_action = {
                 let files = self.shared.files();
                 if files.selected_entry().is_none() && !files.loading && files.error.is_none() {
@@ -8605,13 +8514,8 @@ impl Widget for InspectorView {
                         .into_iter()
                         .enumerate()
                         .find(|(index, _)| {
-                            root_inspector_action_button_rect(
-                                ctx.bounds(),
-                                &files.tasks,
-                                &rows,
-                                *index,
-                            )
-                            .contains(pointer.position)
+                            root_inspector_action_button_rect(ctx.bounds(), &rows, *index)
+                                .contains(pointer.position)
                         })
                         .map(|(_, action)| action)
                 } else {
@@ -8653,7 +8557,7 @@ impl Widget for InspectorView {
                         .into_iter()
                         .enumerate()
                         .find(|(index, _)| {
-                            inspector_action_button_rect(ctx.bounds(), &files.tasks, *index)
+                            inspector_action_button_rect(ctx.bounds(), *index)
                                 .contains(pointer.position)
                         })
                         .map(|(_, action)| (action, entry.path))
@@ -8725,8 +8629,7 @@ impl Widget for InspectorView {
             let details_hit = {
                 let files = self.shared.files();
                 inspector_details_available(&files)
-                    && inspector_detail_button_rect(ctx.bounds(), &files.tasks)
-                        .contains(pointer.position)
+                    && inspector_detail_button_rect(ctx.bounds()).contains(pointer.position)
             };
             if details_hit {
                 let details_open = self.shared.files().inspector_details_open;
@@ -8766,19 +8669,13 @@ impl Widget for InspectorView {
         let files = self.shared.files();
         let bounds = ctx.bounds();
 
-        // Sidebar surface + left hairline (matches the bespoke chrome).
+        // Sidebar surface + left hairline (matches the surrounding inspector chrome).
         ctx.fill_rect(bounds, pal.sidebar);
-        widgets::hairline_left(ctx, bounds, pal.border);
+        paint_hairline(ctx, bounds, HairlineEdge::Left, pal.border);
 
         let x = bounds.x() + INSPECTOR_PAD;
         let w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
-        let mut y = bounds.y() + INSPECTOR_PAD + 4.0;
-
-        let header = pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
-        widgets::draw_text_in(ctx, Rect::new(x, y, w, 18.0), "INSPECTOR", header);
-        y += 30.0;
-        self.task_panel(ctx, &theme, &pal, bounds, &files.tasks);
-        y += inspector_task_panel_height(&files.tasks) + 12.0;
+        let mut y = bounds.y();
 
         if files.loading {
             let details_open = files.inspector_details_open;
@@ -8792,7 +8689,6 @@ impl Widget for InspectorView {
                 w,
                 "Loading SIFS",
                 &rows,
-                &files.tasks,
                 Some(details_open),
             );
             return;
@@ -8810,7 +8706,6 @@ impl Widget for InspectorView {
                 w,
                 "SIFS unavailable",
                 &rows,
-                &files.tasks,
                 Some(details_open),
             );
             return;
@@ -8830,11 +8725,10 @@ impl Widget for InspectorView {
                 w,
                 unselected_inspector_title(files.source),
                 &rows,
-                &files.tasks,
                 details_open,
             );
             if !actions.is_empty() {
-                self.root_action_buttons(ctx, &theme, &pal, bounds, &files.tasks, &rows, &actions);
+                self.root_action_buttons(ctx, &theme, &pal, bounds, &rows, &actions);
             }
             return;
         };
@@ -8843,13 +8737,21 @@ impl Widget for InspectorView {
 
         // Name + kind.
         let details_open = files.inspector_details_open;
-        let detail_rect = inspector_detail_button_rect(bounds, &files.tasks);
-        self.detail_button(ctx, &theme, &pal, detail_rect, details_open);
+        let detail_rect = inspector_detail_button_rect(bounds);
+        self.detail_button(ctx, &theme, detail_rect, details_open);
         let title_right_gap = INSPECTOR_DETAIL_BUTTON_W + 10.0;
-        let name_style = pal.text_style(&theme, 16.0, FontWeight::SEMIBOLD, pal.text);
         let title_rect = Rect::new(x, y, (w - title_right_gap).max(0.0), 24.0);
         let display_name = display_name_for_width(&entry.name, title_rect.width(), 8.8);
-        widgets::draw_text_in(ctx, title_rect, &display_name, name_style);
+        paint_text_block(
+            ctx,
+            &theme,
+            title_rect,
+            &display_name,
+            TextBlockPaint::new()
+                .text_token(theme.text.xl)
+                .color(pal.text)
+                .weight(FontWeight::SEMIBOLD),
+        );
         y += 26.0;
         let kind = details
             .map(|details| details.kind.as_str())
@@ -8862,7 +8764,6 @@ impl Widget for InspectorView {
                     "file"
                 }
             });
-        let kind_style = pal.text_style(&theme, 12.5, FontWeight::NORMAL, pal.text_muted);
         let kind_line = if files.source == FilesSourceKind::Sifs {
             sifs_compact_header_line(
                 entry,
@@ -8879,19 +8780,22 @@ impl Widget for InspectorView {
         } else {
             w
         };
-        widgets::draw_text_in(
+        paint_text_block(
             ctx,
+            &theme,
             Rect::new(x, y, kind_width, 20.0),
             &display_name_for_width(&kind_line, kind_width, 6.8),
-            kind_style,
+            TextBlockPaint::new()
+                .text_token(theme.text.sm)
+                .color(pal.text_muted),
         );
         y += 34.0;
 
         let actions = inspector_actions(&files, entry);
         if !actions.is_empty() {
-            self.action_buttons(ctx, &theme, &pal, bounds, &files.tasks, &actions);
-            let actions_bottom = inspector_actions_origin_y(bounds, &files.tasks)
-                + inspector_actions_height(actions.len());
+            self.action_buttons(ctx, &theme, &pal, bounds, &actions);
+            let actions_bottom =
+                inspector_actions_origin_y(bounds) + inspector_actions_height(actions.len());
             y = actions_bottom.max(y) + 12.0;
         }
 
@@ -8899,8 +8803,13 @@ impl Widget for InspectorView {
 
         if files.source == FilesSourceKind::Local {
             y += 10.0;
-            let sect = pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
-            widgets::draw_text_in(ctx, Rect::new(x, y, w, 16.0), "LOCAL FILE", sect);
+            paint_section_label(
+                ctx,
+                &theme,
+                Rect::new(x, y, w, 16.0),
+                "Local file",
+                SectionLabelPaint::new().color(pal.text_faint),
+            );
             y += 24.0;
 
             let local = files.selected_local_details.as_ref();
@@ -8909,13 +8818,12 @@ impl Widget for InspectorView {
                 files.details_error.as_deref(),
                 local,
             );
-            let status_color = local_metadata_status_color(
-                &pal,
+            let status_tone = local_metadata_status_tone(
                 files.details_loading,
                 files.details_error.as_deref(),
                 local,
             );
-            y = self.status_badge(ctx, &theme, &pal, x, y, w, status_label, status_color);
+            y = self.status_badge(ctx, &theme, x, y, w, status_label, status_tone);
             y = self.info_row(
                 ctx,
                 &theme,
@@ -8963,13 +8871,12 @@ impl Widget for InspectorView {
 
             if details_open {
                 y += 14.0;
-                let detail_heading =
-                    pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
-                widgets::draw_text_in(
+                paint_section_label(
                     ctx,
+                    &theme,
                     Rect::new(x, y, w, 16.0),
-                    "TECHNICAL DETAILS",
-                    detail_heading,
+                    "Technical details",
+                    SectionLabelPaint::new().color(pal.text_faint),
                 );
                 y += 22.0;
                 if let Some(local) = local {
@@ -9030,44 +8937,24 @@ impl Widget for InspectorView {
 
         // Placement section.
         y += 10.0;
-        let sect = pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
-        widgets::draw_text_in(ctx, Rect::new(x, y, w, 16.0), "PLACEMENT", sect);
+        paint_section_label(
+            ctx,
+            &theme,
+            Rect::new(x, y, w, 16.0),
+            "Placement",
+            SectionLabelPaint::new().color(pal.text_faint),
+        );
         y += 24.0;
 
-        // node badge: a real Lucide HardDrive (Storage) icon + the node label, in a rounded pill.
         let node_label = short_node_label(&files.node_id);
-        let badge_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, pal.accent);
-        const BADGE_ICON: f32 = 13.0;
-        const BADGE_ICON_GAP: f32 = 7.0;
-        let label_w = ctx
-            .measure_text(node_label.clone(), badge_style.clone())
-            .map(|m| m.width)
-            .unwrap_or(80.0);
-        // pill = left pad(10) + icon + gap + label + right pad(10)
-        let badge_w = 10.0 + BADGE_ICON + BADGE_ICON_GAP + label_w + 10.0;
-        let badge = Rect::new(x, y, badge_w.min(w), 26.0);
-        widgets::round_panel(ctx, badge, pal.field, pal.border, 13.0);
-        draw_glyph(
+        paint_placement_badge(
             ctx,
-            IconGlyph::Storage,
-            Rect::new(
-                badge.x() + 10.0,
-                badge.y() + (badge.height() - BADGE_ICON) / 2.0,
-                BADGE_ICON,
-                BADGE_ICON,
-            ),
-            pal.accent,
-        );
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(
-                badge.x() + 10.0 + BADGE_ICON + BADGE_ICON_GAP,
-                badge.y(),
-                (badge.width() - 10.0 - BADGE_ICON - BADGE_ICON_GAP - 6.0).max(0.0),
-                badge.height(),
-            ),
+            &theme,
+            Rect::new(x, y, w, 26.0),
             &node_label,
-            badge_style,
+            Some(IconGlyph::Storage),
+            SemanticTone::Accent,
+            None,
         );
         y += 36.0;
 
@@ -9076,13 +8963,12 @@ impl Widget for InspectorView {
             files.details_error.as_deref(),
             details,
         );
-        let status_color = sifs_metadata_status_color(
-            &pal,
+        let status_tone = sifs_metadata_status_tone(
             files.details_loading,
             files.details_error.as_deref(),
             details,
         );
-        y = self.status_badge(ctx, &theme, &pal, x, y, w, status_label, status_color);
+        y = self.status_badge(ctx, &theme, x, y, w, status_label, status_tone);
 
         let policy = details
             .map(|details| details.policy.as_str())
@@ -9114,12 +9000,12 @@ impl Widget for InspectorView {
 
         if details_open {
             y += 14.0;
-            let detail_heading = pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
-            widgets::draw_text_in(
+            paint_section_label(
                 ctx,
+                &theme,
                 Rect::new(x, y, w, 16.0),
-                "TECHNICAL DETAILS",
-                detail_heading,
+                "Technical details",
+                SectionLabelPaint::new().color(pal.text_faint),
             );
             y += 22.0;
 
@@ -9334,19 +9220,18 @@ impl Widget for InspectorView {
         }
 
         if !files.clustered {
-            let note = pal.text_style(&theme, 11.5, FontWeight::NORMAL, pal.text_faint);
-            for line in widgets::wrap_lines(
-                "Join a cluster to spread this object across nodes and tune replication.",
-                w,
-                |s| {
-                    ctx.measure_text(s, note.clone())
-                        .map(|m| m.width)
-                        .unwrap_or(0.0)
-                },
-            ) {
-                widgets::draw_text_in(ctx, Rect::new(x, y, w, 18.0), &line, note.clone());
-                y += 17.0;
-            }
+            let note = "Join a cluster to spread this object across nodes and tune replication.";
+            let note_h = Self::estimated_line_count(note, w, 7.0) as f32 * 17.0;
+            paint_text_block(
+                ctx,
+                &theme,
+                Rect::new(x, y, w, note_h),
+                note,
+                TextBlockPaint::new()
+                    .text_token(theme.text.xs)
+                    .color(pal.text_faint),
+            );
+            y += note_h;
         }
 
         if !entry.is_dir {
@@ -9370,7 +9255,7 @@ impl Widget for InspectorView {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let (selected_entry, selected_actions, root_actions, root_rows, details_open, tasks) = {
+        let (selected_entry, selected_actions, root_actions, root_rows, details_open) = {
             let files = self.shared.files();
             let selected_entry = files.selected_entry().cloned();
             let selected_actions = selected_entry
@@ -9394,57 +9279,15 @@ impl Widget for InspectorView {
                 root_actions,
                 root_rows,
                 inspector_details_available(&files).then_some(files.inspector_details_open),
-                files.tasks.clone(),
             )
         };
-
-        let mut task_panel = SemanticsNode::new(
-            inspector_task_panel_widget_id(ctx.widget_id()),
-            SemanticsRole::Text,
-            inspector_task_panel_rect(ctx.bounds(), &tasks),
-        );
-        task_panel.parent = Some(ctx.widget_id());
-        task_panel.name = Some("File task queue".to_string());
-        task_panel.description = Some(files_task_queue_summary(&tasks));
-        ctx.push(task_panel);
-
-        if files_tasks_have_finished(&tasks) {
-            let mut node = SemanticsNode::new(
-                inspector_task_clear_widget_id(ctx.widget_id()),
-                SemanticsRole::Button,
-                inspector_task_clear_rect(ctx.bounds(), &tasks),
-            );
-            node.parent = Some(ctx.widget_id());
-            node.name = Some("Clear finished file tasks".to_string());
-            node.description =
-                Some("Dismiss completed, failed, and cancelled file operations".to_string());
-            node.actions = vec![SemanticsAction::Activate];
-            ctx.push(node);
-        }
-
-        for (index, task) in tasks
-            .iter()
-            .enumerate()
-            .filter(|(_, task)| task.state.can_cancel())
-        {
-            let mut node = SemanticsNode::new(
-                inspector_task_cancel_widget_id(ctx.widget_id(), task.id),
-                SemanticsRole::Button,
-                inspector_task_cancel_rect(ctx.bounds(), &tasks, index),
-            );
-            node.parent = Some(ctx.widget_id());
-            node.name = Some(format!("Cancel {}", task.title));
-            node.description = Some(task.detail.clone());
-            node.actions = vec![SemanticsAction::Activate];
-            ctx.push(node);
-        }
 
         if let Some(entry) = &selected_entry {
             for (index, action) in selected_actions.into_iter().enumerate() {
                 let mut node = SemanticsNode::new(
                     inspector_action_button_widget_id(ctx.widget_id(), action),
                     SemanticsRole::Button,
-                    inspector_action_button_rect(ctx.bounds(), &tasks, index),
+                    inspector_action_button_rect(ctx.bounds(), index),
                 );
                 node.parent = Some(ctx.widget_id());
                 node.name = Some(action.semantic_name(entry));
@@ -9499,7 +9342,7 @@ impl Widget for InspectorView {
                 let mut node = SemanticsNode::new(
                     root_inspector_action_button_widget_id(ctx.widget_id(), action),
                     SemanticsRole::Button,
-                    root_inspector_action_button_rect(ctx.bounds(), &tasks, &root_rows, index),
+                    root_inspector_action_button_rect(ctx.bounds(), &root_rows, index),
                 );
                 node.parent = Some(ctx.widget_id());
                 node.name = Some(action.label().to_string());
@@ -9516,7 +9359,7 @@ impl Widget for InspectorView {
         let mut node = SemanticsNode::new(
             inspector_detail_button_widget_id(ctx.widget_id()),
             SemanticsRole::Button,
-            inspector_detail_button_rect(ctx.bounds(), &tasks),
+            inspector_detail_button_rect(ctx.bounds()),
         );
         node.parent = Some(ctx.widget_id());
         node.name = Some(inspector_detail_button_label(details_open).to_string());
@@ -9539,71 +9382,57 @@ impl InspectorView {
         w: f32,
         title: &str,
         rows: &[(&str, String)],
-        tasks: &[FilesTask],
         details_open: Option<bool>,
     ) {
-        let label_style = pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text_faint);
-        let value_style = pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text);
         let value_w = (w - 24.0).max(0.0);
-        let row_layout: Vec<(&str, Vec<String>)> = rows
+        let row_heights = rows
             .iter()
-            .map(|(label, value)| {
-                let lines = widgets::wrap_lines(value, value_w, |s| {
-                    ctx.measure_text(s, value_style.clone())
-                        .map(|m| m.width)
-                        .unwrap_or(0.0)
-                });
-                (*label, lines)
-            })
-            .collect();
-        let panel_h = 44.0
-            + row_layout
-                .iter()
-                .map(|(_, lines)| 15.0 + (lines.len().max(1) as f32 * 16.0) + 8.0)
-                .sum::<f32>();
+            .map(|(_, value)| detail_row_height_for_value(ctx, theme, value_w, value, Some(3)))
+            .collect::<Vec<_>>();
+        let panel_h = 44.0 + row_heights.iter().sum::<f32>();
         let panel = Rect::new(x, y, w, panel_h);
-        widgets::round_panel(ctx, panel, pal.panel, pal.border, 8.0);
         let detail_button =
-            details_open.map(|open| (inspector_detail_button_rect(ctx.bounds(), tasks), open));
+            details_open.map(|open| (inspector_detail_button_rect(ctx.bounds()), open));
         let title_right_gap = if detail_button.is_some() {
             INSPECTOR_DETAIL_BUTTON_W + 10.0
         } else {
             0.0
         };
-        widgets::draw_text_in(
+        let geometry = paint_section_panel(
             ctx,
-            Rect::new(
-                panel.x() + 12.0,
-                panel.y() + 10.0,
-                (panel.width() - 24.0 - title_right_gap).max(0.0),
-                20.0,
-            ),
+            theme,
+            panel,
             title,
-            pal.text_style(theme, 13.5, FontWeight::SEMIBOLD, pal.text),
+            SectionPanelPaint::new()
+                .fill(pal.panel)
+                .border(pal.border)
+                .title_color(pal.text)
+                .radius(8.0)
+                .header_height(38.0)
+                .content_padding(Insets {
+                    left: 12.0,
+                    top: 0.0,
+                    right: 12.0,
+                    bottom: 6.0,
+                })
+                .title_token(theme.text.base)
+                .trailing_width(title_right_gap),
         );
         if let Some((rect, open)) = detail_button {
-            self.detail_button(ctx, theme, pal, rect, open);
+            self.detail_button(ctx, theme, rect, open);
         }
 
-        let mut row_y = panel.y() + 38.0;
-        for (label, lines) in row_layout {
-            widgets::draw_text_in(
+        let mut row_y = geometry.content_rect.y();
+        for (label, value) in rows {
+            row_y += paint_detail_row_at(
                 ctx,
-                Rect::new(panel.x() + 12.0, row_y, value_w, 14.0),
+                theme,
+                Point::new(geometry.content_rect.x(), row_y),
+                geometry.content_rect.width(),
                 label,
-                label_style.clone(),
+                value,
+                Some(3),
             );
-            row_y += 15.0;
-            for line in lines.iter().take(3) {
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(panel.x() + 12.0, row_y, value_w, 16.0),
-                    line,
-                    value_style.clone(),
-                );
-                row_y += 16.0;
-            }
-            row_y += 8.0;
         }
     }
 
@@ -9611,16 +9440,27 @@ impl InspectorView {
         &self,
         ctx: &mut PaintCtx,
         theme: &sui::DefaultTheme,
-        pal: &Palette,
         rect: Rect,
         details_open: bool,
     ) {
-        widgets::round_panel(ctx, rect, pal.field, pal.border, 7.0);
-        widgets::draw_text_in(
+        let (icon, paint) = if details_open {
+            (
+                IconGlyph::ChevronUp,
+                CommandButtonPaint::tonal(SemanticTone::Accent).icon_tone(SemanticTone::Accent),
+            )
+        } else {
+            (
+                IconGlyph::ChevronDown,
+                CommandButtonPaint::neutral().icon_tone(SemanticTone::Neutral),
+            )
+        };
+        paint_command_button(
             ctx,
-            Rect::new(rect.x() + 10.0, rect.y() + 4.0, rect.width() - 20.0, 18.0),
+            theme,
+            rect,
             inspector_detail_button_label(details_open),
-            pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text),
+            Some(icon),
+            paint,
         );
     }
 
@@ -9628,32 +9468,24 @@ impl InspectorView {
         &self,
         ctx: &mut PaintCtx,
         theme: &sui::DefaultTheme,
-        pal: &Palette,
         x: f32,
         y: f32,
         w: f32,
         label: &str,
-        tone: Color,
+        tone: SemanticTone,
     ) -> f32 {
-        let text_style = pal.text_style(theme, 12.0, FontWeight::SEMIBOLD, tone);
+        let (_, tone_text) = theme.semantic_tone_colors(tone);
+        let mut text_style = theme.text_style(tone_text);
+        text_style.font_size = theme.text.sm.size;
+        text_style.line_height = theme.text.sm.line_height;
+        text_style.weight = FontWeight::SEMIBOLD;
         let text_w = ctx
             .measure_text(label.to_string(), text_style.clone())
             .map(|m| m.width)
             .unwrap_or(120.0);
         let badge_w = (text_w + 22.0).min(w).max(80.0);
         let badge = Rect::new(x, y, badge_w, 26.0);
-        widgets::round_panel(ctx, badge, pal.field, tone, 13.0);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(
-                badge.x() + 11.0,
-                badge.y() + 4.0,
-                badge.width() - 22.0,
-                18.0,
-            ),
-            label,
-            text_style,
-        );
+        paint_status_badge(ctx, badge, theme, label, None, tone);
         badge.max_y()
     }
 
@@ -9663,7 +9495,6 @@ impl InspectorView {
         theme: &sui::DefaultTheme,
         pal: &Palette,
         bounds: Rect,
-        tasks: &[FilesTask],
         actions: &[InspectorAction],
     ) {
         for (index, action) in actions.iter().copied().enumerate() {
@@ -9671,7 +9502,7 @@ impl InspectorView {
                 ctx,
                 theme,
                 pal,
-                inspector_action_button_rect(bounds, tasks, index),
+                inspector_action_button_rect(bounds, index),
                 action,
             );
         }
@@ -9683,7 +9514,6 @@ impl InspectorView {
         theme: &sui::DefaultTheme,
         pal: &Palette,
         bounds: Rect,
-        tasks: &[FilesTask],
         rows: &[(&'static str, String)],
         actions: &[RootInspectorAction],
     ) {
@@ -9692,7 +9522,7 @@ impl InspectorView {
                 ctx,
                 theme,
                 pal,
-                root_inspector_action_button_rect(bounds, tasks, rows, index),
+                root_inspector_action_button_rect(bounds, rows, index),
                 action,
             );
         }
@@ -9702,28 +9532,26 @@ impl InspectorView {
         &self,
         ctx: &mut PaintCtx,
         theme: &sui::DefaultTheme,
-        pal: &Palette,
+        _pal: &Palette,
         rect: Rect,
         action: RootInspectorAction,
     ) {
-        let (fill, border, text, icon) = match action {
-            RootInspectorAction::RefreshFolder => (pal.field, pal.border, pal.text, pal.accent),
-            RootInspectorAction::RepairReplicas => (pal.field, pal.border, pal.accent, pal.accent),
-            RootInspectorAction::OpenCluster => (pal.field, pal.border, pal.text, pal.accent),
-            RootInspectorAction::ConnectionSettings => (pal.field, pal.warn, pal.warn, pal.warn),
+        let style = match action {
+            RootInspectorAction::RefreshFolder | RootInspectorAction::OpenCluster => {
+                CommandButtonPaint::neutral().icon_tone(SemanticTone::Accent)
+            }
+            RootInspectorAction::RepairReplicas => CommandButtonPaint::tonal(SemanticTone::Accent),
+            RootInspectorAction::ConnectionSettings => {
+                CommandButtonPaint::tonal(SemanticTone::Warning)
+            }
         };
-        widgets::round_panel(ctx, rect, fill, border, 7.0);
-        draw_glyph(
+        paint_command_button(
             ctx,
-            action.glyph(),
-            Rect::new(rect.x() + 9.0, rect.y() + 7.0, 13.0, 13.0),
-            icon,
-        );
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(rect.x() + 28.0, rect.y() + 5.0, rect.width() - 36.0, 18.0),
+            theme,
+            rect,
             action.label(),
-            pal.text_style(theme, 11.0, FontWeight::MEDIUM, text),
+            Some(action.glyph()),
+            style,
         );
     }
 
@@ -9731,13 +9559,13 @@ impl InspectorView {
         &self,
         ctx: &mut PaintCtx,
         theme: &sui::DefaultTheme,
-        pal: &Palette,
+        _pal: &Palette,
         rect: Rect,
         action: InspectorAction,
     ) {
-        let (fill, border, text, icon) = match action {
-            InspectorAction::OpenFolder => (pal.accent, pal.accent, pal.on_accent, pal.on_accent),
-            InspectorAction::Delete => (pal.field, pal.border, pal.warn, pal.warn),
+        let style = match action {
+            InspectorAction::OpenFolder => CommandButtonPaint::filled(SemanticTone::Accent),
+            InspectorAction::Delete => CommandButtonPaint::tonal(SemanticTone::Danger),
             InspectorAction::RefreshPlacement
             | InspectorAction::RepairReplicas
             | InspectorAction::MakeMetadataPrimary
@@ -9746,170 +9574,23 @@ impl InspectorView {
             | InspectorAction::PinContent
             | InspectorAction::UnpinContent
             | InspectorAction::ConnectionSettings => {
-                (pal.field, pal.border, pal.accent, pal.accent)
+                CommandButtonPaint::tonal(SemanticTone::Accent)
             }
             InspectorAction::CopyToSifs | InspectorAction::CopyToLocal => {
-                (pal.field, pal.border, pal.accent, pal.accent)
+                CommandButtonPaint::tonal(SemanticTone::Accent)
             }
             InspectorAction::Copy | InspectorAction::Move | InspectorAction::Rename => {
-                (pal.field, pal.border, pal.text, pal.text_muted)
+                CommandButtonPaint::neutral()
             }
         };
-        widgets::round_panel(ctx, rect, fill, border, 7.0);
-        let icon_rect = Rect::new(rect.x() + 9.0, rect.y() + 7.0, 14.0, 14.0);
-        draw_glyph(ctx, action.glyph(), icon_rect, icon);
-        widgets::draw_text_in(
+        paint_command_button(
             ctx,
-            Rect::new(rect.x() + 30.0, rect.y() + 5.0, rect.width() - 38.0, 18.0),
+            theme,
+            rect,
             action.label(),
-            pal.text_style(theme, 11.5, FontWeight::MEDIUM, text),
+            Some(action.glyph()),
+            style,
         );
-    }
-
-    fn task_panel(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        pal: &Palette,
-        bounds: Rect,
-        tasks: &[FilesTask],
-    ) {
-        let panel = inspector_task_panel_rect(bounds, tasks);
-        widgets::round_panel(ctx, panel, pal.panel, pal.border, 8.0);
-        let has_finished = files_tasks_have_finished(tasks);
-        let title_right = if has_finished {
-            inspector_task_clear_rect(bounds, tasks).x() - 8.0
-        } else {
-            panel.max_x() - 12.0
-        };
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(
-                panel.x() + 12.0,
-                panel.y() + 10.0,
-                (title_right - panel.x() - 12.0).max(0.0),
-                18.0,
-            ),
-            "FILE TASKS",
-            pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint),
-        );
-        if has_finished {
-            let clear = inspector_task_clear_rect(bounds, tasks);
-            widgets::round_panel(ctx, clear, pal.field, pal.border, 7.0);
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(clear.x() + 8.0, clear.y() + 3.0, clear.width() - 16.0, 16.0),
-                "Clear",
-                pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text),
-            );
-        }
-        let summary = files_task_queue_summary(tasks);
-        let summary_style = pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text_muted);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(
-                panel.x() + 12.0,
-                panel.y() + 27.0,
-                panel.width() - 24.0,
-                16.0,
-            ),
-            &summary,
-            summary_style,
-        );
-
-        if tasks.is_empty() {
-            let badge = Rect::new(panel.x() + 12.0, panel.y() + 52.0, 68.0, 24.0);
-            widgets::round_panel(ctx, badge, pal.field, pal.good, 12.0);
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(
-                    badge.x() + 10.0,
-                    badge.y() + 4.0,
-                    badge.width() - 20.0,
-                    16.0,
-                ),
-                "Idle",
-                pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, pal.good),
-            );
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(
-                    panel.x() + 12.0,
-                    panel.y() + 84.0,
-                    panel.width() - 24.0,
-                    18.0,
-                ),
-                "No active file operations",
-                pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text),
-            );
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(
-                    panel.x() + 12.0,
-                    panel.y() + 104.0,
-                    panel.width() - 24.0,
-                    32.0,
-                ),
-                "Worker queue empty",
-                pal.text_style(theme, 11.0, FontWeight::NORMAL, pal.text_faint),
-            );
-            return;
-        }
-
-        let title_style = pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.text);
-        let detail_style = pal.text_style(theme, 10.5, FontWeight::NORMAL, pal.text_faint);
-        for (index, task) in tasks.iter().enumerate() {
-            let y = panel.y() + 46.0 + index as f32 * INSPECTOR_TASK_ROW_H;
-            let cancel = inspector_task_cancel_rect(bounds, tasks, index);
-            let text_w = if task.state.can_cancel() {
-                cancel.x() - panel.x() - 20.0
-            } else {
-                panel.width() - 24.0
-            }
-            .max(0.0);
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(panel.x() + 12.0, y, text_w, 14.0),
-                &format!("{} · {}", task.title, task.state.label()),
-                title_style.clone(),
-            );
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(panel.x() + 12.0, y + 13.0, text_w, 13.0),
-                &files_task_detail_display_for_width(task, text_w),
-                detail_style.clone(),
-            );
-            let tone = match task.state {
-                FilesTaskState::Running | FilesTaskState::CancelRequested => pal.accent,
-                FilesTaskState::Completed | FilesTaskState::Cancelled => pal.good,
-                FilesTaskState::Failed => pal.warn,
-            };
-            let bar = Rect::new(panel.x() + 12.0, y + 26.0, text_w.min(180.0), 2.0);
-            if bar.width() > 0.0 {
-                widgets::fill_round_rect(ctx, bar, pal.field, 1.0);
-                let fraction = task_progress_fraction(task);
-                widgets::fill_round_rect(
-                    ctx,
-                    Rect::new(bar.x(), bar.y(), bar.width() * fraction, bar.height()),
-                    tone,
-                    1.0,
-                );
-            }
-            if task.state.can_cancel() {
-                widgets::round_panel(ctx, cancel, pal.field, pal.border, 7.0);
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(
-                        cancel.x() + 8.0,
-                        cancel.y() + 3.0,
-                        cancel.width() - 16.0,
-                        16.0,
-                    ),
-                    "Cancel",
-                    pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text),
-                );
-            }
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9917,31 +9598,14 @@ impl InspectorView {
         &self,
         ctx: &mut PaintCtx,
         theme: &sui::DefaultTheme,
-        pal: &Palette,
+        _pal: &Palette,
         x: f32,
-        mut y: f32,
+        y: f32,
         w: f32,
         label: &str,
         value: &str,
     ) -> f32 {
-        let label_style = pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x, y, w, 16.0),
-            &label.to_uppercase(),
-            label_style,
-        );
-        y += 18.0;
-        let value_style = pal.text_style(theme, 12.5, FontWeight::NORMAL, pal.text);
-        for line in widgets::wrap_lines(value, w, |s| {
-            ctx.measure_text(s, value_style.clone())
-                .map(|m| m.width)
-                .unwrap_or(0.0)
-        }) {
-            widgets::draw_text_in(ctx, Rect::new(x, y, w, 18.0), &line, value_style.clone());
-            y += 17.0;
-        }
-        y + 6.0
+        y + paint_detail_row_at(ctx, theme, Point::new(x, y), w, label, value, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9959,505 +9623,153 @@ impl InspectorView {
     ) -> f32 {
         let height = Self::preview_section_height(w, loading, error, preview);
         let panel = Rect::new(x, y, w, height);
-        widgets::round_panel(ctx, panel, pal.panel, pal.border, 8.0);
-
-        widgets::draw_text_in(
+        let geometry = paint_section_panel(
             ctx,
-            Rect::new(
-                panel.x() + 12.0,
-                panel.y() + 10.0,
-                panel.width() - 24.0,
-                16.0,
-            ),
+            theme,
+            panel,
             "PREVIEW",
-            pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint),
+            SectionPanelPaint::new()
+                .fill(pal.panel)
+                .border(pal.border)
+                .title_color(pal.text_faint)
+                .radius(8.0)
+                .header_height(34.0)
+                .content_padding(Insets {
+                    left: 12.0,
+                    top: 0.0,
+                    right: 12.0,
+                    bottom: 8.0,
+                })
+                .title_token(theme.text.xs),
         );
 
-        let mut row_y = panel.y() + 34.0;
-        let inner_w = (panel.width() - 24.0).max(0.0);
-        let value_style = pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text);
-        let muted_style = pal.text_style(theme, 10.8, FontWeight::NORMAL, pal.text_faint);
+        let row_y = geometry.content_rect.y();
+        let inner_x = geometry.content_rect.x();
+        let inner_w = geometry.content_rect.width();
+        let body_paint = TextBlockPaint::new()
+            .text_token(theme.text.sm)
+            .color(pal.text);
+        let muted_paint = TextBlockPaint::new()
+            .text_token(theme.text.xs)
+            .color(pal.text_faint);
 
         if loading {
-            widgets::draw_text_in(
+            paint_text_block(
                 ctx,
-                Rect::new(panel.x() + 12.0, row_y, inner_w, 18.0),
+                theme,
+                Rect::new(inner_x, row_y, inner_w, 18.0),
                 "Reading bounded preview",
-                value_style,
+                body_paint,
             );
-            return panel.max_y();
+            return geometry.panel_rect.max_y();
         }
 
         if let Some(error) = error {
-            for line in widgets::wrap_lines(error, inner_w, |s| {
-                ctx.measure_text(s, value_style.clone())
-                    .map(|m| m.width)
-                    .unwrap_or(0.0)
-            })
-            .into_iter()
-            .take(3)
-            {
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(panel.x() + 12.0, row_y, inner_w, 18.0),
-                    &line,
-                    value_style.clone(),
-                );
-                row_y += 17.0;
-            }
-            return panel.max_y();
+            let text_h = Self::estimated_line_count(error, inner_w, 7.0).min(3) as f32 * 17.0;
+            paint_text_block(
+                ctx,
+                theme,
+                Rect::new(inner_x, row_y, inner_w, text_h),
+                error,
+                body_paint,
+            );
+            return geometry.panel_rect.max_y();
         }
 
         let Some(preview) = preview else {
-            widgets::draw_text_in(
+            paint_text_block(
                 ctx,
-                Rect::new(panel.x() + 12.0, row_y, inner_w, 18.0),
+                theme,
+                Rect::new(inner_x, row_y, inner_w, 18.0),
                 "Preview not loaded yet",
-                value_style,
+                body_paint,
             );
-            return panel.max_y();
+            return geometry.panel_rect.max_y();
         };
 
-        if preview.binary {
+        let (preview_text, body_h) = if preview.binary {
             let value = preview.lines.join(" ");
-            for line in widgets::wrap_lines(&value, inner_w, |s| {
-                ctx.measure_text(s, value_style.clone())
-                    .map(|m| m.width)
-                    .unwrap_or(0.0)
-            })
-            .into_iter()
-            .take(3)
-            {
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(panel.x() + 12.0, row_y, inner_w, 18.0),
-                    &line,
-                    value_style.clone(),
-                );
-                row_y += 17.0;
-            }
+            let height = Self::estimated_line_count(&value, inner_w, 7.0).min(3) as f32 * 17.0;
+            (value, height)
         } else {
-            for line in preview.lines.iter().take(FILE_PREVIEW_MAX_LINES) {
-                for wrapped in widgets::wrap_lines(line, inner_w, |s| {
-                    ctx.measure_text(s, value_style.clone())
-                        .map(|m| m.width)
-                        .unwrap_or(0.0)
-                })
-                .into_iter()
-                .take(2)
-                {
-                    widgets::draw_text_in(
-                        ctx,
-                        Rect::new(panel.x() + 12.0, row_y, inner_w, 18.0),
-                        &wrapped,
-                        value_style.clone(),
-                    );
-                    row_y += 17.0;
-                }
-            }
-        }
+            let lines = preview
+                .lines
+                .iter()
+                .take(FILE_PREVIEW_MAX_LINES)
+                .cloned()
+                .collect::<Vec<_>>();
+            let height = lines
+                .iter()
+                .map(|line| Self::estimated_line_count(line, inner_w, 7.0).min(2) as f32 * 17.0)
+                .sum::<f32>();
+            (lines.join("\n"), height)
+        };
+        paint_text_block(
+            ctx,
+            theme,
+            Rect::new(inner_x, row_y, inner_w, body_h),
+            &preview_text,
+            body_paint,
+        );
 
         if preview.truncated {
-            widgets::draw_text_in(
+            paint_text_block(
                 ctx,
-                Rect::new(panel.x() + 12.0, row_y, inner_w, 18.0),
+                theme,
+                Rect::new(inner_x, row_y + body_h, inner_w, 17.0),
                 &format!("Preview truncated to {} KB.", FILE_PREVIEW_MAX_BYTES / 1024),
-                muted_style,
+                muted_paint,
             );
         }
 
-        panel.max_y()
+        geometry.panel_rect.max_y()
     }
 }
 
 /// The inspector wrapped in a `PanelSection`-less host so it can be a `SizedBox` child. We keep the
 /// inspector as a single painter (above), so this is just the bare widget. A thin wrapper exists so
 /// the composed pod reads cleanly.
-fn inspector(shared: &Shared, scroll_state: &ScrollState) -> impl Widget + use<> {
+fn inspector(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_state: &ScrollState,
+) -> impl Widget + use<> {
     let s = shared.clone();
+    let header = WidgetPadding::horizontal(
+        CONTENT_PAD,
+        SizedBox::new().height(18.0).with_child(
+            SectionLabel::new("Inspector")
+                .semantic_name("Inspector")
+                .theme_when(clone_reader(reader)),
+        ),
+    )
+    .fill_child_height();
+    let task_queue =
+        WidgetPadding::horizontal(CONTENT_PAD, InspectorTaskQueue::new(shared.clone(), reader))
+            .fill_child_width();
+    let body = WidgetPadding::new(
+        sui::Insets {
+            left: 0.0,
+            right: 0.0,
+            top: CONTENT_PAD + 4.0,
+            bottom: 0.0,
+        },
+        Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .spacing(12.0)
+            .with_child(header)
+            .with_child(task_queue)
+            .with_child(InspectorView::new(shared.clone())),
+    )
+    .fill_child_width();
     Background::new(
         Color::TRANSPARENT,
-        ScrollView::vertical(InspectorView::new(shared.clone()))
+        ScrollView::vertical(body)
             .state(scroll_state.clone())
             .name("File inspector")
             .viewport_width_hint(true),
     )
     .brush_when(move || palette(&s).sidebar)
-}
-
-// ---------------------------------------------------------------------------
-// RebuildOnChange<K> — a reusable "rebuild my child when a key changes" wrapper.
-// ---------------------------------------------------------------------------
-
-/// Hosts a child [`WidgetPod`] that is *rebuilt from scratch* whenever a watched key changes.
-///
-/// Some composed widgets (`Breadcrumb`, the current virtual-table configuration, and similar
-/// fixed child trees) are cheaper to rebuild when their backing key changes than to make every
-/// child fully reactive. This widget owns that rebuild boundary:
-///
-/// * It owns a `build: Fn(&K) -> WidgetPod` closure and a `key: Fn() -> K` reader.
-/// * On each `RedrawRequested` it reads the current key; if it differs from the last-built key it
-///   rebuilds the child pod and requests measure + arrange + paint (the diff-on-redraw technique,
-///   like the Settings `StatusReflector`).
-/// * The headless test harness does **not** dispatch `RedrawRequested`, so — exactly like the
-///   Settings host — it ALSO rebuilds on the pointer-up that triggered the navigation. A pointer
-///   release is the only moment a navigation can happen, so this is both sufficient and cheap.
-///
-/// (Chat will reuse this pattern for its streaming transcript: same shape — a key that changes as
-/// messages stream in, a child rebuilt from the current message list.)
-struct RebuildOnChange<K: PartialEq + Clone> {
-    key_fn: Box<dyn Fn() -> K>,
-    build: Box<dyn Fn(&K) -> WidgetPod>,
-    last_key: K,
-    child: WidgetPod,
-}
-
-impl<K: PartialEq + Clone> RebuildOnChange<K> {
-    fn new<KF, BF>(key_fn: KF, build: BF) -> Self
-    where
-        KF: Fn() -> K + 'static,
-        BF: Fn(&K) -> WidgetPod + 'static,
-    {
-        let last_key = key_fn();
-        let child = build(&last_key);
-        Self {
-            key_fn: Box::new(key_fn),
-            build: Box::new(build),
-            last_key,
-            child,
-        }
-    }
-
-    /// Rebuild the child pod if the watched key changed. Returns whether a rebuild happened.
-    fn refresh(&mut self) -> bool {
-        let key = (self.key_fn)();
-        if key != self.last_key {
-            self.child = (self.build)(&key);
-            self.last_key = key;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-impl<K: PartialEq + Clone + 'static> Widget for RebuildOnChange<K> {
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        // Rebuild on the pointer-up that triggers a navigation (the headless harness never sends
-        // RedrawRequested, so this is the path the tests exercise) …
-        let pointer_up = matches!(
-            event,
-            Event::Pointer(p) if matches!(p.kind, sui::PointerEventKind::Up)
-        );
-        // … and on each redraw, to catch a navigation driven from outside a pointer gesture.
-        let redraw = matches!(event, Event::Window(WindowEvent::RedrawRequested));
-        if (pointer_up || redraw) && self.refresh() {
-            ctx.request_measure();
-            ctx.request_arrange();
-            ctx.request_paint();
-        }
-    }
-
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        // A measure pass is the last chance to rebuild before layout, so refresh here too (keeps the
-        // built child in sync when something else forces a measure, e.g. a resize or tab switch).
-        self.refresh();
-        self.child.measure(ctx, constraints)
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        self.child.arrange(ctx, bounds);
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        self.child.paint(ctx);
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.child.semantics(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.child);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.child);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Split — left pane fills, right pane fixed width, a vertical separator between.
-// ---------------------------------------------------------------------------
-
-/// A horizontal split: the `left` pane fills the remaining width while the `right` pane keeps a
-/// fixed `right_width`, with a 1px vertical [`Separator`] between them. (A plain horizontal `Stack`
-/// measures children left-to-right and lets the first child consume the full width before the fixed
-/// pane is measured, collapsing the right pane — this reserves the fixed width up front.)
-struct Split {
-    left: WidgetPod,
-    separator: WidgetPod,
-    right: WidgetPod,
-    right_width: f32,
-}
-
-const SPLIT_SEPARATOR_W: f32 = 1.0;
-
-impl Split {
-    fn new<L, R>(left: L, right: R, right_width: f32, reader: &ThemeReader) -> Self
-    where
-        L: Widget + 'static,
-        R: Widget + 'static,
-    {
-        Self {
-            left: WidgetPod::new(left),
-            separator: WidgetPod::new(Separator::vertical().theme_when(clone_reader(reader))),
-            right: WidgetPod::new(right),
-            right_width: right_width.max(0.0),
-        }
-    }
-
-    /// (left_width, right_width) for a given total width.
-    fn split_widths(&self, total: f32) -> (f32, f32) {
-        let right = self.right_width.min((total - SPLIT_SEPARATOR_W).max(0.0));
-        let left = (total - right - SPLIT_SEPARATOR_W).max(0.0);
-        (left, right)
-    }
-}
-
-impl Widget for Split {
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let total = if constraints.max.width.is_finite() {
-            constraints.max.width
-        } else {
-            self.right_width + 320.0 + SPLIT_SEPARATOR_W
-        };
-        let height = constraints.max.height;
-        let (left_w, right_w) = self.split_widths(total);
-        self.left
-            .measure(ctx, Constraints::tight(Size::new(left_w, height)));
-        self.separator.measure(
-            ctx,
-            Constraints::tight(Size::new(SPLIT_SEPARATOR_W, height)),
-        );
-        self.right
-            .measure(ctx, Constraints::tight(Size::new(right_w, height)));
-        Size::new(total, height)
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        let (left_w, right_w) = self.split_widths(bounds.width());
-        self.left.arrange(
-            ctx,
-            Rect::new(bounds.x(), bounds.y(), left_w, bounds.height()),
-        );
-        self.separator.arrange(
-            ctx,
-            Rect::new(
-                bounds.x() + left_w,
-                bounds.y(),
-                SPLIT_SEPARATOR_W,
-                bounds.height(),
-            ),
-        );
-        self.right.arrange(
-            ctx,
-            Rect::new(
-                bounds.x() + left_w + SPLIT_SEPARATOR_W,
-                bounds.y(),
-                right_w,
-                bounds.height(),
-            ),
-        );
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        self.left.paint(ctx);
-        self.separator.paint(ctx);
-        self.right.paint(ctx);
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.left.semantics(ctx);
-        self.separator.semantics(ctx);
-        self.right.semantics(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.left);
-        visitor.visit(&self.separator);
-        visitor.visit(&self.right);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.left);
-        visitor.visit(&mut self.separator);
-        visitor.visit(&mut self.right);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FixedLeftSplit — left pane fixed width, right pane fills.
-// ---------------------------------------------------------------------------
-
-struct FixedLeftSplit {
-    left: WidgetPod,
-    separator: WidgetPod,
-    right: WidgetPod,
-    left_width: f32,
-}
-
-impl FixedLeftSplit {
-    fn new<L, R>(left: L, right: R, left_width: f32, reader: &ThemeReader) -> Self
-    where
-        L: Widget + 'static,
-        R: Widget + 'static,
-    {
-        Self {
-            left: WidgetPod::new(left),
-            separator: WidgetPod::new(Separator::vertical().theme_when(clone_reader(reader))),
-            right: WidgetPod::new(right),
-            left_width: left_width.max(0.0),
-        }
-    }
-
-    fn split_widths(&self, total: f32) -> (f32, f32) {
-        let left = self.left_width.min((total - SPLIT_SEPARATOR_W).max(0.0));
-        let right = (total - left - SPLIT_SEPARATOR_W).max(0.0);
-        (left, right)
-    }
-}
-
-impl Widget for FixedLeftSplit {
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let total = if constraints.max.width.is_finite() {
-            constraints.max.width
-        } else {
-            self.left_width + 320.0 + SPLIT_SEPARATOR_W
-        };
-        let height = constraints.max.height;
-        let (left_w, right_w) = self.split_widths(total);
-        self.left
-            .measure(ctx, Constraints::tight(Size::new(left_w, height)));
-        self.separator.measure(
-            ctx,
-            Constraints::tight(Size::new(SPLIT_SEPARATOR_W, height)),
-        );
-        self.right
-            .measure(ctx, Constraints::tight(Size::new(right_w, height)));
-        Size::new(total, height)
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        let (left_w, right_w) = self.split_widths(bounds.width());
-        self.left.arrange(
-            ctx,
-            Rect::new(bounds.x(), bounds.y(), left_w, bounds.height()),
-        );
-        self.separator.arrange(
-            ctx,
-            Rect::new(
-                bounds.x() + left_w,
-                bounds.y(),
-                SPLIT_SEPARATOR_W,
-                bounds.height(),
-            ),
-        );
-        self.right.arrange(
-            ctx,
-            Rect::new(
-                bounds.x() + left_w + SPLIT_SEPARATOR_W,
-                bounds.y(),
-                right_w,
-                bounds.height(),
-            ),
-        );
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        self.left.paint(ctx);
-        self.separator.paint(ctx);
-        self.right.paint(ctx);
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.left.semantics(ctx);
-        self.separator.semantics(ctx);
-        self.right.semantics(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.left);
-        visitor.visit(&self.separator);
-        visitor.visit(&self.right);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.left);
-        visitor.visit(&mut self.separator);
-        visitor.visit(&mut self.right);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Small layout helper (copied from settings.rs — horizontal inset without Padding).
-// ---------------------------------------------------------------------------
-
-/// Insets a single child horizontally by `pad` on each side (the vertical axis is left to the
-/// caller). Keeps content off the panel edges without pulling in the container `Padding` widget.
-struct InsetX {
-    child: WidgetPod,
-    pad: f32,
-}
-
-impl InsetX {
-    fn new<W>(child: W, pad: f32) -> Self
-    where
-        W: Widget + 'static,
-    {
-        Self {
-            child: WidgetPod::new(child),
-            pad: pad.max(0.0),
-        }
-    }
-}
-
-impl Widget for InsetX {
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let inner_max = Size::new(
-            (constraints.max.width - self.pad * 2.0).max(0.0),
-            constraints.max.height,
-        );
-        let inner = Constraints::new(Size::ZERO, inner_max);
-        let child = self.child.measure(ctx, inner);
-        Size::new(child.width + self.pad * 2.0, child.height)
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        let inner = Rect::new(
-            bounds.x() + self.pad,
-            bounds.y(),
-            (bounds.width() - self.pad * 2.0).max(0.0),
-            bounds.height(),
-        );
-        self.child.arrange(ctx, inner);
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        self.child.paint(ctx);
-    }
-
-    fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.child.semantics(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.child);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.child);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -10485,7 +9797,7 @@ fn header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         },
         move |_key| WidgetPod::new(header(&s, &r)),
     );
-    InsetX::new(rebuilt, CONTENT_PAD)
+    WidgetPadding::horizontal(CONTENT_PAD, rebuilt).fill_child_height()
 }
 
 /// The file-list column wrapped so it rebuilds (rows) whenever the path changes. A shared
@@ -10523,20 +9835,26 @@ fn wide_pod(
     places_scroll_state: &ScrollState,
     inspector_scroll_state: &ScrollState,
 ) -> WidgetPod {
-    let places = ScrollView::vertical(FilesPlacesRail::new(shared.clone()))
-        .state(places_scroll_state.clone());
-    let list_with_places = FixedLeftSplit::new(
+    let places_scroll =
+        ScrollView::vertical(files_places_rail(shared, reader)).state(places_scroll_state.clone());
+    let places = Background::new(Color::TRANSPARENT, places_scroll).brush_when({
+        let s = shared.clone();
+        move || palette(&s).sidebar
+    });
+    let list_with_places = FixedPaneSplit::horizontal(
         places,
+        Separator::vertical().theme_when(clone_reader(reader)),
         list_column(shared, reader, scroll_state),
-        PLACES_W,
-        reader,
-    );
-    let body = Split::new(
+    )
+    .fixed_first(PLACES_W)
+    .divider_extent(1.0);
+    let body = FixedPaneSplit::horizontal(
         list_with_places,
-        inspector(shared, inspector_scroll_state),
-        INSPECTOR_W,
-        reader,
-    );
+        Separator::vertical().theme_when(clone_reader(reader)),
+        inspector(shared, reader, inspector_scroll_state),
+    )
+    .fixed_second(INSPECTOR_W)
+    .divider_extent(1.0);
     let header = Stack::vertical()
         .alignment(Alignment::Stretch)
         .with_child(
@@ -10546,9 +9864,9 @@ fn wide_pod(
         )
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)));
     WidgetPod::new(
-        widgets::Dock::new(body)
+        Dock::new(body)
             .top(HEADER_H + 1.0, header)
-            .bottom(FILES_STATUS_H, FilesStatusBar::new(shared.clone())),
+            .bottom(FILES_STATUS_H, files_status_bar(shared, reader)),
     )
 }
 
@@ -10563,9 +9881,9 @@ fn narrow_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState)
         )
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)));
     WidgetPod::new(
-        widgets::Dock::new(list_column(shared, reader, scroll_state))
+        Dock::new(list_column(shared, reader, scroll_state))
             .top(HEADER_H + 1.0, header)
-            .bottom(FILES_STATUS_H, FilesStatusBar::new(shared.clone())),
+            .bottom(FILES_STATUS_H, files_status_bar(shared, reader)),
     )
 }
 
@@ -11344,6 +10662,98 @@ mod tests {
     }
 
     #[test]
+    fn source_selector_uses_segmented_control_and_switches_to_local() -> sui::Result<()> {
+        let root = files_test_temp_dir("source-selector");
+        fs::write(root.join("local.txt"), b"local").expect("write local file");
+
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/services".to_string();
+            files.sifs_path = "/services".to_string();
+            files.local_path = root.to_string_lossy().into_owned();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/services/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files source selector")
+                    .root(
+                        SizedBox::new()
+                            .width(1120.0)
+                            .height(720.0)
+                            .with_child(view(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let snapshot = window.snapshot()?;
+        let group = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::RadioGroup
+                    && node.name.as_deref() == Some("Files source")
+            })
+            .expect("files source segmented control should expose a radio group");
+        assert_eq!(
+            group.value,
+            Some(sui::SemanticsValue::Text("SIFS".to_string()))
+        );
+        let sifs = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::RadioButton
+                    && node.name.as_deref() == Some("Browse SIFS")
+            })
+            .expect("SIFS source option should be exposed");
+        assert!(sifs.state.selected);
+        assert_eq!(sifs.state.checked, Some(sui::ToggleState::Checked));
+        let local = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::RadioButton
+                    && node.name.as_deref() == Some("Browse local files")
+            })
+            .expect("local source option should be exposed");
+        assert_eq!(local.state.checked, Some(sui::ToggleState::Unchecked));
+
+        window
+            .get_by_role(sui::SemanticsRole::RadioButton)
+            .with_name("Browse local files")
+            .click()?;
+
+        let files = shared.files();
+        assert_eq!(files.source, FilesSourceKind::Local);
+        assert_eq!(files.path, root.to_string_lossy());
+        assert!(
+            files
+                .entries
+                .iter()
+                .any(|entry| entry.name == "local.txt" && !entry.is_dir)
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn places_rail_opens_sifs_services() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -11393,10 +10803,39 @@ mod tests {
             }),
             "directory row should explain the select versus open split"
         );
+        let places_list = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::List
+                    && node.name.as_deref() == Some("Files places")
+            })
+            .expect("places rail should be exposed as a navigable list");
+        assert!(
+            places_list.actions.contains(&sui::SemanticsAction::Focus),
+            "places list should be focusable"
+        );
+        let services_place = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::ListItem
+                    && node.name.as_deref() == Some("Services")
+                    && node.description.as_deref() == Some("service data")
+            })
+            .expect("services place should be exposed as a list item");
+        assert!(
+            services_place
+                .actions
+                .contains(&sui::SemanticsAction::Activate),
+            "places entries should remain activatable"
+        );
 
         window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Open Services")
+            .get_by_role(sui::SemanticsRole::ListItem)
+            .with_name("Services")
             .click()?;
 
         let files = shared.files();
@@ -11934,12 +11373,12 @@ mod tests {
 
         assert_eq!(
             inspector.summary(),
-            "error|Sifs|/|device authorization was denied|false|"
+            "error|Sifs|/|device authorization was denied|false"
         );
         shared.files_mut().inspector_details_open = true;
         assert_eq!(
             inspector.summary(),
-            "error|Sifs|/|device authorization was denied|true|"
+            "error|Sifs|/|device authorization was denied|true"
         );
     }
 
@@ -11953,13 +11392,13 @@ mod tests {
             files.path = "/services".to_string();
         }
         let inspector = InspectorView::new(shared.clone());
-        assert_eq!(inspector.summary(), "loading|Sifs|/services|false|");
+        assert_eq!(inspector.summary(), "loading|Sifs|/services|false");
 
         {
             let mut files = shared.files_mut();
             files.inspector_details_open = true;
         }
-        assert_eq!(inspector.summary(), "loading|Sifs|/services|true|");
+        assert_eq!(inspector.summary(), "loading|Sifs|/services|true");
 
         {
             let mut files = shared.files_mut();
@@ -11968,7 +11407,7 @@ mod tests {
         }
         assert_eq!(
             inspector.summary(),
-            "unselected|Sifs|/services|false|0|true|Not checked yet; refresh this folder to update health|"
+            "unselected|Sifs|/services|false|0|true|Not checked yet; refresh this folder to update health"
         );
     }
 
@@ -12542,12 +11981,12 @@ mod tests {
         };
         assert_eq!(
             sifs_replication_summary(Some(&details), true),
-            "one durable location recorded; repair status not loaded"
+            "one replica location recorded; repair status not loaded"
         );
         details.current_locations.push("node-b".to_string());
         assert_eq!(
             sifs_replication_summary(Some(&details), true),
-            "2 durable locations recorded; repair status not loaded"
+            "2 replica locations recorded; repair status not loaded"
         );
         details.health = Some(SifsObjectHealth {
             agent_state: "pending-repair".to_string(),
@@ -12560,7 +11999,7 @@ mod tests {
         });
         assert_eq!(
             sifs_replication_summary(Some(&details), true),
-            "replicated; 2/3 durable nodes, 1 repair pending"
+            "replicated; 2/3 replicas, 1 repair pending"
         );
         details.health.as_mut().unwrap().pending_repair_count = 0;
         details
@@ -12571,12 +12010,12 @@ mod tests {
             .clear();
         assert_eq!(
             sifs_replication_summary(Some(&details), true),
-            "replicated; 2 durable nodes current"
+            "replicated; 2 replicas current"
         );
         details.health.as_mut().unwrap().open_conflict_count = 1;
         assert_eq!(
             sifs_replication_summary(Some(&details), true),
-            "replicated; 2 durable nodes, 1 conflict open"
+            "replicated; 2 replicas, 1 conflict open"
         );
         details.policy = "local-owned".to_string();
         assert_eq!(
@@ -12616,9 +12055,81 @@ mod tests {
         let entry = state.entries[0].clone();
         assert_eq!(
             entry_row_meta(&entry, &state, true),
-            "5 B · 1/2 nodes · 1 repair"
+            "5 B · 1/2 replicas · 1 repair"
         );
         assert_eq!(entry_row_meta(&entry, &state, false), "5 B");
+    }
+
+    #[test]
+    fn file_row_placement_badge_maps_sifs_sync_truth() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.source = FilesSourceKind::Sifs;
+        state.clustered = true;
+        state.details_loading = false;
+        state.details_error = None;
+        state.selected = Some(0);
+        state.entries = vec![SifsEntry {
+            name: "artifact.txt".to_string(),
+            path: "/artifact.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(5),
+        }];
+        let entry = state.entries[0].clone();
+
+        let mut details = test_sifs_details(Vec::new());
+        details.current_locations = vec!["node-a".to_string(), "node-b".to_string()];
+        details.health = Some(SifsObjectHealth {
+            agent_state: "current".to_string(),
+            version_count: 1,
+            receipt_count: 2,
+            intent_count: 0,
+            open_conflict_count: 0,
+            pending_repair_count: 0,
+            missing_replica_nodes: Vec::new(),
+        });
+        state.selected_details = Some(details.clone());
+        assert_eq!(
+            file_row_placement_badge(&entry, &state, 0),
+            FileRowPlacementBadge {
+                label: "synced".to_string(),
+                tone: SemanticTone::Success,
+                icon: IconGlyph::Storage,
+                replicas: Some((2, 2)),
+            }
+        );
+
+        details.health = Some(SifsObjectHealth {
+            agent_state: "pending-repair".to_string(),
+            version_count: 1,
+            receipt_count: 1,
+            intent_count: 1,
+            open_conflict_count: 0,
+            pending_repair_count: 1,
+            missing_replica_nodes: vec!["node-c".to_string()],
+        });
+        state.selected_details = Some(details);
+        assert_eq!(
+            file_row_placement_badge(&entry, &state, 0),
+            FileRowPlacementBadge {
+                label: "repair".to_string(),
+                tone: SemanticTone::Warning,
+                icon: IconGlyph::Redo,
+                replicas: Some((2, 3)),
+            }
+        );
+
+        state.details_error = Some("metadata failed".to_string());
+        assert_eq!(
+            file_row_placement_badge(&entry, &state, 0),
+            FileRowPlacementBadge {
+                label: "failed".to_string(),
+                tone: SemanticTone::Danger,
+                icon: IconGlyph::Alert,
+                replicas: None,
+            }
+        );
     }
 
     #[test]
@@ -12729,13 +12240,13 @@ mod tests {
         };
         assert_eq!(
             sifs_compact_placement_summary(Some(&details), true, false, None),
-            "2 nodes healthy"
+            "2 replicas healthy"
         );
 
         details.health.as_mut().unwrap().pending_repair_count = 1;
         assert_eq!(
             sifs_compact_placement_summary(Some(&details), true, false, None),
-            "2/3 nodes · 1 repair"
+            "2/3 replicas · 1 repair"
         );
     }
 
@@ -13101,13 +12612,7 @@ mod tests {
             files_task_detail_display(&sifs_task),
             "Authorize SIFS in Connection"
         );
-        assert_eq!(
-            FilesTaskStrip::detail_display(&sifs_task, 120.0),
-            "Authorize SIFS"
-        );
-        let compact = files_task_detail_display_for_width(&sifs_task, 180.0);
-        assert_eq!(compact, "Authorize SIFS in Connection");
-        assert!(compact.chars().count() <= 29);
+        assert_eq!(task_strip_detail_display(&sifs_task), "Authorize SIFS");
 
         let local_task = FilesTask {
             id: 2,
@@ -14372,7 +13877,7 @@ mod tests {
             .nodes
             .iter()
             .find(|node| {
-                node.role == sui::SemanticsRole::Text
+                node.role == sui::SemanticsRole::GenericContainer
                     && node.name.as_deref() == Some("Files status")
             })
             .expect("files status semantics");
@@ -14440,7 +13945,7 @@ mod tests {
         );
         assert_eq!(
             table.description.as_deref(),
-            Some("Columns: Name, Kind / size")
+            Some("Columns: Name, Placement, Kind / size")
         );
 
         Ok(())
@@ -14737,7 +14242,7 @@ mod tests {
             .expect("artifact row semantics");
         assert!(
             row.description.as_deref().is_some_and(
-                |description| description.contains("Placement 5 B · 1/2 nodes · 1 repair")
+                |description| description.contains("Placement 5 B · 1/2 replicas · 1 repair")
             ),
             "selected SIFS row should expose compact placement metadata, got {:?}",
             row.description
@@ -15090,6 +14595,8 @@ mod tests {
         let window = app.main_window()?;
 
         window
+            .get_by_role(sui::SemanticsRole::Text)
+            .with_name("File task strip")
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open Connection settings for Refresh placement")
             .click()?;
@@ -15347,6 +14854,7 @@ mod tests {
                 .collect();
         }
         let scroll_state = ScrollState::new();
+        let reader: ThemeReader = Rc::new(DefaultTheme::light);
 
         let runtime = sui::Application::new()
             .window(
@@ -15356,7 +14864,7 @@ mod tests {
                         SizedBox::new()
                             .width(INSPECTOR_W)
                             .height(320.0)
-                            .with_child(inspector(&shared, &scroll_state)),
+                            .with_child(inspector(&shared, &reader, &scroll_state)),
                     ),
             )
             .build()?;
@@ -16085,6 +15593,7 @@ mod tests {
             });
         }
         let scroll_state = ScrollState::new();
+        let reader: ThemeReader = Rc::new(DefaultTheme::light);
 
         let runtime = sui::Application::new()
             .window(
@@ -16094,7 +15603,7 @@ mod tests {
                         SizedBox::new()
                             .width(INSPECTOR_W)
                             .height(280.0)
-                            .with_child(inspector(&shared, &scroll_state)),
+                            .with_child(inspector(&shared, &reader, &scroll_state)),
                     ),
             )
             .build()?;

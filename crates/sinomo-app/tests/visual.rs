@@ -663,6 +663,17 @@ fn touch_at(root: &sui_testing::Locator, x: f32, y: f32) {
         .expect("touch up");
 }
 
+fn refresh_visual_layout(window: &sui_testing::TestWindow) {
+    use sui::{Event, Size, WindowEvent};
+
+    window
+        .dispatch_event_now(Event::Window(WindowEvent::Resized(Size::new(
+            1280.0, 720.0,
+        ))))
+        .expect("refresh visual layout");
+    window.run_until_idle().expect("settle refreshed layout");
+}
+
 fn seed_chat_providers(shared: &sinomo_app::state::Shared) {
     use sinomo_cli::app_api::ProviderSummary;
 
@@ -703,6 +714,12 @@ fn seed_healthy_chat_runtime(shared: &sinomo_app::state::Shared) {
 
 fn open_chat_provider_select(window: &sui_testing::TestWindow) -> sui::Rect {
     use sui::SemanticsRole;
+
+    window
+        .get_by_role(SemanticsRole::Button)
+        .with_name("gpt-4o")
+        .click()
+        .expect("open model selector");
 
     window
         .get_by_role(SemanticsRole::ComboBox)
@@ -1424,7 +1441,7 @@ fn capture_chat_composed() {
 
     // Empty state, dark: "Chat with {agent}" + hint.
     {
-        let shared = boot(Tab::Sinomo);
+        let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Sinomo, "chat-empty-dark");
         let runtime = build_runtime(shared).expect("build runtime");
         let app = TestApp::from_runtime(runtime).expect("headless test app");
         let window = app.main_window().expect("main window");
@@ -1434,7 +1451,7 @@ fn capture_chat_composed() {
 
     // Empty state, light: the same restyled live by the theme reader.
     {
-        let shared = boot(Tab::Sinomo);
+        let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Sinomo, "chat-empty-light");
         shared.borrow_mut().theme_mode = AppThemeMode::Light;
         let runtime = build_runtime(shared).expect("build runtime");
         let app = TestApp::from_runtime(runtime).expect("headless test app");
@@ -1446,19 +1463,20 @@ fn capture_chat_composed() {
 
     // Sidebar sessions: several chats plus a channel, with the compact row treatment visible.
     {
-        let shared = boot(Tab::Sinomo);
-        seed_sidebar_sessions(&shared);
-        let runtime = build_runtime(shared).expect("build runtime");
+        let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Sinomo, "chat-sidebar-sessions");
+        let runtime = build_runtime(shared.clone()).expect("build runtime");
         let app = TestApp::from_runtime(runtime).expect("headless test app");
         let window = app.main_window().expect("main window");
         app.run_until_idle()
             .expect("settle chat-sidebar-sessions layout");
+        seed_sidebar_sessions(&shared);
+        refresh_visual_layout(&window);
         capture("chat-composed-sidebar-sessions", &window);
     }
 
     // Populated transcript: a few user/agent bubbles, not streaming.
     {
-        let shared = boot(Tab::Sinomo);
+        let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Sinomo, "chat-messages");
         seed_conversation(&shared);
         let runtime = build_runtime(shared).expect("build runtime");
         let app = TestApp::from_runtime(runtime).expect("headless test app");
@@ -1470,7 +1488,7 @@ fn capture_chat_composed() {
     // Code-editing transcript: markdown answer blocks, highlighted code, and tool-call expanders
     // seeded from a file-editing patch.
     {
-        let shared = boot(Tab::Sinomo);
+        let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Sinomo, "chat-code-editing");
         {
             let mut chat = shared.chat_mut();
             chat.messages = vec![
@@ -1531,7 +1549,7 @@ fn capture_chat_composed() {
     // capture is deterministic and shows the populated picker.
     {
         use sinomo_cli::app_api::ProviderSummary;
-        let shared = boot(Tab::Sinomo);
+        let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Sinomo, "chat-models-loaded");
         seed_conversation(&shared);
         {
             let mut chat = shared.chat_mut();
@@ -1560,7 +1578,7 @@ fn capture_chat_composed() {
     // Streaming: a partial agent reply with the "thinking…" indicator and the Send button swapped
     // for a Spinner.
     {
-        let shared = boot(Tab::Sinomo);
+        let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Sinomo, "chat-streaming");
         {
             let mut chat = shared.chat_mut();
             chat.messages = vec![
@@ -1587,7 +1605,7 @@ fn capture_chat_composed() {
     // then open the provider Select through semantics so the capture follows the widget identity
     // instead of a fragile coordinate.
     {
-        let shared = boot(Tab::Sinomo);
+        let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Sinomo, "chat-selector");
         seed_conversation(&shared);
         seed_chat_providers(&shared);
         let runtime = build_runtime(shared).expect("build runtime");
@@ -1601,8 +1619,14 @@ fn capture_chat_composed() {
     // Chat edit popup: open through the row's semantic edit button so the capture covers the
     // rename/delete surface without relying on hover coordinates.
     {
-        let shared = boot(Tab::Sinomo);
+        let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Sinomo, "chat-edit");
         shared.borrow_mut().theme_mode = AppThemeMode::Light;
+        let runtime = build_runtime(shared.clone()).expect("build runtime");
+        let app = TestApp::from_runtime(runtime).expect("headless test app");
+        let window = app.main_window().expect("main window");
+        app.run_until_idle().expect("settle chat-edit layout");
+        seed_chat_providers(&shared);
+        seed_healthy_chat_runtime(&shared);
         {
             let mut chat = shared.chat_mut();
             let session_id = "visual-chat-edit".to_string();
@@ -1617,10 +1641,7 @@ fn capture_chat_composed() {
             chat.session_id = session_id;
             chat.models_loading = false;
         }
-        let runtime = build_runtime(shared).expect("build runtime");
-        let app = TestApp::from_runtime(runtime).expect("headless test app");
-        let window = app.main_window().expect("main window");
-        app.run_until_idle().expect("settle chat-edit layout");
+        refresh_visual_layout(&window);
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Edit Roadmap review")
@@ -1652,6 +1673,12 @@ fn capture_chat_composed() {
             .expect("load visual channel")
             .expect("visual channel persisted");
         assert_eq!(stored.enabled_participants_in_order().len(), 2);
+        let runtime = build_runtime(shared.clone()).expect("build runtime");
+        let app = TestApp::from_runtime(runtime).expect("headless test app");
+        let window = app.main_window().expect("main window");
+        app.run_until_idle().expect("settle channel-edit layout");
+        seed_chat_providers(&shared);
+        seed_healthy_chat_runtime(&shared);
         {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1670,10 +1697,7 @@ fn capture_chat_composed() {
             chat.session_id = session_id;
             chat.models_loading = false;
         }
-        let runtime = build_runtime(shared).expect("build runtime");
-        let app = TestApp::from_runtime(runtime).expect("headless test app");
-        let window = app.main_window().expect("main window");
-        app.run_until_idle().expect("settle channel-edit layout");
+        refresh_visual_layout(&window);
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Edit Release triage")
