@@ -5812,6 +5812,38 @@ mod tests {
     }
 
     #[test]
+    fn dfs_status_service_dispatch_allows_cluster_member_signer() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-status-member-dispatch");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let registry = daemon_service_registry(&paths, None, &[]);
+        let host = DaemonServiceRegistryHost::from_registry_for_paths(registry, &paths)
+            .expect("service host");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut authenticated = test_authenticated_command(DaemonSignerAuthority::Member);
+        authenticated.route = sinomo_dfs::DFS_STATUS_ROUTE.to_string();
+        let request = sinomo_dfs::dfs_status_rpc_request().expect("dfs status request");
+
+        let (response, stop) = runtime
+            .block_on(dispatch_rpc_via_registry_to_response_async(
+                &host,
+                &authenticated,
+                request,
+                None,
+                None,
+            ))
+            .expect("dfs status dispatch");
+
+        assert!(!stop);
+        let status =
+            sinomo_dfs::decode_dfs_status_rpc_response(&response).expect("dfs status response");
+        assert_eq!(status.file_system_count, 0);
+    }
+
+    #[test]
     fn daemon_service_registry_host_installs_active_native_dylib_routes_from_descriptor() {
         let Ok(library_path) = std::env::var("SINOMO_DAEMON_TEST_NATIVE_DYLIB") else {
             return;

@@ -2494,15 +2494,6 @@ where
         };
         let traceparent = request.traceparent().unwrap_or_default().to_string();
         let call_started_at = Instant::now();
-        let sign_started_at = Instant::now();
-        let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
-        let request_sign_us = cluster_object_rpc_elapsed_us(sign_started_at);
-        metrics::histogram!(
-            "sinomo.object_rpc.sign.us",
-            "route" => request.route.clone(),
-            "category" => request.category.clone()
-        )
-        .record(request_sign_us as f64);
         let deadline = ClusterEndpointRpcDeadline::new(options.timeouts.connect_timeout);
         let mut failed_edges = ClusterDeliveryFailedEdges::default();
         let mut failures = Vec::new();
@@ -2519,7 +2510,6 @@ where
             route = %request.route,
             category = %request.category,
             %target_node_id,
-            sign_us = request_sign_us,
             "cluster object rpc route start"
         );
 
@@ -2586,6 +2576,15 @@ where
                 } else {
                     cluster_relay_hop_transport_timeouts(options.timeouts, endpoint_attempt_budget)
                 };
+                let sign_started_at = Instant::now();
+                let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
+                let request_sign_us = cluster_object_rpc_elapsed_us(sign_started_at);
+                metrics::histogram!(
+                    "sinomo.object_rpc.sign.us",
+                    "route" => request.route.clone(),
+                    "category" => request.category.clone()
+                )
+                .record(request_sign_us as f64);
                 let (outer_build_us, outer_sign_us, send_us, response) = if final_hop {
                     let send_started_at = Instant::now();
                     let response = cluster_object_rpc_attempt_with_timeout(
@@ -2868,15 +2867,6 @@ where
         };
         let traceparent = request.traceparent().unwrap_or_default().to_string();
         let call_started_at = Instant::now();
-        let sign_started_at = Instant::now();
-        let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
-        let request_sign_us = cluster_object_rpc_elapsed_us(sign_started_at);
-        metrics::histogram!(
-            "sinomo.object_rpc.sign.us",
-            "route" => request.route.clone(),
-            "category" => request.category.clone()
-        )
-        .record(request_sign_us as f64);
         let deadline = ClusterEndpointRpcDeadline::new(options.timeouts.connect_timeout);
         let mut failed_edges = ClusterDeliveryFailedEdges::default();
         let mut failures = Vec::new();
@@ -2893,7 +2883,6 @@ where
             route = %request.route,
             category = %request.category,
             %target_node_id,
-            sign_us = request_sign_us,
             stream = true,
             "cluster object rpc stream route start"
         );
@@ -2962,6 +2951,15 @@ where
                 } else {
                     cluster_relay_hop_transport_timeouts(options.timeouts, endpoint_attempt_budget)
                 };
+                let sign_started_at = Instant::now();
+                let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
+                let request_sign_us = cluster_object_rpc_elapsed_us(sign_started_at);
+                metrics::histogram!(
+                    "sinomo.object_rpc.sign.us",
+                    "route" => request.route.clone(),
+                    "category" => request.category.clone()
+                )
+                .record(request_sign_us as f64);
                 let (outer_build_us, outer_sign_us, send_us, response) = if final_hop {
                     let send_started_at = Instant::now();
                     let response = cluster_object_rpc_attempt_with_timeout(
@@ -4585,7 +4583,10 @@ mod tests {
     #[derive(Default)]
     struct RecordingSignedHost {
         target_sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
+        target_auths: Vec<Vec<u8>>,
         stream_target_sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
+        stream_target_auths: Vec<Vec<u8>>,
+        signed_routes: Vec<String>,
         fail_first_send: bool,
         error_first_send: bool,
         stream_error_first_send: bool,
@@ -4595,9 +4596,12 @@ mod tests {
     impl ClusterSignedEndpointRpcAsyncHost for RecordingSignedHost {
         fn sign_endpoint_rpc_request_async<'a>(
             &'a mut self,
-            _request: &'a ObjectRpcRequest,
+            request: &'a ObjectRpcRequest,
         ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
-            Box::pin(async { Ok(b"test-auth".to_vec()) })
+            let next = self.signed_routes.len() + 1;
+            self.signed_routes.push(request.route.clone());
+            let auth = format!("test-auth-{next}").into_bytes();
+            Box::pin(async move { Ok(auth) })
         }
 
         fn send_signed_endpoint_rpc_async<'a>(
@@ -4615,8 +4619,11 @@ mod tests {
                 .stall_first_send
                 .filter(|_| self.target_sends.is_empty());
             let sends = &mut self.target_sends;
+            let auths = &mut self.target_auths;
+            let auth = _auth.to_vec();
             Box::pin(async move {
                 sends.push((endpoint, request, timeouts));
+                auths.push(auth);
                 if let Some(stall) = stall {
                     tokio::time::sleep(stall).await;
                 }
@@ -4647,8 +4654,11 @@ mod tests {
             let request = request.clone();
             let should_error = self.stream_error_first_send && self.stream_target_sends.is_empty();
             let sends = &mut self.stream_target_sends;
+            let auths = &mut self.stream_target_auths;
+            let auth = _auth.to_vec();
             Box::pin(async move {
                 sends.push((endpoint, request, timeouts));
+                auths.push(auth);
                 if should_error {
                     let response = ObjectRpcResponse::encode_error(
                         "/test/stream-target",
@@ -4972,6 +4982,11 @@ mod tests {
             "auth-error-target.test:21353"
         );
         assert_eq!(host.target_sends[1].0.address, "retry-target.test:21353");
+        assert_eq!(host.target_auths.len(), 2);
+        assert_ne!(
+            host.target_auths[0], host.target_auths[1],
+            "each endpoint retry must carry a fresh daemon auth nonce"
+        );
     }
 
     #[test]
@@ -5196,6 +5211,11 @@ mod tests {
         assert_eq!(
             host.stream_target_sends[1].0.address,
             "stream-retry-target.test:21353"
+        );
+        assert_eq!(host.stream_target_auths.len(), 2);
+        assert_ne!(
+            host.stream_target_auths[0], host.stream_target_auths[1],
+            "each streamed endpoint retry must carry a fresh daemon auth nonce"
         );
     }
 

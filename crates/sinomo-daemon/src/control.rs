@@ -4813,6 +4813,99 @@ mod tests {
     }
 
     #[test]
+    fn signed_dfs_status_dispatches_through_daemon_control_for_cluster_member() {
+        let target_root = sinomo_testdir::TestDir::new("sinomo-daemon-control-dfs-status-target");
+        let target_data_dir = SinomoDataDir::new(&target_root);
+        target_data_dir.ensure_root_layout().expect("target layout");
+        let target_daemon_paths = DaemonPaths::new(&target_data_dir);
+        let target_identity =
+            sinomo_core::node::load_or_create_main_node_identity(&target_data_dir.root())
+                .expect("target identity");
+        let peer_root = sinomo_testdir::TestDir::new("sinomo-daemon-control-dfs-status-peer");
+        let peer_data_dir = SinomoDataDir::new(&peer_root);
+        peer_data_dir.ensure_root_layout().expect("peer layout");
+        let peer_identity =
+            sinomo_core::node::load_or_create_main_node_identity(&peer_data_dir.root())
+                .expect("peer identity");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_control_dfs_status")
+                .expect("cluster id");
+        let target_node = NodeId::from_legacy_named("node_daemon_control_dfs_status_target")
+            .expect("target node");
+        let peer_node =
+            NodeId::from_legacy_named("node_daemon_control_dfs_status_peer").expect("peer node");
+        let now = OffsetDateTime::now_utc();
+
+        let mut target_state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "control-dfs-status",
+            target_node.clone(),
+            "target",
+            target_identity.public_key.clone(),
+            now,
+        );
+        target_state
+            .members
+            .push(sinomo_core::ClusterMemberRecord::local_non_voting(
+                cluster_id.clone(),
+                peer_node.clone(),
+                "peer",
+                peer_identity.public_key.clone(),
+                now,
+            ));
+        sinomo_core::cluster::write_cluster_state(
+            &sinomo_core::network::ClusterPaths::new(&target_data_dir),
+            &target_state,
+        )
+        .expect("write target state");
+
+        let mut peer_state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "control-dfs-status",
+            peer_node,
+            "peer",
+            peer_identity.public_key,
+            now,
+        );
+        peer_state
+            .members
+            .push(sinomo_core::ClusterMemberRecord::local_voter(
+                cluster_id,
+                target_node,
+                "target",
+                target_identity.public_key,
+                now,
+            ));
+        sinomo_core::cluster::write_cluster_state(
+            &sinomo_core::network::ClusterPaths::new(&peer_data_dir),
+            &peer_state,
+        )
+        .expect("write peer state");
+
+        let request = sinomo_dfs::dfs_status_rpc_request()
+            .expect("dfs status request")
+            .with_trace_context_if_missing();
+        let signed =
+            sign_daemon_rpc_request_from_data_dir(&peer_data_dir, &request).expect("signed rpc");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let response = runtime
+            .block_on(dispatch_daemon_control_request_in_process_async(
+                target_daemon_paths,
+                runtime.handle().clone(),
+                request.with_auth(signed),
+            ))
+            .expect("daemon control dispatch");
+
+        let status =
+            sinomo_dfs::decode_dfs_status_rpc_response(&response).expect("dfs status response");
+        assert_eq!(status.file_system_count, 0);
+    }
+
+    #[test]
     fn sandbox_replica_candidates_use_advertised_content_services_and_local_fallback() {
         let local = NodeId::from_legacy_named("node_local").expect("local node");
         let replica = NodeId::from_legacy_named("node_replica").expect("replica node");
