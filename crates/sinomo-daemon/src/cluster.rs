@@ -2797,7 +2797,6 @@ impl ClusterNetworkMaintenance {
             plan,
             use_formation_timeouts,
         } = pending;
-        let import_probe_keys = connectivity_import_probe_keys_for_plan(&plan);
         let records = self
             .execute_connectivity_probe_plan_async(&state, plan)
             .await;
@@ -2811,12 +2810,10 @@ impl ClusterNetworkMaintenance {
         match written {
             Ok(()) => {
                 self.idle_stats.incr_connectivity_record_sets_written();
-                let import_records =
-                    connectivity_import_records_for_probe_keys(&import_probe_keys, &records);
                 let imported = import_peer_connectivity_records_from_reachable_endpoints_async(
                     &paths,
                     &state,
-                    &import_records,
+                    &records,
                     runtime,
                     use_formation_timeouts,
                 )
@@ -2943,33 +2940,6 @@ where
     }
 }
 
-fn connectivity_import_probe_keys_for_plan(
-    plan: &ClusterConnectivityProbePlan,
-) -> BTreeSet<(NodeId, sinomo_core::network::ClusterEndpointId)> {
-    plan.entries
-        .iter()
-        .map(|entry| {
-            (
-                entry.endpoint.node_id.clone(),
-                entry.endpoint.endpoint_id.clone(),
-            )
-        })
-        .collect()
-}
-
-fn connectivity_import_records_for_probe_keys(
-    keys: &BTreeSet<(NodeId, sinomo_core::network::ClusterEndpointId)>,
-    records: &[ClusterConnectivityRecord],
-) -> Vec<ClusterConnectivityRecord> {
-    records
-        .iter()
-        .filter(|record| {
-            keys.contains(&(record.target_node_id.clone(), record.endpoint_id.clone()))
-        })
-        .cloned()
-        .collect()
-}
-
 async fn import_peer_connectivity_records_from_reachable_endpoints_async(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -2993,13 +2963,18 @@ async fn import_peer_connectivity_records_from_reachable_endpoints_async(
     } else {
         cluster_control_plane_timeouts()
     };
+    let import_records = peer_connectivity_import_records_for_reachable_peers(
+        state,
+        records,
+        OffsetDateTime::now_utc(),
+    );
     let mut visited = BTreeSet::new();
-    let mut endpoints = Vec::new();
-    for record in records {
+    let mut endpoints = Vec::with_capacity(import_records.len());
+    for record in &import_records {
         let Some(endpoint) = peer_connectivity_import_endpoint_for_record(state, record) else {
             continue;
         };
-        let key = format!("{}:{}", endpoint.node_id, endpoint.endpoint_id);
+        let key = endpoint.node_id.to_string();
         if !visited.insert(key) {
             continue;
         }
@@ -3066,6 +3041,73 @@ async fn import_peer_connectivity_records_from_reachable_endpoints_async(
         }
     }
     imported
+}
+
+fn peer_connectivity_import_records_for_reachable_peers(
+    state: &ClusterBootstrapState,
+    records: &[ClusterConnectivityRecord],
+    now: OffsetDateTime,
+) -> Vec<ClusterConnectivityRecord> {
+    let mut best_by_peer = BTreeMap::<NodeId, ClusterConnectivityRecord>::new();
+    for record in records {
+        if record.expires_at <= now
+            || peer_connectivity_import_endpoint_for_record(state, record).is_none()
+        {
+            continue;
+        }
+        match best_by_peer.entry(record.target_node_id.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(record.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if peer_connectivity_import_record_cmp(record, entry.get()).is_lt() {
+                    entry.insert(record.clone());
+                }
+            }
+        }
+    }
+    best_by_peer.into_values().collect()
+}
+
+fn peer_connectivity_import_record_cmp(
+    left: &ClusterConnectivityRecord,
+    right: &ClusterConnectivityRecord,
+) -> std::cmp::Ordering {
+    peer_connectivity_import_record_rank(left).cmp(&peer_connectivity_import_record_rank(right))
+}
+
+fn peer_connectivity_import_record_rank(
+    record: &ClusterConnectivityRecord,
+) -> (u8, u16, u64, u8, &str, &str) {
+    (
+        peer_connectivity_import_state_rank(&record.state),
+        record.consecutive_failures,
+        record.latency_ms.unwrap_or(u64::MAX),
+        peer_connectivity_import_transport_rank(&record.transport),
+        record.endpoint_id.as_str(),
+        record.address.as_str(),
+    )
+}
+
+fn peer_connectivity_import_state_rank(state: &ClusterConnectivityState) -> u8 {
+    match state {
+        ClusterConnectivityState::Healthy => 0,
+        ClusterConnectivityState::Degraded => 1,
+        ClusterConnectivityState::Unreachable => 2,
+    }
+}
+
+fn peer_connectivity_import_transport_rank(transport: &ClusterTransportKind) -> u8 {
+    match transport {
+        ClusterTransportKind::Loopback => 0,
+        ClusterTransportKind::LanTcp => 1,
+        ClusterTransportKind::Iroh => 2,
+        ClusterTransportKind::LanQuic => 3,
+        ClusterTransportKind::WebRtc => 4,
+        ClusterTransportKind::TurnRelay => 5,
+        ClusterTransportKind::HttpsRelay => 6,
+        ClusterTransportKind::InProcess => 7,
+    }
 }
 
 fn connectivity_import_timeout_for_endpoint(
@@ -13196,7 +13238,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_connectivity_import_uses_current_probe_batch_records_only() {
+    fn peer_connectivity_import_uses_reachable_records_from_full_active_set() {
         let now = OffsetDateTime::now_utc();
         let cluster_id =
             ClusterId::from_legacy_named("cluster_peer_import_probe_batch").expect("cluster id");
@@ -13258,27 +13300,17 @@ mod tests {
             now,
             60,
         );
-        let plan = ClusterConnectivityProbePlan {
-            active_keys: vec![cluster_connectivity_probe_key(
-                &local_node,
-                &selected_endpoint,
-            )],
-            entries: vec![sinomo_core::network::ClusterConnectivityProbeBatchEntry {
-                key: cluster_connectivity_probe_key(&local_node, &selected_endpoint),
-                endpoint: selected_endpoint.clone(),
-                previous: None,
-            }],
-            timestamp: "test".to_string(),
+        let import_records = peer_connectivity_import_records_for_reachable_peers(
+            &state,
+            &[selected_record.clone(), skipped_record.clone()],
             now,
-            startup_settle_active: false,
-        };
-        let import_keys = connectivity_import_probe_keys_for_plan(&plan);
-        let import_records = connectivity_import_records_for_probe_keys(
-            &import_keys,
-            &[selected_record.clone(), skipped_record],
         );
 
-        assert_eq!(import_records, vec![selected_record]);
+        assert_eq!(
+            import_records,
+            vec![selected_record, skipped_record],
+            "peer connectivity import should use the full active reachable set, not only this tick's probe batch"
+        );
     }
 
     #[test]

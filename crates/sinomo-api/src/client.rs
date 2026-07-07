@@ -357,7 +357,7 @@ impl DaemonApiClient {
     /// Fetches cluster health rows through the daemon's `/cluster/health`
     /// route.
     pub fn cluster_health(&self) -> Result<Vec<ClusterHealthRow>, DaemonApiError> {
-        let request = sinomo_core::cluster::cluster_health_rpc_request_without_peer_views()?;
+        let request = sinomo_core::cluster::cluster_health_rpc_request()?;
         let response = self.call_request(&request)?;
         sinomo_core::cluster::decode_cluster_health_rpc_response(&response)
             .map_err(DaemonApiError::from)
