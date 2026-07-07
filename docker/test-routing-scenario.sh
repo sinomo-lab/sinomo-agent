@@ -265,6 +265,13 @@ run_network_payload_probe() {
     --param "min-payload-bytes-per-second=$NETWORK_PAYLOAD_MIN_BYTES_PER_SEC"
 }
 
+run_dfs_routed_status_probe() {
+  local node="$1"
+  run_probe "$node" cluster.dfs.routed-status \
+    --param expected-targets=2 \
+    --param "timeout-ms=$NETWORK_TIMEOUT_MS"
+}
+
 assert_forwarded_endpoint_configured() {
   log "checking node1 manual forwarded endpoint config"
   compose exec -T node1 grep -F "host.docker.internal:$PUBLIC_PORT" /data/configs/cluster/endpoints.json
@@ -493,6 +500,9 @@ run_network_probe node3
 run_network_payload_probe node1
 run_network_payload_probe node2
 run_network_payload_probe node3
+run_dfs_routed_status_probe node1
+run_dfs_routed_status_probe node2
+run_dfs_routed_status_probe node3
 assert_forwarded_endpoint_active
 wait_for_dfs_ready
 run_concurrent_duplex_dfs_probe

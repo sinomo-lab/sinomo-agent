@@ -2240,9 +2240,9 @@ fn cluster_signed_endpoint_rpc_observation(
     started: Instant,
 ) -> Option<ClusterSignedEndpointRpcObservation> {
     match result {
-        Ok(_) => Some(ClusterSignedEndpointRpcObservation::success(Some(
-            cluster_signed_endpoint_rpc_elapsed_latency_ms(started),
-        ))),
+        Ok(response) => Some(cluster_signed_endpoint_response_observation(
+            response, started,
+        )),
         Err(error) => cluster_signed_endpoint_rpc_error_observation(error),
     }
 }
@@ -2252,10 +2252,23 @@ fn cluster_signed_endpoint_stream_response_rpc_observation(
     started: Instant,
 ) -> Option<ClusterSignedEndpointRpcObservation> {
     match result {
-        Ok(_) => Some(ClusterSignedEndpointRpcObservation::success(Some(
-            cluster_signed_endpoint_rpc_elapsed_latency_ms(started),
-        ))),
+        Ok(response) => Some(cluster_signed_endpoint_response_observation(
+            &response.response,
+            started,
+        )),
         Err(error) => cluster_signed_endpoint_rpc_error_observation(error),
+    }
+}
+
+fn cluster_signed_endpoint_response_observation(
+    response: &ObjectRpcResponse,
+    started: Instant,
+) -> ClusterSignedEndpointRpcObservation {
+    match response.error_detail() {
+        Err(NetworkError::AuthDenied) => ClusterSignedEndpointRpcObservation::auth_denied(),
+        _ => ClusterSignedEndpointRpcObservation::success(Some(
+            cluster_signed_endpoint_rpc_elapsed_latency_ms(started),
+        )),
     }
 }
 
@@ -5184,6 +5197,38 @@ mod tests {
             host.stream_target_sends[1].0.address,
             "stream-retry-target.test:21353"
         );
+    }
+
+    #[test]
+    fn signed_endpoint_response_observation_classifies_auth_error_frame() {
+        let response =
+            ObjectRpcResponse::encode_error("/test/target", "network authorization was denied")
+                .expect("auth error response");
+        let observation = cluster_signed_endpoint_rpc_observation(Ok(&response), Instant::now())
+            .expect("observation");
+
+        assert!(observation.is_auth_denied());
+    }
+
+    #[test]
+    fn signed_endpoint_stream_response_observation_classifies_auth_error_frame() {
+        let response = crate::ObjectRpcStreamResponse::from_buffered_response(
+            ObjectRpcResponse::encode_error(
+                "/test/stream-target",
+                "network authorization was denied",
+            )
+            .expect("auth error response"),
+            crate::RawByteStreamChunkOptions {
+                chunk_bytes: 4,
+                max_total_bytes: Some(1024),
+                idle_timeout: Some(Duration::from_secs(1)),
+            },
+        );
+        let observation =
+            cluster_signed_endpoint_stream_response_rpc_observation(Ok(&response), Instant::now())
+                .expect("observation");
+
+        assert!(observation.is_auth_denied());
     }
 
     #[test]

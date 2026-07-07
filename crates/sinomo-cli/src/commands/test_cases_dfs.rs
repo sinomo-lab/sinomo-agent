@@ -7,6 +7,9 @@
 //!
 //! - `cluster.dfs.read-your-write` — self-contained write/read/rename/delete
 //!   roundtrip; read-your-write must hold immediately on the writing node.
+//! - `cluster.dfs.routed-status` — route a signed DFS status RPC to every
+//!   remote main daemon; this catches DFS route auth/routing regressions that a
+//!   generic network ping can miss.
 //! - `cluster.dfs.invariants` — operational-metric sweep: no open conflicts,
 //!   no stuck routed namespace ops, no leaked cross-shard locks.
 //! - `cluster.dfs.lightweight-latency` — warmed SIFS stat/list/read-prefix
@@ -36,12 +39,15 @@
 
 use crate::file_manager::FileManagerBackend;
 use crate::sifs_file_manager::SifsFileManagerBackend;
+use sinomo_runtime::api::DaemonApiClient;
+use sinomo_runtime::cluster;
 use sinomo_runtime::dfs::{
     self, DfsFetchBlobResponseChunk, DfsFileSystemId, DfsMessageCommand, DfsNetworkMessage,
-    DfsObjectId, DfsReadResponseChunk, DfsRoutedMessage, DfsStageBlobChunkCommand, DfsVersion,
-    SIFS_FILE_SYSTEM_ID,
+    DfsObjectId, DfsOperatorStatus, DfsReadResponseChunk, DfsRoutedMessage,
+    DfsStageBlobChunkCommand, DfsVersion, SIFS_FILE_SYSTEM_ID,
 };
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::network::ClusterPaths;
 use sinomo_runtime::node::NodeId;
 use sinomo_runtime::test::{
     SinomoTestContext, SinomoTestError, SinomoTestOutcome, SinomoTestRegistryBuilder,
@@ -70,6 +76,7 @@ pub fn register_dfs_cluster_test_cases(
 ) -> SinomoTestRegistryBuilder {
     builder
         .register(dfs_read_your_write())
+        .register(dfs_routed_status())
         .register(dfs_concurrent_file_race())
         .register(dfs_concurrent_dir_race())
         .register(dfs_failover_current_read())
@@ -99,6 +106,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_read_your_write(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_routed_status(ctx) {
+        id: "cluster.dfs.routed-status",
+        summary: "Route signed DFS status RPCs to every remote main daemon",
+        tags: ["cluster-dfs", "probe", "routing"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_routed_status(ctx)
         }
     }
 }
@@ -371,6 +390,103 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     Ok(SinomoTestOutcome::passed(format!(
         "write/read/rename/delete roundtrip held read-your-write on node {node}"
     )))
+}
+
+fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let timeout_ms = optional_u64_parameter(ctx, "timeout-ms")?.unwrap_or(5_000);
+    let expected_targets = optional_usize_parameter(ctx, "expected-targets", 1)?;
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot refresh cluster snapshot before DFS routed status: {error}"
+        ))
+    })?;
+    let state = cluster::read_cluster_state(&cluster_paths)
+        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+    let targets = dfs_routed_status_targets_from_state(&state);
+    ctx.record("target_count", targets.len());
+    ctx.record(
+        "targets",
+        targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    );
+    if targets.len() < expected_targets {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "DFS routed status saw {} remote main targets, expected at least {expected_targets}",
+            targets.len()
+        )));
+    }
+
+    let daemon_client = DaemonApiClient::connect()
+        .map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot connect to local daemon for DFS routed status: {source}"
+            ))
+        })?
+        .with_timeout(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1)));
+    let request = dfs::dfs_status_rpc_request()
+        .map_err(|source| SinomoTestError::failed(source.to_string()))?;
+    let mut statuses = BTreeMap::new();
+    let mut failures = Vec::new();
+    for target in &targets {
+        match daemon_client.object_rpc_to_target(
+            target,
+            &request,
+            Duration::from_millis(timeout_ms),
+            true,
+        ) {
+            Ok(response) => match dfs::decode_dfs_status_rpc_response(&response) {
+                Ok(status) => {
+                    statuses.insert(target.to_string(), dfs_status_probe_summary(&status));
+                }
+                Err(error) => failures.push(format!("{target}: decode failed: {error}")),
+            },
+            Err(error) => failures.push(format!("{target}: {error}")),
+        }
+    }
+    ctx.record("statuses", statuses);
+    if !failures.is_empty() {
+        ctx.record("failures", failures.clone());
+        return Ok(SinomoTestOutcome::failed(format!(
+            "DFS routed status failed for {}/{} targets",
+            failures.len(),
+            targets.len()
+        )));
+    }
+
+    Ok(SinomoTestOutcome::passed(format!(
+        "DFS routed status succeeded for {} remote main daemon(s)",
+        targets.len()
+    )))
+}
+
+fn dfs_routed_status_targets_from_state(
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+) -> Vec<NodeId> {
+    let mut targets = state
+        .members
+        .iter()
+        .filter(|member| {
+            member.node_id != state.local_node_id
+                && member.state.is_authorized()
+                && member.capabilities.iter().any(|capability| {
+                    capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY
+                })
+        })
+        .map(|member| member.node_id.clone())
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets
+}
+
+fn dfs_status_probe_summary(status: &DfsOperatorStatus) -> BTreeMap<&'static str, u64> {
+    BTreeMap::from([
+        ("file_systems", status.file_system_count as u64),
+        ("objects", status.object_count as u64),
+        ("pending_writes", status.pending_write_count as u64),
+        ("open_conflicts", status.open_conflict_count as u64),
+        ("pending_repairs", status.pending_repair_count as u64),
+    ])
 }
 
 fn run_concurrent_file_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {

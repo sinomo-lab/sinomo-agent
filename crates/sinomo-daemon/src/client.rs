@@ -934,9 +934,9 @@ fn daemon_rpc_connectivity_observation(
         )
     } else if observation.is_auth_denied() {
         (
-            sinomo_core::network::ClusterConnectivityState::Degraded,
+            sinomo_core::network::ClusterConnectivityState::Unreachable,
             None,
-            true,
+            false,
         )
     } else {
         (
@@ -1749,9 +1749,9 @@ mod tests {
         assert_eq!(
             auth_denied,
             (
-                sinomo_core::network::ClusterConnectivityState::Degraded,
+                sinomo_core::network::ClusterConnectivityState::Unreachable,
                 None,
-                true
+                false
             )
         );
     }
