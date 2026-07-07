@@ -97,7 +97,11 @@ impl ReadyState {
     pub fn build_with_waker(backend: Backend, waker: Option<sui::UiHandle>) -> Self {
         let interactive = waker.is_some();
         let chat = ChatState::new_with_waker(&backend, waker);
-        let evolution = EvolutionState::new(&backend);
+        let evolution = if interactive {
+            EvolutionState::new_lightweight(&backend)
+        } else {
+            EvolutionState::new(&backend)
+        };
         let cluster = ClusterState::new(&backend);
         let files = FilesState::new(&backend);
         let settings = if interactive {

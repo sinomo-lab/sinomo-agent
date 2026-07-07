@@ -2,7 +2,9 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::mpsc::Receiver;
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 
 use sui::{
     ArrangeCtx, Button, Color, Constraints, DefaultTheme, Event, EventCtx, FontWeight, IconGlyph,
@@ -20,6 +22,7 @@ use crate::backend::evolution::{
 use crate::state::Shared;
 use crate::theme::Palette;
 use crate::ui::widgets;
+use sinomo_runtime::local::SinomoDataDir;
 
 const HEADER_H: f32 = 78.0;
 const PAD: f32 = 20.0;
@@ -67,12 +70,31 @@ pub struct EvolutionState {
     pub decision_error: Option<String>,
     decision_action: Option<EvolutionDecisionAction>,
     decision_rx: Option<Receiver<EvolutionDecisionEvent>>,
+    dashboard_load_rx: Option<Receiver<EvolutionDashboard>>,
+    dashboard_load_started: bool,
     scope_revision: u64,
 }
 
 impl EvolutionState {
     pub fn new(backend: &Backend) -> Self {
         let dashboard = EvolutionDashboard::load(backend);
+        Self::from_dashboard(dashboard)
+    }
+
+    pub fn new_lightweight(backend: &Backend) -> Self {
+        Self::from_dashboard(EvolutionDashboard {
+            source: backend
+                .data_dir
+                .root()
+                .join("evolution")
+                .display()
+                .to_string(),
+            jobs: Vec::new(),
+            error: Some("Evolution data is loading.".to_string()),
+        })
+    }
+
+    fn from_dashboard(dashboard: EvolutionDashboard) -> Self {
         let selected = (!dashboard.jobs.is_empty()).then_some(0);
         Self {
             dashboard,
@@ -90,8 +112,72 @@ impl EvolutionState {
             decision_error: None,
             decision_action: None,
             decision_rx: None,
+            dashboard_load_rx: None,
+            dashboard_load_started: false,
             scope_revision: 0,
         }
+    }
+
+    pub fn begin_dashboard_load(
+        &mut self,
+        data_dir: Arc<SinomoDataDir>,
+        waker: Option<sui::UiHandle>,
+    ) -> bool {
+        if self.dashboard_load_started || self.dashboard_load_rx.is_some() {
+            return false;
+        }
+        let (tx, rx) = mpsc::channel();
+        match thread::Builder::new()
+            .name("sinomo-app-evolution-load".to_string())
+            .spawn(move || {
+                let dashboard = load_evolution_dashboard(data_dir.as_ref());
+                let _ = tx.send(dashboard);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }) {
+            Ok(_) => {
+                self.dashboard_load_rx = Some(rx);
+                self.dashboard_load_started = true;
+                true
+            }
+            Err(error) => {
+                self.dashboard.error = Some(format!("Evolution data failed to load: {error}"));
+                self.dashboard_load_started = false;
+                false
+            }
+        }
+    }
+
+    pub fn pump_dashboard_load(&mut self) -> bool {
+        let Some(rx) = self.dashboard_load_rx.as_ref() else {
+            return false;
+        };
+        let dashboard = match rx.try_recv() {
+            Ok(dashboard) => dashboard,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.dashboard_load_rx = None;
+                self.dashboard_load_started = false;
+                self.dashboard.error =
+                    Some("Evolution data failed to load: worker exited".to_string());
+                return true;
+            }
+        };
+        self.dashboard_load_rx = None;
+        let selected_id = self
+            .selected
+            .and_then(|index| self.dashboard.jobs.get(index))
+            .map(|job| job.id.clone());
+        self.dashboard = dashboard;
+        self.selected = selected_id
+            .and_then(|id| self.dashboard.jobs.iter().position(|job| job.id == id))
+            .or(match self.selected {
+                Some(index) if index < self.dashboard.jobs.len() => Some(index),
+                _ if !self.dashboard.jobs.is_empty() => Some(0),
+                _ => None,
+            });
+        true
     }
 
     pub fn reload(&mut self, backend: &Backend) {
@@ -2692,6 +2778,33 @@ mod tests {
             rows.iter()
                 .all(|(_, value)| !value.contains("no candidate selected"))
         );
+    }
+
+    #[test]
+    fn lightweight_evolution_state_loads_dashboard_asynchronously() {
+        let backend = Backend::local_fallback();
+        let mut state = EvolutionState::new_lightweight(&backend);
+
+        assert_eq!(
+            state.dashboard.error.as_deref(),
+            Some("Evolution data is loading.")
+        );
+        assert!(state.dashboard.jobs.is_empty());
+        assert!(state.begin_dashboard_load(backend.data_dir.clone(), None));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if state.pump_dashboard_load() {
+                assert_ne!(
+                    state.dashboard.error.as_deref(),
+                    Some("Evolution data is loading.")
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        panic!("dashboard load worker did not finish");
     }
 
     #[test]

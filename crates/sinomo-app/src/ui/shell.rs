@@ -491,7 +491,10 @@ impl Widget for Shell {
                     };
                     self.shared
                         .settings_mut()
-                        .begin_initial_load(backend, waker.clone());
+                        .begin_initial_load(backend.clone(), waker.clone());
+                    self.shared
+                        .evolution_mut()
+                        .begin_dashboard_load(backend.data_dir.clone(), waker.clone());
                     self.shared.chat_mut().start_session_list_load(waker);
                     self.schedule_chat_session_timer(ctx);
                     self.start_cluster_refresh_if_active();
@@ -507,6 +510,11 @@ impl Widget for Shell {
                 };
                 let settings_changed = if self.shared.is_ready() {
                     self.shared.settings_mut().pump_initial_load()
+                } else {
+                    false
+                };
+                let evolution_changed = if self.shared.is_ready() {
+                    self.shared.evolution_mut().pump_dashboard_load()
                 } else {
                     false
                 };
@@ -526,7 +534,12 @@ impl Widget for Shell {
                     false
                 };
                 self.schedule_chat_session_timer(ctx);
-                if files_changed || cluster_changed || chat_changed || settings_changed {
+                if files_changed
+                    || cluster_changed
+                    || chat_changed
+                    || settings_changed
+                    || evolution_changed
+                {
                     ctx.request_measure();
                     ctx.request_arrange();
                     ctx.request_semantics();
@@ -534,6 +547,7 @@ impl Widget for Shell {
                 if changed
                     || device_changed
                     || settings_changed
+                    || evolution_changed
                     || files_changed
                     || cluster_changed
                     || chat_changed
@@ -562,8 +576,13 @@ impl Widget for Shell {
             } else {
                 false
             };
+            let evolution_changed = if self.shared.is_ready() {
+                self.shared.evolution_mut().pump_dashboard_load()
+            } else {
+                false
+            };
             self.schedule_chat_session_timer(ctx);
-            if cluster_changed || chat_changed || settings_changed {
+            if cluster_changed || chat_changed || settings_changed || evolution_changed {
                 ctx.request_measure();
                 ctx.request_arrange();
                 ctx.request_semantics();

@@ -45,7 +45,7 @@ pub struct ClusterState {
 impl ClusterState {
     pub fn new(backend: &Backend) -> Self {
         Self {
-            snapshot: backend.cluster_snapshot(),
+            snapshot: backend.cluster_startup_snapshot(),
             selected: None,
             diagnostics_open: false,
             refreshing: false,
@@ -2253,6 +2253,23 @@ mod tests {
         assert_eq!(state.snapshot.nodes.len(), 1);
         assert_eq!(state.selected, None);
         assert!(!state.diagnostics_open);
+    }
+
+    #[test]
+    fn cluster_state_starts_with_lightweight_placeholder() {
+        let backend = Backend::local_fallback();
+        let state = ClusterState::new(&backend);
+
+        assert!(state.snapshot.nodes.is_empty());
+        assert!(!state.refreshing);
+        assert!(
+            state
+                .snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("loading in the background")),
+            "startup cluster state should not synchronously fetch live health"
+        );
     }
 
     #[test]
