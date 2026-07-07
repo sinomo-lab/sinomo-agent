@@ -67,10 +67,7 @@ use sinomo_core::{
 };
 #[cfg(test)]
 use sinomo_core::{ClusterJoinInvite, ClusterMemberRole, ClusterMemberState, TrustDomain};
-use sinomo_rollout::{
-    ClusterRolloutBuildRequest, SelfRolloutPaths, managed_source_status, read_rollout_status,
-    source_heads_match,
-};
+use sinomo_rollout::{ClusterRolloutBuildRequest, SelfRolloutPaths, read_rollout_status};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -113,6 +110,7 @@ const DAEMON_SHADOW_STATUS_STARTUP_RETRY_INTERVAL: Duration = Duration::from_sec
 const DAEMON_SHADOW_STATUS_STARTUP_RETRY_ATTEMPTS: u8 = 20;
 pub const DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL: Duration =
     sinomo_core::network::CLUSTER_NETWORK_PROBE_INTERVAL;
+const DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS: i64 = 120;
 // Network-info records describe stable endpoint/environment data, not liveness.
 // Active health and connectivity probes handle reachability, so unchanged records
 // can refresh sparsely to avoid idle WAL/snapshot churn on low-write storage.
@@ -663,20 +661,48 @@ fn cached_connectivity_record_set_matches(
         })
 }
 
-fn rollout_status_matches_desired(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DesiredRolloutReconcileDecision {
+    Complete,
+    TerminalFailure,
+    Wait,
+    Retry,
+}
+
+fn desired_rollout_reconcile_decision(
     status: Option<&ClusterNodeRolloutStatus>,
     mode: Option<&str>,
     requested_at: Option<&str>,
-) -> bool {
+    now: OffsetDateTime,
+) -> DesiredRolloutReconcileDecision {
     let Some(status) = status else {
-        return false;
+        return DesiredRolloutReconcileDecision::Retry;
     };
-    status.mode.as_deref() == mode
-        && status.requested_at.as_deref() == requested_at
-        && matches!(
-            status.status.as_str(),
-            "accepted" | "main-staged" | "healthy" | "recovered"
-        )
+    if status.mode.as_deref() != mode || status.requested_at.as_deref() != requested_at {
+        return DesiredRolloutReconcileDecision::Retry;
+    }
+    match status.status.as_str() {
+        "accepted" | "healthy" | "recovered" => DesiredRolloutReconcileDecision::Complete,
+        "failed" | "rejected" | "rolled-back" => DesiredRolloutReconcileDecision::TerminalFailure,
+        _ if rollout_progress_status_is_stale(status, now) => {
+            DesiredRolloutReconcileDecision::Retry
+        }
+        _ => DesiredRolloutReconcileDecision::Wait,
+    }
+}
+
+fn rollout_progress_status_is_stale(
+    status: &ClusterNodeRolloutStatus,
+    now: OffsetDateTime,
+) -> bool {
+    let Some(updated_at) = status
+        .updated_at
+        .as_deref()
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+    else {
+        return true;
+    };
+    now - updated_at >= time::Duration::seconds(DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS)
 }
 
 fn remember_connectivity_record_set(
@@ -1942,7 +1968,6 @@ pub(crate) struct ClusterNetworkMaintenance {
     pub connectivity_converged: bool,
     pub environment_id: Option<String>,
     pub local_node_role: ClusterNodeRole,
-    pub last_desired_rollout_attempt: Option<String>,
     pub solo_cluster_idle: bool,
     pub startup_settle_until: Option<Instant>,
     pub tick: u64,
@@ -1998,7 +2023,6 @@ impl ClusterNetworkMaintenance {
             connectivity_converged: false,
             environment_id: None,
             local_node_role: ClusterNodeRole::default(),
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -2426,36 +2450,18 @@ impl ClusterNetworkMaintenance {
             detail: "daemon paths have no data directory parent".to_string(),
         })?;
         let rollout_paths = SelfRolloutPaths::new(data_dir);
-        if rollout_status_matches_desired(
-            read_rollout_status(&rollout_paths)?.as_ref(),
+        let current_status = read_rollout_status(&rollout_paths)?;
+        match desired_rollout_reconcile_decision(
+            current_status.as_ref(),
             desired.mode.as_deref(),
             desired.requested_at.as_deref(),
+            OffsetDateTime::now_utc(),
         ) {
-            return Ok(());
+            DesiredRolloutReconcileDecision::Complete
+            | DesiredRolloutReconcileDecision::TerminalFailure
+            | DesiredRolloutReconcileDecision::Wait => return Ok(()),
+            DesiredRolloutReconcileDecision::Retry => {}
         }
-        if let Some(source_head) = desired.source_head.as_deref()
-            && managed_source_status(&rollout_paths)
-                .ok()
-                .and_then(|status| status.head)
-                .as_deref()
-                .is_some_and(|current_head| source_heads_match(Some(current_head), source_head))
-        {
-            return Ok(());
-        }
-
-        let attempt_key = format!(
-            "{}:{}",
-            desired.requested_at.as_deref().unwrap_or("unknown-request"),
-            desired
-                .source_head
-                .as_deref()
-                .or(desired.source.as_deref())
-                .unwrap_or("unknown-source")
-        );
-        if self.last_desired_rollout_attempt.as_deref() == Some(attempt_key.as_str()) {
-            return Ok(());
-        }
-        self.last_desired_rollout_attempt = Some(attempt_key);
 
         let requested_at = desired.requested_at.clone().unwrap_or_else(|| {
             OffsetDateTime::now_utc()
@@ -8444,6 +8450,124 @@ mod tests {
         );
     }
 
+    fn desired_rollout_status_for_test(
+        status: &str,
+        phase: &str,
+        updated_at: OffsetDateTime,
+    ) -> ClusterNodeRolloutStatus {
+        ClusterNodeRolloutStatus {
+            status: status.to_string(),
+            mode: Some("cluster-remote-build".to_string()),
+            detail: None,
+            phase: Some(phase.to_string()),
+            progress_current: Some(2),
+            progress_total: Some(5),
+            progress_message: Some(phase.to_string()),
+            source: Some("source".to_string()),
+            requested_at: Some("2026-07-07T00:00:00Z".to_string()),
+            staged_at: None,
+            updated_at: Some(updated_at.format(&Rfc3339).expect("updated timestamp")),
+            failed_at: None,
+            diagnostics: None,
+            stdout_log: None,
+            stderr_log: None,
+            stdout_tail: None,
+            stderr_tail: None,
+        }
+    }
+
+    #[test]
+    fn desired_rollout_reconcile_retries_missing_or_stale_progress() {
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                None,
+                Some("cluster-remote-build"),
+                Some("2026-07-07T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::Retry
+        );
+
+        let fresh = desired_rollout_status_for_test("in-progress", "building", now);
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                Some(&fresh),
+                Some("cluster-remote-build"),
+                Some("2026-07-07T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::Wait
+        );
+
+        let stale = desired_rollout_status_for_test(
+            "in-progress",
+            "building",
+            now - time::Duration::seconds(DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS + 1),
+        );
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                Some(&stale),
+                Some("cluster-remote-build"),
+                Some("2026-07-07T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::Retry
+        );
+
+        let stale_main_staged = desired_rollout_status_for_test(
+            "main-staged",
+            "main-staged",
+            now - time::Duration::seconds(DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS + 1),
+        );
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                Some(&stale_main_staged),
+                Some("cluster-remote-build"),
+                Some("2026-07-07T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::Retry
+        );
+    }
+
+    #[test]
+    fn desired_rollout_reconcile_stops_on_complete_or_hard_failure() {
+        let now = OffsetDateTime::now_utc();
+        let accepted = desired_rollout_status_for_test("accepted", "shadow-finalized", now);
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                Some(&accepted),
+                Some("cluster-remote-build"),
+                Some("2026-07-07T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::Complete
+        );
+
+        let rejected = desired_rollout_status_for_test("rejected", "build-failed", now);
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                Some(&rejected),
+                Some("cluster-remote-build"),
+                Some("2026-07-07T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::TerminalFailure
+        );
+
+        let failed = desired_rollout_status_for_test("failed", "activation-failed", now);
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                Some(&failed),
+                Some("cluster-remote-build"),
+                Some("2026-07-07T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::TerminalFailure
+        );
+    }
+
     #[test]
     fn maintenance_failure_backoff_retries_after_configured_delay() {
         let now = Instant::now();
@@ -8554,7 +8678,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -8592,7 +8715,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Mobile,
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -8633,7 +8755,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Mobile,
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -8684,7 +8805,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -8718,7 +8838,6 @@ mod tests {
             connectivity_converged: false,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -8750,7 +8869,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: Some("old-environment".to_string()),
             local_node_role: ClusterNodeRole::Mobile,
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -8820,7 +8938,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -9123,7 +9240,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -9177,7 +9293,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -9305,7 +9420,6 @@ mod tests {
             connectivity_converged: false,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -9519,7 +9633,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: sinomo_core::network::cluster_local_node_role(&state),
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -9621,7 +9734,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: sinomo_core::network::cluster_local_node_role(&state),
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -9736,7 +9848,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: sinomo_core::network::cluster_local_node_role(&state),
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -9801,7 +9912,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: true,
 
             startup_settle_until: None,
@@ -11210,7 +11320,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -11390,7 +11499,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: Some("old-environment".to_string()),
             local_node_role: ClusterNodeRole::Workstation,
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -11502,7 +11610,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -12313,7 +12420,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: sinomo_core::network::cluster_local_node_role(&state),
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -12440,7 +12546,6 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
-            last_desired_rollout_attempt: None,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
