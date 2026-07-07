@@ -59,7 +59,6 @@ use super::{
     daemon_handle_daemon_sandbox_toolchain_import_package, daemon_handle_daemon_sandbox_write,
 };
 use crate::commands::{read_cluster_kv_snapshot, read_cluster_state};
-use base64::Engine;
 use sinomo_agent::{AgentRuntimeControlHost, AgentSessionResumeRequest, AgentSessionSteerRequest};
 use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, ProviderReasoningEffort,
@@ -155,6 +154,86 @@ fn cluster_connectivity_key(
 
 fn cluster_endpoint_key(node_id: &NodeId, endpoint: &ClusterEndpointRecord) -> String {
     format!("/cluster/endpoints/{node_id}/{}", endpoint.endpoint_id)
+}
+
+struct TestIrohNetworkModule;
+
+fn stable_iroh_endpoint_id_raw(node_id: &NodeId, endpoint_public_key: &str) -> ClusterEndpointId {
+    ClusterEndpointId::derived(
+        "sinomo.iroh.endpoint",
+        format!("{}\0{endpoint_public_key}", node_id.as_str()),
+    )
+}
+
+fn test_iroh_endpoint_public_key(address: &str) -> Option<&str> {
+    let rest = address.strip_prefix("iroh://")?;
+    rest.split(['?', '#']).next().filter(|key| !key.is_empty())
+}
+
+impl network::NetworkModule for TestIrohNetworkModule {
+    fn descriptor(&self) -> network::NetworkModuleDescriptor {
+        network::NetworkModuleDescriptor {
+            id: "test-iroh".to_string(),
+            transports: vec![ClusterTransportKind::Iroh],
+            address_schemes: vec!["iroh".to_string()],
+            dialer: true,
+            listener: false,
+            supports_runtime_toggle: true,
+        }
+    }
+
+    fn start(&self, _ctx: &network::NetworkModuleContext) -> Result<(), network::NetworkError> {
+        Ok(())
+    }
+
+    fn stop(&self) -> Result<(), network::NetworkError> {
+        Ok(())
+    }
+
+    fn dial_rpc(
+        &self,
+        _endpoint: &ClusterEndpointRecord,
+        request: &[u8],
+        _timeouts: network::DaemonRpcTimeouts,
+    ) -> network::NetworkFuture<Vec<u8>> {
+        let response = request.to_vec();
+        Box::pin(async move { Ok(response) })
+    }
+
+    fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, network::NetworkError> {
+        Ok(Vec::new())
+    }
+
+    fn endpoint_role(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+    ) -> network::NetworkModuleEndpointRole {
+        let Some(public_key) = test_iroh_endpoint_public_key(&endpoint.address) else {
+            return network::NetworkModuleEndpointRole::Unknown;
+        };
+        let shadow_node_id = shadow_daemon_node_id(&endpoint.node_id);
+        if endpoint.endpoint_id == stable_iroh_endpoint_id_raw(&shadow_node_id, public_key) {
+            return network::NetworkModuleEndpointRole::ShadowDaemon;
+        }
+        if endpoint.endpoint_id == stable_iroh_endpoint_id_raw(&endpoint.node_id, public_key) {
+            return network::NetworkModuleEndpointRole::MainDaemon;
+        }
+        network::NetworkModuleEndpointRole::Unknown
+    }
+}
+
+fn install_test_iroh_network_module() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let registry = network::NetworkModuleRegistry::new();
+        registry.register(Arc::new(TestIrohNetworkModule), None, true, false);
+        network::set_network_module_registry(Arc::new(registry));
+    });
+}
+
+fn iroh_invite_introducer_endpoint(node_id: &NodeId, address: String) -> ClusterEndpointRecord {
+    install_test_iroh_network_module();
+    invite_introducer_endpoint(node_id, address)
 }
 
 fn rollout_target_endpoint_for_main(
@@ -6543,7 +6622,7 @@ fn daemon_advertised_endpoints_use_route_addresses_for_known_peers() {
 }
 
 #[test]
-fn cluster_doctor_reports_duplicate_iroh_endpoint_public_keys() {
+fn cluster_doctor_reports_duplicate_module_endpoint_identities() {
     let cluster_id = ClusterId::from_legacy_named("cluster_doctor_iroh").expect("cluster");
     let local_node = NodeId::from_legacy_named("node_doctor_local").expect("node");
     let mut state = ClusterBootstrapState::initialized_locally(
@@ -6583,7 +6662,7 @@ fn cluster_doctor_reports_duplicate_iroh_endpoint_public_keys() {
     let findings = cluster_doctor_findings(&state, &[], &[]);
 
     assert!(findings.iter().any(|finding| {
-        finding.code == "duplicate-iroh-endpoint"
+        finding.code == "duplicate-endpoint"
             && finding.detail.contains("same_public_key")
             && finding.detail.contains(local_node.as_str())
     }));
@@ -11496,6 +11575,7 @@ fn rollout_pending_error_grace_extends_for_matching_active_status() {
 
 #[test]
 fn rollout_cluster_targets_deduplicate_explicit_targets() {
+    install_test_iroh_network_module();
     let targets = rollout_cluster_targets(&RolloutOptions {
         targets: vec![
             "192.0.2.11:21353".to_string(),
@@ -11560,7 +11640,7 @@ fn rollout_cluster_targets_include_shadow_only_repair_route() {
         "remote-shadow-key",
         now,
     );
-    let shadow_iroh = invite_introducer_endpoint(
+    let shadow_iroh = iroh_invite_introducer_endpoint(
         &remote_shadow_id,
         "iroh://rollout_shadow_only_repair?relay=https://relay.example./".to_string(),
     );
@@ -11623,7 +11703,7 @@ fn rollout_cluster_targets_keep_one_route_per_main_node() {
     remote_main.capabilities = main_daemon_capabilities(&ClusterMemberRole::Learner);
     remote_main.allowed_capabilities = remote_main.capabilities.clone();
     let main_tcp = invite_introducer_endpoint(&remote_main_id, "10.0.0.42:21353".to_string());
-    let main_iroh = invite_introducer_endpoint(
+    let main_iroh = iroh_invite_introducer_endpoint(
         &remote_main_id,
         "iroh://rollout_main_duplicate?relay=https://relay.example./".to_string(),
     );
@@ -11636,10 +11716,12 @@ fn rollout_cluster_targets_keep_one_route_per_main_node() {
         "remote-shadow-key",
         now,
     );
-    remote_shadow.endpoints.push(invite_introducer_endpoint(
-        &remote_shadow_id,
-        "iroh://rollout_shadow_duplicate?relay=https://relay.example./".to_string(),
-    ));
+    remote_shadow
+        .endpoints
+        .push(iroh_invite_introducer_endpoint(
+            &remote_shadow_id,
+            "iroh://rollout_shadow_duplicate?relay=https://relay.example./".to_string(),
+        ));
     state.members.push(remote_main);
     state.members.push(remote_shadow);
 
@@ -11734,7 +11816,7 @@ fn rollout_cluster_target_prefers_direct_shadow_endpoint_before_iroh() {
         NodeId::from_legacy_named("node_rollout_shadow_iroh_main").expect("main node");
     let shadow_node_id = shadow_daemon_node_id(&main_node_id);
     let lan_endpoint = invite_introducer_endpoint(&shadow_node_id, "10.0.0.42:21354".to_string());
-    let mut iroh_endpoint = invite_introducer_endpoint(
+    let mut iroh_endpoint = iroh_invite_introducer_endpoint(
         &shadow_node_id,
         "iroh://shadow_iroh_rollout?relay=https://relay.example./".to_string(),
     );
@@ -11768,11 +11850,10 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
         "local-public-key",
         OffsetDateTime::now_utc(),
     );
-    let lan_endpoint = invite_introducer_endpoint(&remote_node_id, "192.0.2.42:21354".to_string());
-    let iroh_endpoint = invite_introducer_endpoint(
-        &remote_node_id,
-        "iroh://rollout_connectivity_remote?relay=https://relay.example./".to_string(),
-    );
+    let private_endpoint =
+        invite_introducer_endpoint(&remote_node_id, "10.0.0.42:21354".to_string());
+    let public_endpoint =
+        invite_introducer_endpoint(&remote_node_id, "203.0.113.42:21354".to_string());
     let mut remote = ClusterMemberRecord::local_non_voting(
         cluster_id,
         remote_node_id,
@@ -11780,7 +11861,7 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
         "remote-public-key",
         OffsetDateTime::now_utc(),
     );
-    remote.endpoints = vec![lan_endpoint.clone(), iroh_endpoint.clone()];
+    remote.endpoints = vec![private_endpoint.clone(), public_endpoint.clone()];
     state.members.push(remote);
     sinomo_runtime::cluster::write_cluster_state(&paths, &state).expect("write state");
     sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
@@ -11789,11 +11870,11 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
     let now = OffsetDateTime::now_utc();
     let records = [
         (
-            &lan_endpoint,
+            &private_endpoint,
             sinomo_runtime::network::ClusterConnectivityState::Unreachable,
         ),
         (
-            &iroh_endpoint,
+            &public_endpoint,
             sinomo_runtime::network::ClusterConnectivityState::Healthy,
         ),
     ]
@@ -11832,7 +11913,7 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
 
     assert_eq!(
         endpoints.first().expect("endpoint").endpoint_id,
-        iroh_endpoint.endpoint_id
+        public_endpoint.endpoint_id
     );
 }
 
@@ -11944,7 +12025,7 @@ fn rollout_target_prefers_unknown_private_tcp_over_shadow_iroh() {
     );
 
     let private_shadow = invite_introducer_endpoint(&shadow_node_id, "10.0.0.42:21354".to_string());
-    let iroh_shadow = invite_introducer_endpoint(
+    let iroh_shadow = iroh_invite_introducer_endpoint(
         &shadow_node_id,
         "iroh://rollout_shadow_private?relay=https://relay.example./".to_string(),
     );
@@ -12001,6 +12082,74 @@ fn rollout_target_prefers_unknown_private_shadow_tcp_over_public_tcp() {
 }
 
 #[test]
+fn rollout_target_prefers_healthy_public_main_over_unknown_private_main() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-public-main-before-private");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_rollout_public_private").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("node_rollout_public_private_local").expect("node");
+    let main_node_id =
+        NodeId::from_legacy_named("node_rollout_public_private_remote").expect("node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "rollout public private",
+        local_node_id.clone(),
+        "local",
+        "local-public-key",
+        OffsetDateTime::now_utc(),
+    );
+
+    let private_main = invite_introducer_endpoint(&main_node_id, "10.0.0.42:21353".to_string());
+    let public_main = invite_introducer_endpoint(&main_node_id, "203.0.113.42:21353".to_string());
+    let mut remote = ClusterMemberRecord::local_voter(
+        cluster_id,
+        main_node_id.clone(),
+        "remote",
+        "remote-public-key",
+        OffsetDateTime::now_utc(),
+    );
+    remote.endpoints = vec![private_main.clone(), public_main.clone()];
+    state.members.push(remote);
+    sinomo_runtime::cluster::write_cluster_state(&paths, &state).expect("write state");
+    sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+        .expect("sync state");
+
+    let now = OffsetDateTime::now_utc();
+    let record = sinomo_runtime::network::cluster_connectivity_record(
+        &state,
+        &public_main,
+        sinomo_runtime::network::ClusterConnectivityState::Healthy,
+        Some(1),
+        0,
+        Some("ok".to_string()),
+        None,
+        now,
+        120,
+    );
+    sinomo_runtime::cluster::sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local_node_id,
+        vec![record],
+    )
+    .expect("connectivity record");
+
+    let selected = rollout_target_endpoint_for_main_with_connectivity(
+        &paths,
+        &state,
+        &main_node_id,
+        &[private_main, public_main.clone()],
+    )
+    .expect("rollout target");
+
+    assert_eq!(selected.node_id, main_node_id);
+    assert_eq!(selected.endpoint_id, public_main.endpoint_id);
+}
+
+#[test]
 fn rollout_target_prefers_healthy_main_tcp_over_shadow_iroh_backup() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-shadow-before-main");
     let data_dir = SinomoDataDir::new(&root);
@@ -12024,7 +12173,7 @@ fn rollout_target_prefers_healthy_main_tcp_over_shadow_iroh_backup() {
     );
 
     let main_endpoint = invite_introducer_endpoint(&main_node_id, "192.0.2.53:21353".to_string());
-    let shadow_endpoint = invite_introducer_endpoint(
+    let shadow_endpoint = iroh_invite_introducer_endpoint(
         &shadow_node_id,
         "iroh://rollout_shadow_before_main?relay=https://relay.example./".to_string(),
     );
@@ -12090,7 +12239,7 @@ fn rollout_endpoint_candidates_include_kv_only_endpoint_records() {
     );
     let remote_node_id =
         NodeId::from_legacy_named("node_rollout_kv_endpoint_remote").expect("node");
-    let iroh_endpoint = invite_introducer_endpoint(
+    let iroh_endpoint = iroh_invite_introducer_endpoint(
         &remote_node_id,
         "iroh://rollout_kv_endpoint?relay=https://relay.example./".to_string(),
     );

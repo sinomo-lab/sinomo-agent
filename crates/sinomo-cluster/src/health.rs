@@ -16,7 +16,10 @@ use sinomo_network::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState,
     ClusterEndpointSelector, ClusterPaths, NetworkError,
 };
-use sinomo_network::{cluster_endpoint_can_carry_main_daemon_rpc, cluster_route_next_hop};
+use sinomo_network::{
+    cluster_endpoint_can_carry_main_daemon_rpc, cluster_endpoint_module_url_identity,
+    cluster_route_next_hop,
+};
 use sinomo_node::{
     DAEMON_MAIN_RUN_CAPABILITY, cluster_member_expected_daemon_process,
     cluster_member_is_legacy_shadow_daemon, cluster_member_is_local_process,
@@ -668,16 +671,18 @@ pub fn cluster_doctor_findings(
         if !cluster_health_member_is_reportable(member) {
             continue;
         }
-        let mut by_address = BTreeMap::<String, usize>::new();
+        let mut by_identity = BTreeMap::<String, usize>::new();
         for endpoint in &member.endpoints {
-            *by_address.entry(endpoint.address.clone()).or_default() += 1;
+            let identity = cluster_endpoint_module_url_identity(endpoint)
+                .unwrap_or_else(|| endpoint.address.clone());
+            *by_identity.entry(identity).or_default() += 1;
         }
-        for (address, count) in by_address {
+        for (identity, count) in by_identity {
             if count > 1 {
                 findings.push(ClusterDoctorFinding::warning(
                     "duplicate-endpoint",
                     format!(
-                        "{} has {count} endpoint records for address {address}",
+                        "{} has {count} endpoint records for endpoint identity {identity}",
                         member.node_id
                     ),
                 ));

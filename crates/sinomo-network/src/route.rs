@@ -1236,6 +1236,7 @@ fn cluster_delivery_route_graph_with_members(
     let local_connectivity = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
     let local_private_prefixes = cluster_delivery_local_private_prefixes(members, local_node_id)?;
     let mut graph = ClusterDeliveryRouteGraph::default();
+    let mut member_endpoint_edge_nodes = RouteNodeSet::default();
     for member in members {
         if !member.state.is_authorized() {
             continue;
@@ -1256,6 +1257,8 @@ fn cluster_delivery_route_graph_with_members(
                 continue;
             };
             graph.push_edge_clone(local_node_id, &endpoint.node_id, Some(endpoint), cost)?;
+            member_endpoint_edge_nodes
+                .try_insert_clone(&endpoint.node_id, "cluster delivery member endpoint edge")?;
         }
     }
     for member in members {
@@ -1270,6 +1273,12 @@ fn cluster_delivery_route_graph_with_members(
             &member.node_id,
             |endpoint| cluster_delivery_local_endpoint_is_usable(local_node_id, endpoint),
         ) {
+            if member_endpoint_edge_nodes.position(&member.node_id).is_ok()
+                && !cluster_delivery_member_has_endpoint(member, &endpoint)
+                && !cluster_delivery_endpoint_is_tcp_tunnel(&endpoint)
+            {
+                continue;
+            }
             let Some(cost) = cluster_delivery_local_endpoint_cost(
                 &local_connectivity,
                 &endpoint,
@@ -1340,6 +1349,15 @@ fn cluster_delivery_members_for_routing(
     }
 
     Ok(members_by_node.into_values().collect())
+}
+
+fn cluster_delivery_member_has_endpoint(
+    member: &ClusterMemberRecord,
+    endpoint: &ClusterEndpointRecord,
+) -> bool {
+    member.endpoints.iter().any(|candidate| {
+        candidate.endpoint_id == endpoint.endpoint_id && candidate.address == endpoint.address
+    })
 }
 
 fn cluster_delivery_merge_member_record(
@@ -1592,7 +1610,7 @@ fn cluster_delivery_endpoint_path_cost(
     address: &str,
     privacy: &ClusterEndpointPrivacy,
 ) -> u64 {
-    if address.starts_with(crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX) {
+    if cluster_delivery_address_is_tcp_tunnel(address) {
         return CLUSTER_DELIVERY_TCP_TUNNEL_PATH_COST;
     }
     match transport {
@@ -1617,6 +1635,15 @@ fn cluster_delivery_endpoint_path_cost(
             ClusterEndpointPrivacy::LocalOnly => 120,
         },
     }
+}
+
+fn cluster_delivery_endpoint_is_tcp_tunnel(endpoint: &ClusterEndpointRecord) -> bool {
+    endpoint.transport == ClusterTransportKind::LanTcp
+        && cluster_delivery_address_is_tcp_tunnel(&endpoint.address)
+}
+
+fn cluster_delivery_address_is_tcp_tunnel(address: &str) -> bool {
+    address.starts_with(crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
 }
 
 fn cluster_delivery_record_path_cost(transport: &ClusterTransportKind, address: &str) -> u64 {
@@ -3390,10 +3417,13 @@ pub(crate) fn relay_envelope_hop_transport_timeouts(
     timeouts: DaemonRpcTimeouts,
     envelope: &RelayEnvelope,
 ) -> DaemonRpcTimeouts {
-    let remaining = envelope
+    cluster_relay_hop_transport_timeouts(timeouts, relay_envelope_hop_timeout(envelope))
+}
+
+fn relay_envelope_hop_timeout(envelope: &RelayEnvelope) -> Option<Duration> {
+    envelope
         .max_hop_timeout_ms
-        .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)));
-    cluster_relay_hop_transport_timeouts(timeouts, remaining)
+        .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3623,7 +3653,10 @@ async fn handle_cluster_relay_envelope_async_with_host(
     let mut failures = Vec::new();
     let mut failed_edges = ClusterDeliveryFailedEdges::default();
     let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
-    for _ in 0..max_route_attempts {
+    let relay_deadline = ClusterEndpointRpcDeadline::new(
+        relay_envelope_hop_timeout(&envelope).or(options.timeouts.connect_timeout),
+    );
+    'route_attempts: for _ in 0..max_route_attempts {
         let plan_started_at = Instant::now();
         let Some(route_plan) = cluster_relay_forward_plan(
             runtime,
@@ -3669,20 +3702,46 @@ async fn handle_cluster_relay_envelope_async_with_host(
             stream = false,
             "cluster relay route plan selected"
         );
-        for endpoint in route_plan.endpoints {
+        let route_endpoint_count = route_plan.endpoints.len();
+        for (endpoint_index, endpoint) in route_plan.endpoints.into_iter().enumerate() {
             let attempt_started_at = Instant::now();
+            let Some(remaining) = relay_deadline.checked_remaining() else {
+                push_cluster_relay_failure(
+                    &mut failures,
+                    format!(
+                        "relay hop budget exhausted after {}ms",
+                        relay_deadline.timeout.unwrap_or_default().as_millis()
+                    ),
+                );
+                break 'route_attempts;
+            };
+            let endpoints_left = route_endpoint_count.saturating_sub(endpoint_index).max(1);
+            let endpoint_attempt_budget = cluster_target_endpoint_attempt_budget(
+                remaining,
+                endpoints_left,
+                route_endpoint_count,
+            );
             let final_hop = &route_plan.next_hop == &envelope.target_node_id;
-            let hop_timeouts = relay_envelope_hop_transport_timeouts(options.timeouts, &envelope);
+            let hop_timeouts =
+                cluster_relay_hop_transport_timeouts(options.timeouts, endpoint_attempt_budget);
             let response = if final_hop {
-                host.send_target_request_async(&endpoint, envelope.inner(), hop_timeouts)
-                    .await
+                cluster_object_rpc_attempt_with_timeout(
+                    host.send_target_request_async(&endpoint, envelope.inner(), hop_timeouts),
+                    endpoint_attempt_budget,
+                    &endpoint,
+                )
+                .await
             } else {
                 let mut forwarded = envelope.clone();
                 forwarded.ttl = envelope.ttl.saturating_sub(1);
                 forwarded.visited.push(local_node_id.clone());
                 let outer = forwarded.into_request()?;
-                host.send_relay_request_async(&endpoint, &outer, hop_timeouts)
-                    .await
+                cluster_object_rpc_attempt_with_timeout(
+                    host.send_relay_request_async(&endpoint, &outer, hop_timeouts),
+                    endpoint_attempt_budget,
+                    &endpoint,
+                )
+                .await
             };
             match response {
                 Ok(response) if relay_response_is_routing_error(&response) => {
@@ -4455,6 +4514,7 @@ mod tests {
     struct RecordingRelayHost {
         relay_sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
         target_sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
+        stall_first_target_send: Option<Duration>,
     }
 
     impl ClusterRelayAsyncHost for RecordingRelayHost {
@@ -4495,9 +4555,15 @@ mod tests {
         {
             let endpoint = endpoint.clone();
             let request = request.clone();
+            let stall = self
+                .stall_first_target_send
+                .filter(|_| self.target_sends.is_empty());
             let sends = &mut self.target_sends;
             Box::pin(async move {
                 sends.push((endpoint, request, timeouts));
+                if let Some(stall) = stall {
+                    tokio::time::sleep(stall).await;
+                }
                 ObjectRpcResponse::encode_body("/test/relay-target", &"ok")
             })
         }
@@ -5302,6 +5368,114 @@ mod tests {
             hinted_endpoint.endpoint_id
         );
         assert_eq!(host.target_sends[0].0.address, "node1:21353");
+    }
+
+    #[test]
+    fn relay_final_hop_splits_hop_budget_across_target_endpoints() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-target-endpoint-budget");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_relay_target_budget").expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_relay_target_budget_local").expect("local node");
+        let target_node =
+            NodeId::from_legacy_named("node_relay_target_budget_target").expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "relay target budget",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut target_member =
+            ClusterMemberRecord::local_voter(cluster_id, target_node.clone(), "target", "pk", now);
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        let stalled_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "stalled-target.test:21353".into(),
+            0,
+        );
+        let healthy_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "healthy-target.test:21353".into(),
+            10,
+        );
+        let backup_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "backup-target.test:21353".into(),
+            20,
+        );
+        target_member.endpoints = vec![
+            stalled_endpoint.clone(),
+            healthy_endpoint.clone(),
+            backup_endpoint.clone(),
+        ];
+        state.members.push(target_member);
+        crate::write_object_file(&paths.state, &state).expect("write state");
+
+        let inner =
+            ObjectRpcRequest::encode_body("/test/target", "test", &"ping").expect("inner request");
+        let mut envelope = RelayEnvelope::new(state.cluster_id.clone(), target_node.clone(), inner);
+        envelope.planned_path = vec![local_node.clone(), target_node.clone()];
+        envelope.target_endpoints = vec![
+            stalled_endpoint.clone(),
+            healthy_endpoint.clone(),
+            backup_endpoint,
+        ];
+        envelope.max_hop_timeout_ms = Some(2_000);
+        let request = envelope.into_request().expect("relay request");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut host = RecordingRelayHost {
+            stall_first_target_send: Some(Duration::from_millis(1_200)),
+            ..RecordingRelayHost::default()
+        };
+
+        let response = runtime
+            .block_on(handle_cluster_relay_async_with_host(
+                runtime.handle(),
+                &paths,
+                &state,
+                &local_node,
+                &request,
+                ClusterRelayOptions::new(DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(
+                    5,
+                ))),
+                &mut host,
+            ))
+            .expect("second endpoint should complete within relay budget");
+
+        assert_eq!(
+            response.decode_body::<String>().expect("response body"),
+            "ok"
+        );
+        assert_eq!(host.target_sends.len(), 2);
+        assert_eq!(
+            host.target_sends[0].0.endpoint_id,
+            stalled_endpoint.endpoint_id
+        );
+        assert_eq!(
+            host.target_sends[1].0.endpoint_id,
+            healthy_endpoint.endpoint_id
+        );
+        let first_timeout = host.target_sends[0]
+            .2
+            .connect_timeout
+            .expect("first timeout");
+        assert!(
+            first_timeout > Duration::from_millis(600)
+                && first_timeout <= Duration::from_millis(700),
+            "first endpoint should get roughly one third of the 2s relay hop budget, got {first_timeout:?}"
+        );
+        assert_eq!(host.target_sends[0].2.idle_timeout, Some(first_timeout));
     }
 
     #[test]

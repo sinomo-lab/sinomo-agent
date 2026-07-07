@@ -407,7 +407,7 @@ pub fn push_unique_introducer(
     endpoint: ClusterEndpointRecord,
 ) {
     if !introducers.iter().any(|candidate| {
-        candidate.endpoint_id == endpoint.endpoint_id || candidate.address == endpoint.address
+        sinomo_network::cluster_endpoint_duplicate_identity_eq(candidate, &endpoint)
     }) {
         introducers.push(endpoint);
     }
@@ -536,6 +536,18 @@ fn address_has_direct_query(address: &str) -> bool {
     query.split('&').any(|part| part.starts_with("direct="))
 }
 
+fn iroh_endpoint_public_key_from_address(address: &str) -> Option<&str> {
+    let rest = address.strip_prefix("iroh://")?;
+    rest.split(['?', '#']).next().filter(|key| !key.is_empty())
+}
+
+fn stable_iroh_endpoint_id(node_id: &NodeId, endpoint_public_key: &str) -> ClusterEndpointId {
+    ClusterEndpointId::derived(
+        "sinomo.iroh.endpoint",
+        format!("{}\0{endpoint_public_key}", node_id.as_str()),
+    )
+}
+
 pub fn invite_introducer_endpoint(node_id: &NodeId, address: String) -> ClusterEndpointRecord {
     if let Some((scheme, _)) = address.split_once("://") {
         let transport = sinomo_network::network_module_registry()
@@ -543,11 +555,20 @@ pub fn invite_introducer_endpoint(node_id: &NodeId, address: String) -> ClusterE
             .and_then(|module| module.descriptor().transports.first().cloned())
             .unwrap_or(ClusterTransportKind::HttpsRelay);
         let has_direct_address = address_has_direct_query(&address);
-        return ClusterEndpointRecord {
-            endpoint_id: ClusterEndpointId::derived(
+        let endpoint_id = if transport == ClusterTransportKind::Iroh {
+            iroh_endpoint_public_key_from_address(&address)
+                .map(|public_key| stable_iroh_endpoint_id(node_id, public_key))
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            ClusterEndpointId::derived(
                 "sinomo.invite.endpoint",
                 format!("{}\0{address}", node_id.as_str()),
-            ),
+            )
+        });
+        return ClusterEndpointRecord {
+            endpoint_id,
             node_id: node_id.clone(),
             transport,
             address,

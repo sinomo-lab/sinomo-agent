@@ -98,6 +98,22 @@ impl DaemonApiClient {
         }
     }
 
+    fn object_rpc_forward_control_timeouts(&self) -> sinomo_core::network::DaemonRpcTimeouts {
+        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(self.timeout)
+    }
+
+    fn object_rpc_forward_stream_control_timeouts(
+        &self,
+    ) -> sinomo_core::network::DaemonRpcTimeouts {
+        let idle_timeout = if self.timeout_overridden {
+            self.timeout
+        } else {
+            OBJECT_RPC_TRANSFER_IDLE_TIMEOUT
+        };
+        sinomo_core::network::DaemonRpcTimeouts::connect_only(self.timeout)
+            .with_idle_timeout(Some(idle_timeout))
+    }
+
     /// The daemon control address this client talks to.
     pub fn address(&self) -> &str {
         &self.address
@@ -184,7 +200,7 @@ impl DaemonApiClient {
         let response = send_daemon_rpc_with_timeouts(
             &self.address,
             &request,
-            object_rpc_forward_control_timeouts(connect_timeout),
+            self.object_rpc_forward_control_timeouts(),
         )?;
         response.error_detail()?;
         response.decode_body().map_err(DaemonApiError::from)
@@ -216,7 +232,7 @@ impl DaemonApiClient {
         let response = send_daemon_rpc_with_timeouts(
             &self.address,
             &request,
-            object_rpc_forward_control_timeouts(connect_timeout),
+            self.object_rpc_forward_stream_control_timeouts(),
         )?;
         response.error_detail()?;
         Ok(response)
@@ -469,19 +485,6 @@ pub fn send_daemon_rpc_raw_with_timeouts(
     })
 }
 
-fn object_rpc_transfer_timeouts(
-    connect_timeout: Duration,
-) -> sinomo_core::network::DaemonRpcTimeouts {
-    sinomo_core::network::DaemonRpcTimeouts::connect_only(connect_timeout)
-        .with_idle_timeout(Some(OBJECT_RPC_TRANSFER_IDLE_TIMEOUT))
-}
-
-fn object_rpc_forward_control_timeouts(
-    connect_timeout: Duration,
-) -> sinomo_core::network::DaemonRpcTimeouts {
-    object_rpc_transfer_timeouts(connect_timeout).with_idle_timeout(Some(connect_timeout))
-}
-
 /// A [`ConfigClient`] backed by RPC to a running daemon's `/config/*` service.
 #[derive(Clone)]
 pub struct RemoteConfigClient {
@@ -724,5 +727,34 @@ mod tests {
             DaemonApiClient::at_address("127.0.0.1:21353").with_timeout(Duration::from_secs(5));
         assert_eq!(client.address(), "127.0.0.1:21353");
         assert_eq!(client.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn forwarded_object_rpc_control_timeout_uses_client_budget() {
+        let client =
+            DaemonApiClient::at_address("127.0.0.1:21353").with_timeout(Duration::from_secs(6));
+        let timeouts = client.object_rpc_forward_control_timeouts();
+        assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(6)));
+        assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn forwarded_streamed_object_rpc_uses_transfer_idle_by_default() {
+        let client = DaemonApiClient::at_address("127.0.0.1:21353");
+        let timeouts = client.object_rpc_forward_stream_control_timeouts();
+        assert_eq!(timeouts.connect_timeout, Some(DAEMON_API_DEFAULT_TIMEOUT));
+        assert_eq!(
+            timeouts.idle_timeout,
+            Some(OBJECT_RPC_TRANSFER_IDLE_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn forwarded_streamed_object_rpc_honors_explicit_client_timeout() {
+        let client =
+            DaemonApiClient::at_address("127.0.0.1:21353").with_timeout(Duration::from_secs(6));
+        let timeouts = client.object_rpc_forward_stream_control_timeouts();
+        assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(6)));
+        assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(6)));
     }
 }

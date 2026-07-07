@@ -3232,7 +3232,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_dfs_message_reuses_warm_service_for_repeated_commands() {
+    fn daemon_dfs_lookup_message_reuses_service_without_full_hydrate() {
         let root = temp_root("daemon_dfs_message_warm_cache");
         let data_root = root.join("data");
         let paths = DaemonPaths::with_root(data_root.join("daemon"));
@@ -3266,8 +3266,8 @@ mod tests {
         let first_refresh = {
             let lane = primary_service.lock().expect("primary service lock");
             assert!(
-                lane.metadata_hydrated,
-                "first fresh-metadata message should hydrate the cold lane"
+                !lane.metadata_hydrated,
+                "lookup messages should use targeted metadata reads instead of forcing a full cold-lane hydrate"
             );
             lane.last_metadata_refresh
         };
@@ -3321,7 +3321,7 @@ mod tests {
         };
         assert!(
             Arc::ptr_eq(&primary_service, &second_primary_service),
-            "endpoint-list refreshes should reuse the hydrated service lane"
+            "endpoint-list refreshes should reuse the service lane"
         );
     }
 

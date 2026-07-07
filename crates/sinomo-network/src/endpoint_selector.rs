@@ -278,6 +278,14 @@ fn cluster_endpoint_is_probeable(endpoint: &ClusterEndpointRecord) -> bool {
         && cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
 }
 
+fn cluster_endpoint_is_builtin_probe_target(endpoint: &ClusterEndpointRecord) -> bool {
+    endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+        && matches!(
+            endpoint.transport,
+            ClusterTransportKind::Loopback | ClusterTransportKind::LanTcp
+        )
+}
+
 fn cluster_endpoint_transport_rank(transport: &ClusterTransportKind) -> u8 {
     match transport {
         ClusterTransportKind::InProcess => 0,
@@ -1415,7 +1423,6 @@ pub(crate) fn try_cluster_rollout_endpoint_targets_impl(
         }
         for endpoint in member.endpoints.iter().filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
-                && cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
                 && cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
         }) {
             if !endpoint_ids.try_insert_clone(&endpoint.endpoint_id, "collect rollout endpoints")? {
@@ -1507,16 +1514,16 @@ fn cluster_rollout_target_endpoint_cmp(
     (
         cluster_rollout_route_process_rank(graph, left, main_node_id, shadow_node_id),
         graph.unavailability_rank(left),
+        cluster_rollout_endpoint_connectivity_rank(graph, left),
         cluster_endpoint_static_fallback_rank(left),
-        graph.quality_rank(left),
         left.priority,
         left.address.as_str(),
     )
         .cmp(&(
             cluster_rollout_route_process_rank(graph, right, main_node_id, shadow_node_id),
             graph.unavailability_rank(right),
+            cluster_rollout_endpoint_connectivity_rank(graph, right),
             cluster_endpoint_static_fallback_rank(right),
-            graph.quality_rank(right),
             right.priority,
             right.address.as_str(),
         ))
@@ -1556,19 +1563,29 @@ fn cluster_rollout_endpoint_cmp(
     (
         &left.node_id,
         graph.unavailability_rank(left),
+        cluster_rollout_endpoint_connectivity_rank(graph, left),
         cluster_endpoint_static_fallback_rank(left),
-        graph.quality_rank(left),
         left.priority,
         left.address.as_str(),
     )
         .cmp(&(
             &right.node_id,
             graph.unavailability_rank(right),
+            cluster_rollout_endpoint_connectivity_rank(graph, right),
             cluster_endpoint_static_fallback_rank(right),
-            graph.quality_rank(right),
             right.priority,
             right.address.as_str(),
         ))
+}
+
+fn cluster_rollout_endpoint_connectivity_rank(
+    graph: &ClusterConnectivityGraph,
+    endpoint: &ClusterEndpointRecord,
+) -> u8 {
+    match graph.state_for_endpoint(endpoint) {
+        Some(ClusterConnectivityState::Healthy) => 0,
+        _ => 1,
+    }
 }
 
 fn cluster_node_status_route_rank(status: Option<&ClusterNodeStatusRecord>) -> u8 {
@@ -1597,8 +1614,12 @@ fn cluster_raft_route_availability_rank(
 ) -> u8 {
     match (&endpoint.transport, connectivity) {
         (_, Some(ClusterConnectivityState::Unreachable)) => 4,
-        (_, Some(ClusterConnectivityState::Healthy)) => 0,
+        (
+            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback,
+            Some(ClusterConnectivityState::Healthy),
+        ) => 0,
         (ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback, _) => 1,
+        (_, Some(ClusterConnectivityState::Healthy)) => 2,
         _ if cluster_endpoint_transport_is_currently_dialable(&endpoint.transport) => 3,
         _ => 1,
     }
@@ -1687,11 +1708,11 @@ pub(crate) fn try_cluster_network_probe_targets_impl(
         if cluster_member_is_local_process(state, member) || !member.state.is_authorized() {
             continue;
         }
-        for endpoint in member.endpoints.iter().filter(|endpoint| {
-            endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
-                && cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
-                && cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
-        }) {
+        for endpoint in member
+            .endpoints
+            .iter()
+            .filter(|endpoint| cluster_endpoint_is_builtin_probe_target(endpoint))
+        {
             if !endpoint_ids
                 .try_insert_clone(&endpoint.endpoint_id, "select network probe endpoints")?
             {

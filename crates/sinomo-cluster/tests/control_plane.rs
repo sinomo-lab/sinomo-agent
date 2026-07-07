@@ -248,11 +248,21 @@ fn first_cluster_rollout_target_endpoint_for_main_with_command_endpoint(
         .next()
 }
 
-fn stable_iroh_endpoint_id(node_id: &NodeId, endpoint_public_key: &str) -> ClusterEndpointId {
+fn stable_iroh_endpoint_id_raw(node_id: &NodeId, endpoint_public_key: &str) -> ClusterEndpointId {
     ClusterEndpointId::derived(
         "sinomo.iroh.endpoint",
         format!("{}\0{endpoint_public_key}", node_id.as_str()),
     )
+}
+
+fn stable_iroh_endpoint_id(node_id: &NodeId, endpoint_public_key: &str) -> ClusterEndpointId {
+    install_test_iroh_network_module();
+    stable_iroh_endpoint_id_raw(node_id, endpoint_public_key)
+}
+
+fn test_iroh_endpoint_public_key(address: &str) -> Option<&str> {
+    let rest = address.strip_prefix("iroh://")?;
+    rest.split(['?', '#']).next().filter(|key| !key.is_empty())
 }
 
 fn test_iroh_endpoint(
@@ -290,6 +300,66 @@ fn test_iroh_endpoint(
 fn install_kv_directory_for_tests() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(sinomo_cluster::install_kv_cluster_directory);
+}
+
+struct TestIrohNetworkModule;
+
+impl NetworkModule for TestIrohNetworkModule {
+    fn descriptor(&self) -> NetworkModuleDescriptor {
+        NetworkModuleDescriptor {
+            id: "test-iroh".to_string(),
+            transports: vec![ClusterTransportKind::Iroh],
+            address_schemes: vec!["iroh".to_string()],
+            dialer: true,
+            listener: false,
+            supports_runtime_toggle: true,
+        }
+    }
+
+    fn start(&self, _ctx: &NetworkModuleContext) -> Result<(), NetworkError> {
+        Ok(())
+    }
+
+    fn stop(&self) -> Result<(), NetworkError> {
+        Ok(())
+    }
+
+    fn dial_rpc(
+        &self,
+        _endpoint: &ClusterEndpointRecord,
+        request: &[u8],
+        _timeouts: DaemonRpcTimeouts,
+    ) -> NetworkFuture<Vec<u8>> {
+        let response = request.to_vec();
+        Box::pin(async move { Ok(response) })
+    }
+
+    fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+        Ok(Vec::new())
+    }
+
+    fn endpoint_role(&self, endpoint: &ClusterEndpointRecord) -> NetworkModuleEndpointRole {
+        let Some(public_key) = test_iroh_endpoint_public_key(&endpoint.address) else {
+            return NetworkModuleEndpointRole::Unknown;
+        };
+        let shadow_node_id = shadow_daemon_node_id(&endpoint.node_id);
+        if endpoint.endpoint_id == stable_iroh_endpoint_id_raw(&shadow_node_id, public_key) {
+            return NetworkModuleEndpointRole::ShadowDaemon;
+        }
+        if endpoint.endpoint_id == stable_iroh_endpoint_id_raw(&endpoint.node_id, public_key) {
+            return NetworkModuleEndpointRole::MainDaemon;
+        }
+        NetworkModuleEndpointRole::Unknown
+    }
+}
+
+fn install_test_iroh_network_module() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let registry = NetworkModuleRegistry::new();
+        registry.register(Arc::new(TestIrohNetworkModule), None, true, false);
+        set_network_module_registry(Arc::new(registry));
+    });
 }
 
 #[test]
@@ -2225,7 +2295,7 @@ fn lan_ip_filter_rejects_non_invitable_addresses() {
 #[test]
 fn interface_ip_filter_keeps_routable_lan_addresses() {
     assert!(is_advertisable_interface_ip(
-        "192.0.2.15".parse().expect("wireguard lan")
+        "10.42.0.15".parse().expect("wireguard lan")
     ));
     assert!(is_advertisable_interface_ip(
         "192.168.1.154".parse().expect("ethernet lan")
@@ -2242,7 +2312,7 @@ fn interface_ip_filter_keeps_routable_lan_addresses() {
 fn interface_candidate_filter_rejects_common_local_only_bridges() {
     let docker_bridge = "172.17.0.1".parse().expect("docker bridge");
     let docker_network = "172.18.0.1".parse().expect("docker network");
-    let routable_lan = "192.0.2.15".parse().expect("routable lan");
+    let routable_lan = "10.42.0.15".parse().expect("routable lan");
 
     assert!(!is_advertisable_interface_candidate(
         "docker0",
@@ -11711,11 +11781,17 @@ fn cluster_kv_txn_forward_driver_uses_endpoint_rpc_without_known_state_authority
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    let (mut state, _local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
         "cluster_kv_forward_node_rpc",
         "node_kv_forward_node_rpc_local",
         "node_kv_forward_node_rpc_voter",
     );
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == local_node_id)
+        .expect("local member")
+        .state = ClusterMemberState::NonVoting;
     state
         .members
         .iter_mut()
@@ -11777,6 +11853,12 @@ fn cluster_kv_txn_async_forward_driver_uses_endpoint_rpc_client() {
         "node_kv_async_forward_node_rpc_local",
         "node_kv_async_forward_node_rpc_voter",
     );
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == local_node_id)
+        .expect("local member")
+        .state = ClusterMemberState::NonVoting;
     let peer_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.86:21353".to_string(), 10);
     state
         .members
@@ -26312,9 +26394,10 @@ fn refresh_local_daemon_membership_cleans_duplicate_iroh_endpoints() {
         .filter(|endpoint| endpoint.transport == ClusterTransportKind::Iroh)
         .collect::<Vec<_>>();
     assert_eq!(iroh_endpoints.len(), 1);
-    assert_eq!(
-        iroh_endpoints[0].endpoint_id,
-        stable_iroh_endpoint_id(&remote_node_id, "same_remote_key")
+    assert!(
+        iroh_endpoints[0]
+            .address
+            .starts_with("iroh://same_remote_key")
     );
 }
 
@@ -33964,6 +34047,14 @@ mod route_cache_tests {
         );
 
         let target_endpoint = endpoint(&target, "10.90.9.11:21353", 0);
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == target)
+            .expect("target member")
+            .endpoints
+            .push(target_endpoint.clone());
+        sinomo_cluster::write_cluster_state(&paths, &state).expect("write target endpoint state");
         let bridge_to_target_record = connectivity_record_from_source(
             &cluster_id,
             &bridge,
@@ -33971,23 +34062,12 @@ mod route_cache_tests {
             ClusterConnectivityState::Healthy,
             Some(1),
         );
-        let mut store = InProcessKvStore::new();
-        store
-            .put_serde(
-                sinomo_cluster::cluster_connectivity_key(
-                    &bridge,
-                    &target,
-                    &target_endpoint.endpoint_id,
-                ),
-                &bridge_to_target_record,
-                None,
-            )
-            .expect("imported bridge connectivity");
-        sinomo_cluster::write_imported_cluster_kv_snapshot_if_changed(
+        sinomo_network::write_local_cluster_connectivity_records(
             &paths,
-            &store.snapshot().expect("imported snapshot"),
+            &bridge,
+            std::slice::from_ref(&bridge_to_target_record),
         )
-        .expect("import bridge connectivity snapshot");
+        .expect("import bridge connectivity record");
 
         let second = cluster_delivery_route_plan_async(
             &runtime,

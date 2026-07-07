@@ -898,7 +898,10 @@ pub fn cluster_connectivity_probe_due_with_startup_settle(
     let retry_seconds = retry_interval.as_secs().min(i64::MAX as u64) as i64;
     let retry_due = record.observed_at + time::Duration::seconds(retry_seconds) <= now;
     if cluster_connectivity_failure_reason_is_identity_mismatch(record) {
-        return startup_settle_active || record.expires_at <= refresh_deadline || retry_due;
+        if startup_settle_active {
+            return record.expires_at <= refresh_deadline;
+        }
+        return record.expires_at <= refresh_deadline || retry_due;
     }
     if startup_settle_active && record.state != ClusterConnectivityState::Healthy {
         return true;

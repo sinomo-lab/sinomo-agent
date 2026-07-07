@@ -31090,6 +31090,60 @@ fn sifs_non_replica_requester_routes_namespace_op_with_read_your_write() {
 }
 
 #[test]
+fn sifs_non_replica_routed_create_is_listed_after_blocking_write() {
+    let cluster = sifs_outsider_cluster("sifs-outsider-create-list-ryw");
+    let SifsPosixCluster {
+        root,
+        primary,
+        observer_node,
+        mut observer,
+        ..
+    } = cluster;
+
+    let stop_primary = Arc::new(AtomicBool::new(false));
+    let primary_stop = Arc::clone(&stop_primary);
+    let primary_thread = std::thread::spawn(move || {
+        let mut primary = primary;
+        while !primary_stop.load(Ordering::SeqCst) {
+            primary.process_incoming().expect("primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        primary
+    });
+
+    let dir = "/users/outsider-list";
+    let path = "/users/outsider-list/tiny.txt";
+    let bytes = b"tiny routed outsider create".to_vec();
+
+    observer
+        .posix_mkdir_all(dir)
+        .expect("routed mkdir from non-replica requester");
+    let mut options = DfsWriteOptions::replicated_eventual(vec![observer_node.clone()]);
+    options.foreground_replica_repair = false;
+    observer
+        .posix_write_file(path, &bytes, options)
+        .expect("committed routed create from non-replica requester");
+
+    assert_eq!(
+        observer
+            .posix_read_file(path)
+            .expect("outsider reads its own routed create"),
+        bytes
+    );
+    let entries = observer
+        .posix_list_dir_distributed(dir)
+        .expect("outsider lists directory after routed create");
+    assert!(
+        entries.iter().any(|entry| entry.path == path),
+        "committed routed create must be visible to an immediate distributed list: {entries:?}"
+    );
+
+    stop_primary.store(true, Ordering::SeqCst);
+    primary_thread.join().expect("primary thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn sifs_non_replica_node_reads_converge_via_sync_pulls() {
     let cluster = sifs_outsider_cluster("sifs-outsider-sync-pull-reads");
     let SifsPosixCluster {

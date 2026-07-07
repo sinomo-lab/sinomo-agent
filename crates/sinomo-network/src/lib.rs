@@ -93,6 +93,8 @@ pub use endpoint_advertisement::{
 pub use endpoint_records::apply_cluster_endpoint_advertisement;
 pub use endpoint_records::cleanup_cluster_endpoint_duplicates;
 pub use endpoint_records::cleanup_member_endpoint_duplicates;
+pub use endpoint_records::cluster_endpoint_duplicate_identity_eq;
+pub use endpoint_records::cluster_endpoint_module_url_identity;
 pub use endpoint_records::upsert_member_endpoint;
 pub use endpoint_records::{cluster_is_settled_solo, cluster_state_needs_join_registration};
 pub use endpoint_selector::{

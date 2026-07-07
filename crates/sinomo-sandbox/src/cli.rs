@@ -8201,6 +8201,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "wasix-runtime"))]
     #[test]
     fn sandbox_doctor_rejects_shell_when_process_substrate_is_missing() {
         let root = sinomo_testdir::TestDir::new("sinomo-sandbox-doctor-shell-substrate");

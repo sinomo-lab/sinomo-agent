@@ -318,11 +318,7 @@ impl SifsFileManagerBackend {
                 .posix_mkdir_all(&parent)
                 .map_err(|error| format!("cannot create SIFS directory {parent}: {error}"))?;
         }
-        let mut options = if foreground_replica_repair {
-            sifs_write_options(&service, &self.replica_candidates)
-        } else {
-            sifs_deferred_publish_write_options(&service, &self.replica_candidates)
-        };
+        let mut options = sifs_write_options(&service, &self.replica_candidates);
         options.foreground_replica_repair = foreground_replica_repair;
         service
             .posix_write_file(&path, bytes, options)
