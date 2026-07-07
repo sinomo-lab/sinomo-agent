@@ -27,7 +27,8 @@ use tokio::sync::{mpsc, oneshot};
 const TCP_TUNNEL_CHANNEL_CAPACITY: usize = 128;
 const TCP_TUNNEL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 const TCP_TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
-const TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX: &str = "tcp-tunnel://";
+const TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX: &str =
+    sinomo_core::network::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX;
 
 type PendingTcpTunnelMap = Arc<tokio::sync::Mutex<HashMap<u64, PendingTcpTunnelRequest>>>;
 

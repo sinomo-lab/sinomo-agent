@@ -245,9 +245,9 @@ pub use rpc_future::ClusterMembershipRpcFuture;
 #[cfg(any(test, feature = "test-support"))]
 pub use sinomo_node::upsert_member_record;
 pub use tcp_tunnel::{
-    CLUSTER_TCP_TUNNEL_OPEN_ROUTE, CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
-    CLUSTER_TCP_TUNNEL_RPC_CATEGORY, ClusterTcpTunnelFrame, ClusterTcpTunnelOpenRequest,
-    ClusterTcpTunnelOpenResponse,
+    CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX, CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
+    CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION, CLUSTER_TCP_TUNNEL_RPC_CATEGORY, ClusterTcpTunnelFrame,
+    ClusterTcpTunnelOpenRequest, ClusterTcpTunnelOpenResponse,
 };
 
 pub type ClusterEndpointId = sinomo_base::Id;

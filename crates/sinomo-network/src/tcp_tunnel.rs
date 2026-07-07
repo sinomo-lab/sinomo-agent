@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub const CLUSTER_TCP_TUNNEL_OPEN_ROUTE: &str = "/cluster/tcp-tunnel/open";
 pub const CLUSTER_TCP_TUNNEL_RPC_CATEGORY: &str = "cluster.tcp-tunnel";
 pub const CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION: u16 = 1;
+pub const CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX: &str = "tcp-tunnel://";
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ClusterTcpTunnelOpenRequest {

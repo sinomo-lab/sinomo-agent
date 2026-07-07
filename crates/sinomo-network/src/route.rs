@@ -38,6 +38,7 @@ const CLUSTER_DELIVERY_DEGRADED_LINK_COST: u64 = 50_000;
 const CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST: u64 = CLUSTER_DELIVERY_DEGRADED_LINK_COST / 2;
 const CLUSTER_DELIVERY_UNOBSERVED_NEIGHBOR_COST: u64 = 75_000;
 const CLUSTER_DELIVERY_UNREACHABLE_LINK_COST: u64 = 500_000;
+const CLUSTER_DELIVERY_TCP_TUNNEL_PATH_COST: u64 = 90;
 const MAX_CLUSTER_DELIVERY_ROUTING_TABLE_CACHE_ENTRIES: usize = 128;
 
 static CLUSTER_DELIVERY_ROUTING_TABLE_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
@@ -1578,6 +1579,9 @@ fn cluster_delivery_endpoint_path_cost(
     address: &str,
     privacy: &ClusterEndpointPrivacy,
 ) -> u64 {
+    if address.starts_with(crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX) {
+        return CLUSTER_DELIVERY_TCP_TUNNEL_PATH_COST;
+    }
     match transport {
         ClusterTransportKind::InProcess => 0,
         ClusterTransportKind::Loopback => 1,
@@ -4988,6 +4992,116 @@ mod tests {
             planned_relay_endpoints[0].endpoint_id,
             observed_endpoint.endpoint_id
         );
+    }
+
+    #[test]
+    fn route_plan_prefers_direct_tcp_over_synthetic_tcp_tunnel() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-route-direct-before-tunnel");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_route_direct_before_tunnel").expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_route_direct_before_tunnel_local").expect("local node");
+        let target_node = NodeId::from_legacy_named("node_route_direct_before_tunnel_target")
+            .expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "route direct before tunnel",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let direct_endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(
+                "endpoint_route_direct_before_tunnel_public",
+            )
+            .expect("endpoint"),
+            node_id: target_node.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "198.51.100.76:21353".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+        let tunnel_endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(
+                "endpoint_route_direct_before_tunnel_tunnel",
+            )
+            .expect("endpoint"),
+            node_id: target_node.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!(
+                "{}{}",
+                crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX,
+                target_node.as_str()
+            ),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+        let mut target_member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            target_node.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![direct_endpoint.clone()];
+        state.members.push(target_member);
+        crate::write_object_file(&paths.state, &state).expect("write state");
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[
+                crate::connectivity::cluster_connectivity_record(
+                    &state,
+                    &direct_endpoint,
+                    ClusterConnectivityState::Healthy,
+                    Some(12),
+                    0,
+                    Some(now.to_string()),
+                    None,
+                    now,
+                    60,
+                ),
+                crate::connectivity::cluster_connectivity_record(
+                    &state,
+                    &tunnel_endpoint,
+                    ClusterConnectivityState::Healthy,
+                    Some(0),
+                    0,
+                    Some(now.to_string()),
+                    None,
+                    now,
+                    60,
+                ),
+            ],
+        )
+        .expect("write local connectivity");
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local_node,
+            &target_node,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
+
+        assert_eq!(plan.next_hop, target_node);
+        assert_eq!(plan.endpoints.len(), 2);
+        assert_eq!(plan.endpoints[0].endpoint_id, direct_endpoint.endpoint_id);
+        assert_eq!(plan.endpoints[1].endpoint_id, tunnel_endpoint.endpoint_id);
     }
 
     #[test]
