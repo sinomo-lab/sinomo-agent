@@ -28014,6 +28014,14 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
         file_stat.content_hash.as_deref(),
         Some(content_hash(&bytes).as_str())
     );
+    assert!(
+        writer
+            .posix_list_dir("/users/routed-dir")
+            .expect("writer list routed dir after write")
+            .iter()
+            .any(|entry| entry.path == "/users/routed-dir/file.txt"),
+        "routed content write must be locally listed after it returns"
+    );
 
     // chmod / utimens route and read back their own effect.
     let mode_stat = writer

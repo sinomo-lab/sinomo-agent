@@ -34,6 +34,8 @@ LARGE_TIMEOUT="${SINOMO_SCENARIO_LARGE_TIMEOUT:-180}"
 LARGE_MIN_WRITE_BYTES_PER_SEC="${SINOMO_SCENARIO_LARGE_MIN_WRITE_BYTES_PER_SEC:-4194304}"
 LARGE_MIN_READ_BYTES_PER_SEC="${SINOMO_SCENARIO_LARGE_MIN_READ_BYTES_PER_SEC:-4194304}"
 LARGE_MAX_READ_PROC_WRITE_BYTES="${SINOMO_SCENARIO_LARGE_MAX_READ_PROC_WRITE_BYTES:-0}"
+CONCURRENT_DFS_LATENCY_ITERATIONS="${SINOMO_SCENARIO_CONCURRENT_DFS_LATENCY_ITERATIONS:-40}"
+CONCURRENT_DFS_PAYLOAD_BYTES="${SINOMO_SCENARIO_CONCURRENT_DFS_PAYLOAD_BYTES:-4096}"
 EXPECTED_MAINS=3
 NODES="node1 node2 node3"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
@@ -342,6 +344,65 @@ run_large_routed_dfs() {
     --param "max-proc-write-bytes=$LARGE_MAX_READ_PROC_WRITE_BYTES"
 }
 
+run_concurrent_duplex_dfs_probe() {
+  local pids labels logs failed index
+  pids=""
+  labels=""
+  logs=""
+  failed=0
+  index=0
+
+  log "checking concurrent bidirectional DFS routing"
+
+  run_concurrent_probe() {
+    local node="$1" id="$2" label probe_log
+    shift 2
+    index=$((index + 1))
+    label="$(printf '%02d' "$index")-$node-$id"
+    label="${label//[^a-zA-Z0-9._-]/_}"
+    probe_log="$ARTIFACTS/concurrent-dfs-$label.json"
+    (
+      compose exec -T "$node" sinomo test run "$id" --require-cluster --json "$@" \
+        >"$probe_log" 2>&1
+    ) &
+    pids="${pids}${pids:+ }$!"
+    labels="${labels}${labels:+ }$node:$id"
+    logs="${logs}${logs:+ }$probe_log"
+  }
+
+  run_concurrent_probe node1 cluster.dfs.read-your-write
+  run_concurrent_probe node1 cluster.dfs.lightweight-latency \
+    --param "iterations=$CONCURRENT_DFS_LATENCY_ITERATIONS" \
+    --param "payload-bytes=$CONCURRENT_DFS_PAYLOAD_BYTES" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT"
+  run_concurrent_probe node3 cluster.dfs.lightweight-latency \
+    --param "iterations=$CONCURRENT_DFS_LATENCY_ITERATIONS" \
+    --param "payload-bytes=$CONCURRENT_DFS_PAYLOAD_BYTES" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT"
+
+  set -- $pids
+  local pid_count=$#
+  local i=1
+  while [ "$i" -le "$pid_count" ]; do
+    local pid label probe_log
+    pid="$(printf '%s\n' "$pids" | cut -d ' ' -f "$i")"
+    label="$(printf '%s\n' "$labels" | cut -d ' ' -f "$i")"
+    probe_log="$(printf '%s\n' "$logs" | cut -d ' ' -f "$i")"
+    if wait "$pid"; then
+      log "  ok: concurrent $label"
+    else
+      log "  FAILED: concurrent $label"
+      sed 's/^/[routing-scenario]   /' "$probe_log"
+      failed=1
+    fi
+    i=$((i + 1))
+  done
+
+  if [ "$failed" -ne 0 ]; then
+    return 1
+  fi
+}
+
 require_no_other_sinomo_projects
 if [ "${SINOMO_SCENARIO_BUILD:-1}" = 1 ]; then
   log "building host binary"
@@ -367,6 +428,7 @@ run_network_payload_probe node2
 run_network_payload_probe node3
 assert_forwarded_endpoint_active
 wait_for_dfs_ready
+run_concurrent_duplex_dfs_probe
 run_cross_segment_dfs
 run_large_routed_dfs
 

@@ -692,7 +692,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    fn sync_remote_namespace_path_until_quiet(&mut self, path: &str) -> Result<()> {
+    pub(super) fn sync_remote_namespace_path_until_quiet(&mut self, path: &str) -> Result<()> {
         let operation = DfsNamespaceOperation::SyncPath {
             path: path.to_string(),
         };

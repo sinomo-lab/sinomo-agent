@@ -163,6 +163,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(candidates)
     }
 
+    fn sync_blocking_routed_write_namespace(
+        &mut self,
+        path: &str,
+        wait_for_commit: bool,
+        foreground_replica_repair: bool,
+        replay_response_journal: bool,
+    ) -> Result<()> {
+        if !wait_for_commit || !foreground_replica_repair || !replay_response_journal {
+            return Ok(());
+        }
+        self.sync_remote_namespace_path_until_quiet(path)
+    }
+
     pub fn bootstrap_distributed_sifs(&mut self) -> Result<()> {
         let fallback_file_system = crate::namespace::distributed_sifs(self.node_id.clone());
         let file_system_id = fallback_file_system.file_system_id.clone();
@@ -847,6 +860,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 {
                     self.touch_parent_directory_modified(&path)?;
                 }
+                self.sync_blocking_routed_write_namespace(
+                    &path,
+                    options.wait_for_commit,
+                    options.foreground_replica_repair,
+                    replay_response_journal,
+                )?;
                 if !options.foreground_replica_repair {
                     return self.stat_object_for_path(&committed_object, &path);
                 }
@@ -1072,6 +1091,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 {
                     self.touch_parent_directory_modified(&path)?;
                 }
+                self.sync_blocking_routed_write_namespace(
+                    &path,
+                    options.wait_for_commit,
+                    options.foreground_replica_repair,
+                    true,
+                )?;
                 if !options.foreground_replica_repair {
                     return self.stat_object_for_path(&committed_object, &path);
                 }
