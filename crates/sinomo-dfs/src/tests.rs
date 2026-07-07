@@ -1638,17 +1638,15 @@ fn adaptive_chunk_window_scales_by_profile_and_object_size() {
 }
 
 #[test]
-fn endpoint_transport_transfer_profile_tracks_best_endpoint_kind() {
+fn endpoint_transport_transfer_profile_keeps_remote_sizing_network_neutral() {
     let local = NodeId::from_legacy_named("node_dfs_transfer_profile_local").expect("local");
     let remote = NodeId::from_legacy_named("node_dfs_transfer_profile_remote").expect("remote");
     let unknown = NodeId::from_legacy_named("node_dfs_transfer_profile_unknown").expect("unknown");
     let sender: DfsMessageSender =
         Arc::new(|_endpoint, _command, _timeout| Err(DfsPeerTransportError::new("test sender")));
 
-    let lan = test_endpoint(&remote, "192.0.2.80:21353");
-    let mut loopback = test_endpoint(&remote, "127.0.0.1:21353");
-    loopback.transport = ClusterTransportKind::Loopback;
-    let transport = DfsEndpointTransport::new(local.clone(), vec![lan, loopback], sender);
+    let remote_endpoint = test_endpoint(&remote, "192.0.2.80:21353");
+    let transport = DfsEndpointTransport::new(local.clone(), vec![remote_endpoint], sender);
 
     assert_eq!(
         transport.transfer_profile(&local),
@@ -1656,7 +1654,7 @@ fn endpoint_transport_transfer_profile_tracks_best_endpoint_kind() {
     );
     assert_eq!(
         transport.transfer_profile(&remote),
-        DfsTransferProfile::Local
+        DfsTransferProfile::Conservative
     );
     assert_eq!(
         transport.transfer_profile(&unknown),

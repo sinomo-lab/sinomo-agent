@@ -13,10 +13,11 @@ use sinomo_runtime::dfs::{
     DfsMetadataJournalReplicationOptions, DfsMetadataShardConfig, DfsNodeAdvertisement,
     DfsObjectKind, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
     DfsPeerTransportFuture, DfsPinAddRequest, DfsPinMode, DfsStat, DfsWriteOptions,
-    LocalContentStore, NetworkedDfsService, cluster_dfs_data_endpoints, content_services_prefix,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
-    fallback_dfs_node_id, metadata_shards_prefix, open_local_sharded_metadata_backend,
-    open_root_local_metadata_backend, publish_cluster_dfs_metadata_journal_with_peer_transport,
+    LocalContentStore, NetworkedDfsService, cluster_dfs_data_endpoints, cluster_dfs_peer_node_ids,
+    content_services_prefix, default_dfs_metadata_root, default_dfs_metadata_shards_root,
+    default_dfs_pin_root, fallback_dfs_node_id, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend,
+    publish_cluster_dfs_metadata_journal_with_peer_transport,
     refresh_cluster_dfs_kv_snapshot_with_peer_transport, sifs_file_system_id,
 };
 use sinomo_runtime::kv::{KvError, KvOp, KvTxn, KvTxnResponse};
@@ -27,7 +28,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const SIFS_ENDPOINT_TARGET_REFRESH_TTL: Duration = Duration::from_secs(1);
+const SIFS_PEER_TARGET_REFRESH_TTL: Duration = Duration::from_secs(1);
 const SIFS_FOREGROUND_METADATA_PUBLISH_MAX_BATCHES_PER_TARGET: usize = 1;
 const SIFS_FOREGROUND_METADATA_PUBLISH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const SIFS_FOREGROUND_METADATA_PUBLISH_TARGET_TIMEOUT: Duration = Duration::from_secs(2);
@@ -38,7 +39,7 @@ pub(crate) struct SifsFileManagerBackend {
     data_dir: SinomoDataDir,
     rpc_runtime: SifsRpcRuntime,
     service: Mutex<NetworkedDfsService<DfsEndpointTransport>>,
-    endpoint_targets_refreshed_at: Mutex<Option<Instant>>,
+    peer_targets_refreshed_at: Mutex<Option<Instant>>,
     replica_candidates: Vec<NodeId>,
 }
 
@@ -90,7 +91,7 @@ impl SifsFileManagerBackend {
             data_dir: data_dir.clone(),
             rpc_runtime,
             service: Mutex::new(service),
-            endpoint_targets_refreshed_at: Mutex::new(Some(Instant::now())),
+            peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
             replica_candidates,
         })
     }
@@ -103,27 +104,27 @@ impl SifsFileManagerBackend {
             .map_err(|_| "SIFS service lock is poisoned".to_string())
     }
 
-    fn refresh_service_endpoint_targets(
+    fn refresh_service_peer_targets(
         &self,
         service: &mut NetworkedDfsService<DfsEndpointTransport>,
     ) {
         let now = Instant::now();
-        if let Ok(mut refreshed_at) = self.endpoint_targets_refreshed_at.lock() {
+        if let Ok(mut refreshed_at) = self.peer_targets_refreshed_at.lock() {
             if refreshed_at
                 .as_ref()
-                .is_some_and(|last| now.duration_since(*last) < SIFS_ENDPOINT_TARGET_REFRESH_TTL)
+                .is_some_and(|last| now.duration_since(*last) < SIFS_PEER_TARGET_REFRESH_TTL)
             {
                 return;
             }
-            if self.refresh_service_endpoint_targets_now(service) {
+            if self.refresh_service_peer_targets_now(service) {
                 *refreshed_at = Some(now);
             }
             return;
         }
-        let _ = self.refresh_service_endpoint_targets_now(service);
+        let _ = self.refresh_service_peer_targets_now(service);
     }
 
-    fn refresh_service_endpoint_targets_now(
+    fn refresh_service_peer_targets_now(
         &self,
         service: &mut NetworkedDfsService<DfsEndpointTransport>,
     ) -> bool {
@@ -137,7 +138,7 @@ impl SifsFileManagerBackend {
         let Ok(state) = cluster::read_cluster_state(&cluster_paths) else {
             return false;
         };
-        service.refresh_endpoint_targets(cluster_dfs_data_endpoints(&cluster_paths, &state));
+        service.refresh_peer_targets(cluster_dfs_peer_node_ids(&state));
         true
     }
 
@@ -163,7 +164,7 @@ impl SifsFileManagerBackend {
     pub(crate) fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         service
             .posix_read_file_distributed(&path)
             .map_err(|error| format!("cannot read SIFS file {path}: {error}"))
@@ -172,7 +173,7 @@ impl SifsFileManagerBackend {
     pub(crate) fn dfs_stat(&self, path: &str) -> Result<DfsStat, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         service
             .posix_stat_distributed(&path)
             .map_err(|error| format!("cannot inspect {path}: {error}"))
@@ -181,7 +182,7 @@ impl SifsFileManagerBackend {
     pub(crate) fn list_dir_shallow(&self, path: &str) -> Result<Vec<FileManagerEntry>, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         service
             .posix_list_dir_distributed(&path)
             .map(|entries| {
@@ -237,7 +238,7 @@ impl SifsFileManagerBackend {
         if !normalized.is_empty() {
             match self.lock_service() {
                 Ok(mut service) => {
-                    self.refresh_service_endpoint_targets(&mut service);
+                    self.refresh_service_peer_targets(&mut service);
                     let read_paths = normalized
                         .iter()
                         .map(|(_, path)| path.clone())
@@ -311,7 +312,7 @@ impl SifsFileManagerBackend {
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         if let Some(parent) = parent_sifs_path(&path) {
             service
                 .posix_mkdir_all(&parent)
@@ -343,7 +344,7 @@ impl SifsFileManagerBackend {
             .map(|(path, bytes)| normalize_sifs_path(path).map(|path| (path, bytes.as_slice())))
             .collect::<Result<Vec<_>, _>>()?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         service
             .posix_create_files_local_eventual_with_known_parents(
                 normalized
@@ -362,7 +363,7 @@ impl SifsFileManagerBackend {
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         let options = sifs_deferred_publish_write_options(&service, &self.replica_candidates);
         service
             .posix_write_file_with_known_parent_deferred_local_replay(&path, bytes, options)
@@ -519,7 +520,7 @@ impl SifsFileManagerBackend {
     pub(crate) fn create_dir_all(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         service
             .posix_mkdir_all(&path)
             .map_err(|error| format!("cannot create SIFS directory {path}: {error}"))?;
@@ -531,7 +532,7 @@ impl SifsFileManagerBackend {
     pub(crate) fn create_dir_all_deferred_local_replay(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         service
             .posix_mkdir_all_without_local_replay(&path)
             .map_err(|error| format!("cannot create SIFS directory {path}: {error}"))
@@ -710,7 +711,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn stat(&self, path: &str) -> Result<FileManagerMetadata, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         let stat = service
             .posix_stat_distributed(&path)
             .map_err(|error| format!("cannot inspect {path}: {error}"))?;
@@ -723,7 +724,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn list_dir(&self, path: &str) -> Result<Vec<FileManagerEntry>, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         let entries = service
             .posix_list_dir_distributed(&path)
             .map_err(|error| format!("cannot list {path}: {error}"))?;
@@ -742,7 +743,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn read_file_prefix(&self, path: &str, max_bytes: u64) -> Result<FileManagerRead, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         let stat = service
             .posix_stat_distributed(&path)
             .map_err(|error| format!("cannot inspect {path}: {error}"))?;
@@ -765,7 +766,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn directory_entry_count(&self, path: &str) -> Result<usize, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         service
             .posix_list_dir_distributed(&path)
             .map(|entries| entries.len())
@@ -779,7 +780,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn create_file(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         let options = sifs_deferred_publish_write_options(&service, &self.replica_candidates);
         service
             .posix_write_file(&path, &[], options)
@@ -793,7 +794,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn create_dir(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         service
             .posix_mkdir(&path)
             .map(|_| ())
@@ -807,7 +808,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
         let from = normalize_sifs_path(from)?;
         let to = normalize_sifs_path(to)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         service
             .posix_rename(&from, &to)
             .map(|_| ())
@@ -820,7 +821,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn delete_file(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         service
             .posix_unlink(&path)
             .map(|_| ())
@@ -833,7 +834,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn delete_dir(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_service_endpoint_targets(&mut service);
+        self.refresh_service_peer_targets(&mut service);
         service
             .posix_rmdir(&path)
             .map(|_| ())
@@ -936,11 +937,11 @@ fn open_sifs_service_with_hydration(
         &cluster_paths,
         Arc::clone(&sync_peer_transport),
     );
-    let (local_node_id, endpoints) = if cluster_paths.state.exists() {
+    let (local_node_id, peer_node_ids) = if cluster_paths.state.exists() {
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
-        let endpoints = cluster_dfs_data_endpoints(&cluster_paths, &state);
-        (state.local_node_id, endpoints)
+        let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+        (state.local_node_id, peer_node_ids)
     } else {
         (fallback_dfs_node_id(), Vec::new())
     };
@@ -948,9 +949,9 @@ fn open_sifs_service_with_hydration(
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
     let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
     let mut service = NetworkedDfsService::new(
-        DfsEndpointTransport::with_peer_transports(
+        DfsEndpointTransport::with_peer_transports_for_nodes(
             local_node_id,
-            endpoints,
+            peer_node_ids,
             sinomo_runtime::dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
             sync_peer_transport,
             async_peer_transport,

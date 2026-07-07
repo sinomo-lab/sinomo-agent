@@ -3,7 +3,6 @@ use crate::{
     DaemonError, DaemonPaths, DaemonRunOptions, send_object_rpc_to_target_async,
     send_object_rpc_to_target_on_runtime,
 };
-use sinomo_core::ClusterEndpointRecord;
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
@@ -48,7 +47,6 @@ use time::OffsetDateTime;
 // seconds makes multi-node DFS writes pay repeated disk scans while a request is
 // still in flight.
 const DAEMON_DFS_MESSAGE_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-const DAEMON_DFS_MESSAGE_ROUTE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK: usize = 8;
 const DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 const DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT: Duration =
@@ -93,9 +91,9 @@ struct DaemonDfsMessageServiceSignature {
 }
 
 #[derive(Clone, Debug)]
-struct DaemonDfsMessageRouteSnapshot {
+struct DaemonDfsMessagePeerSnapshot {
     signature: DaemonDfsMessageServiceSignature,
-    endpoints: Vec<ClusterEndpointRecord>,
+    peer_node_ids: Vec<NodeId>,
 }
 
 #[derive(Debug)]
@@ -108,8 +106,7 @@ struct DaemonDfsMessageServiceLane {
 #[derive(Debug)]
 struct DaemonDfsMessageServiceCacheEntry {
     signature: DaemonDfsMessageServiceSignature,
-    endpoints: Vec<ClusterEndpointRecord>,
-    last_route_refresh: Instant,
+    peer_node_ids: Vec<NodeId>,
     primary_service: Arc<Mutex<DaemonDfsMessageServiceLane>>,
     read_services: Vec<Arc<Mutex<DaemonDfsMessageServiceLane>>>,
     next_read_service: usize,
@@ -383,14 +380,14 @@ fn daemon_dfs_control_plane_client_on_runtime(
 
 pub(crate) fn daemon_dfs_endpoint_transport(
     local_node_id: sinomo_core::node::NodeId,
-    endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+    peer_node_ids: impl IntoIterator<Item = NodeId>,
 ) -> DfsEndpointTransport {
     let peer_transport = Arc::new(DaemonDfsUnavailablePeerTransport);
     let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
     let async_peer_transport: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = peer_transport;
-    DfsEndpointTransport::with_peer_transports(
+    DfsEndpointTransport::with_peer_transports_for_nodes(
         local_node_id,
-        endpoints,
+        peer_node_ids,
         sinomo_dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
         sync_peer_transport,
         async_peer_transport,
@@ -399,14 +396,14 @@ pub(crate) fn daemon_dfs_endpoint_transport(
 
 pub(crate) fn daemon_dfs_endpoint_transport_on_runtime(
     local_node_id: sinomo_core::node::NodeId,
-    endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+    peer_node_ids: impl IntoIterator<Item = NodeId>,
     runtime: &tokio::runtime::Handle,
 ) -> DfsEndpointTransport {
     let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(runtime);
     let async_peer_transport = daemon_dfs_async_peer_transport(runtime);
-    DfsEndpointTransport::with_peer_transports(
+    DfsEndpointTransport::with_peer_transports_for_nodes(
         local_node_id,
-        endpoints,
+        peer_node_ids,
         sinomo_dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
         peer_transport,
         async_peer_transport,
@@ -629,39 +626,22 @@ fn daemon_dfs_perf_trace(args: std::fmt::Arguments<'_>) {
     tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "daemon dfs perf");
 }
 
-fn read_daemon_dfs_message_route_snapshot(
+fn read_daemon_dfs_message_peer_snapshot(
     cluster_paths: &ClusterPaths,
-) -> Result<Option<DaemonDfsMessageRouteSnapshot>, sinomo_dfs::DfsError> {
+) -> Result<Option<DaemonDfsMessagePeerSnapshot>, sinomo_dfs::DfsError> {
     if !cluster_paths.state.exists() {
         return Ok(None);
     }
     let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(daemon_dfs_network_error)?;
-    let endpoints = sinomo_dfs::cluster_dfs_data_endpoints(cluster_paths, &state);
-    Ok(Some(DaemonDfsMessageRouteSnapshot {
+    let peer_node_ids = sinomo_dfs::cluster_dfs_peer_node_ids(&state);
+    Ok(Some(DaemonDfsMessagePeerSnapshot {
         signature: DaemonDfsMessageServiceSignature {
             local_node_id: state.local_node_id,
             kv_snapshot_available: cluster_paths.kv_paths().snapshot.exists(),
         },
-        endpoints,
+        peer_node_ids,
     }))
-}
-
-fn cached_daemon_dfs_message_route_snapshot(
-    cache_key: &PathBuf,
-) -> Result<Option<DaemonDfsMessageRouteSnapshot>, sinomo_dfs::DfsError> {
-    let cache = daemon_dfs_message_service_cache()
-        .lock()
-        .map_err(|_| daemon_dfs_cache_lock_error())?;
-    Ok(cache
-        .get(cache_key)
-        .filter(|entry| {
-            entry.last_route_refresh.elapsed() < DAEMON_DFS_MESSAGE_ROUTE_REFRESH_INTERVAL
-        })
-        .map(|entry| DaemonDfsMessageRouteSnapshot {
-            signature: entry.signature.clone(),
-            endpoints: entry.endpoints.clone(),
-        }))
 }
 
 fn schedule_daemon_dfs_message_deferred_work(cache_key: PathBuf) {
@@ -707,15 +687,15 @@ fn open_daemon_dfs_message_service_lane(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     local_node_id: &sinomo_core::node::NodeId,
-    endpoints: Vec<ClusterEndpointRecord>,
+    peer_node_ids: Vec<NodeId>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<Arc<Mutex<DaemonDfsMessageServiceLane>>, sinomo_dfs::DfsError> {
     let content = sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let metadata_backend =
         sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
-    let transport = DfsEndpointServedMessageTransport::new_with_peer_transport(
+    let transport = DfsEndpointServedMessageTransport::new_with_peer_transport_for_nodes(
         local_node_id.clone(),
-        endpoints,
+        peer_node_ids,
         daemon_dfs_blocking_peer_transport_on_runtime(runtime),
         sinomo_dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
     );
@@ -765,20 +745,12 @@ fn process_daemon_dfs_message_command_on_runtime(
         requires_full_metadata_hydrate,
         ensure_ms
     ));
-    let route_started = Instant::now();
-    let cached_route_snapshot = cached_daemon_dfs_message_route_snapshot(&cache_key)?;
-    let route_cache_hit = cached_route_snapshot.is_some();
-    let route_snapshot = match cached_route_snapshot {
-        Some(snapshot) => snapshot,
-        None => {
-            let Some(snapshot) = read_daemon_dfs_message_route_snapshot(cluster_paths)? else {
-                return Ok(None);
-            };
-            snapshot
-        }
+    let peer_snapshot_started = Instant::now();
+    let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot(cluster_paths)? else {
+        return Ok(None);
     };
-    let route_ms = route_started.elapsed().as_millis();
-    let signature = route_snapshot.signature.clone();
+    let peer_snapshot_ms = peer_snapshot_started.elapsed().as_millis();
+    let signature = peer_snapshot.signature.clone();
     if command.routed_message.target_node_id != signature.local_node_id {
         return Err(sinomo_dfs::DfsError::Network {
             message: format!(
@@ -787,7 +759,7 @@ fn process_daemon_dfs_message_command_on_runtime(
             ),
         });
     }
-    let endpoints = route_snapshot.endpoints.clone();
+    let peer_node_ids = peer_snapshot.peer_node_ids.clone();
     let cache_select_started = Instant::now();
     let cache_lock_wait_started = Instant::now();
     let (service_lane, cache_lock_wait_ms) = {
@@ -795,15 +767,15 @@ fn process_daemon_dfs_message_command_on_runtime(
             .lock()
             .map_err(|_| daemon_dfs_cache_lock_error())?;
         let cache_lock_wait_ms = cache_lock_wait_started.elapsed().as_millis();
-        let should_rebuild = cache
-            .get(&cache_key)
-            .is_none_or(|entry| entry.signature != signature);
+        let should_rebuild = cache.get(&cache_key).is_none_or(|entry| {
+            entry.signature != signature || entry.peer_node_ids != peer_node_ids
+        });
         if should_rebuild {
             let primary_service = open_daemon_dfs_message_service_lane(
                 data_dir,
                 cluster_paths,
                 &signature.local_node_id,
-                endpoints.clone(),
+                peer_node_ids.clone(),
                 runtime,
             )?;
             let read_services = (0..daemon_dfs_read_service_pool_size())
@@ -812,7 +784,7 @@ fn process_daemon_dfs_message_command_on_runtime(
                         data_dir,
                         cluster_paths,
                         &signature.local_node_id,
-                        endpoints.clone(),
+                        peer_node_ids.clone(),
                         runtime,
                     )
                 })
@@ -821,8 +793,7 @@ fn process_daemon_dfs_message_command_on_runtime(
                 cache_key.clone(),
                 DaemonDfsMessageServiceCacheEntry {
                     signature: signature.clone(),
-                    endpoints: endpoints.clone(),
-                    last_route_refresh: Instant::now(),
+                    peer_node_ids: peer_node_ids.clone(),
                     primary_service,
                     read_services,
                     next_read_service: 0,
@@ -833,10 +804,6 @@ fn process_daemon_dfs_message_command_on_runtime(
         let entry = cache
             .get_mut(&cache_key)
             .expect("daemon DFS message cache entry inserted");
-        if !route_cache_hit {
-            entry.endpoints = endpoints.clone();
-            entry.last_route_refresh = Instant::now();
-        }
         if use_read_lane && !entry.read_services.is_empty() {
             let index = entry.next_read_service % entry.read_services.len();
             entry.next_read_service = entry.next_read_service.wrapping_add(1);
@@ -852,9 +819,6 @@ fn process_daemon_dfs_message_command_on_runtime(
         .lock()
         .map_err(|_| daemon_dfs_cache_lock_error())?;
     let lane_lock_wait_ms = lane_lock_wait_started.elapsed().as_millis();
-    let endpoint_refresh_started = Instant::now();
-    service_lane.service.refresh_message_endpoints(endpoints);
-    let endpoint_refresh_ms = endpoint_refresh_started.elapsed().as_millis();
     let hydrate_started = Instant::now();
     let mut hydrated_metadata = false;
     if requires_full_metadata_hydrate
@@ -870,15 +834,13 @@ fn process_daemon_dfs_message_command_on_runtime(
     let hydrate_ms = hydrate_started.elapsed().as_millis();
     let process_started = Instant::now();
     daemon_dfs_perf_trace(format_args!(
-        "dfs-message-dispatch-before-process request={} kind={} route_cache_hit={} route_ms={} cache_select_ms={} cache_lock_wait_ms={} lane_lock_wait_ms={} endpoint_refresh_ms={} full_hydrate={} hydrate_ms={} pre_process_total_ms={}",
+        "dfs-message-dispatch-before-process request={} kind={} peer_snapshot_ms={} cache_select_ms={} cache_lock_wait_ms={} lane_lock_wait_ms={} full_hydrate={} hydrate_ms={} pre_process_total_ms={}",
         request_id,
         message_kind,
-        route_cache_hit,
-        route_ms,
+        peer_snapshot_ms,
         cache_select_ms,
         cache_lock_wait_ms,
         lane_lock_wait_ms,
-        endpoint_refresh_ms,
         hydrated_metadata,
         hydrate_ms,
         trace_started.elapsed().as_millis()
@@ -887,16 +849,14 @@ fn process_daemon_dfs_message_command_on_runtime(
         service_lane.service.process_message_command(command)?;
     let process_ms = process_started.elapsed().as_millis();
     daemon_dfs_perf_trace(format_args!(
-        "dfs-message-dispatch request={} read_lane={} route_cache_hit={} route_ms={} ensure_ms={} cache_select_ms={} cache_lock_wait_ms={} lane_lock_wait_ms={} endpoint_refresh_ms={} full_hydrate={} hydrate_ms={} process_ms={} outbound_messages={} events={} total_ms={}",
+        "dfs-message-dispatch request={} read_lane={} peer_snapshot_ms={} ensure_ms={} cache_select_ms={} cache_lock_wait_ms={} lane_lock_wait_ms={} full_hydrate={} hydrate_ms={} process_ms={} outbound_messages={} events={} total_ms={}",
         request_id,
         use_read_lane,
-        route_cache_hit,
-        route_ms,
+        peer_snapshot_ms,
         ensure_ms,
         cache_select_ms,
         cache_lock_wait_ms,
         lane_lock_wait_ms,
-        endpoint_refresh_ms,
         hydrated_metadata,
         hydrate_ms,
         process_ms,
@@ -3278,7 +3238,12 @@ mod tests {
         let paths = DaemonPaths::with_root(data_root.join("daemon"));
         let local = NodeId::from_legacy_named("node_dfs_protocol_warm_local").expect("local");
         let remote = NodeId::from_legacy_named("node_dfs_protocol_warm_remote").expect("remote");
-        write_test_cluster_state(&data_root, &local);
+        write_test_cluster_state_with_remote_endpoint(
+            &data_root,
+            &local,
+            &remote,
+            "10.77.0.1:21353",
+        );
         let runtime = daemon_test_runtime("daemon-dfs-message-warm-cache");
 
         let cache_key = SinomoDataDir::new(&data_root).root();

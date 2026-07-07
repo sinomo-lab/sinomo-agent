@@ -1,6 +1,6 @@
 //! Endpoint-backed DFS data-plane transport and served-message processing.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -293,7 +293,7 @@ struct DeferredDfsEndpointSend {
 #[derive(Clone)]
 pub struct DfsEndpointTransport {
     local_node_id: NodeId,
-    endpoints_by_node_id: BTreeMap<NodeId, Vec<ClusterEndpointRecord>>,
+    known_remote_nodes: BTreeSet<NodeId>,
     incoming_messages: VecDeque<DfsRoutedMessage>,
     detached_sends: Arc<std::sync::Mutex<Vec<DeferredDfsEndpointSend>>>,
     connect_timeout: Duration,
@@ -309,7 +309,7 @@ impl std::fmt::Debug for DfsEndpointTransport {
         formatter
             .debug_struct("DfsEndpointTransport")
             .field("local_node_id", &self.local_node_id)
-            .field("endpoints_by_node_id", &self.endpoints_by_node_id)
+            .field("known_remote_nodes", &self.known_remote_nodes)
             .field("incoming_messages", &self.incoming_messages)
             .field("connect_timeout", &self.connect_timeout)
             .finish_non_exhaustive()
@@ -434,11 +434,28 @@ impl DfsEndpointTransport {
         peer_transport: Arc<dyn DfsPeerTransport>,
         async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     ) -> Self {
+        let peer_node_ids = endpoints.into_iter().map(|endpoint| endpoint.node_id);
+        Self::with_peer_transports_for_nodes(
+            local_node_id,
+            peer_node_ids,
+            connect_timeout,
+            peer_transport,
+            async_peer_transport,
+        )
+    }
+
+    pub fn with_peer_transports_for_nodes(
+        local_node_id: NodeId,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
+        connect_timeout: Duration,
+        peer_transport: Arc<dyn DfsPeerTransport>,
+        async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    ) -> Self {
         let direct_read_peer_transport = Arc::clone(&peer_transport);
         let async_direct_read_peer_transport = Arc::clone(&async_peer_transport);
-        Self::with_senders(
+        Self::with_senders_for_nodes(
             local_node_id,
-            endpoints,
+            peer_node_ids,
             connect_timeout,
             Some(dfs_message_sender_from_peer_transport(peer_transport)),
             Some(async_dfs_message_sender_from_peer_transport(
@@ -488,19 +505,36 @@ impl DfsEndpointTransport {
         async_direct_read_sender: Option<AsyncDfsDirectReadSender>,
         async_direct_read_stream_sender: Option<AsyncDfsDirectReadStreamSender>,
     ) -> Self {
-        let mut endpoints_by_node_id: BTreeMap<NodeId, Vec<ClusterEndpointRecord>> =
-            BTreeMap::new();
-        for endpoint in endpoints {
-            if endpoint.node_id != local_node_id {
-                endpoints_by_node_id
-                    .entry(endpoint.node_id.clone())
-                    .or_default()
-                    .push(endpoint);
-            }
-        }
+        let peer_node_ids = endpoints.into_iter().map(|endpoint| endpoint.node_id);
+        Self::with_senders_for_nodes(
+            local_node_id,
+            peer_node_ids,
+            connect_timeout,
+            sender,
+            async_sender,
+            direct_read_sender,
+            async_direct_read_sender,
+            async_direct_read_stream_sender,
+        )
+    }
+
+    fn with_senders_for_nodes(
+        local_node_id: NodeId,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
+        connect_timeout: Duration,
+        sender: Option<DfsMessageSender>,
+        async_sender: Option<AsyncDfsMessageSender>,
+        direct_read_sender: Option<DfsDirectReadSender>,
+        async_direct_read_sender: Option<AsyncDfsDirectReadSender>,
+        async_direct_read_stream_sender: Option<AsyncDfsDirectReadStreamSender>,
+    ) -> Self {
+        let known_remote_nodes = peer_node_ids
+            .into_iter()
+            .filter(|node_id| node_id != &local_node_id)
+            .collect();
         Self {
             local_node_id,
-            endpoints_by_node_id,
+            known_remote_nodes,
             incoming_messages: VecDeque::new(),
             detached_sends: Arc::new(std::sync::Mutex::new(Vec::new())),
             connect_timeout,
@@ -513,32 +547,21 @@ impl DfsEndpointTransport {
     }
 
     fn replace_endpoints(&mut self, endpoints: impl IntoIterator<Item = ClusterEndpointRecord>) {
-        let mut endpoints_by_node_id: BTreeMap<NodeId, Vec<ClusterEndpointRecord>> =
-            BTreeMap::new();
-        for endpoint in endpoints {
-            if endpoint.node_id != self.local_node_id {
-                endpoints_by_node_id
-                    .entry(endpoint.node_id.clone())
-                    .or_default()
-                    .push(endpoint);
-            }
-        }
-        self.endpoints_by_node_id = endpoints_by_node_id;
+        self.replace_peer_nodes(endpoints.into_iter().map(|endpoint| endpoint.node_id));
+    }
+
+    fn replace_peer_nodes(&mut self, peer_node_ids: impl IntoIterator<Item = NodeId>) {
+        self.known_remote_nodes = peer_node_ids
+            .into_iter()
+            .filter(|node_id| node_id != &self.local_node_id)
+            .collect();
     }
 
     fn transfer_profile_for_target(&self, target_node_id: &NodeId) -> DfsTransferProfile {
         if target_node_id == &self.local_node_id {
             return DfsTransferProfile::Local;
         }
-        self.endpoints_by_node_id
-            .get(target_node_id)
-            .map(|endpoints| {
-                sinomo_core::network::ClusterEndpointSelector::transfer_profile_for_endpoints(
-                    endpoints.iter(),
-                )
-                .into()
-            })
-            .unwrap_or(DfsTransferProfile::Conservative)
+        DfsTransferProfile::Conservative
     }
 
     fn send_routed_message_to_endpoint(
@@ -731,8 +754,8 @@ impl DfsEndpointTransport {
         if !require_local_source
             && routed_message.source_node_id != self.local_node_id
             && !self
-                .endpoints_by_node_id
-                .contains_key(&routed_message.source_node_id)
+                .known_remote_nodes
+                .contains(&routed_message.source_node_id)
         {
             return Err(NetworkError::UnknownNode {
                 node_id: routed_message.source_node_id.clone(),
@@ -744,7 +767,7 @@ impl DfsEndpointTransport {
                 frame_target_node_id: routed_message.target_node_id.clone(),
             });
         }
-        if !self.endpoints_by_node_id.contains_key(target_node_id) {
+        if !self.known_remote_nodes.contains(target_node_id) {
             return Err(NetworkError::UnknownNode {
                 node_id: target_node_id.clone(),
             });
@@ -1152,6 +1175,10 @@ impl NetworkedDfsService<DfsEndpointTransport> {
     pub fn refresh_endpoint_targets(&mut self, endpoints: Vec<ClusterEndpointRecord>) {
         self.transport.replace_endpoints(endpoints);
     }
+
+    pub fn refresh_peer_targets(&mut self, peer_node_ids: Vec<NodeId>) {
+        self.transport.replace_peer_nodes(peer_node_ids);
+    }
 }
 
 #[derive(Debug)]
@@ -1170,23 +1197,54 @@ impl DfsEndpointServedMessageTransport {
         peer_transport: Arc<dyn DfsPeerTransport>,
         connect_timeout: Duration,
     ) -> Self {
-        Self::new_with_message_sender(
+        let peer_node_ids = endpoints.into_iter().map(|endpoint| endpoint.node_id);
+        Self::new_with_peer_transport_for_nodes(
             local_node_id,
-            endpoints,
+            peer_node_ids,
+            peer_transport,
+            connect_timeout,
+        )
+    }
+
+    pub fn new_with_peer_transport_for_nodes(
+        local_node_id: NodeId,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
+        peer_transport: Arc<dyn DfsPeerTransport>,
+        connect_timeout: Duration,
+    ) -> Self {
+        Self::new_with_message_sender_for_nodes(
+            local_node_id,
+            peer_node_ids,
             dfs_message_sender_from_peer_transport(peer_transport),
             connect_timeout,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_message_sender(
         local_node_id: NodeId,
         endpoints: Vec<ClusterEndpointRecord>,
         sender: DfsMessageSender,
         connect_timeout: Duration,
     ) -> Self {
-        let endpoint_transport = DfsEndpointTransport::with_senders(
+        let peer_node_ids = endpoints.into_iter().map(|endpoint| endpoint.node_id);
+        Self::new_with_message_sender_for_nodes(
+            local_node_id,
+            peer_node_ids,
+            sender,
+            connect_timeout,
+        )
+    }
+
+    fn new_with_message_sender_for_nodes(
+        local_node_id: NodeId,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
+        sender: DfsMessageSender,
+        connect_timeout: Duration,
+    ) -> Self {
+        let endpoint_transport = DfsEndpointTransport::with_senders_for_nodes(
             local_node_id.clone(),
-            endpoints,
+            peer_node_ids,
             connect_timeout,
             Some(sender),
             None,
@@ -1223,6 +1281,10 @@ impl DfsEndpointServedMessageTransport {
 
     pub fn replace_endpoints(&mut self, endpoints: Vec<ClusterEndpointRecord>) {
         self.endpoint_transport.replace_endpoints(endpoints);
+    }
+
+    pub fn replace_peer_nodes(&mut self, peer_node_ids: Vec<NodeId>) {
+        self.endpoint_transport.replace_peer_nodes(peer_node_ids);
     }
 
     fn drain_queued_messages(&mut self) -> Vec<DfsRoutedMessage> {
@@ -1314,6 +1376,10 @@ fn dfs_network_message_is_inline_served_response(message: &DfsNetworkMessage) ->
 impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
     pub fn refresh_message_endpoints(&mut self, endpoints: Vec<ClusterEndpointRecord>) {
         self.transport.replace_endpoints(endpoints);
+    }
+
+    pub fn refresh_message_peer_targets(&mut self, peer_node_ids: Vec<NodeId>) {
+        self.transport.replace_peer_nodes(peer_node_ids);
     }
 
     pub fn drain_message_deferred_work(&mut self) {

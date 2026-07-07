@@ -517,12 +517,26 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
     if endpoint.transport != ClusterTransportKind::LanTcp {
         return None;
     }
-    if !tcp_tunnel_is_synthetic_endpoint(endpoint) {
-        spawn_tcp_tunnel_connect_attempt(endpoint, runtime, paths);
-        return None;
-    }
     let mut signed = request.clone();
     signed.auth = Some(auth.to_vec());
+    if !tcp_tunnel_is_synthetic_endpoint(endpoint) {
+        if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
+            return Some(send_over_tcp_tunnel_handle(handle, signed, timeouts).await);
+        }
+        match connect_tcp_tunnel_to_endpoint_for_rpc(endpoint, runtime, paths, timeouts).await {
+            Ok(handle) => {
+                return Some(send_over_tcp_tunnel_handle(handle, signed, timeouts).await);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    "tcp tunnel open to {} ({}) failed before rpc; falling back to direct tcp: {error}",
+                    endpoint.node_id,
+                    endpoint.address
+                );
+                return None;
+            }
+        }
+    }
     if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
         return match send_over_tcp_tunnel_handle(handle, signed, timeouts).await {
             Ok(response) => Some(Ok(response)),
@@ -568,12 +582,46 @@ pub(crate) async fn forward_signed_endpoint_rpc_via_tcp_tunnel(
     if endpoint.transport != ClusterTransportKind::LanTcp {
         return None;
     }
-    if !tcp_tunnel_is_synthetic_endpoint(endpoint) {
-        spawn_tcp_tunnel_connect_attempt(endpoint, runtime, paths);
-        return None;
-    }
     let mut signed = request.clone();
     signed.auth = Some(auth.to_vec());
+    if !tcp_tunnel_is_synthetic_endpoint(endpoint) {
+        if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
+            return Some(
+                forward_stream_over_tcp_tunnel_handle(
+                    handle,
+                    signed,
+                    timeouts,
+                    upstream,
+                    upstream_address,
+                    max_response_bytes,
+                )
+                .await,
+            );
+        }
+        match connect_tcp_tunnel_to_endpoint_for_rpc(endpoint, runtime, paths, timeouts).await {
+            Ok(handle) => {
+                return Some(
+                    forward_stream_over_tcp_tunnel_handle(
+                        handle,
+                        signed,
+                        timeouts,
+                        upstream,
+                        upstream_address,
+                        max_response_bytes,
+                    )
+                    .await,
+                );
+            }
+            Err(error) => {
+                tracing::debug!(
+                    "tcp tunnel open to {} ({}) failed before streamed rpc; falling back to direct tcp: {error}",
+                    endpoint.node_id,
+                    endpoint.address
+                );
+                return None;
+            }
+        }
+    }
     if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
         return match forward_stream_over_tcp_tunnel_handle(
             handle,
@@ -932,25 +980,54 @@ async fn connect_tcp_tunnel_to_endpoint(
     runtime: &tokio::runtime::Handle,
     paths: Option<&DaemonPaths>,
 ) -> Result<Arc<TcpTunnelHandle>, NetworkError> {
+    connect_tcp_tunnel_to_endpoint_with_timeout(
+        endpoint,
+        runtime,
+        paths,
+        TCP_TUNNEL_CONNECT_TIMEOUT,
+    )
+    .await
+}
+
+async fn connect_tcp_tunnel_to_endpoint_for_rpc(
+    endpoint: &ClusterEndpointRecord,
+    runtime: &tokio::runtime::Handle,
+    paths: Option<&DaemonPaths>,
+    rpc_timeouts: DaemonRpcTimeouts,
+) -> Result<Arc<TcpTunnelHandle>, NetworkError> {
+    let connect_timeout = rpc_timeouts
+        .connect_timeout
+        .map(|timeout| timeout.min(TCP_TUNNEL_CONNECT_TIMEOUT))
+        .unwrap_or(TCP_TUNNEL_CONNECT_TIMEOUT);
+    connect_tcp_tunnel_to_endpoint_with_timeout(endpoint, runtime, paths, connect_timeout).await
+}
+
+async fn connect_tcp_tunnel_to_endpoint_with_timeout(
+    endpoint: &ClusterEndpointRecord,
+    runtime: &tokio::runtime::Handle,
+    paths: Option<&DaemonPaths>,
+    connect_timeout: Duration,
+) -> Result<Arc<TcpTunnelHandle>, NetworkError> {
     if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
         return Ok(handle);
     }
     let connect_lock = TCP_TUNNELS.connect_lock(&endpoint.node_id);
     let _connect_guard = connect_lock.lock().await;
-    connect_tcp_tunnel_to_endpoint_after_lock(endpoint, runtime, paths).await
+    connect_tcp_tunnel_to_endpoint_after_lock(endpoint, runtime, paths, connect_timeout).await
 }
 
 async fn connect_tcp_tunnel_to_endpoint_after_lock(
     endpoint: &ClusterEndpointRecord,
     runtime: &tokio::runtime::Handle,
     paths: Option<&DaemonPaths>,
+    connect_timeout: Duration,
 ) -> Result<Arc<TcpTunnelHandle>, NetworkError> {
     if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
         return Ok(handle);
     }
     let mut stream = AsyncDaemonControlStream::connect_with_options(
         &endpoint.address,
-        DaemonRpcTimeouts::connect_and_idle(TCP_TUNNEL_CONNECT_TIMEOUT),
+        DaemonRpcTimeouts::connect_and_idle(connect_timeout),
     )
     .await?;
     let request = signed_tcp_tunnel_open_request(runtime).await?;
@@ -1005,33 +1082,6 @@ async fn connect_tcp_tunnel_to_endpoint_after_lock(
         .await;
     }
     Ok(handle)
-}
-
-fn spawn_tcp_tunnel_connect_attempt(
-    endpoint: &ClusterEndpointRecord,
-    runtime: &tokio::runtime::Handle,
-    paths: Option<&DaemonPaths>,
-) {
-    let connect_lock = TCP_TUNNELS.connect_lock(&endpoint.node_id);
-    let Ok(connect_guard) = connect_lock.try_lock_owned() else {
-        return;
-    };
-    let endpoint = endpoint.clone();
-    let runtime_for_task = runtime.clone();
-    let paths = paths.cloned().or_else(daemon_paths_from_env);
-    runtime.spawn(async move {
-        let _connect_guard = connect_guard;
-        if let Err(error) =
-            connect_tcp_tunnel_to_endpoint_after_lock(&endpoint, &runtime_for_task, paths.as_ref())
-                .await
-        {
-            tracing::debug!(
-                "background tcp tunnel open to {} ({}) failed: {error}",
-                endpoint.node_id,
-                endpoint.address
-            );
-        }
-    });
 }
 
 async fn signed_tcp_tunnel_open_request(
@@ -1689,16 +1739,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_tunnel_does_not_hijack_real_lan_endpoint() {
-        let (tx, _rx) = mpsc::channel(1);
-        let node_name = "tcp_tunnel_real_lan_not_hijacked";
+    async fn tcp_tunnel_real_lan_endpoint_reuses_existing_tunnel() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let node_name = "tcp_tunnel_real_lan_reuses_existing";
         let node_id = NodeId::from_legacy_named(node_name).expect("test node id");
         let handle = test_tunnel_handle(node_name, tx);
         TCP_TUNNELS.insert(handle.clone());
         let endpoint = test_endpoint(
-            "tcp_tunnel_real_lan_not_hijacked_endpoint",
+            "tcp_tunnel_real_lan_reuses_existing_endpoint",
             &node_id,
             "10.0.0.2:21353",
+            ClusterTransportKind::LanTcp,
+        );
+        let endpoint_for_send = endpoint.clone();
+        let request = test_rpc_request();
+
+        let send_task = tokio::spawn(async move {
+            send_signed_endpoint_rpc_via_tcp_tunnel(
+                &endpoint_for_send,
+                b"auth",
+                &request,
+                DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
+                &tokio::runtime::Handle::current(),
+                None,
+            )
+            .await
+        });
+        let id = match rx.recv().await.expect("tunnel request") {
+            ClusterTcpTunnelFrame::Request { id, request } => {
+                assert_eq!(request.route, "/test/tcp-tunnel");
+                assert_eq!(request.auth.as_deref(), Some(b"auth".as_slice()));
+                id
+            }
+            other => panic!("expected tunnel request, got {other:?}"),
+        };
+        let pending = handle
+            .pending
+            .lock()
+            .await
+            .remove(&id)
+            .expect("pending tunnel request");
+        match pending.kind {
+            PendingTcpTunnelRequestKind::Collect { tx, .. } => {
+                tx.send(Ok(ObjectRpcResponse::from_encoded_body(
+                    "/test/tcp-tunnel",
+                    Vec::new(),
+                )))
+                .expect("send tunnel response");
+            }
+            PendingTcpTunnelRequestKind::Forward { .. } => {
+                panic!("expected collected tunnel response")
+            }
+        }
+
+        let result = send_task.await.expect("join send task");
+        assert!(matches!(result, Some(Ok(_))));
+        assert!(TCP_TUNNELS.get(&node_id).is_some());
+        assert!(handle.pending.lock().await.is_empty());
+        assert!(!handle.clean_shutdown.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_real_lan_endpoint_falls_back_when_open_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind closed endpoint");
+        let address = listener.local_addr().expect("listener address").to_string();
+        drop(listener);
+        let node_id =
+            NodeId::from_legacy_named("tcp_tunnel_real_lan_open_fallback").expect("test node id");
+        let endpoint = test_endpoint(
+            "tcp_tunnel_real_lan_open_fallback_endpoint",
+            &node_id,
+            &address,
             ClusterTransportKind::LanTcp,
         );
 
@@ -1706,16 +1819,14 @@ mod tests {
             &endpoint,
             b"auth",
             &test_rpc_request(),
-            DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(5)),
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(20)),
             &tokio::runtime::Handle::current(),
             None,
         )
         .await;
 
         assert!(result.is_none());
-        assert!(TCP_TUNNELS.get(&node_id).is_some());
-        assert!(handle.pending.lock().await.is_empty());
-        assert!(!handle.clean_shutdown.load(Ordering::Relaxed));
+        assert!(TCP_TUNNELS.get(&node_id).is_none());
     }
 
     #[tokio::test]

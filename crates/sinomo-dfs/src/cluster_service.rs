@@ -6,7 +6,10 @@
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{ClusterPaths, ObjectRpcRequest};
 use sinomo_core::node::NodeId;
-use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord};
+use sinomo_core::{
+    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource,
+    ClusterTransportKind,
+};
 use std::sync::Arc;
 
 use crate::{
@@ -16,11 +19,38 @@ use crate::{
 };
 
 pub fn cluster_dfs_data_endpoints(
-    cluster_paths: &ClusterPaths,
+    _cluster_paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
-    sinomo_core::network::ClusterEndpointSelector::new(cluster_paths, state)
-        .select(sinomo_core::network::ClusterEndpointSelectionPurpose::MainDaemonDataPlane)
+    cluster_dfs_peer_node_ids(state)
+        .into_iter()
+        .map(cluster_dfs_logical_peer_endpoint)
+        .collect()
+}
+
+pub fn cluster_dfs_peer_node_ids(state: &ClusterBootstrapState) -> Vec<NodeId> {
+    state
+        .members
+        .iter()
+        .filter(|member| member.cluster_id == state.cluster_id && member.state.is_authorized())
+        .map(|member| member.node_id.clone())
+        .collect()
+}
+
+fn cluster_dfs_logical_peer_endpoint(node_id: NodeId) -> ClusterEndpointRecord {
+    ClusterEndpointRecord {
+        endpoint_id: sinomo_core::network::ClusterEndpointId::derived(
+            "sinomo.dfs.logical-peer",
+            node_id.as_str(),
+        ),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::InProcess,
+        address: format!("cluster-node://{node_id}"),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: None,
+    }
 }
 
 pub(crate) fn open_cluster_dfs_service_with_message_sender(
@@ -73,20 +103,20 @@ pub(crate) fn open_cluster_dfs_service_with_message_sender_lazy(
     service.with_boxed_metadata_backend_lazy(metadata)
 }
 
-pub(crate) fn open_cluster_dfs_service_with_peer_transports(
+pub(crate) fn open_cluster_dfs_service_with_peer_transports_for_nodes(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     local_node_id: NodeId,
-    endpoints: Vec<ClusterEndpointRecord>,
+    peer_node_ids: Vec<NodeId>,
     peer_transport: Arc<dyn DfsPeerTransport>,
     async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
 ) -> Result<NetworkedDfsService<DfsEndpointTransport>, DfsError> {
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let mut service = NetworkedDfsService::new(
-        DfsEndpointTransport::with_peer_transports(
+        DfsEndpointTransport::with_peer_transports_for_nodes(
             local_node_id,
-            endpoints,
+            peer_node_ids,
             DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
             peer_transport,
             async_peer_transport,

@@ -3917,11 +3917,15 @@ pub(crate) fn open_daemon_sandbox_dfs_service_on_runtime(
             detail: source.to_string(),
         },
     )?;
-    let endpoints = sinomo_dfs::cluster_dfs_data_endpoints(&cluster_paths, &state);
+    let peer_node_ids = sinomo_dfs::cluster_dfs_peer_node_ids(&state);
     let transport = if let Some(runtime) = runtime {
-        daemon_dfs_endpoint_transport_on_runtime(state.local_node_id.clone(), endpoints, runtime)
+        daemon_dfs_endpoint_transport_on_runtime(
+            state.local_node_id.clone(),
+            peer_node_ids,
+            runtime,
+        )
     } else {
-        daemon_dfs_endpoint_transport(state.local_node_id.clone(), endpoints)
+        daemon_dfs_endpoint_transport(state.local_node_id.clone(), peer_node_ids)
     };
     let dfs = sinomo_dfs::NetworkedDfsService::new(transport, content);
     let dfs = crate::dfs::with_daemon_dfs_control_plane_on_runtime(dfs, &cluster_paths, runtime);

@@ -92,11 +92,11 @@ mod service_write;
 mod smoke;
 mod transfer;
 
-pub use cluster_service::cluster_dfs_data_endpoints;
+pub use cluster_service::{cluster_dfs_data_endpoints, cluster_dfs_peer_node_ids};
 pub(crate) use cluster_service::{
     object_rpc_request_from_kv_payload, open_cluster_dfs_service_with_message_sender,
     open_cluster_dfs_service_with_message_sender_lazy,
-    open_cluster_dfs_service_with_peer_transports,
+    open_cluster_dfs_service_with_peer_transports_for_nodes,
 };
 pub(crate) use content_store::content_hash;
 pub use content_store::{

@@ -1651,7 +1651,7 @@ struct DaemonDfsBrowserBackend {
     data_dir: SinomoDataDir,
     service: Mutex<sinomo_dfs::MountedSifsService>,
     replica_candidates: Vec<sinomo_core::node::NodeId>,
-    endpoint_targets_refreshed_at: Mutex<Option<Instant>>,
+    peer_targets_refreshed_at: Mutex<Option<Instant>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1732,7 +1732,7 @@ impl DaemonDfsBrowserBackend {
             data_dir,
             service: Mutex::new(opened.service),
             replica_candidates: opened.replica_candidates,
-            endpoint_targets_refreshed_at: Mutex::new(Some(Instant::now())),
+            peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
         })
     }
 
@@ -1765,32 +1765,29 @@ impl DaemonDfsBrowserBackend {
         })
     }
 
-    fn refresh_endpoint_targets(&self, service: &mut sinomo_dfs::MountedSifsService) {
+    fn refresh_peer_targets(&self, service: &mut sinomo_dfs::MountedSifsService) {
         let now = Instant::now();
-        if let Ok(mut refreshed_at) = self.endpoint_targets_refreshed_at.lock() {
+        if let Ok(mut refreshed_at) = self.peer_targets_refreshed_at.lock() {
             if refreshed_at
                 .as_ref()
                 .is_some_and(|last| now.duration_since(*last) < Duration::from_secs(1))
             {
                 return;
             }
-            if self.refresh_endpoint_targets_now(service) {
+            if self.refresh_peer_targets_now(service) {
                 *refreshed_at = Some(now);
             }
             return;
         }
-        let _ = self.refresh_endpoint_targets_now(service);
+        let _ = self.refresh_peer_targets_now(service);
     }
 
-    fn refresh_endpoint_targets_now(&self, service: &mut sinomo_dfs::MountedSifsService) -> bool {
+    fn refresh_peer_targets_now(&self, service: &mut sinomo_dfs::MountedSifsService) -> bool {
         let cluster_paths = ClusterPaths::new(&self.data_dir);
         let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) else {
             return false;
         };
-        service.refresh_endpoint_targets(sinomo_dfs::cluster_dfs_data_endpoints(
-            &cluster_paths,
-            &state,
-        ));
+        service.refresh_peer_targets(sinomo_dfs::cluster_dfs_peer_node_ids(&state));
         true
     }
 
@@ -1811,7 +1808,7 @@ impl DaemonDfsBrowserBackend {
     ) -> Result<crate::DaemonDfsBrowserListResponse, ServiceError> {
         let path = normalize_sifs_browser_path(&request.path)?;
         let mut service = self.lock_service()?;
-        self.refresh_endpoint_targets(&mut service);
+        self.refresh_peer_targets(&mut service);
         let mut entries: Vec<_> = match service.posix_list_dir_distributed(&path) {
             Ok(entries) => entries,
             Err(sinomo_dfs::DfsPosixError::NotFound { .. }) if request.missing_is_empty => {
@@ -1850,7 +1847,7 @@ impl DaemonDfsBrowserBackend {
     ) -> Result<crate::DaemonDfsBrowserStatResponse, ServiceError> {
         let path = normalize_sifs_browser_path(&request.path)?;
         let mut service = self.lock_service()?;
-        self.refresh_endpoint_targets(&mut service);
+        self.refresh_peer_targets(&mut service);
         let stat = service
             .posix_stat_distributed(&path)
             .map_err(dfs_browser_service_error)?;
@@ -1902,7 +1899,7 @@ impl DaemonDfsBrowserBackend {
     ) -> Result<crate::DaemonDfsBrowserReadFileResponse, ServiceError> {
         let path = normalize_sifs_browser_path(&request.path)?;
         let mut service = self.lock_service()?;
-        self.refresh_endpoint_targets(&mut service);
+        self.refresh_peer_targets(&mut service);
         let bytes = service
             .posix_read_file_distributed(&path)
             .map_err(dfs_browser_service_error)?;
@@ -1918,7 +1915,7 @@ impl DaemonDfsBrowserBackend {
         let version = sinomo_dfs::DfsVersion::new(&request.version)
             .map_err(|source| ServiceError::Service(source.to_string()))?;
         let mut service = self.lock_service()?;
-        self.refresh_endpoint_targets(&mut service);
+        self.refresh_peer_targets(&mut service);
         let bytes = service
             .read_object_version_content(
                 &object_id,
@@ -1937,7 +1934,7 @@ impl DaemonDfsBrowserBackend {
         let path = normalize_sifs_browser_path(&request.path)?;
         let max_bytes = usize::try_from(request.max_bytes).unwrap_or(usize::MAX);
         let mut service = self.lock_service()?;
-        self.refresh_endpoint_targets(&mut service);
+        self.refresh_peer_targets(&mut service);
         let stat = service
             .posix_stat_distributed(&path)
             .map_err(dfs_browser_service_error)?;
@@ -1961,7 +1958,7 @@ impl DaemonDfsBrowserBackend {
             .map(|path| normalize_sifs_browser_path(&path).map(|normalized| (path, normalized)))
             .collect::<Result<Vec<_>, _>>()?;
         let mut service = self.lock_service()?;
-        self.refresh_endpoint_targets(&mut service);
+        self.refresh_peer_targets(&mut service);
         let files = paths
             .into_iter()
             .map(
@@ -2054,7 +2051,7 @@ impl DaemonDfsBrowserBackend {
     ) -> Result<String, ServiceError> {
         let path = normalize_sifs_browser_path(path)?;
         let mut service = self.lock_service()?;
-        self.refresh_endpoint_targets(&mut service);
+        self.refresh_peer_targets(&mut service);
         let stat = service
             .posix_stat_distributed(&path)
             .map_err(dfs_browser_service_error)?;

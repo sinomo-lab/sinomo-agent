@@ -20,8 +20,8 @@ use crate::{
     AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsEndpointTransport, DfsError,
     DfsNodeAdvertisement, DfsNodeId, DfsObjectRpcSendOptions, DfsPeerTransport,
     DfsPeerTransportError, DfsPeerTransportFuture, DfsPosixError, NetworkedDfsService,
-    cluster_dfs_data_endpoints, content_services_prefix, fallback_dfs_node_id,
-    object_rpc_request_from_kv_payload, open_cluster_dfs_service_with_peer_transports,
+    cluster_dfs_peer_node_ids, content_services_prefix, fallback_dfs_node_id,
+    object_rpc_request_from_kv_payload, open_cluster_dfs_service_with_peer_transports_for_nodes,
 };
 
 pub type MountedSifsService = NetworkedDfsService<DfsEndpointTransport>;
@@ -58,9 +58,9 @@ pub fn open_mounted_sifs_service(
         .as_ref()
         .map(|state| state.local_node_id.clone())
         .unwrap_or_else(fallback_dfs_node_id);
-    let endpoints = cluster_state
+    let peer_node_ids = cluster_state
         .as_ref()
-        .map(|state| cluster_dfs_data_endpoints(&cluster_paths, state))
+        .map(cluster_dfs_peer_node_ids)
         .unwrap_or_default();
     let peer_transport = Arc::new(MountedSifsPeerTransport {
         data_dir: data_dir.clone(),
@@ -76,11 +76,11 @@ pub fn open_mounted_sifs_service(
     } else {
         None
     };
-    let mut service = open_cluster_dfs_service_with_peer_transports(
+    let mut service = open_cluster_dfs_service_with_peer_transports_for_nodes(
         &data_dir,
         &cluster_paths,
         local_node_id.clone(),
-        endpoints,
+        peer_node_ids,
         sync_peer_transport,
         async_peer_transport,
         control_plane,

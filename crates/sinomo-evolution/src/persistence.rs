@@ -25,7 +25,7 @@ use sinomo_runtime::dfs::{
     AsyncDfsPeerTransport, DfsEndpointTransport, DfsMetadataJournalReplicationOptions,
     DfsMetadataShardConfig, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
     DfsPeerTransportFuture, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
-    cluster_dfs_data_endpoints, default_dfs_metadata_root, default_dfs_metadata_shards_root,
+    cluster_dfs_peer_node_ids, default_dfs_metadata_root, default_dfs_metadata_shards_root,
     fallback_dfs_node_id, metadata_shards_prefix, open_local_sharded_metadata_backend,
     open_root_local_metadata_backend, publish_cluster_dfs_metadata_journal_with_peer_transport,
     sifs_file_system_id,
@@ -2585,15 +2585,15 @@ fn open_evolution_sifs_service(
             detail: source.to_string(),
         })?;
     let cluster_paths = ClusterPaths::new(data_dir);
-    let (local_node_id, endpoints) = if cluster_paths.state.exists() {
+    let (local_node_id, peer_node_ids) = if cluster_paths.state.exists() {
         let state = cluster::read_cluster_state_without_kv(&cluster_paths).map_err(|source| {
             EvolutionPersistenceError::Sifs {
                 path: cluster_paths.state.display().to_string(),
                 detail: source.to_string(),
             }
         })?;
-        let endpoints = cluster_dfs_data_endpoints(&cluster_paths, &state);
-        (state.local_node_id, endpoints)
+        let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+        (state.local_node_id, peer_node_ids)
     } else {
         (fallback_dfs_node_id(), Vec::new())
     };
@@ -2607,9 +2607,9 @@ fn open_evolution_sifs_service(
     let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
     let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
     let service = NetworkedDfsService::new(
-        DfsEndpointTransport::with_peer_transports(
+        DfsEndpointTransport::with_peer_transports_for_nodes(
             local_node_id,
-            endpoints,
+            peer_node_ids,
             sinomo_runtime::dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
             sync_peer_transport,
             async_peer_transport,
