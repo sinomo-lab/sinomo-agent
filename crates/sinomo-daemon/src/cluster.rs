@@ -4086,6 +4086,12 @@ async fn probe_member_routed_ping_status_async(
         );
         return Ok(None);
     }
+    if let Some(rows) =
+        fetch_local_cluster_health_rows_from_member_async(paths, state, member, runtime).await?
+        && let Some(status) = member_status_from_peer_local_health_rows(member, rows)
+    {
+        return Ok(Some(status));
+    }
     let expected_process = cluster_member_expected_daemon_process(member).map(str::to_string);
     let paths_for_statuses = paths.clone();
     let member_for_statuses = member.clone();
@@ -4122,6 +4128,27 @@ async fn probe_member_routed_ping_status_async(
         status.availability = ClusterNodeAvailability::Online;
         status
     })))
+}
+
+fn member_status_from_peer_local_health_rows(
+    member: &ClusterMemberRecord,
+    rows: Vec<ClusterHealthRow>,
+) -> Option<ClusterNodeStatusRecord> {
+    let expected_process = cluster_member_expected_daemon_process(member);
+    rows.into_iter().find_map(|row| {
+        let process_matches = expected_process
+            .map(|process| row.status.process == process)
+            .unwrap_or(true);
+        if row.availability != ClusterNodeAvailability::Online
+            || row.status.node_id != member.node_id
+            || !process_matches
+        {
+            return None;
+        }
+        let mut status = row.status;
+        status.availability = ClusterNodeAvailability::Online;
+        Some(status)
+    })
 }
 
 async fn call_member_object_rpc_target_async(
@@ -7279,6 +7306,33 @@ fn cluster_raft_append_attempt_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_cluster_node_status(
+        cluster_id: &ClusterId,
+        node_id: &NodeId,
+        process: &str,
+        commit: Option<&str>,
+        observed_at: OffsetDateTime,
+    ) -> ClusterNodeStatusRecord {
+        ClusterNodeStatusRecord {
+            cluster_id: cluster_id.clone(),
+            node_id: node_id.clone(),
+            process: process.to_string(),
+            availability: ClusterNodeAvailability::Online,
+            daemon_version: "0.1.0-test".to_string(),
+            commit: commit.map(str::to_string),
+            target_os: Some("test-os".to_string()),
+            target_arch: Some("test-arch".to_string()),
+            hostname: None,
+            pid: Some(42),
+            address: Some("127.0.0.1:21353".to_string()),
+            bind_address: Some("0.0.0.0:21353".to_string()),
+            executable: Some("sinomo".to_string()),
+            rollout: None,
+            daemon_started_at: Some("2026-05-04T00:00:00Z".to_string()),
+            observed_at,
+        }
+    }
 
     fn test_network_module_relay_endpoint(node_id: &NodeId, key: &str) -> ClusterEndpointRecord {
         let address = format!("iroh://{key}?relay=https://relay.example./");
@@ -13939,6 +13993,66 @@ mod tests {
             Some(&voter_endpoint.endpoint_id),
             "join bootstrap must still try voter command targets even when local health is stale/offline"
         );
+    }
+
+    #[test]
+    fn routed_ping_status_prefers_peer_local_health_row() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_routed_ping_health").expect("cluster id");
+        let remote_node = NodeId::from_legacy_named("node_daemon_routed_ping_health_remote")
+            .expect("remote node");
+        let other_node =
+            NodeId::from_legacy_named("node_daemon_routed_ping_health_other").expect("other node");
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            remote_node.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+
+        let fresh = test_cluster_node_status(
+            &cluster_id,
+            &remote_node,
+            sinomo_core::node::DAEMON_MAIN_CLUSTER_ROLE,
+            Some("fresh-commit"),
+            now,
+        );
+        let selected = member_status_from_peer_local_health_rows(
+            &member,
+            vec![
+                ClusterHealthRow {
+                    member: ClusterMemberRecord::local_voter(
+                        cluster_id.clone(),
+                        other_node.clone(),
+                        "other",
+                        "pk-other",
+                        now,
+                    ),
+                    status: test_cluster_node_status(
+                        &cluster_id,
+                        &other_node,
+                        sinomo_core::node::DAEMON_MAIN_CLUSTER_ROLE,
+                        Some("other-commit"),
+                        now,
+                    ),
+                    availability: ClusterNodeAvailability::Online,
+                },
+                ClusterHealthRow {
+                    member: member.clone(),
+                    status: fresh.clone(),
+                    availability: ClusterNodeAvailability::Online,
+                },
+            ],
+        )
+        .expect("fresh peer row");
+
+        assert_eq!(selected.commit.as_deref(), Some("fresh-commit"));
+        assert_eq!(selected.node_id, remote_node);
+        assert_eq!(selected.availability, ClusterNodeAvailability::Online);
     }
 
     #[test]
