@@ -400,6 +400,7 @@ type FilesOperationResult = Result<FilesOperationOutcome, FilesOperationFailure>
 pub struct FilesState {
     pub data_dir: Arc<SinomoDataDir>,
     daemon_address: Option<String>,
+    daemon_unavailable_detail: Option<String>,
     app_runtime: tokio::runtime::Handle,
     pub source: FilesSourceKind,
     pub browser: Option<SifsBrowser>,
@@ -453,10 +454,11 @@ impl FilesState {
         Self {
             data_dir: backend.data_dir.clone(),
             daemon_address: backend.connection.daemon_address().map(str::to_string),
+            daemon_unavailable_detail: backend.connection_issue_detail(),
             app_runtime: backend.app_runtime.handle().clone(),
             source: FilesSourceKind::Sifs,
             browser: None,
-            error: None,
+            error: backend.connection_issue_detail(),
             clustered: backend.connection.is_clustered(),
             loaded: false,
             loading: false,
@@ -549,7 +551,11 @@ impl FilesState {
         let result = self
             .daemon_address
             .as_deref()
-            .ok_or_else(|| "SIFS browsing requires a daemon connection".to_string())
+            .ok_or_else(|| {
+                self.daemon_unavailable_detail
+                    .clone()
+                    .unwrap_or_else(|| "SIFS browsing requires a daemon connection".to_string())
+            })
             .and_then(|address| SifsBrowser::open_daemon_on_runtime(address, &self.app_runtime));
         match result {
             Ok(browser) => {
@@ -786,6 +792,7 @@ impl FilesState {
         let (result_tx, result_rx) = mpsc::channel();
         let data_dir = self.data_dir.clone();
         let daemon_address = self.daemon_address.clone();
+        let daemon_unavailable_detail = self.daemon_unavailable_detail.clone();
         let app_runtime = self.app_runtime.clone();
         let cancellations = self.worker_cancellations.clone();
         let timeout_tx = result_tx.clone();
@@ -796,6 +803,7 @@ impl FilesState {
                 files_worker_loop(
                     data_dir,
                     daemon_address,
+                    daemon_unavailable_detail,
                     app_runtime,
                     command_rx,
                     result_tx,
@@ -2312,6 +2320,7 @@ impl FilesOperationProgress<'_> {
 fn files_worker_loop(
     data_dir: Arc<SinomoDataDir>,
     daemon_address: Option<String>,
+    daemon_unavailable_detail: Option<String>,
     app_runtime: tokio::runtime::Handle,
     command_rx: Receiver<FilesWorkerCommand>,
     result_tx: Sender<FilesWorkerResult>,
@@ -2319,9 +2328,11 @@ fn files_worker_loop(
     waker: sui::UiHandle,
 ) {
     let mut browser: Option<SifsBrowser> = None;
-    let mut open_error: Option<String> = daemon_address
-        .is_none()
-        .then(|| "SIFS browsing requires a daemon connection".to_string());
+    let mut open_error: Option<String> = daemon_address.is_none().then(|| {
+        daemon_unavailable_detail
+            .clone()
+            .unwrap_or_else(|| "SIFS browsing requires a daemon connection".to_string())
+    });
     while let Ok(command) = command_rx.recv() {
         match command {
             FilesWorkerCommand::List {
@@ -7483,8 +7494,8 @@ fn task_strip_action_slot(
 fn task_strip_row(shared: &Shared, reader: &ThemeReader, task: &FilesTask) -> impl Widget + use<> {
     let theme = reader();
     let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
-    let title_style = pal.text_style(&theme, 11.5, FontWeight::MEDIUM, pal.text);
-    let detail_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
+    let title_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, pal.text);
+    let detail_style = pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_faint);
     let title = format!("{} · {}", task.title, task.state.label());
     let detail = task_strip_detail_display(task);
     let progress = task_progress_fraction(task);
@@ -7520,7 +7531,7 @@ fn task_strip_content(
 ) -> impl Widget + use<> {
     let theme = reader();
     let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
-    let overflow_style = pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text_muted);
+    let overflow_style = pal.text_style(&theme, 11.0, FontWeight::MEDIUM, pal.text_muted);
     let hidden = task_strip_hidden_task_count(tasks);
     let has_finished = files_tasks_have_finished(tasks);
 
@@ -7660,7 +7671,7 @@ fn inspector_task_queue_content(
 ) -> impl Widget + use<> {
     let theme = reader();
     let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
-    let summary_style = pal.text_style(&theme, 10.8, FontWeight::MEDIUM, pal.text_muted);
+    let summary_style = pal.text_style(&theme, 11.0, FontWeight::MEDIUM, pal.text_muted);
     let has_finished = files_tasks_have_finished(tasks);
 
     let header_body = Flex::vertical()
@@ -9407,7 +9418,7 @@ impl InspectorView {
                 .fill(pal.panel)
                 .border(pal.border)
                 .title_color(pal.text)
-                .radius(8.0)
+                .radius(10.0)
                 .header_height(38.0)
                 .content_padding(Insets {
                     left: 12.0,
@@ -9632,7 +9643,7 @@ impl InspectorView {
                 .fill(pal.panel)
                 .border(pal.border)
                 .title_color(pal.text_faint)
-                .radius(8.0)
+                .radius(10.0)
                 .header_height(34.0)
                 .content_padding(Insets {
                     left: 12.0,
@@ -10303,7 +10314,7 @@ pub fn view(shared: Shared) -> impl Widget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Backend;
+    use crate::backend::{Backend, Connection};
     use crate::state::AppState;
     use sinomo_cli::app_api::SifsPinDetails;
 
@@ -12679,6 +12690,29 @@ mod tests {
         assert_eq!(
             state.connection_attention_detail(),
             Some("SIFS unavailable: daemon connection refused".to_string())
+        );
+    }
+
+    #[test]
+    fn embedded_daemon_failure_initializes_files_error() {
+        let mut backend = Backend::local_fallback();
+        backend.connection = Connection::LocalFallback {
+            reason: Some("embedded daemon exited before ready: duplicate config key".to_string()),
+        };
+
+        let state = FilesState::new(&backend);
+
+        assert_eq!(
+            state.error.as_deref(),
+            Some(
+                "embedded daemon failed: embedded daemon exited before ready: duplicate config key; daemon-backed chat and SIFS are unavailable"
+            )
+        );
+        assert_eq!(
+            state.connection_attention_detail().as_deref(),
+            Some(
+                "SIFS unavailable: embedded daemon failed: embedded daemon exited before ready: duplicate config key; daemon-backed chat and SIFS are unavailable"
+            )
         );
     }
 

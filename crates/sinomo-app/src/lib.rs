@@ -175,7 +175,8 @@ mod tests {
                 .strip_prefix(root)
                 .expect("app source file under root")
                 .display()
-                .to_string();
+                .to_string()
+                .replace('\\', "/");
             if relative == "backend/mod.rs" {
                 continue;
             }

@@ -163,6 +163,23 @@ impl Backend {
         self.cluster_snapshot_with_health_scope(ClusterHealthScope::Local)
     }
 
+    pub fn cluster_startup_snapshot(&self) -> ClusterSnapshot {
+        let observed_at = OffsetDateTime::now_utc();
+        let status = self.app_cluster_status();
+        ClusterSnapshot {
+            cluster_id: status.cluster_id,
+            local_node_id: status.local_node_id,
+            source: connection_source(&self.connection),
+            observed_at: observed_at.to_string(),
+            nodes: Vec::new(),
+            links: Vec::new(),
+            warnings: vec![
+                "cluster topology is loading in the background; open Cluster to refresh live health"
+                    .to_string(),
+            ],
+        }
+    }
+
     pub fn refresh_cluster_snapshot(&self) -> ClusterSnapshot {
         self.cluster_snapshot_with_health_scope(ClusterHealthScope::Full)
     }
@@ -613,7 +630,7 @@ fn connection_source(connection: &Connection) -> String {
     match connection {
         Connection::Daemon(status) => format!("daemon {}", status.address),
         Connection::InProcessDaemon(status) => format!("in-process daemon {}", status.address),
-        Connection::LocalFallback => "local files".to_string(),
+        Connection::LocalFallback { .. } => "local files".to_string(),
     }
 }
 

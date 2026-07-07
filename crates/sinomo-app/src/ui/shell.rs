@@ -487,7 +487,17 @@ impl Widget for Shell {
                 let (changed, became_ready) = self.shared.pump_connect();
                 if became_ready {
                     self.build_content();
-                    let waker = { self.shared.borrow().waker.clone() };
+                    let (backend, waker) = {
+                        let app = self.shared.borrow();
+                        let ready = app.ready.as_ref().expect("ready after connect");
+                        (ready.backend.clone(), app.waker.clone())
+                    };
+                    self.shared
+                        .settings_mut()
+                        .begin_initial_load(backend.clone(), waker.clone());
+                    self.shared
+                        .evolution_mut()
+                        .begin_dashboard_load(backend.data_dir.clone(), waker.clone());
                     self.shared.chat_mut().start_session_list_load(waker);
                     self.schedule_chat_session_timer(ctx);
                     self.start_cluster_refresh_if_active();
@@ -498,6 +508,16 @@ impl Widget for Shell {
                 // Drain any in-progress provider device-login (Settings tab).
                 let device_changed = if self.shared.is_ready() {
                     self.shared.settings_mut().pump_device_login()
+                } else {
+                    false
+                };
+                let settings_changed = if self.shared.is_ready() {
+                    self.shared.settings_mut().pump_initial_load()
+                } else {
+                    false
+                };
+                let evolution_changed = if self.shared.is_ready() {
+                    self.shared.evolution_mut().pump_dashboard_load()
                 } else {
                     false
                 };
@@ -517,12 +537,24 @@ impl Widget for Shell {
                     false
                 };
                 self.schedule_chat_session_timer(ctx);
-                if files_changed || cluster_changed || chat_changed {
+                if files_changed
+                    || cluster_changed
+                    || chat_changed
+                    || settings_changed
+                    || evolution_changed
+                {
                     ctx.request_measure();
                     ctx.request_arrange();
                     ctx.request_semantics();
                 }
-                if changed || device_changed || files_changed || cluster_changed || chat_changed {
+                if changed
+                    || device_changed
+                    || settings_changed
+                    || evolution_changed
+                    || files_changed
+                    || cluster_changed
+                    || chat_changed
+                {
                     ctx.request_paint();
                 }
                 self.sync_active_tab(ctx);
@@ -541,8 +573,18 @@ impl Widget for Shell {
             } else {
                 false
             };
+            let settings_changed = if self.shared.is_ready() {
+                self.shared.settings_mut().pump_initial_load()
+            } else {
+                false
+            };
+            let evolution_changed = if self.shared.is_ready() {
+                self.shared.evolution_mut().pump_dashboard_load()
+            } else {
+                false
+            };
             self.schedule_chat_session_timer(ctx);
-            if cluster_changed || chat_changed {
+            if cluster_changed || chat_changed || settings_changed || evolution_changed {
                 ctx.request_measure();
                 ctx.request_arrange();
                 ctx.request_semantics();
@@ -623,7 +665,7 @@ impl Shell {
     /// line, for a more polished loading look.
     fn paint_loading(&self, ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette) {
         let status = self.shared.status_text();
-        let style = pal.text_style(theme, 15.0, FontWeight::MEDIUM, pal.text_muted);
+        let style = pal.text_style(theme, 14.0, FontWeight::MEDIUM, pal.text_muted);
         let measurement = ctx.measure_text(status.clone(), style.clone()).ok();
         let tw = measurement.as_ref().map(|m| m.width).unwrap_or(160.0);
         let th = measurement.as_ref().map(|m| m.height).unwrap_or(20.0);
@@ -657,7 +699,16 @@ impl Shell {
             pal.accent
         };
 
-        let style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text_muted);
+        let style = pal.text_style(
+            theme,
+            12.0,
+            FontWeight::MEDIUM,
+            if status.degraded {
+                pal.warn_text
+            } else {
+                pal.text_muted
+            },
+        );
         let tw = ctx
             .measure_text(label.clone(), style.clone())
             .map(|m| m.width)
@@ -686,12 +737,14 @@ impl Shell {
         let pill = Rect::new(pill_x, pill_y, pill_w, pill_h);
         self.status_pill_rect.set(pill);
         let pressed = self.status_pill_pressed.get();
-        let bg = if pressed {
-            pal.hover
-        } else if status.degraded {
-            pal.field
+        // Mesh chip: quiet surface-2 fill with a hairline; a degraded mesh
+        // rides the warning wash so the state reads without shouting.
+        let bg = if status.degraded {
+            pal.warn_soft
+        } else if pressed {
+            pal.surface_3
         } else {
-            pal.field
+            pal.surface_2
         };
         widgets::round_panel(
             ctx,
@@ -821,11 +874,15 @@ fn shell_status(shared: &Shared) -> ShellStatus {
     };
 
     let mut issues = Vec::new();
-    if let Some(detail) = ready.chat.connection_attention_detail() {
+    if let Some(detail) = ready.backend.connection_issue_detail() {
         issues.push(detail);
-    }
-    if let Some(error) = ready.files.error.as_deref().filter(|text| !text.is_empty()) {
-        issues.push(format!("SIFS unavailable: {error}"));
+    } else {
+        if let Some(detail) = ready.chat.connection_attention_detail() {
+            issues.push(detail);
+        }
+        if let Some(error) = ready.files.error.as_deref().filter(|text| !text.is_empty()) {
+            issues.push(format!("SIFS unavailable: {error}"));
+        }
     }
 
     if issues.is_empty() {
@@ -860,7 +917,7 @@ fn shell_status(shared: &Shared) -> ShellStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Backend;
+    use crate::backend::{Backend, Connection};
     use crate::state::AppState;
     use crate::ui::chat::{ActivityTone, ChatActivityEntry};
     use crate::ui::settings::SettingsSection;
@@ -1182,6 +1239,24 @@ mod tests {
         let status = shell_status(&shared);
         assert_eq!(status.label, "Needs attention");
         assert!(status.detail.contains("SIFS store failed"));
+    }
+
+    #[test]
+    fn embedded_daemon_failure_sets_attention_status() {
+        let mut backend = Backend::local_fallback();
+        backend.connection = Connection::LocalFallback {
+            reason: Some("embedded daemon exited before ready: duplicate config key".to_string()),
+        };
+        let shared = Shared::new(AppState::ready(backend));
+
+        let status = shell_status(&shared);
+
+        assert_eq!(status.label, "Needs attention");
+        assert!(status.degraded);
+        assert!(!status.connected_daemon);
+        assert!(status.detail.contains("embedded daemon failed"));
+        assert!(status.detail.contains("duplicate config key"));
+        assert_eq!(shared.borrow().status, "Local (daemon failed)");
     }
 
     #[test]

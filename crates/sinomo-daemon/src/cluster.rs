@@ -4143,7 +4143,7 @@ async fn call_member_object_rpc_target_async(
     {
         Ok(response) => Ok(Some(response)),
         Err(error) => {
-            tracing::warn!(
+            tracing::debug!(
                 "sinomo daemon {operation} of {} failed: {error}",
                 member.node_id
             );

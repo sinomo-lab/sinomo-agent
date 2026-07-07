@@ -18,17 +18,18 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 
 use serde_json::Value;
 use sinomo_agent::{AgentDefinition, AgentOutputFormat, AgentPackageDefinition, AgentRole};
 use sinomo_cli::app_api::{SkillDetail, SkillMutationResult, SkillSummary, agent_summaries};
 use sui::{
-    Alignment, ArrangeCtx, Color, Constraints, DefaultTheme, Event, EventCtx, FieldGroup,
-    FontWeight, FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx,
-    PointerEventKind, Rect, ScrollState, ScrollView, Select, SemanticsCtx, Separator, Size,
-    SizedBox, Stack, Switch, SwitchView, TabBar, TextArea, TextInput, Widget, WidgetPod,
-    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
+    Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FieldGroup, FontWeight,
+    FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx, PointerEventKind, Rect,
+    ScrollState, ScrollView, Select, SemanticsCtx, Separator, Size, SizedBox, Stack, Switch,
+    SwitchView, TabBar, TextArea, TextInput, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, WindowEvent,
 };
 
 use sinomo_runtime::config::{
@@ -176,6 +177,8 @@ pub struct SettingsState {
     pub skill_action_error: Option<String>,
     pub skill_action_status: Option<String>,
     pub skill_text_expanded: bool,
+    initial_load_rx: Option<Receiver<SettingsState>>,
+    initial_load_started: bool,
     connection_detail_expanded: Vec<Tab>,
     node_detail_expanded: bool,
     advanced_detail_expanded: Vec<String>,
@@ -424,7 +427,7 @@ impl SettingsState {
                     });
                     (summary.is_some(), summary)
                 }
-                crate::backend::Connection::LocalFallback => (false, None),
+                crate::backend::Connection::LocalFallback { .. } => (false, None),
             }
         };
 
@@ -479,6 +482,8 @@ impl SettingsState {
             skill_action_error,
             skill_action_status: None,
             skill_text_expanded: false,
+            initial_load_rx: None,
+            initial_load_started: false,
             connection_detail_expanded: Vec::new(),
             node_detail_expanded: false,
             advanced_detail_expanded: Vec::new(),
@@ -486,6 +491,136 @@ impl SettingsState {
             provider_storage_detail_expanded: false,
             provider_remove_confirming: None,
         }
+    }
+
+    /// Cheap startup state for the interactive app. The full settings snapshot can touch config,
+    /// skills, modules, and cluster state, so it is preloaded after the shell is interactive.
+    pub fn new_lightweight(backend: &Backend) -> Self {
+        let data_dir = backend.data_dir.clone();
+        let cluster_status = backend.app_cluster_status();
+        let (clustered, cluster_summary) = if cluster_status.clustered {
+            (true, cluster_status.summary.clone())
+        } else {
+            match &backend.connection {
+                crate::backend::Connection::Daemon(status)
+                | crate::backend::Connection::InProcessDaemon(status) => {
+                    let summary = status.cluster.as_ref().map(|cluster| {
+                        format!(
+                            "cluster {} · {:?}",
+                            short(&format!("{:?}", cluster.cluster_id), 14),
+                            cluster.member_state
+                        )
+                    });
+                    (summary.is_some(), summary)
+                }
+                crate::backend::Connection::LocalFallback { .. } => (false, None),
+            }
+        };
+        Self {
+            data_dir,
+            config: backend.config.clone(),
+            config_items: Vec::new(),
+            config_error: Some("Settings data is loading.".to_string()),
+            provider_forms: Vec::new(),
+            mode_label: backend.mode_label(),
+            status_detail: backend.status_detail(),
+            node_id: backend.node.node_id.to_string(),
+            role: format!("{:?}", backend.node.role).to_lowercase(),
+            clustered,
+            cluster_id: cluster_status.cluster_id.clone(),
+            cluster_node_id: cluster_status.local_node_id.clone(),
+            cluster_summary,
+            join_invite: String::new(),
+            invite_result: None,
+            cluster_action_error: cluster_status.error,
+            cluster_action_status: None,
+            leave_confirming: false,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            selected: None,
+            field_errors: std::collections::HashMap::new(),
+            device_login: None,
+            provider_add_open: false,
+            provider_add_provider_index: 0,
+            provider_add_account: "default".to_string(),
+            provider_add_api_key: String::new(),
+            provider_add_model: provider_default_model(CONFIGURABLE_PROVIDERS[0]),
+            provider_add_base_url: String::new(),
+            provider_add_error: None,
+            provider_action_error: None,
+            provider_action_status: None,
+            agent_snapshot: AgentConfigSnapshot::default(),
+            agent_selected_id: None,
+            agent_form: AgentForm::new_custom("custom-agent".to_string()),
+            agent_action_error: None,
+            agent_action_status: None,
+            agent_delete_confirming: None,
+            module_snapshot: ModuleConfigSnapshot::default(),
+            module_selected_node_id: None,
+            module_action_error: None,
+            module_action_status: None,
+            skills: Vec::new(),
+            skill_detail: None,
+            skill_selected: None,
+            skills_include_all: true,
+            skill_import_path: String::new(),
+            skill_export_path: String::new(),
+            skill_action_error: None,
+            skill_action_status: None,
+            skill_text_expanded: false,
+            initial_load_rx: None,
+            initial_load_started: false,
+            connection_detail_expanded: Vec::new(),
+            node_detail_expanded: false,
+            advanced_detail_expanded: Vec::new(),
+            provider_detail_expanded: Vec::new(),
+            provider_storage_detail_expanded: false,
+            provider_remove_confirming: None,
+        }
+    }
+
+    pub fn begin_initial_load(&mut self, backend: Backend, waker: Option<sui::UiHandle>) -> bool {
+        if self.initial_load_started || self.initial_load_rx.is_some() {
+            return false;
+        }
+        let (tx, rx) = mpsc::channel();
+        match thread::Builder::new()
+            .name("sinomo-app-settings-load".to_string())
+            .spawn(move || {
+                let settings = SettingsState::new(&backend);
+                let _ = tx.send(settings);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }) {
+            Ok(_) => {
+                self.initial_load_rx = Some(rx);
+                self.initial_load_started = true;
+                true
+            }
+            Err(error) => {
+                self.config_error = Some(format!("Settings data failed to load: {error}"));
+                self.initial_load_started = false;
+                false
+            }
+        }
+    }
+
+    pub fn pump_initial_load(&mut self) -> bool {
+        let Some(rx) = self.initial_load_rx.as_ref() else {
+            return false;
+        };
+        let Ok(mut loaded) = rx.try_recv() else {
+            return false;
+        };
+        loaded.selected = self.selected;
+        loaded.connection_detail_expanded = self.connection_detail_expanded.clone();
+        loaded.node_detail_expanded = self.node_detail_expanded;
+        loaded.advanced_detail_expanded = self.advanced_detail_expanded.clone();
+        loaded.provider_detail_expanded = self.provider_detail_expanded.clone();
+        loaded.provider_storage_detail_expanded = self.provider_storage_detail_expanded;
+        loaded.initial_load_started = true;
+        *self = loaded;
+        true
     }
 
     /// Open a section's detail page.
@@ -2069,18 +2204,6 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     move || reader()
 }
 
-fn mix_color(from: Color, to: Color, amount: f32) -> Color {
-    let amount = amount.clamp(0.0, 1.0);
-    Color::new(
-        from.space,
-        from.red + (to.red - from.red) * amount,
-        from.green + (to.green - from.green) * amount,
-        from.blue + (to.blue - from.blue) * amount,
-        from.alpha + (to.alpha - from.alpha) * amount,
-    )
-    .clamped()
-}
-
 fn secondary_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     let reader = Rc::clone(reader);
     move || {
@@ -2102,15 +2225,14 @@ fn danger_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'sta
         let mut theme = reader();
         let danger = theme.palette.danger;
         let contrast = theme.palette.danger_text;
-        let border = theme.palette.border;
         theme.palette.accent = danger;
-        theme.palette.accent_hover = mix_color(danger, contrast, 0.08);
-        theme.palette.accent_pressed = mix_color(danger, contrast, 0.16);
-        theme.palette.accent_border = mix_color(danger, border, 0.12);
-        theme.palette.accent_border_hover = mix_color(danger, border, 0.20);
+        theme.palette.accent_hover = theme.palette.danger_hover;
+        theme.palette.accent_pressed = theme.palette.danger_hover;
+        theme.palette.accent_border = danger;
+        theme.palette.accent_border_hover = theme.palette.danger_hover;
         theme.palette.accent_border_focus = danger;
         theme.palette.accent_text = contrast;
-        theme.palette.focus_ring = danger.with_alpha(theme.palette.focus_ring.alpha);
+        // The focus ring stays the shared Mesh focus color: one ring, everywhere.
         theme
     }
 }
@@ -2159,6 +2281,15 @@ fn connection_issues(shared: &Shared) -> Vec<ConnectionIssue> {
     };
 
     let mut issues = Vec::new();
+    if let Some(detail) = ready.backend.connection_issue_detail() {
+        issues.push(ConnectionIssue {
+            title: "Daemon startup",
+            detail,
+            tab: Tab::Settings,
+            action: "Open Settings",
+        });
+        return issues;
+    }
     if let Some(detail) = ready.chat.connection_attention_detail_full() {
         issues.push(ConnectionIssue {
             title: "Chat sessions",
@@ -2502,6 +2633,7 @@ fn index_to_mode(i: usize) -> AppThemeMode {
     match i {
         0 => AppThemeMode::Light,
         1 => AppThemeMode::Dark,
+        2 => AppThemeMode::Void,
         _ => AppThemeMode::System,
     }
 }
@@ -2510,7 +2642,8 @@ fn mode_to_index(mode: AppThemeMode) -> usize {
     match mode {
         AppThemeMode::Light => 0,
         AppThemeMode::Dark => 1,
-        AppThemeMode::System => 2,
+        AppThemeMode::Void => 2,
+        AppThemeMode::System => 3,
     }
 }
 
@@ -2554,7 +2687,7 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
     let tab_bar = {
         let s = shared.clone();
         TabBar::new("theme")
-            .tabs(["Light", "Dark", "System"])
+            .tabs(["Light", "Dark", "Void", "System"])
             .selected(mode_index)
             .theme_when(clone_reader(reader))
             .on_change(move |i, _| {
@@ -6606,10 +6739,10 @@ impl Widget for StatusReflector {
         let (primary, _sub) = self.lines();
 
         let primary_color = match self.lines_is_error() {
-            true => pal.accent,
+            true => pal.danger_text,
             false => pal.text,
         };
-        let primary_style = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, primary_color);
+        let primary_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, primary_color);
         widgets::draw_text_in(
             ctx,
             Rect::new(bounds.x(), bounds.y(), bounds.width(), STATUS_LINE_H),
@@ -6876,6 +7009,23 @@ mod tests {
         )
         .expect("skill file");
         path
+    }
+
+    #[test]
+    fn lightweight_settings_state_defers_expensive_snapshots() {
+        let backend = Backend::local_fallback();
+        let state = SettingsState::new_lightweight(&backend);
+
+        assert!(state.config_items.is_empty());
+        assert!(state.provider_forms.is_empty());
+        assert!(state.agent_snapshot.agents.is_empty());
+        assert!(state.module_snapshot.nodes.is_empty());
+        assert!(state.skills.is_empty());
+        assert_eq!(
+            state.config_error.as_deref(),
+            Some("Settings data is loading.")
+        );
+        assert!(!state.initial_load_started);
     }
 
     #[test]
@@ -7956,13 +8106,29 @@ mod tests {
             "advanced configuration should expose raw value disclosures"
         );
 
+        // Click the topmost raw-value disclosure at its semantics bounds so the
+        // test tracks the layout instead of hardcoding coordinates.
+        let snapshot = window.snapshot()?;
+        let disclosure = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.role == sui::SemanticsRole::Button
+                    && node.name.as_deref() == Some("Edit raw value")
+            })
+            .min_by(|a, b| a.bounds.y().total_cmp(&b.bounds.y()))
+            .expect("raw value disclosure present")
+            .clone();
+        let center = sui::Point::new(
+            disclosure.bounds.x() + disclosure.bounds.width() / 2.0,
+            disclosure.bounds.y() + disclosure.bounds.height() / 2.0,
+        );
         let root = window.root();
-        let mut down =
-            sui::PointerEvent::new(sui::PointerEventKind::Down, sui::Point::new(510.0, 210.0));
+        let mut down = sui::PointerEvent::new(sui::PointerEventKind::Down, center);
         down.button = Some(sui::PointerButton::Primary);
         root.dispatch_event(sui::Event::Pointer(down))?;
-        let mut up =
-            sui::PointerEvent::new(sui::PointerEventKind::Up, sui::Point::new(510.0, 210.0));
+        let mut up = sui::PointerEvent::new(sui::PointerEventKind::Up, center);
         up.button = Some(sui::PointerButton::Primary);
         root.dispatch_event(sui::Event::Pointer(up))?;
 
