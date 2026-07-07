@@ -1748,6 +1748,14 @@ pub(crate) fn rollout_pending_error_grace(
     ROLLOUT_ACTIVE_STATUS_ERROR_GRACE
 }
 
+pub(crate) fn rollout_missing_status_grace(has_seen_matching_status: bool) -> Duration {
+    if has_seen_matching_status {
+        ROLLOUT_TERMINAL_STATUS_GRACE
+    } else {
+        ROLLOUT_ACTIVE_STATUS_ERROR_GRACE
+    }
+}
+
 fn send_rollout_request_with_progress<F>(
     target: &RolloutTarget,
     operation: &'static str,
@@ -1769,6 +1777,8 @@ where
     let mut drew_progress = false;
     let mut pending_error: Option<CliError> = None;
     let mut pending_error_started_at: Option<Instant> = None;
+    let mut has_seen_matching_status = false;
+    let mut missing_status_started_at: Option<Instant> = None;
     loop {
         if pending_error.is_none() {
             match result_rx.recv_timeout(ROLLOUT_PROGRESS_POLL_INTERVAL) {
@@ -1799,6 +1809,33 @@ where
             .ok()
             .and_then(|status| status.rollout)
             .filter(|status| rollout_status_matches_expectation(status, &expectation));
+        if rollout_status.is_some() {
+            has_seen_matching_status = true;
+            missing_status_started_at = None;
+        } else {
+            let missing_started_at = *missing_status_started_at.get_or_insert_with(Instant::now);
+            if missing_started_at.elapsed()
+                >= rollout_missing_status_grace(has_seen_matching_status)
+            {
+                if drew_progress {
+                    println!();
+                }
+                return Err(CliError::Network {
+                    address: target.label().to_string(),
+                    detail: if has_seen_matching_status {
+                        format!(
+                            "{operation} progress disappeared before the rollout request returned; run `sinomo rollout diagnostics --target {}`",
+                            target.label()
+                        )
+                    } else {
+                        format!(
+                            "{operation} did not publish progress before timeout; run `sinomo rollout diagnostics --target {}`",
+                            target.label()
+                        )
+                    },
+                });
+            }
+        }
         let line = format_rollout_progress_line(
             target.label(),
             operation,

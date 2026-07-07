@@ -43,8 +43,8 @@ use super::{
     parse_provider_command, parse_rollout_command, parse_slash_command, parse_test_command,
     parse_uninstall_options, parse_usage_options, read_cluster_rollout_status,
     require_cluster_runtime_quorum_with_paths_and_daemon, rollout_advance_with_data_dir,
-    rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_pending_error_grace,
-    rollout_progress_bar, rollout_status_matches_expectation,
+    rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_missing_status_grace,
+    rollout_pending_error_grace, rollout_progress_bar, rollout_status_matches_expectation,
     rollout_target_endpoint_for_main_with_connectivity, rollout_telemetry_gates_set_with_data_dir,
     rollout_terminal_response, run_tui_with_handler_io, run_tui_with_handler_io_and_daemon,
     shadow_daemon_node_id, sign_daemon_rpc_request_from_data_dir, stage_rollout_main_activation,
@@ -11571,6 +11571,15 @@ fn rollout_pending_error_grace_extends_for_matching_active_status() {
         rollout_pending_error_grace(Some(&status), &expectation),
         Duration::from_secs(45)
     );
+}
+
+#[test]
+fn rollout_missing_status_grace_shortens_after_matching_progress() {
+    assert_eq!(
+        rollout_missing_status_grace(false),
+        Duration::from_secs(15 * 60)
+    );
+    assert_eq!(rollout_missing_status_grace(true), Duration::from_secs(45));
 }
 
 #[test]
