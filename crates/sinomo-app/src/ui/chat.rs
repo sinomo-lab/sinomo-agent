@@ -5222,29 +5222,16 @@ fn danger_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'sta
         let mut theme = reader();
         let danger = theme.palette.danger;
         let contrast = theme.palette.danger_text;
-        let border = theme.palette.border;
         theme.palette.accent = danger;
-        theme.palette.accent_hover = mix_color(danger, contrast, 0.08);
-        theme.palette.accent_pressed = mix_color(danger, contrast, 0.16);
-        theme.palette.accent_border = mix_color(danger, border, 0.12);
-        theme.palette.accent_border_hover = mix_color(danger, border, 0.20);
+        theme.palette.accent_hover = theme.palette.danger_hover;
+        theme.palette.accent_pressed = theme.palette.danger_hover;
+        theme.palette.accent_border = danger;
+        theme.palette.accent_border_hover = theme.palette.danger_hover;
         theme.palette.accent_border_focus = danger;
         theme.palette.accent_text = contrast;
-        theme.palette.focus_ring = danger.with_alpha(theme.palette.focus_ring.alpha);
+        // The focus ring stays the shared Mesh focus color: one ring, everywhere.
         theme
     }
-}
-
-fn mix_color(base: Color, toward: Color, amount: f32) -> Color {
-    let amount = amount.clamp(0.0, 1.0);
-    Color::new(
-        base.space,
-        base.red + (toward.red - base.red) * amount,
-        base.green + (toward.green - base.green) * amount,
-        base.blue + (toward.blue - base.blue) * amount,
-        base.alpha + (toward.alpha - base.alpha) * amount,
-    )
-    .clamped()
 }
 
 /// Resolve the app chrome palette for the current theme (used by the `Label` color readers and the
@@ -5401,11 +5388,11 @@ fn color_from_rgb(rgb: [u8; 3]) -> Color {
 
 fn diff_line_color(line: &str, pal: &Palette) -> Color {
     if line.starts_with('+') && !line.starts_with("+++") {
-        pal.good
+        pal.ok_text
     } else if line.starts_with('-') && !line.starts_with("---") {
-        pal.bad
+        pal.danger_text
     } else if line.starts_with("@@") {
-        pal.accent
+        pal.accent_text
     } else {
         pal.text
     }
@@ -5413,11 +5400,11 @@ fn diff_line_color(line: &str, pal: &Palette) -> Color {
 
 fn diff_line_background(line: &str, pal: &Palette) -> Option<Color> {
     if line.starts_with('+') && !line.starts_with("+++") {
-        Some(pal.good.with_alpha(0.12))
+        Some(pal.ok_soft)
     } else if line.starts_with('-') && !line.starts_with("---") {
-        Some(pal.bad.with_alpha(0.12))
+        Some(pal.danger_soft)
     } else if line.starts_with("@@") {
-        Some(pal.accent.with_alpha(0.10))
+        Some(pal.accent_soft)
     } else {
         None
     }
@@ -6574,8 +6561,8 @@ fn session_row_content(
     let active = shared.chat().session_id == session.id;
     let editing = shared.chat().session_edit_id.as_deref() == Some(session.id.as_str());
     let label_color = if active { pal.text } else { pal.text_muted };
-    let title_style = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, label_color);
-    let meta_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
+    let title_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, label_color);
+    let meta_style = pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_faint);
     let icon_color = match session.kind {
         ConversationKind::Chat if active => pal.accent,
         ConversationKind::Chat => pal.text_faint,
@@ -7589,12 +7576,8 @@ impl Widget for SessionEditPopup {
 
     fn paint(&self, ctx: &mut PaintCtx) {
         let panel = self.panel_rect;
-        let scrim = if self.theme.surfaces.dark {
-            Color::srgba(0.0, 0.0, 0.0, 0.42)
-        } else {
-            Color::srgba(0.08, 0.12, 0.18, 0.14)
-        };
-        ctx.fill_rect(ctx.bounds(), scrim);
+        // Mesh scrim token; Void darkens further while Light stays airy.
+        ctx.fill_rect(ctx.bounds(), self.theme.surfaces.overlay_scrim);
         sui::paint_theme_shadow(
             ctx,
             panel,
@@ -7607,8 +7590,8 @@ impl Widget for SessionEditPopup {
             panel,
             &self.title,
             SectionPanelPaint::new()
-                .fill(self.theme.palette.surface_raised)
-                .border(self.theme.palette.border)
+                .fill(self.theme.surfaces.overlay)
+                .border(self.theme.palette.border_strong)
                 .title_color(self.theme.palette.text)
                 .radius(Self::CORNER_RADIUS)
                 .header_height(Self::PANEL_PADDING + Self::TITLE_HEIGHT + Self::BODY_GAP)
@@ -9682,24 +9665,20 @@ impl TranscriptView {
         let bubble_radius = theme.radius._2xl.min(14.0);
         let row_mode = mode == TranscriptLayoutMode::Row && !item.is_user && !is_error;
         let (container, content_x, content_w, text_color) = if row_mode {
+            // Wide transcripts read as a log row: quiet surface, subtle
+            // hairline, the agent's identity hue on the rail glyph.
             let rail_w = 24.0;
             let rail_gap = 10.0;
             let row_w =
                 (item.bubble_w + rail_w + rail_gap).min((area.width() - PAD * 2.0).max(0.0));
             let row = Rect::new(area.x() + PAD, y, row_w, item.bubble_h);
-            let radius = theme.radius.lg.min(8.0);
-            paint_rounded_panel(
-                ctx,
-                row,
-                pal.panel.with_alpha(if pal.dark { 0.74 } else { 0.82 }),
-                pal.border.with_alpha(0.72),
-                radius,
-            );
+            let radius = theme.radius.md.min(6.0);
+            paint_rounded_panel(ctx, row, pal.panel, pal.border_subtle, radius);
             draw_glyph(
                 ctx,
                 IconGlyph::Sparkles,
                 Rect::new(row.x() + 5.0, row.y() + 10.0, 14.0, 14.0),
-                pal.accent,
+                pal.agent[0],
             );
             (
                 row,
@@ -9708,25 +9687,26 @@ impl TranscriptView {
                 pal.text,
             )
         } else {
+            // Mesh bubbles: user rides the accent wash with an accent border,
+            // the agent stays on the quiet surface tier, errors go danger-soft.
             let (bx, bubble_color, text_color, border) = if item.is_user {
                 (
                     area.x() + area.width() - PAD - item.bubble_w,
-                    pal.selected,
+                    pal.accent_soft,
                     pal.text,
-                    Some(pal.accent.with_alpha(0.35)),
+                    Some(pal.accent_border),
                 )
             } else if is_error {
-                (area.x() + PAD, pal.panel, pal.text, Some(pal.bad))
+                (area.x() + PAD, pal.danger_soft, pal.text, Some(pal.bad))
             } else {
-                (area.x() + PAD, pal.panel, pal.text, Some(pal.border))
+                (
+                    area.x() + PAD,
+                    pal.surface_2,
+                    pal.text,
+                    Some(pal.border_subtle),
+                )
             };
             let bubble = Rect::new(bx, y, item.bubble_w, item.bubble_h);
-            sui::paint_theme_shadow(
-                ctx,
-                bubble,
-                [bubble_radius; 4],
-                &theme.shadows.box_shadow.xs,
-            );
             match border {
                 Some(bc) => paint_rounded_panel(ctx, bubble, bubble_color, bc, bubble_radius),
                 None => paint_rounded_rect(ctx, bubble, bubble_color, bubble_radius),
@@ -9800,17 +9780,19 @@ impl TranscriptView {
             .language
             .as_deref()
             .unwrap_or(if code.is_diff { "diff" } else { "text" });
+        // Mesh code blocks: bg-subtle in Light, the inset field tier in
+        // dark/void; a quiet surface-2 header band with the mono meta label.
         let content = paint_code_panel(
             ctx,
             theme,
             rect,
             label,
             CodePanelPaint::new()
-                .fill(pal.field)
+                .fill(if pal.dark { pal.field } else { pal.bg_subtle })
                 .border(pal.border)
-                .header_fill(pal.titlebar)
+                .header_fill(pal.surface_2)
                 .label_color(pal.text_faint)
-                .radius(theme.radius.xl.min(10.0))
+                .radius(theme.radius.md.min(6.0))
                 .header_height(24.0),
         );
         if content.width() <= 0.0 || content.height() <= 0.0 {
@@ -9988,12 +9970,13 @@ impl TranscriptView {
     }
 
     fn tool_card_paint(pal: &Palette) -> ActionTilePaint {
+        // Mesh tool-call card: quiet surface, hairline border, r-2 corners.
         ActionTilePaint::neutral()
             .background(pal.panel)
             .border(pal.border)
             .title_color(pal.text)
             .subtitle_color(pal.text_faint)
-            .radius(10.0)
+            .radius(6.0)
             .padding_x(12.0)
     }
 
@@ -11527,12 +11510,14 @@ fn composer_control_row(
     } else {
         42.0
     };
+    // Mesh accent discipline: Send is the composer's one primary action, so
+    // the model picker rides the quiet neutral treatment like its siblings.
     let model = {
         let s = shared.clone();
         sui::Button::new(model_button_label(&shared.chat()))
             .icon(IconGlyph::Sparkles)
             .min_height(CONTROL_ROW_H)
-            .theme_when(composer_control_reader(reader))
+            .theme_when(secondary_button_theme(reader))
             .on_press_with_ctx(move |ctx| {
                 s.chat_mut().toggle_composer_popup(ComposerPopup::Model);
                 request_chat_window_relayout(ctx);

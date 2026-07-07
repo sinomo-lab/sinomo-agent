@@ -488,7 +488,7 @@ fn paint_header(
     topology: &Topology,
     refreshing: bool,
 ) {
-    let title = pal.text_style(theme, 21.0, FontWeight::SEMIBOLD, pal.text);
+    let title = pal.text_style(theme, 20.0, FontWeight::SEMIBOLD, pal.text);
     widgets::draw_text_in(
         ctx,
         Rect::new(bounds.x() + PAD, bounds.y() + 16.0, 280.0, 28.0),
@@ -502,7 +502,7 @@ fn paint_header(
     } else {
         subtitle
     };
-    let style = pal.text_style(theme, 13.0, FontWeight::NORMAL, pal.text_muted);
+    let style = pal.text_style(theme, 14.0, FontWeight::NORMAL, pal.text_muted);
     widgets::draw_text_in(
         ctx,
         Rect::new(
@@ -550,7 +550,7 @@ fn paint_empty(
     widgets::draw_centered(
         ctx,
         detail,
-        pal.text_style(theme, 13.0, FontWeight::NORMAL, pal.text_faint),
+        pal.text_style(theme, 14.0, FontWeight::NORMAL, pal.text_faint),
         cx,
         cy + 18.0,
     );
@@ -567,13 +567,13 @@ fn paint_edges(ctx: &mut PaintCtx, pal: &Palette, topology: &Topology, layout: &
             continue;
         };
         let color = if edge.public_ip {
-            pal.accent
+            pal.info
         } else if edge.state == "degraded" {
             pal.warn
         } else {
-            pal.border_strong.with_alpha(0.76)
+            pal.border_strong
         };
-        let width = if edge.virtual_lan { 1.6 } else { 2.0 };
+        let width = if edge.virtual_lan { 1.0 } else { 1.5 };
         let mut path = PathBuilder::new();
         path.move_to(*a).line_to(*b);
         ctx.stroke(path.build(), color, StrokeStyle::new(width));
@@ -613,8 +613,19 @@ fn paint_vertices(
                 vertex.radius + if selected_here { 4.0 } else { 1.0 },
             ),
             border,
-            StrokeStyle::new(if selected_here { 2.2 } else { 1.1 }),
+            StrokeStyle::new(if selected_here { 2.0 } else { 1.25 }),
         );
+        if selected_here {
+            // Selected nodes glow like the Mesh cluster map's self node — a
+            // soft accent halo outside the ring (empty in Light, damped in Void).
+            if let Some(glow) = pal.glow_accent.first {
+                ctx.stroke(
+                    Path::circle(vertex.center, vertex.radius + 6.0),
+                    glow.color,
+                    StrokeStyle::new(glow.blur * 0.35),
+                );
+            }
+        }
         if vertex.vertex.kind == GraphVertexKind::Node && vertex.vertex.public_reachable {
             paint_public_reachability_badge(ctx, pal, vertex.center, vertex.radius);
         }
@@ -628,7 +639,7 @@ fn paint_vertices(
             vertex.center.x,
             label_y,
         );
-        let detail_style = pal.text_style(theme, 10.5, FontWeight::NORMAL, pal.text_faint);
+        let detail_style = pal.text_style(theme, 11.0, FontWeight::NORMAL, pal.text_faint);
         widgets::draw_centered(
             ctx,
             &vertex.vertex.detail,
@@ -647,8 +658,8 @@ fn paint_legend(ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette, bo
         (pal.good, "online"),
         (pal.bad, "offline"),
         (unknown_node_color(pal), "unknown"),
-        (lan_segment_color(), "LAN"),
-        (public_node_color(), "public route"),
+        (lan_segment_color(pal), "LAN"),
+        (public_node_color(pal), "public route"),
     ];
     let mut cursor = x;
     for (color, label) in items {
@@ -666,7 +677,7 @@ fn paint_legend(ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette, bo
 
 fn vertex_fill(pal: &Palette, vertex: &GraphVertex) -> Color {
     match vertex.kind {
-        GraphVertexKind::LanSegment => lan_segment_color(),
+        GraphVertexKind::LanSegment => lan_segment_color(pal),
         GraphVertexKind::Node => match vertex.availability.as_str() {
             "online" => pal.good,
             "offline" => pal.bad,
@@ -678,7 +689,7 @@ fn vertex_fill(pal: &Palette, vertex: &GraphVertex) -> Color {
 
 fn paint_public_reachability_badge(ctx: &mut PaintCtx, pal: &Palette, center: Point, radius: f32) {
     let badge_center = Point::new(center.x + radius * 0.58, center.y - radius * 0.58);
-    ctx.fill(Path::circle(badge_center, 5.5), public_node_color());
+    ctx.fill(Path::circle(badge_center, 5.5), public_node_color(pal));
     ctx.stroke(
         Path::circle(badge_center, 6.4),
         pal.panel,
@@ -686,20 +697,20 @@ fn paint_public_reachability_badge(ctx: &mut PaintCtx, pal: &Palette, center: Po
     );
 }
 
-fn public_node_color() -> Color {
-    Color::srgba(0.14, 0.52, 0.92, 1.0)
+/// Public/internet reachability rides the informational hue.
+fn public_node_color(pal: &Palette) -> Color {
+    pal.info
 }
 
-fn lan_segment_color() -> Color {
-    Color::srgba(0.58, 0.41, 0.10, 1.0)
+/// LAN segment hubs use the amber agent hue — a topology identity, not a
+/// warning (labels next to them stay on ink tokens).
+fn lan_segment_color(pal: &Palette) -> Color {
+    pal.agent[3]
 }
 
+/// Unknown availability reads as disabled, not as a status.
 fn unknown_node_color(pal: &Palette) -> Color {
-    if pal.dark {
-        Color::srgba(0.28, 0.34, 0.42, 1.0)
-    } else {
-        Color::srgba(0.78, 0.84, 0.91, 1.0)
-    }
+    pal.text_disabled
 }
 
 enum DetailRowLayout {
@@ -814,7 +825,10 @@ fn paint_detail_panel(
     refreshing: bool,
 ) {
     let panel = detail_panel_rect(bounds);
-    widgets::round_panel(ctx, panel, pal.panel.with_alpha(0.96), pal.border, 8.0);
+    // Floating inspector: Mesh overlay surface with a strong border and the
+    // medium shadow ladder (empty in Void, where the border carries elevation).
+    sui::paint_theme_shadow(ctx, panel, [10.0; 4], &theme.shadows.box_shadow.md);
+    widgets::round_panel(ctx, panel, pal.overlay, pal.border_strong, 10.0);
 
     let lines = selection
         .map(|selection| detail_lines(snapshot, topology, selection, diagnostics_open))
@@ -823,10 +837,10 @@ fn paint_detail_panel(
         selection.is_none() && !refreshing && cluster_actionable_warning(snapshot).is_some();
     let show_overview_details = overview_detail_toggle_visible(snapshot, selection);
     let selected_warning_action = selected_node_needs_connection_settings(snapshot, selection);
-    let title_style = pal.text_style(theme, 15.0, FontWeight::SEMIBOLD, pal.text);
+    let title_style = pal.text_style(theme, 14.0, FontWeight::SEMIBOLD, pal.text);
     let label_style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text_muted);
     let value_style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text);
-    let hint_style = pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text_faint);
+    let hint_style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_faint);
     let mut cy = panel.y() + PANEL_PAD;
     if let Some((title, rest)) = lines.split_first() {
         widgets::draw_text_in(
@@ -1469,7 +1483,7 @@ fn paint_detail_toggle(
     rect: Rect,
     diagnostics_open: bool,
 ) {
-    widgets::round_panel(ctx, rect, pal.field, pal.border, 7.0);
+    widgets::round_panel(ctx, rect, pal.surface_2, pal.border, 6.0);
     widgets::draw_text_in(
         ctx,
         Rect::new(rect.x() + 10.0, rect.y() + 5.0, rect.width() - 20.0, 18.0),
@@ -1480,7 +1494,7 @@ fn paint_detail_toggle(
         } else {
             "Show diagnostics"
         },
-        pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.text),
+        pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text),
     );
 }
 
@@ -1490,7 +1504,7 @@ fn paint_cluster_warning_action(
     pal: &Palette,
     rect: Rect,
 ) {
-    widgets::round_panel(ctx, rect, pal.accent, pal.accent, 7.0);
+    widgets::round_panel(ctx, rect, pal.accent, pal.accent, 6.0);
     draw_glyph(
         ctx,
         IconGlyph::Alert,
@@ -1505,7 +1519,7 @@ fn paint_cluster_warning_action(
         } else {
             "Connection settings"
         },
-        pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.on_accent),
+        pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.on_accent),
     );
 }
 
@@ -1516,14 +1530,23 @@ fn paint_cluster_refresh_action(
     rect: Rect,
     refreshing: bool,
 ) {
-    let fill = if refreshing { pal.selected } else { pal.field };
-    widgets::round_panel(ctx, rect, fill, pal.border, 7.0);
+    let fill = if refreshing {
+        pal.accent_soft
+    } else {
+        pal.surface_2
+    };
+    let border = if refreshing {
+        pal.accent_border
+    } else {
+        pal.border
+    };
+    widgets::round_panel(ctx, rect, fill, border, 6.0);
     draw_glyph(
         ctx,
         IconGlyph::Redo,
         Rect::new(rect.x() + 10.0, rect.y() + 7.0, 14.0, 14.0),
         if refreshing {
-            pal.accent
+            pal.accent_text
         } else {
             pal.text_muted
         },
@@ -1532,7 +1555,7 @@ fn paint_cluster_refresh_action(
         ctx,
         Rect::new(rect.x() + 30.0, rect.y() + 5.0, rect.width() - 36.0, 18.0),
         if refreshing { "Refreshing" } else { "Refresh" },
-        pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.text),
+        pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text),
     );
 }
 
@@ -2551,7 +2574,7 @@ mod tests {
         let fill = vertex_fill(&pal, &topology.vertices[0]);
 
         assert_eq!(fill, pal.bad);
-        assert_ne!(fill, public_node_color());
+        assert_ne!(fill, public_node_color(&pal));
     }
 
     #[test]

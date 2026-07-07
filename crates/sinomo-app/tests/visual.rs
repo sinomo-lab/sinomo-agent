@@ -127,6 +127,18 @@ fn capture_tabs() {
         shared.borrow_mut().theme_mode = AppThemeMode::Light;
         capture(shared, name);
     }
+
+    // Void (true-black OLED) variants to validate the border-only elevation.
+    for (tab, name) in [
+        (Tab::Sinomo, "sinomo-void"),
+        (Tab::Evolution, "evolution-void"),
+        (Tab::Cluster, "cluster-void"),
+        (Tab::Settings, "settings-void"),
+    ] {
+        let shared = boot(tab);
+        shared.borrow_mut().theme_mode = AppThemeMode::Void;
+        capture(shared, name);
+    }
 }
 
 #[test]

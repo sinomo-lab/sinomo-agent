@@ -7494,8 +7494,8 @@ fn task_strip_action_slot(
 fn task_strip_row(shared: &Shared, reader: &ThemeReader, task: &FilesTask) -> impl Widget + use<> {
     let theme = reader();
     let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
-    let title_style = pal.text_style(&theme, 11.5, FontWeight::MEDIUM, pal.text);
-    let detail_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
+    let title_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, pal.text);
+    let detail_style = pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_faint);
     let title = format!("{} · {}", task.title, task.state.label());
     let detail = task_strip_detail_display(task);
     let progress = task_progress_fraction(task);
@@ -7531,7 +7531,7 @@ fn task_strip_content(
 ) -> impl Widget + use<> {
     let theme = reader();
     let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
-    let overflow_style = pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text_muted);
+    let overflow_style = pal.text_style(&theme, 11.0, FontWeight::MEDIUM, pal.text_muted);
     let hidden = task_strip_hidden_task_count(tasks);
     let has_finished = files_tasks_have_finished(tasks);
 
@@ -7671,7 +7671,7 @@ fn inspector_task_queue_content(
 ) -> impl Widget + use<> {
     let theme = reader();
     let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
-    let summary_style = pal.text_style(&theme, 10.8, FontWeight::MEDIUM, pal.text_muted);
+    let summary_style = pal.text_style(&theme, 11.0, FontWeight::MEDIUM, pal.text_muted);
     let has_finished = files_tasks_have_finished(tasks);
 
     let header_body = Flex::vertical()
@@ -9418,7 +9418,7 @@ impl InspectorView {
                 .fill(pal.panel)
                 .border(pal.border)
                 .title_color(pal.text)
-                .radius(8.0)
+                .radius(10.0)
                 .header_height(38.0)
                 .content_padding(Insets {
                     left: 12.0,
@@ -9643,7 +9643,7 @@ impl InspectorView {
                 .fill(pal.panel)
                 .border(pal.border)
                 .title_color(pal.text_faint)
-                .radius(8.0)
+                .radius(10.0)
                 .header_height(34.0)
                 .content_padding(Insets {
                     left: 12.0,

@@ -663,7 +663,7 @@ impl Shell {
     /// line, for a more polished loading look.
     fn paint_loading(&self, ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette) {
         let status = self.shared.status_text();
-        let style = pal.text_style(theme, 15.0, FontWeight::MEDIUM, pal.text_muted);
+        let style = pal.text_style(theme, 14.0, FontWeight::MEDIUM, pal.text_muted);
         let measurement = ctx.measure_text(status.clone(), style.clone()).ok();
         let tw = measurement.as_ref().map(|m| m.width).unwrap_or(160.0);
         let th = measurement.as_ref().map(|m| m.height).unwrap_or(20.0);
@@ -697,7 +697,16 @@ impl Shell {
             pal.accent
         };
 
-        let style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text_muted);
+        let style = pal.text_style(
+            theme,
+            12.0,
+            FontWeight::MEDIUM,
+            if status.degraded {
+                pal.warn_text
+            } else {
+                pal.text_muted
+            },
+        );
         let tw = ctx
             .measure_text(label.clone(), style.clone())
             .map(|m| m.width)
@@ -726,12 +735,14 @@ impl Shell {
         let pill = Rect::new(pill_x, pill_y, pill_w, pill_h);
         self.status_pill_rect.set(pill);
         let pressed = self.status_pill_pressed.get();
-        let bg = if pressed {
-            pal.hover
-        } else if status.degraded {
-            pal.field
+        // Mesh chip: quiet surface-2 fill with a hairline; a degraded mesh
+        // rides the warning wash so the state reads without shouting.
+        let bg = if status.degraded {
+            pal.warn_soft
+        } else if pressed {
+            pal.surface_3
         } else {
-            pal.field
+            pal.surface_2
         };
         widgets::round_panel(
             ctx,

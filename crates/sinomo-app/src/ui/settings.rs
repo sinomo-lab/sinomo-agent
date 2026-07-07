@@ -25,11 +25,11 @@ use serde_json::Value;
 use sinomo_agent::{AgentDefinition, AgentOutputFormat, AgentPackageDefinition, AgentRole};
 use sinomo_cli::app_api::{SkillDetail, SkillMutationResult, SkillSummary, agent_summaries};
 use sui::{
-    Alignment, ArrangeCtx, Color, Constraints, DefaultTheme, Event, EventCtx, FieldGroup,
-    FontWeight, FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx,
-    PointerEventKind, Rect, ScrollState, ScrollView, Select, SemanticsCtx, Separator, Size,
-    SizedBox, Stack, Switch, SwitchView, TabBar, TextArea, TextInput, Widget, WidgetPod,
-    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
+    Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FieldGroup, FontWeight,
+    FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx, PointerEventKind, Rect,
+    ScrollState, ScrollView, Select, SemanticsCtx, Separator, Size, SizedBox, Stack, Switch,
+    SwitchView, TabBar, TextArea, TextInput, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, WindowEvent,
 };
 
 use sinomo_runtime::config::{
@@ -2204,18 +2204,6 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     move || reader()
 }
 
-fn mix_color(from: Color, to: Color, amount: f32) -> Color {
-    let amount = amount.clamp(0.0, 1.0);
-    Color::new(
-        from.space,
-        from.red + (to.red - from.red) * amount,
-        from.green + (to.green - from.green) * amount,
-        from.blue + (to.blue - from.blue) * amount,
-        from.alpha + (to.alpha - from.alpha) * amount,
-    )
-    .clamped()
-}
-
 fn secondary_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     let reader = Rc::clone(reader);
     move || {
@@ -2237,15 +2225,14 @@ fn danger_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'sta
         let mut theme = reader();
         let danger = theme.palette.danger;
         let contrast = theme.palette.danger_text;
-        let border = theme.palette.border;
         theme.palette.accent = danger;
-        theme.palette.accent_hover = mix_color(danger, contrast, 0.08);
-        theme.palette.accent_pressed = mix_color(danger, contrast, 0.16);
-        theme.palette.accent_border = mix_color(danger, border, 0.12);
-        theme.palette.accent_border_hover = mix_color(danger, border, 0.20);
+        theme.palette.accent_hover = theme.palette.danger_hover;
+        theme.palette.accent_pressed = theme.palette.danger_hover;
+        theme.palette.accent_border = danger;
+        theme.palette.accent_border_hover = theme.palette.danger_hover;
         theme.palette.accent_border_focus = danger;
         theme.palette.accent_text = contrast;
-        theme.palette.focus_ring = danger.with_alpha(theme.palette.focus_ring.alpha);
+        // The focus ring stays the shared Mesh focus color: one ring, everywhere.
         theme
     }
 }
@@ -2646,6 +2633,7 @@ fn index_to_mode(i: usize) -> AppThemeMode {
     match i {
         0 => AppThemeMode::Light,
         1 => AppThemeMode::Dark,
+        2 => AppThemeMode::Void,
         _ => AppThemeMode::System,
     }
 }
@@ -2654,7 +2642,8 @@ fn mode_to_index(mode: AppThemeMode) -> usize {
     match mode {
         AppThemeMode::Light => 0,
         AppThemeMode::Dark => 1,
-        AppThemeMode::System => 2,
+        AppThemeMode::Void => 2,
+        AppThemeMode::System => 3,
     }
 }
 
@@ -2698,7 +2687,7 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
     let tab_bar = {
         let s = shared.clone();
         TabBar::new("theme")
-            .tabs(["Light", "Dark", "System"])
+            .tabs(["Light", "Dark", "Void", "System"])
             .selected(mode_index)
             .theme_when(clone_reader(reader))
             .on_change(move |i, _| {
@@ -6750,10 +6739,10 @@ impl Widget for StatusReflector {
         let (primary, _sub) = self.lines();
 
         let primary_color = match self.lines_is_error() {
-            true => pal.accent,
+            true => pal.danger_text,
             false => pal.text,
         };
-        let primary_style = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, primary_color);
+        let primary_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, primary_color);
         widgets::draw_text_in(
             ctx,
             Rect::new(bounds.x(), bounds.y(), bounds.width(), STATUS_LINE_H),
@@ -8117,13 +8106,29 @@ mod tests {
             "advanced configuration should expose raw value disclosures"
         );
 
+        // Click the topmost raw-value disclosure at its semantics bounds so the
+        // test tracks the layout instead of hardcoding coordinates.
+        let snapshot = window.snapshot()?;
+        let disclosure = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.role == sui::SemanticsRole::Button
+                    && node.name.as_deref() == Some("Edit raw value")
+            })
+            .min_by(|a, b| a.bounds.y().total_cmp(&b.bounds.y()))
+            .expect("raw value disclosure present")
+            .clone();
+        let center = sui::Point::new(
+            disclosure.bounds.x() + disclosure.bounds.width() / 2.0,
+            disclosure.bounds.y() + disclosure.bounds.height() / 2.0,
+        );
         let root = window.root();
-        let mut down =
-            sui::PointerEvent::new(sui::PointerEventKind::Down, sui::Point::new(510.0, 210.0));
+        let mut down = sui::PointerEvent::new(sui::PointerEventKind::Down, center);
         down.button = Some(sui::PointerButton::Primary);
         root.dispatch_event(sui::Event::Pointer(down))?;
-        let mut up =
-            sui::PointerEvent::new(sui::PointerEventKind::Up, sui::Point::new(510.0, 210.0));
+        let mut up = sui::PointerEvent::new(sui::PointerEventKind::Up, center);
         up.button = Some(sui::PointerButton::Primary);
         root.dispatch_event(sui::Event::Pointer(up))?;
 

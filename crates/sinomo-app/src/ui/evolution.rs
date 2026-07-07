@@ -32,8 +32,9 @@ const START_NARROW_COLLAPSED_H: f32 = 206.0;
 const START_NARROW_EXPANDED_H: f32 = 270.0;
 const START_BREAKPOINT: f32 = 760.0;
 const CONTROL_LABEL_H: f32 = 14.0;
-const CONTROL_LABEL_GAP: f32 = 5.0;
-const CONTROL_H: f32 = 38.0;
+const CONTROL_LABEL_GAP: f32 = 4.0;
+/// Form controls ride the Mesh large control height (`--sm-ctl-h-lg`).
+const CONTROL_H: f32 = 34.0;
 const CONTROL_GAP: f32 = 8.0;
 const STARTER_ACTION_COUNT: usize = 3;
 const STARTER_ACTION_H: f32 = 30.0;
@@ -48,7 +49,8 @@ const QUEUE_HEADER_H: f32 = 48.0;
 const ROW_H: f32 = 78.0;
 const SECTION_GAP: f32 = 16.0;
 const DECISION_SECTION_H: f32 = 146.0;
-const DECISION_BUTTON_H: f32 = 32.0;
+/// Decision actions use the Mesh control height (`--sm-ctl-h`).
+const DECISION_BUTTON_H: f32 = 28.0;
 const READINESS_DETAIL_BUTTON_W: f32 = 136.0;
 const OBJECTIVE_PLACEHOLDER: &str = "Describe the improvement or task";
 const SCOPE_PLACEHOLDER: &str = "Optional: path globs, comma-separated";
@@ -507,6 +509,24 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     move || reader()
 }
 
+/// Quiet Mesh neutral treatment for secondary actions: surface-2 fill,
+/// hairline border, ink label. Keeps the accent budget for the one primary
+/// action per view.
+fn secondary_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || {
+        let mut theme = reader();
+        theme.palette.accent = theme.palette.control;
+        theme.palette.accent_hover = theme.palette.control_hover;
+        theme.palette.accent_pressed = theme.palette.control_active;
+        theme.palette.accent_border = theme.palette.border;
+        theme.palette.accent_border_hover = theme.palette.border_hover;
+        theme.palette.accent_border_focus = theme.palette.border_focus;
+        theme.palette.accent_text = theme.palette.text;
+        theme
+    }
+}
+
 struct RebuildOnChange<K: PartialEq + Clone> {
     key_fn: Box<dyn Fn() -> K>,
     build: Box<dyn Fn(&K) -> WidgetPod>,
@@ -623,7 +643,7 @@ impl EvolutionView {
             Button::new("Show details")
                 .icon(IconGlyph::ChevronDown)
                 .min_height(DECISION_BUTTON_H)
-                .theme_when(clone_reader(&reader))
+                .theme_when(secondary_button_theme(&reader))
                 .on_press_with_ctx(move |ctx| {
                     s.evolution_mut().set_readiness_details_open(true);
                     ctx.request_arrange();
@@ -635,7 +655,7 @@ impl EvolutionView {
             Button::new("Hide details")
                 .icon(IconGlyph::ChevronUp)
                 .min_height(DECISION_BUTTON_H)
-                .theme_when(clone_reader(&reader))
+                .theme_when(secondary_button_theme(&reader))
                 .on_press_with_ctx(move |ctx| {
                     s.evolution_mut().set_readiness_details_open(false);
                     ctx.request_arrange();
@@ -664,7 +684,7 @@ impl EvolutionView {
             Button::new("Reject")
                 .icon(IconGlyph::Close)
                 .min_height(DECISION_BUTTON_H)
-                .theme_when(clone_reader(&reader))
+                .theme_when(secondary_button_theme(&reader))
                 .enabled_when({
                     let s = s.clone();
                     move || s.evolution().can_decide_selected()
@@ -766,7 +786,7 @@ impl StartControls {
             let s = shared.clone();
             Button::new("Options")
                 .icon(IconGlyph::ChevronDown)
-                .theme_when(clone_reader(&reader))
+                .theme_when(secondary_button_theme(&reader))
                 .on_press_with_ctx(move |ctx| {
                     s.evolution_mut().toggle_start_advanced();
                     ctx.request_measure();
@@ -840,7 +860,7 @@ impl StartControls {
                     .icon(action.icon())
                     .min_height(STARTER_ACTION_H)
                     .enabled_when(move || !enabled_shared.evolution().is_starting())
-                    .theme_when(clone_reader(&reader))
+                    .theme_when(secondary_button_theme(&reader))
                     .on_press_with_ctx(move |ctx| {
                         s.evolution_mut().apply_starter_objective(action);
                         request_window_relayout(ctx);
@@ -1538,7 +1558,7 @@ fn paint_header(
     dashboard: &EvolutionDashboard,
 ) {
     ctx.fill_rect(rect, pal.window);
-    let title = pal.text_style(theme, 21.0, FontWeight::SEMIBOLD, pal.text);
+    let title = pal.text_style(theme, 20.0, FontWeight::SEMIBOLD, pal.text);
     widgets::draw_text_in(
         ctx,
         Rect::new(rect.x() + PAD, rect.y() + 12.0, 260.0, 28.0),
@@ -1556,7 +1576,7 @@ fn paint_header(
             22.0,
         ),
         &subtitle,
-        pal.text_style(theme, 13.0, FontWeight::NORMAL, pal.text_muted),
+        pal.text_style(theme, 14.0, FontWeight::NORMAL, pal.text_muted),
     );
 
     if rect.width() > 740.0 {
@@ -1592,7 +1612,7 @@ fn paint_metric(
     value: usize,
     color: Color,
 ) {
-    widgets::round_panel(ctx, rect, pal.panel, pal.border, 7.0);
+    widgets::round_panel(ctx, rect, pal.panel, pal.border, 10.0);
     ctx.fill(
         Path::circle(widgets::point(rect.x() + 14.0, rect.y() + 15.0), 4.0),
         color,
@@ -1628,7 +1648,7 @@ fn paint_start_panel(
         ctx,
         Rect::new(rect.x() + PAD, rect.y() + 10.0, 150.0, 22.0),
         "Start job",
-        pal.text_style(theme, 15.0, FontWeight::SEMIBOLD, pal.text),
+        pal.text_style(theme, 14.0, FontWeight::SEMIBOLD, pal.text),
     );
 
     let (status, status_color) = {
@@ -1731,7 +1751,7 @@ fn paint_start_label(
         ctx,
         rect,
         label,
-        pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text_faint),
+        pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text_faint),
     );
 }
 
@@ -1770,7 +1790,7 @@ fn paint_queue(
             18.0,
         ),
         "Observed through promoted lifecycle",
-        pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text_faint),
+        pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_faint),
     );
 
     if dashboard.jobs.is_empty() {
@@ -1801,13 +1821,12 @@ fn paint_queue(
         let row = Rect::new(rect.x(), y, rect.width(), ROW_H);
         let selected_here = selected == Some(index);
         if selected_here {
-            ctx.fill_rect(row.inflate(-1.0, -1.0), pal.selected);
-            widgets::hairline_left(ctx, row, pal.accent);
-        } else if index % 2 == 1 {
-            ctx.fill_rect(row, pal.window.with_alpha(0.18));
+            // Mesh selected row: accent wash plus a 2px accent rail.
+            ctx.fill_rect(row.inflate(-1.0, -1.0), pal.accent_soft);
+            ctx.fill_rect(Rect::new(row.x(), row.y(), 2.0, row.height()), pal.accent);
         }
         paint_queue_row(ctx, theme, pal, row, job, selected_here);
-        widgets::hairline_bottom(ctx, row, pal.border.with_alpha(0.72));
+        widgets::hairline_bottom(ctx, row, pal.border_subtle);
         y += ROW_H;
     }
 }
@@ -1865,7 +1884,7 @@ fn paint_queue_row(
             &meta,
             ((rect.width() - 64.0) / 8.7).clamp(18.0, 38.0) as usize,
         ),
-        pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text_muted),
+        pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_muted),
     );
     let target = job
         .target_module
@@ -1931,7 +1950,7 @@ fn paint_detail(
         ctx,
         Rect::new(inner.x(), inner.y() + 34.0, inner.width(), 21.0),
         &meta,
-        pal.text_style(theme, 12.5, FontWeight::NORMAL, pal.text_muted),
+        pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_muted),
     );
 
     let mut y = inner.y() + 72.0;
@@ -2006,7 +2025,7 @@ fn paint_detail_empty(
         panel_w,
         panel_h,
     );
-    widgets::round_panel(ctx, panel, pal.panel, pal.border, 8.0);
+    widgets::round_panel(ctx, panel, pal.panel, pal.border, 10.0);
     widgets::draw_centered(
         ctx,
         "No evolution job selected",
@@ -2017,7 +2036,7 @@ fn paint_detail_empty(
     widgets::draw_centered(
         ctx,
         empty_detail_subtitle(start_ready, starting),
-        pal.text_style(theme, 13.0, FontWeight::NORMAL, pal.text_faint),
+        pal.text_style(theme, 14.0, FontWeight::NORMAL, pal.text_faint),
         panel.x() + panel.width() / 2.0,
         panel.y() + 58.0,
     );
@@ -2073,18 +2092,15 @@ fn paint_status_pill(
     label: &str,
     phase: EvolutionPhase,
 ) {
+    // Mesh status badge: translucent status wash, status-text ink, a solid
+    // status dot for peripheral legibility. Never a heavy filled block.
     let color = tone_color(pal, phase);
-    widgets::round_panel(
-        ctx,
-        rect,
-        pal.field,
-        color.with_alpha(0.85),
-        rect.height() / 2.0,
-    );
+    let (soft, ink) = tone_badge_colors(pal, phase);
+    widgets::fill_round_rect(ctx, rect, soft, 4.0);
     ctx.fill(
         Path::circle(
             widgets::point(rect.x() + 13.0, rect.y() + rect.height() / 2.0),
-            4.0,
+            3.5,
         ),
         color,
     );
@@ -2097,7 +2113,7 @@ fn paint_status_pill(
             rect.height(),
         ),
         &compact(label, 9),
-        pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text),
+        pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, ink),
     );
 }
 
@@ -2131,41 +2147,46 @@ fn paint_lifecycle(
     } else {
         0.0
     };
+    // Mesh plan stepper: hairline connectors, accent for completed stages, the
+    // active dot rides an accent-soft halo, incomplete dots are hollow rings.
     for index in 0..stages.len() - 1 {
         let x1 = left + step * index as f32;
         let x2 = left + step * (index + 1) as f32;
         let color = if index < current {
             pal.accent
         } else {
-            pal.border_strong.with_alpha(0.55)
+            pal.border
         };
         let mut builder = sui::PathBuilder::new();
         builder
             .move_to(widgets::point(x1, y))
             .line_to(widgets::point(x2, y));
-        ctx.stroke(builder.build(), color, StrokeStyle::new(2.0));
+        ctx.stroke(builder.build(), color, StrokeStyle::new(1.0));
     }
     for (index, (_, label)) in stages.iter().enumerate() {
         let x = left + step * index as f32;
-        let passed = index <= current;
-        let color = if index == current {
-            tone_color(pal, job.phase)
-        } else if passed {
-            pal.accent
+        let center = widgets::point(x, y);
+        if index == current {
+            let tone = tone_color(pal, job.phase);
+            let (halo, _) = tone_badge_colors(pal, job.phase);
+            ctx.fill(Path::circle(center, 10.0), halo);
+            ctx.fill(Path::circle(center, 4.0), tone);
+            ctx.stroke(Path::circle(center, 7.0), tone, StrokeStyle::new(1.5));
+        } else if index < current {
+            ctx.fill(Path::circle(center, 7.0), pal.accent);
         } else {
-            pal.field
-        };
-        ctx.fill(Path::circle(widgets::point(x, y), 7.0), color);
-        ctx.stroke(
-            Path::circle(widgets::point(x, y), 7.0),
-            pal.border,
-            StrokeStyle::new(1.0),
-        );
+            ctx.fill(Path::circle(center, 7.0), pal.window);
+            ctx.stroke(
+                Path::circle(center, 7.0),
+                pal.border_strong,
+                StrokeStyle::new(1.5),
+            );
+        }
         if index % 2 == 0 || step > 54.0 {
             widgets::draw_centered(
                 ctx,
                 label,
-                pal.text_style(theme, 9.8, FontWeight::NORMAL, pal.text_faint),
+                pal.text_style(theme, 10.0, FontWeight::NORMAL, pal.text_faint),
                 x,
                 y + 22.0,
             );
@@ -2204,7 +2225,7 @@ fn paint_kv_grid(
             ctx,
             Rect::new(x, y, col_w - 10.0, 14.0),
             label,
-            pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text_faint),
+            pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text_faint),
         );
         widgets::draw_text_in(
             ctx,
@@ -2222,7 +2243,7 @@ fn paint_rows(
     rect: Rect,
     rows: &[(String, String)],
 ) {
-    widgets::round_panel(ctx, rect, pal.panel, pal.border, 8.0);
+    widgets::round_panel(ctx, rect, pal.panel, pal.border, 10.0);
     let mut y = rect.y() + 9.0;
     for (index, (label, value)) in rows.iter().take(4).enumerate() {
         let row = Rect::new(rect.x() + 12.0, y, rect.width() - 24.0, 22.0);
@@ -2230,13 +2251,13 @@ fn paint_rows(
             ctx,
             Rect::new(row.x(), row.y(), 122.0, row.height()),
             label,
-            pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.text_muted),
+            pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text_muted),
         );
         widgets::draw_text_in(
             ctx,
             Rect::new(row.x() + 126.0, row.y(), row.width() - 126.0, row.height()),
             &compact(value, ((row.width() - 126.0) / 7.0).max(18.0) as usize),
-            pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text),
+            pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text),
         );
         y += 24.0;
         if index < rows.len() - 1 {
@@ -2281,7 +2302,7 @@ fn paint_rail(
         ctx,
         Rect::new(inner.x(), inner.y(), inner.width(), 24.0),
         "Safety and evidence",
-        pal.text_style(theme, 15.0, FontWeight::SEMIBOLD, pal.text),
+        pal.text_style(theme, 14.0, FontWeight::SEMIBOLD, pal.text),
     );
     let Some(job) = job else {
         let rows = readiness_rows(dashboard, readiness_details_open);
@@ -2325,12 +2346,12 @@ fn paint_decision_action_section(
     job: &EvolutionJobSummary,
     action: &DecisionActionStatus,
 ) -> f32 {
-    widgets::round_panel(ctx, rect, pal.panel, pal.border, 8.0);
+    widgets::round_panel(ctx, rect, pal.panel, pal.border, 10.0);
     widgets::draw_text_in(
         ctx,
         Rect::new(rect.x() + 12.0, rect.y() + 10.0, rect.width() - 24.0, 20.0),
         "Operator decision",
-        pal.text_style(theme, 12.5, FontWeight::SEMIBOLD, pal.text),
+        pal.text_style(theme, 12.0, FontWeight::SEMIBOLD, pal.text),
     );
     let mut y = rect.y() + 36.0;
     for (label, value) in decision_action_rows(job, action).iter().take(3) {
@@ -2338,7 +2359,7 @@ fn paint_decision_action_section(
             ctx,
             Rect::new(rect.x() + 12.0, y, 78.0, 18.0),
             label,
-            pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text_faint),
+            pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text_faint),
         );
         let color = if label == "State" && action.error.is_some() {
             pal.bad
@@ -2351,7 +2372,7 @@ fn paint_decision_action_section(
             ctx,
             Rect::new(rect.x() + 90.0, y, rect.width() - 102.0, 18.0),
             &compact(value, ((rect.width() - 102.0) / 6.6).max(14.0) as usize),
-            pal.text_style(theme, 10.8, FontWeight::NORMAL, color),
+            pal.text_style(theme, 11.0, FontWeight::NORMAL, color),
         );
         y += 21.0;
     }
@@ -2375,12 +2396,12 @@ fn paint_rail_section(
     title: &str,
     rows: &[(String, String)],
 ) -> f32 {
-    widgets::round_panel(ctx, rect, pal.panel, pal.border, 8.0);
+    widgets::round_panel(ctx, rect, pal.panel, pal.border, 10.0);
     widgets::draw_text_in(
         ctx,
         Rect::new(rect.x() + 12.0, rect.y() + 10.0, rect.width() - 24.0, 20.0),
         title,
-        pal.text_style(theme, 12.5, FontWeight::SEMIBOLD, pal.text),
+        pal.text_style(theme, 12.0, FontWeight::SEMIBOLD, pal.text),
     );
     let mut y = rect.y() + 36.0;
     for (label, value) in rows.iter().take(5) {
@@ -2388,13 +2409,13 @@ fn paint_rail_section(
             ctx,
             Rect::new(rect.x() + 12.0, y, 88.0, 18.0),
             label,
-            pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text_faint),
+            pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text_faint),
         );
         widgets::draw_text_in(
             ctx,
             Rect::new(rect.x() + 100.0, y, rect.width() - 112.0, 18.0),
             &compact(value, ((rect.width() - 112.0) / 6.6).max(14.0) as usize),
-            pal.text_style(theme, 10.8, FontWeight::NORMAL, pal.text),
+            pal.text_style(theme, 11.0, FontWeight::NORMAL, pal.text),
         );
         y += 22.0;
     }
@@ -2575,6 +2596,17 @@ fn tone_color(pal: &Palette, phase: EvolutionPhase) -> Color {
         EvolutionPhase::Passed => pal.good,
         EvolutionPhase::Failed => pal.bad,
         EvolutionPhase::Recovered => pal.text_muted,
+    }
+}
+
+/// The Mesh badge pair for a phase: translucent wash + legible status text.
+fn tone_badge_colors(pal: &Palette, phase: EvolutionPhase) -> (Color, Color) {
+    match phase {
+        EvolutionPhase::Active => (pal.accent_soft, pal.accent_text),
+        EvolutionPhase::AwaitingDecision => (pal.warn_soft, pal.warn_text),
+        EvolutionPhase::Passed => (pal.ok_soft, pal.ok_text),
+        EvolutionPhase::Failed => (pal.danger_soft, pal.danger_text),
+        EvolutionPhase::Recovered => (pal.surface_3, pal.text_muted),
     }
 }
 
