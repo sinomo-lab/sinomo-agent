@@ -203,7 +203,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             ..
                         } if command.foreground_replica_repair && !repair_jobs.is_empty() => {
                             if let Some(path) = created_object_path.as_deref() {
-                                self.touch_routed_create_parent_directory(path);
+                                self.record_routed_create_parent_directory_touch(
+                                    path,
+                                    command.foreground_replica_repair,
+                                );
                             }
                             self.track_pending_remote_write_response(
                                 intent_id,
@@ -228,11 +231,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         }
                         NetworkedDfsWriteOutcome::Committed { .. } => {
                             if let Some(path) = created_object_path.as_deref() {
-                                if command.foreground_replica_repair {
-                                    self.touch_routed_create_parent_directory(path);
-                                } else {
-                                    self.defer_routed_create_parent_directory_touch(path);
-                                }
+                                self.record_routed_create_parent_directory_touch(
+                                    path,
+                                    command.foreground_replica_repair,
+                                );
                             }
                             outcome.clone()
                         }
@@ -685,11 +687,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             ) && let Some(path) = pending.created_object_path.as_deref()
             {
-                if pending.foreground_replica_repair {
-                    self.touch_routed_create_parent_directory(path);
-                } else {
-                    self.defer_routed_create_parent_directory_touch(path);
-                }
+                self.record_routed_create_parent_directory_touch(
+                    path,
+                    pending.foreground_replica_repair,
+                );
             }
             let metadata_journal_batches = self.routed_write_response_metadata_journal_batches(
                 &pending.object_id,
@@ -806,6 +807,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// the requester) through journal replay. Best effort: a primary that does
     /// not hold the parent directory record must still answer the committed
     /// write.
+    fn record_routed_create_parent_directory_touch(&mut self, path: &str, foreground: bool) {
+        if foreground
+            && !self
+                .transport
+                .can_return_committed_foreground_response_before_replica_repair()
+        {
+            self.touch_routed_create_parent_directory(path);
+        } else {
+            self.defer_routed_create_parent_directory_touch(path);
+        }
+    }
+
     fn touch_routed_create_parent_directory(&mut self, path: &str) {
         let _ = self.touch_parent_directory_modified(path);
     }
