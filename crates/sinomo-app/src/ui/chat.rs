@@ -54,12 +54,13 @@ use sui::{
     SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsAction, SemanticsCtx,
     SemanticsNode, SemanticsRole, Separator, SignalMeter, Size, SizedBox, Stack, StackHostOptions,
     StatusBadge, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextArea, TextBlockPaint,
-    TextCellPaint, TextInput, TextWrap, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, containers::Padding as WidgetPadding, draw_glyph, paint_action_tile,
-    paint_callout, paint_code_lines, paint_code_panel, paint_command_button,
-    paint_disclosure_button, paint_empty_state, paint_icon_button, paint_rounded_panel,
-    paint_rounded_rect, paint_section_label_detail, paint_section_panel, paint_text_block,
-    paint_text_cell, wrap_text_lines,
+    TextCellPaint, TextDocument, TextInput, TextLayoutRequest, TextStyle, TextWrap,
+    TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    containers::Padding as WidgetPadding, draw_glyph, paint_action_tile, paint_callout,
+    paint_code_lines, paint_code_panel, paint_command_button, paint_disclosure_button,
+    paint_empty_state, paint_icon_button, paint_rounded_panel, paint_rounded_rect,
+    paint_section_label_detail, paint_section_panel, paint_text_block, paint_text_cell,
+    wrap_text_lines,
 };
 
 #[cfg(test)]
@@ -6426,6 +6427,143 @@ fn session_row_description(session: &SessionRef) -> String {
     }
 }
 
+struct CompactSidebarRowBody {
+    icon: IconGlyph,
+    icon_color: Color,
+    icon_size: f32,
+    icon_slot_width: f32,
+    gap: f32,
+    title: String,
+    title_style: TextStyle,
+    subtitle: Option<String>,
+    subtitle_style: Option<TextStyle>,
+}
+
+impl CompactSidebarRowBody {
+    fn new(
+        icon: IconGlyph,
+        icon_color: Color,
+        title: impl Into<String>,
+        title_style: TextStyle,
+    ) -> Self {
+        Self {
+            icon,
+            icon_color,
+            icon_size: 16.0,
+            icon_slot_width: 20.0,
+            gap: 7.0,
+            title: title.into(),
+            title_style,
+            subtitle: None,
+            subtitle_style: None,
+        }
+    }
+
+    fn subtitle(mut self, subtitle: impl Into<String>, style: TextStyle) -> Self {
+        self.subtitle = Some(subtitle.into());
+        self.subtitle_style = Some(style);
+        self
+    }
+}
+
+impl Widget for CompactSidebarRowBody {
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let width = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            self.icon_slot_width + self.gap + 160.0
+        };
+        let height = if constraints.max.height.is_finite() {
+            constraints.max.height
+        } else {
+            self.title_style.line_height
+                + self
+                    .subtitle_style
+                    .as_ref()
+                    .map(|style| style.line_height)
+                    .unwrap_or(0.0)
+        };
+        constraints.clamp(Size::new(width.max(0.0), height.max(1.0)))
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let bounds = ctx.bounds();
+        if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+            return;
+        }
+
+        let icon_slot = self.icon_slot_width.min(bounds.width()).max(0.0);
+        let icon_rect = Rect::new(bounds.x(), bounds.y(), icon_slot, bounds.height());
+        draw_glyph(
+            ctx,
+            self.icon,
+            center_square_for_sidebar_row(icon_rect, self.icon_size),
+            self.icon_color,
+        );
+
+        let text_x = bounds.x() + icon_slot + self.gap;
+        let text_width = (bounds.max_x() - text_x).max(0.0);
+        if text_width <= 0.0 {
+            return;
+        }
+
+        let subtitle_line = self
+            .subtitle_style
+            .as_ref()
+            .map(|style| style.line_height.max(1.0))
+            .unwrap_or(0.0);
+        let title_line = self.title_style.line_height.max(1.0);
+        let text_height = if self.subtitle.is_some() {
+            title_line + subtitle_line
+        } else {
+            title_line
+        };
+        let text_y = bounds.y() + ((bounds.height() - text_height).max(0.0) * 0.5);
+        let title_rect = Rect::new(text_x, text_y, text_width, title_line);
+        paint_sidebar_single_line_text(ctx, title_rect, &self.title, &self.title_style);
+
+        if let (Some(subtitle), Some(style)) = (&self.subtitle, &self.subtitle_style) {
+            let subtitle_rect = Rect::new(text_x, title_rect.max_y(), text_width, subtitle_line);
+            paint_sidebar_single_line_text(ctx, subtitle_rect, subtitle, style);
+        }
+    }
+}
+
+fn center_square_for_sidebar_row(rect: Rect, side: f32) -> Rect {
+    let side = side.min(rect.width()).min(rect.height()).max(0.0);
+    Rect::new(
+        rect.x() + ((rect.width() - side).max(0.0) * 0.5),
+        rect.y() + ((rect.height() - side).max(0.0) * 0.5),
+        side,
+        side,
+    )
+}
+
+fn paint_sidebar_single_line_text(ctx: &mut PaintCtx, rect: Rect, text: &str, style: &TextStyle) {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 || text.is_empty() {
+        return;
+    }
+
+    let color = style.color;
+    let mut layout_style = style.clone();
+    layout_style.color = Color::WHITE;
+    let mut document = TextDocument::from_plain_text(text.to_string(), layout_style);
+    for paragraph in &mut document.paragraphs {
+        paragraph.style.wrap = TextWrap::NoWrap;
+    }
+
+    ctx.push_clip_rect(rect);
+    if let Ok(layout) = ctx.layout_text_document(
+        TextLayoutRequest::new(document)
+            .with_box_size(Size::new(rect.width().max(1.0), rect.height().max(1.0))),
+    ) {
+        ctx.draw_text_layout_with_color(rect.origin, &layout, color);
+    } else {
+        ctx.draw_text(rect, text.to_string(), style.clone());
+    }
+    ctx.pop_clip();
+}
+
 fn session_row_content(
     shared: &Shared,
     reader: &ThemeReader,
@@ -6444,25 +6582,13 @@ fn session_row_content(
         ConversationKind::Channel => pal.accent,
     };
 
-    let icon = SizedBox::new()
-        .width(20.0)
-        .height(SIDEBAR_ROW_H)
-        .with_child(
-            Icon::new(IconGlyph::Chat)
-                .size(16.0)
-                .color(icon_color)
-                .label(session_kind_icon_description(session.kind)),
-        );
-    let text = Flex::vertical()
-        .main_gap(0.0)
-        .align_items(Alignment::Stretch)
-        .with_child(Label::new(session.title.clone()).style(title_style))
-        .with_child(Label::new(session_meta_label(&session)).style(meta_style));
-    let body = Flex::horizontal()
-        .main_gap(7.0)
-        .align_items(Alignment::Center)
-        .with_child(icon)
-        .with_item(text, FlexItem::fill().min_width(0.0));
+    let body = CompactSidebarRowBody::new(
+        IconGlyph::Chat,
+        icon_color,
+        session.title.clone(),
+        title_style,
+    )
+    .subtitle(session_meta_label(&session), meta_style);
 
     let s = shared.clone();
     let session_id = session.id.clone();
@@ -7227,10 +7353,10 @@ fn channel_agent_row(
     let body = Flex::horizontal()
         .main_gap(7.0)
         .align_items(Alignment::Center)
-        .with_child(icon)
+        .with_item(icon, FlexItem::new().no_shrink())
         .with_item(
             Label::new(label).font_size(12.5).color_when(text_color),
-            FlexItem::fill().min_width(0.0),
+            FlexItem::new().grow(1.0).min_width(0.0),
         );
     let row = TrailingSlotRow::new(body, action)
         .trailing_width(CHANNEL_AGENT_ROW_ACTION)
