@@ -16,6 +16,8 @@ DFS_READY_WAIT="${SINOMO_SCENARIO_DFS_READY_WAIT:-120}"
 EXPECT_TIMEOUT="${SINOMO_SCENARIO_EXPECT_TIMEOUT:-90}"
 POLL_INTERVAL="${SINOMO_SCENARIO_POLL_INTERVAL:-1}"
 PUBLIC_PORT="${SINOMO_SCENARIO_PUBLIC_PORT:-32166}"
+TUNNEL_STALL_PORT="${SINOMO_SCENARIO_TUNNEL_STALL_PORT:-32167}"
+NODE3_DIRECT_PORT="${SINOMO_SCENARIO_NODE3_DIRECT_PORT:-32168}"
 NETWORK_REQUESTS_PER_TARGET="${SINOMO_SCENARIO_NETWORK_REQUESTS_PER_TARGET:-4}"
 NETWORK_WARMUP_REQUESTS_PER_TARGET="${SINOMO_SCENARIO_NETWORK_WARMUP_REQUESTS_PER_TARGET:-2}"
 NETWORK_CONCURRENCY="${SINOMO_SCENARIO_NETWORK_CONCURRENCY:-8}"
@@ -29,6 +31,7 @@ NETWORK_PAYLOAD_RESPONSE_BYTES="${SINOMO_SCENARIO_NETWORK_PAYLOAD_RESPONSE_BYTES
 NETWORK_PAYLOAD_MIN_BYTES_PER_SEC="${SINOMO_SCENARIO_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC:-8388608}"
 NETWORK_READY_WAIT="${SINOMO_SCENARIO_NETWORK_READY_WAIT:-20}"
 ENDPOINT_FALLBACK_TIMEOUT_MS="${SINOMO_SCENARIO_ENDPOINT_FALLBACK_TIMEOUT_MS:-5000}"
+TUNNEL_STALE_FALLBACK_TIMEOUT_MS="${SINOMO_SCENARIO_TUNNEL_STALE_FALLBACK_TIMEOUT_MS:-5000}"
 LARGE_BYTES="${SINOMO_SCENARIO_LARGE_BYTES:-16777216}"
 LARGE_TIMEOUT="${SINOMO_SCENARIO_LARGE_TIMEOUT:-180}"
 LARGE_MIN_WRITE_BYTES_PER_SEC="${SINOMO_SCENARIO_LARGE_MIN_WRITE_BYTES_PER_SEC:-4194304}"
@@ -40,6 +43,7 @@ EXPECTED_MAINS=3
 NODES="node1 node2 node3"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 ARTIFACTS="${SINOMO_SCENARIO_ARTIFACTS:-$SINOMO_ROOT/target/routing-scenario-artifacts/$RUN_ID}"
+TUNNEL_STALL_PROXY_PID=""
 
 mkdir -p "$ARTIFACTS"
 
@@ -88,6 +92,7 @@ collect_artifacts() {
 
 cleanup() {
   local rc="$?"
+  stop_tunnel_stall_proxy || true
   if [ "$rc" -ne 0 ]; then
     collect_artifacts
   fi
@@ -108,7 +113,8 @@ main_online_count() {
 doctor_connectivity_warnings() {
   compose exec -T node1 sinomo cluster doctor 2>/dev/null \
     | grep -E "endpoint-unreachable|node-offline" \
-    | grep -Fv "foreign:21353" || true
+    | grep -Fv "foreign:21353" \
+    | grep -Fv "host.docker.internal:$TUNNEL_STALL_PORT" || true
 }
 
 wait_for_cluster_ready() {
@@ -294,6 +300,66 @@ assert_endpoint_error_fallback() {
     --param "timeout-ms=$ENDPOINT_FALLBACK_TIMEOUT_MS"
 }
 
+start_tunnel_stall_proxy() {
+  local proxy_log started deadline
+  if [ -n "$TUNNEL_STALL_PROXY_PID" ] && kill -0 "$TUNNEL_STALL_PROXY_PID" 2>/dev/null; then
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "python3 is required for the tcp tunnel stall proxy"
+    return 1
+  fi
+  proxy_log="$ARTIFACTS/tcp-tunnel-stall-proxy.log"
+  log "starting tcp tunnel stall proxy on 0.0.0.0:$TUNNEL_STALL_PORT -> 127.0.0.1:$NODE3_DIRECT_PORT"
+  python3 "$SINOMO_DOCKER_DIR/tcp_tunnel_stall_proxy.py" \
+    --listen-host 0.0.0.0 \
+    --listen-port "$TUNNEL_STALL_PORT" \
+    --target-host 127.0.0.1 \
+    --target-port "$NODE3_DIRECT_PORT" \
+    >"$proxy_log" 2>&1 &
+  TUNNEL_STALL_PROXY_PID="$!"
+  started="$(date +%s)"
+  deadline=$(( started + 10 ))
+  while :; do
+    if (exec 9<>"/dev/tcp/127.0.0.1/$TUNNEL_STALL_PORT") 2>/dev/null; then
+      exec 9>&- 2>/dev/null || true
+      return 0
+    fi
+    if ! kill -0 "$TUNNEL_STALL_PROXY_PID" 2>/dev/null; then
+      log "tcp tunnel stall proxy exited early"
+      sed 's/^/[routing-scenario]   /' "$proxy_log" || true
+      return 1
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      log "tcp tunnel stall proxy did not start"
+      sed 's/^/[routing-scenario]   /' "$proxy_log" || true
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+stop_tunnel_stall_proxy() {
+  if [ -n "$TUNNEL_STALL_PROXY_PID" ] && kill -0 "$TUNNEL_STALL_PROXY_PID" 2>/dev/null; then
+    kill "$TUNNEL_STALL_PROXY_PID" 2>/dev/null || true
+    wait "$TUNNEL_STALL_PROXY_PID" 2>/dev/null || true
+  fi
+  TUNNEL_STALL_PROXY_PID=""
+}
+
+assert_tcp_tunnel_stale_fallback() {
+  local rc
+  log "checking direct RPC fallback after stalled persistent TCP tunnel"
+  start_tunnel_stall_proxy
+  rc=0
+  run_probe node1 cluster.network.tcp-tunnel-stale-fallback \
+    --param target-name=node3 \
+    --param "stall-endpoint-address=host.docker.internal:$TUNNEL_STALL_PORT" \
+    --param "timeout-ms=$TUNNEL_STALE_FALLBACK_TIMEOUT_MS" || rc="$?"
+  stop_tunnel_stall_proxy
+  return "$rc"
+}
+
 run_cross_segment_dfs() {
   local path_a path_b payload_a payload_b
   path_a="/services/routing-scenario/$RUN_ID/node2-to-node3.txt"
@@ -419,6 +485,7 @@ wait_for_cluster_ready
 assert_forwarded_endpoint_configured
 wait_for_network_ready
 assert_endpoint_error_fallback
+assert_tcp_tunnel_stale_fallback
 wait_for_network_ready
 run_network_probe node1
 run_network_probe node2

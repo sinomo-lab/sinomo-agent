@@ -37,6 +37,7 @@ pub fn register_network_cluster_test_cases(
     builder
         .register(network_ping_benchmark())
         .register(network_endpoint_error_fallback())
+        .register(network_tcp_tunnel_stale_fallback())
 }
 
 sinomo_runtime::test::sinomo_test_case! {
@@ -59,6 +60,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_network_endpoint_error_fallback(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn network_tcp_tunnel_stale_fallback(ctx) {
+        id: "cluster.network.tcp-tunnel-stale-fallback",
+        summary: "A stale persistent TCP tunnel on a real endpoint falls back to direct RPC",
+        tags: ["cluster-network", "probe", "routing", "failure-mode"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_network_tcp_tunnel_stale_fallback(ctx)
         }
     }
 }
@@ -549,6 +562,89 @@ fn run_network_endpoint_error_fallback(ctx: &mut SinomoTestContext) -> SinomoTes
     ))
 }
 
+fn run_network_tcp_tunnel_stale_fallback(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let target_name = ctx.required_parameter("target-name")?.trim().to_string();
+    let stall_endpoint_address = ctx
+        .required_parameter("stall-endpoint-address")?
+        .trim()
+        .to_string();
+    if target_name.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "target-name".to_string(),
+            detail: "must not be empty".to_string(),
+        });
+    }
+    if stall_endpoint_address.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "stall-endpoint-address".to_string(),
+            detail: "must not be empty".to_string(),
+        });
+    }
+    let timeout_ms = optional_u64_parameter(ctx, "timeout-ms", DEFAULT_TIMEOUT_MS)?;
+
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot refresh cluster snapshot before tcp tunnel stale fallback probe: {error}"
+        ))
+    })?;
+    let cluster_state = cluster::read_cluster_state(&cluster_paths)
+        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+    let target = cluster_state
+        .members
+        .iter()
+        .find(|member| {
+            member.display_name == target_name
+                && member.state.is_authorized()
+                && member_has_main_daemon(member)
+        })
+        .ok_or_else(|| {
+            SinomoTestError::failed(format!(
+                "cannot find authorized main daemon target named {target_name}"
+            ))
+        })?;
+    let stall_endpoint = target
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.address == stall_endpoint_address)
+        .cloned()
+        .ok_or_else(|| {
+            let addresses = target
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.address.clone())
+                .collect::<Vec<_>>();
+            SinomoTestError::failed(format!(
+                "target {target_name} does not advertise stall endpoint {stall_endpoint_address}; addresses={addresses:?}"
+            ))
+        })?;
+
+    let probe_outcome = run_network_tcp_tunnel_stale_fallback_probe(
+        target,
+        &stall_endpoint,
+        &stall_endpoint_address,
+        timeout_ms,
+    )?;
+    if !matches!(
+        probe_outcome.status,
+        sinomo_runtime::test::SinomoTestStatus::Passed
+    ) {
+        return Ok(probe_outcome);
+    }
+
+    ctx.record("target_name", target_name);
+    ctx.record("target_node_id", target.node_id.to_string());
+    ctx.record("stall_endpoint_address", stall_endpoint_address);
+    ctx.record(
+        "seeded_stall_endpoint_id",
+        stall_endpoint.endpoint_id.to_string(),
+    );
+    Ok(SinomoTestOutcome::passed(
+        "routed RPC recovered from a stalled tcp tunnel by using direct RPC on the same endpoint",
+    ))
+}
+
 fn endpoint_error_fallback_seed_records(
     cluster_state: &ClusterBootstrapState,
     target: &ClusterMemberRecord,
@@ -654,6 +750,50 @@ fn run_network_endpoint_error_fallback_probe(
         .map_err(|source| {
             SinomoTestError::failed(format!(
                 "endpoint fallback routed RPC failed after seeding {bad_endpoint_address}: {source}"
+            ))
+        })?;
+    let response = cluster::decode_cluster_network_ping_rpc_response(&response)
+        .map_err(|source| SinomoTestError::failed(source.to_string()))?;
+    if response.nonce != nonce {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "nonce mismatch: got {}, expected {}",
+            response.nonce, nonce
+        )));
+    }
+    if response.responder_node_id != target.node_id {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "responder mismatch: got {}, expected {}",
+            response.responder_node_id, target.node_id
+        )));
+    }
+    Ok(SinomoTestOutcome::passed(""))
+}
+
+fn run_network_tcp_tunnel_stale_fallback_probe(
+    target: &ClusterMemberRecord,
+    stall_endpoint: &sinomo_runtime::core::ClusterEndpointRecord,
+    stall_endpoint_address: &str,
+    timeout_ms: u64,
+) -> SinomoTestResult {
+    let nonce = format!(
+        "tcp-tunnel-stale-fallback-{}-{}",
+        current_millis(),
+        std::process::id()
+    );
+    let request = cluster::cluster_network_ping_rpc_request_with_response_payload(&nonce, 0, 0)
+        .map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot prepare tcp tunnel stale fallback ping request: {source}"
+            ))
+        })?;
+    let response = sinomo_runtime::daemon::send_daemon_rpc_to_endpoint(
+        stall_endpoint,
+        &request,
+        Duration::from_millis(timeout_ms),
+    )
+        .map_err(|source| {
+            SinomoTestError::failed(format!(
+                "tcp tunnel stale fallback endpoint RPC failed through {stall_endpoint_address}: {source}"
             ))
         })?;
     let response = cluster::decode_cluster_network_ping_rpc_response(&response)

@@ -70,6 +70,8 @@ services:
     <<: *node-defaults
     hostname: node3
     depends_on: [node1, foreign]
+    ports:
+      - "${SINOMO_SCENARIO_NODE3_DIRECT_PORT:-32168}:21353"
     environment:
       ROLE: joiner
       NODE_NAME: node3
@@ -79,7 +81,7 @@ services:
       SINOMO_CLUSTER_JOIN_TRACE: "${SINOMO_CLUSTER_JOIN_TRACE:-0}"
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
-      SINOMO_MANUAL_ENDPOINTS_JSON: '{"main":[{"address":"tcp://foreign:21353","scope":"internet-direct","priority":0}]}'
+      SINOMO_MANUAL_ENDPOINTS_JSON: '{"main":[{"address":"tcp://host.docker.internal:${SINOMO_SCENARIO_TUNNEL_STALL_PORT:-32167}","scope":"internet-direct","priority":0},{"address":"tcp://foreign:21353","scope":"internet-direct","priority":1}]}'
       INTRODUCER: host.docker.internal:${SINOMO_SCENARIO_PUBLIC_PORT:-32166}
       JOIN_INVITE: /shared/forwarded-invite.json
     volumes:

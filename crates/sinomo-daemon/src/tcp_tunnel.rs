@@ -27,6 +27,8 @@ use tokio::sync::{mpsc, oneshot};
 const TCP_TUNNEL_CHANNEL_CAPACITY: usize = 128;
 const TCP_TUNNEL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 const TCP_TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
+const TCP_TUNNEL_REAL_ENDPOINT_RPC_TIMEOUT: Duration = Duration::from_millis(750);
+const TCP_TUNNEL_REAL_ENDPOINT_MIN_DIRECT_FALLBACK_BUDGET: Duration = Duration::from_millis(500);
 const TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX: &str =
     sinomo_core::network::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX;
 
@@ -520,12 +522,35 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
     let mut signed = request.clone();
     signed.auth = Some(auth.to_vec());
     if !tcp_tunnel_is_synthetic_endpoint(endpoint) {
+        let tunnel_timeouts = tcp_tunnel_real_endpoint_rpc_timeouts(timeouts);
         if let Some(handle) = TCP_TUNNELS.get(&endpoint.node_id) {
-            return Some(send_over_tcp_tunnel_handle(handle, signed, timeouts).await);
+            return match send_over_tcp_tunnel_handle(handle, signed, tunnel_timeouts).await {
+                Ok(response) => Some(Ok(response)),
+                Err(error) => {
+                    tracing::debug!(
+                        "tcp tunnel send to {} ({}) failed on a real endpoint; falling back to direct tcp: {error}",
+                        endpoint.node_id,
+                        endpoint.address
+                    );
+                    None
+                }
+            };
         }
-        match connect_tcp_tunnel_to_endpoint_for_rpc(endpoint, runtime, paths, timeouts).await {
+        match connect_tcp_tunnel_to_endpoint_for_rpc(endpoint, runtime, paths, tunnel_timeouts)
+            .await
+        {
             Ok(handle) => {
-                return Some(send_over_tcp_tunnel_handle(handle, signed, timeouts).await);
+                return match send_over_tcp_tunnel_handle(handle, signed, tunnel_timeouts).await {
+                    Ok(response) => Some(Ok(response)),
+                    Err(error) => {
+                        tracing::debug!(
+                            "tcp tunnel send to {} ({}) failed after open on a real endpoint; falling back to direct tcp: {error}",
+                            endpoint.node_id,
+                            endpoint.address
+                        );
+                        None
+                    }
+                };
             }
             Err(error) => {
                 tracing::debug!(
@@ -566,6 +591,43 @@ pub(crate) async fn send_signed_endpoint_rpc_via_tcp_tunnel(
             endpoint.node_id, endpoint.address
         ),
     }))
+}
+
+fn tcp_tunnel_real_endpoint_rpc_timeouts(timeouts: DaemonRpcTimeouts) -> DaemonRpcTimeouts {
+    let total_timeout = match (timeouts.connect_timeout, timeouts.idle_timeout) {
+        (Some(connect), Some(idle)) => Some(connect.min(idle)),
+        (Some(timeout), None) | (None, Some(timeout)) => Some(timeout),
+        (None, None) => None,
+    };
+    let tunnel_budget = tcp_tunnel_real_endpoint_rpc_budget(total_timeout);
+    let connect_timeout = Some(
+        timeouts
+            .connect_timeout
+            .map(|timeout| timeout.min(tunnel_budget))
+            .unwrap_or(tunnel_budget),
+    );
+    let idle_timeout = Some(
+        timeouts
+            .idle_timeout
+            .or(timeouts.connect_timeout)
+            .map(|timeout| timeout.min(tunnel_budget))
+            .unwrap_or(tunnel_budget),
+    );
+    timeouts
+        .with_connect_timeout(connect_timeout)
+        .with_idle_timeout(idle_timeout)
+}
+
+fn tcp_tunnel_real_endpoint_rpc_budget(total_timeout: Option<Duration>) -> Duration {
+    let Some(total_timeout) = total_timeout else {
+        return TCP_TUNNEL_REAL_ENDPOINT_RPC_TIMEOUT;
+    };
+    if total_timeout <= TCP_TUNNEL_REAL_ENDPOINT_MIN_DIRECT_FALLBACK_BUDGET {
+        return total_timeout;
+    }
+    total_timeout
+        .saturating_sub(TCP_TUNNEL_REAL_ENDPOINT_MIN_DIRECT_FALLBACK_BUDGET)
+        .min(TCP_TUNNEL_REAL_ENDPOINT_RPC_TIMEOUT)
 }
 
 pub(crate) async fn forward_signed_endpoint_rpc_via_tcp_tunnel(
@@ -1867,6 +1929,32 @@ mod tests {
         assert!(handle.clean_shutdown.load(Ordering::Relaxed));
     }
 
+    #[test]
+    fn tcp_tunnel_real_endpoint_timeouts_leave_direct_fallback_budget() {
+        let shaped = tcp_tunnel_real_endpoint_rpc_timeouts(DaemonRpcTimeouts::connect_and_idle(
+            Duration::from_secs(5),
+        ));
+
+        assert_eq!(
+            shaped.connect_timeout,
+            Some(TCP_TUNNEL_REAL_ENDPOINT_RPC_TIMEOUT)
+        );
+        assert_eq!(
+            shaped.idle_timeout,
+            Some(TCP_TUNNEL_REAL_ENDPOINT_RPC_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn tcp_tunnel_real_endpoint_timeouts_preserve_tiny_deadlines() {
+        let timeout = Duration::from_millis(25);
+        let shaped =
+            tcp_tunnel_real_endpoint_rpc_timeouts(DaemonRpcTimeouts::connect_and_idle(timeout));
+
+        assert_eq!(shaped.connect_timeout, Some(timeout));
+        assert_eq!(shaped.idle_timeout, Some(timeout));
+    }
+
     #[tokio::test]
     async fn tcp_tunnel_real_lan_endpoint_reuses_existing_tunnel() {
         let (tx, mut rx) = mpsc::channel(1);
@@ -1926,6 +2014,36 @@ mod tests {
         assert!(TCP_TUNNELS.get(&node_id).is_some());
         assert!(handle.pending.lock().await.is_empty());
         assert!(!handle.clean_shutdown.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_real_lan_endpoint_falls_back_when_existing_tunnel_times_out() {
+        let (tx, _rx) = mpsc::channel(1);
+        let node_name = "tcp_tunnel_real_lan_existing_timeout_fallback";
+        let node_id = NodeId::from_legacy_named(node_name).expect("test node id");
+        let handle = test_tunnel_handle(node_name, tx);
+        TCP_TUNNELS.insert(handle.clone());
+        let endpoint = test_endpoint(
+            "tcp_tunnel_real_lan_existing_timeout_fallback_endpoint",
+            &node_id,
+            "10.0.0.2:21353",
+            ClusterTransportKind::LanTcp,
+        );
+
+        let result = send_signed_endpoint_rpc_via_tcp_tunnel(
+            &endpoint,
+            b"auth",
+            &test_rpc_request(),
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(1)),
+            &tokio::runtime::Handle::current(),
+            None,
+        )
+        .await;
+
+        assert!(result.is_none());
+        assert!(TCP_TUNNELS.get(&node_id).is_none());
+        assert!(handle.pending.lock().await.is_empty());
+        assert!(handle.clean_shutdown.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
