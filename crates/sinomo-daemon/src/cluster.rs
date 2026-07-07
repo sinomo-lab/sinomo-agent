@@ -683,12 +683,34 @@ fn desired_rollout_reconcile_decision(
     }
     match status.status.as_str() {
         "accepted" | "healthy" | "recovered" => DesiredRolloutReconcileDecision::Complete,
-        "failed" | "rejected" | "rolled-back" => DesiredRolloutReconcileDecision::TerminalFailure,
+        "failed" | "rejected" | "rolled-back" if desired_rollout_failure_is_hard(status) => {
+            DesiredRolloutReconcileDecision::TerminalFailure
+        }
+        "failed" | "rejected" | "rolled-back" if rollout_progress_status_is_stale(status, now) => {
+            DesiredRolloutReconcileDecision::Retry
+        }
+        "failed" | "rejected" | "rolled-back" => DesiredRolloutReconcileDecision::Wait,
         _ if rollout_progress_status_is_stale(status, now) => {
             DesiredRolloutReconcileDecision::Retry
         }
         _ => DesiredRolloutReconcileDecision::Wait,
     }
+}
+
+fn desired_rollout_failure_is_hard(status: &ClusterNodeRolloutStatus) -> bool {
+    let Some(phase) = status.phase.as_deref() else {
+        return false;
+    };
+    matches!(
+        phase,
+        "activation-failed"
+            | "build-failed"
+            | "module-install-failed"
+            | "rejected"
+            | "shadow-finalized"
+            | "source-rejected"
+            | "staging-failed"
+    )
 }
 
 fn rollout_progress_status_is_stale(
@@ -8610,6 +8632,17 @@ mod tests {
             DesiredRolloutReconcileDecision::TerminalFailure
         );
 
+        let source_rejected = desired_rollout_status_for_test("rejected", "source-rejected", now);
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                Some(&source_rejected),
+                Some("cluster-remote-build"),
+                Some("2026-07-07T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::TerminalFailure
+        );
+
         let failed = desired_rollout_status_for_test("failed", "activation-failed", now);
         assert_eq!(
             desired_rollout_reconcile_decision(
@@ -8619,6 +8652,62 @@ mod tests {
                 now,
             ),
             DesiredRolloutReconcileDecision::TerminalFailure
+        );
+
+        let rolled_back = desired_rollout_status_for_test("rolled-back", "shadow-finalized", now);
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                Some(&rolled_back),
+                Some("cluster-remote-build"),
+                Some("2026-07-07T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::TerminalFailure
+        );
+    }
+
+    #[test]
+    fn desired_rollout_reconcile_retries_stale_recoverable_failure() {
+        let now = OffsetDateTime::now_utc();
+        let fresh = desired_rollout_status_for_test("failed", "transport-failed", now);
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                Some(&fresh),
+                Some("cluster-remote-build"),
+                Some("2026-07-07T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::Wait
+        );
+
+        let stale = desired_rollout_status_for_test(
+            "failed",
+            "transport-failed",
+            now - time::Duration::seconds(DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS + 1),
+        );
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                Some(&stale),
+                Some("cluster-remote-build"),
+                Some("2026-07-07T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::Retry
+        );
+
+        let stale_unknown_phase = desired_rollout_status_for_test(
+            "rejected",
+            "control-request-failed",
+            now - time::Duration::seconds(DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS + 1),
+        );
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                Some(&stale_unknown_phase),
+                Some("cluster-remote-build"),
+                Some("2026-07-07T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::Retry
         );
     }
 
