@@ -3225,6 +3225,9 @@ fn cluster_target_final_hop_transport_timeouts(
         if let Some(remaining) = remaining_route_budget {
             capped = capped.min(remaining);
         }
+        if let Some(remaining) = endpoint_attempt_budget {
+            capped = capped.min(remaining);
+        }
         capped
     });
     timeouts
@@ -4565,7 +4568,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_final_hop_transport_timeouts_preserve_response_budget() {
+    fn cluster_target_final_hop_transport_timeouts_cap_response_budget_per_endpoint() {
         let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(15));
         let shaped = cluster_target_final_hop_transport_timeouts(
             base,
@@ -4574,11 +4577,24 @@ mod tests {
         );
 
         assert_eq!(shaped.connect_timeout, Some(Duration::from_secs(2)));
+        assert_eq!(shaped.idle_timeout, Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn cluster_target_final_hop_transport_timeouts_preserve_single_endpoint_response_budget() {
+        let base = DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(15));
+        let shaped = cluster_target_final_hop_transport_timeouts(
+            base,
+            Some(Duration::from_secs(12)),
+            Some(Duration::from_secs(12)),
+        );
+
+        assert_eq!(shaped.connect_timeout, Some(Duration::from_secs(12)));
         assert_eq!(shaped.idle_timeout, Some(Duration::from_secs(12)));
     }
 
     #[test]
-    fn cluster_target_rpc_caps_connect_attempt_but_preserves_final_hop_idle_budget() {
+    fn cluster_target_rpc_caps_connect_and_idle_attempts_per_endpoint() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-target-endpoint-attempt-budget");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -4645,15 +4661,7 @@ mod tests {
         assert_eq!(host.target_sends[1].0.address, "198.51.100.76:21353");
         for (_, _, timeouts) in &host.target_sends {
             assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(5)));
-            let idle_timeout = timeouts.idle_timeout.expect("idle timeout");
-            assert!(
-                idle_timeout > Duration::from_secs(10),
-                "final-hop response idle budget must not be capped to the per-endpoint connect budget: {idle_timeout:?}"
-            );
-            assert!(
-                idle_timeout <= Duration::from_secs(15),
-                "idle budget must remain capped by the caller's route budget: {idle_timeout:?}"
-            );
+            assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(5)));
         }
     }
 
