@@ -7,12 +7,11 @@
 //! POSIX layers.
 
 use std::collections::BTreeSet;
-use std::io::Read;
 use std::time::Instant;
 
 use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
-use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
+use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt};
 use time::OffsetDateTime;
 
 use crate::metadata_pages::walk_metadata_pages;
@@ -506,38 +505,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let object = object.clone();
         self.track_metadata_tombstone(&object);
         Ok(object.clone())
-    }
-
-    pub(crate) fn store_conflicting_write_content_hash(
-        &self,
-        request: &DfsWriteRequest,
-        bytes: &[u8],
-    ) -> Result<Option<String>, DfsError> {
-        match self.content.put_object_version(
-            request.object_id.as_str(),
-            request.target_version.as_str(),
-            bytes,
-        ) {
-            Ok(manifest) => Ok(Some(manifest.content_hash)),
-            Err(ContentStoreError::VersionHashConflict { new_hash, .. }) => Ok(Some(new_hash)),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    pub(crate) fn store_conflicting_write_reader_content_hash<R: Read>(
-        &self,
-        request: &DfsWriteRequest,
-        reader: R,
-    ) -> Result<Option<String>, DfsError> {
-        match self.content.put_object_version_from_reader(
-            request.object_id.as_str(),
-            request.target_version.as_str(),
-            reader,
-        ) {
-            Ok(manifest) => Ok(Some(manifest.content_hash)),
-            Err(ContentStoreError::VersionHashConflict { new_hash, .. }) => Ok(Some(new_hash)),
-            Err(error) => Err(error.into()),
-        }
     }
 
     pub(crate) fn ensure_replicated_confirmed_object(

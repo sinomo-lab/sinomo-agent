@@ -98,7 +98,7 @@ pub const DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF: Duration = Duration::from_secs
 /// publishes — only fast retry breaks the cycle once the bridge publishes).
 pub const DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DAEMON_CLUSTER_FORMATION_CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(8);
-const DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT: Duration = Duration::from_millis(750);
+const DAEMON_CLUSTER_FORMATION_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const DAEMON_CLUSTER_FORMATION_IROH_COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 const DAEMON_CLUSTER_FORMATION_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(350);
 /// Learner KV snapshot pull cadence. Convergence is event-driven — the voter
@@ -2797,9 +2797,14 @@ impl ClusterNetworkMaintenance {
             plan,
             use_formation_timeouts,
         } = pending;
-        let records = self
+        let probe_records = self
             .execute_connectivity_probe_plan_async(&state, plan)
             .await;
+        let records = merge_probe_records_with_unsuperseded_bootstrap_connectivity(
+            &paths,
+            &source_node_id,
+            probe_records,
+        );
         let written = sinomo_core::network::write_local_cluster_connectivity_record_set_async(
             &runtime,
             &paths,
@@ -2810,6 +2815,24 @@ impl ClusterNetworkMaintenance {
         match written {
             Ok(()) => {
                 self.idle_stats.incr_connectivity_record_sets_written();
+                let mut publish_host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+                    DaemonClusterRpcMode::new(runtime.clone()),
+                    if use_formation_timeouts {
+                        cluster_formation_control_plane_timeouts()
+                    } else {
+                        cluster_control_plane_timeouts()
+                    },
+                );
+                let published =
+                    sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_async_with_state_and_host(
+                        &runtime,
+                        &paths,
+                        &source_node_id,
+                        records.clone(),
+                        state.clone(),
+                        &mut publish_host,
+                    )
+                    .await;
                 let imported = import_peer_connectivity_records_from_reachable_endpoints_async(
                     &paths,
                     &state,
@@ -2823,8 +2846,17 @@ impl ClusterNetworkMaintenance {
                         "sinomo daemon imported {imported} peer connectivity record set(s)"
                     );
                 }
-                self.connectivity_converged = true;
-                self.record_publish_success();
+                match published {
+                    Ok(_) => {
+                        self.connectivity_converged = true;
+                        self.record_publish_success();
+                    }
+                    Err(error) => {
+                        self.connectivity_converged = false;
+                        self.record_connectivity_publish_failure();
+                        tracing::warn!("sinomo daemon connectivity quorum publish failed: {error}");
+                    }
+                }
             }
             Err(error) => {
                 self.connectivity_converged = false;
@@ -2895,6 +2927,44 @@ impl ClusterNetworkMaintenance {
             probed,
         )
     }
+}
+
+fn merge_probe_records_with_unsuperseded_bootstrap_connectivity(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    mut probe_records: Vec<ClusterConnectivityRecord>,
+) -> Vec<ClusterConnectivityRecord> {
+    let now = OffsetDateTime::now_utc();
+    let mut probed_keys = BTreeSet::new();
+    for record in &probe_records {
+        probed_keys.insert(connectivity_record_target_endpoint_key(record));
+    }
+    let existing_records =
+        sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+            paths,
+            source_node_id,
+        )
+        .unwrap_or_default();
+    for record in existing_records {
+        if record.source_node_id != *source_node_id
+            || matches!(record.state, ClusterConnectivityState::Unreachable)
+            || !sinomo_core::network::cluster_network_record_live(record.expires_at, now)
+        {
+            continue;
+        }
+        let key = connectivity_record_target_endpoint_key(&record);
+        if probed_keys.insert(key) {
+            probe_records.push(record);
+        }
+    }
+    probe_records
+}
+
+fn connectivity_record_target_endpoint_key(record: &ClusterConnectivityRecord) -> (String, String) {
+    (
+        record.target_node_id.to_string(),
+        record.endpoint_id.to_string(),
+    )
 }
 
 fn cluster_network_deadline_with_tail_reserve(
@@ -9277,6 +9347,86 @@ mod tests {
                 .any(|record| record.source_node_id == local_node
                     && record.target_node_id == remote_node),
             "pending async probe should record the remote endpoint result"
+        );
+        let kv_records =
+            sinomo_core::cluster::read_cluster_connectivity_graph_from_kv(&cluster_paths)
+                .expect("kv connectivity records");
+        assert!(
+            kv_records
+                .iter()
+                .any(|record| record.source_node_id == local_node
+                    && record.target_node_id == remote_node),
+            "pending async probe should publish the local source connectivity set into cluster KV"
+        );
+    }
+
+    #[test]
+    fn pending_connectivity_probe_preserves_unsuperseded_bootstrap_records() {
+        let root = unique_cluster_test_root("sinomo-daemon-connectivity-bootstrap-merge");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_connectivity_bootstrap_merge").expect("cluster");
+        let local =
+            NodeId::from_legacy_named("node_connectivity_bootstrap_merge_local").expect("local");
+        let introducer =
+            NodeId::from_legacy_named("node_connectivity_bootstrap_merge_intro").expect("intro");
+        let probed =
+            NodeId::from_legacy_named("node_connectivity_bootstrap_merge_probed").expect("probed");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "connectivity bootstrap merge",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let introducer_endpoint =
+            sinomo_core::network::daemon_lan_endpoint(&introducer, "node3:21353".to_string(), 10);
+        let probed_endpoint =
+            sinomo_core::network::daemon_lan_endpoint(&probed, "node1:21353".to_string(), 20);
+        let introducer_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &introducer_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some("join".to_string()),
+            None,
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let probed_record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &probed_endpoint,
+            ClusterConnectivityState::Unreachable,
+            None,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
+            None,
+            Some("probe failed".to_string()),
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
+        );
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &paths,
+            &local,
+            std::slice::from_ref(&introducer_record),
+        )
+        .expect("seed bootstrap connectivity");
+
+        let merged = merge_probe_records_with_unsuperseded_bootstrap_connectivity(
+            &paths,
+            &local,
+            vec![probed_record.clone()],
+        );
+
+        assert!(merged.contains(&probed_record));
+        assert!(
+            merged.contains(&introducer_record),
+            "fresh probe replacement must retain a live join introducer edge for bootstrap routing"
         );
     }
 

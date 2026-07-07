@@ -4111,6 +4111,19 @@ fn temp_root(name: &str) -> sinomo_testdir::TestDir {
     sinomo_testdir::TestDir::new(&format!("sinomo-dfs-{name}"))
 }
 
+fn open_shared_metadata_posix_service(
+    root: &Path,
+    metadata_root: &Path,
+    node_id: NodeId,
+    content_name: &str,
+) -> NetworkedDfsService<ReceiveOnlyTransport> {
+    let metadata = open_root_local_metadata_backend(metadata_root).expect("metadata backend");
+    let content = LocalContentStore::new(root.join(content_name)).expect("content store");
+    NetworkedDfsService::new(ReceiveOnlyTransport::new(node_id), content)
+        .with_metadata_backend(metadata)
+        .expect("shared metadata service")
+}
+
 #[test]
 fn networked_dfs_builds_routed_messages_without_transport_send() {
     let root = temp_root("networked-dfs-builds-routed-messages");
@@ -8092,8 +8105,8 @@ fn metadata_snapshot_install_processor_replaces_backend_snapshot() {
 }
 
 #[test]
-fn metadata_journal_intent_conflict_applies_incrementally_without_full_hydrate() {
-    let root = temp_root("metadata-journal-intent-conflict-incremental");
+fn metadata_journal_intent_conflict_rejects_incrementally_without_full_hydrate() {
+    let root = temp_root("metadata-journal-intent-reject-incremental");
     let owner = NodeId::from_legacy_named("node_meta_conflict_owner").expect("owner");
     let replica = NodeId::from_legacy_named("node_meta_conflict_replica").expect("replica");
     let object_id = DfsObjectId::from_legacy_named("obj_meta_conflict").expect("object");
@@ -8186,7 +8199,7 @@ fn metadata_journal_intent_conflict_applies_incrementally_without_full_hydrate()
 
     assert!(
         dfs.pending_reads.contains_key("sentinel-read"),
-        "metadata journal conflict handling must not clear active read state with a full hydrate"
+        "metadata journal intent rejection must not clear active read state with a full hydrate"
     );
     let stored_intent = dfs
         .metadata_backend()
@@ -8194,11 +8207,12 @@ fn metadata_journal_intent_conflict_applies_incrementally_without_full_hydrate()
         .get_intent(&object_id, &second_intent.intent_id)
         .expect("stored intent")
         .expect("second intent remains");
-    assert_eq!(stored_intent.status, DfsWriteIntentStatus::Conflict);
+    assert_eq!(stored_intent.status, DfsWriteIntentStatus::Rejected);
     assert!(
-        !dfs.conflicts_for_object(&object_id)
+        dfs.conflicts_for_object(&object_id)
             .expect("conflicts")
-            .is_empty()
+            .is_empty(),
+        "normal metadata replay must not create DFS conflicts"
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -12340,8 +12354,8 @@ fn hydrate_from_metadata_backend_does_not_resurrect_aborted_pending_write() {
 }
 
 #[test]
-fn hydrate_from_metadata_backend_converts_competing_pending_intent_to_conflict() {
-    let root = temp_root("hydrate-competing-pending-intent-conflict");
+fn hydrate_from_metadata_backend_rejects_competing_pending_intent_without_conflict() {
+    let root = temp_root("hydrate-competing-pending-intent-reject");
     let owner = NodeId::from_legacy_named("node_hydrate_conflict_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_hydrate_conflict_replica").expect("node");
     let object_id = DfsObjectId::from_legacy_named("obj_hydrate_conflict").expect("object");
@@ -12425,7 +12439,7 @@ fn hydrate_from_metadata_backend_converts_competing_pending_intent_to_conflict()
         LocalContentStore::new(content_root).expect("recovered content"),
     )
     .with_metadata_backend(recovered_backend)
-    .expect("competing pending intent should hydrate as conflict");
+    .expect("competing pending intent should hydrate as rejected");
 
     assert!(
         recovered_owner
@@ -12440,16 +12454,14 @@ fn hydrate_from_metadata_backend_converts_competing_pending_intent_to_conflict()
             .expect("visible object")
             .version,
         version_1,
-        "conflicting recovered intent must not publish a visible version"
+        "rejected recovered intent must not publish a visible version"
     );
     let conflicts = recovered_owner
         .conflicts_for_object(&object_id)
         .expect("conflicts");
-    assert_eq!(conflicts.len(), 1);
-    assert_eq!(conflicts[0].local_version, version_3);
-    assert_eq!(
-        conflicts[0].local_content_hash.as_deref(),
-        Some(second_hash.as_str())
+    assert!(
+        conflicts.is_empty(),
+        "normal hydrate rejection must not create DFS conflicts"
     );
     let recovered_intent = recovered_owner
         .metadata_backend()
@@ -12457,7 +12469,7 @@ fn hydrate_from_metadata_backend_converts_competing_pending_intent_to_conflict()
         .get_intent(&object_id, &format!("dfs_intent_{}_99", owner.as_str()))
         .expect("intent")
         .expect("intent");
-    assert_eq!(recovered_intent.status, DfsWriteIntentStatus::Conflict);
+    assert_eq!(recovered_intent.status, DfsWriteIntentStatus::Rejected);
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -24038,78 +24050,46 @@ fn sifs_distributed_write_rejects_stale_backend_base_version() {
         .len();
 
     let mut stale_writer = stale;
-    let stale_bytes = b"stale overwrite".to_vec();
-    let stale_hash = content_hash(&stale_bytes);
     let request = DfsWriteRequest {
         file_system_id: stale_stat.file_system_id.clone(),
         object_id: stale_stat.object_id.clone(),
         target_version: crate::namespace::next_version(&stale_stat.version),
         requesting_node_id: node_id.clone(),
     };
-    let outcome = stale_writer
+    let error = stale_writer
         .write_distributed_eventual_with_base(
             request,
             Some(stale_stat.version.clone()),
-            stale_bytes,
+            b"stale overwrite".to_vec(),
             vec![node_id.clone()],
             DfsReplicationPolicy::new(1, 1).expect("policy"),
         )
-        .expect("stale write is reported as conflict");
-    let conflict = match outcome {
-        NetworkedDfsWriteOutcome::Conflict { conflict } => conflict,
-        other => panic!("stale write must conflict instead of overwriting: {other:?}"),
-    };
-    assert_eq!(
-        conflict.local_content_hash.as_deref(),
-        Some(stale_hash.as_str()),
-        "stale writer conflict should preserve the losing writer content hash"
-    );
-    assert_eq!(
-        stale_writer
-            .content()
-            .read_blob(&stale_hash)
-            .expect("stale conflict content"),
-        b"stale overwrite"
+        .expect_err("stale write must reject");
+    assert!(
+        error.to_string().contains("stale DFS write base"),
+        "unexpected stale write error: {error}"
     );
 
-    let journal_after_conflict = stale_writer
+    let journal_after_rejection = stale_writer
         .metadata_backend()
         .expect("stale writer metadata backend")
         .journal_since(0)
-        .expect("journal after conflict");
+        .expect("journal after rejection");
     assert_eq!(
-        journal_after_conflict.len(),
-        journal_count_before_conflict + 1,
-        "stale writer conflict must append to the shared metadata journal without overwriting fresh writer entries"
+        journal_after_rejection.len(),
+        journal_count_before_conflict,
+        "stale writer rejection must not append conflict metadata or overwrite fresh writer entries"
     );
-    assert!(matches!(
-        journal_after_conflict.last().map(|entry| &entry.mutation),
-        Some(DfsMetadataMutation::PutConflict { .. })
-    ));
 
-    let mut reloaded = networked_sifs_with_backend(&root, node_id);
+    let reloaded = networked_sifs_with_backend(&root, node_id);
     assert_eq!(
         reloaded
             .posix_stat(file_path)
-            .expect("stat after conflict")
+            .expect("stat after stale rejection")
             .content_hash,
         fresh_stat.content_hash,
-        "stale conflict publication must not replace the committed content hash"
+        "stale rejection must not replace the committed content hash"
     );
-    assert!(
-        matches!(
-            reloaded.posix_read_file(file_path),
-            Err(DfsPosixError::Conflict { .. })
-        ),
-        "open DFS conflicts must not be reported as missing files"
-    );
-    reloaded
-        .update_conflict_status(
-            &conflict.object_id,
-            &conflict.conflict_id,
-            DfsConflictStatus::Resolved,
-        )
-        .expect("resolve conflict");
     assert_eq!(
         reloaded.posix_read_file(file_path).expect("read winner"),
         b"XYcdef"
@@ -25219,7 +25199,10 @@ fn sifs_cluster_posix_contract_concurrent_whole_file_overwrite_many_readers() {
             None
         }
         Err(DfsPosixError::PendingWrite { intent_id, .. }) => Some(intent_id),
-        Err(DfsPosixError::Conflict { .. }) => None,
+        Err(DfsPosixError::Dfs(DfsError::Busy { .. })) => None,
+        Err(DfsPosixError::Conflict { .. }) => {
+            panic!("observer overwrite created a DFS conflict during normal operation")
+        }
         Err(error) => panic!("observer overwrite failed unexpectedly: {error}"),
     };
 
@@ -25374,14 +25357,17 @@ fn sifs_cluster_posix_contract_concurrent_write_at_truncate_races() {
                 format!("pending:{intent_id}"),
                 None,
             ),
-            Err(DfsPosixError::Conflict { .. }) => record_posix_observation(
+            Err(DfsPosixError::Conflict { .. }) => {
+                panic!("{op} created a DFS conflict during normal operation")
+            }
+            Err(DfsPosixError::Dfs(DfsError::Busy { .. })) => record_posix_observation(
                 &mut observations,
                 scenario,
                 op,
                 &node,
                 path,
                 Instant::now(),
-                "conflict",
+                "retry-busy",
                 None,
             ),
             Err(error) => panic!("{op} returned unexpected error: {error}"),
@@ -25966,6 +25952,84 @@ fn sifs_cluster_posix_contract_rmdir_vs_child_create() {
 }
 
 #[test]
+fn sifs_posix_rmdir_rejects_child_from_fresh_shared_metadata_handle() {
+    let root = temp_root("sifs-rmdir-shared-metadata-race");
+    let metadata_root = root.join("metadata");
+    let node = NodeId::from_legacy_named("node_sifs_rmdir_shared_metadata").expect("node");
+    let dir = "/services/shared-rmdir-race";
+    let child = "/services/shared-rmdir-race/child.txt";
+
+    let mut seed =
+        open_shared_metadata_posix_service(&root, &metadata_root, node.clone(), "content-seed");
+    seed.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    seed.posix_mkdir(dir).expect("mkdir race dir");
+
+    let mut child_writer =
+        open_shared_metadata_posix_service(&root, &metadata_root, node.clone(), "content-child");
+    let mut remover =
+        open_shared_metadata_posix_service(&root, &metadata_root, node.clone(), "content-rmdir");
+
+    child_writer
+        .posix_write_file(
+            child,
+            b"child",
+            DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+        )
+        .expect("child create commits first");
+    assert!(matches!(
+        remover.posix_rmdir(dir),
+        Err(DfsPosixError::DirectoryNotEmpty { .. })
+    ));
+
+    let verifier =
+        open_shared_metadata_posix_service(&root, &metadata_root, node, "content-verify");
+    assert!(verifier.posix_stat(dir).is_ok());
+    assert!(verifier.posix_stat(child).is_ok());
+}
+
+#[test]
+fn sifs_posix_child_create_rejects_parent_removed_by_fresh_shared_metadata_handle() {
+    let root = temp_root("sifs-child-create-shared-metadata-race");
+    let metadata_root = root.join("metadata");
+    let node = NodeId::from_legacy_named("node_sifs_child_shared_metadata").expect("node");
+    let dir = "/services/shared-child-race";
+    let child = "/services/shared-child-race/child.txt";
+
+    let mut seed =
+        open_shared_metadata_posix_service(&root, &metadata_root, node.clone(), "content-seed");
+    seed.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    seed.posix_mkdir(dir).expect("mkdir race dir");
+
+    let mut child_writer =
+        open_shared_metadata_posix_service(&root, &metadata_root, node.clone(), "content-child");
+    let mut remover =
+        open_shared_metadata_posix_service(&root, &metadata_root, node.clone(), "content-rmdir");
+
+    remover.posix_rmdir(dir).expect("rmdir commits first");
+    assert!(matches!(
+        child_writer.posix_write_file(
+            child,
+            b"child",
+            DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+        ),
+        Err(DfsPosixError::MissingParent { .. })
+            | Err(DfsPosixError::NotFound { .. })
+            | Err(DfsPosixError::Dfs(_))
+    ));
+
+    let verifier =
+        open_shared_metadata_posix_service(&root, &metadata_root, node, "content-verify");
+    assert!(matches!(
+        verifier.posix_stat(dir),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert!(matches!(
+        verifier.posix_stat(child),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+}
+
+#[test]
 fn sifs_cluster_posix_contract_directory_rename_while_child_mutations_run() {
     let cluster = sifs_two_primary_cluster("sifs-contract-dir-rename-child");
     let scenario = "directory-rename-while-child-mutations-run";
@@ -26022,7 +26086,7 @@ fn sifs_cluster_posix_contract_directory_rename_while_child_mutations_run() {
     );
     assert!(
         rename.is_ok(),
-        "directory rename should serialize with child mutation"
+        "directory rename should serialize with child mutation: {rename:?}"
     );
     assert!(matches!(
         replica.posix_stat("/users/contract-proj"),
@@ -26505,11 +26569,9 @@ fn sifs_cluster_posix_contract_partitioned_concurrent_writers_are_fenced() {
     assert!(
         matches!(
             stale,
-            Err(DfsPosixError::PendingWrite { .. })
-                | Err(DfsPosixError::Conflict { .. })
-                | Err(DfsPosixError::Dfs(_))
+            Err(DfsPosixError::PendingWrite { .. }) | Err(DfsPosixError::Dfs(_))
         ),
-        "stale partitioned primary must fail, route, or conflict instead of silently committing: {stale:?}"
+        "stale partitioned primary must fail or route instead of silently committing: {stale:?}"
     );
     finish_posix_observations(&observations);
     std::fs::remove_dir_all(&root).ok();
@@ -27243,8 +27305,11 @@ fn sifs_cluster_posix_concurrent_creates_serialize_with_explicit_conflict() {
             Ok(NetworkedDfsWriteOutcome::Committed { content_hash, .. }) => {
                 committed_hashes.push(content_hash.clone());
             }
-            Ok(NetworkedDfsWriteOutcome::Conflict { .. }) | Err(_) => {
+            Err(_) => {
                 surfaced_failures += 1;
+            }
+            Ok(NetworkedDfsWriteOutcome::Conflict { .. }) => {
+                panic!("racing create created a DFS conflict during normal operation")
             }
             Ok(NetworkedDfsWriteOutcome::Pending { .. }) => {
                 panic!("racing write left pending after settle")
@@ -27254,8 +27319,8 @@ fn sifs_cluster_posix_concurrent_creates_serialize_with_explicit_conflict() {
     assert_eq!(
         (committed_hashes.len(), surfaced_failures),
         (1, 1),
-        "exactly one racing create must commit and the other must surface an explicit \
-         conflict; writer: {writer_outcome:?}, observer: {observer_outcome:?}"
+        "exactly one racing create must commit and the other must reject without a conflict; \
+         writer: {writer_outcome:?}, observer: {observer_outcome:?}"
     );
     let winner_hash = committed_hashes.remove(0);
     assert!(
@@ -27276,8 +27341,9 @@ fn sifs_cluster_posix_concurrent_creates_serialize_with_explicit_conflict() {
     };
     assert_eq!(primary_stat.size_bytes, Some(winner_len as u64));
 
-    // Reads of a conflicted object either return the winning bytes or surface
-    // the conflict explicitly; they must never return the losing candidate.
+    // Reads after a rejected racing write return the winner or report missing
+    // content while repair catches up; they must never surface a normal DFS
+    // conflict or return the losing candidate.
     match cluster.primary.posix_read_file_distributed(path) {
         Ok(bytes) => {
             let read_hash = content_hash(&bytes);
@@ -27286,7 +27352,9 @@ fn sifs_cluster_posix_concurrent_creates_serialize_with_explicit_conflict() {
                 "read after race must observe the winning content only"
             );
         }
-        Err(DfsPosixError::Conflict { .. }) => {}
+        Err(DfsPosixError::Conflict { .. }) => {
+            panic!("read after racing create surfaced a DFS conflict during normal operation")
+        }
         Err(DfsPosixError::NotFound { .. }) => {
             // Content may still live only on the winning replica; metadata
             // remains authoritative for the assertion above.
@@ -28626,6 +28694,192 @@ fn sifs_cluster_posix_mkdir_all_remote_primary_skips_when_local_chain_exists() {
 }
 
 #[test]
+fn sifs_cluster_routed_mkdir_all_allows_immediate_child_mkdir() {
+    let cluster = sifs_two_primary_cluster("sifs-routed-mkdir-all-child");
+    let SifsTwoPrimaryCluster {
+        root,
+        users_primary,
+        services_primary,
+        mut replica,
+        rejections,
+        ..
+    } = cluster;
+    assert!(
+        rejections.is_empty(),
+        "two-primary setup must not reject journal batches: {rejections:?}"
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let users_stop = Arc::clone(&stop);
+    let users_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(users_primary, users_stop));
+    let services_stop = Arc::clone(&stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+
+    let base = "/services/cluster-tests";
+    let child = "/services/cluster-tests/dir-race-local";
+    replica
+        .posix_mkdir_all(base)
+        .expect("routed mkdir_all base");
+    replica
+        .posix_mkdir(child)
+        .expect("immediate child mkdir sees routed mkdir_all parent");
+    assert!(replica.posix_stat(base).is_ok());
+    assert!(replica.posix_stat(child).is_ok());
+
+    stop.store(true, Ordering::SeqCst);
+    let _users_primary = users_thread.join().expect("users thread");
+    let _services_primary = services_thread.join().expect("services thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_cluster_routed_lookup_under_split_prefix_uses_exact_path_primary() {
+    let cluster = sifs_two_primary_cluster("sifs-routed-lookup-split-prefix");
+    let SifsTwoPrimaryCluster {
+        root,
+        mut services_primary,
+        mut replica,
+        services_primary_node,
+        rejections,
+        ..
+    } = cluster;
+    assert!(
+        rejections.is_empty(),
+        "two-primary setup must not reject journal batches: {rejections:?}"
+    );
+
+    let dir = "/services/cluster-tests/latency-regression";
+    let path = "/services/cluster-tests/latency-regression/tiny.txt";
+    let bytes = b"split-prefix routed lookup".to_vec();
+    services_primary
+        .posix_mkdir_all(dir)
+        .expect("services primary mkdir_all dir");
+    services_primary
+        .posix_write_file(
+            path,
+            &bytes,
+            sifs_cluster_write_options(&services_primary_node),
+        )
+        .expect("services primary write file");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+
+    let stat = replica
+        .posix_stat_distributed(path)
+        .expect("distributed stat follows exact path primary");
+    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
+    assert_eq!(
+        replica
+            .posix_read_file_distributed(path)
+            .expect("distributed read after exact-primary stat"),
+        bytes
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    let services_primary = services_thread.join().expect("services thread");
+    assert_eq!(
+        services_primary
+            .posix_stat(path)
+            .expect("services primary stat")
+            .size_bytes,
+        Some(bytes.len() as u64)
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_cluster_routed_child_create_rejects_parent_removed_on_primary() {
+    let mut cluster = sifs_two_primary_cluster("sifs-routed-create-removed-parent");
+    let dir = "/services/cluster-tests/stale-parent";
+    let child = "/services/cluster-tests/stale-parent/child.txt";
+    cluster
+        .services_primary
+        .posix_mkdir_all(dir)
+        .expect("services primary creates parent");
+    sifs_two_primary_publish_until(&mut cluster, "stale writer sees parent", |cluster| {
+        cluster.replica.posix_stat(dir).is_ok()
+    });
+    cluster
+        .services_primary
+        .posix_rmdir(dir)
+        .expect("services primary removes parent");
+    assert!(matches!(
+        cluster.services_primary.posix_stat(dir),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert!(
+        cluster.replica.posix_stat(dir).is_ok(),
+        "replica must still have stale parent metadata before routed write"
+    );
+
+    let create = cluster.replica.posix_write_file(
+        child,
+        b"child",
+        sifs_cluster_write_options(&cluster.replica_node.clone()),
+    );
+    assert!(
+        matches!(
+            create,
+            Err(DfsPosixError::PendingWrite { .. })
+                | Err(DfsPosixError::MissingParent { .. })
+                | Err(DfsPosixError::NotFound { .. })
+                | Err(DfsPosixError::Dfs(_))
+        ),
+        "stale routed child create must not commit: {create:?}"
+    );
+
+    let request_id = cluster.replica.pending_routed_writes.keys().next().cloned();
+    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    let routed_error = loop {
+        let Some(request_id) = request_id.as_deref() else {
+            break None;
+        };
+        match cluster.replica.write_outcome(request_id) {
+            Err(error) => break Some(error),
+            Ok(NetworkedDfsWriteOutcome::Pending { .. }) => {}
+            Ok(outcome) => panic!("stale routed child create unexpectedly settled: {outcome:?}"),
+        }
+        let _ = cluster
+            .services_primary
+            .process_incoming()
+            .expect("services primary handles routed write");
+        let _ = cluster
+            .replica
+            .process_incoming()
+            .expect("replica handles routed write response");
+        if Instant::now() >= deadline {
+            panic!(
+                "stale routed child create did not settle; pending={:?}",
+                cluster.replica.pending_routed_writes
+            );
+        }
+        std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+    };
+    if let Some(error) = routed_error {
+        assert!(
+            error
+                .to_string()
+                .contains("parent directory does not exist"),
+            "unexpected stale routed child create rejection: {error}"
+        );
+    }
+    assert!(matches!(
+        cluster.services_primary.posix_stat(child),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert!(matches!(
+        cluster.replica.posix_stat(child),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
 fn sifs_cluster_bulk_local_eventual_splits_mixed_primary_batch() {
     let mut cluster = sifs_two_primary_cluster("sifs-bulk-mixed-primary");
     let local_dir = "/users/bulk-mixed";
@@ -28799,6 +29053,16 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
         .iter()
         .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
+    let file_system_id = sifs_file_system_id();
+    for (path, _) in &batch {
+        assert!(
+            users_primary
+                .metadata()
+                .object_by_normalized_posix_path(&file_system_id, path)
+                .is_none(),
+            "reader unexpectedly had remote-primary metadata before bulk read for {path}"
+        );
+    }
     let read_results = users_primary.posix_read_files_distributed(&read_paths);
     replica_stop.store(true, Ordering::SeqCst);
     let _replica = replica_thread.join().expect("replica thread");
@@ -28807,6 +29071,15 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
             result.expect("bulk remote read"),
             *bytes,
             "remote primary bulk read returned wrong bytes for {path}"
+        );
+    }
+    for (path, _) in &batch {
+        assert!(
+            users_primary
+                .metadata()
+                .object_by_normalized_posix_path(&file_system_id, path)
+                .is_none(),
+            "bulk read should not materialize remote-primary metadata on the reader for {path}"
         );
     }
 
@@ -31833,5 +32106,112 @@ fn sifs_routed_lookup_reselects_refreshed_primary_after_redirect_chain() {
         .join()
         .expect("intermediate primary thread");
     current_thread.join().expect("current primary thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_routed_lookup_uses_local_replica_after_authority_redirect_cycle() {
+    let root = temp_root("sifs-lookup-redirect-cycle-local-replica");
+    let primary_a =
+        NodeId::from_legacy_named("node_sifs_lookup_cycle_primary_a").expect("primary a");
+    let primary_b =
+        NodeId::from_legacy_named("node_sifs_lookup_cycle_primary_b").expect("primary b");
+    let requester_node =
+        NodeId::from_legacy_named("node_sifs_lookup_cycle_requester").expect("requester");
+
+    let network = InProcessNetwork::new();
+    let shard_config = |primary: &NodeId| DfsMetadataShardConfig {
+        file_system_id: sifs_file_system_id(),
+        shard_id: "services".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![primary_a.clone(), primary_b.clone(), requester_node.clone()],
+        epoch: 2,
+        assignment: DfsMetadataShardAssignment::PathPrefix {
+            prefix: SIFS_SERVICES_PATH.to_string(),
+        },
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let put_control_plane = |kv_client: &SharedDfsControlPlaneKvClient<InProcessKvStore>,
+                             primary: &NodeId| {
+        kv_client.with_client(|kv| {
+            let mut control = DfsControlPlaneStore::new(kv);
+            control
+                .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                    requester_node.clone(),
+                )))
+                .expect("filesystem config");
+            control
+                .put_metadata_shard(&shard_config(primary))
+                .expect("services shard config");
+        });
+    };
+
+    let kv_a = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    put_control_plane(&kv_a, &primary_b);
+    let kv_b = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    put_control_plane(&kv_b, &primary_a);
+    let kv_requester = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    put_control_plane(&kv_requester, &requester_node);
+
+    let node_a = sifs_posix_cluster_node(&network, &kv_a, &root, "primary-a", primary_a.clone());
+    let node_b = sifs_posix_cluster_node(&network, &kv_b, &root, "primary-b", primary_b.clone());
+    let mut requester = sifs_posix_cluster_node(
+        &network,
+        &kv_requester,
+        &root,
+        "requester",
+        requester_node.clone(),
+    );
+
+    requester
+        .bootstrap_distributed_sifs()
+        .expect("requester SIFS bootstrap");
+    let path = "/services/lookup-cycle-local-replica.txt";
+    let bytes = b"local replica survives redirect cycle".to_vec();
+    requester
+        .posix_mkdir_all("/services")
+        .expect("requester creates services");
+    requester
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![primary_a.clone(), primary_b.clone()]),
+        )
+        .expect("requester writes local replica");
+
+    put_control_plane(&kv_requester, &primary_a);
+    requester.cached_sifs_metadata_shards = Some(CachedSifsMetadataShards {
+        recorded_at: Instant::now(),
+        shards: vec![shard_config(&primary_a)],
+    });
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let a_stop = Arc::clone(&stop);
+    let a_thread = std::thread::spawn(move || {
+        let mut node = node_a;
+        while !a_stop.load(Ordering::SeqCst) {
+            node.process_incoming().expect("primary a pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let b_stop = Arc::clone(&stop);
+    let b_thread = std::thread::spawn(move || {
+        let mut node = node_b;
+        while !b_stop.load(Ordering::SeqCst) {
+            node.process_incoming().expect("primary b pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let stat = requester.posix_stat_distributed(path);
+
+    stop.store(true, Ordering::SeqCst);
+    a_thread.join().expect("primary a thread");
+    b_thread.join().expect("primary b thread");
+    assert_eq!(
+        stat.expect("local replica stat survives authority redirect cycle")
+            .size_bytes,
+        Some(bytes.len() as u64)
+    );
     std::fs::remove_dir_all(&root).ok();
 }

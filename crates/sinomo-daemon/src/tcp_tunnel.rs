@@ -1,7 +1,4 @@
-use crate::{
-    AuthenticatedDaemonCommand, DaemonError, DaemonPaths, daemon_rpc_body_sha256,
-    sign_daemon_rpc_request_digest_for_local_node,
-};
+use crate::{AuthenticatedDaemonCommand, DaemonError, DaemonPaths, daemon_rpc_body_sha256};
 use sinomo_core::cluster::read_cluster_state_without_kv;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
@@ -784,7 +781,7 @@ async fn ping_tcp_tunnel_peer(
         format!("tcp-tunnel-maintenance-{peer_node_id}"),
         0,
     )?;
-    let auth = sign_object_rpc_request_for_local_node(&request, runtime).await?;
+    let auth = sign_object_rpc_request_for_local_node(&request, runtime, Some(paths)).await?;
     let response = send_signed_endpoint_rpc_via_tcp_tunnel(
         &endpoint,
         &auth,
@@ -1158,7 +1155,7 @@ async fn connect_tcp_tunnel_to_endpoint_after_lock(
         DaemonRpcTimeouts::connect_and_idle(connect_timeout),
     )
     .await?;
-    let request = signed_tcp_tunnel_open_request(runtime).await?;
+    let request = signed_tcp_tunnel_open_request(runtime, paths).await?;
     stream
         .write_request(&endpoint.address, &request, ObjectFrameIoOptions::none())
         .await?;
@@ -1214,26 +1211,34 @@ async fn connect_tcp_tunnel_to_endpoint_after_lock(
 
 async fn signed_tcp_tunnel_open_request(
     runtime: &tokio::runtime::Handle,
+    paths: Option<&DaemonPaths>,
 ) -> Result<ObjectRpcRequest, NetworkError> {
     let mut request = ObjectRpcRequest::encode_body(
         CLUSTER_TCP_TUNNEL_OPEN_ROUTE,
         CLUSTER_TCP_TUNNEL_RPC_CATEGORY,
         &ClusterTcpTunnelOpenRequest::default(),
     )?;
-    request.auth = Some(sign_object_rpc_request_for_local_node(&request, runtime).await?);
+    request.auth = Some(sign_object_rpc_request_for_local_node(&request, runtime, paths).await?);
     Ok(request)
 }
 
 async fn sign_object_rpc_request_for_local_node(
     request: &ObjectRpcRequest,
     runtime: &tokio::runtime::Handle,
+    paths: Option<&DaemonPaths>,
 ) -> Result<Vec<u8>, NetworkError> {
+    let data_dir = tcp_tunnel_signing_data_dir(paths)?;
     let route = request.route.clone();
     let category = request.category.clone();
     let body_sha256 = daemon_rpc_body_sha256(&request);
     Ok(runtime
         .spawn_blocking(move || {
-            sign_daemon_rpc_request_digest_for_local_node(&route, &category, body_sha256)
+            sinomo_core::network::sign_daemon_rpc_request_digest_from_data_dir(
+                &data_dir,
+                &route,
+                &category,
+                body_sha256,
+            )
         })
         .await
         .map_err(|source| NetworkError::Io {
@@ -1244,6 +1249,25 @@ async fn sign_object_rpc_request_for_local_node(
             operation: "sign tcp tunnel request".to_string(),
             detail: error.to_string(),
         })?)
+}
+
+fn tcp_tunnel_signing_data_dir(paths: Option<&DaemonPaths>) -> Result<SinomoDataDir, NetworkError> {
+    if let Some(paths) = paths {
+        let Some(data_dir) = paths.root.parent() else {
+            return Err(NetworkError::Io {
+                operation: "tcp tunnel signing data directory".to_string(),
+                detail: format!(
+                    "daemon path {} has no parent data directory",
+                    paths.root.display()
+                ),
+            });
+        };
+        return Ok(SinomoDataDir::new(data_dir));
+    }
+    SinomoDataDir::from_env_or_home().map_err(|source| NetworkError::Io {
+        operation: "tcp tunnel signing data directory".to_string(),
+        detail: source.to_string(),
+    })
 }
 
 fn spawn_tcp_tunnel(
@@ -1659,6 +1683,42 @@ mod tests {
         assert_eq!(first.node_id, peer);
         assert_eq!(first.transport, ClusterTransportKind::LanTcp);
         assert!(tcp_tunnel_is_synthetic_endpoint(&first));
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_open_request_signs_with_daemon_paths_cluster_node() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-tcp-tunnel-path-signing");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let daemon_paths = DaemonPaths::new(&data_dir);
+        daemon_paths.ensure().expect("daemon paths");
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let local =
+            NodeId::from_legacy_named("node_tcp_tunnel_path_signing_local").expect("local node id");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_tcp_tunnel_path_signing")
+                .expect("cluster id");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "tcp tunnel path signing",
+            local.clone(),
+            "local",
+            "pk-local",
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+
+        let request =
+            signed_tcp_tunnel_open_request(&tokio::runtime::Handle::current(), Some(&daemon_paths))
+                .await
+                .expect("signed request");
+        let envelope: crate::SignedDaemonCommand =
+            sinomo_core::network::SinomoObjectCodec::default()
+                .decode(request.auth.as_deref().expect("auth envelope"))
+                .expect("decode signed envelope");
+
+        assert_eq!(envelope.node_id, local.to_string());
     }
 
     #[tokio::test]

@@ -383,7 +383,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         if apply_synced_path_object
             && let Some(object) = response.synced_path_object.as_ref()
-            && !self.routed_response_object_targets_local_primary(object)?
             && let Err(error) = self.apply_metadata_object_to_service_state(object.clone())
         {
             let reason = format!("routed namespace path sync failed: {error}");
@@ -410,9 +409,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         if apply_synced_path_object {
             for object in &response.synced_path_objects {
-                if self.routed_response_object_targets_local_primary(object)? {
-                    continue;
-                }
                 if let Err(error) = self.apply_metadata_object_to_service_state(object.clone()) {
                     let reason = format!("routed namespace path sync failed: {error}");
                     if let Some(pending) = self
@@ -715,15 +711,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             },
         );
         self.settle_routed_namespace_op(&request_id, timeout)
-    }
-
-    fn routed_response_object_targets_local_primary(
-        &mut self,
-        object: &DfsObjectMetadata,
-    ) -> Result<bool, DfsError> {
-        Ok(self
-            .select_metadata_shard_for_object(object)?
-            .is_some_and(|shard| shard.primary_node_id == self.node_id))
     }
 
     fn settle_routed_namespace_op(

@@ -266,11 +266,7 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
     }
 
     fn connectivity_records(&self) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
-        // Active connectivity is network-plane state, not a stable cluster
-        // fact. KV keeps durable membership/endpoints/status; route choice uses
-        // local probe records plus peer records fetched directly over the
-        // network plane.
-        Ok(Vec::new())
+        read_cluster_connectivity_graph_from_kv(&self.paths)
     }
 
     fn version(&self) -> Result<sinomo_network::DirectoryVersion, NetworkError> {

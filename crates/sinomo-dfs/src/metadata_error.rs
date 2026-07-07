@@ -29,6 +29,8 @@ pub enum MetadataBackendError {
         expected: DfsVersion,
         current: DfsVersion,
     },
+    #[error("directory is not empty: {path}")]
+    DirectoryNotEmpty { path: String },
 }
 
 pub type Result<T> = std::result::Result<T, MetadataBackendError>;

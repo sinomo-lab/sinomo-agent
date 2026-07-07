@@ -32,7 +32,7 @@ The repository now has the first production-oriented DFS slice:
 
 - `sinomo-dfs` defines the default `sifs` filesystem, subtree policies, object metadata, POSIX-like path APIs, read/write routing, network messages, policy violation events, and local-owned directory exposure.
 - `LocalContentStore` stores immutable content-addressed blobs plus object-version manifests and supports chunked writes, extent manifests, range reads, range streams, write-at patches, scrub, version GC, blob GC, quotas, and content stats.
-- `LocalSobjMetadataBackend` stores sharded durable metadata as compact SOBJ table snapshots plus packed table and journal logs. File/object metadata, versions, intents, receipts, conflicts, namespace transactions, visible-version commits, namespace jobs, and tombstone compaction state do not live in the cluster KV.
+- `LocalSobjMetadataBackend` stores sharded durable metadata as compact SOBJ table snapshots plus packed table and journal logs. File/object metadata, versions, intents, receipts, namespace transactions, visible-version commits, namespace jobs, tombstone compaction state, and future split-cluster conflict records do not live in the cluster KV.
 - `NetworkedDfsService` can run local-owned, replicated-eventual, and replicated-confirmed object workflows, route writes to metadata-shard primaries, apply metadata journal batches incrementally, and rebuild pending repair work from persisted intents and receipts after restart.
 - `sinomo-kv` remains the compact control plane for filesystem config, metadata-shard placement, service discovery, and fenced primary epochs.
 - `sinomo-network` carries chunked DFS data-plane messages with range offsets, transfer windows, and per-chunk checksums.
@@ -62,6 +62,12 @@ For distributed eventual objects, policy separates:
 - `repair_deadline`: how aggressively the cluster should converge after a node reconnects.
 
 This mirrors the useful Ceph distinction between the replicas needed to accept a write and the target replica count the cluster repairs toward later. Sinomo exposes that distinction through `DfsReplicationPolicy` and persisted write-intent/receipt records.
+
+## Consistency Invariant
+
+SIFS/DFS guarantees strong eventual consistency for normal cluster operation. When KV quorum is available and the responsible owner or metadata-shard primary can be reached through `sinomo-network`, DFS must serialize writes through that authority and must not create conflict records. Concurrent writes are resolved by compare-and-append metadata transactions: one write advances the visible version, stale-base writers retry or fail, and intents remain pending until their receipt policy is satisfied or they are rejected. Replicas and caches may lag, but the authoritative visible version does not fork. Any normal quorum-backed path that records a conflict is a correctness bug.
+
+Conflict records are reserved for future split-cluster or disconnected-authority recovery, where a partitioned cluster might later discover two independently accepted histories. That mode is future work and must be backed by an explicit reconciliation algorithm before it can be enabled. In the current design, no-quorum or unreachable-authority writes queue, remain pending, or fail fast; they do not become normal conflicts.
 
 ## System Shape
 
@@ -98,7 +104,7 @@ Properties:
 
 - filesystem config, metadata shard placement, policy defaults, service discovery, and owner/primary epochs are KV keys,
 - KV data must remain small enough to duplicate across all control-plane voters,
-- file paths, dentries, inodes, object versions, chunk manifests, write intents, replica receipts, and conflict records are not stored in KV,
+- file paths, dentries, inodes, object versions, chunk manifests, write intents, replica receipts, and future split-cluster conflict records are not stored in KV,
 - phones and roaming devices should normally be learners or non-voting data nodes, not quorum voters.
 
 Recommendation: keep only cluster-wide routing and placement decisions in KV. Namespace and version decisions belong to DFS metadata shards.
@@ -114,7 +120,7 @@ The metadata plane is a CephFS-MDS-like service with Sinomo local-first adjustme
 - namespace transactions are the preferred batching primitive for large metadata changes; they can carry object and visible-version records together so first-publication commits do not require a separate version append,
 - each shard has an append-only journal for mutation replication and replay,
 - large directories split into directory fragments by filename hash,
-- directory/object/intent/conflict scans have cursor APIs and service hydration walks pages instead of loading one bulk vector for each record class,
+- directory/object/intent scans have cursor APIs and service hydration walks pages instead of loading one bulk vector for each record class; conflict scans are reserved for future split-cluster reconciliation metadata,
 - metadata journal batches are bounded by entry count and encoded size and apply to service state incrementally instead of forcing full `hydrate_from_metadata_backend()` after every received batch,
 - shard replicas accept journal batches and compact snapshots only from the current configured shard primary,
 - roaming devices can hold read caches or learner replicas without becoming quorum voters.
@@ -126,7 +132,7 @@ inode/{inode_id}
 dirfrag/{dir_inode}/{frag_id}/dentry/{name_hash}/{name}
 version/{object_id}/{version}
 receipt/{object_id}/{version}/{replica_node_id}
-conflict/{file_system_id}/{conflict_id}
+conflict/{file_system_id}/{conflict_id}        # future split-cluster recovery only
 journal/{shard_id}/{sequence}
 ```
 
@@ -180,7 +186,7 @@ Commit protocol:
 Convergence guarantee:
 
 - If the metadata shard has a live primary or can elect/fence a new primary, at least one current committed replica remains reachable over time, and eligible replica nodes eventually reconnect, then anti-entropy repair eventually brings every desired replica to the current committed version.
-- If concurrent disconnected writes happen, convergence is to explicit conflict records, not silent overwrite.
+- If quorum and the metadata authority are available, concurrent writes do not create conflicts: the metadata transaction serializes one visible version and rejects or retries stale writers. Split-cluster disconnected writes are future work; if that mode is enabled later, convergence must be to explicit conflict records, not silent overwrite.
 
 This is "eventual consistency" for content placement and cache convergence. The visible object version is still serialized by the metadata shard. That boundary keeps the system understandable: replicas may lag, but the authoritative current version does not fork silently.
 
@@ -190,7 +196,6 @@ Intent states:
 open -> staging -> commit-ready -> committed
                   -> pending-repair
                   -> aborted
-                  -> conflicted
 ```
 
 Receipt states:
@@ -233,7 +238,7 @@ txn(
     update intent/<object_id>/<intent_id>.state = committed
     append replication-job entries for missing desired replicas
   failure:
-    leave intent pending or create conflict according to policy
+    leave intent pending or reject/retry according to policy
 )
 ```
 
@@ -260,7 +265,7 @@ for each desired replica:
   if local blob exists and hash matches:
     write or refresh receipt
   if local blob hash diverges:
-    create conflict or quarantine local blob
+    quarantine local blob and repair from authoritative metadata
 ```
 
 ### Placement Algorithm
@@ -313,7 +318,7 @@ On reconnect or periodic background tick:
 2. Missing confirmed blobs are pulled from owner or eligible replicas.
 3. Extra unreferenced blobs become garbage-collection candidates.
 4. Pending receipts are retried if the local blob hash matches the version manifest.
-5. Divergent local writes become conflict records unless policy allows discard.
+5. Divergent local blobs are quarantined unless they match authoritative metadata. Divergent independently accepted writes are only possible in future split-cluster recovery mode.
 6. Distributed eventual objects are re-replicated until their desired replica count is satisfied.
 
 This is the main roaming recovery loop.
@@ -321,7 +326,7 @@ This is the main roaming recovery loop.
 ### Failure Semantics
 
 - No KV quorum: no visible metadata writes for distributed objects.
-- Owner offline for `local-owned`: writes queue, fail, or create conflict candidates according to policy; ownership does not move automatically.
+- Owner offline for `local-owned`: writes queue or fail fast according to policy; ownership does not move automatically.
 - Too few eligible receipts for distributed eventual objects: commit waits, degrades to pending, or rejects based on timeout policy.
 - Some desired replicas offline after threshold commit: visible version may commit, and repair later converges replicas toward policy.
 - Cache stale: reads can continue only when caller and policy allow stale reads.
@@ -336,7 +341,7 @@ This is the best fit for Sinomo's expected cluster shape:
 - local-first access,
 - intermittent mobile devices,
 - policy-sensitive raw content,
-- coding subtrees where explicit conflicts are better than hidden merges.
+- coding subtrees where future split-cluster conflicts must be explicit rather than hidden merges.
 
 It also maps directly onto existing crates: `sinomo-kv` already provides a small replicated control plane, `sinomo-network` already carries protocol messages, and `sinomo-dfs` already has owner-routed local-owned behavior.
 
@@ -351,7 +356,7 @@ Responsibilities:
 - create, update, and tombstone namespace records,
 - map filesystem paths to stable object IDs,
 - track object kind, owner, visible version, policy, and provenance,
-- track version manifests, content hashes, replica receipts, and conflicts,
+- track version manifests, content hashes, replica receipts, and future split-cluster conflicts,
 - perform shard-local compare-and-append write coordination,
 - publish journal-backed metadata updates to local caches.
 
@@ -432,7 +437,7 @@ The data plane moves bytes between nodes over `sinomo-network` protocol messages
 
 ## SIFS Cluster Root
 
-SIFS is the cluster root filesystem. It is the default DFS namespace exposed to operators, agents, cluster services, and rollout/self-evolution workflows. Higher-level concepts such as evolution workspaces are layered onto SIFS paths; DFS itself records object identity, path metadata, versions, locations, receipts, conflicts, and inherited subtree policy.
+SIFS is the cluster root filesystem. It is the default DFS namespace exposed to operators, agents, cluster services, and rollout/self-evolution workflows. Higher-level concepts such as evolution workspaces are layered onto SIFS paths; DFS itself records object identity, path metadata, versions, locations, receipts, future split-cluster conflicts, and inherited subtree policy.
 
 The initial SIFS layout is mixed-architecture:
 
@@ -450,7 +455,7 @@ The initial SIFS layout is mixed-architecture:
 
 ## Metadata Model
 
-SIFS is the default DFS namespace and cluster root filesystem. Agents and higher-level services can map their own directory layouts onto SIFS, but DFS metadata only records object identity, paths, versions, locations, receipts, conflicts, and inherited subtree policy.
+SIFS is the default DFS namespace and cluster root filesystem. Agents and higher-level services can map their own directory layouts onto SIFS, but DFS metadata only records object identity, paths, versions, locations, receipts, future split-cluster conflicts, and inherited subtree policy.
 
 Object identity is stable across path moves:
 
@@ -481,14 +486,14 @@ Version metadata is split from object metadata:
 - replica receipts,
 - commit state.
 
-Conflict metadata is first-class:
+Future split-cluster conflict metadata is first-class but dormant in normal operation:
 
 - conflicted object ID,
 - base version,
 - local candidate version,
 - competing visible version,
 - producing node,
-- conflict strategy,
+- split-recovery strategy,
 - resolution status.
 
 The public DFS API exposes both levels:
@@ -496,7 +501,7 @@ The public DFS API exposes both levels:
 - SIFS path APIs for filesystem-like agent workflows,
 - lower-level object/version APIs for replication, repair, audit, and advanced tools.
 
-The lower-level API makes object identity, visible version, requested version, content hash, replica receipts, and conflict state explicit.
+The lower-level API makes object identity, visible version, requested version, content hash, replica receipts, and future split-cluster conflict state explicit.
 
 ## Control-Plane Keyspace
 
@@ -510,7 +515,7 @@ Use slash-delimited `sinomo-kv` keys and typed compact values only for configura
 /dfs/services/content/<node_id>
 ```
 
-Important rule: this keyspace must not contain per-path, per-object, per-version, receipt, or conflict records.
+Important rule: this keyspace must not contain per-path, per-object, per-version, receipt, or future split-cluster conflict records.
 
 ## Metadata-Shard Keyspace
 
@@ -523,7 +528,7 @@ object/<object_id>
 version/<object_id>/<version>
 intent/<object_id>/<intent_id>
 receipt/<object_id>/<version>/<node_id>
-conflict/<object_id>/<conflict_id>
+conflict/<object_id>/<conflict_id>        # future split-cluster recovery only
 namespace-transaction/<transaction_id>
 namespace-job/<job_id>
 pin/<node_id>/<file_system_id>/<escaped_path>
@@ -561,7 +566,8 @@ privacy:
   encryption_required
   redaction_profile
 conflict:
-  reject | owner-serial | branch | last-writer-wins | resolver
+  normal: metadata-authority-serial
+  split_recovery: reject | branch | resolver
 retention:
   ttl
   keep_versions
@@ -581,7 +587,9 @@ locality:
   owner_required: true
   automatic_read_cache: true
   prefer_session_nodes: true
-conflict: owner-serial
+conflict:
+  normal: owner-serial
+  split_recovery: reject
 privacy:
   raw_content_may_leave_owner: true unless subtree policy narrows it
 ```
@@ -598,7 +606,9 @@ locality:
   owner_required: false
   automatic_read_cache: true
   prefer_session_nodes: true
-conflict: branch
+conflict:
+  normal: metadata-authority-serial
+  split_recovery: branch
 privacy:
   raw_content_may_leave_owner: true unless subtree policy narrows it
 ```
@@ -684,21 +694,21 @@ Every read result makes freshness explicit:
 - current metadata but content still repairing,
 - unavailable because all eligible nodes are offline,
 - rejected by policy,
-- conflict requires caller decision.
+- future split-cluster conflict requires caller decision.
 
-## Conflict Strategy
+## Write Serialization And Future Split Recovery
 
-Silent overwrite is avoided.
+Silent overwrite is avoided. During normal operation, conflict creation is also avoided: quorum-backed metadata authority serializes visible writes and rejects or retries stale-base writers.
 
-Default strategies:
+Normal strategies:
 
 - `local-owned`: owner serializes writes; reject mismatched base version.
 - `replicated-confirmed`: CAS intent rejects concurrent visible-version change.
-- `replicated-eventual`: create conflict versions unless policy explicitly says last-writer-wins.
+- `replicated-eventual`: metadata-shard authority serializes visible-version changes after the commit threshold is met; stale-base writes retry or reject.
 - `append-only`: no conflict for appends, only ordering metadata.
-- `ephemeral-local`: local process owns conflict handling.
+- `ephemeral-local`: local process owns local overwrite behavior until content is promoted.
 
-For coding subtrees, conflict versions appear as explicit files or reviewable metadata so agents can resolve them using diff and tests.
+Future split-cluster recovery may introduce conflict records when two isolated authorities later discover divergent committed histories. That mode is not enabled by normal DFS operation and needs a documented reconciliation algorithm before use. For coding subtrees, future conflict versions should appear as explicit files or reviewable metadata so agents can resolve them using diff and tests.
 
 ## Roaming Behavior
 
@@ -708,7 +718,7 @@ Behavior rules:
 
 - Phone and laptop sleep should not block cluster control-plane writes.
 - Reads may use cached content if policy permits stale reads.
-- Writes to an offline owner should queue, fail fast, or create a conflict candidate according to policy.
+- Writes to an offline owner should queue or fail fast according to policy.
 - Ownership transfer is explicit and fenced through the control plane or responsible metadata shard; it is not inferred from owner unreachability.
 - Pinned SIFS paths can prefetch likely-needed files before a node leaves LAN.
 - Reconnect should repair by comparing manifests and receipts, not by scanning arbitrary directories.
@@ -739,7 +749,7 @@ Cache states are visible to agents:
 - remote-current,
 - pending-replication,
 - unavailable-offline,
-- conflicted,
+- split-conflicted (future split-cluster recovery only),
 - policy-blocked.
 
 ## Security and Policy Enforcement
@@ -778,7 +788,7 @@ dfs.write.staged
 dfs.write.receipt.recorded
 dfs.write.committed
 dfs.write.rejected
-dfs.write.conflict.created
+dfs.write.conflict.created        # future split-cluster recovery only
 dfs.replica.requested
 dfs.replica.completed
 dfs.replica.failed
@@ -799,8 +809,8 @@ These events carry node, filesystem, object, version, policy, content hash, and 
 
 ### Metadata Scaling
 
-- Backend scans expose cursor APIs for object, intent, receipt, conflict, namespace-job, and directory-fragment records.
-- Service restart hydration walks pages and reconstructs coordinator, repair, conflict, and tombstone state from backend records.
+- Backend scans expose cursor APIs for object, intent, receipt, future split-cluster conflict, namespace-job, and directory-fragment records.
+- Service restart hydration walks pages and reconstructs coordinator, repair, future split-cluster conflict, and tombstone state from backend records.
 - Metadata journal replication uses bounded batches and applies each journal entry directly to service state. Sparse legacy entries are hydrated from keyed backend records when possible; unrecoverable namespace transaction entries fail explicitly instead of importing the whole filesystem.
 
 ### Write Amplification
@@ -835,7 +845,7 @@ The load-bearing invariant behind this design: a shard replica's backend journal
 File and symlink renames (and hardlinks) whose source and destination live in metadata shards owned by *different* primaries run as a durable two-step saga coordinated by the source-side primary:
 
 1. the coordinator validates the source, persists a `RenameObjectAcrossShardPrimaries` (or `HardlinkAcrossShardPrimaries`) namespace job, and locks the in-flight path against concurrent content writes and namespace mutations,
-2. the destination primary atomically validates the destination and adopts the moved record together with its version, receipt, intent, and conflict history (`AdoptObjectAtPath` / `AdoptHardlinkAlias`, mirroring same-node shard migration), journaled in the destination shard,
+2. the destination primary atomically validates the destination and adopts the moved record together with its version, receipt, intent, and future split-cluster conflict history (`AdoptObjectAtPath` / `AdoptHardlinkAlias`, mirroring same-node shard migration), journaled in the destination shard,
 3. the coordinator then atomically tombstones the old path, evicts the moved record from the source shard (same-object-id tombstone plus shard-index repoint, exactly the journal shape of a same-node cross-shard move), and touches the source parent.
 
 Structured destination rejections abort the saga before anything mutated; transport failures park the job (lock held) for daemon maintenance to resume, re-resolving the destination primary from the control plane so shard transfers mid-saga are followed. After adoption commits, recovery is forward only — the move either fully applies everywhere or cleanly rejects. Unlinking a canonical record whose surviving hardlink alias lives under another primary promotes it through the same saga. Requesters regain read-your-write for the foreign half via a `SyncPath` round to the destination primary. Intent ids cover the target version so a new shard authority can never mint an id that collides with the previous coordinator's history.

@@ -5,19 +5,20 @@ use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
 use sinomo_dfs::{
     DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, DfsBlobTransferResult, DfsCommitVersionCommand,
-    DfsConfirmedTimeoutAction, DfsConfirmedTimeoutOutcome, DfsConflictStatus, DfsControlPlaneStore,
-    DfsDistributedWriteResult, DfsFetchBlobResponse, DfsFetchBlobResponseChunk, DfsFetchBlobResult,
-    DfsFileSystem, DfsFileSystemId, DfsMessageTransport, DfsMetadataBackend, DfsMetadataMutation,
-    DfsMetadataReplicationOutcome, DfsMetadataShardAssignment, DfsMetadataShardConfig,
-    DfsMetadataShardId, DfsNetworkMessage, DfsNodeAdvertisement, DfsObjectId, DfsObjectKind,
-    DfsObjectMetadata, DfsObjectVersionRecord, DfsOwnerHandoffOutcome, DfsReadData,
-    DfsReadResponse, DfsReadResponseChunk, DfsReadResult, DfsRepairReplicaChunkCommand,
-    DfsRepairReplicaCommand, DfsRepairReplicaResponse, DfsReplicaReceiptRecord,
-    DfsReplicationPolicy, DfsRoutedMessage, DfsStageBlobChunkCommand, DfsStageBlobCommand,
-    DfsStageBlobResponse, DfsVersion, DfsWriteIntentState, DfsWriteIntentStatus,
-    LocalSobjMetadataBackend, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
-    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
-    SharedDfsControlPlaneKvClient, file_system_config_key, sifs_node_files_path,
+    DfsConfirmedTimeoutAction, DfsConfirmedTimeoutOutcome, DfsControlPlaneStore,
+    DfsDistributedWriteResult, DfsError, DfsFetchBlobResponse, DfsFetchBlobResponseChunk,
+    DfsFetchBlobResult, DfsFileSystem, DfsFileSystemId, DfsMessageTransport, DfsMetadataBackend,
+    DfsMetadataMutation, DfsMetadataReplicationOutcome, DfsMetadataShardAssignment,
+    DfsMetadataShardConfig, DfsMetadataShardId, DfsNetworkMessage, DfsNodeAdvertisement,
+    DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord, DfsOwnerHandoffOutcome,
+    DfsReadData, DfsReadResponse, DfsReadResponseChunk, DfsReadResult,
+    DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
+    DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsRoutedMessage, DfsStageBlobChunkCommand,
+    DfsStageBlobCommand, DfsStageBlobResponse, DfsVersion, DfsWriteIntentState,
+    DfsWriteIntentStatus, LocalSobjMetadataBackend, NetworkedDfsReadFreshness,
+    NetworkedDfsReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
+    NetworkedDfsWriteOutcome, SharedDfsControlPlaneKvClient, file_system_config_key,
+    sifs_node_files_path,
 };
 use std::fs;
 use std::io::{Read, Result as IoResult};
@@ -5303,13 +5304,11 @@ fn networked_dfs_self_only_fast_path_rejects_duplicate_pending_intent() {
             vec![owner],
             DfsReplicationPolicy::new(1, 1).expect("policy"),
         )
-        .expect("duplicate write should be isolated as conflict");
+        .expect_err("duplicate write should reject without creating a conflict");
     assert!(matches!(
         duplicate,
-        NetworkedDfsWriteOutcome::Conflict { conflict }
-            if conflict.remote_version == version_1
-                && conflict.local_version == version_2
-                && conflict.reason.contains("duplicate DFS write intent")
+        DfsError::Distributed { message }
+            if message.contains("duplicate DFS write intent")
     ));
     assert_eq!(
         owner_dfs
@@ -5328,12 +5327,19 @@ fn networked_dfs_self_only_fast_path_rejects_duplicate_pending_intent() {
             .state,
         DfsWriteIntentState::AwaitingReceipts
     );
+    assert!(
+        owner_dfs
+            .conflicts_for_object(&object_id)
+            .expect("conflicts")
+            .is_empty(),
+        "normal duplicate pending writes must not create DFS conflicts"
+    );
 
     cleanup(&root);
 }
 
 #[test]
-fn networked_dfs_second_writer_conflicts_with_existing_pending_write() {
+fn networked_dfs_second_writer_rejects_existing_pending_write_without_conflict() {
     let owner = NodeId::from_legacy_named("node_pending_conflict_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_pending_conflict_replica").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
@@ -5418,13 +5424,11 @@ fn networked_dfs_second_writer_conflicts_with_existing_pending_write() {
             vec![owner.clone(), replica],
             DfsReplicationPolicy::new(2, 2).expect("policy"),
         )
-        .expect("second write should become conflict");
+        .expect_err("second write should reject without creating a conflict");
     assert!(matches!(
         second,
-        NetworkedDfsWriteOutcome::Conflict { conflict }
-            if conflict.remote_version == version_1
-                && conflict.local_version == version_3
-                && conflict.reason.contains("pending DFS write intent")
+        DfsError::Distributed { message }
+            if message.contains("pending DFS write intent")
     ));
     assert_eq!(
         owner_dfs
@@ -5438,8 +5442,10 @@ fn networked_dfs_second_writer_conflicts_with_existing_pending_write() {
     let conflicts = owner_dfs
         .conflicts_for_object(&object_id)
         .expect("conflicts");
-    assert_eq!(conflicts.len(), 1);
-    assert_eq!(conflicts[0].local_version, version_3);
+    assert!(
+        conflicts.is_empty(),
+        "normal pending-write serialization must not create DFS conflicts"
+    );
 
     cleanup(&root);
 }
@@ -5728,13 +5734,20 @@ fn networked_dfs_three_nodes_two_replicas_supports_multiple_readers_and_writers(
             vec![node_a.clone(), node_b],
             DfsReplicationPolicy::new(2, 2).expect("policy"),
         )
-        .expect("stale writer is handled");
+        .expect_err("stale writer should reject without creating a conflict");
     assert!(matches!(
         stale_writer,
-        NetworkedDfsWriteOutcome::Conflict { conflict }
-            if conflict.remote_version == version_3
-                && conflict.local_version == DfsVersion::from_legacy_named("version_4").expect("version")
+        DfsError::Distributed { message }
+            if message.contains("stale DFS write base")
+                || message.contains("base version conflict")
     ));
+    assert!(
+        dfs_a
+            .conflicts_for_object(&object_id)
+            .expect("conflicts")
+            .is_empty(),
+        "normal stale-base writes must not create DFS conflicts"
+    );
 
     cleanup(&root);
 }
@@ -6896,11 +6909,12 @@ fn networked_dfs_write_uses_backend_current_metadata_over_transient_memory() {
             vec![node.clone()],
             DfsReplicationPolicy::new(1, 1).expect("policy"),
         )
-        .expect("write outcome");
+        .expect_err("stale transient-memory write must reject");
     assert!(matches!(
         outcome,
-        NetworkedDfsWriteOutcome::Conflict { conflict }
-            if conflict.remote_version == version_2
+        DfsError::Distributed { message }
+            if message.contains("stale DFS write base")
+                || message.contains("base version conflict")
     ));
     assert_eq!(
         dfs.metadata_backend()
@@ -6910,6 +6924,12 @@ fn networked_dfs_write_uses_backend_current_metadata_over_transient_memory() {
             .expect("backend object")
             .version,
         version_2
+    );
+    assert!(
+        dfs.conflicts_for_object(&object_id)
+            .expect("conflicts")
+            .is_empty(),
+        "backend-current stale writes must not create DFS conflicts"
     );
 
     cleanup(&root);
@@ -11860,7 +11880,7 @@ fn networked_dfs_replicated_confirmed_can_downgrade_then_repair() {
 }
 
 #[test]
-fn networked_dfs_stale_replicated_eventual_write_creates_conflict_read_view() {
+fn networked_dfs_stale_replicated_eventual_write_rejects_without_conflict() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
@@ -11923,52 +11943,35 @@ fn networked_dfs_stale_replicated_eventual_write_creates_conflict_read_view() {
             vec![owner.clone()],
             DfsReplicationPolicy::new(1, 1).expect("policy"),
         )
-        .expect("stale write becomes conflict");
-    let conflict = match write {
-        NetworkedDfsWriteOutcome::Conflict { conflict } => conflict,
-        other => panic!("expected conflict outcome, got {other:?}"),
-    };
-    assert_eq!(conflict.local_version, version_3);
-    assert_eq!(conflict.remote_version, version_2);
-    assert_eq!(conflict.status, DfsConflictStatus::Open);
-    assert_eq!(
+        .expect_err("stale write should reject without conflict");
+    assert!(matches!(
+        write,
+        DfsError::Distributed { message }
+            if message.contains("stale DFS write base")
+                || message.contains("base version conflict")
+    ));
+    assert!(
         dfs.metadata_backend()
             .expect("backend")
             .conflicts_for_object(&object_id)
             .expect("conflicts")
-            .len(),
-        1
+            .is_empty(),
+        "normal stale write must not persist conflict records"
     );
 
     let read = dfs
         .read_local_object_with_state(&object_id, false)
-        .expect("conflicted read");
+        .expect("read after stale rejection");
     assert!(matches!(
         read,
-        NetworkedDfsReadOutcome::Conflicted {
-            visible_version,
-            conflicts,
-            ..
-        } if visible_version == version_2 && conflicts.len() == 1
-    ));
-    dfs.update_conflict_status(
-        &object_id,
-        &conflict.conflict_id,
-        DfsConflictStatus::Resolved,
-    )
-    .expect("resolve conflict")
-    .expect("conflict");
-    assert!(matches!(
-        dfs.read_local_object_with_state(&object_id, false)
-            .expect("resolved read"),
-        NetworkedDfsReadOutcome::Found { .. }
+        NetworkedDfsReadOutcome::Found { data, .. } if data.version == version_2
     ));
 
     cleanup(&root);
 }
 
 #[test]
-fn networked_dfs_reconnect_reconciliation_refreshes_receipt_and_records_conflict() {
+fn networked_dfs_reconnect_reconciliation_refreshes_receipt_and_ignores_divergent_manifest() {
     let node = NodeId::from_legacy_named("node_laptop").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
@@ -12029,11 +12032,11 @@ fn networked_dfs_reconnect_reconciliation_refreshes_receipt_and_records_conflict
         .expect("reconcile");
     assert_eq!(reconciliation.refreshed_receipts, 1);
     assert!(!reconciliation.missing_current);
-    assert_eq!(reconciliation.conflicts.len(), 1);
     assert_eq!(
-        reconciliation.conflicts[0].local_version,
-        DfsVersion::from_legacy_named("version_3_local").expect("version")
+        reconciliation.ignored_divergent_manifests, 1,
+        "divergent reconnect manifests should be ignored, not published as conflicts"
     );
+    assert!(reconciliation.conflicts.is_empty());
     assert_eq!(
         dfs.metadata_backend()
             .expect("backend")
@@ -12044,9 +12047,17 @@ fn networked_dfs_reconnect_reconciliation_refreshes_receipt_and_records_conflict
     );
     assert!(matches!(
         dfs.read_local_object_with_state(&object_id, false)
-            .expect("conflicted read"),
-        NetworkedDfsReadOutcome::Conflicted { .. }
+            .expect("read after reconnect"),
+        NetworkedDfsReadOutcome::Found { .. }
     ));
+    assert!(
+        dfs.metadata_backend()
+            .expect("backend")
+            .conflicts_for_object(&object_id)
+            .expect("conflicts")
+            .is_empty(),
+        "normal reconnect reconciliation must not create DFS conflicts"
+    );
     let journal_count_before_repeat = dfs
         .metadata_backend()
         .expect("backend")
@@ -12066,14 +12077,14 @@ fn networked_dfs_reconnect_reconciliation_refreshes_receipt_and_records_conflict
         repeated_reconciliation.refreshed_receipts, 0,
         "repeat reconnect reconciliation should not report unchanged receipts as refreshed"
     );
-    assert_eq!(repeated_reconciliation.conflicts.len(), 1);
     assert_eq!(
-        repeated_reconciliation.conflicts[0].conflict_id, reconciliation.conflicts[0].conflict_id,
-        "repeat reconnect reconciliation should report the same durable conflict"
+        repeated_reconciliation.ignored_divergent_manifests, 1,
+        "repeat reconnect reconciliation should keep ignoring the same divergent manifest"
     );
+    assert!(repeated_reconciliation.conflicts.is_empty());
     assert_eq!(
         journal_count_after_repeat, journal_count_before_repeat,
-        "repeat reconnect reconciliation must not republish unchanged conflicts or receipts"
+        "repeat reconnect reconciliation must not publish unchanged conflicts or receipts"
     );
 
     cleanup(&root);
@@ -12140,6 +12151,7 @@ fn networked_dfs_reconnect_reconciliation_ignores_historical_manifests() {
         .expect("reconcile historical manifest");
 
     assert_eq!(reconciliation.refreshed_receipts, 1);
+    assert_eq!(reconciliation.ignored_divergent_manifests, 0);
     assert!(!reconciliation.missing_current);
     assert!(
         reconciliation.conflicts.is_empty(),
@@ -12157,6 +12169,7 @@ fn networked_dfs_reconnect_reconciliation_ignores_historical_manifests() {
         repeated.refreshed_receipts, 0,
         "known historical manifests should not cause repeat receipt refresh reports"
     );
+    assert_eq!(repeated.ignored_divergent_manifests, 0);
     assert!(repeated.conflicts.is_empty());
 
     cleanup(&root);

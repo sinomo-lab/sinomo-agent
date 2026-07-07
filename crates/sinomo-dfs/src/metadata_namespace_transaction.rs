@@ -6,15 +6,31 @@
 
 use std::collections::BTreeSet;
 
+use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_keys::{dentry_key, path_record_for_object};
 use crate::metadata_object_index::{
     object_index_table_ops_with_previous, object_indexes_are_materialized,
 };
+use crate::metadata_pages::child_objects_for_directory_from_tables;
 use crate::metadata_records::{
     DfsMetadataTableOp, DfsNamespaceTransaction, normalized_version_record,
 };
 use crate::metadata_tables::DfsMetadataTables;
 use crate::{DfsObjectId, DfsObjectKind, DfsObjectMetadata};
+
+pub(crate) fn validate_namespace_transaction_preconditions(
+    tables: &DfsMetadataTables,
+    transaction: &DfsNamespaceTransaction,
+) -> Result<()> {
+    let mut scratch = tables.clone();
+    for op in plan_namespace_transaction_table_ops(tables, transaction) {
+        scratch.apply(op);
+    }
+    for object in &transaction.objects {
+        validate_directory_tombstone_has_no_children(tables, &scratch, object)?;
+    }
+    Ok(())
+}
 
 pub(crate) fn plan_namespace_transaction_table_ops(
     tables: &DfsMetadataTables,
@@ -161,6 +177,30 @@ pub(crate) fn object_path_has_external_owner(
         .dentries
         .get(&dentry_key(&path_record))
         .is_some_and(|record| !owns_path(&record.object_id))
+}
+
+fn validate_directory_tombstone_has_no_children(
+    before: &DfsMetadataTables,
+    after: &DfsMetadataTables,
+    object: &DfsObjectMetadata,
+) -> Result<()> {
+    if object.kind != DfsObjectKind::Tombstone {
+        return Ok(());
+    }
+    let Some(current) = before.objects.get(&object.object_id) else {
+        return Ok(());
+    };
+    if current.kind != DfsObjectKind::Directory || current.path != object.path {
+        return Ok(());
+    }
+    if child_objects_for_directory_from_tables(after, &object.file_system_id, &object.path)
+        .is_empty()
+    {
+        return Ok(());
+    }
+    Err(MetadataBackendError::DirectoryNotEmpty {
+        path: object.path.clone(),
+    })
 }
 
 fn plan_object_index_ops(

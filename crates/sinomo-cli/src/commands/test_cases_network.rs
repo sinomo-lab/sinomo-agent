@@ -6,7 +6,10 @@
 
 use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster;
-use sinomo_runtime::core::{ClusterBootstrapState, ClusterMemberRecord};
+use sinomo_runtime::core::{
+    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
+    ClusterTransportKind,
+};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
@@ -15,6 +18,7 @@ use sinomo_runtime::test::{
     SinomoTestRequirement, SinomoTestResult,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
@@ -36,6 +40,8 @@ pub fn register_network_cluster_test_cases(
 ) -> SinomoTestRegistryBuilder {
     builder
         .register(network_ping_benchmark())
+        .register(network_state_hygiene())
+        .register(network_state_hygiene_dirty_fixture())
         .register(network_endpoint_error_fallback())
         .register(network_tcp_tunnel_stale_fallback())
 }
@@ -44,10 +50,34 @@ sinomo_runtime::test::sinomo_test_case! {
     pub fn network_ping_benchmark(ctx) {
         id: "cluster.network.ping-benchmark",
         summary: "Concurrent signed cluster network ping RPCs to every remote main daemon",
-        tags: ["cluster-network", "probe", "performance"],
+        tags: ["cluster-network", "probe", "performance", "cluster-network-dfs-acceptance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_network_ping_benchmark(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn network_state_hygiene(ctx) {
+        id: "cluster.network.hygiene",
+        summary: "Advertised endpoints and active connectivity records are internally consistent",
+        tags: ["cluster-network", "probe", "routing", "hygiene", "cluster-network-dfs-acceptance"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_network_state_hygiene(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn network_state_hygiene_dirty_fixture(ctx) {
+        id: "cluster.network.hygiene-dirty-fixture",
+        summary: "Network hygiene detects and restores an injected stale local connectivity record",
+        tags: ["cluster-network", "probe", "routing", "hygiene", "failure-mode"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_network_state_hygiene_dirty_fixture(ctx)
         }
     }
 }
@@ -73,6 +103,248 @@ sinomo_runtime::test::sinomo_test_case! {
         run: {
             run_network_tcp_tunnel_stale_fallback(ctx)
         }
+    }
+}
+
+fn run_network_state_hygiene(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let expected_targets = optional_usize_parameter(ctx, "expected-targets", 1)?;
+    let max_findings = optional_usize_parameter(ctx, "max-findings", 0)?;
+    let require_active_routes = optional_bool_parameter(ctx, "require-active-routes", true)?;
+
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot refresh cluster snapshot before network hygiene: {error}"
+        ))
+    })?;
+    let cluster_state = cluster::read_cluster_state(&cluster_paths)
+        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+    let targets = network_ping_targets_from_state(&cluster_state)?;
+    ctx.record("target_count", targets.len());
+    ctx.record(
+        "targets",
+        targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    );
+    if targets.len() < expected_targets {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "network hygiene saw {} remote main targets, expected at least {expected_targets}",
+            targets.len()
+        )));
+    }
+
+    let local_records =
+        network::read_local_cluster_connectivity_records(&cluster_paths).map_err(|error| {
+            SinomoTestError::failed(format!("cannot read local connectivity records: {error}"))
+        })?;
+    let kv_records =
+        cluster::read_cluster_connectivity_graph_from_kv(&cluster_paths).map_err(|error| {
+            SinomoTestError::failed(format!("cannot read KV connectivity records: {error}"))
+        })?;
+    let active_records =
+        network::read_cluster_connectivity_graph(&cluster_paths).map_err(|error| {
+            SinomoTestError::failed(format!("cannot read active connectivity graph: {error}"))
+        })?;
+    let findings = network_hygiene_findings(
+        &cluster_state,
+        &local_records,
+        &kv_records,
+        &active_records,
+        NetworkHygieneOptions {
+            require_active_routes,
+        },
+    );
+    ctx.record("local_connectivity_records", local_records.len());
+    ctx.record("kv_connectivity_records", kv_records.len());
+    ctx.record("active_connectivity_records", active_records.len());
+    ctx.record("max_findings", max_findings);
+    ctx.record("findings", findings.clone());
+    if findings.len() > max_findings {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "network hygiene found {} issue(s): {}",
+            findings.len(),
+            findings
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        )));
+    }
+    Ok(SinomoTestOutcome::passed(
+        "advertised endpoints and connectivity records are consistent",
+    ))
+}
+
+fn run_network_state_hygiene_dirty_fixture(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let expected_targets = optional_usize_parameter(ctx, "expected-targets", 1)?;
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot refresh cluster snapshot before network hygiene dirty fixture: {error}"
+        ))
+    })?;
+    let cluster_state = cluster::read_cluster_state(&cluster_paths)
+        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+    let targets = network_ping_targets_from_state(&cluster_state)?;
+    ctx.record("target_count", targets.len());
+    ctx.record(
+        "targets",
+        targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    );
+    if targets.len() < expected_targets {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "network hygiene dirty fixture saw {} remote main targets, expected at least {expected_targets}",
+            targets.len()
+        )));
+    }
+    let target = targets
+        .first()
+        .cloned()
+        .ok_or_else(|| SinomoTestError::failed("no remote main target available".to_string()))?;
+
+    let original_source_records = network::read_local_cluster_connectivity_records_for_source(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+    )
+    .map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot snapshot local-source connectivity records: {error}"
+        ))
+    })?;
+    let dirty = network_hygiene_dirty_fixture_record(&cluster_state, &target);
+    let mut seeded_records = original_source_records.clone();
+    seeded_records.retain(|record| record.endpoint_id != dirty.endpoint_id);
+    seeded_records.push(dirty.clone());
+    network::write_local_cluster_connectivity_record_set(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+        &seeded_records,
+    )
+    .map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot seed dirty local connectivity fixture: {error}"
+        ))
+    })?;
+
+    let probe_result =
+        run_network_state_hygiene_dirty_fixture_probe(&cluster_paths, &cluster_state, &dirty);
+    let restore_result = network::write_local_cluster_connectivity_record_set(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+        &original_source_records,
+    );
+    if let Err(error) = restore_result {
+        return Err(SinomoTestError::failed(format!(
+            "cannot restore local connectivity after hygiene dirty fixture: {error}"
+        )));
+    }
+    let findings = probe_result?;
+    ctx.record("dirty_target", target.to_string());
+    ctx.record("dirty_endpoint_id", dirty.endpoint_id.to_string());
+    ctx.record("dirty_address", dirty.address.clone());
+    ctx.record("findings", findings.clone());
+    if !findings.iter().any(|finding| {
+        finding.contains("references unadvertised endpoint")
+            && finding.contains(dirty.endpoint_id.as_str())
+    }) {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "network hygiene did not flag injected stale endpoint {}; findings={findings:?}",
+            dirty.endpoint_id
+        )));
+    }
+
+    let restored_source_records = network::read_local_cluster_connectivity_records_for_source(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+    )
+    .map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot verify local connectivity restore after dirty fixture: {error}"
+        ))
+    })?;
+    if restored_source_records
+        .iter()
+        .any(|record| record.endpoint_id == dirty.endpoint_id)
+    {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "dirty endpoint {} remained after restore",
+            dirty.endpoint_id
+        )));
+    }
+
+    Ok(SinomoTestOutcome::passed(
+        "network hygiene detected an injected stale local connectivity record and restored state",
+    ))
+}
+
+fn run_network_state_hygiene_dirty_fixture_probe(
+    cluster_paths: &ClusterPaths,
+    cluster_state: &ClusterBootstrapState,
+    dirty: &network::ClusterConnectivityRecord,
+) -> Result<Vec<String>, SinomoTestError> {
+    let local_records =
+        network::read_local_cluster_connectivity_records(cluster_paths).map_err(|error| {
+            SinomoTestError::failed(format!(
+                "cannot read local connectivity records after dirty fixture: {error}"
+            ))
+        })?;
+    if !local_records
+        .iter()
+        .any(|record| record.endpoint_id == dirty.endpoint_id)
+    {
+        return Err(SinomoTestError::failed(format!(
+            "dirty endpoint {} was not persisted before hygiene probe",
+            dirty.endpoint_id
+        )));
+    }
+    let kv_records =
+        cluster::read_cluster_connectivity_graph_from_kv(cluster_paths).map_err(|error| {
+            SinomoTestError::failed(format!(
+                "cannot read KV connectivity records after dirty fixture: {error}"
+            ))
+        })?;
+    let active_records =
+        network::read_cluster_connectivity_graph(cluster_paths).map_err(|error| {
+            SinomoTestError::failed(format!(
+                "cannot read active connectivity graph after dirty fixture: {error}"
+            ))
+        })?;
+    Ok(network_hygiene_findings(
+        cluster_state,
+        &local_records,
+        &kv_records,
+        &active_records,
+        NetworkHygieneOptions {
+            require_active_routes: false,
+        },
+    ))
+}
+
+fn network_hygiene_dirty_fixture_record(
+    state: &ClusterBootstrapState,
+    target: &NodeId,
+) -> network::ClusterConnectivityRecord {
+    let now = OffsetDateTime::now_utc();
+    network::ClusterConnectivityRecord {
+        cluster_id: state.cluster_id.clone(),
+        source_node_id: state.local_node_id.clone(),
+        target_node_id: target.clone(),
+        endpoint_id: network::ClusterEndpointId::derived(
+            "sinomo.test.network.hygiene.dirty-endpoint",
+            format!("{}\0{}", state.local_node_id.as_str(), target.as_str()),
+        ),
+        transport: ClusterTransportKind::LanTcp,
+        address: "stale.example.test:21353".to_string(),
+        state: network::ClusterConnectivityState::Healthy,
+        latency_ms: Some(1),
+        consecutive_failures: 0,
+        last_success_at: Some(now.to_string()),
+        last_failure_at: None,
+        failure_reason: None,
+        observed_at: now,
+        expires_at: now + time::Duration::seconds(network::CLUSTER_CONNECTIVITY_TTL_SECONDS),
     }
 }
 
@@ -478,13 +750,13 @@ fn run_network_endpoint_error_fallback(ctx: &mut SinomoTestContext) -> SinomoTes
             ))
         })?;
 
-    let original_connectivity = network::read_local_cluster_connectivity_records_for_source(
+    let original_connectivity = cluster_connectivity_records_for_source_with_bootstrap_fallback(
         &cluster_paths,
         &cluster_state.local_node_id,
     )
     .map_err(|error| {
         SinomoTestError::failed(format!(
-            "cannot snapshot local connectivity before endpoint fallback probe: {error}"
+            "cannot snapshot KV connectivity before endpoint fallback probe: {error}"
         ))
     })?;
     let seed_records = endpoint_error_fallback_seed_records(
@@ -493,29 +765,24 @@ fn run_network_endpoint_error_fallback(ctx: &mut SinomoTestContext) -> SinomoTes
         &bad_endpoint,
         original_connectivity.clone(),
     );
-    network::write_local_cluster_connectivity_record_set(
+    sync_connectivity_fixture_to_quorum(
         &cluster_paths,
         &cluster_state.local_node_id,
-        &seed_records,
-    )
-    .map_err(|error| {
-        SinomoTestError::failed(format!(
-            "cannot seed deterministic bad endpoint preference: {error}"
-        ))
-    })?;
+        seed_records,
+        "seed deterministic bad endpoint preference",
+    )?;
 
     let probe_result =
         run_network_endpoint_error_fallback_probe(target, &bad_endpoint_address, timeout_ms);
 
-    let restore_result = network::write_local_cluster_connectivity_record_set(
+    let restore_result = sync_connectivity_fixture_to_quorum(
         &cluster_paths,
         &cluster_state.local_node_id,
-        &original_connectivity,
+        original_connectivity.clone(),
+        "restore connectivity after endpoint fallback probe",
     );
     if let Err(error) = restore_result {
-        return Err(SinomoTestError::failed(format!(
-            "cannot restore local connectivity after endpoint fallback probe: {error}"
-        )));
+        return Err(error);
     }
     let probe_outcome = probe_result?;
     if !matches!(
@@ -539,16 +806,15 @@ fn run_network_endpoint_error_fallback(ctx: &mut SinomoTestContext) -> SinomoTes
     );
     identity_mismatch.failure_reason =
         Some(network::ClusterConnectivityFailureReason::IdentityMismatch);
-    network::write_local_cluster_connectivity_records(
+    let mut final_connectivity = original_connectivity;
+    final_connectivity.retain(|record| record.endpoint_id != bad_endpoint.endpoint_id);
+    final_connectivity.push(identity_mismatch);
+    sync_connectivity_fixture_to_quorum(
         &cluster_paths,
         &cluster_state.local_node_id,
-        std::slice::from_ref(&identity_mismatch),
-    )
-    .map_err(|error| {
-        SinomoTestError::failed(format!(
-            "cannot mark bad endpoint as identity-mismatch after fallback probe: {error}"
-        ))
-    })?;
+        final_connectivity,
+        "mark bad endpoint as identity-mismatch after fallback probe",
+    )?;
 
     ctx.record("target_name", target_name);
     ctx.record("target_node_id", target.node_id.to_string());
@@ -560,6 +826,47 @@ fn run_network_endpoint_error_fallback(ctx: &mut SinomoTestContext) -> SinomoTes
     Ok(SinomoTestOutcome::passed(
         "routed RPC retried the auth-error endpoint and reached the requested target",
     ))
+}
+
+fn cluster_connectivity_records_for_source_with_bootstrap_fallback(
+    cluster_paths: &ClusterPaths,
+    source_node_id: &NodeId,
+) -> Result<Vec<network::ClusterConnectivityRecord>, network::NetworkError> {
+    let records = cluster::read_cluster_connectivity_graph_from_kv(cluster_paths)?
+        .into_iter()
+        .filter(|record| record.source_node_id == *source_node_id)
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        // When the source has not yet published into KV, use the local
+        // bootstrap cache to construct the complete source-owned set that this
+        // fixture will commit to quorum.
+        return network::read_local_cluster_connectivity_records_for_source(
+            cluster_paths,
+            source_node_id,
+        );
+    }
+    Ok(records)
+}
+
+fn sync_connectivity_fixture_to_quorum(
+    cluster_paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    records: Vec<network::ClusterConnectivityRecord>,
+    action: &str,
+) -> Result<(), SinomoTestError> {
+    let mut driver = super::cli_cluster_control_plane_driver();
+    let snapshot = cluster::sync_cluster_connectivity_records_to_quorum_with_host(
+        cluster_paths,
+        source_node_id,
+        records,
+        &mut driver,
+    )
+    .map_err(|error| SinomoTestError::failed(format!("cannot {action}: {error}")))?;
+    if let Some(snapshot) = snapshot {
+        super::write_imported_cluster_kv_snapshot(cluster_paths, &snapshot)
+            .map_err(|error| SinomoTestError::failed(format!("cannot cache {action}: {error}")))?;
+    }
+    Ok(())
 }
 
 fn run_network_tcp_tunnel_stale_fallback(ctx: &mut SinomoTestContext) -> SinomoTestResult {
@@ -837,6 +1144,290 @@ fn member_has_main_daemon(member: &ClusterMemberRecord) -> bool {
         .any(|capability| capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct NetworkHygieneOptions {
+    require_active_routes: bool,
+}
+
+#[derive(Clone, Debug)]
+struct NetworkHygieneEndpointInfo {
+    node_id: NodeId,
+    transport: ClusterTransportKind,
+    address: String,
+    privacy: ClusterEndpointPrivacy,
+}
+
+fn network_hygiene_findings(
+    state: &ClusterBootstrapState,
+    local_records: &[network::ClusterConnectivityRecord],
+    kv_records: &[network::ClusterConnectivityRecord],
+    active_records: &[network::ClusterConnectivityRecord],
+    options: NetworkHygieneOptions,
+) -> Vec<String> {
+    let mut findings = Vec::new();
+    let mut endpoints = BTreeMap::<network::ClusterEndpointId, NetworkHygieneEndpointInfo>::new();
+    let mut members = BTreeMap::<NodeId, &ClusterMemberRecord>::new();
+    for member in &state.members {
+        members.insert(member.node_id.clone(), member);
+        collect_member_endpoint_hygiene_findings(state, member, &mut endpoints, &mut findings);
+    }
+    collect_connectivity_record_hygiene_findings(
+        "local",
+        state,
+        &members,
+        &endpoints,
+        local_records,
+        &mut findings,
+    );
+    collect_connectivity_record_hygiene_findings(
+        "kv",
+        state,
+        &members,
+        &endpoints,
+        kv_records,
+        &mut findings,
+    );
+    if options.require_active_routes {
+        collect_active_route_hygiene_findings(state, active_records, &mut findings);
+    }
+    findings.sort();
+    findings.dedup();
+    findings
+}
+
+fn collect_member_endpoint_hygiene_findings(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    endpoints: &mut BTreeMap<network::ClusterEndpointId, NetworkHygieneEndpointInfo>,
+    findings: &mut Vec<String>,
+) {
+    if !member.state.is_authorized() {
+        return;
+    }
+    let remote = member.node_id != state.local_node_id;
+    let mut member_endpoint_ids = BTreeSet::new();
+    for endpoint in &member.endpoints {
+        if endpoint.node_id != member.node_id {
+            findings.push(format!(
+                "member {} contains endpoint {} for different node {}",
+                member.node_id, endpoint.endpoint_id, endpoint.node_id
+            ));
+        }
+        if !member_endpoint_ids.insert(endpoint.endpoint_id.clone()) {
+            findings.push(format!(
+                "member {} advertises duplicate endpoint id {}",
+                member.node_id, endpoint.endpoint_id
+            ));
+        }
+        if endpoint.address.trim().is_empty() {
+            findings.push(format!(
+                "member {} endpoint {} has empty address",
+                member.node_id, endpoint.endpoint_id
+            ));
+        }
+        if remote && endpoint.privacy == ClusterEndpointPrivacy::LocalOnly {
+            findings.push(format!(
+                "remote member {} advertises local-only endpoint {} at {}",
+                member.node_id, endpoint.endpoint_id, endpoint.address
+            ));
+        }
+        if remote
+            && matches!(
+                endpoint.transport,
+                ClusterTransportKind::InProcess | ClusterTransportKind::Loopback
+            )
+        {
+            findings.push(format!(
+                "remote member {} advertises non-peer transport {:?} endpoint {} at {}",
+                member.node_id, endpoint.transport, endpoint.endpoint_id, endpoint.address
+            ));
+        }
+        if endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+            && endpoint_address_is_peer_undialable(&endpoint.address)
+        {
+            findings.push(format!(
+                "member {} advertises peer-visible endpoint {} at undialable address {}",
+                member.node_id, endpoint.endpoint_id, endpoint.address
+            ));
+        }
+        if let Some(existing) = endpoints.insert(
+            endpoint.endpoint_id.clone(),
+            NetworkHygieneEndpointInfo::from_endpoint(endpoint),
+        ) && existing.node_id != endpoint.node_id
+        {
+            findings.push(format!(
+                "endpoint id {} is advertised by both {} and {}",
+                endpoint.endpoint_id, existing.node_id, endpoint.node_id
+            ));
+        }
+    }
+}
+
+fn collect_connectivity_record_hygiene_findings(
+    scope: &str,
+    state: &ClusterBootstrapState,
+    members: &BTreeMap<NodeId, &ClusterMemberRecord>,
+    endpoints: &BTreeMap<network::ClusterEndpointId, NetworkHygieneEndpointInfo>,
+    records: &[network::ClusterConnectivityRecord],
+    findings: &mut Vec<String>,
+) {
+    for record in records {
+        if record.cluster_id != state.cluster_id {
+            findings.push(format!(
+                "{scope} connectivity record {} -> {} uses foreign cluster {}",
+                record.source_node_id, record.target_node_id, record.cluster_id
+            ));
+        }
+        if !members
+            .get(&record.source_node_id)
+            .is_some_and(|member| member.state.is_authorized())
+        {
+            findings.push(format!(
+                "{scope} connectivity record source {} is not an authorized member",
+                record.source_node_id
+            ));
+        }
+        if !members
+            .get(&record.target_node_id)
+            .is_some_and(|member| member.state.is_authorized())
+        {
+            findings.push(format!(
+                "{scope} connectivity record target {} is not an authorized member",
+                record.target_node_id
+            ));
+        }
+        let Some(endpoint) = endpoints.get(&record.endpoint_id) else {
+            if connectivity_record_is_synthetic_tcp_tunnel(record) {
+                if !synthetic_tcp_tunnel_record_targets_peer(record) {
+                    findings.push(format!(
+                        "{scope} synthetic tcp tunnel record {} -> {} has mismatched address {}",
+                        record.source_node_id, record.target_node_id, record.address
+                    ));
+                }
+                continue;
+            }
+            findings.push(format!(
+                "{scope} connectivity record {} -> {} references unadvertised endpoint {} at {}",
+                record.source_node_id, record.target_node_id, record.endpoint_id, record.address
+            ));
+            continue;
+        };
+        if endpoint.node_id != record.target_node_id {
+            findings.push(format!(
+                "{scope} connectivity record {} -> {} references endpoint {} owned by {}",
+                record.source_node_id, record.target_node_id, record.endpoint_id, endpoint.node_id
+            ));
+        }
+        if endpoint.transport != record.transport {
+            findings.push(format!(
+                "{scope} connectivity record {} -> {} endpoint {} transport {:?} != advertised {:?}",
+                record.source_node_id,
+                record.target_node_id,
+                record.endpoint_id,
+                record.transport,
+                endpoint.transport
+            ));
+        }
+        if endpoint.address != record.address {
+            findings.push(format!(
+                "{scope} connectivity record {} -> {} endpoint {} address {} != advertised {}",
+                record.source_node_id,
+                record.target_node_id,
+                record.endpoint_id,
+                record.address,
+                endpoint.address
+            ));
+        }
+        if record.source_node_id != record.target_node_id
+            && record.state != network::ClusterConnectivityState::Unreachable
+            && endpoint.privacy == ClusterEndpointPrivacy::LocalOnly
+        {
+            findings.push(format!(
+                "{scope} connectivity record {} -> {} marks local-only endpoint {} reachable",
+                record.source_node_id, record.target_node_id, record.endpoint_id
+            ));
+        }
+    }
+}
+
+fn connectivity_record_is_synthetic_tcp_tunnel(
+    record: &network::ClusterConnectivityRecord,
+) -> bool {
+    record.transport == ClusterTransportKind::LanTcp
+        && record
+            .address
+            .starts_with(network::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
+}
+
+fn synthetic_tcp_tunnel_record_targets_peer(record: &network::ClusterConnectivityRecord) -> bool {
+    record
+        .address
+        .strip_prefix(network::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
+        == Some(record.target_node_id.as_str())
+}
+
+fn collect_active_route_hygiene_findings(
+    state: &ClusterBootstrapState,
+    active_records: &[network::ClusterConnectivityRecord],
+    findings: &mut Vec<String>,
+) {
+    let graph = network::ClusterConnectivityGraph::from_records(
+        state.local_node_id.clone(),
+        active_records.to_vec(),
+    );
+    for target in network_ping_targets_from_state(state).unwrap_or_default() {
+        if network::cluster_route_next_hop(&graph, &state.local_node_id, &target).is_none() {
+            findings.push(format!(
+                "active connectivity graph has no route from {} to remote main {}",
+                state.local_node_id, target
+            ));
+        }
+    }
+}
+
+impl NetworkHygieneEndpointInfo {
+    fn from_endpoint(endpoint: &ClusterEndpointRecord) -> Self {
+        Self {
+            node_id: endpoint.node_id.clone(),
+            transport: endpoint.transport.clone(),
+            address: endpoint.address.clone(),
+            privacy: endpoint.privacy.clone(),
+        }
+    }
+}
+
+fn endpoint_address_is_peer_undialable(address: &str) -> bool {
+    if endpoint_address_uses_localhost_name(address) {
+        return true;
+    }
+    endpoint_address_socket(address).is_some_and(|socket| {
+        socket.ip().is_loopback() || socket.ip().is_unspecified() || socket.ip().is_multicast()
+    })
+}
+
+fn endpoint_address_socket(address: &str) -> Option<SocketAddr> {
+    let value = normalized_tcp_endpoint_address(address);
+    value.parse::<SocketAddr>().ok()
+}
+
+fn endpoint_address_uses_localhost_name(address: &str) -> bool {
+    let value = normalized_tcp_endpoint_address(address)
+        .trim()
+        .to_ascii_lowercase();
+    value == "localhost" || value.starts_with("localhost:") || value.starts_with("localhost/")
+}
+
+fn normalized_tcp_endpoint_address(address: &str) -> &str {
+    let value = address.trim();
+    if let Some(rest) = value
+        .strip_prefix("tcp://")
+        .or_else(|| value.strip_prefix("lan-tcp://"))
+    {
+        return rest;
+    }
+    value
+}
+
 #[derive(Clone, Debug)]
 struct NetworkPingJob {
     target_node_id: NodeId,
@@ -975,6 +1566,24 @@ fn optional_f64_parameter(
     }
 }
 
+fn optional_bool_parameter(
+    ctx: &SinomoTestContext,
+    key: &str,
+    default: bool,
+) -> Result<bool, SinomoTestError> {
+    match ctx.parameter(key) {
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(SinomoTestError::InvalidParameter {
+                name: key.to_string(),
+                detail: "must be one of true,false,1,0,yes,no,on,off".to_string(),
+            }),
+        },
+        None => Ok(default),
+    }
+}
+
 fn require_positive(name: &str, value: usize) -> Result<(), SinomoTestError> {
     if value == 0 {
         return Err(SinomoTestError::InvalidParameter {
@@ -1086,4 +1695,286 @@ fn current_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_runtime::core::{
+        CapabilityName, ClusterEndpointSource, ClusterMemberRecord, ClusterMemberState,
+        ClusterTransportKind,
+    };
+    use sinomo_runtime::node::ClusterId;
+
+    fn test_state() -> ClusterBootstrapState {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_network_hygiene").expect("cluster");
+        let local_node = NodeId::from_legacy_named("node_network_hygiene_local").expect("node");
+        let remote_node = NodeId::from_legacy_named("node_network_hygiene_remote").expect("node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "network hygiene",
+            local_node.clone(),
+            "local",
+            "local-public-key",
+            now,
+        );
+        state.members[0].capabilities.push(main_daemon_capability());
+        let mut remote = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote_node,
+            "remote",
+            "remote-public-key",
+            now,
+        );
+        remote.capabilities.push(main_daemon_capability());
+        state.members.push(remote);
+        state
+    }
+
+    fn main_daemon_capability() -> CapabilityName {
+        CapabilityName::new(sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY)
+            .expect("main daemon capability")
+    }
+
+    fn test_endpoint(node_id: &NodeId, name: &str, address: &str) -> ClusterEndpointRecord {
+        ClusterEndpointRecord {
+            endpoint_id: network::ClusterEndpointId::from_legacy_named(name).expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: address.to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        }
+    }
+
+    fn test_connectivity_record(
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+    ) -> network::ClusterConnectivityRecord {
+        let now = OffsetDateTime::now_utc();
+        network::cluster_connectivity_record(
+            state,
+            endpoint,
+            network::ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        )
+    }
+
+    fn test_synthetic_tcp_tunnel_record(
+        state: &ClusterBootstrapState,
+        target: &NodeId,
+    ) -> network::ClusterConnectivityRecord {
+        let now = OffsetDateTime::now_utc();
+        network::ClusterConnectivityRecord {
+            cluster_id: state.cluster_id.clone(),
+            source_node_id: state.local_node_id.clone(),
+            target_node_id: target.clone(),
+            endpoint_id: network::ClusterEndpointId::derived(
+                "sinomo.test.synthetic.tcp-tunnel",
+                format!("{}\0{}", state.local_node_id.as_str(), target.as_str()),
+            ),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!(
+                "{}{}",
+                network::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX,
+                target.as_str()
+            ),
+            state: network::ClusterConnectivityState::Healthy,
+            latency_ms: Some(1),
+            consecutive_failures: 0,
+            last_success_at: Some(now.to_string()),
+            last_failure_at: None,
+            failure_reason: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(network::CLUSTER_CONNECTIVITY_TTL_SECONDS),
+        }
+    }
+
+    #[test]
+    fn network_hygiene_flags_remote_local_only_endpoint() {
+        let mut state = test_state();
+        let remote_index = 1;
+        let mut endpoint = test_endpoint(
+            &state.members[remote_index].node_id,
+            "endpoint_network_hygiene_remote_local_only",
+            "peer.example.test:21353",
+        );
+        endpoint.privacy = ClusterEndpointPrivacy::LocalOnly;
+        state.members[remote_index].endpoints.push(endpoint);
+
+        let findings = network_hygiene_findings(
+            &state,
+            &[],
+            &[],
+            &[],
+            NetworkHygieneOptions {
+                require_active_routes: false,
+            },
+        );
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("advertises local-only endpoint")),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn network_hygiene_flags_connectivity_record_for_removed_endpoint() {
+        let state = test_state();
+        let remote_index = 1;
+        let endpoint = test_endpoint(
+            &state.members[remote_index].node_id,
+            "endpoint_network_hygiene_removed",
+            "peer.example.test:21353",
+        );
+        let record = test_connectivity_record(&state, &endpoint);
+
+        let findings = network_hygiene_findings(
+            &state,
+            &[record],
+            &[],
+            &[],
+            NetworkHygieneOptions {
+                require_active_routes: false,
+            },
+        );
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("references unadvertised endpoint")),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn network_hygiene_flags_missing_active_route_to_remote_main() {
+        let state = test_state();
+
+        let findings = network_hygiene_findings(
+            &state,
+            &[],
+            &[],
+            &[],
+            NetworkHygieneOptions {
+                require_active_routes: true,
+            },
+        );
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("has no route")),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn network_hygiene_accepts_current_advertised_connectivity() {
+        let mut state = test_state();
+        let remote_index = 1;
+        let endpoint = test_endpoint(
+            &state.members[remote_index].node_id,
+            "endpoint_network_hygiene_current",
+            "peer.example.test:21353",
+        );
+        let record = test_connectivity_record(&state, &endpoint);
+        state.members[remote_index].endpoints.push(endpoint);
+
+        let findings = network_hygiene_findings(
+            &state,
+            &[record.clone()],
+            &[],
+            &[record],
+            NetworkHygieneOptions {
+                require_active_routes: true,
+            },
+        );
+
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn network_hygiene_accepts_synthetic_tcp_tunnel_connectivity() {
+        let state = test_state();
+        let target = state.members[1].node_id.clone();
+        let record = test_synthetic_tcp_tunnel_record(&state, &target);
+
+        let findings = network_hygiene_findings(
+            &state,
+            &[record.clone()],
+            &[],
+            &[record],
+            NetworkHygieneOptions {
+                require_active_routes: true,
+            },
+        );
+
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn network_hygiene_flags_peer_visible_loopback_address() {
+        let mut state = test_state();
+        let remote_index = 1;
+        let endpoint = test_endpoint(
+            &state.members[remote_index].node_id,
+            "endpoint_network_hygiene_loopback",
+            "127.0.0.1:21353",
+        );
+        state.members[remote_index].endpoints.push(endpoint);
+
+        let findings = network_hygiene_findings(
+            &state,
+            &[],
+            &[],
+            &[],
+            NetworkHygieneOptions {
+                require_active_routes: false,
+            },
+        );
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("undialable address")),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn network_hygiene_ignores_removed_member_endpoint() {
+        let mut state = test_state();
+        let remote_index = 1;
+        state.members[remote_index].state = ClusterMemberState::Removed;
+        let mut endpoint = test_endpoint(
+            &state.members[remote_index].node_id,
+            "endpoint_network_hygiene_removed_member",
+            "127.0.0.1:21353",
+        );
+        endpoint.privacy = ClusterEndpointPrivacy::LocalOnly;
+        state.members[remote_index].endpoints.push(endpoint);
+
+        let findings = network_hygiene_findings(
+            &state,
+            &[],
+            &[],
+            &[],
+            NetworkHygieneOptions {
+                require_active_routes: false,
+            },
+        );
+
+        assert!(findings.is_empty(), "{findings:?}");
+    }
 }

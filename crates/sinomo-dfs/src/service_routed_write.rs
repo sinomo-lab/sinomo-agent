@@ -797,8 +797,69 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 epoch: shard.epoch,
             });
         }
+        if object.content_hash.is_none() {
+            self.ensure_routed_create_parent_current(object)?;
+        }
         self.add_transient_object_metadata(object.clone())?;
         Ok(true)
+    }
+
+    fn ensure_routed_create_parent_current(
+        &self,
+        object: &DfsObjectMetadata,
+    ) -> Result<(), DfsError> {
+        let Some(parent_path) = crate::posix_path::parent_posix_path(&object.path) else {
+            return Ok(());
+        };
+        let parent_key = crate::posix_path::normalized_posix_path_key(&parent_path)
+            .unwrap_or_else(|| parent_path.clone());
+        let metadata_key = crate::namespace::metadata_path(&parent_key);
+        if let Some(tombstone) = self
+            .tombstones_by_metadata_path
+            .get(&(object.file_system_id.clone(), metadata_key.clone()))
+            && tombstone.kind == DfsObjectKind::Tombstone
+        {
+            return Err(DfsError::Distributed {
+                message: format!("parent directory does not exist: {parent_path}"),
+            });
+        }
+        let memory_parent = self
+            .metadata
+            .object_by_normalized_posix_path(&object.file_system_id, &parent_key)
+            .cloned();
+        let backend_parent = self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_object_by_path(&object.file_system_id, &metadata_key))
+            .transpose()?
+            .flatten();
+        let parent = match (memory_parent.as_ref(), backend_parent.as_ref()) {
+            (Some(memory_parent), Some(backend_parent)) => {
+                Some(self.resolve_authoritative_object_metadata(
+                    &backend_parent.object_id,
+                    Some(memory_parent),
+                    Some(backend_parent),
+                )?)
+            }
+            (_, Some(backend_parent)) => Some(backend_parent.clone()),
+            (Some(memory_parent), None) => Some(memory_parent.clone()),
+            (None, None) => None,
+        };
+        match parent {
+            Some(parent) if parent.kind == DfsObjectKind::Directory => Ok(()),
+            Some(parent) if parent.kind == DfsObjectKind::Tombstone => Err(DfsError::Distributed {
+                message: format!("parent directory does not exist: {parent_path}"),
+            }),
+            Some(parent) => Err(DfsError::Distributed {
+                message: format!(
+                    "parent path {parent_path} is not a directory for routed create {}: {:?}",
+                    object.path, parent.kind
+                ),
+            }),
+            None => Err(DfsError::Distributed {
+                message: format!("parent directory does not exist: {parent_path}"),
+            }),
+        }
     }
 
     /// Records the parent-directory mtime update for an object that a routed

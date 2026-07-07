@@ -15,9 +15,9 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum DfsPosixError {
     #[error("DFS error: {0}")]
-    Dfs(#[from] DfsError),
+    Dfs(DfsError),
     #[error("metadata backend error: {0}")]
-    Metadata(#[from] MetadataBackendError),
+    Metadata(MetadataBackendError),
     #[error("not found: {path}")]
     NotFound { path: String },
     #[error("already exists: {path}")]
@@ -47,6 +47,26 @@ pub enum DfsPosixError {
 }
 
 pub type Result<T> = std::result::Result<T, DfsPosixError>;
+
+impl From<DfsError> for DfsPosixError {
+    fn from(error: DfsError) -> Self {
+        match error {
+            DfsError::DirectoryNotEmpty { path } => DfsPosixError::DirectoryNotEmpty { path },
+            error => DfsPosixError::Dfs(error),
+        }
+    }
+}
+
+impl From<MetadataBackendError> for DfsPosixError {
+    fn from(error: MetadataBackendError) -> Self {
+        match error {
+            MetadataBackendError::DirectoryNotEmpty { path } => {
+                DfsPosixError::DirectoryNotEmpty { path }
+            }
+            error => DfsPosixError::Metadata(error),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsStat {

@@ -698,6 +698,9 @@ fn cluster_member_publish_record_for_snapshot(
     member: &ClusterMemberRecord,
 ) -> ClusterMemberRecord {
     let mut member = member.clone();
+    member
+        .endpoints
+        .retain(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly);
     let Some(existing) = snapshot
         .and_then(|snapshot| snapshot.get(&cluster_member_key(&member.node_id)))
         .and_then(|entry| entry.decode::<ClusterMemberRecord>().ok())
@@ -867,4 +870,46 @@ fn member_publish_targets_voter_first(
     ClusterEndpointSelector::new(paths, state).select_internal(
         ClusterEndpointInternalSelectionPurpose::MemberPublishClusterStateAuthorityFirst,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn member_publish_record_does_not_publish_local_only_endpoints() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_member_publish_sanitize").expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_member_publish_sanitize").expect("node");
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            node_id.clone(),
+            "publisher",
+            "publisher-public-key",
+            now,
+        );
+        member.endpoints.push(ClusterEndpointRecord::loopback(
+            node_id.clone(),
+            "127.0.0.1:21353",
+        ));
+        member.endpoints.push(sinomo_network::daemon_lan_endpoint(
+            &node_id,
+            "peer.example.test:21353".to_string(),
+            0,
+        ));
+
+        let published = cluster_member_publish_record_for_snapshot(None, &member);
+
+        assert_eq!(published.endpoints.len(), 1);
+        assert!(
+            published
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly),
+            "{:?}",
+            published.endpoints
+        );
+        assert_eq!(member.endpoints.len(), 2, "local state must stay untouched");
+    }
 }

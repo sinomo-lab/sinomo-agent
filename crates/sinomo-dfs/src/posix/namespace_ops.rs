@@ -114,7 +114,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object.kind = DfsObjectKind::Tombstone;
         object.version = next_version(&object.version);
         object.current_locations = vec![self.node_id.clone()];
-        self.add_object_metadata(object.clone())?;
+        self.apply_namespace_transaction(DfsNamespaceTransaction {
+            transaction_id: namespace_transaction_id_for_path("rmdir", &object.object_id, &path),
+            file_system_id: object.file_system_id.clone(),
+            objects: vec![object.clone()],
+            versions: Vec::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+        })?;
         self.touch_parent_directory_modified(&path)?;
         self.stat_object(&object)
     }

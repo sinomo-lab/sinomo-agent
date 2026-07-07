@@ -183,7 +183,7 @@ pub use identity::{
     DEFAULT_DFS_NODE_ID, SIFS_FILE_SYSTEM_ID, fallback_dfs_node_id, sifs_file_system_id,
 };
 pub(crate) use intent::{
-    conflict_id_for, distributed_error_creates_conflict, distributed_intent_from_record,
+    distributed_error_is_stale_or_concurrent_write, distributed_intent_from_record,
     distributed_intent_matches_record, distributed_intent_matches_routed_write_command,
     routed_write_command_content_hash, write_intent_record,
     write_intent_record_matches_routed_write_command, write_intent_status_requires_hydrate_restore,

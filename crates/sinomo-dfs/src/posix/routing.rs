@@ -304,7 +304,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     Ok(Some(object)) => return Ok((resolved, Some(object))),
                     Ok(None) => return Ok((resolved, None)),
-                    Err(error) if self.is_local_metadata_replica_for_shard(&shard) => {
+                    Err(error)
+                        if self.is_local_metadata_replica_for_shard(&shard)
+                            && !namespace_lookup_error_allows_local_replica_fallback(&error) =>
+                    {
                         return Err(error.into());
                     }
                     Err(_) => {}
@@ -772,6 +775,15 @@ fn default_sifs_split_shard_for_path(path: &str) -> Option<(&'static str, &'stat
     } else {
         None
     }
+}
+
+fn namespace_lookup_error_allows_local_replica_fallback(error: &DfsError) -> bool {
+    matches!(
+        error,
+        DfsError::Distributed { message }
+            if message.starts_with("routed namespace lookup exceeded ")
+                && message.ends_with(" authority redirects")
+    )
 }
 
 fn namespace_operation_routing_path(operation: &DfsNamespaceOperation) -> Option<&str> {

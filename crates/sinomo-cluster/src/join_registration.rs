@@ -466,6 +466,10 @@ pub fn reconcile_cluster_join_with_introducers_with_host(
         ) {
             Ok(response) => {
                 if response.accepted {
+                    let accepted_snapshot_timeout = match channel.endpoint.transport {
+                        ClusterTransportKind::Iroh => iroh_remaining,
+                        _ => tcp_remaining,
+                    };
                     if let Some(reconciliation) = reconcile_accepted_join_response_with_host(
                         state,
                         &request.invite,
@@ -474,6 +478,18 @@ pub fn reconcile_cluster_join_with_introducers_with_host(
                         connectivity_paths,
                         host,
                     )? {
+                        return Ok(reconciliation);
+                    }
+                    if let Some(reconciliation) =
+                        reconcile_already_accepted_join_from_snapshot_with_host(
+                            state,
+                            &request.invite,
+                            &channel.endpoint,
+                            accepted_snapshot_timeout,
+                            connectivity_paths,
+                            host,
+                        )?
+                    {
                         return Ok(reconciliation);
                     }
                     failures.push(format!(

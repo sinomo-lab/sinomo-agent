@@ -10,8 +10,15 @@ pub(crate) fn locally_learned_bridge_route_endpoint(endpoint: &ClusterEndpointRe
         ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
     ) && endpoint.address.parse::<SocketAddr>().is_err()
         && endpoint.address.contains(':')
+        && !cluster_endpoint_uses_tcp_tunnel_address(endpoint)
         && matches!(endpoint.source, ClusterEndpointSource::Observed)
         && endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+}
+
+pub(crate) fn cluster_endpoint_uses_tcp_tunnel_address(endpoint: &ClusterEndpointRecord) -> bool {
+    endpoint
+        .address
+        .starts_with(crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
 }
 
 /// Whether the local node still needs to run join registration: it either has
