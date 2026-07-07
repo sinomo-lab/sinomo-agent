@@ -10,6 +10,9 @@ pub use accounting::{
     ContentStoreQuota, ContentStoreQuotaResource, ContentStoreQuotaUsage, ContentStoreStats,
 };
 use accounting::{ContentStoreQuotaDelta, ContentStoreStatsDelta, ContentStoreStatsSnapshot};
+use blake3::hazmat::{
+    ChainingValue, HasherExt, Mode, left_subtree_len, merge_subtrees_non_root, merge_subtrees_root,
+};
 pub use chunked::ChunkedBlobAssembler;
 #[cfg(test)]
 use fs_ops::write_file_atomic;
@@ -45,6 +48,8 @@ const CONTENT_STORE_STATS_FILE: &str = "stats.sobj";
 const CONTENT_STORE_STATS_LOCK_FILE: &str = "stats.lock";
 const STREAMED_OBJECT_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 const STREAMED_BLOB_ONLY_MIN_BYTES: usize = 1024 * 1024;
+const CONTENT_HASH_TREE_VERSION: u32 = 1;
+const CONTENT_HASH_TREE_LEAF_BYTES: u64 = 1024 * 1024;
 
 fn content_store_perf_trace(args: std::fmt::Arguments<'_>) {
     tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "dfs content store perf");
@@ -130,6 +135,24 @@ pub struct ContentPatchManifest {
 pub struct ContentVersionIdentity {
     pub content_hash: String,
     pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ContentHashTree {
+    version: u32,
+    object_id: String,
+    object_version: String,
+    size_bytes: u64,
+    content_hash: String,
+    leaf_bytes: u64,
+    leaves: Vec<ContentHashTreeLeaf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ContentHashTreeLeaf {
+    logical_offset: u64,
+    size_bytes: u64,
+    chaining_value: ChainingValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1059,7 +1082,7 @@ impl LocalContentStore {
             return Ok(self.has_blob(&manifest.content_hash)?);
         }
         let extents = self.logical_extents_for_manifest(manifest)?;
-        self.extents_available(&extents)
+        self.extents_readable(&extents)
     }
 
     pub fn read_manifest(&self, object_id: &str, version: &str) -> Result<ContentManifest> {
@@ -1510,6 +1533,42 @@ impl LocalContentStore {
         )
     }
 
+    pub(crate) fn put_object_version_patch_with_trusted_content_hash_and_base_identity(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        target_version: &str,
+        offset: u64,
+        bytes: &[u8],
+        trusted_content_hash: &str,
+        base_identity: Option<&ContentVersionIdentity>,
+    ) -> Result<ContentPatchManifest> {
+        hash_hex(trusted_content_hash)?;
+        self.validate_object_version_patch_source(
+            object_id,
+            base_version,
+            offset,
+            bytes.len() as u64,
+            base_identity,
+        )?;
+        let (patch_hash, patch_size) = if bytes.is_empty() {
+            (None, 0)
+        } else {
+            let (hash, size) = self.write_bytes_as_blob(bytes)?;
+            (Some(hash), size)
+        };
+        self.put_object_version_patch_from_blob_with_trusted_content_hash(
+            object_id,
+            base_version,
+            target_version,
+            offset,
+            patch_hash,
+            patch_size,
+            Some(trusted_content_hash),
+            base_identity,
+        )
+    }
+
     pub fn put_object_version_patch_from_reader_with_info<R: Read>(
         &self,
         object_id: &str,
@@ -1635,6 +1694,30 @@ impl LocalContentStore {
         source_path: &Path,
         base_identity: Option<&ContentVersionIdentity>,
     ) -> Result<ContentPatchManifest> {
+        self.put_object_version_patch_from_file_with_trusted_content_hash(
+            object_id,
+            base_version,
+            target_version,
+            offset,
+            source_path,
+            None,
+            base_identity,
+        )
+    }
+
+    fn put_object_version_patch_from_file_with_trusted_content_hash(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        target_version: &str,
+        offset: u64,
+        source_path: &Path,
+        trusted_content_hash: Option<&str>,
+        base_identity: Option<&ContentVersionIdentity>,
+    ) -> Result<ContentPatchManifest> {
+        if let Some(trusted_content_hash) = trusted_content_hash {
+            hash_hex(trusted_content_hash)?;
+        }
         let (patch_hash, patch_size) = file_content_hash_and_size(source_path)?;
         self.validate_object_version_patch_source(
             object_id,
@@ -1644,13 +1727,14 @@ impl LocalContentStore {
             base_identity,
         )?;
         if patch_size == 0 {
-            return self.put_object_version_patch_from_blob(
+            return self.put_object_version_patch_from_blob_with_trusted_content_hash(
                 object_id,
                 base_version,
                 target_version,
                 offset,
                 None,
                 0,
+                trusted_content_hash,
                 base_identity,
             );
         }
@@ -1662,13 +1746,14 @@ impl LocalContentStore {
             })?;
             self.publish_tracked_file_as_blob(&patch_hash, source_path, &blob_path, &patch_hash)?;
         }
-        self.put_object_version_patch_from_blob(
+        self.put_object_version_patch_from_blob_with_trusted_content_hash(
             object_id,
             base_version,
             target_version,
             offset,
             Some(patch_hash),
             patch_size,
+            trusted_content_hash,
             base_identity,
         )
     }
@@ -1746,6 +1831,32 @@ impl LocalContentStore {
         patch_size: u64,
         base_identity: Option<&ContentVersionIdentity>,
     ) -> Result<ContentPatchManifest> {
+        self.put_object_version_patch_from_blob_with_trusted_content_hash(
+            object_id,
+            base_version,
+            target_version,
+            offset,
+            patch_hash,
+            patch_size,
+            None,
+            base_identity,
+        )
+    }
+
+    fn put_object_version_patch_from_blob_with_trusted_content_hash(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        target_version: &str,
+        offset: u64,
+        patch_hash: Option<String>,
+        patch_size: u64,
+        trusted_content_hash: Option<&str>,
+        base_identity: Option<&ContentVersionIdentity>,
+    ) -> Result<ContentPatchManifest> {
+        if let Some(trusted_content_hash) = trusted_content_hash {
+            hash_hex(trusted_content_hash)?;
+        }
         let base_manifest = self.patch_base_manifest(object_id, base_version, base_identity)?;
         let base_extents = self.logical_extents_for_manifest(&base_manifest)?;
         self.ensure_extents_readable(&base_extents)?;
@@ -1815,7 +1926,26 @@ impl LocalContentStore {
         });
         let target_extents = coalesce_extents(target_extents)?;
         validate_extents_cover_size(&target_extents, target_size, object_id, target_version)?;
-        let content_hash = self.hash_extents(&target_extents)?;
+        let placeholder_content_hash = trusted_content_hash.unwrap_or(&base_manifest.content_hash);
+        let target_manifest_for_hash = ContentManifest {
+            object_id: object_id.to_owned(),
+            version: target_version.to_owned(),
+            content_hash: placeholder_content_hash.to_owned(),
+            size_bytes: target_size,
+            extents: target_extents.clone(),
+        };
+        let hash_tree = self.patch_hash_tree_for_extents(
+            &base_manifest,
+            &target_manifest_for_hash,
+            offset,
+            patch_size,
+            trusted_content_hash,
+        )?;
+        let content_hash = match (hash_tree.as_ref(), trusted_content_hash) {
+            (Some(tree), _) => tree.content_hash.clone(),
+            (None, Some(content_hash)) => content_hash.to_owned(),
+            (None, None) => self.hash_extents(&target_extents)?,
+        };
         let manifest = ContentManifest {
             object_id: object_id.to_owned(),
             version: target_version.to_owned(),
@@ -1824,6 +1954,12 @@ impl LocalContentStore {
             extents: target_extents,
         };
         let manifest = self.write_manifest_create_new_or_existing(manifest)?;
+        if let Some(hash_tree) = hash_tree {
+            self.write_hash_tree_create_new_or_existing(ContentHashTree {
+                content_hash: manifest.content_hash.clone(),
+                ..hash_tree
+            })?;
+        }
         Ok(ContentPatchManifest {
             manifest,
             patch_hash,
@@ -2915,18 +3051,6 @@ impl LocalContentStore {
         Ok(())
     }
 
-    fn extents_available(&self, extents: &[ContentExtent]) -> Result<bool> {
-        for extent in extents {
-            if !self.has_blob(&extent.content_hash)? {
-                return Ok(false);
-            }
-            if !self.extent_range_readable(extent)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
     fn extents_readable(&self, extents: &[ContentExtent]) -> Result<bool> {
         for extent in extents {
             if !self.extent_range_readable(extent)? {
@@ -2956,6 +3080,271 @@ impl LocalContentStore {
                 ),
             })?;
         Ok(required_end <= reader.size_bytes())
+    }
+
+    fn read_hash_tree_optional(
+        &self,
+        object_id: &str,
+        version: &str,
+    ) -> Result<Option<ContentHashTree>> {
+        let path = self.hash_tree_path(object_id, version);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(decode_hash_tree(&read_file(&path)?)?))
+    }
+
+    fn write_hash_tree_create_new_or_existing(
+        &self,
+        tree: ContentHashTree,
+    ) -> Result<ContentHashTree> {
+        let path = self.hash_tree_path(&tree.object_id, &tree.object_version);
+        if path.is_file() {
+            let existing = decode_hash_tree(&read_file(&path)?)?;
+            self.validate_hash_tree_for_manifest_fields(
+                &existing,
+                &tree.object_id,
+                &tree.object_version,
+                tree.size_bytes,
+                &tree.content_hash,
+            )?;
+            return Ok(existing);
+        }
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent.to_path_buf())?;
+        }
+        let bytes = encode_hash_tree(&tree)?;
+        if let Err(error) = write_file_create_new_atomic(&path, &bytes) {
+            if let ContentStoreError::Io { source, .. } = &error
+                && source.kind() == io::ErrorKind::AlreadyExists
+            {
+                let existing = decode_hash_tree(&read_file(&path)?)?;
+                self.validate_hash_tree_for_manifest_fields(
+                    &existing,
+                    &tree.object_id,
+                    &tree.object_version,
+                    tree.size_bytes,
+                    &tree.content_hash,
+                )?;
+                return Ok(existing);
+            }
+            return Err(error);
+        }
+        Ok(tree)
+    }
+
+    fn validate_hash_tree_for_manifest_fields(
+        &self,
+        tree: &ContentHashTree,
+        object_id: &str,
+        version: &str,
+        size_bytes: u64,
+        content_hash: &str,
+    ) -> Result<()> {
+        hash_hex(&tree.content_hash)?;
+        if tree.version != CONTENT_HASH_TREE_VERSION
+            || tree.object_id != object_id
+            || tree.object_version != version
+            || tree.size_bytes != size_bytes
+            || tree.content_hash != content_hash
+            || tree.leaf_bytes != CONTENT_HASH_TREE_LEAF_BYTES
+        {
+            return Err(ContentStoreError::InvalidChunkedContent {
+                message: format!(
+                    "content hash tree does not match manifest: object={object_id}, version={version}"
+                ),
+            });
+        }
+        let expected_leaves = content_hash_tree_leaf_count(size_bytes)?;
+        if tree.leaves.len() != expected_leaves {
+            return Err(ContentStoreError::InvalidChunkedContent {
+                message: format!(
+                    "content hash tree leaf count mismatch: object={object_id}, version={version}, expected={expected_leaves}, actual={}",
+                    tree.leaves.len()
+                ),
+            });
+        }
+        for (index, leaf) in tree.leaves.iter().enumerate() {
+            let (expected_offset, expected_size) = content_hash_tree_leaf_range(size_bytes, index)?;
+            if leaf.logical_offset != expected_offset || leaf.size_bytes != expected_size {
+                return Err(ContentStoreError::InvalidChunkedContent {
+                    message: format!(
+                        "content hash tree leaf shape mismatch: object={object_id}, version={version}, leaf={index}"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn hash_tree_for_manifest(&self, manifest: &ContentManifest) -> Result<ContentHashTree> {
+        if let Some(tree) = self.read_hash_tree_optional(&manifest.object_id, &manifest.version)? {
+            self.validate_hash_tree_for_manifest_fields(
+                &tree,
+                &manifest.object_id,
+                &manifest.version,
+                manifest.size_bytes,
+                &manifest.content_hash,
+            )?;
+            return Ok(tree);
+        }
+        let tree = self.build_hash_tree_for_manifest(manifest, &manifest.content_hash)?;
+        self.write_hash_tree_create_new_or_existing(tree)
+    }
+
+    fn build_hash_tree_for_manifest(
+        &self,
+        manifest: &ContentManifest,
+        expected_content_hash: &str,
+    ) -> Result<ContentHashTree> {
+        hash_hex(expected_content_hash)?;
+        let leaf_count = content_hash_tree_leaf_count(manifest.size_bytes)?;
+        let mut leaves = Vec::with_capacity(leaf_count);
+        for index in 0..leaf_count {
+            let (logical_offset, size_bytes) =
+                content_hash_tree_leaf_range(manifest.size_bytes, index)?;
+            let bytes = self.read_manifest_range(
+                manifest,
+                logical_offset,
+                usize::try_from(size_bytes).map_err(|_| {
+                    ContentStoreError::InvalidChunkedContent {
+                        message: format!(
+                            "content hash tree leaf is too large to buffer: object={}, version={}, bytes={size_bytes}",
+                            manifest.object_id, manifest.version
+                        ),
+                    }
+                })?,
+            )?;
+            if bytes.len() as u64 != size_bytes {
+                return Err(ContentStoreError::InvalidChunkedContent {
+                    message: format!(
+                        "content hash tree leaf read was short: object={}, version={}, expected={size_bytes}, actual={}",
+                        manifest.object_id,
+                        manifest.version,
+                        bytes.len()
+                    ),
+                });
+            }
+            leaves.push(ContentHashTreeLeaf {
+                logical_offset,
+                size_bytes,
+                chaining_value: hash_tree_leaf_chaining_value(logical_offset, &bytes),
+            });
+        }
+        let content_hash = content_hash_from_hash_tree_leaves(manifest.size_bytes, &leaves)?;
+        if content_hash != expected_content_hash {
+            return Err(ContentStoreError::BlobHashMismatch {
+                expected: expected_content_hash.to_owned(),
+                actual: content_hash,
+            });
+        }
+        Ok(ContentHashTree {
+            version: CONTENT_HASH_TREE_VERSION,
+            object_id: manifest.object_id.clone(),
+            object_version: manifest.version.clone(),
+            size_bytes: manifest.size_bytes,
+            content_hash: expected_content_hash.to_owned(),
+            leaf_bytes: CONTENT_HASH_TREE_LEAF_BYTES,
+            leaves,
+        })
+    }
+
+    fn patch_hash_tree_for_extents(
+        &self,
+        base_manifest: &ContentManifest,
+        target_manifest: &ContentManifest,
+        offset: u64,
+        patch_size: u64,
+        trusted_content_hash: Option<&str>,
+    ) -> Result<Option<ContentHashTree>> {
+        if target_manifest.size_bytes <= CONTENT_HASH_TREE_LEAF_BYTES {
+            return Ok(None);
+        }
+        let base_tree = if base_manifest.size_bytes > CONTENT_HASH_TREE_LEAF_BYTES {
+            Some(self.hash_tree_for_manifest(base_manifest)?)
+        } else {
+            None
+        };
+        let leaf_count = content_hash_tree_leaf_count(target_manifest.size_bytes)?;
+        let mut leaves = Vec::with_capacity(leaf_count);
+        let patch_end =
+            offset
+                .checked_add(patch_size)
+                .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+                    message: format!(
+                        "patch range overflows object size: object={}, offset={offset}, bytes={patch_size}",
+                        target_manifest.object_id
+                    ),
+                })?;
+        for index in 0..leaf_count {
+            let (logical_offset, size_bytes) =
+                content_hash_tree_leaf_range(target_manifest.size_bytes, index)?;
+            let leaf_end = logical_offset.checked_add(size_bytes).ok_or_else(|| {
+                ContentStoreError::InvalidChunkedContent {
+                    message: format!(
+                        "content hash tree leaf range overflows: object={}, version={}",
+                        target_manifest.object_id, target_manifest.version
+                    ),
+                }
+            })?;
+            let overlaps_patch = logical_offset < patch_end && leaf_end > offset;
+            let reusable = base_tree.as_ref().and_then(|tree| {
+                tree.leaves.get(index).filter(|leaf| {
+                    !overlaps_patch
+                        && leaf.logical_offset == logical_offset
+                        && leaf.size_bytes == size_bytes
+                })
+            });
+            if let Some(leaf) = reusable {
+                leaves.push(leaf.clone());
+                continue;
+            }
+            let bytes = self.read_manifest_range(
+                target_manifest,
+                logical_offset,
+                usize::try_from(size_bytes).map_err(|_| {
+                    ContentStoreError::InvalidChunkedContent {
+                        message: format!(
+                            "content hash tree patch leaf is too large to buffer: object={}, version={}, bytes={size_bytes}",
+                            target_manifest.object_id, target_manifest.version
+                        ),
+                    }
+                })?,
+            )?;
+            if bytes.len() as u64 != size_bytes {
+                return Err(ContentStoreError::InvalidChunkedContent {
+                    message: format!(
+                        "content hash tree patch leaf read was short: object={}, version={}, expected={size_bytes}, actual={}",
+                        target_manifest.object_id,
+                        target_manifest.version,
+                        bytes.len()
+                    ),
+                });
+            }
+            leaves.push(ContentHashTreeLeaf {
+                logical_offset,
+                size_bytes,
+                chaining_value: hash_tree_leaf_chaining_value(logical_offset, &bytes),
+            });
+        }
+        let content_hash = content_hash_from_hash_tree_leaves(target_manifest.size_bytes, &leaves)?;
+        if let Some(trusted_content_hash) = trusted_content_hash
+            && content_hash != trusted_content_hash
+        {
+            return Err(ContentStoreError::BlobHashMismatch {
+                expected: trusted_content_hash.to_owned(),
+                actual: content_hash,
+            });
+        }
+        Ok(Some(ContentHashTree {
+            version: CONTENT_HASH_TREE_VERSION,
+            object_id: target_manifest.object_id.clone(),
+            object_version: target_manifest.version.clone(),
+            size_bytes: target_manifest.size_bytes,
+            content_hash,
+            leaf_bytes: CONTENT_HASH_TREE_LEAF_BYTES,
+            leaves,
+        }))
     }
 
     fn write_bytes_as_blob(&self, bytes: &[u8]) -> Result<(String, u64)> {
@@ -3077,6 +3466,14 @@ impl LocalContentStore {
             .join("manifest.sobj")
     }
 
+    fn hash_tree_path(&self, object_id: &str, version: &str) -> PathBuf {
+        self.root
+            .join("objects")
+            .join(object_id)
+            .join(version)
+            .join("hash-tree.sobj")
+    }
+
     fn staging_path(&self, intent_id: &str) -> PathBuf {
         self.root.join("staging").join(intent_id)
     }
@@ -3088,6 +3485,16 @@ fn encode_manifest(manifest: &ContentManifest) -> Result<Vec<u8>> {
 }
 
 fn decode_manifest(bytes: &[u8]) -> Result<ContentManifest> {
+    sinomo_object_serde::from_bytes(bytes)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn encode_hash_tree(tree: &ContentHashTree) -> Result<Vec<u8>> {
+    sinomo_object_serde::to_bytes(tree, 1, LengthMode::U32)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn decode_hash_tree(bytes: &[u8]) -> Result<ContentHashTree> {
     sinomo_object_serde::from_bytes(bytes)
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
 }
@@ -3235,6 +3642,123 @@ fn validate_extents_cover_size(
 
 pub(crate) fn content_hash(bytes: &[u8]) -> String {
     format!("{HASH_PREFIX}{}", blake3::hash(bytes).to_hex())
+}
+
+fn content_hash_tree_leaf_count(size_bytes: u64) -> Result<usize> {
+    if size_bytes == 0 {
+        return Ok(0);
+    }
+    usize::try_from(size_bytes.div_ceil(CONTENT_HASH_TREE_LEAF_BYTES)).map_err(|_| {
+        ContentStoreError::InvalidChunkedContent {
+            message: format!("content hash tree has too many leaves: bytes={size_bytes}"),
+        }
+    })
+}
+
+fn content_hash_tree_leaf_range(size_bytes: u64, index: usize) -> Result<(u64, u64)> {
+    let index = u64::try_from(index).map_err(|_| ContentStoreError::InvalidChunkedContent {
+        message: "content hash tree leaf index is too large".to_string(),
+    })?;
+    let logical_offset = index
+        .checked_mul(CONTENT_HASH_TREE_LEAF_BYTES)
+        .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+            message: format!("content hash tree leaf offset overflows: leaf={index}"),
+        })?;
+    if logical_offset >= size_bytes {
+        return Err(ContentStoreError::InvalidChunkedContent {
+            message: format!(
+                "content hash tree leaf starts beyond object: leaf={index}, offset={logical_offset}, size={size_bytes}"
+            ),
+        });
+    }
+    Ok((
+        logical_offset,
+        CONTENT_HASH_TREE_LEAF_BYTES.min(size_bytes - logical_offset),
+    ))
+}
+
+fn hash_tree_leaf_chaining_value(logical_offset: u64, bytes: &[u8]) -> ChainingValue {
+    let mut hasher = blake3::Hasher::new();
+    if logical_offset > 0 {
+        hasher.set_input_offset(logical_offset);
+    }
+    hasher.update(bytes);
+    hasher.finalize_non_root()
+}
+
+fn content_hash_from_hash_tree_leaves(
+    size_bytes: u64,
+    leaves: &[ContentHashTreeLeaf],
+) -> Result<String> {
+    if size_bytes == 0 {
+        return Ok(content_hash(&[]));
+    }
+    if size_bytes <= CONTENT_HASH_TREE_LEAF_BYTES || leaves.len() <= 1 {
+        return Err(ContentStoreError::InvalidChunkedContent {
+            message: "content hash tree root requires at least two leaves".to_string(),
+        });
+    }
+    let left_len = left_subtree_len(size_bytes);
+    let left_leaf_count =
+        usize::try_from(left_len / CONTENT_HASH_TREE_LEAF_BYTES).map_err(|_| {
+            ContentStoreError::InvalidChunkedContent {
+                message: format!("content hash tree left subtree is too large: bytes={left_len}"),
+            }
+        })?;
+    if left_leaf_count == 0 || left_leaf_count >= leaves.len() {
+        return Err(ContentStoreError::InvalidChunkedContent {
+            message: format!(
+                "content hash tree invalid root split: bytes={size_bytes}, left_leaves={left_leaf_count}, leaves={}",
+                leaves.len()
+            ),
+        });
+    }
+    let left = content_hash_tree_subtree_cv(&leaves[..left_leaf_count], left_len)?;
+    let right = content_hash_tree_subtree_cv(&leaves[left_leaf_count..], size_bytes - left_len)?;
+    Ok(format!(
+        "{HASH_PREFIX}{}",
+        merge_subtrees_root(&left, &right, Mode::Hash).to_hex()
+    ))
+}
+
+fn content_hash_tree_subtree_cv(
+    leaves: &[ContentHashTreeLeaf],
+    size_bytes: u64,
+) -> Result<ChainingValue> {
+    if leaves.is_empty() {
+        return Err(ContentStoreError::InvalidChunkedContent {
+            message: "content hash tree subtree has no leaves".to_string(),
+        });
+    }
+    if leaves.len() == 1 {
+        if leaves[0].size_bytes != size_bytes {
+            return Err(ContentStoreError::InvalidChunkedContent {
+                message: format!(
+                    "content hash tree leaf size mismatch: expected={size_bytes}, actual={}",
+                    leaves[0].size_bytes
+                ),
+            });
+        }
+        return Ok(leaves[0].chaining_value);
+    }
+    let left_len = left_subtree_len(size_bytes);
+    let left_leaf_count =
+        usize::try_from(left_len / CONTENT_HASH_TREE_LEAF_BYTES).map_err(|_| {
+            ContentStoreError::InvalidChunkedContent {
+                message: format!("content hash tree subtree split is too large: bytes={left_len}"),
+            }
+        })?;
+    if left_leaf_count == 0 || left_leaf_count >= leaves.len() {
+        return Err(ContentStoreError::InvalidChunkedContent {
+            message: format!(
+                "content hash tree invalid subtree split: bytes={size_bytes}, left_leaves={left_leaf_count}, leaves={}",
+                leaves.len()
+            ),
+        });
+    }
+    let left = content_hash_tree_subtree_cv(&leaves[..left_leaf_count], left_len)?;
+    let right = content_hash_tree_subtree_cv(&leaves[left_leaf_count..], size_bytes - left_len)?;
+    Ok(merge_subtrees_non_root(&left, &right, Mode::Hash))
 }
 
 fn ensure_bytes_match_hash(hash: &str, bytes: &[u8]) -> Result<()> {
@@ -5122,6 +5646,79 @@ mod tests {
             range,
             expected[patch_offset - 11..patch_offset + patch.len() + 11]
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn large_patch_uses_hash_tree_sidecar_without_materializing_logical_blob() {
+        let root = temp_root("large-patch-hash-tree-sidecar");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let base_len = (CONTENT_HASH_TREE_LEAF_BYTES * 3 + 17) as usize;
+        let mut base = vec![0_u8; base_len];
+        for (index, byte) in base.iter_mut().enumerate() {
+            *byte = ((index * 31 + 7) % 251) as u8;
+        }
+        let base_manifest = store
+            .put_object_version("object-large-patch", "v1", &base)
+            .expect("put base object");
+
+        let first_offset = CONTENT_HASH_TREE_LEAF_BYTES as usize + 123;
+        let first_patch = (0..4097)
+            .map(|index| ((index * 17 + 3) % 241) as u8)
+            .collect::<Vec<_>>();
+        let mut expected = base.clone();
+        expected[first_offset..first_offset + first_patch.len()].copy_from_slice(&first_patch);
+        let first = store
+            .put_object_version_patch(
+                "object-large-patch",
+                "v1",
+                "v2",
+                first_offset as u64,
+                &first_patch,
+            )
+            .expect("put first patch");
+        assert_eq!(first.content_hash, content_hash(&expected));
+        assert!(
+            !store
+                .has_blob(&first.content_hash)
+                .expect("first logical blob"),
+            "large patch should keep the logical object as extents"
+        );
+
+        let second_offset = (CONTENT_HASH_TREE_LEAF_BYTES * 2) as usize + 211;
+        let second_patch = (0..8193)
+            .map(|index| ((index * 13 + 11) % 239) as u8)
+            .collect::<Vec<_>>();
+        expected[second_offset..second_offset + second_patch.len()].copy_from_slice(&second_patch);
+        let second = store
+            .put_object_version_patch(
+                "object-large-patch",
+                "v2",
+                "v3",
+                second_offset as u64,
+                &second_patch,
+            )
+            .expect("put second patch");
+        assert_eq!(second.content_hash, content_hash(&expected));
+        assert!(
+            !store
+                .has_blob(&second.content_hash)
+                .expect("second logical blob"),
+            "large patch should not materialize the patched logical blob"
+        );
+        assert!(
+            store.hash_tree_path("object-large-patch", "v1").is_file(),
+            "base hash tree should be cached for subsequent patches"
+        );
+        for manifest in [&base_manifest, &first, &second] {
+            let tree = store
+                .read_hash_tree_optional(&manifest.object_id, &manifest.version)
+                .expect("read hash tree")
+                .expect("hash tree exists");
+            assert_eq!(tree.content_hash, manifest.content_hash);
+            assert_eq!(tree.size_bytes, manifest.size_bytes);
+        }
 
         cleanup(&root);
     }

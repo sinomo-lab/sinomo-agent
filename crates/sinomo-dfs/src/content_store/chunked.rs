@@ -255,9 +255,43 @@ impl LocalContentStore {
 
     pub fn commit_chunked_object_version_patch_with_base_identity(
         &self,
+        assembler: ChunkedBlobAssembler,
+        base_version: &str,
+        offset: u64,
+        base_identity: Option<&ContentVersionIdentity>,
+    ) -> Result<ContentManifest> {
+        self.commit_chunked_object_version_patch_impl(
+            assembler,
+            base_version,
+            offset,
+            None,
+            base_identity,
+        )
+    }
+
+    pub(crate) fn commit_chunked_object_version_patch_with_trusted_content_hash_and_base_identity(
+        &self,
+        assembler: ChunkedBlobAssembler,
+        base_version: &str,
+        offset: u64,
+        trusted_content_hash: &str,
+        base_identity: Option<&ContentVersionIdentity>,
+    ) -> Result<ContentManifest> {
+        self.commit_chunked_object_version_patch_impl(
+            assembler,
+            base_version,
+            offset,
+            Some(trusted_content_hash),
+            base_identity,
+        )
+    }
+
+    fn commit_chunked_object_version_patch_impl(
+        &self,
         mut assembler: ChunkedBlobAssembler,
         base_version: &str,
         offset: u64,
+        trusted_content_hash: Option<&str>,
         base_identity: Option<&ContentVersionIdentity>,
     ) -> Result<ContentManifest> {
         if !assembler.is_complete() {
@@ -291,12 +325,13 @@ impl LocalContentStore {
             });
         }
         let manifest = self
-            .put_object_version_patch_from_file(
+            .put_object_version_patch_from_file_with_trusted_content_hash(
                 &assembler.object_id,
                 base_version,
                 &assembler.version,
                 offset,
                 &assembler.path,
+                trusted_content_hash,
                 base_identity,
             )?
             .manifest;

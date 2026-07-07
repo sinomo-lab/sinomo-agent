@@ -20,6 +20,9 @@ pub(crate) fn plan_namespace_transaction_table_ops(
     tables: &DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
 ) -> Vec<DfsMetadataTableOp> {
+    if transaction.objects.len() == 1 {
+        return plan_single_object_namespace_transaction_table_ops(tables, transaction);
+    }
     let mut scratch = tables.clone();
     let mut table_ops = Vec::new();
     apply_planned_op(
@@ -57,6 +60,31 @@ pub(crate) fn plan_namespace_transaction_table_ops(
                 version: normalized_version_record(version),
             },
         );
+    }
+    table_ops
+}
+
+fn plan_single_object_namespace_transaction_table_ops(
+    tables: &DfsMetadataTables,
+    transaction: &DfsNamespaceTransaction,
+) -> Vec<DfsMetadataTableOp> {
+    let mut table_ops = Vec::new();
+    table_ops.push(DfsMetadataTableOp::PutNamespaceTransaction {
+        transaction: transaction.clone(),
+    });
+    if let Some(object) = transaction.objects.first()
+        && !tables.compacted_tombstone_matches(object)
+    {
+        table_ops.extend(object_index_table_ops_with_previous(
+            tables,
+            object,
+            tables.objects.get(&object.object_id),
+        ));
+    }
+    for version in &transaction.versions {
+        table_ops.push(DfsMetadataTableOp::PutVersion {
+            version: normalized_version_record(version),
+        });
     }
     table_ops
 }

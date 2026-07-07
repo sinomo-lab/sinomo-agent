@@ -178,6 +178,7 @@ impl Preset {
 }
 
 fn main() -> BenchResult<()> {
+    init_trace_from_env();
     let args = Args::parse()?;
     args.emit_config();
     match args.scenario {
@@ -206,6 +207,17 @@ fn main() -> BenchResult<()> {
         remove_dir_all_if_exists(&args.root)?;
     }
     Ok(())
+}
+
+fn init_trace_from_env() {
+    if env::var_os("SINOMO_DFS_BENCH_TRACE").is_none() {
+        return;
+    }
+    let filter = tracing_subscriber::EnvFilter::from_default_env();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 impl Args {
@@ -1682,11 +1694,22 @@ fn run_network_write_at(args: &Args) -> BenchResult<()> {
     let mut patched_bytes = 0u64;
     let mut last_offset = 0u64;
     let mut last_patch = Vec::new();
+    let mut write_call_elapsed = Duration::ZERO;
+    let mut process_elapsed = Duration::ZERO;
+    let mut replica_process_elapsed = Duration::ZERO;
+    let mut owner_process_elapsed = Duration::ZERO;
+    let mut replica_commit_process_elapsed = Duration::ZERO;
+    let mut max_write_call_elapsed = Duration::ZERO;
+    let mut max_process_elapsed = Duration::ZERO;
+    let mut max_replica_process_elapsed = Duration::ZERO;
+    let mut max_owner_process_elapsed = Duration::ZERO;
+    let mut max_replica_commit_process_elapsed = Duration::ZERO;
     for index in 0..args.write_at_ops {
         let offset = write_at_offset(index, args.blob_bytes, args.write_at_bytes);
         let previous_version = bench_object_metadata(&owner_dfs, &object_id)?
             .version
             .clone();
+        let write_call_start = Instant::now();
         owner_dfs.posix_write_file_at_from_reader(
             path,
             offset,
@@ -1698,11 +1721,30 @@ fn run_network_write_at(args: &Args) -> BenchResult<()> {
                 foreground_replica_repair: false,
             },
         )?;
+        let current_write_call_elapsed = write_call_start.elapsed();
+        write_call_elapsed += current_write_call_elapsed;
+        max_write_call_elapsed = max_write_call_elapsed.max(current_write_call_elapsed);
         let deadline = Instant::now() + Duration::from_secs(args.network_timeout_secs);
+        let process_start = Instant::now();
         loop {
+            let replica_process_start = Instant::now();
             let replica_batch = replica_dfs.process_incoming()?;
+            let current_replica_process_elapsed = replica_process_start.elapsed();
+            replica_process_elapsed += current_replica_process_elapsed;
+            max_replica_process_elapsed =
+                max_replica_process_elapsed.max(current_replica_process_elapsed);
+            let owner_process_start = Instant::now();
             let owner_batch = owner_dfs.process_incoming()?;
+            let current_owner_process_elapsed = owner_process_start.elapsed();
+            owner_process_elapsed += current_owner_process_elapsed;
+            max_owner_process_elapsed =
+                max_owner_process_elapsed.max(current_owner_process_elapsed);
+            let replica_commit_process_start = Instant::now();
             let replica_commit_batch = replica_dfs.process_incoming()?;
+            let current_replica_commit_process_elapsed = replica_commit_process_start.elapsed();
+            replica_commit_process_elapsed += current_replica_commit_process_elapsed;
+            max_replica_commit_process_elapsed =
+                max_replica_commit_process_elapsed.max(current_replica_commit_process_elapsed);
             owner_events = owner_events.saturating_add(owner_batch.len());
             replica_events = replica_events
                 .saturating_add(replica_batch.len())
@@ -1726,6 +1768,9 @@ fn run_network_write_at(args: &Args) -> BenchResult<()> {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
+        let current_process_elapsed = process_start.elapsed();
+        process_elapsed += current_process_elapsed;
+        max_process_elapsed = max_process_elapsed.max(current_process_elapsed);
         patched_bytes = patched_bytes.saturating_add(args.write_at_bytes as u64);
         last_offset = offset;
         last_patch = patch_bytes(index, args.write_at_bytes);
@@ -1756,6 +1801,16 @@ fn run_network_write_at(args: &Args) -> BenchResult<()> {
             "patched_bytes": patched_bytes,
             "ops_per_second": rate(args.write_at_ops as u64, patch_elapsed),
             "mib_per_second": mib_per_second(patched_bytes, patch_elapsed),
+            "write_call_ms": write_call_elapsed.as_secs_f64() * 1000.0,
+            "process_ms": process_elapsed.as_secs_f64() * 1000.0,
+            "replica_process_ms": replica_process_elapsed.as_secs_f64() * 1000.0,
+            "owner_process_ms": owner_process_elapsed.as_secs_f64() * 1000.0,
+            "replica_commit_process_ms": replica_commit_process_elapsed.as_secs_f64() * 1000.0,
+            "max_write_call_ms": max_write_call_elapsed.as_secs_f64() * 1000.0,
+            "max_process_ms": max_process_elapsed.as_secs_f64() * 1000.0,
+            "max_replica_process_ms": max_replica_process_elapsed.as_secs_f64() * 1000.0,
+            "max_owner_process_ms": max_owner_process_elapsed.as_secs_f64() * 1000.0,
+            "max_replica_commit_process_ms": max_replica_commit_process_elapsed.as_secs_f64() * 1000.0,
             "owner_events": owner_events,
             "replica_events": replica_events,
             "process_loops": process_loops,

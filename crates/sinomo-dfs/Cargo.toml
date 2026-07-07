@@ -28,6 +28,7 @@ sinomo-module = { path = "../sinomo-module" }
 [dev-dependencies]
 sinomo-testdir = { path = "../sinomo-testdir" }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "scale"

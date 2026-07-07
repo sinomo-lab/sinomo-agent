@@ -33,26 +33,6 @@ pub(crate) struct DfsMetadataReplayCursor {
     pub(crate) last_sequence: u64,
 }
 
-pub(crate) fn current_next_journal_sequence(root: &Path) -> Result<u64> {
-    let journal_dir = root.join("journal");
-    if !journal_dir.exists() {
-        return Ok(1);
-    }
-    let head_next_sequence =
-        read_sobj_optional::<DfsMetadataJournalHead>(&journal_dir.join("head.sobj"))?
-            .and_then(|head| (head.next_sequence > 0).then_some(head.next_sequence));
-    let mut max_sequence = head_next_sequence
-        .map(|next_sequence| next_sequence.saturating_sub(1))
-        .unwrap_or(0);
-
-    max_sequence = max_sequence.max(max_segmented_journal_sequence(root)?);
-    for (sequence, _, _) in legacy_journal_entry_paths_since(root, 0)? {
-        max_sequence = max_sequence.max(sequence);
-    }
-
-    Ok(max_sequence.saturating_add(1).max(1))
-}
-
 pub(crate) fn recover_next_journal_sequence(root: &Path) -> Result<u64> {
     let journal_dir = root.join("journal");
     if !journal_dir.exists() {
@@ -275,7 +255,7 @@ pub(crate) fn write_local_journal_entry(
     next_sequence: &mut u64,
     mutation: DfsMetadataMutation,
 ) -> Result<DfsMetadataJournalEntry> {
-    let sequence = (*next_sequence).max(current_next_journal_sequence(root)?);
+    let sequence = (*next_sequence).max(1);
     let entry = DfsMetadataJournalEntry {
         shard_id: shard_id.clone(),
         sequence,
@@ -298,7 +278,7 @@ pub(crate) fn write_local_journal_entries(
     }
     let trace_started = Instant::now();
     let sequence_started = Instant::now();
-    let mut candidate_sequence = (*next_sequence).max(current_next_journal_sequence(root)?);
+    let mut candidate_sequence = (*next_sequence).max(1);
     let sequence_ms = sequence_started.elapsed().as_millis();
     let build_started = Instant::now();
     let mut entries = Vec::with_capacity(mutations.len());

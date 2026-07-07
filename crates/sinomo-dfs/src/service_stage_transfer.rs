@@ -435,10 +435,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .patch_base_identity_for_current_object(&transfer.object_id, &transfer.base_version)?;
         let manifest = match self
             .content
-            .commit_chunked_object_version_patch_with_base_identity(
+            .commit_chunked_object_version_patch_with_trusted_content_hash_and_base_identity(
                 transfer.chunks.assembler,
                 transfer.base_version.as_str(),
                 transfer.offset,
+                &transfer.content_hash,
                 base_identity.as_ref(),
             ) {
             Ok(manifest) => manifest,

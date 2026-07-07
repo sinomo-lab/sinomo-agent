@@ -1029,6 +1029,10 @@ impl LocalSobjMetadataBackend {
     fn begin_metadata_write(&mut self) -> Result<MetadataWriteLock> {
         let lock = self.metadata_write_lock()?;
         self.refresh_metadata_tables()?;
+        self.next_sequence = self
+            .next_sequence
+            .max(self.materialized_through_sequence.saturating_add(1))
+            .max(1);
         Ok(lock)
     }
 
@@ -5195,6 +5199,62 @@ mod tests {
                 .len(),
             writer_count * writes_per_writer,
             "concurrent materialization must not lose object indexes"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_stale_open_writer_refreshes_next_sequence_from_table_log() {
+        let root = temp_root("local_backend_stale_open_writer_refreshes_next_sequence");
+        let mut stale_writer =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("stale writer");
+        stale_writer
+            .put_file_system(&file_system())
+            .expect("filesystem");
+
+        let mut fresh_writer =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("fresh writer");
+        let mut fresh_object = object(version("version_1"));
+        fresh_object.object_id =
+            DfsObjectId::from_legacy_named("obj_fresh_writer_sequence").expect("object");
+        fresh_object.path = "/docs/fresh-writer-sequence.md".to_string();
+        fresh_writer
+            .put_object(&fresh_object)
+            .expect("fresh writer object");
+
+        let mut stale_object = object(version("version_1"));
+        stale_object.object_id =
+            DfsObjectId::from_legacy_named("obj_stale_writer_sequence").expect("object");
+        stale_object.path = "/docs/stale-writer-sequence.md".to_string();
+        let stale_entry = stale_writer
+            .put_object(&stale_object)
+            .expect("stale writer object");
+        assert_eq!(
+            stale_entry.sequence, 3,
+            "a stale open handle must advance from materialized table state before writing"
+        );
+
+        let sequences = stale_writer
+            .journal_since(0)
+            .expect("journal")
+            .into_iter()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![1, 2, 3]);
+        assert_eq!(
+            stale_writer
+                .get_object(&fresh_object.object_id)
+                .expect("fresh object"),
+            Some(fresh_object)
+        );
+        assert_eq!(
+            stale_writer
+                .get_object(&stale_object.object_id)
+                .expect("stale object"),
+            Some(stale_object)
         );
 
         cleanup(&root);

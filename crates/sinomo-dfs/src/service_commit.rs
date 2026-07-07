@@ -1062,12 +1062,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let manifest = self
             .content
-            .put_object_version_patch_with_info_and_base_identity(
+            .put_object_version_patch_with_trusted_content_hash_and_base_identity(
                 object_id.as_str(),
                 base_version.as_str(),
                 target_version.as_str(),
                 offset,
                 bytes,
+                expected_hash,
                 base_identity,
             )?
             .manifest;
