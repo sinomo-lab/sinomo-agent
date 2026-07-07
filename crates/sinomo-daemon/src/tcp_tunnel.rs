@@ -764,6 +764,29 @@ async fn send_over_tcp_tunnel_handle(
     request: ObjectRpcRequest,
     timeouts: DaemonRpcTimeouts,
 ) -> Result<ObjectRpcResponse, NetworkError> {
+    match send_over_tcp_tunnel_handle_once(handle.clone(), request.clone(), timeouts).await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            if let Some(current) = TCP_TUNNELS
+                .get(&handle.peer_node_id)
+                .filter(|current| !Arc::ptr_eq(current, &handle))
+            {
+                tracing::debug!(
+                    "retrying tcp tunnel request to {} on replacement tunnel after stale handle failed: {error}",
+                    handle.peer_node_id
+                );
+                return send_over_tcp_tunnel_handle_once(current, request, timeouts).await;
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn send_over_tcp_tunnel_handle_once(
+    handle: Arc<TcpTunnelHandle>,
+    request: ObjectRpcRequest,
+    timeouts: DaemonRpcTimeouts,
+) -> Result<ObjectRpcResponse, NetworkError> {
     let result = handle.send(request, timeouts).await;
     if let Err(error) = result.as_ref() {
         TCP_TUNNELS.remove_if_same(&handle);
@@ -775,6 +798,49 @@ async fn send_over_tcp_tunnel_handle(
 }
 
 async fn forward_stream_over_tcp_tunnel_handle(
+    handle: Arc<TcpTunnelHandle>,
+    request: ObjectRpcRequest,
+    timeouts: DaemonRpcTimeouts,
+    upstream: &mut AsyncDaemonControlStream,
+    upstream_address: &str,
+    max_response_bytes: usize,
+) -> Result<ClusterRelayStreamSendOutcome, NetworkError> {
+    match forward_stream_over_tcp_tunnel_handle_once(
+        handle.clone(),
+        request.clone(),
+        timeouts,
+        upstream,
+        upstream_address,
+        max_response_bytes,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            if let Some(current) = TCP_TUNNELS
+                .get(&handle.peer_node_id)
+                .filter(|current| !Arc::ptr_eq(current, &handle))
+            {
+                tracing::debug!(
+                    "retrying tcp tunnel stream request to {} on replacement tunnel after stale handle failed: {error}",
+                    handle.peer_node_id
+                );
+                return forward_stream_over_tcp_tunnel_handle_once(
+                    current,
+                    request,
+                    timeouts,
+                    upstream,
+                    upstream_address,
+                    max_response_bytes,
+                )
+                .await;
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn forward_stream_over_tcp_tunnel_handle_once(
     handle: Arc<TcpTunnelHandle>,
     request: ObjectRpcRequest,
     timeouts: DaemonRpcTimeouts,
@@ -1687,6 +1753,69 @@ mod tests {
         assert!(TCP_TUNNELS.get(&node_id).is_none());
         assert!(handle.pending.lock().await.is_empty());
         assert!(handle.clean_shutdown.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_send_retries_current_handle_after_idle_replacement() {
+        let (old_tx, old_rx) = mpsc::channel(1);
+        drop(old_rx);
+        let node_name = "tcp_tunnel_retry_after_idle_replacement";
+        let node_id = NodeId::from_legacy_named(node_name).expect("test node id");
+        let old = test_tunnel_handle(node_name, old_tx);
+        TCP_TUNNELS.insert(old.clone());
+
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        let current = test_tunnel_handle(node_name, new_tx);
+        TCP_TUNNELS.insert(current.clone());
+        assert!(old.clean_shutdown.load(Ordering::Relaxed));
+        assert!(Arc::ptr_eq(
+            &TCP_TUNNELS.get(&node_id).expect("current tunnel"),
+            &current
+        ));
+
+        let request = test_rpc_request();
+        let send_task = tokio::spawn(async move {
+            send_over_tcp_tunnel_handle(
+                old,
+                request,
+                DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
+            )
+            .await
+        });
+        let id = match new_rx.recv().await.expect("retried tunnel request") {
+            ClusterTcpTunnelFrame::Request { id, request } => {
+                assert_eq!(request.route, "/test/tcp-tunnel");
+                id
+            }
+            other => panic!("expected retried tunnel request, got {other:?}"),
+        };
+        let pending = current
+            .pending
+            .lock()
+            .await
+            .remove(&id)
+            .expect("pending retried request");
+        match pending.kind {
+            PendingTcpTunnelRequestKind::Collect { tx, .. } => {
+                tx.send(Ok(ObjectRpcResponse::from_encoded_body(
+                    "/test/tcp-tunnel",
+                    Vec::new(),
+                )))
+                .expect("send retried tunnel response");
+            }
+            PendingTcpTunnelRequestKind::Forward { .. } => {
+                panic!("expected collected tunnel response")
+            }
+        }
+
+        let response = send_task.await.expect("join send task");
+        assert!(response.is_ok());
+        assert!(Arc::ptr_eq(
+            &TCP_TUNNELS.get(&node_id).expect("current tunnel retained"),
+            &current
+        ));
+        assert!(current.pending.lock().await.is_empty());
+        assert!(!current.clean_shutdown.load(Ordering::Relaxed));
     }
 
     #[test]
