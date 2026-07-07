@@ -6,7 +6,10 @@ use sinomo_local::SinomoDataDir;
 use sinomo_node::load_or_create_main_node_identity;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -14,6 +17,7 @@ pub const DAEMON_AUTH_PROTOCOL: &str = "sinomo.daemon-auth.v1";
 
 static DAEMON_SIGNING_IDENTITIES: OnceLock<Mutex<HashMap<PathBuf, CachedDaemonSigningIdentity>>> =
     OnceLock::new();
+static DAEMON_AUTH_NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct CachedDaemonSigningIdentity {
@@ -255,5 +259,33 @@ fn auth_nonce_suffix() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    format!("{nanos}")
+    let sequence = DAEMON_AUTH_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos}-{sequence}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn daemon_auth_nonce_suffix_is_unique_under_concurrent_signing() {
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            workers.push(std::thread::spawn(|| {
+                let mut values = Vec::new();
+                for _ in 0..512 {
+                    values.push(auth_nonce_suffix());
+                }
+                values
+            }));
+        }
+
+        let mut seen = BTreeSet::new();
+        for worker in workers {
+            for value in worker.join().expect("nonce worker should finish") {
+                assert!(seen.insert(value), "duplicate daemon auth nonce suffix");
+            }
+        }
+    }
 }
