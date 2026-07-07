@@ -11,8 +11,9 @@
 //! backend resolves), the loading screen, the [`Event::Custom`] external-wake handler that
 //! drives [`Shared::pump_connect`] + the provider device-login pump, and the measure/arrange
 //! that reserves the title-bar height and gives the rest to content. The TabBar drives the
-//! active tab through `shared.active_tab`; the Shell detects that change on the next redraw
-//! (diff-on-redraw) and requests the same relayout the old hand-painted strip did.
+//! active tab through `shared.active_tab`, reads the same state back through `selected_when`, and
+//! the Shell detects that change on the next redraw (diff-on-redraw) to request the same relayout
+//! the old hand-painted strip did.
 
 use std::cell::Cell;
 
@@ -51,7 +52,8 @@ pub struct Shell {
     shared: Shared,
     logo: SingleChild,
     /// The tab strip, composed from a stock `TabBar`. It drives `shared.active_tab` via
-    /// `on_change`; the Shell relayouts the content on the change (see `event`).
+    /// `on_change`; the Shell relayouts the content on the change (see `event`). The widget
+    /// instance is preserved across tab switches so the stock TabBar owns switch animation.
     tabs: WidgetPod,
     /// A spinner shown next to the status text while the backend connection resolves.
     spinner: WidgetPod,
@@ -61,7 +63,7 @@ pub struct Shell {
     /// The active tab last laid out. The `TabBar` flips `shared.active_tab` and requests only a
     /// repaint, but the content `SwitchView` only measures/arranges its *active* child — so a tab
     /// switch needs a fresh measure+arrange for the newly-shown view. We diff on `RedrawRequested`
-    /// to catch it (the same diff-on-redraw the tabs use internally for nested switches).
+    /// to catch it while preserving the TabBar instance and its in-flight selector animation.
     last_tab: Cell<Tab>,
     compact_tabs: Cell<bool>,
     last_render_options: Cell<Option<WindowRenderOptions>>,
@@ -185,7 +187,6 @@ impl Shell {
             return;
         }
         self.last_tab.set(current);
-        self.tabs = WidgetPod::new(build_tab_bar(&self.shared, self.compact_tabs.get()));
         self.start_cluster_refresh_if_active();
         ctx.request_measure();
         ctx.request_arrange();
@@ -225,11 +226,13 @@ fn build_tab_bar(shared: &Shared, compact: bool) -> TabBar {
             }
         }
     };
+    let selected = {
+        let s = shared.clone();
+        move || Some(s.active_tab().index())
+    };
     TabBar::new("shell-tabs")
         .tabs(labels)
-        // TabBar caches the selected index. Shell rebuilds this strip whenever `shared.active_tab`
-        // changes so programmatic navigation keeps the chrome and content in sync.
-        .selected(shared.active_tab().index())
+        .selected_when(selected)
         .gap(if compact { COMPACT_TAB_GAP } else { TAB_GAP })
         .theme_when(tab_bar_theme(shared, compact))
         .on_change(on_change)
@@ -530,8 +533,7 @@ impl Widget for Shell {
         // The composed `TabBar` flips `shared.active_tab` and requests only a repaint, but the
         // content `SwitchView` lays out only its active child — so the newly-shown tab view needs a
         // fresh measure+arrange. Detect the change on the redraw the TabBar triggered and request
-        // the relayout (diff-on-redraw, mirroring how the old hand-painted `switch_to` relayouted,
-        // and how the inner tab hosts catch nested switches).
+        // the relayout while preserving the TabBar instance and its selector animation.
         if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
             let cluster_changed = self.pump_cluster_refresh();
             let chat_changed = if self.shared.is_ready() {
@@ -964,6 +966,89 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn shell_tabbar_switch_preserves_widget_animation() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let mut state = AppState::ready(backend);
+        state.active_tab = Tab::Sinomo;
+        let shared = Shared::new(state);
+        let mut runtime = crate::build_runtime(shared.clone())?;
+        let window_id = runtime.window_ids()[0];
+        let switch_duration = shared.theme().motion.tab_switch_duration();
+
+        let output = runtime.render(window_id)?;
+        let tab_bar = output
+            .semantics
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
+            })
+            .expect("shell tab bar semantics");
+        let settings_point = sui::Point::new(
+            tab_bar.bounds.max_x() - 42.0,
+            tab_bar.bounds.y() + tab_bar.bounds.height() / 2.0,
+        );
+        click_runtime_point(&mut runtime, window_id, settings_point)?;
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+
+        runtime.handle_event(window_id, Event::Window(WindowEvent::RedrawRequested))?;
+        runtime.tick(switch_duration * 0.5);
+        assert!(
+            dispatch_ready_events(&mut runtime)? >= 1,
+            "tab switch should schedule animation frames after shell redraw"
+        );
+        assert!(
+            runtime.next_wakeup_time(window_id)?.is_some(),
+            "tab switch should still be animating at half duration"
+        );
+
+        runtime.tick(switch_duration);
+        dispatch_ready_events(&mut runtime)?;
+        let output = runtime.render(window_id)?;
+        let tab_bar = output
+            .semantics
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
+            })
+            .expect("shell tab bar semantics");
+        assert_eq!(
+            tab_bar.value,
+            Some(SemanticsValue::Text("Settings".to_string()))
+        );
+
+        Ok(())
+    }
+
+    fn click_runtime_point(
+        runtime: &mut sui::Runtime,
+        window_id: sui::WindowId,
+        point: sui::Point,
+    ) -> sui::Result<()> {
+        runtime.handle_event(
+            window_id,
+            Event::Pointer(sui::PointerEvent::new(PointerEventKind::Move, point)),
+        )?;
+
+        let mut down = sui::PointerEvent::new(PointerEventKind::Down, point);
+        down.button = Some(PointerButton::Primary);
+        down.buttons = sui::PointerButtons::new(1);
+        runtime.handle_event(window_id, Event::Pointer(down))?;
+
+        let mut up = sui::PointerEvent::new(PointerEventKind::Up, point);
+        up.button = Some(PointerButton::Primary);
+        runtime.handle_event(window_id, Event::Pointer(up))
+    }
+
+    fn dispatch_ready_events(runtime: &mut sui::Runtime) -> sui::Result<usize> {
+        let ready = runtime.drain_ready_events();
+        let count = ready.len();
+        for (window_id, event) in ready {
+            runtime.handle_event(window_id, event)?;
+        }
+        Ok(count)
     }
 
     #[test]
