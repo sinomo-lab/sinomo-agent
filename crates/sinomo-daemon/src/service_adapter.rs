@@ -4417,6 +4417,17 @@ pub(crate) async fn try_dispatch_via_registry_async(
     {
         return None;
     }
+    tracing::trace!(
+        target: "sinomo.daemon.service_rpc",
+        traceparent = %request.traceparent().unwrap_or_default(),
+        route = %request.route,
+        category = %request.category,
+        stream_address = %stream_address,
+        signer_node_id = %authenticated.signer_node_id,
+        body_bytes = request.body.len(),
+        dfs_data_plane = sinomo_dfs::dfs_route_is_message_data_plane(&request.route),
+        "daemon service rpc dispatch accepted"
+    );
     if sinomo_core::network::object_rpc_request_stream_mode(request).expects_raw_streamed_response()
     {
         return Some(
@@ -4630,6 +4641,21 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
     paths: Option<&DaemonPaths>,
     replay_key: Option<Vec<u8>>,
 ) -> Result<(ObjectRpcResponse, bool), DaemonError> {
+    let traceparent = request.traceparent().unwrap_or_default().to_string();
+    let route = request.route.clone();
+    let category = request.category.clone();
+    let body_bytes = request.body.len();
+    let dispatch_started = Instant::now();
+    tracing::trace!(
+        target: "sinomo.daemon.service_rpc",
+        traceparent = %traceparent,
+        route = %route,
+        category = %category,
+        signer_node_id = %authenticated.signer_node_id,
+        body_bytes,
+        dfs_data_plane = sinomo_dfs::dfs_route_is_message_data_plane(&route),
+        "daemon service rpc dispatch start"
+    );
     annotate_daemon_service_request(&mut request, authenticated);
     let router = service_host
         .route_policy_layer()
@@ -4656,6 +4682,16 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
     if let (Some(paths), Some(key)) = (paths, replay_key.as_ref()) {
         crate::control::complete_daemon_dfs_message_replay(paths, key, &response);
     }
+    tracing::trace!(
+        target: "sinomo.daemon.service_rpc",
+        traceparent = %traceparent,
+        route = %route,
+        category = %category,
+        response_body_bytes = response.body.len(),
+        elapsed_ms = dispatch_started.elapsed().as_millis(),
+        stop,
+        "daemon service rpc dispatch complete"
+    );
     Ok((response, stop))
 }
 

@@ -60,6 +60,26 @@ const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_millis(9_500);
 
 type DaemonDfsMessageService = NetworkedDfsService<DfsEndpointServedMessageTransport>;
 
+fn daemon_dfs_message_kind(message: &sinomo_dfs::DfsNetworkMessage) -> &'static str {
+    match message {
+        sinomo_dfs::DfsNetworkMessage::DistributedWriteRequest(_) => "distributed-write-request",
+        sinomo_dfs::DfsNetworkMessage::DistributedWriteResponse(_) => "distributed-write-response",
+        sinomo_dfs::DfsNetworkMessage::NamespaceRequest(_) => "namespace-request",
+        sinomo_dfs::DfsNetworkMessage::NamespaceResponse(_) => "namespace-response",
+        sinomo_dfs::DfsNetworkMessage::MetadataJournalBatch(_) => "metadata-journal-batch",
+        sinomo_dfs::DfsNetworkMessage::MetadataJournalBatchResponse(_) => {
+            "metadata-journal-batch-response"
+        }
+        sinomo_dfs::DfsNetworkMessage::StageBlob(_) => "stage-blob",
+        sinomo_dfs::DfsNetworkMessage::StageBlobChunk(_) => "stage-blob-chunk",
+        sinomo_dfs::DfsNetworkMessage::StageBlobResponse(_) => "stage-blob-response",
+        sinomo_dfs::DfsNetworkMessage::FetchBlob(_) => "fetch-blob",
+        sinomo_dfs::DfsNetworkMessage::FetchBlobResponse(_) => "fetch-blob-response",
+        sinomo_dfs::DfsNetworkMessage::FetchBlobResponseChunk(_) => "fetch-blob-response-chunk",
+        _ => "other",
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DaemonDfsMessageCommandProcessResult {
     response: DfsMessageResponse,
@@ -728,6 +748,23 @@ fn process_daemon_dfs_message_command_on_runtime(
     let requires_full_metadata_hydrate =
         sinomo_dfs::dfs_message_requires_full_metadata_hydrate(&command);
     let request_id = command.request_id.clone();
+    let source_node_id = command.routed_message.source_node_id.clone();
+    let target_node_id = command.routed_message.target_node_id.clone();
+    let frame_id = command.routed_message.frame_id;
+    let message_id = command.routed_message.message_id;
+    let message_kind = daemon_dfs_message_kind(&command.routed_message.message);
+    daemon_dfs_perf_trace(format_args!(
+        "dfs-message-dispatch-start request={} kind={} source={} target={} frame_id={} message_id={} read_lane={} full_hydrate_required={} ensure_ms={}",
+        request_id,
+        message_kind,
+        source_node_id,
+        target_node_id,
+        frame_id,
+        message_id,
+        use_read_lane,
+        requires_full_metadata_hydrate,
+        ensure_ms
+    ));
     let route_started = Instant::now();
     let cached_route_snapshot = cached_daemon_dfs_message_route_snapshot(&cache_key)?;
     let route_cache_hit = cached_route_snapshot.is_some();
@@ -832,6 +869,20 @@ fn process_daemon_dfs_message_command_on_runtime(
     }
     let hydrate_ms = hydrate_started.elapsed().as_millis();
     let process_started = Instant::now();
+    daemon_dfs_perf_trace(format_args!(
+        "dfs-message-dispatch-before-process request={} kind={} route_cache_hit={} route_ms={} cache_select_ms={} cache_lock_wait_ms={} lane_lock_wait_ms={} endpoint_refresh_ms={} full_hydrate={} hydrate_ms={} pre_process_total_ms={}",
+        request_id,
+        message_kind,
+        route_cache_hit,
+        route_ms,
+        cache_select_ms,
+        cache_lock_wait_ms,
+        lane_lock_wait_ms,
+        endpoint_refresh_ms,
+        hydrated_metadata,
+        hydrate_ms,
+        trace_started.elapsed().as_millis()
+    ));
     let DfsMessageProcessResult { response, events } =
         service_lane.service.process_message_command(command)?;
     let process_ms = process_started.elapsed().as_millis();
@@ -870,6 +921,15 @@ async fn handle_daemon_dfs_message_async(
     let message_cache_key = data_dir.root();
     let cluster_paths = ClusterPaths::new(&data_dir);
     let request_id = command.request_id.clone();
+    let source_node_id = command.routed_message.source_node_id.clone();
+    let target_node_id = command.routed_message.target_node_id.clone();
+    let frame_id = command.routed_message.frame_id;
+    let message_id = command.routed_message.message_id;
+    let message_kind = daemon_dfs_message_kind(&command.routed_message.message);
+    daemon_dfs_perf_trace(format_args!(
+        "dfs-message-handler-start request={} kind={} source={} target={} frame_id={} message_id={}",
+        request_id, message_kind, source_node_id, target_node_id, frame_id, message_id
+    ));
     let process_data_dir = data_dir.clone();
     let process_cluster_paths = cluster_paths.clone();
     let process_runtime = runtime.clone();
