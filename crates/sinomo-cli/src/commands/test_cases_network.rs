@@ -138,6 +138,7 @@ fn run_network_state_hygiene(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .map_err(|error| SinomoTestError::failed(error.to_string()))?;
     let targets = filter_network_test_targets(
         ctx,
+        &cluster_state,
         network_ping_targets_from_state(&cluster_paths, &cluster_state)?,
     )?;
     ctx.record("target_count", targets.len());
@@ -206,6 +207,7 @@ fn run_network_state_hygiene_dirty_fixture(ctx: &mut SinomoTestContext) -> Sinom
         .map_err(|error| SinomoTestError::failed(error.to_string()))?;
     let targets = filter_network_test_targets(
         ctx,
+        &cluster_state,
         network_ping_targets_from_state(&cluster_paths, &cluster_state)?,
     )?;
     ctx.record("target_count", targets.len());
@@ -409,6 +411,7 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     );
     let targets = filter_network_test_targets(
         ctx,
+        &cluster_state,
         network_ping_targets_from_state(&cluster_paths, &cluster_state)?,
     )?;
     let target_count = targets.len();
@@ -1418,25 +1421,19 @@ fn network_test_member_targets_from_state(
 
 fn filter_network_test_targets(
     ctx: &SinomoTestContext,
+    state: &ClusterBootstrapState,
     targets: Vec<NodeId>,
 ) -> Result<Vec<NodeId>, SinomoTestError> {
-    let Some(target_node_id) = ctx.parameter("target-node-id") else {
-        return Ok(targets);
-    };
-    let target_node_id = target_node_id.trim();
-    if target_node_id.is_empty() {
+    if ctx.parameter("target-node-id").is_some() && ctx.parameter("target-name").is_some() {
         return Err(SinomoTestError::InvalidParameter {
             name: "target-node-id".to_string(),
-            detail: "must not be empty".to_string(),
+            detail: "cannot be combined with target-name".to_string(),
         });
     }
-    let target_node_id =
-        target_node_id
-            .parse::<NodeId>()
-            .map_err(|source| SinomoTestError::InvalidParameter {
-                name: "target-node-id".to_string(),
-                detail: source.to_string(),
-            })?;
+
+    let Some(target_node_id) = network_target_filter_node_id(ctx, state)? else {
+        return Ok(targets);
+    };
     let filtered = targets
         .into_iter()
         .filter(|target| target == &target_node_id)
@@ -1448,6 +1445,55 @@ fn filter_network_test_targets(
         });
     }
     Ok(filtered)
+}
+
+fn network_target_filter_node_id(
+    ctx: &SinomoTestContext,
+    state: &ClusterBootstrapState,
+) -> Result<Option<NodeId>, SinomoTestError> {
+    if let Some(target_node_id) = ctx.parameter("target-node-id") {
+        let target_node_id = target_node_id.trim();
+        if target_node_id.is_empty() {
+            return Err(SinomoTestError::InvalidParameter {
+                name: "target-node-id".to_string(),
+                detail: "must not be empty".to_string(),
+            });
+        }
+        return target_node_id
+            .parse::<NodeId>()
+            .map(Some)
+            .map_err(|source| SinomoTestError::InvalidParameter {
+                name: "target-node-id".to_string(),
+                detail: source.to_string(),
+            });
+    }
+
+    let Some(target_name) = ctx.parameter("target-name") else {
+        return Ok(None);
+    };
+    let target_name = target_name.trim();
+    if target_name.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "target-name".to_string(),
+            detail: "must not be empty".to_string(),
+        });
+    }
+    let matches = state
+        .members
+        .iter()
+        .filter(|member| member.display_name == target_name)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [member] => Ok(Some(member.node_id.clone())),
+        [] => Err(SinomoTestError::InvalidParameter {
+            name: "target-name".to_string(),
+            detail: format!("no cluster member is named {target_name}"),
+        }),
+        _ => Err(SinomoTestError::InvalidParameter {
+            name: "target-name".to_string(),
+            detail: format!("multiple cluster members are named {target_name}"),
+        }),
+    }
 }
 
 fn member_has_main_daemon(member: &ClusterMemberRecord) -> bool {
@@ -2353,7 +2399,23 @@ mod tests {
 
         let ctx =
             SinomoTestContext::new("/tmp").with_parameter("target-node-id", selected.to_string());
-        let filtered = filter_network_test_targets(&ctx, targets).expect("filter");
+        let filtered = filter_network_test_targets(&ctx, &state, targets).expect("filter");
+
+        assert_eq!(filtered, vec![selected]);
+    }
+
+    #[test]
+    fn network_target_filter_selects_requested_remote_main_by_name() {
+        let mut state = test_state();
+        let selected = state.members[1].node_id.clone();
+        let other = add_remote_main(&mut state, "node_network_hygiene_roaming_remote");
+        let targets = network_test_member_targets_from_state(&state).expect("targets");
+        assert_eq!(targets.len(), 2);
+        assert!(targets.contains(&selected), "{targets:?}");
+        assert!(targets.contains(&other), "{targets:?}");
+
+        let ctx = SinomoTestContext::new("/tmp").with_parameter("target-name", "remote");
+        let filtered = filter_network_test_targets(&ctx, &state, targets).expect("filter");
 
         assert_eq!(filtered, vec![selected]);
     }
@@ -2366,7 +2428,7 @@ mod tests {
         let ctx =
             SinomoTestContext::new("/tmp").with_parameter("target-node-id", missing.to_string());
 
-        let error = filter_network_test_targets(&ctx, targets).expect_err("missing target");
+        let error = filter_network_test_targets(&ctx, &state, targets).expect_err("missing target");
 
         assert!(
             matches!(

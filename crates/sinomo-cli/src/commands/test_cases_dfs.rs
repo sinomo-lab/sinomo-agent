@@ -430,6 +430,7 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .map_err(|error| SinomoTestError::failed(error.to_string()))?;
     let targets = filter_dfs_routed_status_targets(
         ctx,
+        &state,
         dfs_routed_status_targets_from_state(&cluster_paths, &state),
     )?;
     let unavailable_repair_targets =
@@ -617,25 +618,19 @@ fn dfs_unavailable_repair_targets_from_state(
 
 fn filter_dfs_routed_status_targets(
     ctx: &SinomoTestContext,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
     targets: Vec<NodeId>,
 ) -> Result<Vec<NodeId>, SinomoTestError> {
-    let Some(target_node_id) = ctx.parameter("target-node-id") else {
-        return Ok(targets);
-    };
-    let target_node_id = target_node_id.trim();
-    if target_node_id.is_empty() {
+    if ctx.parameter("target-node-id").is_some() && ctx.parameter("target-name").is_some() {
         return Err(SinomoTestError::InvalidParameter {
             name: "target-node-id".to_string(),
-            detail: "must not be empty".to_string(),
+            detail: "cannot be combined with target-name".to_string(),
         });
     }
-    let target_node_id =
-        target_node_id
-            .parse::<NodeId>()
-            .map_err(|source| SinomoTestError::InvalidParameter {
-                name: "target-node-id".to_string(),
-                detail: source.to_string(),
-            })?;
+
+    let Some(target_node_id) = dfs_target_filter_node_id(ctx, state)? else {
+        return Ok(targets);
+    };
     let filtered = targets
         .into_iter()
         .filter(|target| target == &target_node_id)
@@ -647,6 +642,55 @@ fn filter_dfs_routed_status_targets(
         });
     }
     Ok(filtered)
+}
+
+fn dfs_target_filter_node_id(
+    ctx: &SinomoTestContext,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+) -> Result<Option<NodeId>, SinomoTestError> {
+    if let Some(target_node_id) = ctx.parameter("target-node-id") {
+        let target_node_id = target_node_id.trim();
+        if target_node_id.is_empty() {
+            return Err(SinomoTestError::InvalidParameter {
+                name: "target-node-id".to_string(),
+                detail: "must not be empty".to_string(),
+            });
+        }
+        return target_node_id
+            .parse::<NodeId>()
+            .map(Some)
+            .map_err(|source| SinomoTestError::InvalidParameter {
+                name: "target-node-id".to_string(),
+                detail: source.to_string(),
+            });
+    }
+
+    let Some(target_name) = ctx.parameter("target-name") else {
+        return Ok(None);
+    };
+    let target_name = target_name.trim();
+    if target_name.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "target-name".to_string(),
+            detail: "must not be empty".to_string(),
+        });
+    }
+    let matches = state
+        .members
+        .iter()
+        .filter(|member| member.display_name == target_name)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [member] => Ok(Some(member.node_id.clone())),
+        [] => Err(SinomoTestError::InvalidParameter {
+            name: "target-name".to_string(),
+            detail: format!("no cluster member is named {target_name}"),
+        }),
+        _ => Err(SinomoTestError::InvalidParameter {
+            name: "target-name".to_string(),
+            detail: format!("multiple cluster members are named {target_name}"),
+        }),
+    }
 }
 
 fn fetch_dfs_repair_views_for_status(

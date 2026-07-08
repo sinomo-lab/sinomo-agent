@@ -273,6 +273,17 @@ run_tag_probe() {
   return 1
 }
 
+cluster_local_node_id() {
+  local node="$1" node_id
+  node_id="$(compose exec -T "$node" sinomo cluster connectivity 2>/dev/null \
+    | awk '/^local node:/ { print $3; exit }')"
+  if [ -z "$node_id" ]; then
+    log "failed to resolve local node id for $node"
+    return 1
+  fi
+  printf '%s\n' "$node_id"
+}
+
 run_network_probe() {
   local node="$1"
   run_probe "$node" cluster.network.ping-benchmark \
@@ -562,12 +573,15 @@ run_large_routed_dfs() {
 }
 
 run_two_online_one_offline_dfs_probe() {
-  local path_a path_b payload_a payload_b
+  local node1_id node2_id path_a path_b payload_a payload_b
 
   log "checking DFS quorum with node3 offline"
+  node1_id="$(cluster_local_node_id node1)"
+  node2_id="$(cluster_local_node_id node2)"
   compose stop node3 >/dev/null
 
   run_probe node1 cluster.network.ping-benchmark \
+    --param "target-node-id=$node2_id" \
     --param expected-targets=1 \
     --param "requests-per-target=$NETWORK_REQUESTS_PER_TARGET" \
     --param "warmup-requests-per-target=$NETWORK_WARMUP_REQUESTS_PER_TARGET" \
@@ -580,6 +594,7 @@ run_two_online_one_offline_dfs_probe() {
     --param max-p95-us=0 \
     --param min-requests-per-second=1
   run_probe node2 cluster.network.ping-benchmark \
+    --param "target-node-id=$node1_id" \
     --param expected-targets=1 \
     --param "requests-per-target=$NETWORK_REQUESTS_PER_TARGET" \
     --param "warmup-requests-per-target=$NETWORK_WARMUP_REQUESTS_PER_TARGET" \
@@ -592,6 +607,7 @@ run_two_online_one_offline_dfs_probe() {
     --param max-p95-us=0 \
     --param min-requests-per-second=1
   run_probe node1 cluster.dfs.routed-status \
+    --param "target-node-id=$node2_id" \
     --param expected-targets=1 \
     --param max-remote-open-conflicts=0 \
     --param max-remote-pending-writes=0 \
