@@ -142,6 +142,7 @@ const PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS: usize =
     sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
 const CLUSTER_CONNECTIVITY_IMPORT_CONCURRENCY: usize = 16;
 const CLUSTER_NETWORK_PENDING_CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(8);
+const CLUSTER_NETWORK_PENDING_CONNECTIVITY_PUBLISH_TIMEOUT: Duration = Duration::from_secs(3);
 const CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLUSTER_NETWORK_PENDING_MEMBER_PUBLISH_TIMEOUT: Duration =
     CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT;
@@ -231,8 +232,16 @@ pub(crate) struct ClusterConnectivityPendingProbe {
     use_formation_timeouts: bool,
 }
 
+pub(crate) struct ClusterConnectivityPendingPublish {
+    paths: ClusterPaths,
+    source_node_id: NodeId,
+    state: ClusterBootstrapState,
+    use_formation_timeouts: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct ClusterNetworkMaintenancePendingWork {
+    connectivity_publish: Option<ClusterConnectivityPendingPublish>,
     connectivity_probe: Option<ClusterConnectivityPendingProbe>,
     member_publishes: Vec<ClusterMemberPublishPendingWork>,
     node_status_refreshes: Vec<ClusterNodeStatusPendingRefresh>,
@@ -241,7 +250,8 @@ pub(crate) struct ClusterNetworkMaintenancePendingWork {
 
 impl ClusterNetworkMaintenancePendingWork {
     fn is_empty(&self) -> bool {
-        self.connectivity_probe.is_none()
+        self.connectivity_publish.is_none()
+            && self.connectivity_probe.is_none()
             && self.member_publishes.is_empty()
             && self.node_status_refreshes.is_empty()
             && self.service_instance_publish.is_none()
@@ -2413,6 +2423,14 @@ impl ClusterNetworkMaintenance {
             let use_formation_timeouts = self
                 .startup_settle_until
                 .is_some_and(|settle_until| settle_until > now);
+            if !cluster_is_solo {
+                pending_work.connectivity_publish = Some(ClusterConnectivityPendingPublish {
+                    paths: cluster_paths.clone(),
+                    source_node_id: state.local_node_id.clone(),
+                    state: state.clone(),
+                    use_formation_timeouts,
+                });
+            }
             if self.service_registry.is_some() {
                 pending_work.service_instance_publish =
                     Some(ClusterServiceInstancePendingPublish {
@@ -2689,20 +2707,20 @@ impl ClusterNetworkMaintenance {
         deadline: Option<Instant>,
     ) {
         let ClusterNetworkMaintenancePendingWork {
+            connectivity_publish,
             connectivity_probe,
             member_publishes,
             node_status_refreshes,
             service_instance_publish,
         } = pending;
-        // Connectivity refreshes must run before cluster writes that may need
-        // freshly-probed routes to reach a voter from a segmented learner.
-        // This also keeps the bounded maintenance tick from spending its whole
-        // budget on doomed quorum writes before route recovery has a chance to
-        // refresh the active graph.
-        let connectivity_deadline = if !member_publishes.is_empty()
+        // Source-owned local connectivity records are a bootstrap cache for
+        // recovering the KV-backed graph. Publish that cache first so
+        // app-facing status/service/member writes have current routes, then
+        // spend any remaining budget on fresh probes.
+        let has_followup_publishes = !member_publishes.is_empty()
             || !node_status_refreshes.is_empty()
-            || service_instance_publish.is_some()
-        {
+            || service_instance_publish.is_some();
+        let cached_connectivity_deadline = if has_followup_publishes {
             cluster_network_deadline_with_tail_reserve(
                 deadline,
                 CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE,
@@ -2710,17 +2728,16 @@ impl ClusterNetworkMaintenance {
         } else {
             deadline
         };
-        if let Some(probe) = connectivity_probe {
+        if let Some(publish) = connectivity_publish {
             if cluster_network_pending_step_with_deadline(
-                "connectivity probe",
-                CLUSTER_NETWORK_PENDING_CONNECTIVITY_TIMEOUT,
-                connectivity_deadline,
-                self.run_pending_connectivity_probe_async(probe, runtime.clone()),
+                "connectivity publish",
+                CLUSTER_NETWORK_PENDING_CONNECTIVITY_PUBLISH_TIMEOUT,
+                cached_connectivity_deadline,
+                self.run_pending_connectivity_publish_async(publish, runtime.clone()),
             )
             .await
             .is_none()
             {
-                self.connectivity_converged = false;
                 self.record_connectivity_publish_failure();
             }
         }
@@ -2755,12 +2772,101 @@ impl ClusterNetworkMaintenance {
                 "service instance publish",
                 CLUSTER_NETWORK_PENDING_SERVICE_PUBLISH_TIMEOUT,
                 deadline,
-                self.run_pending_service_instance_publish_async(publish, runtime),
+                self.run_pending_service_instance_publish_async(publish, runtime.clone()),
             )
             .await
             .is_none()
             {
                 self.record_publish_failure();
+            }
+        }
+        let connectivity_deadline = if has_followup_publishes {
+            cluster_network_deadline_with_tail_reserve(
+                deadline,
+                CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE,
+            )
+        } else {
+            deadline
+        };
+        if let Some(probe) = connectivity_probe {
+            if cluster_network_pending_step_with_deadline(
+                "connectivity probe",
+                CLUSTER_NETWORK_PENDING_CONNECTIVITY_TIMEOUT,
+                connectivity_deadline,
+                self.run_pending_connectivity_probe_async(probe, runtime.clone()),
+            )
+            .await
+            .is_none()
+            {
+                self.connectivity_converged = false;
+                self.record_connectivity_publish_failure();
+            }
+        }
+    }
+
+    async fn run_pending_connectivity_publish_async(
+        &mut self,
+        pending: ClusterConnectivityPendingPublish,
+        runtime: tokio::runtime::Handle,
+    ) {
+        let ClusterConnectivityPendingPublish {
+            paths,
+            source_node_id,
+            state,
+            use_formation_timeouts,
+        } = pending;
+        let read_paths = paths.clone();
+        let read_source_node_id = source_node_id.clone();
+        let records = match runtime
+            .spawn_blocking(move || {
+                sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                    &read_paths,
+                    &read_source_node_id,
+                )
+            })
+            .await
+        {
+            Ok(Ok(records)) => records,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    "sinomo daemon cached connectivity read failed for {source_node_id}: {error}"
+                );
+                self.record_connectivity_publish_failure();
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "sinomo daemon cached connectivity read task failed for {source_node_id}: {error}"
+                );
+                self.record_connectivity_publish_failure();
+                return;
+            }
+        };
+        if records.is_empty() {
+            return;
+        }
+        let mut publish_host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+            DaemonClusterRpcMode::new(runtime.clone()),
+            if use_formation_timeouts {
+                cluster_formation_control_plane_timeouts()
+            } else {
+                cluster_control_plane_timeouts()
+            },
+        );
+        match sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_async_with_state_and_host(
+            &runtime,
+            &paths,
+            &source_node_id,
+            records,
+            state,
+            &mut publish_host,
+        )
+        .await
+        {
+            Ok(_) => self.record_publish_success(),
+            Err(error) => {
+                self.record_connectivity_publish_failure();
+                tracing::warn!("sinomo daemon cached connectivity quorum publish failed: {error}");
             }
         }
     }
@@ -10051,6 +10157,145 @@ mod tests {
                 .any(|record| record.source_node_id == local_node
                     && record.target_node_id == remote_node),
             "pending async probe should publish the local source connectivity set into cluster KV"
+        );
+    }
+
+    #[test]
+    fn cluster_network_maintenance_publishes_cached_connectivity_before_fresh_probe() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let root = unique_cluster_test_root("sinomo-daemon-cached-connectivity-publish");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let daemon_paths = DaemonPaths::with_root(data_root.join("daemon"));
+        daemon_paths.ensure().expect("daemon paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_cached_connectivity_publish").expect("cluster");
+        let local_node =
+            NodeId::from_legacy_named("node_cached_connectivity_publish_local").expect("local");
+        let remote_node =
+            NodeId::from_legacy_named("node_cached_connectivity_publish_remote").expect("remote");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "cached connectivity publish",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint =
+            sinomo_core::network::daemon_lan_endpoint(&remote_node, "127.0.0.1:1".to_string(), 10);
+        let mut remote_member = ClusterMemberRecord::local_non_voting(
+            cluster_id,
+            remote_node.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        remote_member.capabilities =
+            sinomo_core::node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![endpoint.clone()];
+        state.members.push(remote_member);
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("sync state to local kv");
+        let cluster =
+            daemon_cluster_status(&state, crate::DaemonClusterProcess::Main).expect("cluster");
+        write_daemon_status(
+            &daemon_paths,
+            &crate::DaemonStatus::new(&DaemonRunOptions::default(), &daemon_paths, Some(cluster)),
+        )
+        .expect("write daemon status");
+
+        let record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(
+                now.format(&Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string()),
+            ),
+            None,
+            now,
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &cluster_paths,
+            &local_node,
+            std::slice::from_ref(&record),
+        )
+        .expect("write local connectivity cache");
+        assert!(
+            sinomo_core::cluster::read_cluster_connectivity_graph_from_kv(&cluster_paths)
+                .expect("initial kv connectivity")
+                .is_empty(),
+            "test starts with a local connectivity cache but no KV connectivity graph"
+        );
+
+        let idle_stats = Arc::new(IdleStatsAtomics::new());
+        let maintenance_now = Instant::now();
+        let mut maintenance = ClusterNetworkMaintenance {
+            service_registry: None,
+            discovery: None,
+            discovery_cache: MdnsDiscoveryCache::new(),
+            connectivity: std::collections::BTreeMap::new(),
+            connectivity_cursor: 0,
+            connectivity_converged: true,
+            environment_id: None,
+            local_node_role: sinomo_core::network::cluster_local_node_role(&state),
+            solo_cluster_idle: false,
+            startup_settle_until: None,
+            tick: 0,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
+            last_publish: maintenance_now
+                .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
+                .unwrap_or(maintenance_now),
+            last_discovery: maintenance_now,
+            last_probe: maintenance_now,
+            idle_stats,
+        };
+
+        let pending = run_cluster_network_maintenance_tick_for_test(
+            &mut maintenance,
+            &daemon_paths,
+            &DaemonRunOptions::default(),
+            &runtime,
+        )
+        .expect("maintenance tick")
+        .expect("publish tick should return pending work");
+        assert!(
+            pending.connectivity_publish.is_some(),
+            "publish ticks should repair KV connectivity from the local cache"
+        );
+        assert!(
+            pending.connectivity_probe.is_none(),
+            "cached connectivity publish must not depend on a fresh probe being due"
+        );
+
+        runtime.block_on(maintenance.run_pending_work_async(pending, runtime.handle().clone()));
+
+        let kv_records =
+            sinomo_core::cluster::read_cluster_connectivity_graph_from_kv(&cluster_paths)
+                .expect("kv connectivity records");
+        assert!(
+            kv_records.iter().any(|record| {
+                record.source_node_id == local_node
+                    && record.target_node_id == remote_node
+                    && record.state == ClusterConnectivityState::Healthy
+            }),
+            "cached local connectivity should be published through the normal cluster KV graph"
         );
     }
 
