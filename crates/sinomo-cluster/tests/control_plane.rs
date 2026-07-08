@@ -20427,7 +20427,7 @@ fn node_status_quorum_publish_driver_delegates_and_cleans_rollout_sidecar() {
     let result = publish_cluster_node_status_to_quorum_with_host(&paths, status.clone(), &mut host)
         .expect("node status publish");
     assert!(result.is_some());
-    assert_eq!(host.cache_checks, 1);
+    assert_eq!(host.cache_checks, 0);
     assert_eq!(host.commits, 1);
     assert_eq!(host.remembers, 1);
     let txn = host.last_txn.as_ref().expect("committed txn");
@@ -20513,7 +20513,7 @@ fn node_status_async_quorum_publish_driver_delegates() {
         ))
         .expect("async node status publish");
     assert!(result.is_some());
-    assert_eq!(host.cache_checks, 1);
+    assert_eq!(host.cache_checks, 0);
     assert_eq!(host.commits, 1);
     assert_eq!(host.remembers, 1);
     assert!(
@@ -20528,7 +20528,7 @@ fn node_status_async_quorum_publish_driver_delegates() {
 }
 
 #[test]
-fn network_info_quorum_publish_driver_delegates_and_uses_publish_cache() {
+fn network_info_quorum_publish_driver_delegates_and_remembers_stored_match() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-info-quorum-driver");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -20564,7 +20564,7 @@ fn network_info_quorum_publish_driver_delegates_and_uses_publish_cache() {
     let result = publish_cluster_network_info_to_quorum_with_host(&paths, info.clone(), &mut host)
         .expect("network info publish");
     assert!(result.is_some());
-    assert_eq!(host.cache_checks, 1);
+    assert_eq!(host.cache_checks, 0);
     assert_eq!(host.commits, 1);
     assert_eq!(host.remembers, 1);
     assert!(
@@ -20600,7 +20600,7 @@ fn network_info_quorum_publish_driver_delegates_and_uses_publish_cache() {
         publish_cluster_network_info_to_quorum_with_host(&paths, info, &mut host).expect("cached");
     assert!(cached.is_none());
     assert_eq!(host.commits, 0);
-    assert_eq!(host.remembers, 1, "cache hit should not re-remember");
+    assert_eq!(host.remembers, 2, "stored match should refresh the cache");
 }
 
 #[test]
@@ -20650,7 +20650,7 @@ fn network_info_async_quorum_publish_driver_delegates() {
         ))
         .expect("async network info publish");
     assert!(result.is_some());
-    assert_eq!(host.cache_checks, 1);
+    assert_eq!(host.cache_checks, 0);
     assert_eq!(host.commits, 1);
     assert_eq!(host.remembers, 1);
     assert!(
@@ -21809,7 +21809,7 @@ fn connectivity_quorum_sync_driver_delegates_commits_and_remembers() {
         result.is_some(),
         "driver should return the committed snapshot"
     );
-    assert_eq!(host.cache_checks, 1);
+    assert_eq!(host.cache_checks, 0);
     assert_eq!(host.commits, vec![1]);
     assert_eq!(host.remembers, 1);
     assert!(
@@ -21842,9 +21842,15 @@ fn connectivity_quorum_sync_driver_delegates_commits_and_remembers() {
         &mut host,
     )
     .expect("cached connectivity quorum sync");
-    assert!(cached.is_none(), "host cache hit should skip KV planning");
+    assert!(
+        cached.is_none(),
+        "stored KV match should skip connectivity planning"
+    );
     assert_eq!(host.commits, Vec::<usize>::new());
-    assert_eq!(host.remembers, 1, "cache-hit path should not re-remember");
+    assert_eq!(
+        host.remembers, 1,
+        "stored KV match should not require another cache write"
+    );
 }
 
 #[test]
@@ -21924,7 +21930,7 @@ fn connectivity_quorum_sync_does_not_cache_uncommitted_ttl_refresh() {
         result.is_none(),
         "fresh stable KV records should not be rewritten"
     );
-    assert_eq!(host.cache_checks, 1);
+    assert_eq!(host.cache_checks, 0);
     assert_eq!(host.commits, Vec::<usize>::new());
     assert_eq!(
         host.remembers, 0,

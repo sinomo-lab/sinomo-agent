@@ -8520,6 +8520,46 @@ mod tests {
     }
 
     #[test]
+    fn node_status_publish_cache_hit_does_not_mask_stale_kv_row() {
+        let (_root, paths, state) =
+            seeded_single_node_cluster_for_publish_cache_test("publish_cache_status_stale");
+        let old_status = test_cluster_node_status(
+            &state.cluster_id,
+            &state.local_node_id,
+            "daemon-main",
+            Some("old"),
+            OffsetDateTime::now_utc(),
+        );
+        seed_cluster_node_status_to_kv(&paths, old_status).expect("seed old status");
+
+        let new_status = test_cluster_node_status(
+            &state.cluster_id,
+            &state.local_node_id,
+            "daemon-main",
+            Some("new"),
+            OffsetDateTime::now_utc(),
+        );
+        let mut host = CachedHitPublishHost::from_paths(&paths);
+
+        let snapshot = sinomo_core::cluster::publish_cluster_node_status_to_quorum_with_host(
+            &paths,
+            new_status.clone(),
+            &mut host,
+        )
+        .expect("publish status")
+        .expect("stale status should be replaced");
+
+        assert_eq!(host.commits, 1);
+        let key = sinomo_core::node::cluster_node_status_key_for_record(&new_status);
+        let stored = snapshot
+            .get(&key)
+            .expect("updated status row")
+            .decode::<ClusterNodeStatusRecord>()
+            .expect("decode status");
+        assert_eq!(stored.commit.as_deref(), Some("new"));
+    }
+
+    #[test]
     fn connectivity_publish_cache_hit_does_not_mask_missing_kv_rows() {
         let (_root, paths, mut state) =
             seeded_single_node_cluster_for_publish_cache_test("publish_cache_connectivity_keepup");
@@ -12781,7 +12821,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_network_info_match_populates_publish_cache() {
+    fn network_info_publish_cache_hit_does_not_mask_missing_kv_snapshot() {
         let root = unique_cluster_test_root("sinomo-daemon-network-info-cache");
         let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
         paths.ensure().expect("paths");
@@ -12820,11 +12860,11 @@ mod tests {
                 .is_none()
         );
         std::fs::remove_file(&paths.kv_paths().snapshot).expect("remove snapshot");
+        let error = sync_cluster_network_info_to_kv(&paths, info)
+            .expect_err("cache hit must not hide a missing KV snapshot");
         assert!(
-            sync_cluster_network_info_to_kv(&paths, info)
-                .expect("cached match without snapshot")
-                .is_none(),
-            "stored-match caching should avoid repeated stable KV snapshot reads"
+            error.to_string().contains("not part of a cluster"),
+            "unexpected missing-snapshot error: {error}"
         );
     }
 
