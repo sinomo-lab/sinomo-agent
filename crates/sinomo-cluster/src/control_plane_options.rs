@@ -63,6 +63,18 @@ impl ClusterRaftAppendReplicationOptions {
         }
         self.fair_command_timeout(endpoint, remaining)
     }
+
+    pub(crate) fn routed_node_command_timeout(&self, remaining: Duration) -> Duration {
+        remaining.min(self.tcp_command_timeout.max(self.iroh_command_timeout))
+    }
+
+    pub(crate) fn routed_node_append_attempt_timeout(
+        &self,
+        remaining: Duration,
+        _request: &ClusterRaftAppendRequest,
+    ) -> Duration {
+        self.routed_node_command_timeout(remaining)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,30 +100,8 @@ impl ClusterRaftLeaderElectionOptions {
         self.kv
     }
 
-    pub(crate) fn command_timeout(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        remaining: Duration,
-    ) -> Duration {
-        match endpoint.transport {
-            ClusterTransportKind::Iroh => remaining.min(self.iroh_command_timeout),
-            _ => remaining.min(self.tcp_command_timeout),
-        }
-    }
-
-    pub(crate) fn fair_command_timeout(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        remaining: Duration,
-    ) -> Duration {
-        let attempt_cap = match endpoint.transport {
-            ClusterTransportKind::Iroh => self.iroh_foreground_attempt_timeout,
-            _ if matches!(endpoint.privacy, ClusterEndpointPrivacy::InternetDirect) => {
-                self.public_foreground_attempt_timeout
-            }
-            _ => self.tcp_foreground_attempt_timeout,
-        };
-        self.command_timeout(endpoint, remaining.min(attempt_cap))
+    pub(crate) fn routed_node_command_timeout(&self, remaining: Duration) -> Duration {
+        remaining.min(self.tcp_command_timeout.max(self.iroh_command_timeout))
     }
 }
 

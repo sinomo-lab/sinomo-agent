@@ -1,7 +1,7 @@
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
 use crate::kv_local_store::locked_kv_state_authority_id_async;
-use sinomo_base::{ClusterBootstrapState, ClusterEndpointRecord, ClusterTransportKind};
+use sinomo_base::ClusterBootstrapState;
 use sinomo_kv::{ClusterKvTxnCommitResult, KvTxn};
 use sinomo_network::ClusterPaths;
 use sinomo_network::DaemonRpcTimeouts;
@@ -11,11 +11,10 @@ use sinomo_network::{
     cluster_node_blocks_leader_preference, cluster_node_blocks_leader_preference_async,
 };
 use sinomo_network::{
-    ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedEndpointRpcAsyncHost,
+    ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedObjectRpcAsyncHost,
 };
 use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_node::NodeId;
-use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,20 +25,12 @@ pub struct ClusterKvTxnForwardOptions {
 }
 
 impl ClusterKvTxnForwardOptions {
-    pub(crate) fn command_timeout(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        remaining: Duration,
-    ) -> Duration {
-        match endpoint.transport {
-            ClusterTransportKind::Iroh => remaining.min(self.iroh_command_timeout),
-            _ => remaining.min(self.tcp_command_timeout),
-        }
+    pub(crate) fn routed_node_command_timeout(&self, remaining: Duration) -> Duration {
+        remaining.min(self.tcp_command_timeout.max(self.iroh_command_timeout))
     }
 
-    pub(crate) fn attempt_timeout(
+    pub(crate) fn routed_node_attempt_timeout(
         &self,
-        endpoint: &ClusterEndpointRecord,
         remaining: Duration,
         remaining_targets: usize,
     ) -> Duration {
@@ -48,7 +39,7 @@ impl ClusterKvTxnForwardOptions {
             .checked_div(target_count)
             .unwrap_or(remaining)
             .max(Duration::from_millis(1));
-        self.command_timeout(endpoint, remaining).min(fair_share)
+        self.routed_node_command_timeout(remaining).min(fair_share)
     }
 }
 
@@ -75,8 +66,9 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
     options: ClusterKvTxnForwardOptions,
     host: &mut impl ClusterKvTxnForwardHost,
 ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
-    let mut targets = ClusterEndpointSelector::new(paths, state)
-        .select_internal(ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand);
+    let mut targets = ClusterEndpointSelector::new(paths, state).select_internal_unique_node_ids(
+        ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+    );
     if targets.is_empty() {
         return Ok(None);
     }
@@ -91,7 +83,7 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
             if authority_id == state.local_node_id {
                 return Ok(None);
             }
-            prefer_known_state_authority_endpoints(&mut targets, &authority_id);
+            prefer_known_state_authority_node(&mut targets, &authority_id);
         }
         _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => {
             return Ok(None);
@@ -99,7 +91,6 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
         _ => {}
     }
 
-    let targets = unique_state_authority_targets_by_node(targets);
     let mut failures = Vec::new();
     let deadline = Instant::now() + options.timeout;
     for (index, target) in targets.iter().enumerate() {
@@ -113,18 +104,15 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
             ));
             break;
         }
-        match forward_cluster_kv_txn_to_state_authority_endpoint_with_host(
+        match forward_cluster_kv_txn_to_state_authority_node_with_host(
             state,
             target,
             txn,
-            options.attempt_timeout(target, remaining, targets.len() - index),
+            options.routed_node_attempt_timeout(remaining, targets.len() - index),
             host,
         ) {
             Ok(response) => return Ok(Some(response)),
-            Err(error) => failures.push(format!(
-                "node {} via selected endpoint {} failed: {error}",
-                target.node_id, target.address
-            )),
+            Err(error) => failures.push(format!("node {target} failed: {error}")),
         }
     }
 
@@ -140,9 +128,9 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
     })
 }
 
-fn forward_cluster_kv_txn_to_state_authority_endpoint_with_host(
+fn forward_cluster_kv_txn_to_state_authority_node_with_host(
     state: &ClusterBootstrapState,
-    endpoint: &ClusterEndpointRecord,
+    target_node_id: &NodeId,
     txn: &KvTxn,
     timeout: Duration,
     host: &mut impl ClusterKvTxnForwardHost,
@@ -154,8 +142,7 @@ fn forward_cluster_kv_txn_to_state_authority_endpoint_with_host(
         txn_payload.category,
         txn_payload.body,
     );
-    let txn_response =
-        host.call_node_object_rpc(state, &endpoint.node_id, &txn_request, timeout)?;
+    let txn_response = host.call_node_object_rpc(state, target_node_id, &txn_request, timeout)?;
     txn_response.error_detail()?;
     let txn_response =
         sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body).map_err(kv_err)?;
@@ -169,12 +156,8 @@ fn forward_cluster_kv_txn_to_state_authority_endpoint_with_host(
         snapshot_payload.category,
         snapshot_payload.body,
     );
-    let snapshot_response = host.call_node_object_rpc(
-        state,
-        &endpoint.node_id,
-        &snapshot_request,
-        snapshot_timeout,
-    )?;
+    let snapshot_response =
+        host.call_node_object_rpc(state, target_node_id, &snapshot_request, snapshot_timeout)?;
     snapshot_response.error_detail()?;
     let snapshot =
         sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&snapshot_response.body).map_err(kv_err)?;
@@ -193,9 +176,9 @@ pub async fn forward_cluster_kv_txn_to_state_authority_async_with_host<H>(
     host: &mut H,
 ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError>
 where
-    H: ClusterSignedEndpointRpcAsyncHost + Send,
+    H: ClusterSignedObjectRpcAsyncHost + Send,
 {
-    let mut targets = ClusterEndpointSelector::select_internal_async(
+    let mut targets = ClusterEndpointSelector::select_internal_unique_node_ids_async(
         runtime,
         paths,
         state,
@@ -222,7 +205,7 @@ where
             if authority_id == state.local_node_id {
                 return Ok(None);
             }
-            prefer_known_state_authority_endpoints(&mut targets, &authority_id);
+            prefer_known_state_authority_node(&mut targets, &authority_id);
         }
         _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => {
             return Ok(None);
@@ -230,7 +213,6 @@ where
         _ => {}
     }
 
-    let targets = unique_state_authority_targets_by_node(targets);
     let mut failures = Vec::new();
     let deadline = Instant::now() + options.timeout;
     for (index, target) in targets.iter().enumerate() {
@@ -244,22 +226,19 @@ where
             ));
             break;
         }
-        match forward_cluster_kv_txn_to_state_authority_endpoint_async_with_host(
+        match forward_cluster_kv_txn_to_state_authority_node_async_with_host(
             runtime,
             paths,
             state,
             target,
             txn,
-            options.attempt_timeout(target, remaining, targets.len() - index),
+            options.routed_node_attempt_timeout(remaining, targets.len() - index),
             host,
         )
         .await
         {
             Ok(response) => return Ok(Some(response)),
-            Err(error) => failures.push(format!(
-                "node {} via selected endpoint {} failed: {error}",
-                target.node_id, target.address
-            )),
+            Err(error) => failures.push(format!("node {target} failed: {error}")),
         }
     }
 
@@ -275,20 +254,14 @@ where
     })
 }
 
-fn prefer_known_state_authority_endpoints(
-    targets: &mut Vec<ClusterEndpointRecord>,
-    authority_id: &NodeId,
-) {
-    if !targets
-        .iter()
-        .any(|endpoint| endpoint.node_id == *authority_id)
-    {
+fn prefer_known_state_authority_node(targets: &mut Vec<NodeId>, authority_id: &NodeId) {
+    if !targets.iter().any(|node_id| node_id == authority_id) {
         return;
     }
     let mut preferred = Vec::new();
     let mut other = Vec::new();
     for target in targets.drain(..) {
-        if target.node_id == *authority_id {
+        if target == *authority_id {
             preferred.push(target);
         } else {
             other.push(target);
@@ -298,27 +271,17 @@ fn prefer_known_state_authority_endpoints(
     *targets = preferred;
 }
 
-fn unique_state_authority_targets_by_node(
-    targets: Vec<ClusterEndpointRecord>,
-) -> Vec<ClusterEndpointRecord> {
-    let mut seen = BTreeSet::new();
-    targets
-        .into_iter()
-        .filter(|target| seen.insert(target.node_id.clone()))
-        .collect()
-}
-
-async fn forward_cluster_kv_txn_to_state_authority_endpoint_async_with_host<H>(
+async fn forward_cluster_kv_txn_to_state_authority_node_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
-    endpoint: &ClusterEndpointRecord,
+    target_node_id: &NodeId,
     txn: &KvTxn,
     timeout: Duration,
     host: &mut H,
 ) -> Result<ClusterKvTxnCommitResult, NetworkError>
 where
-    H: ClusterSignedEndpointRpcAsyncHost + Send,
+    H: ClusterSignedObjectRpcAsyncHost + Send,
 {
     let started = Instant::now();
     let txn_payload = sinomo_kv::cluster_kv_txn_rpc_payload(txn).map_err(kv_err)?;
@@ -331,7 +294,7 @@ where
     let txn_response = client
         .call_target(
             state,
-            &endpoint.node_id,
+            target_node_id,
             &txn_request,
             ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(timeout)),
         )
@@ -352,7 +315,7 @@ where
     let snapshot_response = client
         .call_target(
             state,
-            &endpoint.node_id,
+            target_node_id,
             &snapshot_request,
             ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(snapshot_timeout)),
         )

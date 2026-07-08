@@ -1989,7 +1989,7 @@ pub async fn forward_streamed_daemon_rpc_to_cluster_endpoint_async(
 /// connections or module transports, but callers do not need transport-specific
 /// branches.
 pub async fn forward_signed_streamed_daemon_rpc_to_cluster_endpoint_with_host_async(
-    host: &mut impl ClusterSignedEndpointRpcAsyncHost,
+    host: &mut impl ClusterSignedObjectRpcAsyncHost,
     endpoint: &ClusterEndpointRecord,
     request: &ObjectRpcRequest,
     timeouts: DaemonRpcTimeouts,
@@ -1997,7 +1997,7 @@ pub async fn forward_signed_streamed_daemon_rpc_to_cluster_endpoint_with_host_as
     upstream_address: &str,
     max_response_bytes: usize,
 ) -> Result<ClusterRelayStreamSendOutcome, NetworkError> {
-    let request_auth = host.sign_endpoint_rpc_request_async(request).await?;
+    let request_auth = host.sign_object_rpc_request_async(request).await?;
     host.forward_signed_endpoint_stream_rpc_async(
         endpoint,
         &request_auth,
@@ -2100,60 +2100,54 @@ impl ClusterObjectRpcOptions {
     }
 }
 
-pub type ClusterSignedEndpointRpcFuture<'a, T> =
+pub type ClusterSignedObjectRpcFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, NetworkError>> + Send + 'a>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ClusterSignedEndpointRpcObservationKind {
+enum ClusterSignedObjectRpcObservationKind {
     Success,
     IoFailure,
     AuthDenied,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClusterSignedEndpointRpcObservation {
-    kind: ClusterSignedEndpointRpcObservationKind,
+pub struct ClusterSignedObjectRpcObservation {
+    kind: ClusterSignedObjectRpcObservationKind,
     latency_ms: Option<u64>,
 }
 
-impl ClusterSignedEndpointRpcObservation {
+impl ClusterSignedObjectRpcObservation {
     pub fn success(latency_ms: Option<u64>) -> Self {
         Self {
-            kind: ClusterSignedEndpointRpcObservationKind::Success,
+            kind: ClusterSignedObjectRpcObservationKind::Success,
             latency_ms,
         }
     }
 
     pub fn io_failure() -> Self {
         Self {
-            kind: ClusterSignedEndpointRpcObservationKind::IoFailure,
+            kind: ClusterSignedObjectRpcObservationKind::IoFailure,
             latency_ms: None,
         }
     }
 
     pub fn auth_denied() -> Self {
         Self {
-            kind: ClusterSignedEndpointRpcObservationKind::AuthDenied,
+            kind: ClusterSignedObjectRpcObservationKind::AuthDenied,
             latency_ms: None,
         }
     }
 
     pub fn is_success(&self) -> bool {
-        matches!(self.kind, ClusterSignedEndpointRpcObservationKind::Success)
+        matches!(self.kind, ClusterSignedObjectRpcObservationKind::Success)
     }
 
     pub fn is_io_failure(&self) -> bool {
-        matches!(
-            self.kind,
-            ClusterSignedEndpointRpcObservationKind::IoFailure
-        )
+        matches!(self.kind, ClusterSignedObjectRpcObservationKind::IoFailure)
     }
 
     pub fn is_auth_denied(&self) -> bool {
-        matches!(
-            self.kind,
-            ClusterSignedEndpointRpcObservationKind::AuthDenied
-        )
+        matches!(self.kind, ClusterSignedObjectRpcObservationKind::AuthDenied)
     }
 
     pub fn latency_ms(&self) -> Option<u64> {
@@ -2161,27 +2155,27 @@ impl ClusterSignedEndpointRpcObservation {
     }
 }
 
-pub trait ClusterSignedEndpointRpcAsyncHost: Send {
-    fn sign_endpoint_rpc_request_async<'a>(
+pub trait ClusterSignedObjectRpcAsyncHost: Send {
+    fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         request: &'a ObjectRpcRequest,
-    ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>>;
+    ) -> ClusterSignedObjectRpcFuture<'a, Vec<u8>>;
 
     fn observe_signed_endpoint_rpc_async<'a>(
         &'a mut self,
         _endpoint: &'a ClusterEndpointRecord,
-        _observation: ClusterSignedEndpointRpcObservation,
-    ) -> ClusterSignedEndpointRpcFuture<'a, ()> {
+        _observation: ClusterSignedObjectRpcObservation,
+    ) -> ClusterSignedObjectRpcFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
 
-    fn send_signed_endpoint_rpc_async<'a>(
+    fn send_signed_object_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
         auth: &'a [u8],
         request: &'a ObjectRpcRequest,
         timeouts: DaemonRpcTimeouts,
-    ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
+    ) -> ClusterSignedObjectRpcFuture<'a, ObjectRpcResponse> {
         Box::pin(async move {
             let started = Instant::now();
             let result = crate::roaming::send_daemon_rpc_to_cluster_endpoint_async(
@@ -2208,7 +2202,7 @@ pub trait ClusterSignedEndpointRpcAsyncHost: Send {
         auth: &'a [u8],
         request: &'a ObjectRpcRequest,
         timeouts: DaemonRpcTimeouts,
-    ) -> ClusterSignedEndpointRpcFuture<'a, crate::ObjectRpcStreamResponse> {
+    ) -> ClusterSignedObjectRpcFuture<'a, crate::ObjectRpcStreamResponse> {
         Box::pin(async move {
             let started = Instant::now();
             let mut signed = request.clone();
@@ -2271,7 +2265,7 @@ pub trait ClusterSignedEndpointRpcAsyncHost: Send {
 fn cluster_signed_endpoint_rpc_observation(
     result: Result<&ObjectRpcResponse, &NetworkError>,
     started: Instant,
-) -> Option<ClusterSignedEndpointRpcObservation> {
+) -> Option<ClusterSignedObjectRpcObservation> {
     match result {
         Ok(response) => Some(cluster_signed_endpoint_response_observation(
             response, started,
@@ -2283,7 +2277,7 @@ fn cluster_signed_endpoint_rpc_observation(
 fn cluster_signed_endpoint_stream_response_rpc_observation(
     result: Result<&crate::ObjectRpcStreamResponse, &NetworkError>,
     started: Instant,
-) -> Option<ClusterSignedEndpointRpcObservation> {
+) -> Option<ClusterSignedObjectRpcObservation> {
     match result {
         Ok(response) => Some(cluster_signed_endpoint_response_observation(
             &response.response,
@@ -2296,10 +2290,10 @@ fn cluster_signed_endpoint_stream_response_rpc_observation(
 fn cluster_signed_endpoint_response_observation(
     response: &ObjectRpcResponse,
     started: Instant,
-) -> ClusterSignedEndpointRpcObservation {
+) -> ClusterSignedObjectRpcObservation {
     match response.error_detail() {
-        Err(NetworkError::AuthDenied) => ClusterSignedEndpointRpcObservation::auth_denied(),
-        _ => ClusterSignedEndpointRpcObservation::success(Some(
+        Err(NetworkError::AuthDenied) => ClusterSignedObjectRpcObservation::auth_denied(),
+        _ => ClusterSignedObjectRpcObservation::success(Some(
             cluster_signed_endpoint_rpc_elapsed_latency_ms(started),
         )),
     }
@@ -2308,16 +2302,16 @@ fn cluster_signed_endpoint_response_observation(
 fn cluster_signed_endpoint_stream_rpc_observation(
     result: Result<&ClusterRelayStreamSendOutcome, &NetworkError>,
     started: Instant,
-) -> Option<ClusterSignedEndpointRpcObservation> {
+) -> Option<ClusterSignedObjectRpcObservation> {
     match result {
         Ok(ClusterRelayStreamSendOutcome::Forwarded)
         | Ok(ClusterRelayStreamSendOutcome::RoutingError(_)) => {
-            Some(ClusterSignedEndpointRpcObservation::success(Some(
+            Some(ClusterSignedObjectRpcObservation::success(Some(
                 cluster_signed_endpoint_rpc_elapsed_latency_ms(started),
             )))
         }
         Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(_)) => {
-            Some(ClusterSignedEndpointRpcObservation::io_failure())
+            Some(ClusterSignedObjectRpcObservation::io_failure())
         }
         Err(error) => cluster_signed_endpoint_rpc_error_observation(error),
     }
@@ -2325,10 +2319,10 @@ fn cluster_signed_endpoint_stream_rpc_observation(
 
 fn cluster_signed_endpoint_rpc_error_observation(
     error: &NetworkError,
-) -> Option<ClusterSignedEndpointRpcObservation> {
+) -> Option<ClusterSignedObjectRpcObservation> {
     match error {
-        NetworkError::Io { .. } => Some(ClusterSignedEndpointRpcObservation::io_failure()),
-        NetworkError::AuthDenied => Some(ClusterSignedEndpointRpcObservation::auth_denied()),
+        NetworkError::Io { .. } => Some(ClusterSignedObjectRpcObservation::io_failure()),
+        NetworkError::AuthDenied => Some(ClusterSignedObjectRpcObservation::auth_denied()),
         _ => None,
     }
 }
@@ -2354,7 +2348,7 @@ pub struct ClusterObjectRpcClient<'a, H> {
     route_context: Option<ClusterObjectRpcRouteContext<'a>>,
 }
 
-impl<'a, H: ClusterSignedEndpointRpcAsyncHost> ClusterObjectRpcClient<'a, H> {
+impl<'a, H: ClusterSignedObjectRpcAsyncHost> ClusterObjectRpcClient<'a, H> {
     /// Build a client for a caller that intentionally has only a concrete endpoint.
     pub fn endpoint_only(host: &'a mut H) -> Self {
         Self {
@@ -2378,7 +2372,7 @@ impl<'a, H: ClusterSignedEndpointRpcAsyncHost> ClusterObjectRpcClient<'a, H> {
 
 impl<'a, H> ClusterObjectRpcClient<'a, H>
 where
-    H: ClusterSignedEndpointRpcAsyncHost + Send,
+    H: ClusterSignedObjectRpcAsyncHost + Send,
 {
     pub async fn call_endpoint(
         &mut self,
@@ -2457,9 +2451,9 @@ where
         let Some(remaining) = deadline.checked_remaining() else {
             return Err(deadline.timeout_error(endpoint));
         };
-        let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
+        let request_auth = self.host.sign_object_rpc_request_async(request).await?;
         cluster_object_rpc_attempt_with_timeout(
-            self.host.send_signed_endpoint_rpc_async(
+            self.host.send_signed_object_rpc_async(
                 endpoint,
                 &request_auth,
                 request,
@@ -2481,7 +2475,7 @@ where
         let Some(remaining) = deadline.checked_remaining() else {
             return Err(deadline.timeout_error(endpoint));
         };
-        let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
+        let request_auth = self.host.sign_object_rpc_request_async(request).await?;
         cluster_object_rpc_attempt_with_timeout(
             self.host.send_signed_endpoint_stream_response_rpc_async(
                 endpoint,
@@ -2549,7 +2543,7 @@ where
             .record(plan_us as f64);
             if route_plan.endpoints.is_empty() {
                 failed_edges.try_insert(&state.local_node_id, &route_plan.next_hop)?;
-                failures.push(format!("{}: no usable endpoint", route_plan.next_hop));
+                failures.push(format!("{}: no usable route", route_plan.next_hop));
                 continue;
             }
             tracing::trace!(
@@ -2619,7 +2613,7 @@ where
                 };
                 let attempt_timeout = final_hop_attempt_budget;
                 let sign_started_at = Instant::now();
-                let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
+                let request_auth = self.host.sign_object_rpc_request_async(request).await?;
                 let request_sign_us = cluster_object_rpc_elapsed_us(sign_started_at);
                 metrics::histogram!(
                     "sinomo.object_rpc.sign.us",
@@ -2630,7 +2624,7 @@ where
                 let (outer_build_us, outer_sign_us, send_us, response) = if final_hop {
                     let send_started_at = Instant::now();
                     let response = cluster_object_rpc_attempt_with_timeout(
-                        self.host.send_signed_endpoint_rpc_async(
+                        self.host.send_signed_object_rpc_async(
                             &endpoint,
                             &request_auth,
                             request,
@@ -2662,11 +2656,11 @@ where
                     )?;
                     let outer_build_us = cluster_object_rpc_elapsed_us(outer_build_started_at);
                     let outer_sign_started_at = Instant::now();
-                    let outer_auth = self.host.sign_endpoint_rpc_request_async(&outer).await?;
+                    let outer_auth = self.host.sign_object_rpc_request_async(&outer).await?;
                     let outer_sign_us = cluster_object_rpc_elapsed_us(outer_sign_started_at);
                     let send_started_at = Instant::now();
                     let response = cluster_object_rpc_attempt_with_timeout(
-                        self.host.send_signed_endpoint_rpc_async(
+                        self.host.send_signed_object_rpc_async(
                             &endpoint,
                             &outer_auth,
                             &outer,
@@ -2837,7 +2831,7 @@ where
                                 .host
                                 .observe_signed_endpoint_rpc_async(
                                     &endpoint,
-                                    ClusterSignedEndpointRpcObservation::io_failure(),
+                                    ClusterSignedObjectRpcObservation::io_failure(),
                                 )
                                 .await;
                         }
@@ -2955,7 +2949,7 @@ where
             .record(plan_us as f64);
             if route_plan.endpoints.is_empty() {
                 failed_edges.try_insert(&state.local_node_id, &route_plan.next_hop)?;
-                failures.push(format!("{}: no usable endpoint", route_plan.next_hop));
+                failures.push(format!("{}: no usable route", route_plan.next_hop));
                 continue;
             }
             tracing::trace!(
@@ -3025,7 +3019,7 @@ where
                 };
                 let attempt_timeout = final_hop_attempt_budget;
                 let sign_started_at = Instant::now();
-                let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
+                let request_auth = self.host.sign_object_rpc_request_async(request).await?;
                 let request_sign_us = cluster_object_rpc_elapsed_us(sign_started_at);
                 metrics::histogram!(
                     "sinomo.object_rpc.sign.us",
@@ -3068,7 +3062,7 @@ where
                     )?;
                     let outer_build_us = cluster_object_rpc_elapsed_us(outer_build_started_at);
                     let outer_sign_started_at = Instant::now();
-                    let outer_auth = self.host.sign_endpoint_rpc_request_async(&outer).await?;
+                    let outer_auth = self.host.sign_object_rpc_request_async(&outer).await?;
                     let outer_sign_us = cluster_object_rpc_elapsed_us(outer_sign_started_at);
                     let send_started_at = Instant::now();
                     let response = cluster_object_rpc_attempt_with_timeout(
@@ -3248,7 +3242,7 @@ where
                                 .host
                                 .observe_signed_endpoint_rpc_async(
                                     &endpoint,
-                                    ClusterSignedEndpointRpcObservation::io_failure(),
+                                    ClusterSignedObjectRpcObservation::io_failure(),
                                 )
                                 .await;
                         }
@@ -4796,7 +4790,7 @@ mod tests {
         target_auths: Vec<Vec<u8>>,
         stream_target_sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
         stream_target_auths: Vec<Vec<u8>>,
-        observations: Vec<(ClusterEndpointRecord, ClusterSignedEndpointRpcObservation)>,
+        observations: Vec<(ClusterEndpointRecord, ClusterSignedObjectRpcObservation)>,
         signed_routes: Vec<String>,
         signed_requests: Vec<ObjectRpcRequest>,
         fail_first_send: bool,
@@ -4806,11 +4800,11 @@ mod tests {
         stall_first_stream_send: Option<Duration>,
     }
 
-    impl ClusterSignedEndpointRpcAsyncHost for RecordingSignedHost {
-        fn sign_endpoint_rpc_request_async<'a>(
+    impl ClusterSignedObjectRpcAsyncHost for RecordingSignedHost {
+        fn sign_object_rpc_request_async<'a>(
             &'a mut self,
             request: &'a ObjectRpcRequest,
-        ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+        ) -> ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
             let next = self.signed_routes.len() + 1;
             self.signed_routes.push(request.route.clone());
             self.signed_requests.push(request.clone());
@@ -4821,8 +4815,8 @@ mod tests {
         fn observe_signed_endpoint_rpc_async<'a>(
             &'a mut self,
             endpoint: &'a ClusterEndpointRecord,
-            observation: ClusterSignedEndpointRpcObservation,
-        ) -> ClusterSignedEndpointRpcFuture<'a, ()> {
+            observation: ClusterSignedObjectRpcObservation,
+        ) -> ClusterSignedObjectRpcFuture<'a, ()> {
             let endpoint = endpoint.clone();
             let observations = &mut self.observations;
             Box::pin(async move {
@@ -4831,13 +4825,13 @@ mod tests {
             })
         }
 
-        fn send_signed_endpoint_rpc_async<'a>(
+        fn send_signed_object_rpc_async<'a>(
             &'a mut self,
             endpoint: &'a ClusterEndpointRecord,
             _auth: &'a [u8],
             request: &'a ObjectRpcRequest,
             timeouts: DaemonRpcTimeouts,
-        ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
+        ) -> ClusterSignedObjectRpcFuture<'a, ObjectRpcResponse> {
             let endpoint = endpoint.clone();
             let request = request.clone();
             let should_fail = self.fail_first_send && self.target_sends.is_empty();
@@ -4876,7 +4870,7 @@ mod tests {
             _auth: &'a [u8],
             request: &'a ObjectRpcRequest,
             timeouts: DaemonRpcTimeouts,
-        ) -> ClusterSignedEndpointRpcFuture<'a, crate::ObjectRpcStreamResponse> {
+        ) -> ClusterSignedObjectRpcFuture<'a, crate::ObjectRpcStreamResponse> {
             let endpoint = endpoint.clone();
             let request = request.clone();
             let should_error = self.stream_error_first_send && self.stream_target_sends.is_empty();

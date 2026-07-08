@@ -1,9 +1,8 @@
 use crate::control_plane_options::ClusterControlPlaneTimeouts;
-use crate::kv_local_store::kv_err;
 use crate::prelude::*;
 use sinomo_kv::{
-    ClusterKvReplicationRequest, ClusterKvReplicationResponse, ClusterKvStateAuthorityVoteRequest,
-    ClusterKvStateAuthorityVoteResponse,
+    ClusterKvReplicationRequest, ClusterKvReplicationResponse, ClusterKvRpcPayload,
+    ClusterKvStateAuthorityVoteRequest, ClusterKvStateAuthorityVoteResponse,
 };
 #[allow(unused_imports)]
 use sinomo_kv::{KvEvent, KvSnapshot};
@@ -29,11 +28,67 @@ pub trait ClusterControlPlaneTransport {
         timeout: Duration,
     ) -> Result<ClusterKvStateAuthorityVoteResponse, NetworkError>;
 
+    fn send_kv_replication_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ClusterKvReplicationRequest,
+        timeout: Duration,
+    ) -> Result<ClusterKvReplicationResponse, NetworkError> {
+        let rpc_request = cluster_kv_object_rpc_request(
+            sinomo_kv::cluster_raft_append_rpc_payload(request).map_err(|source| {
+                NetworkError::Io {
+                    operation: "encode routed cluster raft append".to_string(),
+                    detail: source.to_string(),
+                }
+            })?,
+        );
+        let response = self.call_node_object_rpc(state, target_node_id, &rpc_request, timeout)?;
+        decode_cluster_raft_append_response(&response)
+    }
+
+    fn request_kv_state_authority_vote_from_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ClusterKvStateAuthorityVoteRequest,
+        timeout: Duration,
+    ) -> Result<ClusterKvStateAuthorityVoteResponse, NetworkError> {
+        let rpc_request = cluster_kv_object_rpc_request(
+            sinomo_kv::cluster_raft_vote_rpc_payload(request).map_err(|source| {
+                NetworkError::Io {
+                    operation: "encode routed cluster raft vote".to_string(),
+                    detail: source.to_string(),
+                }
+            })?,
+        );
+        let response = self.call_node_object_rpc(state, target_node_id, &rpc_request, timeout)?;
+        decode_cluster_raft_vote_response(&response)
+    }
+
     fn probe_cluster_state_authority(
         &mut self,
         endpoint: &ClusterEndpointRecord,
         timeout: Duration,
     ) -> bool;
+
+    fn probe_cluster_state_authority_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        timeout: Duration,
+    ) -> bool {
+        let Ok(payload) = sinomo_kv::cluster_kv_snapshot_rpc_payload() else {
+            return false;
+        };
+        let request = cluster_kv_object_rpc_request(payload);
+        self.call_node_object_rpc(state, target_node_id, &request, timeout)
+            .and_then(|response| {
+                response.error_detail()?;
+                Ok(response)
+            })
+            .is_ok()
+    }
 
     fn fetch_cluster_kv_snapshot(
         &mut self,
@@ -123,6 +178,34 @@ pub trait ClusterControlPlaneTransport {
     }
 
     fn on_kv_replication_sent(&mut self) {}
+}
+
+fn cluster_kv_object_rpc_request(payload: ClusterKvRpcPayload) -> ObjectRpcRequest {
+    ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
+}
+
+fn decode_cluster_raft_append_response(
+    response: &ObjectRpcResponse,
+) -> Result<ClusterKvReplicationResponse, NetworkError> {
+    response.error_detail()?;
+    sinomo_kv::decode_cluster_raft_append_rpc_response_body(&response.body).map_err(|source| {
+        NetworkError::Io {
+            operation: "decode routed cluster raft append".to_string(),
+            detail: source.to_string(),
+        }
+    })
+}
+
+fn decode_cluster_raft_vote_response(
+    response: &ObjectRpcResponse,
+) -> Result<ClusterKvStateAuthorityVoteResponse, NetworkError> {
+    response.error_detail()?;
+    sinomo_kv::decode_cluster_raft_vote_rpc_response_body(&response.body).map_err(|source| {
+        NetworkError::Io {
+            operation: "decode routed cluster raft vote".to_string(),
+            detail: source.to_string(),
+        }
+    })
 }
 
 pub struct ClusterControlPlaneDriver<T> {

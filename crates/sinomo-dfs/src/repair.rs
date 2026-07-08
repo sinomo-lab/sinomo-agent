@@ -25,8 +25,8 @@ pub(crate) fn repair_error_indicates_transient_route_failure(reason: &str) -> bo
         || reason.contains("network i/o error")
         || reason.contains("target was not routable")
         || reason.contains("not routable")
+        || reason.contains("no usable route")
         || reason.contains("no routable dfs repair blob alternate source")
-        || reason.contains("no usable endpoint")
         || reason.contains("unknown node")
 }
 

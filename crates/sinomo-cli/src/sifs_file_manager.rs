@@ -9,11 +9,11 @@ use crate::file_manager::{
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::dfs::{
-    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsControlPlaneStore, DfsEndpointTransport,
+    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsControlPlaneStore,
     DfsMetadataJournalReplicationOptions, DfsMetadataShardConfig, DfsNodeAdvertisement,
-    DfsObjectKind, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
-    DfsPeerTransportFuture, DfsPinAddRequest, DfsPinMode, DfsStat, DfsWriteOptions,
-    LocalContentStore, NetworkedDfsService, cluster_dfs_data_endpoints, cluster_dfs_peer_node_ids,
+    DfsNodeTransport, DfsObjectKind, DfsObjectRpcSendOptions, DfsPeerTransport,
+    DfsPeerTransportError, DfsPeerTransportFuture, DfsPinAddRequest, DfsPinMode, DfsStat,
+    DfsWriteOptions, LocalContentStore, NetworkedDfsService, cluster_dfs_peer_node_ids,
     content_services_prefix, default_dfs_metadata_root, default_dfs_metadata_shards_root,
     default_dfs_pin_root, fallback_dfs_node_id, metadata_shards_prefix,
     open_local_sharded_metadata_backend, open_root_local_metadata_backend,
@@ -38,7 +38,7 @@ const SIFS_MAINTENANCE_REFRESH_TIMEOUT: Duration = Duration::from_millis(750);
 pub(crate) struct SifsFileManagerBackend {
     data_dir: SinomoDataDir,
     rpc_runtime: SifsRpcRuntime,
-    service: Mutex<NetworkedDfsService<DfsEndpointTransport>>,
+    service: Mutex<NetworkedDfsService<DfsNodeTransport>>,
     peer_targets_refreshed_at: Mutex<Option<Instant>>,
     replica_candidates: Vec<NodeId>,
 }
@@ -84,7 +84,7 @@ impl SifsFileManagerBackend {
     fn from_service(
         data_dir: &SinomoDataDir,
         rpc_runtime: SifsRpcRuntime,
-        service: NetworkedDfsService<DfsEndpointTransport>,
+        service: NetworkedDfsService<DfsNodeTransport>,
     ) -> Result<Self, String> {
         let replica_candidates = sifs_replica_candidates(data_dir, service.node_id());
         Ok(Self {
@@ -98,16 +98,13 @@ impl SifsFileManagerBackend {
 
     fn lock_service(
         &self,
-    ) -> Result<std::sync::MutexGuard<'_, NetworkedDfsService<DfsEndpointTransport>>, String> {
+    ) -> Result<std::sync::MutexGuard<'_, NetworkedDfsService<DfsNodeTransport>>, String> {
         self.service
             .lock()
             .map_err(|_| "SIFS service lock is poisoned".to_string())
     }
 
-    fn refresh_service_peer_targets(
-        &self,
-        service: &mut NetworkedDfsService<DfsEndpointTransport>,
-    ) {
+    fn refresh_service_peer_targets(&self, service: &mut NetworkedDfsService<DfsNodeTransport>) {
         let now = Instant::now();
         if let Ok(mut refreshed_at) = self.peer_targets_refreshed_at.lock() {
             if refreshed_at
@@ -126,7 +123,7 @@ impl SifsFileManagerBackend {
 
     fn refresh_service_peer_targets_now(
         &self,
-        service: &mut NetworkedDfsService<DfsEndpointTransport>,
+        service: &mut NetworkedDfsService<DfsNodeTransport>,
     ) -> bool {
         let cluster_paths = ClusterPaths::new(&self.data_dir);
         if !cluster_paths.state.exists() {
@@ -913,7 +910,7 @@ fn sifs_parallel_read_worker_count_for(
 fn open_sifs_service_read_only(
     data_dir: &SinomoDataDir,
     rpc_runtime: &SifsRpcRuntime,
-) -> Result<NetworkedDfsService<DfsEndpointTransport>, String> {
+) -> Result<NetworkedDfsService<DfsNodeTransport>, String> {
     open_sifs_service_with_hydration(data_dir, rpc_runtime, false)
 }
 
@@ -921,7 +918,7 @@ fn open_sifs_service_with_hydration(
     data_dir: &SinomoDataDir,
     rpc_runtime: &SifsRpcRuntime,
     hydrate_metadata: bool,
-) -> Result<NetworkedDfsService<DfsEndpointTransport>, String> {
+) -> Result<NetworkedDfsService<DfsNodeTransport>, String> {
     data_dir
         .ensure_root_layout()
         .map_err(|error| format!("cannot prepare Sinomo data directory: {error}"))?;
@@ -945,7 +942,7 @@ fn open_sifs_service_with_hydration(
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
     let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
     let mut service = NetworkedDfsService::new(
-        DfsEndpointTransport::with_peer_transports_for_nodes(
+        DfsNodeTransport::with_peer_transports_for_nodes(
             local_node_id,
             peer_node_ids,
             sinomo_runtime::dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
@@ -1112,9 +1109,8 @@ fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> 
     let Ok(state) = cluster::read_cluster_state_without_kv(&cluster_paths) else {
         return candidates;
     };
-    let routable_node_ids = cluster_dfs_data_endpoints(&cluster_paths, &state)
+    let routable_node_ids = cluster_dfs_peer_node_ids(&state)
         .into_iter()
-        .map(|endpoint| endpoint.node_id)
         .collect::<BTreeSet<_>>();
     let graph = network::ClusterConnectivityGraph::read_for_local(&cluster_paths, &state);
     let Ok(entries) = cluster::read_cluster_kv_latest_observed_prefix_entries(
@@ -1347,7 +1343,7 @@ fn request_sifs_daemon_maintenance_refresh() {
 }
 
 fn sifs_write_options(
-    service: &NetworkedDfsService<DfsEndpointTransport>,
+    service: &NetworkedDfsService<DfsNodeTransport>,
     replica_candidates: &[NodeId],
 ) -> DfsWriteOptions {
     let mut candidates = replica_candidates.to_vec();
@@ -1358,7 +1354,7 @@ fn sifs_write_options(
 }
 
 fn sifs_deferred_publish_write_options(
-    service: &NetworkedDfsService<DfsEndpointTransport>,
+    service: &NetworkedDfsService<DfsNodeTransport>,
     replica_candidates: &[NodeId],
 ) -> DfsWriteOptions {
     let mut candidates = replica_candidates.to_vec();

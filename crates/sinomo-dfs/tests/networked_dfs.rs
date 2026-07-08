@@ -2541,16 +2541,10 @@ fn distributed_sifs_bootstrap_exposes_cluster_root_users_and_services_in_metadat
     control_plane.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
-            .advertise_metadata_service(&DfsNodeAdvertisement::metadata(
-                owner.clone(),
-                "loopback://metadata",
-            ))
+            .advertise_metadata_service(&DfsNodeAdvertisement::metadata(owner.clone()))
             .expect("metadata advertisement");
         control
-            .advertise_content_service(&DfsNodeAdvertisement::content(
-                owner.clone(),
-                "loopback://content",
-            ))
+            .advertise_content_service(&DfsNodeAdvertisement::content(owner.clone()))
             .expect("content advertisement");
         let dfs_keys: Vec<_> = kv
             .range_prefix("/dfs/")

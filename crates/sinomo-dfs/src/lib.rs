@@ -13,7 +13,6 @@ mod default_cluster;
 mod direct_read;
 mod discovery;
 mod distributed;
-mod endpoint_transport;
 mod error;
 mod identity;
 mod intent;
@@ -54,6 +53,7 @@ mod model;
 mod module_surface;
 mod mounted_sifs;
 mod namespace;
+mod node_transport;
 mod operator;
 mod posix;
 mod posix_model;
@@ -92,7 +92,7 @@ mod service_write;
 mod smoke;
 mod transfer;
 
-pub use cluster_service::{cluster_dfs_data_endpoints, cluster_dfs_peer_node_ids};
+pub use cluster_service::cluster_dfs_peer_node_ids;
 pub(crate) use cluster_service::{
     object_rpc_request_from_kv_payload, open_cluster_dfs_service_with_message_sender,
     open_cluster_dfs_service_with_message_sender_lazy,
@@ -124,8 +124,7 @@ pub use default_cluster::{
     default_cluster_metadata_shards_with_async_host, default_cluster_metadata_shards_with_host,
     default_cluster_sifs, default_cluster_sifs_owner, default_cluster_sifs_subtree_policies,
     default_metadata_shard_primary_node_id, default_metadata_shard_replica_node_ids,
-    dfs_service_endpoint_for_member, dfs_service_endpoint_rank, dfs_service_members,
-    ensure_default_cluster_dfs, ensure_default_cluster_dfs_async,
+    dfs_service_members, ensure_default_cluster_dfs, ensure_default_cluster_dfs_async,
     ensure_default_distributed_dfs_with_async_host, ensure_default_distributed_dfs_with_host,
     metadata_shard_layout_matches, metadata_shard_primary_transfer_ready_from_local_backend,
     metadata_shard_replica_node_ids, run_default_cluster_dfs_smoke_with_peer_transport,
@@ -150,29 +149,13 @@ pub(crate) use direct_read::{
 };
 pub use discovery::{
     DfsClusterView, DfsNodeAdvertisement, content_service_key, content_services_prefix,
-    dfs_cluster_node_endpoint, metadata_service_key, metadata_services_prefix,
+    metadata_service_key, metadata_services_prefix,
 };
 pub use distributed::{
     DfsDistributedError, DfsReplicaCandidate, DfsReplicaPlacementPlan, DfsReplicaPlacementRequest,
     DfsReplicaReceiptState, DfsReplicationPolicy, DfsWriteIntentState,
     DistributedEventualCoordinator, DistributedRepairJob, DistributedReplicaReceipt,
     DistributedWriteIntent, plan_replicas, validate_replication_plan,
-};
-#[cfg(test)]
-pub(crate) use endpoint_transport::{
-    AsyncDfsDirectReadSender, AsyncDfsDirectReadStreamSender, AsyncDfsMessageSender,
-    DfsDirectReadSender, async_dfs_direct_read_sender_from_peer_transport,
-    dfs_direct_read_sender_from_peer_transport,
-};
-pub use endpoint_transport::{
-    AsyncDfsPeerTransport, DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT, DfsEndpointServedMessageTransport,
-    DfsEndpointTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
-    DfsPeerTransportFuture,
-};
-pub(crate) use endpoint_transport::{DfsMessageSender, dfs_message_sender_from_peer_transport};
-#[cfg(test)]
-pub(crate) use endpoint_transport::{
-    process_cluster_dfs_message_command, run_cluster_dfs_message_command_with_metadata_publish,
 };
 pub use error::DfsError;
 pub(crate) use error::{
@@ -273,16 +256,16 @@ pub(crate) use metadata_records::{
     remote_read_rejection_prunes_location,
 };
 pub use metadata_replication::{
-    AsyncDfsMetadataEndpointTransport, AsyncDfsMetadataJournalBatchSender,
-    AsyncDfsMetadataJournalReplicationTransport, AsyncDfsMetadataSnapshotInstallSender,
+    AsyncDfsMetadataJournalBatchSender, AsyncDfsMetadataJournalReplicationTransport,
+    AsyncDfsMetadataNodeTransport, AsyncDfsMetadataSnapshotInstallSender,
     DEFAULT_DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT,
     DEFAULT_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET,
-    DEFAULT_DFS_METADATA_REPLICATION_TIMEOUT, DFS_METADATA_REPLICATION_MAX_ENDPOINTS_PER_TARGET,
-    DfsMetadataEndpointTransport, DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
+    DEFAULT_DFS_METADATA_REPLICATION_TIMEOUT, DFS_METADATA_REPLICATION_MAX_NODE_ROUTES_PER_TARGET,
+    DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationOutcome,
     DfsMetadataJournalReplicationReport, DfsMetadataJournalReplicationTransport,
     DfsMetadataJournalReplicationTransportError, DfsMetadataJournalReplicationTransportFuture,
-    DfsMetadataPeerTransportError, DfsMetadataPublishScheduleOptions,
+    DfsMetadataNodeTransport, DfsMetadataPeerTransportError, DfsMetadataPublishScheduleOptions,
     DfsMetadataPublishScheduleStart, DfsMetadataPublishScheduler, DfsMetadataReplicaShardContext,
     DfsMetadataSnapshotInstallSender, LocalDfsMetadataJournalPublisherHost,
     cluster_dfs_metadata_replica_shard_context, dfs_events_should_publish_metadata,
@@ -342,6 +325,22 @@ pub use namespace::{
 };
 pub(crate) use namespace::{
     metadata_path, namespace_transaction_id_for_batch, namespace_transaction_id_for_object,
+};
+#[cfg(test)]
+pub(crate) use node_transport::{
+    AsyncDfsDirectReadSender, AsyncDfsDirectReadStreamSender, AsyncDfsMessageSender,
+    DfsDirectReadSender, async_dfs_direct_read_sender_from_peer_transport,
+    dfs_direct_read_sender_from_peer_transport,
+};
+pub use node_transport::{
+    AsyncDfsPeerTransport, DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT, DfsNodeServedMessageTransport,
+    DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
+    DfsPeerTransportFuture,
+};
+pub(crate) use node_transport::{DfsMessageSender, dfs_message_sender_from_peer_transport};
+#[cfg(test)]
+pub(crate) use node_transport::{
+    process_cluster_dfs_message_command, run_cluster_dfs_message_command_with_metadata_publish,
 };
 pub use operator::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsAgentFileSystemSummary,
@@ -460,8 +459,8 @@ pub use smoke::{
 };
 #[cfg(test)]
 pub(crate) use smoke::{
-    dfs_smoke_content_node_ids, dfs_smoke_replica_candidate_sets,
-    dfs_smoke_routable_node_ids_with_graph, run_cluster_dfs_smoke,
+    dfs_smoke_content_node_ids, dfs_smoke_replica_candidate_sets, dfs_smoke_routable_node_ids,
+    run_cluster_dfs_smoke,
 };
 #[cfg(test)]
 use transfer::{

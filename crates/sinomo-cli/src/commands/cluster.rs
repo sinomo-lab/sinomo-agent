@@ -2678,14 +2678,7 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Resu
     match daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {
         Ok(snapshot) => {
             write_imported_cluster_kv_snapshot(paths, &snapshot)?;
-            if cluster::read_cluster_state(paths)
-                .map(|state| sinomo_runtime::kv::cluster_kv_raft_local_is_voter(&state))
-                .unwrap_or(false)
-            {
-                Ok(())
-            } else {
-                refresh_cluster_kv_from_reachable_voters(paths)
-            }
+            Ok(())
         }
         Err(_) => refresh_cluster_kv_from_reachable_voters(paths),
     }
@@ -2703,16 +2696,22 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
             cluster_kv_state_authority_id(paths, state).or(Ok(None))
         }
 
-        fn fetch_cluster_kv_snapshot(
+        fn call_node_object_rpc(
             &mut self,
-            endpoint: &ClusterEndpointRecord,
+            _state: &ClusterBootstrapState,
+            target_node_id: &NodeId,
+            request: &network::ObjectRpcRequest,
             timeout: Duration,
-        ) -> Result<KvSnapshot, network::NetworkError> {
-            daemon_fetch_cluster_kv_snapshot_from_endpoint(endpoint, timeout).map_err(|source| {
-                network::NetworkError::Io {
-                    operation: "cluster kv snapshot refresh".to_string(),
-                    detail: source.to_string(),
-                }
+        ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
+            daemon_send_object_rpc_to_target_with_timeouts(
+                target_node_id,
+                request,
+                network::DaemonRpcTimeouts::connect_and_idle(timeout),
+                false,
+            )
+            .map_err(|source| network::NetworkError::Io {
+                operation: "cluster kv snapshot refresh".to_string(),
+                detail: source.to_string(),
             })
         }
 

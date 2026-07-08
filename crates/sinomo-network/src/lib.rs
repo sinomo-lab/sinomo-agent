@@ -107,7 +107,7 @@ pub use endpoint_selector::{
 };
 pub use endpoint_selector::{
     ClusterEndpointSelectionPurpose, ClusterEndpointSelector, ClusterEndpointTransferProfile,
-    cluster_endpoint_can_carry_main_daemon_rpc,
+    ClusterRouteTransferProfile, cluster_endpoint_can_carry_main_daemon_rpc,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use endpoint_selector::{
@@ -224,8 +224,8 @@ pub use route::{
     ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterRelayAsyncHost, ClusterRelayOptions,
     ClusterRelayStreamForwardAsyncHost, ClusterRelayStreamForwardOutcome,
     ClusterRelayStreamRequestAction, ClusterRelayStreamSendOutcome,
-    ClusterSignedEndpointRpcAsyncHost, ClusterSignedEndpointRpcFuture,
-    ClusterSignedEndpointRpcObservation, RelayEnvelope, cluster_relay_stream_request_action,
+    ClusterSignedObjectRpcAsyncHost, ClusterSignedObjectRpcFuture,
+    ClusterSignedObjectRpcObservation, RelayEnvelope, cluster_relay_stream_request_action,
     forward_signed_streamed_daemon_rpc_to_cluster_endpoint_with_host_async,
     forward_streamed_daemon_rpc_to_cluster_endpoint_async, handle_cluster_relay_async_with_host,
     handle_cluster_relay_stream_forward_async_with_host, relay_request_inner_route,

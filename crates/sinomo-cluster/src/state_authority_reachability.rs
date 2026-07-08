@@ -1,11 +1,9 @@
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
-use sinomo_base::{
-    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
-    ClusterMemberRole, ClusterTransportKind,
+use sinomo_base::{ClusterBootstrapState, ClusterMemberRecord, ClusterMemberRole};
+use sinomo_network::{
+    ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector, ClusterPaths, NetworkError,
 };
-use sinomo_network::{ClusterConnectivityGraph, ClusterPaths, NetworkError};
-use sinomo_network::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
 use sinomo_node::{ClusterId, NodeId};
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -42,45 +40,33 @@ pub struct ClusterStateAuthorityReachabilityOptions {
 }
 
 impl ClusterStateAuthorityReachabilityOptions {
-    pub fn command_timeout(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        remaining: Duration,
-    ) -> Duration {
-        match endpoint.transport {
-            ClusterTransportKind::Iroh => remaining.min(self.iroh_command_timeout),
-            _ => remaining.min(self.tcp_command_timeout),
-        }
+    pub fn routed_node_command_timeout(&self, remaining: Duration) -> Duration {
+        remaining.min(self.tcp_command_timeout.max(self.iroh_command_timeout))
     }
 
-    pub fn fair_command_timeout(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        remaining: Duration,
-    ) -> Duration {
-        let attempt_cap = match endpoint.transport {
-            ClusterTransportKind::Iroh => self.iroh_foreground_attempt_timeout,
-            _ if matches!(endpoint.privacy, ClusterEndpointPrivacy::InternetDirect) => {
-                self.public_foreground_attempt_timeout
-            }
-            _ => self.tcp_foreground_attempt_timeout,
-        };
-        self.command_timeout(endpoint, remaining.min(attempt_cap))
+    pub fn routed_node_attempt_timeout(&self, remaining: Duration) -> Duration {
+        let attempt_cap = self
+            .tcp_foreground_attempt_timeout
+            .max(self.public_foreground_attempt_timeout)
+            .max(self.iroh_foreground_attempt_timeout);
+        self.routed_node_command_timeout(remaining.min(attempt_cap))
     }
 }
 
 pub trait ClusterStateAuthorityReachabilityHost {
-    fn probe_cluster_state_authority(
+    fn probe_cluster_state_authority_node(
         &mut self,
-        endpoint: &ClusterEndpointRecord,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
         timeout: Duration,
     ) -> bool;
 }
 
 pub trait ClusterStateAuthorityReachabilityAsyncHost {
-    fn probe_cluster_state_authority_async<'a>(
+    fn probe_cluster_state_authority_node_async<'a>(
         &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
+        state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<bool, NetworkError>> + Send + 'a>>;
 }
@@ -100,21 +86,24 @@ pub fn cluster_reachable_state_authority_count_with_host(
         }
     }
     let deadline = Instant::now() + options.timeout;
-    let targets = ClusterEndpointSelector::new(paths, state)
-        .select(ClusterEndpointSelectionPurpose::AvailableClusterStateAuthority);
-    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
-    for (index, endpoint) in targets.iter().enumerate() {
+    let targets = ClusterEndpointSelector::new(paths, state).select_internal_unique_node_ids(
+        ClusterEndpointInternalSelectionPurpose::Public(
+            sinomo_network::ClusterEndpointSelectionPurpose::AvailableClusterStateAuthority,
+        ),
+    );
+    for (index, target_node_id) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
         if remaining.is_zero() {
             break;
         }
-        if host.probe_cluster_state_authority(
-            endpoint,
-            cluster_state_authority_probe_timeout(&graph, state, endpoint, options, remaining),
+        if host.probe_cluster_state_authority_node(
+            state,
+            target_node_id,
+            cluster_state_authority_probe_timeout(options, remaining),
         ) {
-            voters.insert(endpoint.node_id.clone());
+            voters.insert(target_node_id.clone());
             if voters.len() >= quorum_size {
                 break;
             }
@@ -141,10 +130,12 @@ pub async fn cluster_reachable_state_authority_count_async_with_host(
         }
     }
     let deadline = Instant::now() + options.timeout;
-    let targets = ClusterEndpointSelector::new(paths, state)
-        .try_select(ClusterEndpointSelectionPurpose::AvailableClusterStateAuthority)?;
-    let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
-    for (index, endpoint) in targets.iter().enumerate() {
+    let targets = ClusterEndpointSelector::new(paths, state).try_select_internal_unique_node_ids(
+        ClusterEndpointInternalSelectionPurpose::Public(
+            sinomo_network::ClusterEndpointSelectionPurpose::AvailableClusterStateAuthority,
+        ),
+    )?;
+    for (index, target_node_id) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
@@ -152,13 +143,14 @@ pub async fn cluster_reachable_state_authority_count_async_with_host(
             break;
         }
         if host
-            .probe_cluster_state_authority_async(
-                endpoint,
-                cluster_state_authority_probe_timeout(&graph, state, endpoint, options, remaining),
+            .probe_cluster_state_authority_node_async(
+                state,
+                target_node_id,
+                cluster_state_authority_probe_timeout(options, remaining),
             )
             .await?
         {
-            voters.insert(endpoint.node_id.clone());
+            voters.insert(target_node_id.clone());
             if voters.len() >= quorum_size {
                 break;
             }
@@ -171,14 +163,10 @@ pub async fn cluster_reachable_state_authority_count_async_with_host(
 }
 
 fn cluster_state_authority_probe_timeout(
-    graph: &ClusterConnectivityGraph,
-    state: &ClusterBootstrapState,
-    endpoint: &ClusterEndpointRecord,
     options: ClusterStateAuthorityReachabilityOptions,
     remaining: Duration,
 ) -> Duration {
-    let _ = (graph, state);
-    options.fair_command_timeout(endpoint, remaining)
+    options.routed_node_attempt_timeout(remaining)
 }
 
 pub fn cluster_has_local_quorum_with_host(

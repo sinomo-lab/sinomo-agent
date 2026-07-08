@@ -352,11 +352,13 @@ impl From<ClusterEndpointSelectionPurpose> for ClusterEndpointInternalSelectionP
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClusterEndpointTransferProfile {
+pub enum ClusterRouteTransferProfile {
     Conservative,
     Lan,
     Local,
 }
+
+pub type ClusterEndpointTransferProfile = ClusterRouteTransferProfile;
 
 pub struct ClusterEndpointSelector<'a> {
     paths: &'a ClusterPaths,
@@ -388,13 +390,13 @@ impl<'a> ClusterEndpointSelector<'a> {
 
     pub fn transfer_profile_for_endpoint(
         endpoint: &ClusterEndpointRecord,
-    ) -> ClusterEndpointTransferProfile {
+    ) -> ClusterRouteTransferProfile {
         cluster_endpoint_transfer_profile(endpoint)
     }
 
     pub fn transfer_profile_for_endpoints<'e>(
         endpoints: impl IntoIterator<Item = &'e ClusterEndpointRecord>,
-    ) -> ClusterEndpointTransferProfile {
+    ) -> ClusterRouteTransferProfile {
         cluster_endpoint_transfer_profile_for_targets(endpoints)
     }
 
@@ -496,6 +498,24 @@ impl<'a> ClusterEndpointSelector<'a> {
         Ok(unique)
     }
 
+    pub fn try_unique_node_ids(
+        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+    ) -> Result<Vec<NodeId>, NetworkError> {
+        let mut seen = EndpointNodeSet::default();
+        let mut node_ids = Vec::new();
+        for endpoint in endpoints {
+            if !seen.try_insert_clone(&endpoint.node_id, "select unique endpoint node ids")? {
+                continue;
+            }
+            crate::object::try_reserve_vec(&mut node_ids, 1, "select unique endpoint node ids")?;
+            node_ids.push(try_clone_selector_id(
+                &endpoint.node_id,
+                "select unique endpoint node ids",
+            )?);
+        }
+        Ok(node_ids)
+    }
+
     pub fn select_unique_node_targets(
         &self,
         purpose: ClusterEndpointSelectionPurpose,
@@ -524,6 +544,21 @@ impl<'a> ClusterEndpointSelector<'a> {
         purpose: ClusterEndpointInternalSelectionPurpose,
     ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
         Self::try_unique_node_targets(self.try_select_internal(purpose)?)
+    }
+
+    pub fn select_internal_unique_node_ids(
+        &self,
+        purpose: ClusterEndpointInternalSelectionPurpose,
+    ) -> Vec<NodeId> {
+        self.try_select_internal_unique_node_ids(purpose)
+            .unwrap_or_default()
+    }
+
+    pub fn try_select_internal_unique_node_ids(
+        &self,
+        purpose: ClusterEndpointInternalSelectionPurpose,
+    ) -> Result<Vec<NodeId>, NetworkError> {
+        Self::try_unique_node_ids(self.try_select_internal(purpose)?)
     }
 
     pub async fn select_async(
@@ -564,6 +599,16 @@ impl<'a> ClusterEndpointSelector<'a> {
     ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
         let _ = runtime;
         ClusterEndpointSelector::new(paths, state).try_select_internal_unique_node_targets(purpose)
+    }
+
+    pub async fn select_internal_unique_node_ids_async(
+        runtime: &tokio::runtime::Handle,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        purpose: ClusterEndpointInternalSelectionPurpose,
+    ) -> Result<Vec<NodeId>, NetworkError> {
+        let _ = runtime;
+        ClusterEndpointSelector::new(paths, state).try_select_internal_unique_node_ids(purpose)
     }
 
     pub fn rollout_targets_for_main_with_command_endpoint(
@@ -626,27 +671,27 @@ fn try_cluster_member_daemon_status_targets_impl(
 
 fn cluster_endpoint_transfer_profile(
     endpoint: &ClusterEndpointRecord,
-) -> ClusterEndpointTransferProfile {
+) -> ClusterRouteTransferProfile {
     match endpoint.transport {
         ClusterTransportKind::InProcess | ClusterTransportKind::Loopback => {
-            ClusterEndpointTransferProfile::Local
+            ClusterRouteTransferProfile::Local
         }
         ClusterTransportKind::LanTcp | ClusterTransportKind::LanQuic => {
-            ClusterEndpointTransferProfile::Lan
+            ClusterRouteTransferProfile::Lan
         }
-        _ => ClusterEndpointTransferProfile::Conservative,
+        _ => ClusterRouteTransferProfile::Conservative,
     }
 }
 
 fn cluster_endpoint_transfer_profile_for_targets<'e>(
     endpoints: impl IntoIterator<Item = &'e ClusterEndpointRecord>,
-) -> ClusterEndpointTransferProfile {
-    let mut profile = ClusterEndpointTransferProfile::Conservative;
+) -> ClusterRouteTransferProfile {
+    let mut profile = ClusterRouteTransferProfile::Conservative;
     for endpoint in endpoints {
         match cluster_endpoint_transfer_profile(endpoint) {
-            ClusterEndpointTransferProfile::Local => return ClusterEndpointTransferProfile::Local,
-            ClusterEndpointTransferProfile::Lan => profile = ClusterEndpointTransferProfile::Lan,
-            ClusterEndpointTransferProfile::Conservative => {}
+            ClusterRouteTransferProfile::Local => return ClusterRouteTransferProfile::Local,
+            ClusterRouteTransferProfile::Lan => profile = ClusterRouteTransferProfile::Lan,
+            ClusterRouteTransferProfile::Conservative => {}
         }
     }
     profile

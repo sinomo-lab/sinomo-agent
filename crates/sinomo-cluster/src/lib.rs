@@ -36,6 +36,7 @@ mod migration;
 mod raft_election;
 mod raft_fanout;
 mod raft_quorum;
+#[cfg(any(test, feature = "test-support"))]
 mod raft_replication;
 mod raft_rpc;
 mod state_authority_reachability;
@@ -193,12 +194,10 @@ pub use migration::{
     write_local_cluster_migration_record,
 };
 pub use raft_fanout::{
-    ClusterKvCommittedFanoutAsyncHost, spawn_cluster_kv_committed_fanout_worker_on_runtime,
+    ClusterKvCommittedFanoutAsyncHost, replicate_cluster_kv_to_node_async_with_host,
+    spawn_cluster_kv_committed_fanout_worker_on_runtime,
 };
 pub use raft_quorum::ClusterKvQuorumAsyncHost;
-pub use raft_replication::{
-    ClusterKvAppendReplicationAsyncHost, replicate_cluster_kv_to_endpoint_async_with_host,
-};
 pub use raft_rpc::handle_cluster_kv_consensus_rpc_request_async;
 pub use state_authority_reachability::{
     ClusterStateAuthorityReachabilityAsyncHost, ClusterStateAuthorityReachabilityHost,
@@ -419,6 +418,7 @@ pub use raft_quorum::{
 #[cfg(any(test, feature = "test-support"))]
 pub use raft_replication::{
     ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
+    replicate_cluster_kv_to_endpoint_async_with_host,
     replicate_cluster_raft_to_endpoint_async_with_host,
     replicate_cluster_raft_to_endpoint_with_host,
     replicate_cluster_raft_to_endpoint_with_local_host,

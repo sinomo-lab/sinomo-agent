@@ -13,11 +13,6 @@ use crate::member_store::merge_cluster_state_from_peer;
 use crate::prelude::*;
 #[cfg(any(test, feature = "test-support"))]
 use crate::raft_replication::replicate_cluster_raft_to_endpoint_with_local_host;
-use crate::raft_replication::{
-    ClusterKvAppendReplicationAsyncHost, ClusterRaftAppendReplicationAsyncHost,
-    ClusterRaftAppendReplicationHost, replicate_cluster_raft_to_endpoint_async_with_options,
-    replicate_cluster_raft_to_endpoint_with_host,
-};
 #[allow(unused_imports)]
 #[allow(unused_imports)]
 use sinomo_kv::KvError;
@@ -33,12 +28,38 @@ use sinomo_network::NetworkError;
 use sinomo_network::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
 use std::time::Duration;
 
-pub trait ClusterKvQuorumAsyncHost: ClusterKvAppendReplicationAsyncHost {
-    fn record_endpoint_command_connectivity(
+pub trait ClusterKvQuorumAsyncHost {
+    fn last_local_kv_replication_index_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, u64>;
+
+    fn build_kv_replication_request_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        next_index: u64,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendRequest>;
+
+    fn send_cluster_kv_replication_to_node_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
+        request: &'a ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse>;
+
+    fn on_kv_replication_sent_async<'a>(&'a mut self) -> ClusterMembershipRpcFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn record_node_command_connectivity(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
-        _endpoint: &ClusterEndpointRecord,
+        _target_node_id: &NodeId,
         _connectivity_state: ClusterConnectivityState,
         _latency_ms: Option<u64>,
     ) {
@@ -49,18 +70,44 @@ pub trait ClusterKvQuorumAsyncHost: ClusterKvAppendReplicationAsyncHost {
         _paths: ClusterPaths,
         _state: ClusterBootstrapState,
         _events: Vec<KvEvent>,
-        _targets: Vec<ClusterEndpointRecord>,
+        _targets: Vec<NodeId>,
     ) -> ClusterMembershipRpcFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
 }
 
-pub trait ClusterRaftQuorumAsyncHost: ClusterRaftAppendReplicationAsyncHost {
-    fn record_endpoint_command_connectivity(
+pub trait ClusterRaftQuorumAsyncHost {
+    fn last_local_raft_log_index_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, u64>;
+
+    fn build_raft_append_request_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        next_index: u64,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendRequest>;
+
+    fn send_raft_append_to_node_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
+        request: &'a ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse>;
+
+    fn on_raft_append_sent_async<'a>(&'a mut self) -> ClusterMembershipRpcFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn record_node_command_connectivity(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
-        _endpoint: &ClusterEndpointRecord,
+        _target_node_id: &NodeId,
         _connectivity_state: ClusterConnectivityState,
         _latency_ms: Option<u64>,
     ) {
@@ -71,7 +118,7 @@ pub trait ClusterRaftQuorumAsyncHost: ClusterRaftAppendReplicationAsyncHost {
         _paths: ClusterPaths,
         _state: ClusterBootstrapState,
         _events: Vec<KvEvent>,
-        _targets: Vec<ClusterEndpointRecord>,
+        _targets: Vec<NodeId>,
     ) -> ClusterMembershipRpcFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -81,19 +128,57 @@ impl<T> ClusterRaftQuorumAsyncHost for T
 where
     T: ClusterKvQuorumAsyncHost,
 {
-    fn record_endpoint_command_connectivity(
+    fn last_local_raft_log_index_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, u64> {
+        self.last_local_kv_replication_index_async(paths, state)
+    }
+
+    fn build_raft_append_request_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        next_index: u64,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendRequest> {
+        self.build_kv_replication_request_async(paths, state, next_index)
+    }
+
+    fn send_raft_append_to_node_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
+        request: &'a ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse> {
+        self.send_cluster_kv_replication_to_node_async(
+            paths,
+            state,
+            target_node_id,
+            request,
+            timeout,
+        )
+    }
+
+    fn on_raft_append_sent_async<'a>(&'a mut self) -> ClusterMembershipRpcFuture<'a, ()> {
+        self.on_kv_replication_sent_async()
+    }
+
+    fn record_node_command_connectivity(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         connectivity_state: ClusterConnectivityState,
         latency_ms: Option<u64>,
     ) {
-        ClusterKvQuorumAsyncHost::record_endpoint_command_connectivity(
+        ClusterKvQuorumAsyncHost::record_node_command_connectivity(
             self,
             paths,
             state,
-            endpoint,
+            target_node_id,
             connectivity_state,
             latency_ms,
         );
@@ -104,26 +189,26 @@ where
         paths: ClusterPaths,
         state: ClusterBootstrapState,
         events: Vec<KvEvent>,
-        targets: Vec<ClusterEndpointRecord>,
+        targets: Vec<NodeId>,
     ) -> ClusterMembershipRpcFuture<'a, ()> {
         self.fan_out_committed_cluster_kv_command_async(paths, state, events, targets)
     }
 }
 
 pub trait ClusterRaftQuorumTransportHost {
-    fn replicate_cluster_raft_to_endpoint(
+    fn replicate_cluster_raft_to_node(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         timeout: Duration,
     ) -> Result<ClusterRaftAppendResponse, NetworkError>;
 
-    fn record_endpoint_command_connectivity(
+    fn record_node_command_connectivity(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
-        _endpoint: &ClusterEndpointRecord,
+        _target_node_id: &NodeId,
         _connectivity_state: ClusterConnectivityState,
         _latency_ms: Option<u64>,
     ) {
@@ -134,7 +219,7 @@ pub trait ClusterRaftQuorumTransportHost {
         _paths: ClusterPaths,
         _state: ClusterBootstrapState,
         _events: Vec<KvEvent>,
-        _targets: Vec<ClusterEndpointRecord>,
+        _targets: Vec<NodeId>,
     ) {
     }
 }
@@ -219,29 +304,24 @@ where
         &ClusterRaftAppendRequest,
         Duration,
     ) -> Result<ClusterRaftAppendResponse, NetworkError>,
-    R: FnMut(
-        &ClusterPaths,
-        &ClusterBootstrapState,
-        &ClusterEndpointRecord,
-        ClusterConnectivityState,
-        Option<u64>,
-    ),
-    F: FnMut(ClusterPaths, ClusterBootstrapState, Vec<KvEvent>, Vec<ClusterEndpointRecord>),
+    R: FnMut(&ClusterPaths, &ClusterBootstrapState, &NodeId, ClusterConnectivityState, Option<u64>),
+    F: FnMut(ClusterPaths, ClusterBootstrapState, Vec<KvEvent>, Vec<NodeId>),
     O: FnMut(),
 {
-    fn replicate_cluster_raft_to_endpoint(
+    fn replicate_cluster_raft_to_node(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         timeout: Duration,
     ) -> Result<ClusterRaftAppendResponse, NetworkError> {
+        let endpoint = representative_cluster_endpoint_for_node(state, target_node_id)?;
         let send_raft_append = &mut self.send_raft_append;
         let on_raft_append_sent = &mut self.on_raft_append_sent;
         replicate_cluster_raft_to_endpoint_with_local_host(
             paths,
             state,
-            endpoint,
+            &endpoint,
             &[],
             self.control_plane_timeouts
                 .raft_append_replication_options(timeout),
@@ -251,18 +331,18 @@ where
         .map(|outcome| outcome.response)
     }
 
-    fn record_endpoint_command_connectivity(
+    fn record_node_command_connectivity(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         connectivity_state: ClusterConnectivityState,
         latency_ms: Option<u64>,
     ) {
         (self.record_endpoint_command_connectivity)(
             paths,
             state,
-            endpoint,
+            target_node_id,
             connectivity_state,
             latency_ms,
         );
@@ -273,7 +353,7 @@ where
         paths: ClusterPaths,
         state: ClusterBootstrapState,
         events: Vec<KvEvent>,
-        targets: Vec<ClusterEndpointRecord>,
+        targets: Vec<NodeId>,
     ) {
         (self.fan_out_committed_cluster_raft_command)(paths, state, events, targets);
     }
@@ -297,14 +377,8 @@ where
         &ClusterRaftAppendRequest,
         Duration,
     ) -> Result<ClusterRaftAppendResponse, NetworkError>,
-    R: FnMut(
-        &ClusterPaths,
-        &ClusterBootstrapState,
-        &ClusterEndpointRecord,
-        ClusterConnectivityState,
-        Option<u64>,
-    ),
-    F: FnMut(ClusterPaths, ClusterBootstrapState, Vec<KvEvent>, Vec<ClusterEndpointRecord>),
+    R: FnMut(&ClusterPaths, &ClusterBootstrapState, &NodeId, ClusterConnectivityState, Option<u64>),
+    F: FnMut(ClusterPaths, ClusterBootstrapState, Vec<KvEvent>, Vec<NodeId>),
     O: FnMut(),
 {
     let mut host = LocalClusterRaftQuorumCommitHost {
@@ -318,20 +392,28 @@ where
     commit_cluster_raft_command_with_quorum_driver(paths, state, command, options, &mut host)
 }
 
-struct DriverRaftAppendReplicationHost<'a, T> {
+struct DriverNodeRaftAppendReplicationHost<'a, T> {
+    paths: &'a ClusterPaths,
+    options: ClusterRaftAppendReplicationOptions,
     transport: &'a mut T,
 }
 
-impl<T> ClusterRaftAppendReplicationHost for DriverRaftAppendReplicationHost<'_, T>
+impl<T> sinomo_kv::ClusterKvRaftAppendReplicationHost for DriverNodeRaftAppendReplicationHost<'_, T>
 where
     T: ClusterControlPlaneTransport,
 {
+    type Error = NetworkError;
+    type Target = NodeId;
+
+    fn kv_error(error: KvError) -> Self::Error {
+        crate::kv_local_store::kv_err(error)
+    }
+
     fn last_local_raft_log_index(
         &mut self,
-        paths: &ClusterPaths,
         state: &ClusterBootstrapState,
-    ) -> Result<u64, NetworkError> {
-        paths
+    ) -> Result<u64, Self::Error> {
+        self.paths
             .kv_paths()
             .locked_last_raft_log_index(&state.local_node_id)
             .map_err(kv_err)
@@ -339,28 +421,38 @@ where
 
     fn build_raft_append_request(
         &mut self,
-        paths: &ClusterPaths,
         state: &ClusterBootstrapState,
         next_index: u64,
-    ) -> Result<ClusterRaftAppendRequest, NetworkError> {
-        paths
+    ) -> Result<ClusterRaftAppendRequest, Self::Error> {
+        self.paths
             .kv_paths()
             .locked_build_raft_append_request_from_next_index(state, next_index)
             .map_err(kv_err)
     }
 
-    fn send_raft_append(
+    fn append_attempt_timeout(
         &mut self,
-        endpoint: &ClusterEndpointRecord,
+        _target: &Self::Target,
+        remaining: Duration,
         request: &ClusterRaftAppendRequest,
-        timeout: Duration,
-    ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-        self.transport
-            .send_kv_replication(endpoint, request, timeout)
+    ) -> Duration {
+        self.options
+            .routed_node_append_attempt_timeout(remaining, request)
     }
 
-    fn on_raft_append_sent(&mut self) {
+    fn on_raft_append_sent(&mut self) -> Result<(), Self::Error> {
         self.transport.on_kv_replication_sent();
+        Ok(())
+    }
+
+    fn send_raft_append(
+        &mut self,
+        target: &Self::Target,
+        request: &ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> Result<ClusterRaftAppendResponse, Self::Error> {
+        self.transport
+            .send_kv_replication_to_node(&request.state, target, request, timeout)
     }
 }
 
@@ -421,41 +513,47 @@ impl<T> ClusterRaftQuorumTransportHost for DriverRaftQuorumCommitHost<'_, T>
 where
     T: ClusterControlPlaneTransport,
 {
-    fn replicate_cluster_raft_to_endpoint(
+    fn replicate_cluster_raft_to_node(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         timeout: Duration,
     ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-        let mut host = DriverRaftAppendReplicationHost {
+        let options = self
+            .driver
+            .timeouts
+            .raft_append_replication_options(timeout);
+        let mut host = DriverNodeRaftAppendReplicationHost {
+            paths,
+            options,
             transport: &mut self.driver.transport,
         };
-        replicate_cluster_raft_to_endpoint_with_host(
-            paths,
+        sinomo_kv::replicate_cluster_kv_raft_to_target_with_host(
             state,
-            endpoint,
+            target_node_id,
             &[],
-            self.driver
-                .timeouts
-                .raft_append_replication_options(timeout),
+            options.kv_options(),
             &mut host,
         )
         .map(|outcome| outcome.response)
     }
 
-    fn record_endpoint_command_connectivity(
+    fn record_node_command_connectivity(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         connectivity_state: ClusterConnectivityState,
         latency_ms: Option<u64>,
     ) {
+        let Ok(endpoint) = representative_cluster_endpoint_for_node(state, target_node_id) else {
+            return;
+        };
         self.driver.transport.record_endpoint_command_connectivity(
             paths,
             state,
-            endpoint,
+            &endpoint,
             connectivity_state,
             latency_ms,
         );
@@ -466,11 +564,15 @@ where
         paths: ClusterPaths,
         state: ClusterBootstrapState,
         events: Vec<KvEvent>,
-        targets: Vec<ClusterEndpointRecord>,
+        targets: Vec<NodeId>,
     ) {
+        let endpoints = targets
+            .iter()
+            .filter_map(|node_id| representative_cluster_endpoint_for_node(&state, node_id).ok())
+            .collect::<Vec<_>>();
         self.driver
             .transport
-            .fan_out_committed_cluster_kv_command(paths, state, events, targets);
+            .fan_out_committed_cluster_kv_command(paths, state, events, endpoints);
     }
 }
 
@@ -494,6 +596,34 @@ where
 struct NetworkClusterKvRaftQuorumCommitHost<'a, H> {
     paths: &'a ClusterPaths,
     host: &'a mut H,
+}
+
+fn remote_voter_node_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Vec<NodeId>, NetworkError> {
+    let mut targets = ClusterEndpointSelector::new(paths, state)
+        .try_select_internal_unique_node_ids(
+            ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+        )?;
+    targets.retain(|node_id| node_id != &state.local_node_id && state.node_is_raft_voter(node_id));
+    Ok(targets)
+}
+
+fn representative_cluster_endpoint_for_node(
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+) -> Result<ClusterEndpointRecord, NetworkError> {
+    state
+        .members
+        .iter()
+        .find(|member| member.node_id == *target_node_id)
+        .and_then(|member| member.endpoints.first())
+        .cloned()
+        .ok_or_else(|| NetworkError::Io {
+            operation: "cluster raft node endpoint representative".to_string(),
+            detail: format!("node {target_node_id} has no known endpoint representative"),
+        })
 }
 
 impl<H> sinomo_kv::ClusterKvRaftCommandStorage for NetworkClusterKvRaftQuorumCommitHost<'_, H>
@@ -550,25 +680,21 @@ impl<H> sinomo_kv::ClusterKvRaftQuorumCommitHost for NetworkClusterKvRaftQuorumC
 where
     H: ClusterRaftQuorumCommitHost,
 {
-    type Target = ClusterEndpointRecord;
+    type Target = NodeId;
 
     fn remote_voter_targets(
         &mut self,
         state: &ClusterBootstrapState,
     ) -> Result<Vec<Self::Target>, NetworkError> {
-        Ok(
-            ClusterEndpointSelector::new(self.paths, state).select_internal(
-                ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
-            ),
-        )
+        remote_voter_node_targets(self.paths, state)
     }
 
     fn target_node_id<'a>(&self, target: &'a Self::Target) -> &'a NodeId {
-        &target.node_id
+        target
     }
 
     fn target_description(&self, target: &Self::Target) -> String {
-        format!("{} ({:?})", target.address, target.transport)
+        target.to_string()
     }
 
     fn replicate_cluster_raft_to_target(
@@ -578,7 +704,7 @@ where
         timeout: Duration,
     ) -> Result<ClusterRaftAppendResponse, NetworkError> {
         self.host
-            .replicate_cluster_raft_to_endpoint(self.paths, state, target, timeout)
+            .replicate_cluster_raft_to_node(self.paths, state, target, timeout)
     }
 
     fn record_target_replication_status(
@@ -597,7 +723,7 @@ where
                 ClusterConnectivityState::Degraded
             }
         };
-        self.host.record_endpoint_command_connectivity(
+        self.host.record_node_command_connectivity(
             self.paths,
             state,
             target,
@@ -648,6 +774,72 @@ pub fn commit_cluster_raft_command_with_quorum_driver(
     sinomo_kv::commit_cluster_kv_raft_command_with_quorum(state, command, options, &mut kv_host)
 }
 
+struct AsyncNodeRaftAppendReplicationHost<'a, H> {
+    paths: &'a ClusterPaths,
+    options: ClusterRaftAppendReplicationOptions,
+    host: &'a mut H,
+}
+
+impl<H> sinomo_kv::ClusterKvRaftAppendReplicationAsyncHost
+    for AsyncNodeRaftAppendReplicationHost<'_, H>
+where
+    H: ClusterRaftQuorumAsyncHost + Send,
+{
+    type Error = NetworkError;
+    type Target = NodeId;
+
+    fn kv_error(error: KvError) -> Self::Error {
+        crate::kv_local_store::kv_err(error)
+    }
+
+    fn last_local_raft_log_index_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, u64, Self::Error> {
+        self.host.last_local_raft_log_index_async(self.paths, state)
+    }
+
+    fn build_raft_append_request_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+        next_index: u64,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, ClusterRaftAppendRequest, Self::Error> {
+        self.host
+            .build_raft_append_request_async(self.paths, state, next_index)
+    }
+
+    fn append_attempt_timeout(
+        &mut self,
+        _target: &Self::Target,
+        remaining: Duration,
+        request: &ClusterRaftAppendRequest,
+    ) -> Duration {
+        self.options
+            .routed_node_append_attempt_timeout(remaining, request)
+    }
+
+    fn on_raft_append_sent_async<'a>(
+        &'a mut self,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
+        self.host.on_raft_append_sent_async()
+    }
+
+    fn send_raft_append_async<'a>(
+        &'a mut self,
+        target: &'a Self::Target,
+        request: &'a ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, ClusterRaftAppendResponse, Self::Error> {
+        self.host.send_raft_append_to_node_async(
+            self.paths,
+            &request.state,
+            target,
+            request,
+            timeout,
+        )
+    }
+}
+
 struct NetworkClusterKvRaftQuorumCommitAsyncHost<'a, H> {
     runtime: &'a tokio::runtime::Handle,
     paths: &'a ClusterPaths,
@@ -666,7 +858,7 @@ where
     fn kv_error(error: KvError) -> Self::Error {
         crate::kv_local_store::kv_err(error)
     }
-    type Target = ClusterEndpointRecord;
+    type Target = NodeId;
 
     fn lock_cluster_raft_commit_sequence_async<'a>(
         &'a mut self,
@@ -750,22 +942,26 @@ where
         let runtime = self.runtime;
         let paths = self.paths;
         Box::pin(async move {
-            ClusterEndpointSelector::select_internal_async(
+            let mut targets = ClusterEndpointSelector::select_internal_unique_node_ids_async(
                 runtime,
                 paths,
                 state,
                 ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
             )
-            .await
+            .await?;
+            targets.retain(|node_id| {
+                node_id != &state.local_node_id && state.node_is_raft_voter(node_id)
+            });
+            Ok(targets)
         })
     }
 
     fn target_node_id<'a>(&self, target: &'a Self::Target) -> &'a NodeId {
-        &target.node_id
+        target
     }
 
     fn target_description(&self, target: &Self::Target) -> String {
-        format!("{} ({:?})", target.address, target.transport)
+        target.to_string()
     }
 
     fn replicate_cluster_raft_to_target_async<'a>(
@@ -775,17 +971,23 @@ where
         timeout: Duration,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, ClusterRaftAppendResponse, NetworkError> {
         let paths = self.paths;
-        let mut endpoint_options = self.append_options;
+        let append_options = self.append_options;
         let host = &mut *self.host;
         Box::pin(async move {
-            endpoint_options.timeout = timeout;
-            replicate_cluster_raft_to_endpoint_async_with_options(
+            let mut node_host = AsyncNodeRaftAppendReplicationHost {
                 paths,
+                options: ClusterRaftAppendReplicationOptions {
+                    timeout,
+                    ..append_options
+                },
+                host,
+            };
+            sinomo_kv::replicate_cluster_kv_raft_to_target_async_with_host(
                 state,
                 target,
                 &[],
-                endpoint_options,
-                host,
+                node_host.options.kv_options(),
+                &mut node_host,
             )
             .await
             .map(|outcome| outcome.response)
@@ -811,7 +1013,7 @@ where
                     ClusterConnectivityState::Degraded
                 }
             };
-            host.record_endpoint_command_connectivity(
+            host.record_node_command_connectivity(
                 paths,
                 state,
                 target,

@@ -6,10 +6,9 @@ use crate::cluster::{
     prune_local_cluster_raft_uncommitted_tail,
 };
 use crate::dfs::{
-    daemon_dfs_endpoint_transport, daemon_dfs_endpoint_transport_on_runtime,
-    daemon_dfs_maintenance_notify, daemon_dfs_pending_maintenance_work,
-    ensure_default_distributed_dfs_async_on_runtime, ensure_default_local_dfs_expose,
-    run_daemon_dfs_maintenance_tick_on_runtime,
+    daemon_dfs_maintenance_notify, daemon_dfs_node_transport, daemon_dfs_node_transport_on_runtime,
+    daemon_dfs_pending_maintenance_work, ensure_default_distributed_dfs_async_on_runtime,
+    ensure_default_local_dfs_expose, run_daemon_dfs_maintenance_tick_on_runtime,
 };
 use crate::{
     AuthenticatedDaemonCommand, DaemonClusterStatus, DaemonDataOwnerLock, DaemonError, DaemonLock,
@@ -3898,14 +3897,14 @@ fn daemon_sandbox_replica_candidates_from_content_advertisements(
 
 pub fn open_daemon_sandbox_dfs_service(
     paths: &DaemonPaths,
-) -> Result<sinomo_dfs::NetworkedDfsService<sinomo_dfs::DfsEndpointTransport>, DaemonError> {
+) -> Result<sinomo_dfs::NetworkedDfsService<sinomo_dfs::DfsNodeTransport>, DaemonError> {
     open_daemon_sandbox_dfs_service_on_runtime(paths, None)
 }
 
 pub(crate) fn open_daemon_sandbox_dfs_service_on_runtime(
     paths: &DaemonPaths,
     runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_dfs::NetworkedDfsService<sinomo_dfs::DfsEndpointTransport>, DaemonError> {
+) -> Result<sinomo_dfs::NetworkedDfsService<sinomo_dfs::DfsNodeTransport>, DaemonError> {
     let data_dir = daemon_data_dir_path(paths)?;
     let data_dir = sinomo_core::local::SinomoDataDir::new(&data_dir);
     data_dir.ensure_root_layout()?;
@@ -3919,14 +3918,14 @@ pub(crate) fn open_daemon_sandbox_dfs_service_on_runtime(
     )?;
     let peer_node_ids = sinomo_dfs::cluster_dfs_peer_node_ids(&state);
     let transport = if let Some(runtime) = runtime {
-        daemon_dfs_endpoint_transport_on_runtime(
+        daemon_dfs_node_transport_on_runtime(
             state.local_node_id.clone(),
             peer_node_ids,
             &data_dir,
             runtime,
         )
     } else {
-        daemon_dfs_endpoint_transport(state.local_node_id.clone(), peer_node_ids)
+        daemon_dfs_node_transport(state.local_node_id.clone(), peer_node_ids)
     };
     let dfs = sinomo_dfs::NetworkedDfsService::new(transport, content);
     let dfs = crate::dfs::with_daemon_dfs_control_plane_on_runtime(dfs, &cluster_paths, runtime);
@@ -4914,9 +4913,9 @@ mod tests {
         let candidates = daemon_sandbox_replica_candidates_from_content_advertisements(
             &local,
             vec![
-                sinomo_dfs::DfsNodeAdvertisement::metadata(metadata_only, "127.0.0.1:1"),
-                sinomo_dfs::DfsNodeAdvertisement::content(replica.clone(), "127.0.0.1:2"),
-                sinomo_dfs::DfsNodeAdvertisement::content(local.clone(), "127.0.0.1:3"),
+                sinomo_dfs::DfsNodeAdvertisement::metadata(metadata_only),
+                sinomo_dfs::DfsNodeAdvertisement::content(replica.clone()),
+                sinomo_dfs::DfsNodeAdvertisement::content(local.clone()),
             ],
         );
 

@@ -9,10 +9,7 @@ use sinomo_core::network::{
     ObjectRpcResponse,
 };
 use sinomo_core::object::Value;
-use sinomo_core::{
-    ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterTransportKind,
-    DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest,
-};
+use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
 use time::OffsetDateTime;
 
 use crate::transfer::{
@@ -242,13 +239,13 @@ fn process_dfs_message_command_for_test(
     metadata_backend: Box<dyn DfsMetadataBackend>,
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
 ) -> Result<DfsMessageProcessResult, DfsError> {
-    let message_sender: DfsMessageSender = Arc::new(|endpoint, command, _timeout| {
+    let message_sender: DfsMessageSender = Arc::new(|target_node_id, command, _timeout| {
         Err(DfsPeerTransportError::new(format!(
             "unexpected DFS message hop to {} while processing test command {}",
-            endpoint, command.request_id
+            target_node_id, command.request_id
         )))
     });
-    let transport = DfsEndpointServedMessageTransport::new_with_message_sender(
+    let transport = DfsNodeServedMessageTransport::new_with_message_sender(
         local_node_id,
         Vec::new(),
         message_sender,
@@ -1029,17 +1026,17 @@ impl DfsMessageTransport for DroppingSendTransport {
     }
 }
 
-fn endpoint_transport_with_direct_read_sender(
+fn node_transport_with_direct_read_sender(
     local_node_id: NodeId,
     remote_node_id: NodeId,
     bytes: Vec<u8>,
     direct_error: Option<String>,
     direct_calls: Arc<Mutex<Vec<DfsDirectReadRequest>>>,
     message_send_calls: Arc<Mutex<usize>>,
-) -> DfsEndpointTransport {
+) -> DfsNodeTransport {
     let direct_calls_for_sender = Arc::clone(&direct_calls);
     let bytes_for_sender = bytes.clone();
-    let direct_sender: DfsDirectReadSender = Arc::new(move |_endpoint, request, _timeout| {
+    let direct_sender: DfsDirectReadSender = Arc::new(move |_target_node_id, request, _timeout| {
         direct_calls_for_sender
             .lock()
             .expect("direct calls")
@@ -1059,7 +1056,7 @@ fn endpoint_transport_with_direct_read_sender(
         })
     });
     let message_send_calls_for_sender = Arc::clone(&message_send_calls);
-    let message_sender: DfsMessageSender = Arc::new(move |_endpoint, _command, _timeout| {
+    let message_sender: DfsMessageSender = Arc::new(move |_target_node_id, _command, _timeout| {
         *message_send_calls_for_sender
             .lock()
             .expect("message send calls") += 1;
@@ -1067,16 +1064,16 @@ fn endpoint_transport_with_direct_read_sender(
             "message sender should not be used by direct-read-eligible messages",
         ))
     });
-    let async_sender: AsyncDfsMessageSender = Arc::new(|_endpoint, _command, _timeout| {
+    let async_sender: AsyncDfsMessageSender = Arc::new(|_target_node_id, _command, _timeout| {
         Box::pin(async {
             Err(DfsPeerTransportError::new(
                 "async sender should not be used by direct-read tests",
             ))
         })
     });
-    DfsEndpointTransport::new_with_peer_senders(
+    DfsNodeTransport::new_with_peer_senders(
         local_node_id,
-        vec![test_endpoint(&remote_node_id, "192.0.2.17:21353")],
+        vec![remote_node_id],
         message_sender,
         async_sender,
         direct_sender,
@@ -1308,22 +1305,6 @@ impl CountingEmptyTransport {
     }
 }
 
-fn test_endpoint(node_id: &NodeId, address: &str) -> ClusterEndpointRecord {
-    ClusterEndpointRecord {
-        endpoint_id: sinomo_core::network::ClusterEndpointId::derived(
-            "sinomo.test.endpoint",
-            format!("{}\0{address}", node_id.as_str()),
-        ),
-        node_id: node_id.clone(),
-        transport: ClusterTransportKind::LanTcp,
-        address: address.to_string(),
-        source: ClusterEndpointSource::Observed,
-        privacy: ClusterEndpointPrivacy::Lan,
-        priority: 10,
-        last_observed_latency_ms: None,
-    }
-}
-
 #[test]
 fn served_message_transport_sends_nested_return_node_requests_synchronously() {
     let primary = NodeId::from_legacy_named("node_served_nested_primary").expect("primary");
@@ -1361,9 +1342,9 @@ fn served_message_transport_sends_nested_return_node_requests_synchronously() {
             )],
         })
     });
-    let mut transport = DfsEndpointServedMessageTransport::new_with_message_sender(
+    let mut transport = DfsNodeServedMessageTransport::new_with_message_sender(
         primary.clone(),
-        vec![test_endpoint(&requester, "192.0.2.68:21353")],
+        vec![requester.clone()],
         sender,
         DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
     );
@@ -1426,9 +1407,9 @@ fn served_message_transport_returns_response_frames_inline() {
             outbound_messages: Vec::new(),
         })
     });
-    let mut transport = DfsEndpointServedMessageTransport::new_with_message_sender(
+    let mut transport = DfsNodeServedMessageTransport::new_with_message_sender(
         primary.clone(),
-        vec![test_endpoint(&requester, "192.0.2.69:21353")],
+        vec![requester.clone()],
         sender,
         DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
     );
@@ -1466,116 +1447,18 @@ fn served_message_transport_returns_response_frames_inline() {
 }
 
 #[test]
-fn dfs_service_endpoint_for_member_uses_logical_node_endpoint() {
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_service_endpoint_logical")
-            .expect("cluster");
-    let local =
-        NodeId::from_legacy_named("node_dfs_service_endpoint_logical_local").expect("local");
-    let remote =
-        NodeId::from_legacy_named("node_dfs_service_endpoint_logical_remote").expect("remote");
-    let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "dfs service endpoint logical",
-        local,
-        "local",
-        "pk-local",
-        now,
-    );
-    let shadow = sinomo_core::node::shadow_daemon_node_id(&remote);
-    let mut folded_shadow_endpoint = test_endpoint(&shadow, "node2:21354");
-    folded_shadow_endpoint.node_id = remote.clone();
-    folded_shadow_endpoint.priority = 0;
-    let main_endpoint = test_endpoint(&remote, "node2:21353");
-    let mut member = sinomo_core::ClusterMemberRecord::local_voter(
-        cluster_id,
-        remote.clone(),
-        "remote",
-        "pk-remote",
-        now,
-    );
-    member.endpoints = vec![folded_shadow_endpoint.clone(), main_endpoint.clone()];
-    state.members.push(member.clone());
+fn dfs_service_advertisements_use_node_identity_only() {
+    let node = NodeId::from_legacy_named("node_dfs_service_advertisement_node_only").expect("node");
 
-    assert_eq!(
-        dfs_service_endpoint_for_member(&state, &member, "loopback://127.0.0.1:21353"),
-        dfs_cluster_node_endpoint(&remote)
-    );
+    let metadata = DfsNodeAdvertisement::metadata(node.clone());
+    let content = DfsNodeAdvertisement::content(node.clone());
 
-    member.endpoints = vec![folded_shadow_endpoint];
-    assert_eq!(
-        dfs_service_endpoint_for_member(&state, &member, "loopback://127.0.0.1:21353"),
-        dfs_cluster_node_endpoint(&remote)
-    );
-}
-
-#[test]
-fn dfs_service_endpoint_for_local_member_does_not_publish_loopback() {
-    let now = OffsetDateTime::now_utc();
-    let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(
-        "cluster_dfs_service_endpoint_local_logical",
-    )
-    .expect("cluster");
-    let local =
-        NodeId::from_legacy_named("node_dfs_service_endpoint_local_logical").expect("local");
-    let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
-        cluster_id,
-        "dfs service endpoint local logical",
-        local.clone(),
-        "local",
-        "pk-local",
-        now,
-    );
-    let mut local_member = state.members[0].clone();
-    local_member.endpoints = vec![
-        ClusterEndpointRecord::loopback(local.clone(), "127.0.0.1:21353"),
-        test_endpoint(&local, "10.14.1.11:21353"),
-    ];
-    state.members[0] = local_member.clone();
-
-    assert_eq!(
-        dfs_service_endpoint_for_member(&state, &local_member, "loopback://127.0.0.1:21353"),
-        dfs_cluster_node_endpoint(&local)
-    );
-}
-
-#[test]
-fn dfs_service_endpoint_for_member_ignores_concrete_route_rank() {
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_service_endpoint_route_rank")
-            .expect("cluster");
-    let local =
-        NodeId::from_legacy_named("node_dfs_service_endpoint_route_rank_local").expect("local");
-    let remote =
-        NodeId::from_legacy_named("node_dfs_service_endpoint_route_rank_remote").expect("remote");
-    let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "dfs service endpoint route rank",
-        local.clone(),
-        "local",
-        "pk-local",
-        now,
-    );
-    let mut public_endpoint = test_endpoint(&remote, "198.51.100.76:21353");
-    public_endpoint.privacy = ClusterEndpointPrivacy::InternetDirect;
-    public_endpoint.priority = 0;
-    let lan_endpoint = test_endpoint(&remote, "10.0.0.41:21353");
-    let mut member = sinomo_core::ClusterMemberRecord::local_voter(
-        cluster_id,
-        remote.clone(),
-        "remote",
-        "pk-remote",
-        now,
-    );
-    member.endpoints = vec![public_endpoint, lan_endpoint.clone()];
-    state.members.push(member.clone());
-
-    assert_eq!(
-        dfs_service_endpoint_for_member(&state, &member, "loopback://127.0.0.1:21353"),
-        dfs_cluster_node_endpoint(&remote)
-    );
+    assert_eq!(metadata.node_id, node);
+    assert!(metadata.accepts_metadata);
+    assert!(!metadata.accepts_content);
+    assert_eq!(content.node_id, metadata.node_id);
+    assert!(!content.accepts_metadata);
+    assert!(content.accepts_content);
 }
 
 #[test]
@@ -1619,15 +1502,15 @@ fn adaptive_chunk_window_scales_by_profile_and_object_size() {
 }
 
 #[test]
-fn endpoint_transport_transfer_profile_keeps_remote_sizing_network_neutral() {
+fn node_transport_transfer_profile_keeps_remote_sizing_network_neutral() {
     let local = NodeId::from_legacy_named("node_dfs_transfer_profile_local").expect("local");
     let remote = NodeId::from_legacy_named("node_dfs_transfer_profile_remote").expect("remote");
     let unknown = NodeId::from_legacy_named("node_dfs_transfer_profile_unknown").expect("unknown");
-    let sender: DfsMessageSender =
-        Arc::new(|_endpoint, _command, _timeout| Err(DfsPeerTransportError::new("test sender")));
+    let sender: DfsMessageSender = Arc::new(|_target_node_id, _command, _timeout| {
+        Err(DfsPeerTransportError::new("test sender"))
+    });
 
-    let remote_endpoint = test_endpoint(&remote, "192.0.2.80:21353");
-    let transport = DfsEndpointTransport::new(local.clone(), vec![remote_endpoint], sender);
+    let transport = DfsNodeTransport::new(local.clone(), vec![remote.clone()], sender);
 
     assert_eq!(
         transport.transfer_profile(&local),
@@ -2321,36 +2204,35 @@ fn direct_read_stream_rpc_keeps_blob_out_of_initial_response() {
 }
 
 #[test]
-fn endpoint_transport_sends_rpc_and_queues_returned_messages() {
-    let local = NodeId::from_legacy_named("node_dfs_endpoint_send_local").expect("local");
-    let remote = NodeId::from_legacy_named("node_dfs_endpoint_send_remote").expect("remote");
-    let endpoint = test_endpoint(&remote, "192.0.2.10:21353");
+fn node_transport_sends_rpc_and_queues_returned_messages() {
+    let local = NodeId::from_legacy_named("node_dfs_node_route_send_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_dfs_node_route_send_remote").expect("remote");
     let calls = Arc::new(Mutex::new(Vec::new()));
     let calls_for_sender = Arc::clone(&calls);
     let local_for_sender = local.clone();
     let remote_for_sender = remote.clone();
-    let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |target_node_id, command, _timeout| {
         calls_for_sender
             .lock()
             .expect("calls lock")
-            .push((endpoint.clone(), command.routed_message.clone()));
+            .push((target_node_id.clone(), command.routed_message.clone()));
         Ok(test_dfs_message_response_from_routed_messages(
             command.request_id.clone(),
             vec![test_dfs_lookup_routed_message(
                 &remote_for_sender,
                 &local_for_sender,
                 100,
-                "/endpoint/send-return",
+                "/node_route/send-return",
             )],
         ))
     });
-    let mut transport = DfsEndpointTransport::with_connect_timeout(
+    let mut transport = DfsNodeTransport::with_connect_timeout(
         local.clone(),
-        vec![endpoint],
+        vec![remote.clone()],
         Duration::from_millis(1),
         sender,
     );
-    let message = test_dfs_lookup_routed_message(&local, &remote, 7, "/endpoint/send");
+    let message = test_dfs_lookup_routed_message(&local, &remote, 7, "/node_route/send");
 
     transport
         .send_routed_message(&remote, message.clone())
@@ -2367,15 +2249,15 @@ fn endpoint_transport_sends_rpc_and_queues_returned_messages() {
 }
 
 #[test]
-fn endpoint_transport_read_message_uses_direct_sender_and_queues_response() {
-    let local = NodeId::from_legacy_named("node_dfs_endpoint_direct_local").expect("local");
-    let remote = NodeId::from_legacy_named("node_dfs_endpoint_direct_remote").expect("remote");
+fn node_transport_read_message_uses_direct_sender_and_queues_response() {
+    let local = NodeId::from_legacy_named("node_dfs_node_route_direct_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_dfs_node_route_direct_remote").expect("remote");
     let object_id = DfsObjectId::generate();
     let version = DfsVersion::generate();
-    let bytes = b"direct endpoint read bytes".to_vec();
+    let bytes = b"direct node_route read bytes".to_vec();
     let direct_calls = Arc::new(Mutex::new(Vec::new()));
     let message_send_calls = Arc::new(Mutex::new(0));
-    let mut transport = endpoint_transport_with_direct_read_sender(
+    let mut transport = node_transport_with_direct_read_sender(
         local.clone(),
         remote.clone(),
         bytes.clone(),
@@ -2389,10 +2271,10 @@ fn endpoint_transport_read_message_uses_direct_sender_and_queues_response() {
         frame_id: 7,
         message_id: 9,
         message: DfsNetworkMessage::ReadRequest(DfsReadRequest {
-            request_id: "endpoint-direct-read".to_string(),
+            request_id: "node_route-direct-read".to_string(),
             object_id: object_id.clone(),
             version: Some(version.clone()),
-            content_hash: Some("blake3:endpoint-direct".to_string()),
+            content_hash: Some("blake3:node_route-direct".to_string()),
             content_size_bytes: Some(bytes.len() as u64),
             range_offset: None,
             range_max_bytes: None,
@@ -2409,7 +2291,7 @@ fn endpoint_transport_read_message_uses_direct_sender_and_queues_response() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].object_id, object_id);
     assert_eq!(calls[0].version, version);
-    assert_eq!(calls[0].content_hash, "blake3:endpoint-direct");
+    assert_eq!(calls[0].content_hash, "blake3:node_route-direct");
     assert_eq!(calls[0].content_size_bytes, bytes.len() as u64);
     drop(calls);
     assert_eq!(*message_send_calls.lock().expect("message send calls"), 0);
@@ -2438,24 +2320,24 @@ fn endpoint_transport_read_message_uses_direct_sender_and_queues_response() {
 }
 
 #[test]
-fn endpoint_transport_async_read_message_uses_direct_sender_and_queues_response() {
+fn node_transport_async_read_message_uses_direct_sender_and_queues_response() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
     runtime.block_on(async {
-        let local = NodeId::from_legacy_named("node_dfs_endpoint_async_direct_local")
+        let local = NodeId::from_legacy_named("node_dfs_node_route_async_direct_local")
             .expect("local");
-        let remote = NodeId::from_legacy_named("node_dfs_endpoint_async_direct_remote")
+        let remote = NodeId::from_legacy_named("node_dfs_node_route_async_direct_remote")
             .expect("remote");
-        let object_id = DfsObjectId::from_legacy_named("object_async_endpoint_direct")
+        let object_id = DfsObjectId::from_legacy_named("object_async_node_route_direct")
             .expect("object");
-        let version = DfsVersion::from_legacy_named("version_async_endpoint_direct")
+        let version = DfsVersion::from_legacy_named("version_async_node_route_direct")
             .expect("version");
-        let bytes = b"async direct endpoint read bytes".to_vec();
+        let bytes = b"async direct node_route read bytes".to_vec();
         let bytes_hash = content_hash(&bytes);
         let direct_calls = Arc::new(Mutex::new(Vec::new()));
-        let async_direct_sender: AsyncDfsDirectReadSender = Arc::new(|_endpoint, _request, _timeout| {
+        let async_direct_sender: AsyncDfsDirectReadSender = Arc::new(|_target_node_id, _request, _timeout| {
             Box::pin(async move {
                 Err(DfsPeerTransportError::new(
                     "buffered async direct sender should not be used when stream sender is available",
@@ -2465,7 +2347,7 @@ fn endpoint_transport_async_read_message_uses_direct_sender_and_queues_response(
         let direct_calls_for_stream_sender = Arc::clone(&direct_calls);
         let bytes_for_stream_sender = bytes.clone();
         let async_direct_stream_sender: AsyncDfsDirectReadStreamSender =
-            Arc::new(move |_endpoint, request, _timeout| {
+            Arc::new(move |_target_node_id, request, _timeout| {
                 let direct_calls_for_stream_sender = Arc::clone(&direct_calls_for_stream_sender);
                 let request = request.clone();
                 let bytes_for_stream_sender = bytes_for_stream_sender.clone();
@@ -2499,7 +2381,7 @@ fn endpoint_transport_async_read_message_uses_direct_sender_and_queues_response(
             });
         let message_send_calls = Arc::new(Mutex::new(0usize));
         let message_send_calls_for_sender = Arc::clone(&message_send_calls);
-        let async_sender: AsyncDfsMessageSender = Arc::new(move |_endpoint, _command, _timeout| {
+        let async_sender: AsyncDfsMessageSender = Arc::new(move |_target_node_id, _command, _timeout| {
             let message_send_calls_for_sender = Arc::clone(&message_send_calls_for_sender);
             Box::pin(async move {
                 *message_send_calls_for_sender
@@ -2510,19 +2392,19 @@ fn endpoint_transport_async_read_message_uses_direct_sender_and_queues_response(
                 ))
             })
         });
-        let sync_sender: DfsMessageSender = Arc::new(|_endpoint, _command, _timeout| {
+        let sync_sender: DfsMessageSender = Arc::new(|_target_node_id, _command, _timeout| {
             Err(DfsPeerTransportError::new(
                 "sync message sender should not be used by async direct-read tests",
             ))
         });
-        let sync_direct_sender: DfsDirectReadSender = Arc::new(|_endpoint, _request, _timeout| {
+        let sync_direct_sender: DfsDirectReadSender = Arc::new(|_target_node_id, _request, _timeout| {
             Err(DfsPeerTransportError::new(
                 "sync direct sender should not be used by async direct-read tests",
             ))
         });
-        let mut transport = DfsEndpointTransport::new_with_message_peer_senders(
+        let mut transport = DfsNodeTransport::new_with_message_peer_senders(
             local.clone(),
-            vec![test_endpoint(&remote, "192.0.2.18:21353")],
+            vec![remote.clone()],
             sync_sender,
             async_sender,
             sync_direct_sender,
@@ -2535,7 +2417,7 @@ fn endpoint_transport_async_read_message_uses_direct_sender_and_queues_response(
             frame_id: 17,
             message_id: 19,
             message: DfsNetworkMessage::ReadRequest(DfsReadRequest {
-                request_id: "endpoint-async-direct-read".to_string(),
+                request_id: "node_route-async-direct-read".to_string(),
                 object_id: object_id.clone(),
                 version: Some(version.clone()),
                 content_hash: Some(bytes_hash.clone()),
@@ -2579,42 +2461,43 @@ fn endpoint_transport_async_read_message_uses_direct_sender_and_queues_response(
 }
 
 #[test]
-fn endpoint_transport_async_send_requires_async_sender() {
+fn node_transport_async_send_requires_async_sender() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
     runtime.block_on(async {
-        let local = NodeId::from_legacy_named("node_dfs_endpoint_async_send_local").expect("local");
+        let local =
+            NodeId::from_legacy_named("node_dfs_node_route_async_send_local").expect("local");
         let remote =
-            NodeId::from_legacy_named("node_dfs_endpoint_async_send_remote").expect("remote");
-        let endpoint = test_endpoint(&remote, "192.0.2.14:21353");
+            NodeId::from_legacy_named("node_dfs_node_route_async_send_remote").expect("remote");
         let calls = Arc::new(Mutex::new(Vec::new()));
         let calls_for_sender = Arc::clone(&calls);
         let local_for_sender = local.clone();
         let remote_for_sender = remote.clone();
-        let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
+        let sender: DfsMessageSender = Arc::new(move |target_node_id, command, _timeout| {
             calls_for_sender
                 .lock()
                 .expect("calls lock")
-                .push((endpoint.clone(), command.routed_message.clone()));
+                .push((target_node_id.clone(), command.routed_message.clone()));
             Ok(test_dfs_message_response_from_routed_messages(
                 command.request_id.clone(),
                 vec![test_dfs_lookup_routed_message(
                     &remote_for_sender,
                     &local_for_sender,
                     100,
-                    "/endpoint/async-missing-return",
+                    "/node_route/async-missing-return",
                 )],
             ))
         });
-        let mut transport = DfsEndpointTransport::with_connect_timeout(
+        let mut transport = DfsNodeTransport::with_connect_timeout(
             local.clone(),
-            vec![endpoint],
+            vec![remote.clone()],
             Duration::from_millis(1),
             sender,
         );
-        let message = test_dfs_lookup_routed_message(&local, &remote, 7, "/endpoint/async-missing");
+        let message =
+            test_dfs_lookup_routed_message(&local, &remote, 7, "/node_route/async-missing");
 
         let error =
             AsyncDfsMessageTransport::send_routed_message_async(&mut transport, &remote, message)
@@ -2632,23 +2515,23 @@ fn endpoint_transport_async_send_requires_async_sender() {
 }
 
 #[test]
-fn endpoint_transport_async_sender_does_not_require_sync_sender() {
+fn node_transport_async_sender_does_not_require_sync_sender() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
     runtime.block_on(async {
-        let local = NodeId::from_legacy_named("node_dfs_endpoint_async_only_local").expect("local");
+        let local =
+            NodeId::from_legacy_named("node_dfs_node_route_async_only_local").expect("local");
         let remote =
-            NodeId::from_legacy_named("node_dfs_endpoint_async_only_remote").expect("remote");
-        let endpoint = test_endpoint(&remote, "192.0.2.15:21353");
+            NodeId::from_legacy_named("node_dfs_node_route_async_only_remote").expect("remote");
         let calls = Arc::new(Mutex::new(Vec::new()));
         let calls_for_sender = Arc::clone(&calls);
         let local_for_sender = local.clone();
         let remote_for_sender = remote.clone();
-        let sender: AsyncDfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
+        let sender: AsyncDfsMessageSender = Arc::new(move |target_node_id, command, _timeout| {
             let calls_for_sender = Arc::clone(&calls_for_sender);
-            let endpoint_node_id = endpoint.clone();
+            let target_node_id_for_sender = target_node_id.clone();
             let request_id = command.request_id.clone();
             let routed_message = command.routed_message.clone();
             let local_for_sender = local_for_sender.clone();
@@ -2657,25 +2540,25 @@ fn endpoint_transport_async_sender_does_not_require_sync_sender() {
                 calls_for_sender
                     .lock()
                     .expect("calls lock")
-                    .push((endpoint_node_id, routed_message));
+                    .push((target_node_id_for_sender, routed_message));
                 Ok(test_dfs_message_response_from_routed_messages(
                     request_id,
                     vec![test_dfs_lookup_routed_message(
                         &remote_for_sender,
                         &local_for_sender,
                         101,
-                        "/endpoint/async-only-return",
+                        "/node_route/async-only-return",
                     )],
                 ))
             })
         });
-        let mut transport = DfsEndpointTransport::with_connect_timeout_async(
+        let mut transport = DfsNodeTransport::with_connect_timeout_async(
             local.clone(),
-            vec![endpoint],
+            vec![remote.clone()],
             Duration::from_millis(1),
             sender,
         );
-        let message = test_dfs_lookup_routed_message(&local, &remote, 7, "/endpoint/async-only");
+        let message = test_dfs_lookup_routed_message(&local, &remote, 7, "/node_route/async-only");
 
         assert!(
             transport
@@ -2704,33 +2587,32 @@ fn endpoint_transport_async_sender_does_not_require_sync_sender() {
 }
 
 #[test]
-fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
+fn node_transport_dual_senders_support_sync_and_async_sends() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
     runtime.block_on(async {
-        let local = NodeId::from_legacy_named("node_dfs_endpoint_dual_local").expect("local");
-        let remote = NodeId::from_legacy_named("node_dfs_endpoint_dual_remote").expect("remote");
-        let endpoint = test_endpoint(&remote, "192.0.2.16:21353");
+        let local = NodeId::from_legacy_named("node_dfs_node_route_dual_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_dfs_node_route_dual_remote").expect("remote");
         let sync_calls = Arc::new(Mutex::new(Vec::new()));
         let async_calls = Arc::new(Mutex::new(Vec::new()));
 
         let sync_calls_for_sender = Arc::clone(&sync_calls);
         let local_for_sync = local.clone();
         let remote_for_sync = remote.clone();
-        let sync_sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
+        let sync_sender: DfsMessageSender = Arc::new(move |target_node_id, command, _timeout| {
             sync_calls_for_sender
                 .lock()
                 .expect("sync calls lock")
-                .push((endpoint.clone(), command.routed_message.frame_id));
+                .push((target_node_id.clone(), command.routed_message.frame_id));
             Ok(test_dfs_message_response_from_routed_messages(
                 command.request_id.clone(),
                 vec![test_dfs_lookup_routed_message(
                     &remote_for_sync,
                     &local_for_sync,
                     201,
-                    "/endpoint/dual-sync-return",
+                    "/node_route/dual-sync-return",
                 )],
             ))
         });
@@ -2738,39 +2620,40 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
         let async_calls_for_sender = Arc::clone(&async_calls);
         let local_for_async = local.clone();
         let remote_for_async = remote.clone();
-        let async_sender: AsyncDfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
-            let async_calls_for_sender = Arc::clone(&async_calls_for_sender);
-            let endpoint_node_id = endpoint.clone();
-            let request_id = command.request_id.clone();
-            let frame_id = command.routed_message.frame_id;
-            let local_for_async = local_for_async.clone();
-            let remote_for_async = remote_for_async.clone();
-            Box::pin(async move {
-                async_calls_for_sender
-                    .lock()
-                    .expect("async calls lock")
-                    .push((endpoint_node_id, frame_id));
-                Ok(test_dfs_message_response_from_routed_messages(
-                    request_id,
-                    vec![test_dfs_lookup_routed_message(
-                        &remote_for_async,
-                        &local_for_async,
-                        301,
-                        "/endpoint/dual-async-return",
-                    )],
-                ))
-            })
-        });
+        let async_sender: AsyncDfsMessageSender =
+            Arc::new(move |target_node_id, command, _timeout| {
+                let async_calls_for_sender = Arc::clone(&async_calls_for_sender);
+                let target_node_id_for_sender = target_node_id.clone();
+                let request_id = command.request_id.clone();
+                let frame_id = command.routed_message.frame_id;
+                let local_for_async = local_for_async.clone();
+                let remote_for_async = remote_for_async.clone();
+                Box::pin(async move {
+                    async_calls_for_sender
+                        .lock()
+                        .expect("async calls lock")
+                        .push((target_node_id_for_sender, frame_id));
+                    Ok(test_dfs_message_response_from_routed_messages(
+                        request_id,
+                        vec![test_dfs_lookup_routed_message(
+                            &remote_for_async,
+                            &local_for_async,
+                            301,
+                            "/node_route/dual-async-return",
+                        )],
+                    ))
+                })
+            });
 
-        let mut transport = DfsEndpointTransport::with_connect_timeout_and_senders(
+        let mut transport = DfsNodeTransport::with_connect_timeout_and_senders(
             local.clone(),
-            vec![endpoint],
+            vec![remote.clone()],
             Duration::from_millis(1),
             sync_sender,
             async_sender,
         );
         let sync_message =
-            test_dfs_lookup_routed_message(&local, &remote, 11, "/endpoint/dual-sync");
+            test_dfs_lookup_routed_message(&local, &remote, 11, "/node_route/dual-sync");
         transport
             .send_routed_message(&remote, sync_message)
             .expect("sync send message");
@@ -2787,7 +2670,7 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
         assert_eq!(incoming[0].source_node_id, remote);
 
         let async_message =
-            test_dfs_lookup_routed_message(&local, &remote, 12, "/endpoint/dual-async");
+            test_dfs_lookup_routed_message(&local, &remote, 12, "/node_route/dual-async");
         AsyncDfsMessageTransport::send_routed_message_async(&mut transport, &remote, async_message)
             .await
             .expect("async send message");
@@ -2805,20 +2688,18 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
 }
 
 #[test]
-fn endpoint_transport_relays_remote_returned_messages_preserving_source() {
-    let local = NodeId::from_legacy_named("node_dfs_endpoint_relay_local").expect("local");
-    let primary = NodeId::from_legacy_named("node_dfs_endpoint_relay_primary").expect("primary");
-    let replica = NodeId::from_legacy_named("node_dfs_endpoint_relay_replica").expect("replica");
-    let primary_endpoint = test_endpoint(&primary, "192.0.2.12:21353");
-    let replica_endpoint = test_endpoint(&replica, "192.0.2.13:21353");
+fn node_transport_relays_remote_returned_messages_preserving_source() {
+    let local = NodeId::from_legacy_named("node_dfs_node_route_relay_local").expect("local");
+    let primary = NodeId::from_legacy_named("node_dfs_node_route_relay_primary").expect("primary");
+    let replica = NodeId::from_legacy_named("node_dfs_node_route_relay_replica").expect("replica");
     let calls = Arc::new(Mutex::new(Vec::new()));
     let calls_for_sender = Arc::clone(&calls);
     let local_for_sender = local.clone();
     let primary_for_sender = primary.clone();
     let replica_for_sender = replica.clone();
-    let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |target_node_id, command, _timeout| {
         calls_for_sender.lock().expect("calls lock").push((
-            endpoint.clone(),
+            target_node_id.clone(),
             command.routed_message.source_node_id.clone(),
             command.routed_message.target_node_id.clone(),
         ));
@@ -2829,7 +2710,7 @@ fn endpoint_transport_relays_remote_returned_messages_preserving_source() {
                     &primary_for_sender,
                     &replica_for_sender,
                     101,
-                    "/endpoint/relay-primary",
+                    "/node_route/relay-primary",
                 )],
             ));
         }
@@ -2840,7 +2721,7 @@ fn endpoint_transport_relays_remote_returned_messages_preserving_source() {
                     &replica_for_sender,
                     &local_for_sender,
                     102,
-                    "/endpoint/relay-replica",
+                    "/node_route/relay-replica",
                 )],
             ));
         }
@@ -2849,13 +2730,13 @@ fn endpoint_transport_relays_remote_returned_messages_preserving_source() {
             outbound_messages: Vec::new(),
         })
     });
-    let mut transport = DfsEndpointTransport::with_connect_timeout(
+    let mut transport = DfsNodeTransport::with_connect_timeout(
         local.clone(),
-        vec![primary_endpoint, replica_endpoint],
+        vec![primary.clone(), replica.clone()],
         Duration::from_millis(1),
         sender,
     );
-    let message = test_dfs_lookup_routed_message(&local, &primary, 9, "/endpoint/relay");
+    let message = test_dfs_lookup_routed_message(&local, &primary, 9, "/node_route/relay");
 
     transport
         .send_routed_message(&primary, message)
@@ -2877,14 +2758,13 @@ fn endpoint_transport_relays_remote_returned_messages_preserving_source() {
 }
 
 #[test]
-fn endpoint_transport_completes_synchronous_replica_write() {
-    let root = temp_root("endpoint-transport-replica-write");
-    let local = NodeId::from_legacy_named("node_dfs_endpoint_write_local").expect("local");
-    let remote = NodeId::from_legacy_named("node_dfs_endpoint_write_remote").expect("remote");
-    let endpoint = test_endpoint(&remote, "192.0.2.11:21353");
+fn node_transport_completes_synchronous_replica_write() {
+    let root = temp_root("node_route-transport-replica-write");
+    let local = NodeId::from_legacy_named("node_dfs_node_route_write_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_dfs_node_route_write_remote").expect("remote");
     let calls = Arc::new(Mutex::new(Vec::new()));
     let calls_for_sender = Arc::clone(&calls);
-    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
         let DfsNetworkMessage::StageBlob(stage) = &command.routed_message.message else {
             return Ok(DfsMessageResponse {
                 request_id: command.request_id.clone(),
@@ -2917,9 +2797,9 @@ fn endpoint_transport_completes_synchronous_replica_write() {
             }],
         })
     });
-    let transport = DfsEndpointTransport::with_connect_timeout(
+    let transport = DfsNodeTransport::with_connect_timeout(
         local.clone(),
-        vec![endpoint],
+        vec![remote.clone()],
         Duration::from_millis(1),
         sender,
     );
@@ -2930,7 +2810,7 @@ fn endpoint_transport_completes_synchronous_replica_write() {
 
     let stat = dfs
         .posix_write_file(
-            "/services/endpoint-transport.txt",
+            "/services/node_route-transport.txt",
             b"replicated bytes",
             DfsWriteOptions {
                 policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
@@ -2953,10 +2833,9 @@ fn posix_wait_for_commit_reports_repair_retry_failure_without_failing_write() {
     let root = temp_root("posix-wait-repair-retry-best-effort");
     let local = NodeId::from_legacy_named("node_posix_wait_repair_local").expect("local");
     let remote = NodeId::from_legacy_named("node_posix_wait_repair_remote").expect("remote");
-    let endpoint = test_endpoint(&remote, "192.0.2.12:21353");
     let stage_calls = Arc::new(Mutex::new(Vec::new()));
     let stage_calls_for_sender = Arc::clone(&stage_calls);
-    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
         let DfsNetworkMessage::StageBlob(stage) = &command.routed_message.message else {
             return Ok(DfsMessageResponse {
                 request_id: command.request_id.clone(),
@@ -2989,9 +2868,9 @@ fn posix_wait_for_commit_reports_repair_retry_failure_without_failing_write() {
             }],
         })
     });
-    let transport = DfsEndpointTransport::with_connect_timeout(
+    let transport = DfsNodeTransport::with_connect_timeout(
         local.clone(),
-        vec![endpoint],
+        vec![remote.clone()],
         Duration::from_millis(1),
         sender,
     );
@@ -3087,12 +2966,11 @@ fn served_message_drains_nested_stage_response_before_returning() {
     let object_id = DfsObjectId::from_legacy_named("obj_served_frame_routed").expect("object");
     let version_1 = DfsVersion::from_legacy_named("version_served_frame_1").expect("version");
     let version_2 = DfsVersion::from_legacy_named("version_served_frame_2").expect("version");
-    let endpoint = test_endpoint(&replica, "192.0.2.21:21353");
     let stage_calls = Arc::new(Mutex::new(Vec::new()));
     let stage_calls_for_sender = Arc::clone(&stage_calls);
     let replica_for_sender = replica.clone();
-    let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
-        assert_eq!(endpoint, &replica_for_sender);
+    let sender: DfsMessageSender = Arc::new(move |target_node_id, command, _timeout| {
+        assert_eq!(target_node_id, &replica_for_sender);
         let message = command.routed_message.message.clone();
         let DfsNetworkMessage::StageBlob(stage) = message else {
             return Ok(DfsMessageResponse {
@@ -3126,9 +3004,9 @@ fn served_message_drains_nested_stage_response_before_returning() {
             }],
         })
     });
-    let transport = DfsEndpointServedMessageTransport::new_with_message_sender(
+    let transport = DfsNodeServedMessageTransport::new_with_message_sender(
         primary.clone(),
-        vec![endpoint],
+        vec![replica.clone()],
         sender,
         Duration::from_millis(1),
     );
@@ -3255,12 +3133,11 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
         DfsObjectId::from_legacy_named("obj_served_deferred_routed").expect("object");
     let version_1 = DfsVersion::from_legacy_named("version_served_deferred_1").expect("version");
     let version_2 = DfsVersion::from_legacy_named("version_served_deferred_2").expect("version");
-    let endpoint = test_endpoint(&replica, "192.0.2.22:21353");
     let repair_calls = Arc::new(Mutex::new(Vec::new()));
     let repair_calls_for_sender = Arc::clone(&repair_calls);
     let replica_for_sender = replica.clone();
-    let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
-        assert_eq!(endpoint, &replica_for_sender);
+    let sender: DfsMessageSender = Arc::new(move |target_node_id, command, _timeout| {
+        assert_eq!(target_node_id, &replica_for_sender);
         if let message @ (DfsNetworkMessage::RepairReplica(_)
         | DfsNetworkMessage::RepairReplicaChunk(_)
         | DfsNetworkMessage::StageBlob(_)
@@ -3276,9 +3153,9 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsEndpointServedMessageTransport::new_with_message_sender(
+    let transport = DfsNodeServedMessageTransport::new_with_message_sender(
         primary.clone(),
-        vec![endpoint],
+        vec![replica.clone()],
         sender,
         Duration::from_millis(1),
     );
@@ -3420,8 +3297,8 @@ fn served_foreground_write_returns_committed_response_before_replica_repair_comp
     let transfer_objects = Arc::new(Mutex::new(Vec::<DfsObjectId>::new()));
     let transfer_objects_for_sender = Arc::clone(&transfer_objects);
     let replica_for_sender = replica.clone();
-    let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
-        assert_eq!(endpoint, &replica_for_sender);
+    let sender: DfsMessageSender = Arc::new(move |target_node_id, command, _timeout| {
+        assert_eq!(target_node_id, &replica_for_sender);
         match &command.routed_message.message {
             DfsNetworkMessage::RepairReplica(command) => transfer_objects_for_sender
                 .lock()
@@ -3446,9 +3323,9 @@ fn served_foreground_write_returns_committed_response_before_replica_repair_comp
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsEndpointServedMessageTransport::new_with_message_sender(
+    let transport = DfsNodeServedMessageTransport::new_with_message_sender(
         primary.clone(),
-        vec![test_endpoint(&replica, "192.0.2.23:21353")],
+        vec![replica.clone()],
         sender,
         Duration::from_millis(1),
     );
@@ -3579,16 +3456,16 @@ fn served_sync_path_does_not_retry_repairs_inline() {
     let path = "/services/served-frame/repair-retry-patch.bin";
     let send_attempts = Arc::new(Mutex::new(0usize));
     let send_attempts_for_sender = Arc::clone(&send_attempts);
-    let sender: DfsMessageSender = Arc::new(move |_endpoint, _command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |_target_node_id, _command, _timeout| {
         *send_attempts_for_sender.lock().expect("send attempts") += 1;
         Ok(DfsMessageResponse {
             request_id: "dropped-stage".to_string(),
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsEndpointServedMessageTransport::new_with_message_sender(
+    let transport = DfsNodeServedMessageTransport::new_with_message_sender(
         primary.clone(),
-        vec![test_endpoint(&replica, "192.0.2.31:21353")],
+        vec![replica.clone()],
         sender,
         Duration::from_millis(1),
     );
@@ -3728,7 +3605,7 @@ impl DfsMetadataJournalReplicationTransport for ApplyingMetadataJournalTransport
         _timeout: Duration,
     ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError> {
         if !self.has_metadata_replication_route(target_node_id) {
-            return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
+            return Err(DfsMetadataJournalReplicationTransportError::MissingRoute);
         }
         self.batches += 1;
         Ok(DfsMetadataJournalBatchResponse {
@@ -3748,7 +3625,7 @@ impl DfsMetadataJournalReplicationTransport for ApplyingMetadataJournalTransport
     ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>
     {
         if !self.has_metadata_replication_route(target_node_id) {
-            return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
+            return Err(DfsMetadataJournalReplicationTransportError::MissingRoute);
         }
         self.snapshot_installs += 1;
         Err(DfsMetadataJournalReplicationTransportError::Failed {
@@ -3795,7 +3672,7 @@ impl DfsMetadataJournalReplicationTransport for SequenceConflictMetadataJournalT
         _timeout: Duration,
     ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError> {
         if !self.has_metadata_replication_route(target_node_id) {
-            return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
+            return Err(DfsMetadataJournalReplicationTransportError::MissingRoute);
         }
         self.batches += 1;
         Ok(DfsMetadataJournalBatchResponse {
@@ -3817,7 +3694,7 @@ impl DfsMetadataJournalReplicationTransport for SequenceConflictMetadataJournalT
     ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>
     {
         if !self.has_metadata_replication_route(target_node_id) {
-            return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
+            return Err(DfsMetadataJournalReplicationTransportError::MissingRoute);
         }
         self.snapshot_installs += 1;
         Ok(DfsMetadataSnapshotInstallResponse {
@@ -5015,16 +4892,13 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
         "pk-local",
         now,
     );
-    let mut replica_member = sinomo_core::cluster::local_cluster_state_authority_member(
+    let replica_member = sinomo_core::cluster::local_cluster_state_authority_member(
         cluster_id,
         replica.clone(),
         "replica",
         "pk-replica",
         now,
     );
-    replica_member
-        .endpoints
-        .push(test_endpoint(&replica, "10.77.0.3:21353"));
     state.members.push(replica_member);
     sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
     sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
@@ -5068,12 +4942,12 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
     backend.put_object(&object).expect("object");
     drop(backend);
 
-    let message_sender: DfsMessageSender = Arc::new(|_endpoint, _command, _timeout| {
+    let message_sender: DfsMessageSender = Arc::new(|_target_node_id, _command, _timeout| {
         Err(DfsPeerTransportError::new(
             "message sender should not be needed",
         ))
     });
-    let sender: DfsMetadataJournalBatchSender = Arc::new(|_endpoint, command, _timeout| {
+    let sender: DfsMetadataJournalBatchSender = Arc::new(|_target_node_id, command, _timeout| {
         Ok(DfsMetadataJournalBatchResponse {
             request_id: command.request_id.clone(),
             shard_id: command.batch.shard_id.clone(),
@@ -5083,7 +4957,7 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
         })
     });
     let snapshot_sender: DfsMetadataSnapshotInstallSender =
-        Arc::new(|_endpoint, _command, _timeout| {
+        Arc::new(|_target_node_id, _command, _timeout| {
             Err(DfsMetadataPeerTransportError::new(
                 "snapshot install should not be needed",
             ))
@@ -5138,16 +5012,13 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
         "pk-local",
         now,
     );
-    let mut replica_member = sinomo_core::cluster::local_cluster_state_authority_member(
+    let replica_member = sinomo_core::cluster::local_cluster_state_authority_member(
         cluster_id,
         replica.clone(),
         "replica",
         "pk-replica",
         now,
     );
-    replica_member
-        .endpoints
-        .push(test_endpoint(&replica, "10.77.0.4:21353"));
     state.members.push(replica_member);
     sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
     sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
@@ -5177,28 +5048,29 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
     )
     .expect("write shard config");
 
-    let message_sender: DfsMessageSender = Arc::new(|_endpoint, _command, _timeout| {
+    let message_sender: DfsMessageSender = Arc::new(|_target_node_id, _command, _timeout| {
         Err(DfsPeerTransportError::new(
             "message sender should not be needed",
         ))
     });
     let sent = Arc::new(Mutex::new(Vec::new()));
     let sent_for_sender = Arc::clone(&sent);
-    let sender: DfsMetadataJournalBatchSender = Arc::new(move |endpoint, command, _timeout| {
-        sent_for_sender
-            .lock()
-            .expect("sent lock")
-            .push((endpoint.to_string(), command.batch.entries.len()));
-        Ok(DfsMetadataJournalBatchResponse {
-            request_id: command.request_id.clone(),
-            shard_id: command.batch.shard_id.clone(),
-            next_after_sequence: command.batch.next_after_sequence,
-            applied_entries: command.batch.entries.len(),
-            result: DfsMetadataJournalBatchResult::Applied,
-        })
-    });
+    let sender: DfsMetadataJournalBatchSender =
+        Arc::new(move |target_node_id, command, _timeout| {
+            sent_for_sender
+                .lock()
+                .expect("sent lock")
+                .push((target_node_id.to_string(), command.batch.entries.len()));
+            Ok(DfsMetadataJournalBatchResponse {
+                request_id: command.request_id.clone(),
+                shard_id: command.batch.shard_id.clone(),
+                next_after_sequence: command.batch.next_after_sequence,
+                applied_entries: command.batch.entries.len(),
+                result: DfsMetadataJournalBatchResult::Applied,
+            })
+        });
     let snapshot_sender: DfsMetadataSnapshotInstallSender =
-        Arc::new(|_endpoint, _command, _timeout| {
+        Arc::new(|_target_node_id, _command, _timeout| {
             Err(DfsMetadataPeerTransportError::new(
                 "snapshot install should not be needed",
             ))
@@ -5264,108 +5136,30 @@ fn dfs_smoke_replica_candidates_preserve_routable_order() {
     assert_eq!(
         candidates,
         vec![vec![local.clone(), reachable], vec![local.clone(), stale],],
-        "DFS smoke should try endpoints in selector order instead of sorted node-id order"
+        "DFS smoke should try routable nodes in selector order instead of sorted node-id order"
     );
 }
 
 #[test]
-fn dfs_smoke_routable_nodes_follow_routes_and_skip_unreachable() {
-    let cluster_id =
-        sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_smoke_routable_nodes")
-            .expect("cluster");
+fn dfs_smoke_routable_nodes_follow_peer_node_order() {
     let local = NodeId::from_legacy_named("node_dfs_smoke_routable_local").expect("local node");
     let bridge = NodeId::from_legacy_named("node_dfs_smoke_routable_bridge").expect("bridge node");
     let target = NodeId::from_legacy_named("node_dfs_smoke_routable_target").expect("target node");
-    let degraded =
-        NodeId::from_legacy_named("node_dfs_smoke_routable_degraded").expect("degraded node");
-    let stale = NodeId::from_legacy_named("node_dfs_smoke_routable_stale").expect("stale node");
-    let now = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2);
-    let local_state = sinomo_core::ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "dfs smoke routable local",
-        local.clone(),
-        "local",
-        "pk-local",
-        now,
-    );
-    let bridge_state = sinomo_core::ClusterBootstrapState::initialized_locally(
-        cluster_id,
-        "dfs smoke routable bridge",
-        bridge.clone(),
-        "bridge",
-        "pk-bridge",
-        now,
-    );
-    let bridge_endpoint = test_endpoint(&bridge, "10.78.0.2:21353");
-    let target_endpoint = test_endpoint(&target, "10.78.0.3:21353");
-    let degraded_endpoint = test_endpoint(&degraded, "10.78.0.5:21353");
-    let stale_endpoint = test_endpoint(&stale, "10.78.0.4:21353");
-    let graph = sinomo_core::network::ClusterConnectivityGraph::from_records(
-        local.clone(),
-        vec![
-            sinomo_core::network::cluster_connectivity_record(
-                &local_state,
-                &bridge_endpoint,
-                sinomo_core::network::ClusterConnectivityState::Healthy,
-                Some(3),
-                0,
-                Some("1970-01-01T02:00:00Z".to_string()),
-                None,
-                now,
-                60,
-            ),
-            sinomo_core::network::cluster_connectivity_record(
-                &bridge_state,
-                &target_endpoint,
-                sinomo_core::network::ClusterConnectivityState::Healthy,
-                Some(4),
-                0,
-                Some("1970-01-01T02:00:00Z".to_string()),
-                None,
-                now,
-                60,
-            ),
-            sinomo_core::network::cluster_connectivity_record(
-                &local_state,
-                &stale_endpoint,
-                sinomo_core::network::ClusterConnectivityState::Unreachable,
-                None,
-                3,
-                None,
-                Some("1970-01-01T02:00:00Z".to_string()),
-                now,
-                60,
-            ),
-            sinomo_core::network::cluster_connectivity_record(
-                &bridge_state,
-                &degraded_endpoint,
-                sinomo_core::network::ClusterConnectivityState::Degraded,
-                Some(5),
-                2,
-                Some("1970-01-01T02:00:00Z".to_string()),
-                Some("1970-01-01T02:00:00Z".to_string()),
-                now,
-                60,
-            ),
-        ],
-    );
 
-    let routable = dfs_smoke_routable_node_ids_with_graph(
+    let routable = dfs_smoke_routable_node_ids(
         &local,
         &[
-            stale_endpoint,
-            target_endpoint.clone(),
-            degraded_endpoint,
-            bridge_endpoint.clone(),
-            target_endpoint,
+            local.clone(),
+            target.clone(),
+            bridge.clone(),
+            target.clone(),
         ],
-        &graph,
     );
 
     assert_eq!(
         routable,
         vec![target, bridge],
-        "DFS smoke should use active multi-hop routes and skip unreachable nodes"
+        "DFS smoke should keep peer-node selector order and de-duplicate node targets"
     );
 }
 
@@ -5377,11 +5171,11 @@ fn dfs_smoke_content_nodes_prefer_fresh_remote_advertisements() {
         NodeId::from_legacy_named("node_dfs_smoke_fresh_ads_reachable").expect("fresh node");
     let now = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2);
 
-    let mut local_advertisement = DfsNodeAdvertisement::content(local.clone(), "local");
+    let mut local_advertisement = DfsNodeAdvertisement::content(local.clone());
     local_advertisement.updated_at = now - time::Duration::hours(2);
-    let mut stale_advertisement = DfsNodeAdvertisement::content(stale.clone(), "stale");
+    let mut stale_advertisement = DfsNodeAdvertisement::content(stale.clone());
     stale_advertisement.updated_at = now - time::Duration::hours(2);
-    let mut fresh_advertisement = DfsNodeAdvertisement::content(fresh.clone(), "fresh");
+    let mut fresh_advertisement = DfsNodeAdvertisement::content(fresh.clone());
     fresh_advertisement.updated_at = now - time::Duration::minutes(5);
 
     let content_nodes = dfs_smoke_content_node_ids(
@@ -5426,18 +5220,18 @@ fn default_cluster_smoke_bootstraps_dfs_before_running_smoke() {
     sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
         .expect("cluster kv state");
 
-    let message_sender: DfsMessageSender = Arc::new(|_endpoint, _command, _timeout| {
+    let message_sender: DfsMessageSender = Arc::new(|_target_node_id, _command, _timeout| {
         Err(DfsPeerTransportError::new(
             "single-node default smoke should not send DFS messages",
         ))
     });
-    let sender: DfsMetadataJournalBatchSender = Arc::new(|_endpoint, _command, _timeout| {
+    let sender: DfsMetadataJournalBatchSender = Arc::new(|_target_node_id, _command, _timeout| {
         Err(DfsMetadataPeerTransportError::new(
             "single-node default smoke should not replicate metadata",
         ))
     });
     let snapshot_sender: DfsMetadataSnapshotInstallSender =
-        Arc::new(|_endpoint, _command, _timeout| {
+        Arc::new(|_target_node_id, _command, _timeout| {
             Err(DfsMetadataPeerTransportError::new(
                 "single-node default smoke should not install metadata snapshots",
             ))
@@ -5457,7 +5251,6 @@ fn default_cluster_smoke_bootstraps_dfs_before_running_smoke() {
             bootstrap: DfsDefaultClusterBootstrapOptions {
                 publish_cluster_control: true,
                 materialize_local_metadata: true,
-                local_endpoint: "loopback://127.0.0.1:21353".to_string(),
             },
             smoke: DfsSmokeOptions {
                 nonce: Some(13579),
@@ -5521,7 +5314,6 @@ fn default_cluster_dfs_helper_writes_default_records_to_cluster_kv() {
         DfsDefaultClusterBootstrapOptions {
             publish_cluster_control: true,
             materialize_local_metadata: true,
-            local_endpoint: "loopback://127.0.0.1:21353".to_string(),
         },
     )
     .expect("default cluster dfs")
@@ -5604,7 +5396,6 @@ fn control_plane_default_bootstrap_host_writes_default_dfs_records() {
         DfsDefaultClusterBootstrapOptions {
             publish_cluster_control: true,
             materialize_local_metadata: true,
-            local_endpoint: "loopback://127.0.0.1:21353".to_string(),
         },
     )
     .expect("default dfs bootstrap");
@@ -5638,18 +5429,14 @@ fn control_plane_default_bootstrap_host_writes_default_dfs_records() {
         .metadata_service(&local)
         .expect("metadata advertisement")
         .expect("metadata advertisement present");
-    assert_eq!(
-        metadata_advertisement.endpoint,
-        dfs_cluster_node_endpoint(&local)
-    );
+    assert_eq!(metadata_advertisement.node_id, local.clone());
+    assert!(metadata_advertisement.accepts_metadata);
     let content_advertisement = store
         .content_service(&local)
         .expect("content advertisement")
         .expect("content advertisement present");
-    assert_eq!(
-        content_advertisement.endpoint,
-        dfs_cluster_node_endpoint(&local)
-    );
+    assert_eq!(content_advertisement.node_id, local);
+    assert!(content_advertisement.accepts_content);
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -7315,16 +7102,13 @@ fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
         "pk-local",
         now,
     );
-    let mut replica_member = sinomo_core::cluster::local_cluster_state_authority_member(
+    let replica_member = sinomo_core::cluster::local_cluster_state_authority_member(
         cluster_id.clone(),
         replica.clone(),
         "replica",
         "pk-replica",
         now,
     );
-    replica_member
-        .endpoints
-        .push(test_endpoint(&replica, "10.77.0.2:21353"));
     state.members.push(replica_member);
     sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
     sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
@@ -7370,21 +7154,22 @@ fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
 
     let sent = Arc::new(Mutex::new(Vec::new()));
     let sent_for_sender = Arc::clone(&sent);
-    let sender: DfsMetadataJournalBatchSender = Arc::new(move |endpoint, command, _timeout| {
-        sent_for_sender
-            .lock()
-            .expect("sent lock")
-            .push((endpoint.to_string(), command.batch.entries.len()));
-        Ok(DfsMetadataJournalBatchResponse {
-            request_id: command.request_id.clone(),
-            shard_id: command.batch.shard_id.clone(),
-            next_after_sequence: command.batch.next_after_sequence,
-            applied_entries: command.batch.entries.len(),
-            result: DfsMetadataJournalBatchResult::Applied,
-        })
-    });
+    let sender: DfsMetadataJournalBatchSender =
+        Arc::new(move |target_node_id, command, _timeout| {
+            sent_for_sender
+                .lock()
+                .expect("sent lock")
+                .push((target_node_id.to_string(), command.batch.entries.len()));
+            Ok(DfsMetadataJournalBatchResponse {
+                request_id: command.request_id.clone(),
+                shard_id: command.batch.shard_id.clone(),
+                next_after_sequence: command.batch.next_after_sequence,
+                applied_entries: command.batch.entries.len(),
+                result: DfsMetadataJournalBatchResult::Applied,
+            })
+        });
     let snapshot_sender: DfsMetadataSnapshotInstallSender =
-        Arc::new(move |_endpoint, _command, _timeout| {
+        Arc::new(move |_target_node_id, _command, _timeout| {
             Err(DfsMetadataPeerTransportError::new(
                 "snapshot install should not be needed",
             ))
@@ -7436,16 +7221,13 @@ fn scheduled_cluster_metadata_publish_uses_async_peer_transport() {
         "pk-local",
         now,
     );
-    let mut replica_member = sinomo_core::cluster::local_cluster_state_authority_member(
+    let replica_member = sinomo_core::cluster::local_cluster_state_authority_member(
         cluster_id.clone(),
         replica.clone(),
         "replica",
         "pk-replica",
         now,
     );
-    replica_member
-        .endpoints
-        .push(test_endpoint(&replica, "10.77.0.3:21353"));
     state.members.push(replica_member);
     sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
     sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
@@ -7589,16 +7371,13 @@ fn async_cluster_metadata_publish_repairs_sequence_conflict_with_snapshot() {
             "pk-local",
             now,
         );
-        let mut replica_member = sinomo_core::cluster::local_cluster_state_authority_member(
+        let replica_member = sinomo_core::cluster::local_cluster_state_authority_member(
             cluster_id.clone(),
             replica.clone(),
             "replica",
             "pk-replica",
             now,
         );
-        replica_member
-            .endpoints
-            .push(test_endpoint(&replica, "10.77.0.4:21353"));
         state.members.push(replica_member);
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
         sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
@@ -7639,7 +7418,7 @@ fn async_cluster_metadata_publish_repairs_sequence_conflict_with_snapshot() {
         let journal_attempts = Arc::new(Mutex::new(0usize));
         let journal_attempts_for_sender = Arc::clone(&journal_attempts);
         let sender: AsyncDfsMetadataJournalBatchSender =
-            Arc::new(move |_endpoint, command, _timeout| {
+            Arc::new(move |_target_node_id, command, _timeout| {
                 let journal_attempts = Arc::clone(&journal_attempts_for_sender);
                 Box::pin(async move {
                     *journal_attempts.lock().expect("journal attempts") += 1;
@@ -7659,13 +7438,13 @@ fn async_cluster_metadata_publish_repairs_sequence_conflict_with_snapshot() {
         let snapshot_installs = Arc::new(Mutex::new(Vec::new()));
         let snapshot_installs_for_sender = Arc::clone(&snapshot_installs);
         let snapshot_sender: AsyncDfsMetadataSnapshotInstallSender =
-            Arc::new(move |endpoint, command, _timeout| {
+            Arc::new(move |target_node_id, command, _timeout| {
                 let snapshot_installs = Arc::clone(&snapshot_installs_for_sender);
                 Box::pin(async move {
                     snapshot_installs
                         .lock()
                         .expect("snapshot installs")
-                        .push((endpoint.to_string(), command.next_after_sequence));
+                        .push((target_node_id.to_string(), command.next_after_sequence));
                     Ok(DfsMetadataSnapshotInstallResponse {
                         request_id: command.request_id.clone(),
                         shard_id: command.shard_id.clone(),
@@ -7721,28 +7500,20 @@ fn async_cluster_metadata_publish_repairs_sequence_conflict_with_snapshot() {
 }
 
 #[test]
-fn metadata_endpoint_transport_sends_one_target_attempt() {
-    let target = NodeId::from_legacy_named("node_meta_endpoint_fallback_target").expect("target");
-    let mut endpoints = vec![
-        test_endpoint(&target, "10.70.0.1:21353"),
-        test_endpoint(&target, "10.70.0.2:21353"),
-        test_endpoint(&target, "10.70.0.3:21353"),
-        test_endpoint(&target, "10.70.0.4:21353"),
-    ];
-    for (index, endpoint) in endpoints.iter_mut().enumerate() {
-        endpoint.priority = index as u16;
-    }
+fn metadata_node_transport_sends_one_target_attempt() {
+    let target = NodeId::from_legacy_named("node_meta_node_route_fallback_target").expect("target");
     let attempted = Arc::new(Mutex::new(Vec::new()));
     let attempted_for_sender = Arc::clone(&attempted);
-    let sender: DfsMetadataJournalBatchSender = Arc::new(move |endpoint, _command, _timeout| {
-        attempted_for_sender
-            .lock()
-            .expect("attempted lock")
-            .push(endpoint.to_string());
-        Err(DfsMetadataPeerTransportError::new("simulated failure"))
-    });
+    let sender: DfsMetadataJournalBatchSender =
+        Arc::new(move |target_node_id, _command, _timeout| {
+            attempted_for_sender
+                .lock()
+                .expect("attempted lock")
+                .push(target_node_id.to_string());
+            Err(DfsMetadataPeerTransportError::new("simulated failure"))
+        });
     let snapshot_sender: DfsMetadataSnapshotInstallSender =
-        Arc::new(move |_endpoint, command, _timeout| {
+        Arc::new(move |_target_node_id, command, _timeout| {
             Ok(DfsMetadataSnapshotInstallResponse {
                 request_id: command.request_id.clone(),
                 shard_id: command.shard_id.clone(),
@@ -7752,9 +7523,10 @@ fn metadata_endpoint_transport_sends_one_target_attempt() {
                 },
             })
         });
-    let mut transport = DfsMetadataEndpointTransport::new(endpoints, sender, snapshot_sender);
+    let mut transport =
+        DfsMetadataNodeTransport::new(vec![target.clone()], sender, snapshot_sender);
     let command = DfsMetadataJournalBatchCommand {
-        request_id: "meta-endpoint-fallback".to_string(),
+        request_id: "meta-node_route-fallback".to_string(),
         source_node_id: None,
         batch: DfsMetadataJournalBatch {
             shard_id: DfsMetadataShardId::new("root"),
@@ -7777,31 +7549,28 @@ fn metadata_endpoint_transport_sends_one_target_attempt() {
 }
 
 #[test]
-fn metadata_endpoint_transport_rejects_mismatched_journal_response() {
-    let target = NodeId::from_legacy_named("node_meta_endpoint_mismatch_target").expect("target");
-    let endpoints = vec![
-        test_endpoint(&target, "10.71.0.1:21353"),
-        test_endpoint(&target, "10.71.0.2:21353"),
-    ];
+fn metadata_node_transport_rejects_mismatched_journal_response() {
+    let target = NodeId::from_legacy_named("node_meta_node_route_mismatch_target").expect("target");
     let attempts = Arc::new(Mutex::new(0usize));
     let attempts_for_sender = Arc::clone(&attempts);
-    let sender: DfsMetadataJournalBatchSender = Arc::new(move |_endpoint, command, _timeout| {
-        let mut attempts = attempts_for_sender.lock().expect("attempts lock");
-        *attempts += 1;
-        Ok(DfsMetadataJournalBatchResponse {
-            request_id: command.request_id.clone(),
-            shard_id: command.batch.shard_id.clone(),
-            next_after_sequence: if *attempts == 1 {
-                command.batch.next_after_sequence + 1
-            } else {
-                command.batch.next_after_sequence
-            },
-            applied_entries: command.batch.entries.len(),
-            result: DfsMetadataJournalBatchResult::Applied,
-        })
-    });
+    let sender: DfsMetadataJournalBatchSender =
+        Arc::new(move |_target_node_id, command, _timeout| {
+            let mut attempts = attempts_for_sender.lock().expect("attempts lock");
+            *attempts += 1;
+            Ok(DfsMetadataJournalBatchResponse {
+                request_id: command.request_id.clone(),
+                shard_id: command.batch.shard_id.clone(),
+                next_after_sequence: if *attempts == 1 {
+                    command.batch.next_after_sequence + 1
+                } else {
+                    command.batch.next_after_sequence
+                },
+                applied_entries: command.batch.entries.len(),
+                result: DfsMetadataJournalBatchResult::Applied,
+            })
+        });
     let snapshot_sender: DfsMetadataSnapshotInstallSender =
-        Arc::new(move |_endpoint, command, _timeout| {
+        Arc::new(move |_target_node_id, command, _timeout| {
             Ok(DfsMetadataSnapshotInstallResponse {
                 request_id: command.request_id.clone(),
                 shard_id: command.shard_id.clone(),
@@ -7811,9 +7580,10 @@ fn metadata_endpoint_transport_rejects_mismatched_journal_response() {
                 },
             })
         });
-    let mut transport = DfsMetadataEndpointTransport::new(endpoints, sender, snapshot_sender);
+    let mut transport =
+        DfsMetadataNodeTransport::new(vec![target.clone()], sender, snapshot_sender);
     let command = DfsMetadataJournalBatchCommand {
-        request_id: "meta-endpoint-mismatch".to_string(),
+        request_id: "meta-node_route-mismatch".to_string(),
         source_node_id: None,
         batch: DfsMetadataJournalBatch {
             shard_id: DfsMetadataShardId::new("root"),
@@ -7832,18 +7602,14 @@ fn metadata_endpoint_transport_rejects_mismatched_journal_response() {
 }
 
 #[test]
-fn async_metadata_endpoint_transport_rejects_mismatched_journal_response() {
+fn async_metadata_node_transport_rejects_mismatched_journal_response() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
     runtime.block_on(async {
-        let target =
-            NodeId::from_legacy_named("node_async_meta_endpoint_mismatch_target").expect("target");
-        let endpoints = vec![
-            test_endpoint(&target, "10.72.0.1:21353"),
-            test_endpoint(&target, "10.72.0.2:21353"),
-        ];
+        let target = NodeId::from_legacy_named("node_async_meta_node_route_mismatch_target")
+            .expect("target");
         let attempts = Arc::new(Mutex::new(0usize));
         let attempts_for_sender = Arc::clone(&attempts);
         let sender: AsyncDfsMetadataJournalBatchSender =
@@ -7875,9 +7641,9 @@ fn async_metadata_endpoint_transport_rejects_mismatched_journal_response() {
                 })
             });
         let mut transport =
-            AsyncDfsMetadataEndpointTransport::new(endpoints, sender, snapshot_sender);
+            AsyncDfsMetadataNodeTransport::new(vec![target.clone()], sender, snapshot_sender);
         let command = DfsMetadataJournalBatchCommand {
-            request_id: "async-meta-endpoint-mismatch".to_string(),
+            request_id: "async-meta-node_route-mismatch".to_string(),
             source_node_id: None,
             batch: DfsMetadataJournalBatch {
                 shard_id: DfsMetadataShardId::new("root"),
@@ -9413,16 +9179,18 @@ fn posix_non_foreground_write_reports_only_durable_locations() {
 }
 
 #[test]
-fn stateless_endpoint_reader_write_commits_after_primary_fetch_receipt() {
-    let root = temp_root("stateless-endpoint-reader-write-primary-fetch");
-    let writer = NodeId::from_legacy_named("node_stateless_endpoint_writer").expect("writer node");
+fn stateless_node_route_reader_write_commits_after_primary_fetch_receipt() {
+    let root = temp_root("stateless-node_route-reader-write-primary-fetch");
+    let writer =
+        NodeId::from_legacy_named("node_stateless_node_route_writer").expect("writer node");
     let primary =
-        NodeId::from_legacy_named("node_stateless_endpoint_primary").expect("primary node");
-    let object_id = DfsObjectId::from_legacy_named("obj_stateless_endpoint_fetch").expect("object");
+        NodeId::from_legacy_named("node_stateless_node_route_primary").expect("primary node");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_stateless_node_route_fetch").expect("object");
     let version_1 =
-        DfsVersion::from_legacy_named("version_stateless_endpoint_fetch_1").expect("version");
+        DfsVersion::from_legacy_named("version_stateless_node_route_fetch_1").expect("version");
     let version_2 =
-        DfsVersion::from_legacy_named("version_stateless_endpoint_fetch_2").expect("version");
+        DfsVersion::from_legacy_named("version_stateless_node_route_fetch_2").expect("version");
     let file_system = file_system(primary.clone());
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
@@ -9467,7 +9235,7 @@ fn stateless_endpoint_reader_write_commits_after_primary_fetch_receipt() {
     let primary_metadata_for_sender = primary_metadata_root.clone();
     let control_plane_for_sender = control_plane.clone();
     let trace_for_sender = Arc::clone(&trace);
-    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
         trace_for_sender
             .lock()
             .expect("trace")
@@ -9500,9 +9268,9 @@ fn stateless_endpoint_reader_write_commits_after_primary_fetch_receipt() {
         }
         Ok(result.response)
     });
-    let transport = DfsEndpointTransport::with_connect_timeout(
+    let transport = DfsNodeTransport::with_connect_timeout(
         writer.clone(),
-        vec![test_endpoint(&primary, "192.0.2.44:21353")],
+        vec![primary.clone()],
         Duration::from_millis(1),
         sender,
     );
@@ -9605,7 +9373,7 @@ fn posix_routed_strict_write_prefers_metadata_primary_replica() {
 
     let captured_desired = Arc::new(Mutex::new(None::<Vec<NodeId>>));
     let captured_desired_for_sender = Arc::clone(&captured_desired);
-    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
         if let DfsNetworkMessage::DistributedWriteRequest(command) = &command.routed_message.message
         {
             *captured_desired_for_sender.lock().expect("capture") =
@@ -9616,9 +9384,9 @@ fn posix_routed_strict_write_prefers_metadata_primary_replica() {
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsEndpointTransport::with_connect_timeout(
+    let transport = DfsNodeTransport::with_connect_timeout(
         writer.clone(),
-        vec![test_endpoint(&primary, "192.0.2.64:21353")],
+        vec![primary.clone()],
         Duration::from_millis(1),
         sender,
     );
@@ -9684,7 +9452,7 @@ fn posix_routed_small_write_sends_inline_bytes_request() {
 
     let captured_command = Arc::new(Mutex::new(None::<DfsDistributedWriteCommand>));
     let captured_command_for_sender = Arc::clone(&captured_command);
-    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
         if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
             &command.routed_message.message
         {
@@ -9695,9 +9463,9 @@ fn posix_routed_small_write_sends_inline_bytes_request() {
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsEndpointTransport::with_connect_timeout(
+    let transport = DfsNodeTransport::with_connect_timeout(
         writer.clone(),
-        vec![test_endpoint(&primary, "192.0.2.68:21353")],
+        vec![primary.clone()],
         Duration::from_millis(1),
         sender,
     );
@@ -9775,7 +9543,7 @@ fn posix_routed_large_write_sends_manifest_only_request() {
 
     let captured_command = Arc::new(Mutex::new(None::<DfsDistributedWriteCommand>));
     let captured_command_for_sender = Arc::clone(&captured_command);
-    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
         if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
             &command.routed_message.message
         {
@@ -9786,9 +9554,9 @@ fn posix_routed_large_write_sends_manifest_only_request() {
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsEndpointTransport::with_connect_timeout(
+    let transport = DfsNodeTransport::with_connect_timeout(
         writer.clone(),
-        vec![test_endpoint(&primary, "192.0.2.65:21353")],
+        vec![primary.clone()],
         Duration::from_millis(1),
         sender,
     );
@@ -9873,16 +9641,16 @@ fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without
 
     let send_count = Arc::new(AtomicUsize::new(0));
     let send_count_for_sender = Arc::clone(&send_count);
-    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
         send_count_for_sender.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(DfsMessageResponse {
             request_id: command.request_id.clone(),
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsEndpointTransport::with_connect_timeout(
+    let transport = DfsNodeTransport::with_connect_timeout(
         local.clone(),
-        vec![test_endpoint(&local, "127.0.0.1:21353")],
+        vec![local.clone()],
         Duration::from_millis(1),
         sender,
     );
@@ -9921,15 +9689,15 @@ fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without
     assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
     assert_eq!(dfs.posix_read_file(path).expect("read local"), bytes);
 
-    let reload_sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+    let reload_sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
         Ok(DfsMessageResponse {
             request_id: command.request_id.clone(),
             outbound_messages: Vec::new(),
         })
     });
-    let reload_transport = DfsEndpointTransport::with_connect_timeout(
+    let reload_transport = DfsNodeTransport::with_connect_timeout(
         local.clone(),
-        vec![test_endpoint(&local, "127.0.0.1:21353")],
+        vec![local.clone()],
         Duration::from_millis(1),
         reload_sender,
     );
@@ -9985,7 +9753,7 @@ fn routed_manifest_write_controls_response_journal_replay() {
 
     let captured_commands = Arc::new(Mutex::new(Vec::<DfsDistributedWriteCommand>::new()));
     let captured_commands_for_sender = Arc::clone(&captured_commands);
-    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
         if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
             &command.routed_message.message
         {
@@ -9999,9 +9767,9 @@ fn routed_manifest_write_controls_response_journal_replay() {
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsEndpointTransport::with_connect_timeout(
+    let transport = DfsNodeTransport::with_connect_timeout(
         writer.clone(),
-        vec![test_endpoint(&primary, "192.0.2.66:21353")],
+        vec![primary.clone()],
         Duration::from_millis(1),
         sender,
     );
@@ -10135,7 +9903,7 @@ fn routed_inline_write_preserves_nonforeground_repair_mode() {
 
     let captured_commands = Arc::new(Mutex::new(Vec::<DfsDistributedWriteCommand>::new()));
     let captured_commands_for_sender = Arc::clone(&captured_commands);
-    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
         if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
             &command.routed_message.message
         {
@@ -10149,9 +9917,9 @@ fn routed_inline_write_preserves_nonforeground_repair_mode() {
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsEndpointTransport::with_connect_timeout(
+    let transport = DfsNodeTransport::with_connect_timeout(
         writer.clone(),
-        vec![test_endpoint(&primary, "192.0.2.67:21353")],
+        vec![primary.clone()],
         Duration::from_millis(1),
         sender,
     );
@@ -10205,17 +9973,19 @@ fn routed_inline_write_preserves_nonforeground_repair_mode() {
 }
 
 #[test]
-fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
-    let root = temp_root("served-endpoint-reader-write-fetch-stage");
-    let writer = NodeId::from_legacy_named("node_served_endpoint_writer").expect("writer node");
-    let primary = NodeId::from_legacy_named("node_served_endpoint_primary").expect("primary node");
-    let replica = NodeId::from_legacy_named("node_served_endpoint_replica").expect("replica node");
+fn served_node_route_reader_write_fetches_and_stages_before_completion() {
+    let root = temp_root("served-node_route-reader-write-fetch-stage");
+    let writer = NodeId::from_legacy_named("node_served_node_route_writer").expect("writer node");
+    let primary =
+        NodeId::from_legacy_named("node_served_node_route_primary").expect("primary node");
+    let replica =
+        NodeId::from_legacy_named("node_served_node_route_replica").expect("replica node");
     let object_id =
-        DfsObjectId::from_legacy_named("obj_served_endpoint_fetch_stage").expect("object");
+        DfsObjectId::from_legacy_named("obj_served_node_route_fetch_stage").expect("object");
     let version_1 =
-        DfsVersion::from_legacy_named("version_served_endpoint_fetch_stage_1").expect("version");
+        DfsVersion::from_legacy_named("version_served_node_route_fetch_stage_1").expect("version");
     let version_2 =
-        DfsVersion::from_legacy_named("version_served_endpoint_fetch_stage_2").expect("version");
+        DfsVersion::from_legacy_named("version_served_node_route_fetch_stage_2").expect("version");
     let file_system = file_system(primary.clone());
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
@@ -10252,11 +10022,11 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
     let staged_chunks_for_replica_sender = Arc::clone(&staged_chunks);
     let payload_for_sender = Arc::clone(&payload);
     let payload_hash_for_sender = payload_hash.clone();
-    let replica_sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
+    let replica_sender: DfsMessageSender = Arc::new(move |target_node_id, command, _timeout| {
         let message = command.routed_message.message.clone();
         let response = match message {
             DfsNetworkMessage::FetchBlob(fetch) => {
-                assert_eq!(endpoint, &writer_for_sender);
+                assert_eq!(target_node_id, &writer_for_sender);
                 assert_eq!(fetch.content_hash, payload_hash_for_sender);
                 let total_chunks = blob_chunk_count(&payload_for_sender).expect("chunk count");
                 let start_chunk_index = fetch.start_chunk_index as usize;
@@ -10298,7 +10068,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
                 });
             }
             DfsNetworkMessage::StageBlob(stage) => {
-                assert_eq!(endpoint, &replica_for_sender);
+                assert_eq!(target_node_id, &replica_for_sender);
                 trace_for_replica_sender
                     .lock()
                     .expect("trace")
@@ -10316,7 +10086,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
                 }))
             }
             DfsNetworkMessage::StageBlobChunk(chunk) => {
-                assert_eq!(endpoint, &replica_for_sender);
+                assert_eq!(target_node_id, &replica_for_sender);
                 trace_for_replica_sender
                     .lock()
                     .expect("trace")
@@ -10362,7 +10132,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
                 }
             }
             DfsNetworkMessage::RepairReplica(repair) => {
-                assert_eq!(endpoint, &replica_for_sender);
+                assert_eq!(target_node_id, &replica_for_sender);
                 trace_for_replica_sender
                     .lock()
                     .expect("trace")
@@ -10384,7 +10154,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
                 ))
             }
             DfsNetworkMessage::RepairReplicaChunk(chunk) => {
-                assert_eq!(endpoint, &replica_for_sender);
+                assert_eq!(target_node_id, &replica_for_sender);
                 trace_for_replica_sender
                     .lock()
                     .expect("trace")
@@ -10450,12 +10220,9 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
             }],
         })
     });
-    let primary_transport = DfsEndpointServedMessageTransport::new_with_message_sender(
+    let primary_transport = DfsNodeServedMessageTransport::new_with_message_sender(
         primary.clone(),
-        vec![
-            test_endpoint(&writer, "192.0.2.44:21353"),
-            test_endpoint(&replica, "192.0.2.45:21353"),
-        ],
+        vec![writer.clone(), replica.clone()],
         replica_sender,
         Duration::from_millis(1),
     );
@@ -10485,42 +10252,43 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
     let primary_service = Arc::new(Mutex::new(primary_service));
     let primary_service_for_sender = Arc::clone(&primary_service);
     let trace_for_primary_sender = Arc::clone(&trace);
-    let primary_message_sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
-        trace_for_primary_sender
-            .lock()
-            .expect("trace")
-            .push(format!(
-                "primary-in:{}",
-                dfs_message_trace_label(&command.routed_message.message)
-            ));
-        let result = primary_service_for_sender
-            .lock()
-            .expect("primary service")
-            .process_message_command(command.clone())
-            .expect("process primary message");
-        for event in &result.events {
+    let primary_message_sender: DfsMessageSender =
+        Arc::new(move |_target_node_id, command, _timeout| {
             trace_for_primary_sender
                 .lock()
                 .expect("trace")
                 .push(format!(
-                    "primary-event:{}",
-                    networked_dfs_event_trace_label(event)
+                    "primary-in:{}",
+                    dfs_message_trace_label(&command.routed_message.message)
                 ));
-        }
-        for routed in &result.response.outbound_messages {
-            trace_for_primary_sender
+            let result = primary_service_for_sender
                 .lock()
-                .expect("trace")
-                .push(format!(
-                    "primary-out:{}",
-                    dfs_message_trace_label(&routed.message)
-                ));
-        }
-        Ok(result.response)
-    });
-    let transport = DfsEndpointTransport::with_connect_timeout(
+                .expect("primary service")
+                .process_message_command(command.clone())
+                .expect("process primary message");
+            for event in &result.events {
+                trace_for_primary_sender
+                    .lock()
+                    .expect("trace")
+                    .push(format!(
+                        "primary-event:{}",
+                        networked_dfs_event_trace_label(event)
+                    ));
+            }
+            for routed in &result.response.outbound_messages {
+                trace_for_primary_sender
+                    .lock()
+                    .expect("trace")
+                    .push(format!(
+                        "primary-out:{}",
+                        dfs_message_trace_label(&routed.message)
+                    ));
+            }
+            Ok(result.response)
+        });
+    let transport = DfsNodeTransport::with_connect_timeout(
         writer.clone(),
-        vec![test_endpoint(&primary, "192.0.2.44:21353")],
+        vec![primary.clone()],
         Duration::from_millis(1),
         primary_message_sender,
     );
@@ -14477,7 +14245,7 @@ fn uncached_remote_read_direct_transport_completes_without_protocol_frame() {
         .expect("owner content blob");
     let direct_calls = Arc::new(Mutex::new(Vec::new()));
     let message_send_calls = Arc::new(Mutex::new(0));
-    let transport = endpoint_transport_with_direct_read_sender(
+    let transport = node_transport_with_direct_read_sender(
         reader.clone(),
         owner.clone(),
         bytes.clone(),
@@ -14551,7 +14319,7 @@ fn failed_uncached_remote_direct_read_cleans_pending_state() {
     let version = DfsVersion::from_legacy_named("version_uncached_error").expect("version");
     let direct_calls = Arc::new(Mutex::new(Vec::new()));
     let message_send_calls = Arc::new(Mutex::new(0));
-    let transport = endpoint_transport_with_direct_read_sender(
+    let transport = node_transport_with_direct_read_sender(
         reader.clone(),
         owner.clone(),
         Vec::new(),
@@ -17311,7 +17079,7 @@ fn repair_retry_schedule_preserves_network_error_diagnostics() {
     dfs.record_repair_retry_scheduled_with_error(
         intent_id,
         &replica,
-        Some("route to target node failed: no usable endpoint".to_string()),
+        Some("route to target node failed: no usable route".to_string()),
     );
 
     let records = dfs.active_repair_attempt_records();
@@ -17326,7 +17094,7 @@ fn repair_retry_schedule_preserves_network_error_diagnostics() {
         records[0]
             .last_error
             .as_deref()
-            .is_some_and(|error| error.contains("no usable endpoint"))
+            .is_some_and(|error| error.contains("no usable route"))
     );
 
     std::fs::remove_dir_all(root).ok();

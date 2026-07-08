@@ -40,7 +40,7 @@ use sinomo_kv::{
 use sinomo_kv::{KvCommand, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
-use sinomo_network::ClusterSignedEndpointRpcAsyncHost;
+use sinomo_network::ClusterSignedObjectRpcAsyncHost;
 use sinomo_network::NetworkError;
 use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse};
 use std::time::Duration;
@@ -60,16 +60,6 @@ pub trait ClusterKvTxnQuorumHost {
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError>;
 
-    fn call_endpoint_object_rpc(
-        &mut self,
-        state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
-        request: &ObjectRpcRequest,
-        timeout: Duration,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        self.call_node_object_rpc(state, &endpoint.node_id, request, timeout)
-    }
-
     fn call_node_object_rpc(
         &mut self,
         state: &ClusterBootstrapState,
@@ -86,7 +76,8 @@ pub trait ClusterKvTxnQuorumHost {
 
     fn request_kv_state_authority_vote(
         &mut self,
-        endpoint: &ClusterEndpointRecord,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
         request: &ClusterKvStateAuthorityVoteRequest,
         timeout: Duration,
     ) -> Result<ClusterKvStateAuthorityVoteResponse, NetworkError>;
@@ -167,23 +158,31 @@ where
 {
     fn send_raft_vote(
         &mut self,
-        endpoint: &ClusterEndpointRecord,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
         request: &sinomo_kv::ClusterRaftVoteRequest,
         timeout: Duration,
     ) -> Result<sinomo_kv::ClusterRaftVoteResponse, NetworkError> {
-        ClusterKvTxnQuorumHost::request_kv_state_authority_vote(self, endpoint, request, timeout)
+        ClusterKvTxnQuorumHost::request_kv_state_authority_vote(
+            self,
+            state,
+            target_node_id,
+            request,
+            timeout,
+        )
     }
 }
 
 pub trait ClusterKvTxnQuorumAsyncHost:
-    ClusterSignedEndpointRpcAsyncHost
+    ClusterSignedObjectRpcAsyncHost
     + ClusterKvQuorumAsyncHost
     + ClusterStateAuthorityReachabilityAsyncHost
     + Send
 {
     fn request_kv_state_authority_vote_async<'a>(
         &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
+        state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
         request: &'a ClusterKvStateAuthorityVoteRequest,
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ClusterKvStateAuthorityVoteResponse>;
@@ -195,12 +194,17 @@ where
 {
     fn send_raft_vote_async<'a>(
         &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
+        state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
         request: &'a sinomo_kv::ClusterRaftVoteRequest,
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::ClusterRaftVoteResponse> {
         ClusterKvTxnQuorumAsyncHost::request_kv_state_authority_vote_async(
-            self, endpoint, request, timeout,
+            self,
+            state,
+            target_node_id,
+            request,
+            timeout,
         )
     }
 }
@@ -242,25 +246,19 @@ where
             .call_node_object_rpc(state, target_node_id, request, timeout)
     }
 
-    fn call_endpoint_object_rpc(
-        &mut self,
-        _state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
-        request: &ObjectRpcRequest,
-        timeout: Duration,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        self.transport
-            .call_endpoint_object_rpc(endpoint, request, timeout)
-    }
-
     fn request_kv_state_authority_vote(
         &mut self,
-        endpoint: &ClusterEndpointRecord,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
         request: &ClusterKvStateAuthorityVoteRequest,
         timeout: Duration,
     ) -> Result<ClusterKvStateAuthorityVoteResponse, NetworkError> {
-        self.transport
-            .request_kv_state_authority_vote(endpoint, request, timeout)
+        self.transport.request_kv_state_authority_vote_from_node(
+            state,
+            target_node_id,
+            request,
+            timeout,
+        )
     }
 
     fn local_is_kv_state_authority(

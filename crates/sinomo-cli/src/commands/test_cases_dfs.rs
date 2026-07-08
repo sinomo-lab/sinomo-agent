@@ -129,7 +129,7 @@ sinomo_runtime::test::sinomo_test_case! {
 sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_service_advertisements(ctx) {
         id: "cluster.dfs.service-advertisements",
-        summary: "Verify DFS service advertisements use network-routed node endpoints",
+        summary: "Verify DFS service advertisements use network-routed node targets",
         tags: ["cluster-dfs", "probe", "routing", "cluster-network-dfs-acceptance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
@@ -593,26 +593,25 @@ fn run_service_advertisements(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .iter()
         .chain(content.iter())
         .filter_map(|advertisement| {
-            (!dfs_service_advertisement_endpoint_is_logical(&advertisement.endpoint)).then(|| {
-                format!(
-                    "{} endpoint={}",
-                    advertisement.node_id, advertisement.endpoint
-                )
-            })
+            advertisement
+                .node_id
+                .as_str()
+                .is_empty()
+                .then(|| format!("{} has empty node id", advertisement.node_id))
         })
         .collect::<Vec<_>>();
 
     ctx.record("metadata_count", metadata.len());
     ctx.record("content_count", content.len());
     ctx.record(
-        "metadata_endpoints",
+        "metadata_nodes",
         metadata
             .iter()
             .map(dfs_service_advertisement_summary)
             .collect::<Vec<_>>(),
     );
     ctx.record(
-        "content_endpoints",
+        "content_nodes",
         content
             .iter()
             .map(dfs_service_advertisement_summary)
@@ -620,9 +619,9 @@ fn run_service_advertisements(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     );
 
     if !bad.is_empty() {
-        ctx.record("bad_endpoints", &bad);
+        ctx.record("bad_advertisements", &bad);
         return Ok(SinomoTestOutcome::failed(format!(
-            "DFS service advertisements contain {} concrete or local endpoint(s)",
+            "DFS service advertisements contain {} invalid node advertisement(s)",
             bad.len()
         )));
     }
@@ -635,7 +634,7 @@ fn run_service_advertisements(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     }
 
     Ok(SinomoTestOutcome::passed(format!(
-        "DFS service advertisements are logical for {} metadata and {} content node(s)",
+        "DFS service advertisements are node-routed for {} metadata and {} content node(s)",
         metadata.len(),
         content.len()
     )))
@@ -657,16 +656,8 @@ fn read_dfs_service_advertisements(
             )
         })?);
     }
-    advertisements.sort_by(|left, right| {
-        left.node_id
-            .cmp(&right.node_id)
-            .then_with(|| left.endpoint.cmp(&right.endpoint))
-    });
+    advertisements.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     Ok(advertisements)
-}
-
-fn dfs_service_advertisement_endpoint_is_logical(endpoint: &str) -> bool {
-    endpoint.starts_with("cluster-node://")
 }
 
 fn dfs_service_advertisement_summary(
@@ -674,7 +665,11 @@ fn dfs_service_advertisement_summary(
 ) -> BTreeMap<&'static str, String> {
     BTreeMap::from([
         ("node_id", advertisement.node_id.to_string()),
-        ("endpoint", advertisement.endpoint.clone()),
+        (
+            "accepts_metadata",
+            advertisement.accepts_metadata.to_string(),
+        ),
+        ("accepts_content", advertisement.accepts_content.to_string()),
     ])
 }
 

@@ -2,26 +2,23 @@ use serde::{Deserialize, Serialize};
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::{
-    ClusterConnectivityGraph, ClusterPaths, cluster_healthy_route_next_hop,
-};
+use sinomo_core::network::ClusterPaths;
 use sinomo_core::node::NodeId;
-use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord};
 use std::collections::BTreeSet;
 use time::OffsetDateTime;
 
 use crate::DfsMessageTransport;
 use crate::{
     DfsControlPlaneKvClient, DfsError, DfsFileSystemId, DfsMessageSender,
-    DfsMetadataEndpointTransport, DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
+    DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
-    DfsMetadataJournalReplicationTransport, DfsMetadataShardAssignment, DfsMetadataShardConfig,
-    DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement, DfsObjectId, DfsPosixError, DfsVersion,
-    DfsWriteOptions, LocalDfsMetadataJournalPublisherHost, NetworkedDfsService,
-    NetworkedDfsServiceEvent, SIFS_SERVICES_PATH, SIFS_USERS_PATH, cluster_dfs_data_endpoints,
-    cluster_dfs_metadata_shards, content_services_prefix, distributed_sifs,
-    inspect_cluster_aware_dfs_status, open_cluster_dfs_service_with_message_sender_lazy,
-    publish_dfs_metadata_journal_with_host,
+    DfsMetadataJournalReplicationTransport, DfsMetadataNodeTransport, DfsMetadataShardAssignment,
+    DfsMetadataShardConfig, DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement, DfsObjectId,
+    DfsPosixError, DfsVersion, DfsWriteOptions, LocalDfsMetadataJournalPublisherHost,
+    NetworkedDfsService, NetworkedDfsServiceEvent, SIFS_SERVICES_PATH, SIFS_USERS_PATH,
+    cluster_dfs_metadata_shards, cluster_dfs_peer_node_ids, content_services_prefix,
+    distributed_sifs, inspect_cluster_aware_dfs_status,
+    open_cluster_dfs_service_with_message_sender_lazy, publish_dfs_metadata_journal_with_host,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -156,20 +153,20 @@ pub(crate) fn run_cluster_dfs_smoke_with_message_sender(
 
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
-    let endpoints = cluster_dfs_data_endpoints(cluster_paths, &state);
-    let routable_node_ids = dfs_smoke_routable_node_ids(cluster_paths, &state, &endpoints);
+    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+    let routable_node_ids = dfs_smoke_routable_node_ids(&state.local_node_id, &peer_node_ids);
     let mut service = open_cluster_dfs_service_with_message_sender_lazy(
         data_dir,
         cluster_paths,
         local_node_id.clone(),
-        endpoints.clone(),
+        peer_node_ids.clone(),
         message_sender,
         control_plane,
     )?;
     let mut smoke_host = LocalDfsSmokeHost::new(data_dir.clone(), cluster_paths.clone());
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let mut metadata_transport =
-        DfsMetadataEndpointTransport::new(endpoints, metadata_sender, snapshot_sender);
+        DfsMetadataNodeTransport::new(peer_node_ids, metadata_sender, snapshot_sender);
     run_dfs_smoke_with_host(
         &mut service,
         &local_node_id,
@@ -416,32 +413,17 @@ pub(crate) fn dfs_smoke_replica_candidate_sets(
     }
 }
 
-fn dfs_smoke_routable_node_ids(
-    cluster_paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    endpoints: &[ClusterEndpointRecord],
-) -> Vec<NodeId> {
-    let Ok(graph) = ClusterConnectivityGraph::try_read_for_local(cluster_paths, state) else {
-        return Vec::new();
-    };
-    dfs_smoke_routable_node_ids_with_graph(&state.local_node_id, endpoints, &graph)
-}
-
-pub(crate) fn dfs_smoke_routable_node_ids_with_graph(
+pub(crate) fn dfs_smoke_routable_node_ids(
     local_node_id: &NodeId,
-    endpoints: &[ClusterEndpointRecord],
-    graph: &ClusterConnectivityGraph,
+    peer_node_ids: &[NodeId],
 ) -> Vec<NodeId> {
     let mut seen_remote_candidates = BTreeSet::new();
     let mut node_ids = Vec::new();
-    for endpoint in endpoints {
-        if endpoint.node_id == *local_node_id
-            || !seen_remote_candidates.insert(endpoint.node_id.clone())
-            || cluster_healthy_route_next_hop(graph, local_node_id, &endpoint.node_id).is_none()
-        {
+    for node_id in peer_node_ids {
+        if node_id == local_node_id || !seen_remote_candidates.insert(node_id.clone()) {
             continue;
         }
-        node_ids.push(endpoint.node_id.clone());
+        node_ids.push(node_id.clone());
     }
     node_ids
 }

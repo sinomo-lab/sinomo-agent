@@ -4,7 +4,10 @@
 //! The Docker cluster gate uses them before DFS scenarios so routing, relay,
 //! authentication, and concurrent request handling must be healthy first.
 
-use sinomo_runtime::api::DaemonApiClient;
+use sinomo_runtime::api::{
+    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DaemonApiClient,
+    DaemonObjectRpcForwardRequest, send_daemon_rpc_async,
+};
 use sinomo_runtime::cluster;
 use sinomo_runtime::core::{
     ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
@@ -437,6 +440,8 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ))
         })?
         .with_timeout(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1)));
+    let daemon_address = daemon_client.address().to_string();
+    let control_timeout = Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1));
     let build_jobs =
         |phase: &str, requests_per_target: usize| -> Result<Vec<NetworkPingJob>, SinomoTestError> {
             let mut jobs = Vec::with_capacity(target_count.saturating_mul(requests_per_target));
@@ -457,11 +462,12 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     jobs.push(NetworkPingJob {
                         target_node_id: target_node_id.clone(),
                         timeout: Duration::from_millis(timeout_ms),
+                        control_timeout,
                         request_payload_bytes: payload_bytes,
                         response_payload_bytes,
                         nonce,
                         request,
-                        daemon_client: daemon_client.clone(),
+                        daemon_address: daemon_address.clone(),
                     });
                 }
             }
@@ -1720,10 +1726,11 @@ struct NetworkPingJob {
     target_node_id: NodeId,
     nonce: String,
     timeout: Duration,
+    control_timeout: Duration,
     request_payload_bytes: usize,
     response_payload_bytes: usize,
     request: network::ObjectRpcRequest,
-    daemon_client: DaemonApiClient,
+    daemon_address: String,
 }
 
 #[derive(Debug)]
@@ -1742,7 +1749,14 @@ enum NetworkPingOutcome {
 
 async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
     let started = Instant::now();
-    let outcome = run_network_ping_job_inner(&job).await;
+    let deadline = job.timeout.saturating_add(Duration::from_secs(2));
+    let outcome = match tokio::time::timeout(deadline, run_network_ping_job_inner(&job)).await {
+        Ok(outcome) => outcome,
+        Err(_) => NetworkPingOutcome::Failure(format!(
+            "network ping job exceeded {}ms deadline",
+            deadline.as_millis()
+        )),
+    };
     let elapsed = started.elapsed();
     NetworkPingResult {
         target_node_id: job.target_node_id,
@@ -1753,19 +1767,38 @@ async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
 }
 
 async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome {
-    let daemon_client = job.daemon_client.clone();
-    let target_node_id = job.target_node_id.clone();
-    let request = job.request.clone();
-    let timeout = job.timeout;
-    let response = match tokio::task::spawn_blocking(move || {
-        daemon_client.object_rpc_to_target(&target_node_id, &request, timeout, true)
-    })
+    let forward_payload = DaemonObjectRpcForwardRequest {
+        target_node_id: job.target_node_id.clone(),
+        request: job.request.clone(),
+        connect_timeout_millis: u64::try_from(job.timeout.as_millis()).unwrap_or(u64::MAX),
+        observe_connectivity: true,
+        raw_response: false,
+    };
+    let forward_request = match network::ObjectRpcRequest::encode_body(
+        DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+        DAEMON_RPC_CATEGORY,
+        &forward_payload,
+    ) {
+        Ok(request) => request,
+        Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
+    };
+    let response = match send_daemon_rpc_async(
+        &job.daemon_address,
+        &forward_request,
+        network::DaemonRpcTimeouts::connect_and_idle(job.control_timeout),
+        &tokio::runtime::Handle::current(),
+    )
     .await
-    .map_err(|source| source.to_string())
-    .and_then(|response| response.map_err(|source| source.to_string()))
     {
         Ok(response) => response,
-        Err(error) => return NetworkPingOutcome::Failure(error),
+        Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
+    };
+    if let Err(error) = response.error_detail() {
+        return NetworkPingOutcome::Failure(error.to_string());
+    }
+    let response = match response.decode_body::<network::ObjectRpcResponse>() {
+        Ok(response) => response,
+        Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
     };
     let response = match cluster::decode_cluster_network_ping_rpc_response(&response) {
         Ok(response) => response,

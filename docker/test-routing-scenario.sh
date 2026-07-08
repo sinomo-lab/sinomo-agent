@@ -31,6 +31,8 @@ NETWORK_PAYLOAD_REQUEST_BYTES="${SINOMO_SCENARIO_NETWORK_PAYLOAD_REQUEST_BYTES:-
 NETWORK_PAYLOAD_RESPONSE_BYTES="${SINOMO_SCENARIO_NETWORK_PAYLOAD_RESPONSE_BYTES:-262144}"
 NETWORK_PAYLOAD_MIN_BYTES_PER_SEC="${SINOMO_SCENARIO_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC:-8388608}"
 NETWORK_READY_WAIT="${SINOMO_SCENARIO_NETWORK_READY_WAIT:-20}"
+NETWORK_READY_PROBE_TIMEOUT="${SINOMO_SCENARIO_NETWORK_READY_PROBE_TIMEOUT:-$(( NETWORK_TIMEOUT_MS / 1000 + 6 ))}"
+ARTIFACT_COMMAND_TIMEOUT="${SINOMO_SCENARIO_ARTIFACT_COMMAND_TIMEOUT:-10}"
 ENDPOINT_FALLBACK_TIMEOUT_MS="${SINOMO_SCENARIO_ENDPOINT_FALLBACK_TIMEOUT_MS:-5000}"
 TUNNEL_STALE_FALLBACK_TIMEOUT_MS="${SINOMO_SCENARIO_TUNNEL_STALE_FALLBACK_TIMEOUT_MS:-5000}"
 DIRECT_STALE_FALLBACK_TIMEOUT_MS="${SINOMO_SCENARIO_DIRECT_STALE_FALLBACK_TIMEOUT_MS:-5000}"
@@ -55,6 +57,23 @@ log() { echo "[routing-scenario] $*"; }
 
 compose() {
   docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
+}
+
+compose_timeout() {
+  local seconds="$1"
+  shift
+  timeout --foreground "${seconds}s" docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
+}
+
+compose_exec_timeout() {
+  local seconds="$1"
+  local node="$2"
+  local host_seconds
+  shift 2
+  host_seconds=$(( seconds + 5 ))
+  timeout --foreground "${host_seconds}s" \
+    docker compose -p "$PROJECT" -f "$COMPOSE_FILE" \
+    exec -T "$node" timeout --foreground "${seconds}s" "$@"
 }
 
 running_other_sinomo_projects() {
@@ -85,12 +104,12 @@ require_no_other_sinomo_projects() {
 
 collect_artifacts() {
   log "collecting artifacts in $ARTIFACTS"
-  compose ps > "$ARTIFACTS/compose-ps.txt" 2>&1 || true
+  compose_timeout "$ARTIFACT_COMMAND_TIMEOUT" ps > "$ARTIFACTS/compose-ps.txt" 2>&1 || true
   for node in $NODES; do
-    compose exec -T "$node" sinomo cluster health > "$ARTIFACTS/cluster-health-$node.txt" 2>&1 || true
-    compose exec -T "$node" sinomo cluster doctor > "$ARTIFACTS/cluster-doctor-$node.txt" 2>&1 || true
-    compose exec -T "$node" sinomo cluster connectivity > "$ARTIFACTS/cluster-connectivity-$node.txt" 2>&1 || true
-    compose logs --no-color "$node" > "$ARTIFACTS/$node.log" 2>&1 || true
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo cluster health > "$ARTIFACTS/cluster-health-$node.txt" 2>&1 || true
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo cluster doctor > "$ARTIFACTS/cluster-doctor-$node.txt" 2>&1 || true
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo cluster connectivity > "$ARTIFACTS/cluster-connectivity-$node.txt" 2>&1 || true
+    compose_timeout "$ARTIFACT_COMMAND_TIMEOUT" logs --no-color "$node" > "$ARTIFACTS/$node.log" 2>&1 || true
   done
 }
 
@@ -186,7 +205,8 @@ wait_for_network_ready() {
   while :; do
     still=""
     for node in $pending; do
-      if compose exec -T "$node" sinomo test run cluster.network.ping-benchmark \
+      if compose_exec_timeout "$NETWORK_READY_PROBE_TIMEOUT" \
+          "$node" sinomo test run cluster.network.ping-benchmark \
           --require-cluster \
           --json \
           --param expected-targets=2 \

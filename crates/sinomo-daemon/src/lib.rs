@@ -158,12 +158,11 @@ pub use auth::{
 #[cfg(test)]
 pub(crate) use client::send_daemon_rpc_raw;
 pub(crate) use client::{
-    DaemonSignedEndpointRpcAsyncHost, cluster_paths_from_env,
+    DaemonSignedObjectRpcAsyncHost, cluster_paths_from_env,
     fetch_cluster_kv_snapshot_from_endpoint_on_runtime,
-    fetch_daemon_status_from_endpoint_on_runtime, send_cluster_kv_watch_events_async,
-    send_cluster_member_publish_async, send_cluster_raft_append_async,
-    send_cluster_raft_append_on_runtime, send_cluster_raft_vote_async,
-    send_cluster_raft_vote_on_runtime, send_object_rpc_to_target_async_with_daemon_paths,
+    fetch_daemon_status_from_endpoint_on_runtime, send_cluster_member_publish_async,
+    send_cluster_raft_append_on_runtime, send_cluster_raft_vote_on_runtime,
+    send_object_rpc_to_target_async_with_daemon_paths,
     send_object_rpc_to_target_on_runtime_with_daemon_paths,
 };
 pub use client::{

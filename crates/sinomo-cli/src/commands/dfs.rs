@@ -1561,21 +1561,15 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
                 println!("  metadata: {}", services.metadata.len());
                 for service in &services.metadata {
                     println!(
-                        "    {} endpoint={} metadata={} content={}",
-                        service.node_id,
-                        service.endpoint,
-                        service.accepts_metadata,
-                        service.accepts_content
+                        "    {} metadata={} content={}",
+                        service.node_id, service.accepts_metadata, service.accepts_content
                     );
                 }
                 println!("  content: {}", services.content.len());
                 for service in &services.content {
                     println!(
-                        "    {} endpoint={} metadata={} content={}",
-                        service.node_id,
-                        service.endpoint,
-                        service.accepts_metadata,
-                        service.accepts_content
+                        "    {} metadata={} content={}",
+                        service.node_id, service.accepts_metadata, service.accepts_content
                     );
                 }
             }
@@ -2260,8 +2254,6 @@ fn run_local_dfs_smoke(
 ) -> Result<sinomo_runtime::dfs::DfsSmokeReport, CliError> {
     data_dir.ensure_root_layout()?;
     let cluster_paths = ClusterPaths::new(data_dir);
-    let options = DaemonRunOptions::default();
-    let local_endpoint = format!("loopback://{}:{}", options.host, options.port);
     let control_plane = cluster_paths.kv_paths().snapshot.exists().then(|| {
         Box::new(CliDfsControlPlaneKvClient::new(&cluster_paths))
             as Box<dyn sinomo_runtime::dfs::DfsControlPlaneKvClient>
@@ -2276,7 +2268,6 @@ fn run_local_dfs_smoke(
             bootstrap: sinomo_runtime::dfs::DfsDefaultClusterBootstrapOptions {
                 publish_cluster_control: false,
                 materialize_local_metadata: false,
-                local_endpoint,
             },
             smoke: foreground_dfs_smoke_options(),
         },
@@ -2835,11 +2826,7 @@ fn decode_dfs_advertisements(
     for entry in entries {
         advertisements.push(entry.decode()?);
     }
-    advertisements.sort_by(|left, right| {
-        left.node_id
-            .cmp(&right.node_id)
-            .then_with(|| left.endpoint.cmp(&right.endpoint))
-    });
+    advertisements.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     Ok(advertisements)
 }
 

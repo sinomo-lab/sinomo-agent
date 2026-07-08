@@ -3,8 +3,7 @@
 //! These records are intentionally compact. They advertise which nodes host DFS
 //! metadata and content services; namespace, inode, object, version, and receipt
 //! metadata remains in DFS metadata shards. DFS data traffic is routed by
-//! `sinomo-network`, so the advertisement endpoint is a logical node endpoint
-//! rather than a concrete dial target.
+//! `sinomo-network`, so service advertisements carry node identity only.
 
 use crate::control_plane::DfsControlPlaneStore;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -13,11 +12,6 @@ use sinomo_core::node::NodeId;
 use time::OffsetDateTime;
 
 const DFS_KV_PREFIX: &str = "/dfs";
-const DFS_CLUSTER_NODE_ENDPOINT_SCHEME: &str = "cluster-node";
-
-pub fn dfs_cluster_node_endpoint(node_id: &NodeId) -> String {
-    format!("{DFS_CLUSTER_NODE_ENDPOINT_SCHEME}://{node_id}")
-}
 
 pub fn metadata_service_key(node_id: &NodeId) -> String {
     format!("{DFS_KV_PREFIX}/services/metadata/{node_id}")
@@ -38,7 +32,6 @@ pub fn content_services_prefix() -> &'static str {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsNodeAdvertisement {
     pub node_id: NodeId,
-    pub endpoint: String,
     #[serde(default)]
     pub capacity_weight: u32,
     #[serde(default)]
@@ -52,10 +45,9 @@ pub struct DfsNodeAdvertisement {
 }
 
 impl DfsNodeAdvertisement {
-    pub fn metadata(node_id: NodeId, endpoint: impl Into<String>) -> Self {
+    pub fn metadata(node_id: NodeId) -> Self {
         Self {
             node_id,
-            endpoint: endpoint.into(),
             capacity_weight: 1,
             accepts_metadata: true,
             accepts_content: false,
@@ -64,10 +56,9 @@ impl DfsNodeAdvertisement {
         }
     }
 
-    pub fn content(node_id: NodeId, endpoint: impl Into<String>) -> Self {
+    pub fn content(node_id: NodeId) -> Self {
         Self {
             node_id,
-            endpoint: endpoint.into(),
             capacity_weight: 1,
             accepts_metadata: false,
             accepts_content: true,

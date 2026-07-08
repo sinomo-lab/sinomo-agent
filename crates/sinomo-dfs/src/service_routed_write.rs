@@ -674,7 +674,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 continue;
             }
-            // Endpoint-served DFS RPCs can return once the metadata primary has
+            // Node-routed DFS RPCs can return once the metadata primary has
             // committed the intent. Remaining repair jobs stay in the normal
             // repair backlog so a slow desired replica does not consume the
             // caller's data-plane deadline after the write is durable.

@@ -14,22 +14,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
-    AsyncDfsMessageTransport, AsyncDfsMetadataEndpointTransport,
-    AsyncDfsMetadataJournalReplicationTransport, AsyncDfsPeerTransport, ContentStoreGcOptions,
+    AsyncDfsMessageTransport, AsyncDfsMetadataJournalReplicationTransport,
+    AsyncDfsMetadataNodeTransport, AsyncDfsPeerTransport, ContentStoreGcOptions,
     ContentStoreGcReport, ContentStoreScrubReport, ContentStoreStagingGcOptions,
     ContentStoreStagingGcReport, ContentStoreVersionGcOptions, ContentStoreVersionGcReport,
     DFS_CHUNK_TRANSFER_IDLE_TIMEOUT, DfsControlPlaneKvClient, DfsError, DfsFileSystemId,
-    DfsMessageSender, DfsMessageTransport, DfsMetadataBackend, DfsMetadataEndpointTransport,
-    DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
-    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
-    DfsMetadataJournalReplicationTransport, DfsMetadataShardConfig, DfsMetadataShardId,
+    DfsMessageSender, DfsMessageTransport, DfsMetadataBackend, DfsMetadataJournalBatchSender,
+    DfsMetadataJournalPublisherHost, DfsMetadataJournalReplicationOptions,
+    DfsMetadataJournalReplicationReport, DfsMetadataJournalReplicationTransport,
+    DfsMetadataNodeTransport, DfsMetadataShardConfig, DfsMetadataShardId,
     DfsMetadataSnapshotInstallSender, DfsNamespaceJobMaintenanceReport, DfsObjectId,
     DfsObjectPageCursor, DfsPeerTransport, DfsTombstoneCompactionOptions,
     DfsTombstoneCompactionReport, DfsTransportIdentity, DfsVersion, DistributedRepairJob,
     LocalDfsMetadataJournalPublisherHost, NetworkedDfsService, NetworkedDfsServiceEvent,
     async_dfs_metadata_journal_batch_sender_from_peer_transport,
-    async_dfs_metadata_snapshot_install_sender_from_peer_transport, cluster_dfs_data_endpoints,
-    cluster_dfs_metadata_shards, cluster_dfs_peer_node_ids, dfs_message_sender_from_peer_transport,
+    async_dfs_metadata_snapshot_install_sender_from_peer_transport, cluster_dfs_metadata_shards,
+    cluster_dfs_peer_node_ids, dfs_message_sender_from_peer_transport,
     dfs_metadata_journal_batch_sender_from_peer_transport, dfs_metadata_replication_notice_lines,
     dfs_metadata_replication_sent_count, dfs_metadata_snapshot_install_sender_from_peer_transport,
     dfs_now_unix_nanos, dfs_path_safe_segment, distributed_sifs,
@@ -83,19 +83,19 @@ pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(
     let local_node_id = state.local_node_id.clone();
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
-    let endpoints = cluster_dfs_data_endpoints(cluster_paths, &state);
+    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
     let mut service = open_cluster_dfs_service_with_message_sender(
         data_dir,
         cluster_paths,
         local_node_id.clone(),
-        endpoints.clone(),
+        peer_node_ids.clone(),
         message_sender,
         control_plane,
     )?;
     let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let mut metadata_transport =
-        DfsMetadataEndpointTransport::new(endpoints, metadata_sender, snapshot_sender);
+        DfsMetadataNodeTransport::new(peer_node_ids, metadata_sender, snapshot_sender);
     run_dfs_maintenance_tick_with_host(
         &mut service,
         &mut maintenance_host,
@@ -138,21 +138,20 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
     let local_node_id = state.local_node_id.clone();
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
-    let endpoints = cluster_dfs_data_endpoints(&cluster_paths, &state);
     let peer_node_ids = cluster_dfs_peer_node_ids(&state);
     let mut service = open_cluster_dfs_service_with_peer_transports_for_nodes(
         &data_dir,
         &cluster_paths,
         local_node_id.clone(),
-        peer_node_ids,
+        peer_node_ids.clone(),
         sync_peer_transport,
         Arc::clone(&peer_transport),
         control_plane,
     )?;
     let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
-    let mut metadata_transport = AsyncDfsMetadataEndpointTransport::new(
-        endpoints,
+    let mut metadata_transport = AsyncDfsMetadataNodeTransport::new(
+        peer_node_ids,
         async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
         async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
     );

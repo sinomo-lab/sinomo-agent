@@ -13,11 +13,11 @@ impl CliSignedEndpointRpcHost {
     }
 }
 
-impl network::ClusterSignedEndpointRpcAsyncHost for CliSignedEndpointRpcHost {
-    fn sign_endpoint_rpc_request_async<'a>(
+impl network::ClusterSignedObjectRpcAsyncHost for CliSignedEndpointRpcHost {
+    fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         request: &'a network::ObjectRpcRequest,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+    ) -> network::ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
         let sign_operation = self.sign_operation;
         Box::pin(async move {
             daemon_sign_daemon_rpc_request_for_local_node(request).map_err(|source| {

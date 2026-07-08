@@ -37,14 +37,12 @@ pub enum DfsTransferProfile {
     Local,
 }
 
-impl From<sinomo_core::network::ClusterEndpointTransferProfile> for DfsTransferProfile {
-    fn from(profile: sinomo_core::network::ClusterEndpointTransferProfile) -> Self {
+impl From<sinomo_core::network::ClusterRouteTransferProfile> for DfsTransferProfile {
+    fn from(profile: sinomo_core::network::ClusterRouteTransferProfile) -> Self {
         match profile {
-            sinomo_core::network::ClusterEndpointTransferProfile::Conservative => {
-                Self::Conservative
-            }
-            sinomo_core::network::ClusterEndpointTransferProfile::Lan => Self::Lan,
-            sinomo_core::network::ClusterEndpointTransferProfile::Local => Self::Local,
+            sinomo_core::network::ClusterRouteTransferProfile::Conservative => Self::Conservative,
+            sinomo_core::network::ClusterRouteTransferProfile::Lan => Self::Lan,
+            sinomo_core::network::ClusterRouteTransferProfile::Local => Self::Local,
         }
     }
 }

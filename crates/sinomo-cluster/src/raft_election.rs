@@ -20,7 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub trait ClusterRaftVoteTransportHost {
     fn send_raft_vote(
         &mut self,
-        endpoint: &ClusterEndpointRecord,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
         request: &ClusterRaftVoteRequest,
         timeout: Duration,
     ) -> Result<ClusterRaftVoteResponse, NetworkError>;
@@ -29,14 +30,11 @@ pub trait ClusterRaftVoteTransportHost {
 pub(crate) trait ClusterRaftVoteTransportAsyncHost {
     fn send_raft_vote_async<'a>(
         &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
+        state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
         request: &'a ClusterRaftVoteRequest,
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ClusterRaftVoteResponse>;
-}
-
-fn try_clone_network_node_id(node_id: &NodeId, operation: &str) -> Result<NodeId, NetworkError> {
-    sinomo_network::try_clone_id(node_id, operation)
 }
 
 fn cluster_raft_campaign_jitter_for_node(node_id: &NodeId, max: Duration) -> Duration {
@@ -62,7 +60,7 @@ struct NetworkClusterKvRaftLeaderElectionHost<'a, H> {
     paths: &'a ClusterPaths,
     state: &'a ClusterBootstrapState,
     options: ClusterRaftLeaderElectionOptions,
-    remote_vote_targets: Vec<ClusterEndpointRecord>,
+    remote_vote_targets: Vec<NodeId>,
     attempt_deadline: Instant,
     transport: &'a mut H,
 }
@@ -72,7 +70,7 @@ impl<'a, H> NetworkClusterKvRaftLeaderElectionHost<'a, H> {
         paths: &'a ClusterPaths,
         state: &'a ClusterBootstrapState,
         options: ClusterRaftLeaderElectionOptions,
-        remote_vote_targets: Vec<ClusterEndpointRecord>,
+        remote_vote_targets: Vec<NodeId>,
         transport: &'a mut H,
     ) -> Self {
         Self {
@@ -131,19 +129,19 @@ where
         voter_id: &NodeId,
         vote: &RaftRequestVoteRequest,
     ) -> Result<RaftRequestVoteResponse, Self::Error> {
-        let endpoint =
+        let target_node_id =
             self.remote_vote_targets
                 .get(target_index)
                 .ok_or_else(|| NetworkError::Io {
                     operation: "cluster raft vote".to_string(),
-                    detail: format!("missing vote endpoint for target index {target_index}"),
+                    detail: format!("missing vote target for target index {target_index}"),
                 })?;
-        if &endpoint.node_id != voter_id {
+        if target_node_id != voter_id {
             return Err(NetworkError::Io {
                 operation: "cluster raft vote".to_string(),
                 detail: format!(
-                    "vote endpoint target mismatch: endpoint is {}, election target is {}",
-                    endpoint.node_id, voter_id
+                    "vote target mismatch: selected target is {}, election target is {}",
+                    target_node_id, voter_id
                 ),
             });
         }
@@ -163,9 +161,10 @@ where
         };
         self.transport
             .send_raft_vote(
-                endpoint,
+                self.state,
+                target_node_id,
                 &request,
-                self.options.fair_command_timeout(endpoint, remaining),
+                self.options.routed_node_command_timeout(remaining),
             )
             .map(|response| response.vote)
     }
@@ -184,7 +183,7 @@ struct NetworkClusterKvRaftLeaderElectionAsyncHost<'a, H> {
     paths: &'a ClusterPaths,
     state: &'a ClusterBootstrapState,
     options: ClusterRaftLeaderElectionOptions,
-    remote_vote_targets: Vec<ClusterEndpointRecord>,
+    remote_vote_targets: Vec<NodeId>,
     attempt_deadline: Instant,
     transport: &'a mut H,
 }
@@ -195,7 +194,7 @@ impl<'a, H> NetworkClusterKvRaftLeaderElectionAsyncHost<'a, H> {
         paths: &'a ClusterPaths,
         state: &'a ClusterBootstrapState,
         options: ClusterRaftLeaderElectionOptions,
-        remote_vote_targets: Vec<ClusterEndpointRecord>,
+        remote_vote_targets: Vec<NodeId>,
         transport: &'a mut H,
     ) -> Self {
         Self {
@@ -284,25 +283,24 @@ where
         voter_id: &'a NodeId,
         vote: &'a RaftRequestVoteRequest,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, RaftRequestVoteResponse, Self::Error> {
-        let endpoint = match self.remote_vote_targets.get(target_index).cloned() {
-            Some(endpoint) => endpoint,
+        let target_node_id = match self.remote_vote_targets.get(target_index).cloned() {
+            Some(target_node_id) => target_node_id,
             None => {
                 return Box::pin(async move {
                     Err(NetworkError::Io {
                         operation: "cluster raft vote".to_string(),
-                        detail: format!("missing vote endpoint for target index {target_index}"),
+                        detail: format!("missing vote target for target index {target_index}"),
                     })
                 });
             }
         };
-        if &endpoint.node_id != voter_id {
-            let endpoint_node_id = endpoint.node_id.clone();
+        if &target_node_id != voter_id {
             let voter_id = voter_id.clone();
             return Box::pin(async move {
                 Err(NetworkError::Io {
                     operation: "cluster raft vote".to_string(),
                     detail: format!(
-                        "vote endpoint target mismatch: endpoint is {endpoint_node_id}, election target is {voter_id}"
+                        "vote target mismatch: selected target is {target_node_id}, election target is {voter_id}"
                     ),
                 })
             });
@@ -323,11 +321,12 @@ where
             state: self.state.clone(),
             vote: vote.clone(),
         };
-        let timeout = self.options.fair_command_timeout(&endpoint, remaining);
+        let timeout = self.options.routed_node_command_timeout(remaining);
         let transport = &mut *self.transport;
+        let state = self.state;
         Box::pin(async move {
             transport
-                .send_raft_vote_async(&endpoint, &request, timeout)
+                .send_raft_vote_async(state, &target_node_id, &request, timeout)
                 .await
                 .map(|response| response.vote)
         })
@@ -412,32 +411,17 @@ pub fn elect_cluster_raft_leader_with_host(
 ) -> Result<bool, NetworkError> {
     let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
     let mut remote_vote_targets = Vec::new();
-    for endpoint in ClusterEndpointSelector::new(paths, state)
-        .select_internal(ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand)
+    for node_id in ClusterEndpointSelector::new(paths, state)
+        .select_internal_unique_node_ids(
+            ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+        )
         .into_iter()
-        .filter(|endpoint| {
-            endpoint.node_id != state.local_node_id && voter_ids.contains(&endpoint.node_id)
-        })
+        .filter(|node_id| node_id != &state.local_node_id && voter_ids.contains(node_id))
     {
-        sinomo_network::try_reserve_vec(
-            &mut remote_vote_targets,
-            1,
-            "collect raft vote endpoints",
-        )?;
-        remote_vote_targets.push(endpoint);
+        sinomo_network::try_reserve_vec(&mut remote_vote_targets, 1, "collect raft vote targets")?;
+        remote_vote_targets.push(node_id);
     }
-    let mut remote_vote_target_ids = Vec::new();
-    sinomo_network::try_reserve_vec(
-        &mut remote_vote_target_ids,
-        remote_vote_targets.len(),
-        "collect raft vote target ids",
-    )?;
-    for endpoint in &remote_vote_targets {
-        remote_vote_target_ids.push(try_clone_network_node_id(
-            &endpoint.node_id,
-            "collect raft vote target ids",
-        )?);
-    }
+    let remote_vote_target_ids = remote_vote_targets.clone();
     let mut election_host = NetworkClusterKvRaftLeaderElectionHost::new(
         paths,
         state,
@@ -463,7 +447,7 @@ pub(crate) async fn elect_cluster_raft_leader_async_with_host(
 ) -> Result<bool, NetworkError> {
     let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
     let mut remote_vote_targets = Vec::new();
-    for endpoint in ClusterEndpointSelector::select_internal_async(
+    for node_id in ClusterEndpointSelector::select_internal_unique_node_ids_async(
         runtime,
         paths,
         state,
@@ -471,28 +455,16 @@ pub(crate) async fn elect_cluster_raft_leader_async_with_host(
     )
     .await?
     .into_iter()
-    .filter(|endpoint| {
-        endpoint.node_id != state.local_node_id && voter_ids.contains(&endpoint.node_id)
-    }) {
+    .filter(|node_id| node_id != &state.local_node_id && voter_ids.contains(node_id))
+    {
         sinomo_network::try_reserve_vec(
             &mut remote_vote_targets,
             1,
-            "collect async raft vote endpoints",
+            "collect async raft vote targets",
         )?;
-        remote_vote_targets.push(endpoint);
+        remote_vote_targets.push(node_id);
     }
-    let mut remote_vote_target_ids = Vec::new();
-    sinomo_network::try_reserve_vec(
-        &mut remote_vote_target_ids,
-        remote_vote_targets.len(),
-        "collect async raft vote target ids",
-    )?;
-    for endpoint in &remote_vote_targets {
-        remote_vote_target_ids.push(try_clone_network_node_id(
-            &endpoint.node_id,
-            "collect async raft vote target ids",
-        )?);
-    }
+    let remote_vote_target_ids = remote_vote_targets.clone();
     let mut election_host = NetworkClusterKvRaftLeaderElectionAsyncHost::new(
         runtime,
         paths,

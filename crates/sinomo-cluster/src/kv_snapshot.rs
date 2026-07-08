@@ -4,9 +4,7 @@ use crate::kv_local_store::{
     locked_kv_state_authority_id, locked_restore_cluster_raft_from_snapshot_if_newer,
     read_cluster_kv_snapshot, write_imported_cluster_kv_snapshot_if_changed,
 };
-use sinomo_base::{
-    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterTransportKind,
-};
+use sinomo_base::ClusterBootstrapState;
 use sinomo_kv::{InProcessKvStore, KvSnapshot};
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
@@ -38,30 +36,16 @@ impl ClusterKvSnapshotRefreshOptions {
         }
     }
 
-    pub(crate) fn command_timeout(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        remaining: Duration,
-    ) -> Duration {
-        match endpoint.transport {
-            ClusterTransportKind::Iroh => remaining.min(self.iroh_command_timeout),
-            _ => remaining.min(self.tcp_command_timeout),
-        }
+    pub(crate) fn routed_node_command_timeout(&self, remaining: Duration) -> Duration {
+        remaining.min(self.tcp_command_timeout.max(self.iroh_command_timeout))
     }
 
-    pub(crate) fn fair_command_timeout(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        remaining: Duration,
-    ) -> Duration {
-        let attempt_cap = match endpoint.transport {
-            ClusterTransportKind::Iroh => self.iroh_foreground_attempt_timeout,
-            _ if matches!(endpoint.privacy, ClusterEndpointPrivacy::InternetDirect) => {
-                self.public_foreground_attempt_timeout
-            }
-            _ => self.tcp_foreground_attempt_timeout,
-        };
-        self.command_timeout(endpoint, remaining.min(attempt_cap))
+    pub(crate) fn routed_node_attempt_timeout(&self, remaining: Duration) -> Duration {
+        let attempt_cap = self
+            .tcp_foreground_attempt_timeout
+            .max(self.public_foreground_attempt_timeout)
+            .max(self.iroh_foreground_attempt_timeout);
+        self.routed_node_command_timeout(remaining.min(attempt_cap))
     }
 }
 
@@ -72,12 +56,6 @@ pub trait ClusterKvSnapshotRefreshHost {
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError>;
 
-    fn fetch_cluster_kv_snapshot(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        timeout: Duration,
-    ) -> Result<KvSnapshot, NetworkError>;
-
     fn restore_cluster_kv_from_snapshot_if_newer(
         &mut self,
         paths: &ClusterPaths,
@@ -87,15 +65,11 @@ pub trait ClusterKvSnapshotRefreshHost {
 
     fn call_node_object_rpc(
         &mut self,
-        _state: &ClusterBootstrapState,
-        _target_node_id: &NodeId,
-        _request: &ObjectRpcRequest,
-        _timeout: Duration,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        Err(NetworkError::ClusterReadOnly {
-            detail: "cluster KV snapshot node object RPC is not supported by this host".to_string(),
-        })
-    }
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError>;
 }
 
 struct LocalClusterKvSnapshotRefreshHost<F> {
@@ -104,7 +78,7 @@ struct LocalClusterKvSnapshotRefreshHost<F> {
 
 impl<F> ClusterKvSnapshotRefreshHost for LocalClusterKvSnapshotRefreshHost<F>
 where
-    F: FnMut(&ClusterEndpointRecord, Duration) -> Result<KvSnapshot, NetworkError>,
+    F: FnMut(&NodeId, Duration) -> Result<KvSnapshot, NetworkError>,
 {
     fn known_kv_state_authority_id(
         &mut self,
@@ -114,14 +88,6 @@ where
         locked_kv_state_authority_id(paths, state)
     }
 
-    fn fetch_cluster_kv_snapshot(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        timeout: Duration,
-    ) -> Result<KvSnapshot, NetworkError> {
-        (self.fetch_cluster_kv_snapshot)(endpoint, timeout)
-    }
-
     fn restore_cluster_kv_from_snapshot_if_newer(
         &mut self,
         paths: &ClusterPaths,
@@ -129,6 +95,28 @@ where
         snapshot: KvSnapshot,
     ) -> Result<bool, NetworkError> {
         locked_restore_cluster_raft_from_snapshot_if_newer(paths, local_node_id, snapshot)
+    }
+
+    fn call_node_object_rpc(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        if request.route != sinomo_kv::CLUSTER_KV_SNAPSHOT_ROUTE {
+            return Err(NetworkError::Io {
+                operation: "cluster KV snapshot refresh".to_string(),
+                detail: format!("unsupported local snapshot RPC route {}", request.route),
+            });
+        }
+        let snapshot = (self.fetch_cluster_kv_snapshot)(target_node_id, timeout)?;
+        let payload =
+            sinomo_kv::cluster_kv_snapshot_response_rpc_payload(&snapshot).map_err(kv_err)?;
+        Ok(ObjectRpcResponse::from_encoded_body(
+            payload.route,
+            payload.body,
+        ))
     }
 }
 
@@ -158,13 +146,13 @@ pub fn refresh_current_cluster_kv_store_with_outcome(
     if let Ok(snapshot) = read_cluster_kv_snapshot(paths) {
         snapshots.push(snapshot);
     }
-    let mut targets = ClusterEndpointSelector::new(paths, state)
-        .select_internal(ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand);
+    let mut targets = ClusterEndpointSelector::new(paths, state).select_internal_unique_node_ids(
+        ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+    );
+    targets.retain(|node_id| node_id != &state.local_node_id);
     if let Ok(Some(leader_id)) = host.known_kv_state_authority_id(paths, state)
         && !cluster_node_blocks_leader_preference(paths, state, &leader_id)
-        && let Some(position) = targets
-            .iter()
-            .position(|endpoint| endpoint.node_id == leader_id)
+        && let Some(position) = targets.iter().position(|node_id| node_id == &leader_id)
     {
         let leader = targets.remove(position);
         targets.insert(0, leader);
@@ -172,39 +160,21 @@ pub fn refresh_current_cluster_kv_store_with_outcome(
 
     let deadline = Instant::now() + options.refresh_budget(!snapshots.is_empty());
     let mut fetched_remote = false;
-    for endpoint in &targets {
+    for target_node_id in &targets {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
         if remaining.is_zero() {
             break;
         }
-        if let Ok(snapshot) = host
-            .fetch_cluster_kv_snapshot(endpoint, options.fair_command_timeout(endpoint, remaining))
-        {
+        if let Ok(snapshot) = fetch_cluster_kv_snapshot_from_state_authority_node(
+            state,
+            target_node_id,
+            options.routed_node_attempt_timeout(remaining),
+            host,
+        ) {
             snapshots.push(snapshot);
             fetched_remote = true;
-        }
-    }
-    if !fetched_remote {
-        let unique_node_targets = ClusterEndpointSelector::unique_node_targets(targets.clone());
-        'node_targets: for target in &unique_node_targets {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or_default();
-            if remaining.is_zero() {
-                break 'node_targets;
-            }
-            if let Ok(snapshot) = fetch_cluster_kv_snapshot_from_state_authority_node(
-                state,
-                &target.node_id,
-                remaining,
-                host,
-            ) {
-                snapshots.push(snapshot);
-                fetched_remote = true;
-                break 'node_targets;
-            }
         }
     }
     let snapshot = snapshots
@@ -248,7 +218,7 @@ pub fn refresh_current_cluster_kv_store_with_local_storage_and_transport<F>(
     fetch_cluster_kv_snapshot: F,
 ) -> Result<InProcessKvStore, NetworkError>
 where
-    F: FnMut(&ClusterEndpointRecord, Duration) -> Result<KvSnapshot, NetworkError>,
+    F: FnMut(&NodeId, Duration) -> Result<KvSnapshot, NetworkError>,
 {
     let mut host = LocalClusterKvSnapshotRefreshHost {
         fetch_cluster_kv_snapshot,

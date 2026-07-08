@@ -9,10 +9,7 @@ use sinomo_core::network::{
     ClusterConnectivityGraph, ClusterPaths, cluster_healthy_route_next_hop,
 };
 use sinomo_core::node::NodeId;
-use sinomo_core::{
-    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
-    ClusterMemberRole, DfsObjectPolicy,
-};
+use sinomo_core::{ClusterBootstrapState, ClusterMemberRecord, ClusterMemberRole, DfsObjectPolicy};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -24,8 +21,8 @@ use crate::{
     DfsMetadataJournalBatchSender, DfsMetadataShardAssignment, DfsMetadataShardConfig,
     DfsMetadataShardId, DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement, DfsPeerTransport,
     DfsSmokeOptions, DfsSmokeReport, DfsSubtreePolicy, SIFS_SERVICES_PATH, SIFS_USERS_PATH,
-    content_service_key, default_dfs_metadata_shards_root, dfs_cluster_node_endpoint,
-    dfs_message_sender_from_peer_transport, dfs_metadata_journal_batch_sender_from_peer_transport,
+    content_service_key, default_dfs_metadata_shards_root, dfs_message_sender_from_peer_transport,
+    dfs_metadata_journal_batch_sender_from_peer_transport,
     dfs_metadata_snapshot_install_sender_from_peer_transport, distributed_sifs,
     file_system_config_key, materialize_default_sifs_metadata,
     materialize_default_sifs_metadata_on_shards, metadata_service_key, metadata_shard_key,
@@ -38,7 +35,6 @@ use crate::{
 pub struct DfsDefaultClusterBootstrapOptions {
     pub publish_cluster_control: bool,
     pub materialize_local_metadata: bool,
-    pub local_endpoint: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -628,7 +624,7 @@ pub fn ensure_default_distributed_dfs_with_host(
                 state.local_node_id.clone(),
             )?;
         }
-        publish_dfs_service_advertisements_with_host(host, state, &options.local_endpoint)?;
+        publish_dfs_service_advertisements_with_host(host, state)?;
         local_has_primary_metadata_shards
     } else {
         default_cluster_sifs_owner(state) == state.local_node_id
@@ -682,8 +678,7 @@ pub async fn ensure_default_distributed_dfs_with_async_host(
             )
             .await?;
         }
-        publish_dfs_service_advertisements_with_async_host(host, state, &options.local_endpoint)
-            .await?;
+        publish_dfs_service_advertisements_with_async_host(host, state).await?;
         local_has_primary_metadata_shards
     } else {
         default_cluster_sifs_owner(state) == state.local_node_id
@@ -1146,42 +1141,22 @@ pub fn dfs_service_members(state: &ClusterBootstrapState) -> Vec<&ClusterMemberR
         .collect()
 }
 
-pub fn dfs_service_endpoint_for_member(
-    _state: &ClusterBootstrapState,
-    member: &ClusterMemberRecord,
-    _local_endpoint: &str,
-) -> String {
-    dfs_cluster_node_endpoint(&member.node_id)
-}
-
-pub fn dfs_service_endpoint_rank(endpoint: &ClusterEndpointRecord) -> (u8, u16, String) {
-    let privacy_rank = match endpoint.privacy {
-        ClusterEndpointPrivacy::InternetDirect => 0,
-        ClusterEndpointPrivacy::Relayed => 1,
-        ClusterEndpointPrivacy::Lan => 2,
-        ClusterEndpointPrivacy::LocalOnly => 3,
-    };
-    (privacy_rank, endpoint.priority, endpoint.address.clone())
-}
-
 fn publish_dfs_service_advertisements_with_host(
     host: &mut impl DfsDefaultClusterBootstrapHost,
     state: &ClusterBootstrapState,
-    local_endpoint: &str,
 ) -> Result<(), DfsError> {
     for member in dfs_service_members(state) {
-        let endpoint = dfs_service_endpoint_for_member(state, member, local_endpoint);
         let metadata_key = metadata_service_key(&member.node_id);
         let content_key = content_service_key(&member.node_id);
         let metadata = stable_dfs_advertisement(
             host,
             &metadata_key,
-            DfsNodeAdvertisement::metadata(member.node_id.clone(), endpoint.clone()),
+            DfsNodeAdvertisement::metadata(member.node_id.clone()),
         )?;
         let content = stable_dfs_advertisement(
             host,
             &content_key,
-            DfsNodeAdvertisement::content(member.node_id.clone(), endpoint),
+            DfsNodeAdvertisement::content(member.node_id.clone()),
         )?;
         host.put_node_advertisement(metadata_key, &metadata)?;
         host.put_node_advertisement(content_key, &content)?;
@@ -1192,22 +1167,20 @@ fn publish_dfs_service_advertisements_with_host(
 async fn publish_dfs_service_advertisements_with_async_host(
     host: &mut impl DfsDefaultClusterAsyncBootstrapHost,
     state: &ClusterBootstrapState,
-    local_endpoint: &str,
 ) -> Result<(), DfsError> {
     for member in dfs_service_members(state) {
-        let endpoint = dfs_service_endpoint_for_member(state, member, local_endpoint);
         let metadata_key = metadata_service_key(&member.node_id);
         let content_key = content_service_key(&member.node_id);
         let metadata = stable_dfs_advertisement_async(
             host,
             metadata_key.clone(),
-            DfsNodeAdvertisement::metadata(member.node_id.clone(), endpoint.clone()),
+            DfsNodeAdvertisement::metadata(member.node_id.clone()),
         )
         .await?;
         let content = stable_dfs_advertisement_async(
             host,
             content_key.clone(),
-            DfsNodeAdvertisement::content(member.node_id.clone(), endpoint),
+            DfsNodeAdvertisement::content(member.node_id.clone()),
         )
         .await?;
         host.put_node_advertisement_async(metadata_key, metadata)
@@ -1227,7 +1200,6 @@ fn stable_dfs_advertisement(
         return Ok(desired);
     };
     if current.node_id == desired.node_id
-        && current.endpoint == desired.endpoint
         && current.accepts_metadata == desired.accepts_metadata
         && current.accepts_content == desired.accepts_content
         && current.capacity_weight == desired.capacity_weight
@@ -1247,7 +1219,6 @@ async fn stable_dfs_advertisement_async(
         return Ok(desired);
     };
     if current.node_id == desired.node_id
-        && current.endpoint == desired.endpoint
         && current.accepts_metadata == desired.accepts_metadata
         && current.accepts_content == desired.accepts_content
         && current.capacity_weight == desired.capacity_weight
