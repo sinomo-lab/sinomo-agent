@@ -142,7 +142,7 @@ const PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS: usize =
     sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
 const CLUSTER_CONNECTIVITY_IMPORT_CONCURRENCY: usize = 16;
 const CLUSTER_NETWORK_PENDING_CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(8);
-const CLUSTER_NETWORK_PENDING_CONNECTIVITY_PUBLISH_TIMEOUT: Duration = Duration::from_secs(3);
+const CLUSTER_NETWORK_PENDING_CONNECTIVITY_PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
 const CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLUSTER_NETWORK_PENDING_MEMBER_PUBLISH_TIMEOUT: Duration =
     CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT;
@@ -2720,19 +2720,11 @@ impl ClusterNetworkMaintenance {
         let has_followup_publishes = !member_publishes.is_empty()
             || !node_status_refreshes.is_empty()
             || service_instance_publish.is_some();
-        let cached_connectivity_deadline = if has_followup_publishes {
-            cluster_network_deadline_with_tail_reserve(
-                deadline,
-                CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE,
-            )
-        } else {
-            deadline
-        };
         if let Some(publish) = connectivity_publish {
             if cluster_network_pending_step_with_deadline(
                 "connectivity publish",
                 CLUSTER_NETWORK_PENDING_CONNECTIVITY_PUBLISH_TIMEOUT,
-                cached_connectivity_deadline,
+                deadline,
                 self.run_pending_connectivity_publish_async(publish, runtime.clone()),
             )
             .await
@@ -10396,6 +10388,16 @@ mod tests {
 
     #[test]
     fn cluster_network_pending_publish_timeouts_respect_control_plane_attempt_budget() {
+        assert!(
+            CLUSTER_NETWORK_PENDING_CONNECTIVITY_PUBLISH_TIMEOUT
+                >= sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
+            "connectivity publish must allow at least one public/manual endpoint attempt"
+        );
+        assert!(
+            CLUSTER_NETWORK_PENDING_CONNECTIVITY_PUBLISH_TIMEOUT
+                >= DAEMON_CLUSTER_FORMATION_IROH_COMMAND_TIMEOUT,
+            "formation connectivity publish must allow one Iroh command attempt"
+        );
         assert!(
             CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT
                 >= sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
