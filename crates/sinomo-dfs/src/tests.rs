@@ -2126,6 +2126,10 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         sinomo_core::network::object_rpc_request_stream_mode(&message_request),
         sinomo_core::network::ObjectRpcRequestStreamMode::Buffered
     );
+    assert!(
+        message_request.uses_full_response_budget(),
+        "DFS data-plane message RPCs need the full verified final-hop response budget"
+    );
     assert_eq!(
         message_request
             .decode_body::<DfsMessageCommand>()

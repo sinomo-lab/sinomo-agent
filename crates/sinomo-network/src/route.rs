@@ -2592,8 +2592,7 @@ where
                         &endpoint,
                     );
                 let final_hop_full_response_budget = final_hop_verified_direct
-                    && crate::object_rpc_request_stream_mode(request)
-                        .expects_raw_streamed_response();
+                    && cluster_target_final_hop_request_uses_full_response_budget(request);
                 let final_hop_attempt_budget = if final_hop {
                     cluster_target_final_hop_attempt_budget(
                         remaining,
@@ -3437,6 +3436,11 @@ fn cluster_target_final_hop_uses_full_response_budget(
 ) -> bool {
     cluster_endpoint_has_healthy_route_evidence(local_connectivity, endpoint)
         && !cluster_endpoint_is_tcp_tunnel(endpoint)
+}
+
+fn cluster_target_final_hop_request_uses_full_response_budget(request: &ObjectRpcRequest) -> bool {
+    crate::object_rpc_request_stream_mode(request).expects_raw_streamed_response()
+        || request.uses_full_response_budget()
 }
 
 fn cluster_endpoint_is_tcp_tunnel(endpoint: &ClusterEndpointRecord) -> bool {
@@ -5340,6 +5344,30 @@ mod tests {
         )
         .expect("streamed budget");
         assert_eq!(streamed, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn cluster_target_final_hop_request_metadata_uses_full_response_budget() {
+        let ordinary = ObjectRpcRequest::from_encoded_body("/test/control", "test", Vec::new());
+        assert!(!cluster_target_final_hop_request_uses_full_response_budget(
+            &ordinary
+        ));
+
+        let data_plane = ObjectRpcRequest::from_encoded_body("/test/data", "test", Vec::new())
+            .with_full_response_budget();
+        assert!(cluster_target_final_hop_request_uses_full_response_budget(
+            &data_plane
+        ));
+
+        let budget = cluster_target_final_hop_attempt_budget(
+            Some(Duration::from_secs(60)),
+            3,
+            Some(CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX),
+            true,
+            cluster_target_final_hop_request_uses_full_response_budget(&data_plane),
+        )
+        .expect("data-plane budget");
+        assert_eq!(budget, Duration::from_secs(60));
     }
 
     #[test]

@@ -367,7 +367,8 @@ pub fn dfs_message_rpc_request(
     command: &DfsMessageCommand,
 ) -> Result<ObjectRpcRequest, NetworkError> {
     let mut request =
-        ObjectRpcRequest::encode_body(dfs_message_route(command), DFS_RPC_CATEGORY, command)?;
+        ObjectRpcRequest::encode_body(dfs_message_route(command), DFS_RPC_CATEGORY, command)?
+            .with_full_response_budget();
     request.ensure_trace_context();
     Ok(request)
 }
