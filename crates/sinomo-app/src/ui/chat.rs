@@ -76,7 +76,7 @@ use sinomo_cli::app_api::{
     ChatToolRuntimeSelection, ChatUsageSnapshot, ProviderSummary, SifsAgentChannelStore,
     agent_summaries, reasoning_efforts,
 };
-use sinomo_runtime::{events::SessionId, local::SinomoDataDir};
+use sinomo_runtime::{config::ConfigClient, events::SessionId, local::SinomoDataDir};
 
 use crate::backend::Backend;
 use crate::backend::chat_engine::{
@@ -855,6 +855,7 @@ pub struct ChatState {
     pub stick_bottom: bool,
     pub agents: Vec<AgentSummary>,
     pub providers: Vec<ProviderSummary>,
+    providers_loading: bool,
     pub efforts: Vec<String>,
     pub provider_idx: usize,
     pub model_idx: usize,
@@ -876,6 +877,7 @@ pub struct ChatState {
     transcript_load_mode: Option<TranscriptLoadMode>,
     transcript_load_started_at: Option<Instant>,
     transcript_load_slow_notice_shown: bool,
+    provider_list_rx: Option<Receiver<ProviderListWorkerResult>>,
     session_list_rx: Option<Receiver<SessionListWorkerResult>>,
     session_list_loading: bool,
     session_list_started_at: Option<Instant>,
@@ -907,6 +909,10 @@ struct SessionListWorkerResult {
     complete: bool,
 }
 
+struct ProviderListWorkerResult {
+    providers: Vec<ProviderSummary>,
+}
+
 impl ChatState {
     pub fn new(backend: &Backend) -> Self {
         Self::new_with_waker(backend, None)
@@ -931,7 +937,12 @@ impl ChatState {
         );
 
         let agents = agent_summaries(&backend.data_dir);
-        let providers = crate::backend::config::cluster_provider_summaries(backend.config.as_ref());
+        let defer_provider_load = waker.is_some() && backend.connection.daemon_address().is_some();
+        let providers = if defer_provider_load {
+            Vec::new()
+        } else {
+            crate::backend::config::cluster_provider_summaries(backend.config.as_ref())
+        };
         let efforts = reasoning_efforts();
         let effort_idx = efforts.iter().position(|e| e == "medium").unwrap_or(0);
         let sifs_daemon = daemon_address
@@ -976,6 +987,7 @@ impl ChatState {
             stick_bottom: true,
             agents,
             providers,
+            providers_loading: defer_provider_load,
             efforts,
             provider_idx: 0,
             model_idx: 0,
@@ -996,6 +1008,7 @@ impl ChatState {
             transcript_load_mode: None,
             transcript_load_started_at: None,
             transcript_load_slow_notice_shown: false,
+            provider_list_rx: None,
             session_list_rx: None,
             session_list_loading: false,
             session_list_started_at: None,
@@ -1014,7 +1027,9 @@ impl ChatState {
         // Eagerly fetch the default/initial provider's models so the model picker is populated
         // without requiring a manual provider toggle. (Results arrive async via `ChatEvent::Models`;
         // a no-op if there is no provider or the list is already populated.)
-        state.maybe_fetch_models();
+        if !state.providers_loading {
+            state.maybe_fetch_models();
+        }
         state
     }
 
@@ -1752,6 +1767,10 @@ impl ChatState {
             return Some(RuntimeRecoveryTarget::Connection);
         }
 
+        if self.providers_loading && self.providers.is_empty() {
+            return None;
+        }
+
         if self.providers.is_empty() {
             return Some(RuntimeRecoveryTarget::Providers);
         }
@@ -1848,6 +1867,9 @@ impl ChatState {
 
     fn recovery_empty_detail(&self, target: RuntimeRecoveryTarget) -> String {
         match target {
+            RuntimeRecoveryTarget::Providers if self.providers_loading => {
+                "Language model providers are loading.".to_string()
+            }
             RuntimeRecoveryTarget::Providers if self.providers.is_empty() => {
                 "No language model provider is configured yet.".to_string()
             }
@@ -3590,6 +3612,7 @@ impl ChatState {
         let previous = self
             .current_provider()
             .map(|provider| (provider.id.clone(), provider.account.clone()));
+        self.providers_loading = false;
         self.providers = providers;
         self.models_loading = false;
         if self.providers.is_empty() {
@@ -3611,6 +3634,64 @@ impl ChatState {
         self.maybe_fetch_models();
         if !self.current_model().is_empty() {
             self.push_model_selection();
+        }
+    }
+
+    pub fn start_provider_list_load(
+        &mut self,
+        config: Arc<dyn ConfigClient>,
+        waker: Option<sui::UiHandle>,
+    ) -> bool {
+        if !self.providers_loading || self.provider_list_rx.is_some() {
+            return false;
+        }
+        let (tx, rx) = mpsc::channel();
+        match thread::Builder::new()
+            .name("sinomo-app-chat-providers".to_string())
+            .spawn(move || {
+                let providers = crate::backend::config::cluster_provider_summaries(config.as_ref());
+                let _ = tx.send(ProviderListWorkerResult { providers });
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }) {
+            Ok(_) => {
+                self.provider_list_rx = Some(rx);
+                true
+            }
+            Err(error) => {
+                self.providers_loading = false;
+                self.replace_activity(
+                    "providers",
+                    format!("provider list failed: {error}"),
+                    ActivityTone::Warn,
+                );
+                true
+            }
+        }
+    }
+
+    pub fn pump_provider_list(&mut self) -> bool {
+        let Some(rx) = self.provider_list_rx.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.provider_list_rx = None;
+                self.refresh_providers(result.providers);
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.provider_list_rx = None;
+                self.providers_loading = false;
+                self.replace_activity(
+                    "providers",
+                    "provider list failed: worker exited",
+                    ActivityTone::Warn,
+                );
+                true
+            }
         }
     }
 
@@ -10640,6 +10721,21 @@ fn selector_signature(shared: &Shared) -> (usize, usize, usize, bool, bool, bool
 /// Build the provider / model / effort selector row for the current selection.
 fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     if shared.chat().providers.is_empty() {
+        if shared.chat().providers_loading {
+            let s = shared.clone();
+            let row = Stack::horizontal()
+                .spacing(8.0)
+                .alignment(Alignment::Center)
+                .with_child(
+                    SizedBox::new().height(SELECTOR_H).with_child(
+                        Label::new("Loading providers...")
+                            .font_size(12.0)
+                            .color_when(move || palette(&s).text_faint),
+                    ),
+                );
+            return WidgetPod::new(row);
+        }
+
         if shared.chat().shows_recovery_empty_card() {
             let recovery_target = shared.chat().runtime_recovery_target();
             let s = shared.clone();
@@ -12028,12 +12124,14 @@ impl ChatView {
         let changed = {
             let mut chat = self.shared.chat_mut();
             let worker_changed = chat.pump_worker_events();
+            let provider_changed = chat.pump_provider_list();
             let list_changed = chat.pump_session_list();
             let transcript_changed = chat.pump_transcript_load();
             let delete_changed = chat.pump_delete();
             let channel_create_changed = chat.pump_channel_create();
             let media_changed = chat.pump_media_call_runtime();
             worker_changed
+                || provider_changed
                 || list_changed
                 || transcript_changed
                 || delete_changed
@@ -18872,6 +18970,38 @@ mod tests {
     /// Issue 2: the default/initial provider's full model list must be fetched eagerly at
     /// construction. Configured accounts seed a usable default model immediately, then
     /// `ChatState::new` kicks the async full-list fetch.
+    #[test]
+    fn provider_loading_does_not_show_provider_setup_recovery() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.providers.clear();
+        state.providers_loading = true;
+
+        assert_eq!(state.runtime_recovery_target(), None);
+        assert!(!state.shows_recovery_empty_card());
+    }
+
+    #[test]
+    fn provider_list_load_applies_async_result() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.providers.clear();
+        state.providers_loading = true;
+
+        assert!(state.start_provider_list_load(backend.config.clone(), None));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if state.pump_provider_list() {
+                assert!(!state.providers_loading);
+                assert!(state.provider_list_rx.is_none());
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        panic!("provider list worker did not finish");
+    }
+
     #[test]
     fn new_fetches_default_provider_models() {
         let backend = Backend::local_fallback();
