@@ -45,9 +45,10 @@ use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::dfs::{
-    self, DfsFetchBlobResponseChunk, DfsFileSystemId, DfsMessageCommand, DfsNetworkMessage,
-    DfsObjectId, DfsOperatorStatus, DfsReadResponseChunk, DfsRoutedMessage,
-    DfsStageBlobChunkCommand, DfsVersion, SIFS_FILE_SYSTEM_ID,
+    self, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsFetchBlobResponseChunk,
+    DfsFileSystemId, DfsMessageCommand, DfsNetworkMessage, DfsObjectId, DfsOperatorRepairView,
+    DfsOperatorStatus, DfsReadResponseChunk, DfsRoutedMessage, DfsStageBlobChunkCommand,
+    DfsVersion, SIFS_FILE_SYSTEM_ID,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
@@ -471,9 +472,31 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ) {
                 Ok(response) => match dfs::decode_dfs_status_rpc_response(&response) {
                     Ok(status) => {
+                        let repairs = if status.pending_repair_count > 0 {
+                            match fetch_dfs_repair_views_for_status(
+                                &daemon_client,
+                                target,
+                                Duration::from_millis(timeout_ms),
+                                status.pending_repair_count,
+                            ) {
+                                Ok(repairs) => repairs,
+                                Err(error) => {
+                                    failures.push(format!(
+                                        "{target}: repair inspection failed: {error}"
+                                    ));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            Vec::new()
+                        };
                         statuses.insert(
                             target.to_string(),
-                            dfs_status_probe_summary(&status, &unavailable_repair_targets),
+                            dfs_status_probe_summary(
+                                &status,
+                                &repairs,
+                                &unavailable_repair_targets,
+                            ),
                         );
                     }
                     Err(error) => failures.push(format!("{target}: decode failed: {error}")),
@@ -532,13 +555,32 @@ fn dfs_routed_status_targets_from_state(
                 && member.capabilities.iter().any(|capability| {
                     capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY
                 })
-                && network::cluster_member_main_daemon_connectivity(cluster_paths, state, member)
-                    != network::ClusterMemberMainDaemonConnectivity::Unreachable
+                && match network::cluster_member_main_daemon_connectivity(
+                    cluster_paths,
+                    state,
+                    member,
+                ) {
+                    network::ClusterMemberMainDaemonConnectivity::Healthy
+                    | network::ClusterMemberMainDaemonConnectivity::Unknown => true,
+                    network::ClusterMemberMainDaemonConnectivity::Degraded
+                    | network::ClusterMemberMainDaemonConnectivity::Unreachable => {
+                        dfs_target_has_healthy_route(cluster_paths, state, &member.node_id)
+                    }
+                }
         })
         .map(|member| member.node_id.clone())
         .collect::<Vec<_>>();
     targets.sort();
     targets
+}
+
+fn dfs_target_has_healthy_route(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+    target: &NodeId,
+) -> bool {
+    let graph = network::ClusterConnectivityGraph::read_for_local(cluster_paths, state);
+    network::cluster_healthy_route_next_hop(&graph, &state.local_node_id, target).is_some()
 }
 
 fn dfs_unavailable_repair_targets_from_state(
@@ -591,12 +633,36 @@ fn filter_dfs_routed_status_targets(
     Ok(filtered)
 }
 
+fn fetch_dfs_repair_views_for_status(
+    daemon_client: &DaemonApiClient,
+    target: &NodeId,
+    timeout: Duration,
+    pending_repair_count: usize,
+) -> Result<Vec<DfsOperatorRepairView>, String> {
+    let limit = pending_repair_count.max(1);
+    let request = dfs::dfs_inspection_rpc_request(&DaemonDfsInspectionRequest::Repair {
+        file_system_id: None,
+        object_id: None,
+        limit: Some(limit),
+        cursor: None,
+    })
+    .map_err(|error| error.to_string())?;
+    let response = daemon_client
+        .dfs_object_rpc_to_target(target, &request, timeout, true)
+        .map_err(|error| error.to_string())?;
+    match dfs::decode_dfs_inspection_rpc_response(&response).map_err(|error| error.to_string())? {
+        DaemonDfsInspectionResponse::Repair { repairs, .. } => Ok(repairs),
+        other => Err(format!("unexpected DFS inspection response: {other:?}")),
+    }
+}
+
 fn dfs_status_probe_summary(
     status: &DfsOperatorStatus,
+    repairs: &[DfsOperatorRepairView],
     unavailable_repair_targets: &BTreeSet<NodeId>,
 ) -> BTreeMap<&'static str, u64> {
     let unavailable_pending_repairs =
-        dfs_unavailable_pending_repair_count(status, unavailable_repair_targets);
+        dfs_unavailable_pending_repair_count(status, repairs, unavailable_repair_targets);
     let active_pending_repairs = status
         .pending_repair_count
         .saturating_sub(unavailable_pending_repairs);
@@ -616,12 +682,13 @@ fn dfs_status_probe_summary(
 
 fn dfs_unavailable_pending_repair_count(
     status: &DfsOperatorStatus,
+    repairs: &[DfsOperatorRepairView],
     unavailable_repair_targets: &BTreeSet<NodeId>,
 ) -> usize {
     if status.pending_repair_count == 0 || unavailable_repair_targets.is_empty() {
         return 0;
     }
-    let unavailable_repairs = status
+    let mut unavailable_repairs = status
         .repair_attempts
         .iter()
         .filter(|attempt| unavailable_repair_targets.contains(&attempt.missing_replica_node_id))
@@ -631,9 +698,19 @@ fn dfs_unavailable_pending_repair_count(
                 attempt.missing_replica_node_id.clone(),
             )
         })
-        .collect::<BTreeSet<_>>()
-        .len();
-    unavailable_repairs.min(status.pending_repair_count)
+        .collect::<BTreeSet<_>>();
+    unavailable_repairs.extend(
+        repairs
+            .iter()
+            .filter(|repair| unavailable_repair_targets.contains(&repair.missing_replica_node_id))
+            .map(|repair| {
+                (
+                    repair.intent_id.clone(),
+                    repair.missing_replica_node_id.clone(),
+                )
+            }),
+    );
+    unavailable_repairs.len().min(status.pending_repair_count)
 }
 
 fn run_service_advertisements(ctx: &mut SinomoTestContext) -> SinomoTestResult {
@@ -3332,6 +3409,20 @@ mod tests {
         }
     }
 
+    fn repair_view(intent_id: &str, missing_replica_node_id: NodeId) -> DfsOperatorRepairView {
+        DfsOperatorRepairView {
+            intent_id: intent_id.to_string(),
+            file_system_id: DfsFileSystemId::from_legacy_named("fs_dfs_repair_view")
+                .expect("file system id"),
+            object_id: DfsObjectId::from_legacy_named(format!("object_{intent_id}"))
+                .expect("object id"),
+            version: DfsVersion::from_legacy_named(format!("version_{intent_id}"))
+                .expect("version"),
+            content_hash: Some(format!("blake3:{intent_id}")),
+            missing_replica_node_id,
+        }
+    }
+
     #[test]
     fn dfs_status_summary_excludes_unavailable_repair_targets_from_active_debt() {
         let unavailable =
@@ -3358,11 +3449,42 @@ mod tests {
                 repair_attempt("reachable_replica", reachable),
             ],
         };
+        let repairs = Vec::new();
 
-        let summary = dfs_status_probe_summary(&status, &unavailable_repair_targets);
+        let summary = dfs_status_probe_summary(&status, &repairs, &unavailable_repair_targets);
 
         assert_eq!(summary.get("pending_repairs"), Some(&1));
         assert_eq!(summary.get("total_pending_repairs"), Some(&2));
+        assert_eq!(summary.get("unavailable_pending_repairs"), Some(&1));
+    }
+
+    #[test]
+    fn dfs_status_summary_uses_repair_views_when_attempt_records_are_absent() {
+        let unavailable =
+            NodeId::from_legacy_named("node_dfs_unavailable_repair_view_target").expect("node");
+        let mut unavailable_repair_targets = BTreeSet::new();
+        unavailable_repair_targets.insert(unavailable.clone());
+        let status = DfsOperatorStatus {
+            file_system_count: 1,
+            object_count: 2,
+            version_count: 3,
+            receipt_count: 4,
+            intent_count: 5,
+            pending_write_count: 0,
+            open_conflict_count: 0,
+            pending_repair_count: 1,
+            repair_attempt_count: 0,
+            pending_namespace_job_count: 0,
+            failed_namespace_job_count: 0,
+            metadata_shards: Vec::new(),
+            repair_attempts: Vec::new(),
+        };
+        let repairs = vec![repair_view("offline_replica_without_attempt", unavailable)];
+
+        let summary = dfs_status_probe_summary(&status, &repairs, &unavailable_repair_targets);
+
+        assert_eq!(summary.get("pending_repairs"), Some(&0));
+        assert_eq!(summary.get("total_pending_repairs"), Some(&1));
         assert_eq!(summary.get("unavailable_pending_repairs"), Some(&1));
     }
 }

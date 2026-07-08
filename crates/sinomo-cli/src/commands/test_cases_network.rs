@@ -1365,11 +1365,11 @@ fn network_ping_targets_from_state(
     let targets = network_test_member_targets_from_state(state)?;
     Ok(targets
         .into_iter()
-        .filter(|target| network_ping_target_is_not_unreachable(paths, state, target))
+        .filter(|target| network_ping_target_is_available_for_probe(paths, state, target))
         .collect())
 }
 
-fn network_ping_target_is_not_unreachable(
+fn network_ping_target_is_available_for_probe(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     target: &NodeId,
@@ -1379,9 +1379,24 @@ fn network_ping_target_is_not_unreachable(
         .iter()
         .find(|member| member.node_id == *target)
         .is_none_or(|member| {
-            network::cluster_member_main_daemon_connectivity(paths, state, member)
-                != network::ClusterMemberMainDaemonConnectivity::Unreachable
+            match network::cluster_member_main_daemon_connectivity(paths, state, member) {
+                network::ClusterMemberMainDaemonConnectivity::Healthy
+                | network::ClusterMemberMainDaemonConnectivity::Unknown => true,
+                network::ClusterMemberMainDaemonConnectivity::Degraded
+                | network::ClusterMemberMainDaemonConnectivity::Unreachable => {
+                    network_target_has_healthy_route(paths, state, target)
+                }
+            }
         })
+}
+
+fn network_target_has_healthy_route(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    target: &NodeId,
+) -> bool {
+    let graph = network::ClusterConnectivityGraph::read_for_local(paths, state);
+    network::cluster_healthy_route_next_hop(&graph, &state.local_node_id, target).is_some()
 }
 
 fn network_test_member_targets_from_state(
@@ -2416,6 +2431,121 @@ mod tests {
         assert!(
             targets.is_empty(),
             "shadow-only degraded connectivity must not make a main daemon benchmark targetable: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn network_ping_targets_exclude_degraded_main() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-ping-target-degraded-main");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let mut state = test_state();
+        let remote = state.members[1].node_id.clone();
+        let main_endpoint = test_endpoint(
+            &remote,
+            "endpoint_network_ping_degraded_main",
+            "remote.test:21353",
+        );
+        state.members[1].endpoints = vec![main_endpoint.clone()];
+        let now = OffsetDateTime::now_utc();
+        let main_connectivity = network::cluster_connectivity_record(
+            &state,
+            &main_endpoint,
+            network::ClusterConnectivityState::Degraded,
+            Some(80),
+            2,
+            Some(now.to_string()),
+            None,
+            now,
+            network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[main_connectivity],
+        )
+        .expect("write connectivity");
+
+        let targets = network_ping_targets_from_state(&paths, &state).expect("targets");
+
+        assert!(
+            targets.is_empty(),
+            "degraded main daemon connectivity must not make a benchmark targetable: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn network_ping_targets_include_degraded_main_with_healthy_route() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-ping-target-routed-main");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let mut state = test_state();
+        let bridge = state.members[1].node_id.clone();
+        let target = add_remote_main(&mut state, "node_network_ping_routed_target");
+        let bridge_endpoint = test_endpoint(
+            &bridge,
+            "endpoint_network_ping_routed_bridge",
+            "bridge.test:21353",
+        );
+        let target_endpoint = test_endpoint(
+            &target,
+            "endpoint_network_ping_routed_target",
+            "target.test:21353",
+        );
+        state.members[1].endpoints = vec![bridge_endpoint.clone()];
+        state.members[2].endpoints = vec![target_endpoint.clone()];
+        let now = OffsetDateTime::now_utc();
+        let local_to_target = network::cluster_connectivity_record(
+            &state,
+            &target_endpoint,
+            network::ClusterConnectivityState::Degraded,
+            Some(80),
+            2,
+            Some(now.to_string()),
+            None,
+            now,
+            network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let local_to_bridge = network::cluster_connectivity_record(
+            &state,
+            &bridge_endpoint,
+            network::ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let mut bridge_state = state.clone();
+        bridge_state.local_node_id = bridge.clone();
+        let bridge_to_target = network::cluster_connectivity_record(
+            &bridge_state,
+            &target_endpoint,
+            network::ClusterConnectivityState::Healthy,
+            Some(2),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[local_to_target, local_to_bridge],
+        )
+        .expect("write local connectivity");
+        network::write_local_cluster_connectivity_record_set(&paths, &bridge, &[bridge_to_target])
+            .expect("write bridge connectivity");
+
+        let targets = network_ping_targets_from_state(&paths, &state).expect("targets");
+
+        assert!(
+            targets.contains(&target),
+            "degraded direct connectivity must stay targetable when the graph has a healthy route: {targets:?}"
         );
     }
 
