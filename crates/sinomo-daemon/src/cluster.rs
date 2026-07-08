@@ -67,7 +67,10 @@ use sinomo_core::{
 };
 #[cfg(test)]
 use sinomo_core::{ClusterJoinInvite, ClusterMemberRole, ClusterMemberState, TrustDomain};
-use sinomo_rollout::{ClusterRolloutBuildRequest, SelfRolloutPaths, read_rollout_status};
+use sinomo_rollout::{
+    CLUSTER_ROLLOUT_PROGRESS_TOTAL, ClusterRolloutBuildRequest, ClusterRolloutProgressUpdate,
+    SelfRolloutPaths, cluster_rollout_progress_status, read_rollout_status, write_rollout_status,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -139,9 +142,13 @@ const PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS: usize =
     sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
 const CLUSTER_CONNECTIVITY_IMPORT_CONCURRENCY: usize = 16;
 const CLUSTER_NETWORK_PENDING_CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(8);
-const CLUSTER_NETWORK_PENDING_MEMBER_PUBLISH_TIMEOUT: Duration = Duration::from_secs(4);
-const CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT: Duration = Duration::from_secs(3);
-const CLUSTER_NETWORK_PENDING_SERVICE_PUBLISH_TIMEOUT: Duration = Duration::from_secs(3);
+const CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(10);
+const CLUSTER_NETWORK_PENDING_MEMBER_PUBLISH_TIMEOUT: Duration =
+    CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT;
+const CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT: Duration =
+    CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT;
+const CLUSTER_NETWORK_PENDING_SERVICE_PUBLISH_TIMEOUT: Duration =
+    CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT;
 const CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE: Duration = Duration::from_secs(4);
 
 #[cfg(test)]
@@ -683,6 +690,10 @@ fn desired_rollout_reconcile_decision(
     }
     match status.status.as_str() {
         "accepted" | "healthy" | "recovered" => DesiredRolloutReconcileDecision::Complete,
+        "main-staged" if rollout_progress_status_is_stale(status, now) => {
+            DesiredRolloutReconcileDecision::TerminalFailure
+        }
+        "main-staged" => DesiredRolloutReconcileDecision::Wait,
         "failed" | "rejected" | "rolled-back" if desired_rollout_failure_is_hard(status) => {
             DesiredRolloutReconcileDecision::TerminalFailure
         }
@@ -707,24 +718,98 @@ fn desired_rollout_failure_is_hard(status: &ClusterNodeRolloutStatus) -> bool {
             | "build-failed"
             | "module-install-failed"
             | "rejected"
+            | "shadow-handoff-failed"
             | "shadow-finalized"
             | "source-rejected"
             | "staging-failed"
     )
 }
 
+fn rollout_progress_status_timestamp(status: &ClusterNodeRolloutStatus) -> Option<OffsetDateTime> {
+    [
+        status.updated_at.as_deref(),
+        status.staged_at.as_deref(),
+        status.failed_at.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+    .max()
+}
+
 fn rollout_progress_status_is_stale(
     status: &ClusterNodeRolloutStatus,
     now: OffsetDateTime,
 ) -> bool {
-    let Some(updated_at) = status
-        .updated_at
-        .as_deref()
-        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-    else {
+    let Some(updated_at) = rollout_progress_status_timestamp(status) else {
         return true;
     };
     now - updated_at >= time::Duration::seconds(DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS)
+}
+
+fn desired_rollout_stale_handoff_failure_status(
+    status: &ClusterNodeRolloutStatus,
+    now: OffsetDateTime,
+) -> ClusterNodeRolloutStatus {
+    let detail = format!(
+        "candidate main handoff did not finalize within {}s; leaving desired rollout failed until a new rollout is requested",
+        DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS
+    );
+    let mut failed = cluster_rollout_progress_status(ClusterRolloutProgressUpdate::new(
+        "failed",
+        status
+            .mode
+            .clone()
+            .unwrap_or_else(|| "cluster-remote-build".to_string()),
+        Some(detail.clone()),
+        status
+            .source
+            .clone()
+            .unwrap_or_else(|| "cluster desired rollout".to_string()),
+        status.requested_at.clone().unwrap_or_else(|| {
+            now.format(&Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string())
+        }),
+        "shadow-handoff-failed",
+        status
+            .progress_current
+            .unwrap_or(CLUSTER_ROLLOUT_PROGRESS_TOTAL),
+        detail,
+    ));
+    failed.staged_at = status.staged_at.clone();
+    failed
+}
+
+fn desired_rollout_stale_handoff_should_be_recorded(
+    status: &ClusterNodeRolloutStatus,
+    now: OffsetDateTime,
+) -> bool {
+    status.status == "main-staged" && rollout_progress_status_is_stale(status, now)
+}
+
+fn record_desired_rollout_stale_handoff_failure_if_needed(
+    rollout_paths: &SelfRolloutPaths,
+    status: &ClusterNodeRolloutStatus,
+    mode: Option<&str>,
+    requested_at: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<bool, DaemonError> {
+    if !desired_rollout_stale_handoff_should_be_recorded(status, now)
+        || status.mode.as_deref() != mode
+        || status.requested_at.as_deref() != requested_at
+    {
+        return Ok(false);
+    }
+    let failed = desired_rollout_stale_handoff_failure_status(status, now);
+    write_rollout_status(rollout_paths, &failed)?;
+    tracing::warn!(
+        "sinomo daemon desired rollout failed after stale handoff: {}",
+        failed
+            .detail
+            .as_deref()
+            .unwrap_or("candidate main handoff did not finalize")
+    );
+    Ok(true)
 }
 
 fn remember_connectivity_record_set(
@@ -2473,11 +2558,23 @@ impl ClusterNetworkMaintenance {
         })?;
         let rollout_paths = SelfRolloutPaths::new(data_dir);
         let current_status = read_rollout_status(&rollout_paths)?;
+        let now = OffsetDateTime::now_utc();
+        if let Some(status) = current_status.as_ref()
+            && record_desired_rollout_stale_handoff_failure_if_needed(
+                &rollout_paths,
+                status,
+                desired.mode.as_deref(),
+                desired.requested_at.as_deref(),
+                now,
+            )?
+        {
+            return Ok(());
+        }
         match desired_rollout_reconcile_decision(
             current_status.as_ref(),
             desired.mode.as_deref(),
             desired.requested_at.as_deref(),
-            OffsetDateTime::now_utc(),
+            now,
         ) {
             DesiredRolloutReconcileDecision::Complete
             | DesiredRolloutReconcileDecision::TerminalFailure
@@ -2628,13 +2725,17 @@ impl ClusterNetworkMaintenance {
             }
         }
         for refresh in node_status_refreshes {
-            let _ = cluster_network_pending_step_with_deadline(
+            if cluster_network_pending_step_with_deadline(
                 "node status refresh",
                 CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT,
                 deadline,
                 self.run_pending_node_status_refresh_async(refresh, runtime.clone()),
             )
-            .await;
+            .await
+            .is_none()
+            {
+                self.record_publish_failure();
+            }
         }
         for publish in member_publishes {
             if cluster_network_pending_step_with_deadline(
@@ -2650,13 +2751,17 @@ impl ClusterNetworkMaintenance {
             }
         }
         if let Some(publish) = service_instance_publish {
-            let _ = cluster_network_pending_step_with_deadline(
+            if cluster_network_pending_step_with_deadline(
                 "service instance publish",
                 CLUSTER_NETWORK_PENDING_SERVICE_PUBLISH_TIMEOUT,
                 deadline,
                 self.run_pending_service_instance_publish_async(publish, runtime),
             )
-            .await;
+            .await
+            .is_none()
+            {
+                self.record_publish_failure();
+            }
         }
     }
 
@@ -8797,10 +8902,49 @@ mod tests {
             DesiredRolloutReconcileDecision::Retry
         );
 
-        let stale_main_staged = desired_rollout_status_for_test(
+        let mut fresh_main_staged =
+            desired_rollout_status_for_test("main-staged", "main-staged", now);
+        fresh_main_staged.updated_at = None;
+        fresh_main_staged.staged_at = Some(now.format(&Rfc3339).expect("staged timestamp"));
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                Some(&fresh_main_staged),
+                Some("cluster-remote-build"),
+                Some("2026-07-07T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::Wait
+        );
+
+        let mut fresh_main_staged_with_stale_update =
+            desired_rollout_status_for_test("main-staged", "main-staged", now);
+        fresh_main_staged_with_stale_update.updated_at = Some(
+            (now - time::Duration::seconds(DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS + 1))
+                .format(&Rfc3339)
+                .expect("updated timestamp"),
+        );
+        fresh_main_staged_with_stale_update.staged_at =
+            Some(now.format(&Rfc3339).expect("staged timestamp"));
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                Some(&fresh_main_staged_with_stale_update),
+                Some("cluster-remote-build"),
+                Some("2026-07-07T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::Wait
+        );
+
+        let mut stale_main_staged = desired_rollout_status_for_test(
             "main-staged",
             "main-staged",
             now - time::Duration::seconds(DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS + 1),
+        );
+        stale_main_staged.updated_at = None;
+        stale_main_staged.staged_at = Some(
+            (now - time::Duration::seconds(DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS + 1))
+                .format(&Rfc3339)
+                .expect("staged timestamp"),
         );
         assert_eq!(
             desired_rollout_reconcile_decision(
@@ -8809,7 +8953,7 @@ mod tests {
                 Some("2026-07-07T00:00:00Z"),
                 now,
             ),
-            DesiredRolloutReconcileDecision::Retry
+            DesiredRolloutReconcileDecision::TerminalFailure
         );
     }
 
@@ -8873,6 +9017,31 @@ mod tests {
     }
 
     #[test]
+    fn desired_rollout_reconcile_hard_failure_does_not_block_new_request() {
+        let now = OffsetDateTime::now_utc();
+        let compile_failure = desired_rollout_status_for_test("rejected", "build-failed", now);
+
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                Some(&compile_failure),
+                Some("cluster-remote-build"),
+                Some("2026-07-07T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::TerminalFailure
+        );
+        assert_eq!(
+            desired_rollout_reconcile_decision(
+                Some(&compile_failure),
+                Some("cluster-remote-build"),
+                Some("2026-07-08T00:00:00Z"),
+                now,
+            ),
+            DesiredRolloutReconcileDecision::Retry
+        );
+    }
+
+    #[test]
     fn desired_rollout_reconcile_retries_stale_recoverable_failure() {
         let now = OffsetDateTime::now_utc();
         let fresh = desired_rollout_status_for_test("failed", "transport-failed", now);
@@ -8915,6 +9084,68 @@ mod tests {
             ),
             DesiredRolloutReconcileDecision::Retry
         );
+    }
+
+    #[test]
+    fn desired_rollout_stale_handoff_status_is_hard_failure() {
+        let now = OffsetDateTime::now_utc();
+        let mut staged = desired_rollout_status_for_test(
+            "main-staged",
+            "main-staged",
+            now - time::Duration::seconds(DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS + 1),
+        );
+        staged.updated_at = None;
+        staged.staged_at = Some(
+            (now - time::Duration::seconds(DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS + 1))
+                .format(&Rfc3339)
+                .expect("staged timestamp"),
+        );
+
+        let failure = desired_rollout_stale_handoff_failure_status(&staged, now);
+
+        assert_eq!(failure.status, "failed");
+        assert_eq!(failure.phase.as_deref(), Some("shadow-handoff-failed"));
+        assert!(failure.failed_at.is_some());
+        assert_eq!(failure.staged_at, staged.staged_at);
+        assert!(desired_rollout_failure_is_hard(&failure));
+    }
+
+    #[test]
+    fn desired_rollout_stale_handoff_is_recorded_to_rollout_state() {
+        let root = unique_cluster_test_root("desired-rollout-stale-handoff-record");
+        let data_dir = root.join("data");
+        let rollout_paths = SelfRolloutPaths::new(&data_dir);
+        sinomo_rollout::ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let now = OffsetDateTime::now_utc();
+        let mut staged = desired_rollout_status_for_test(
+            "main-staged",
+            "main-staged",
+            now - time::Duration::seconds(DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS + 1),
+        );
+        staged.updated_at = None;
+        staged.staged_at = Some(
+            (now - time::Duration::seconds(DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS + 1))
+                .format(&Rfc3339)
+                .expect("staged timestamp"),
+        );
+        write_rollout_status(&rollout_paths, &staged).expect("staged status");
+
+        let recorded = record_desired_rollout_stale_handoff_failure_if_needed(
+            &rollout_paths,
+            &staged,
+            Some("cluster-remote-build"),
+            Some("2026-07-07T00:00:00Z"),
+            now,
+        )
+        .expect("record handoff failure");
+        let status = read_rollout_status(&rollout_paths)
+            .expect("read rollout status")
+            .expect("rollout status");
+
+        assert!(recorded);
+        assert_eq!(status.status, "failed");
+        assert_eq!(status.phase.as_deref(), Some("shadow-handoff-failed"));
+        assert_eq!(status.requested_at.as_deref(), Some("2026-07-07T00:00:00Z"));
     }
 
     #[test]
@@ -9915,6 +10146,107 @@ mod tests {
         assert!(
             already_expired <= Instant::now(),
             "connectivity should be skipped when the remaining budget is already reserved"
+        );
+    }
+
+    #[test]
+    fn cluster_network_pending_publish_timeouts_respect_control_plane_attempt_budget() {
+        assert!(
+            CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT
+                >= sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
+            "node-status publish needs enough budget for one public endpoint attempt"
+        );
+        assert!(
+            CLUSTER_NETWORK_PENDING_MEMBER_PUBLISH_TIMEOUT
+                >= sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
+            "member publish needs enough budget for one public endpoint attempt"
+        );
+        assert!(
+            CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT
+                >= DAEMON_CLUSTER_FORMATION_IROH_COMMAND_TIMEOUT,
+            "formation node-status publish needs enough budget for one Iroh command attempt"
+        );
+        assert!(
+            CLUSTER_NETWORK_PENDING_MEMBER_PUBLISH_TIMEOUT
+                >= DAEMON_CLUSTER_FORMATION_IROH_COMMAND_TIMEOUT,
+            "formation member publish needs enough budget for one Iroh command attempt"
+        );
+    }
+
+    #[test]
+    fn cluster_network_maintenance_records_node_status_timeout_for_retry() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let root = unique_cluster_test_root("sinomo-daemon-node-status-timeout-retry");
+        let data_root = root.join("data");
+        let daemon_paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let maintenance_now = Instant::now();
+        let mut maintenance = ClusterNetworkMaintenance {
+            service_registry: None,
+            discovery: None,
+            discovery_cache: MdnsDiscoveryCache::new(),
+            connectivity: std::collections::BTreeMap::new(),
+            connectivity_cursor: 0,
+            connectivity_converged: true,
+            environment_id: None,
+            local_node_role: ClusterNodeRole::Workstation,
+            solo_cluster_idle: false,
+            startup_settle_until: None,
+            tick: 0,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
+            last_publish: maintenance_now,
+            last_discovery: maintenance_now,
+            last_probe: maintenance_now,
+            idle_stats: Arc::new(IdleStatsAtomics::new()),
+        };
+        let pending = ClusterNetworkMaintenancePendingWork {
+            node_status_refreshes: vec![ClusterNodeStatusPendingRefresh {
+                paths: daemon_paths,
+                label: "node status",
+                use_formation_timeouts: false,
+            }],
+            ..Default::default()
+        };
+        let expired_deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap_or_else(Instant::now);
+
+        runtime.block_on(maintenance.run_pending_work_until_async(
+            pending,
+            runtime.handle().clone(),
+            expired_deadline,
+        ));
+
+        assert_eq!(
+            maintenance.publish_failure_streak, 1,
+            "timed-out node-status publish should count as a publish failure"
+        );
+        let before_backoff = Instant::now()
+            .checked_add(DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF / 2)
+            .expect("before backoff instant");
+        let after_backoff = Instant::now()
+            .checked_add(
+                DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF + Duration::from_millis(100),
+            )
+            .expect("after backoff instant");
+        assert!(
+            !sinomo_core::network::cluster_network_maintenance_interval_due(
+                before_backoff,
+                maintenance.last_publish,
+                DAEMON_CLUSTER_PUBLISH_INTERVAL,
+            ),
+            "timeout should not cause a tight retry loop"
+        );
+        assert!(
+            sinomo_core::network::cluster_network_maintenance_interval_due(
+                after_backoff,
+                maintenance.last_publish,
+                DAEMON_CLUSTER_PUBLISH_INTERVAL,
+            ),
+            "timeout should keep publish eligible after the failure backoff"
         );
     }
 

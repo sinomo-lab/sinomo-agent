@@ -9386,6 +9386,11 @@ fn stateless_endpoint_reader_write_commits_after_primary_fetch_receipt() {
         primary_backend
             .put_file_system(&file_system)
             .expect("primary filesystem");
+        for object in distributed_sifs_bootstrap_objects(file_system.owner_node_id.clone()) {
+            primary_backend
+                .put_object(&object)
+                .expect("primary SIFS bootstrap object");
+        }
     }
     let primary_for_sender = primary.clone();
     let primary_content_for_sender = primary_content_root.clone();
@@ -9436,6 +9441,8 @@ fn stateless_endpoint_reader_write_commits_after_primary_fetch_receipt() {
         NetworkedDfsService::new(transport, writer_content).with_control_plane(control_plane);
     dfs.add_file_system(file_system.clone())
         .expect("writer filesystem");
+    dfs.bootstrap_distributed_sifs()
+        .expect("writer SIFS bootstrap");
     let mut object = file_metadata(primary.clone());
     object.file_system_id = file_system.file_system_id.clone();
     object.object_id = object_id.clone();
