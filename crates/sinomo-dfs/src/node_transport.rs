@@ -301,6 +301,7 @@ pub struct DfsNodeTransport {
     direct_read_sender: Option<DfsDirectReadSender>,
     async_direct_read_sender: Option<AsyncDfsDirectReadSender>,
     async_direct_read_stream_sender: Option<AsyncDfsDirectReadStreamSender>,
+    operation_deadline: Option<Instant>,
 }
 
 impl std::fmt::Debug for DfsNodeTransport {
@@ -502,7 +503,31 @@ impl DfsNodeTransport {
             direct_read_sender,
             async_direct_read_sender,
             async_direct_read_stream_sender,
+            operation_deadline: None,
         }
+    }
+
+    pub fn set_operation_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
+        std::mem::replace(&mut self.operation_deadline, deadline)
+    }
+
+    fn current_connect_timeout(
+        &self,
+        operation: impl Into<String>,
+    ) -> Result<Duration, NetworkError> {
+        let Some(deadline) = self.operation_deadline else {
+            return Ok(self.connect_timeout);
+        };
+        let Some(remaining) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+        else {
+            return Err(NetworkError::Io {
+                operation: operation.into(),
+                detail: "DFS operation deadline expired before routed send".to_string(),
+            });
+        };
+        Ok(self.connect_timeout.min(remaining))
     }
 
     fn replace_peer_nodes(&mut self, peer_node_ids: impl IntoIterator<Item = NodeId>) {
@@ -556,9 +581,11 @@ impl DfsNodeTransport {
                     detail: "DFS peer transport was constructed without a sync sender".to_string(),
                 });
             };
+            let connect_timeout =
+                self.current_connect_timeout(format!("send DFS message to {target_node_id}"))?;
             let returned_messages = send_dfs_routed_message_to_peer(
                 sender,
-                self.connect_timeout,
+                connect_timeout,
                 target_node_id,
                 routed_message,
             )?;
@@ -587,9 +614,11 @@ impl DfsNodeTransport {
         let Some(request) = dfs_direct_read_request_from_read_request(read_request) else {
             return Ok(None);
         };
+        let connect_timeout =
+            self.current_connect_timeout(format!("direct DFS read from {target_node_id}"))?;
         let response = send_dfs_direct_read_to_peer(
             sender,
-            self.connect_timeout,
+            connect_timeout,
             target_node_id.clone(),
             &request,
         )?;
@@ -611,11 +640,13 @@ impl DfsNodeTransport {
         let Some(request) = dfs_direct_read_request_from_read_request(read_request) else {
             return Ok(None);
         };
+        let connect_timeout =
+            self.current_connect_timeout(format!("direct DFS read from {target_node_id}"))?;
         let response = if let Some(sender) = self.async_direct_read_stream_sender.as_ref().cloned()
         {
             send_dfs_direct_read_stream_to_peer_async(
                 sender,
-                self.connect_timeout,
+                connect_timeout,
                 target_node_id.clone(),
                 &request,
             )
@@ -623,7 +654,7 @@ impl DfsNodeTransport {
         } else if let Some(sender) = self.async_direct_read_sender.as_ref().cloned() {
             send_dfs_direct_read_to_peer_async(
                 sender,
-                self.connect_timeout,
+                connect_timeout,
                 target_node_id.clone(),
                 &request,
             )
@@ -655,6 +686,8 @@ impl DfsNodeTransport {
                 detail: "DFS peer transport was constructed without a sync sender".to_string(),
             });
         };
+        let connect_timeout =
+            self.current_connect_timeout(format!("send detached DFS message to {target_node_id}"))?;
         self.detached_sends
             .lock()
             .map_err(|_| NetworkError::Io {
@@ -663,7 +696,7 @@ impl DfsNodeTransport {
             })?
             .push(DeferredDfsPeerSend {
                 sender,
-                connect_timeout: self.connect_timeout,
+                connect_timeout,
                 target_node_id: target_node_id.clone(),
                 routed_message,
             });
@@ -761,7 +794,8 @@ impl DfsNodeTransport {
                 }
                 continue;
             }
-            let connect_timeout = self.connect_timeout;
+            let connect_timeout =
+                self.current_connect_timeout(format!("send DFS message to {target_node_id}"))?;
             let Some(sender) = self.async_sender.as_ref().cloned() else {
                 return Err(NetworkError::Io {
                     operation: format!("send DFS message to {target_node_id}"),
@@ -1128,6 +1162,120 @@ impl DfsMessageTransport for DfsNodeTransport {
 impl NetworkedDfsService<DfsNodeTransport> {
     pub fn refresh_peer_targets(&mut self, peer_node_ids: Vec<NodeId>) {
         self.transport.replace_peer_nodes(peer_node_ids);
+    }
+
+    pub fn set_transport_operation_deadline(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Option<Instant> {
+        self.transport.set_operation_deadline(deadline)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DfsObjectId, DfsReadResult};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn node_id(name: &str) -> NodeId {
+        NodeId::from_legacy_named(name).expect("node id")
+    }
+
+    fn test_message(source: &NodeId, target: &NodeId, frame_id: u64) -> DfsRoutedMessage {
+        DfsRoutedMessage {
+            source_node_id: source.clone(),
+            target_node_id: target.clone(),
+            frame_id,
+            message_id: frame_id,
+            message: DfsNetworkMessage::ReadResponse(DfsReadResponse {
+                request_id: format!("read_response_{frame_id}"),
+                object_id: DfsObjectId::from_legacy_named(format!("object_{frame_id}"))
+                    .expect("object id"),
+                result: DfsReadResult::NotFound,
+            }),
+        }
+    }
+
+    #[test]
+    fn operation_deadline_bounds_consecutive_sync_sends() {
+        let local = node_id("node_deadline_local");
+        let remote = node_id("node_deadline_remote");
+        let observed_timeouts = Arc::new(Mutex::new(Vec::new()));
+        let sender_timeouts = Arc::clone(&observed_timeouts);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, connect_timeout| {
+            sender_timeouts
+                .lock()
+                .expect("timeouts")
+                .push(connect_timeout);
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(60),
+            sender,
+        );
+        transport.set_operation_deadline(Some(Instant::now() + Duration::from_millis(100)));
+
+        transport
+            .send_routed_message(&remote, test_message(&local, &remote, 1))
+            .expect("first send");
+        transport
+            .send_routed_message(&remote, test_message(&local, &remote, 2))
+            .expect("second send");
+
+        let observed = observed_timeouts.lock().expect("timeouts").clone();
+        assert_eq!(observed.len(), 2);
+        assert!(
+            observed[0] <= Duration::from_millis(100),
+            "first send should be capped by operation deadline, got {:?}",
+            observed[0]
+        );
+        assert!(
+            observed[1] < observed[0],
+            "second send should receive only remaining operation budget: {observed:?}"
+        );
+    }
+
+    #[test]
+    fn operation_deadline_expiry_rejects_before_sender_runs() {
+        let local = node_id("node_expired_deadline_local");
+        let remote = node_id("node_expired_deadline_remote");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _connect_timeout| {
+            sender_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(60),
+            sender,
+        );
+        transport.set_operation_deadline(Some(Instant::now() + Duration::from_millis(1)));
+        std::thread::sleep(Duration::from_millis(5));
+
+        let error = transport
+            .send_routed_message(&remote, test_message(&local, &remote, 1))
+            .expect_err("expired deadline should fail before send");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            error
+                .to_string()
+                .contains("DFS operation deadline expired before routed send"),
+            "unexpected error: {error}"
+        );
     }
 }
 

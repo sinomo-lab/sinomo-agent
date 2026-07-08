@@ -388,7 +388,7 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
     retry_bulk_mutation(
         deadline,
-        || backend.write_file(&path, payload.as_bytes()),
+        || backend.write_file_with_deadline(&path, payload.as_bytes(), deadline),
         || format!("cannot write SIFS file {path}"),
     )?;
     expect_payload_now(&backend, &path, payload.as_bytes(), "after write")?;
@@ -867,27 +867,43 @@ fn run_concurrent_file_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .create_dir_all(&base)
         .map_err(SinomoTestError::failed)?;
     backend
-        .write_file(&path, &seed)
+        .write_file_with_deadline(&path, &seed, Instant::now() + timeout)
         .map_err(SinomoTestError::failed)?;
     ctx.record("node", &node);
     ctx.record("path", &path);
 
     let started = Instant::now();
-    let run_writer =
-        |label: &'static str, data_dir: SinomoDataDir, path: String, bytes: Vec<u8>| {
-            std::thread::spawn(move || {
-                let started = Instant::now();
-                let result = SifsFileManagerBackend::open(&data_dir)
-                    .and_then(|backend| backend.write_file(&path, &bytes));
-                (
-                    label,
-                    result.map(|_| ()).map_err(|error| error.to_string()),
-                    started.elapsed().as_millis() as u64,
-                )
-            })
-        };
-    let thread_a = run_writer("writer-a", data_dir.clone(), path.clone(), writer_a.clone());
-    let thread_b = run_writer("writer-b", data_dir.clone(), path.clone(), writer_b.clone());
+    let deadline = started + timeout;
+    let run_writer = |label: &'static str,
+                      data_dir: SinomoDataDir,
+                      path: String,
+                      bytes: Vec<u8>,
+                      deadline: Instant| {
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = SifsFileManagerBackend::open(&data_dir)
+                .and_then(|backend| backend.write_file_with_deadline(&path, &bytes, deadline));
+            (
+                label,
+                result.map(|_| ()).map_err(|error| error.to_string()),
+                started.elapsed().as_millis() as u64,
+            )
+        })
+    };
+    let thread_a = run_writer(
+        "writer-a",
+        data_dir.clone(),
+        path.clone(),
+        writer_a.clone(),
+        deadline,
+    );
+    let thread_b = run_writer(
+        "writer-b",
+        data_dir.clone(),
+        path.clone(),
+        writer_b.clone(),
+        deadline,
+    );
     let results = vec![
         thread_a
             .join()
@@ -1583,9 +1599,10 @@ fn run_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         deadline,
         || {
             if foreground_repair {
-                backend.write_file_with_foreground_replica_repair(&path, &payload)
+                backend
+                    .write_file_with_foreground_replica_repair_deadline(&path, &payload, deadline)
             } else {
-                backend.write_file(&path, &payload)
+                backend.write_file_with_deadline(&path, &payload, deadline)
             }
         },
         || format!("cannot write SIFS file {path}"),
@@ -1896,7 +1913,7 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let deadline = started + timeout;
     retry_bulk_mutation(
         deadline,
-        || backend.create_dir_all_deferred_local_replay(&base),
+        || backend.create_dir_all_deferred_local_replay_until(&base, deadline),
         || format!("cannot create SIFS directory {base}"),
     )?;
     let mkdir_elapsed = started.elapsed();
@@ -1909,7 +1926,7 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let write_started = Instant::now();
     retry_bulk_mutation(
         deadline,
-        || backend.write_files_with_known_parents_deferred_publish(&batch),
+        || backend.write_files_with_known_parents_deferred_publish_until(&batch, deadline),
         || format!("cannot write SIFS bulk batch under {base}"),
     )?;
     let write_elapsed = write_started.elapsed();
@@ -2221,7 +2238,7 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     if let Some(parent) = parent.as_deref() {
         retry_bulk_mutation(
             deadline,
-            || backend.create_dir_all_deferred_local_replay(parent),
+            || backend.create_dir_all_deferred_local_replay_until(parent, deadline),
             || format!("cannot create SIFS parent directory {parent}"),
         )?;
     }
@@ -2230,7 +2247,7 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let write_started = Instant::now();
     retry_bulk_mutation(
         deadline,
-        || backend.write_file_with_known_parent_deferred_publish(&path, &payload),
+        || backend.write_file_with_known_parent_deferred_publish_until(&path, &payload, deadline),
         || format!("cannot write large SIFS file {path}"),
     )?;
     let write_elapsed = write_started.elapsed();
