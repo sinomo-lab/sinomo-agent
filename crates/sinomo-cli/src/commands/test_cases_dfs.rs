@@ -555,23 +555,27 @@ fn dfs_routed_status_targets_from_state(
                 && member.capabilities.iter().any(|capability| {
                     capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY
                 })
-                && match network::cluster_member_main_daemon_connectivity(
-                    cluster_paths,
-                    state,
-                    member,
-                ) {
-                    network::ClusterMemberMainDaemonConnectivity::Healthy
-                    | network::ClusterMemberMainDaemonConnectivity::Unknown => true,
-                    network::ClusterMemberMainDaemonConnectivity::Degraded
-                    | network::ClusterMemberMainDaemonConnectivity::Unreachable => {
-                        dfs_target_has_healthy_route(cluster_paths, state, &member.node_id)
-                    }
-                }
+                && dfs_member_available_for_route(cluster_paths, state, member)
         })
         .map(|member| member.node_id.clone())
         .collect::<Vec<_>>();
     targets.sort();
     targets
+}
+
+fn dfs_member_available_for_route(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+    member: &sinomo_runtime::core::ClusterMemberRecord,
+) -> bool {
+    match network::cluster_member_main_daemon_connectivity(cluster_paths, state, member) {
+        network::ClusterMemberMainDaemonConnectivity::Healthy
+        | network::ClusterMemberMainDaemonConnectivity::Unknown => true,
+        network::ClusterMemberMainDaemonConnectivity::Degraded
+        | network::ClusterMemberMainDaemonConnectivity::Unreachable => {
+            dfs_target_has_healthy_route(cluster_paths, state, &member.node_id)
+        }
+    }
 }
 
 fn dfs_target_has_healthy_route(
@@ -592,8 +596,7 @@ fn dfs_unavailable_repair_targets_from_state(
         .iter()
         .filter(|member| {
             member.state.is_authorized()
-                && network::cluster_member_main_daemon_connectivity(cluster_paths, state, member)
-                    == network::ClusterMemberMainDaemonConnectivity::Unreachable
+                && !dfs_member_available_for_route(cluster_paths, state, member)
         })
         .map(|member| member.node_id.clone())
         .collect()
@@ -3387,6 +3390,73 @@ fn probe_nonce() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_runtime::core::{
+        CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
+        ClusterEndpointSource, ClusterMemberRecord, ClusterTransportKind,
+    };
+    use sinomo_runtime::node::ClusterId;
+
+    fn test_state() -> ClusterBootstrapState {
+        let now = time::OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_dfs_status_targets").expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_dfs_status_targets_local").expect("local node");
+        let remote_node =
+            NodeId::from_legacy_named("node_dfs_status_targets_remote").expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "dfs status targets",
+            local_node,
+            "local",
+            "local-public-key",
+            now,
+        );
+        state.members[0].capabilities.push(main_daemon_capability());
+        let mut remote = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote_node,
+            "remote",
+            "remote-public-key",
+            now,
+        );
+        remote.capabilities.push(main_daemon_capability());
+        state.members.push(remote);
+        state
+    }
+
+    fn add_remote_main(state: &mut ClusterBootstrapState, name: &str) -> NodeId {
+        let now = time::OffsetDateTime::now_utc();
+        let node = NodeId::from_legacy_named(name).expect("node");
+        let mut member = ClusterMemberRecord::local_voter(
+            state.cluster_id.clone(),
+            node.clone(),
+            name,
+            format!("{name}-public-key"),
+            now,
+        );
+        member.capabilities.push(main_daemon_capability());
+        state.members.push(member);
+        node
+    }
+
+    fn main_daemon_capability() -> CapabilityName {
+        CapabilityName::new(sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY)
+            .expect("main daemon capability")
+    }
+
+    fn test_endpoint(node_id: &NodeId, name: &str, address: &str) -> ClusterEndpointRecord {
+        ClusterEndpointRecord {
+            endpoint_id: network::ClusterEndpointId::from_legacy_named(name).expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: address.to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        }
+    }
 
     fn repair_attempt(
         intent_id: &str,
@@ -3421,6 +3491,119 @@ mod tests {
             content_hash: Some(format!("blake3:{intent_id}")),
             missing_replica_node_id,
         }
+    }
+
+    fn connectivity_record(
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        connectivity_state: network::ClusterConnectivityState,
+    ) -> network::ClusterConnectivityRecord {
+        let now = time::OffsetDateTime::now_utc();
+        let consecutive_failures = match connectivity_state {
+            network::ClusterConnectivityState::Healthy => 0,
+            network::ClusterConnectivityState::Degraded => 2,
+            network::ClusterConnectivityState::Unreachable => 3,
+        };
+        network::cluster_connectivity_record(
+            state,
+            endpoint,
+            connectivity_state,
+            Some(1),
+            consecutive_failures,
+            Some(now.to_string()),
+            None,
+            now,
+            network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        )
+    }
+
+    #[test]
+    fn dfs_unavailable_repair_targets_include_degraded_main_without_route() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-degraded-repair-target");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let mut state = test_state();
+        let unavailable = state.members[1].node_id.clone();
+        let endpoint = test_endpoint(
+            &unavailable,
+            "endpoint_dfs_degraded_repair_target",
+            "unavailable.test:21353",
+        );
+        state.members[1].endpoints = vec![endpoint.clone()];
+        let degraded = connectivity_record(
+            &state,
+            &endpoint,
+            network::ClusterConnectivityState::Degraded,
+        );
+        network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[degraded],
+        )
+        .expect("write connectivity");
+
+        let targets = dfs_unavailable_repair_targets_from_state(&paths, &state);
+
+        assert!(
+            targets.contains(&unavailable),
+            "a degraded main daemon with no healthy route must be treated as unavailable repair debt: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn dfs_unavailable_repair_targets_keep_routed_degraded_main_available() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-routed-repair-target");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let mut state = test_state();
+        let bridge = state.members[1].node_id.clone();
+        let target = add_remote_main(&mut state, "node_dfs_routed_repair_target");
+        let bridge_endpoint = test_endpoint(
+            &bridge,
+            "endpoint_dfs_routed_repair_bridge",
+            "bridge.test:21353",
+        );
+        let target_endpoint = test_endpoint(
+            &target,
+            "endpoint_dfs_routed_repair_target",
+            "target.test:21353",
+        );
+        state.members[1].endpoints = vec![bridge_endpoint.clone()];
+        state.members[2].endpoints = vec![target_endpoint.clone()];
+        let local_to_target = connectivity_record(
+            &state,
+            &target_endpoint,
+            network::ClusterConnectivityState::Degraded,
+        );
+        let local_to_bridge = connectivity_record(
+            &state,
+            &bridge_endpoint,
+            network::ClusterConnectivityState::Healthy,
+        );
+        let mut bridge_state = state.clone();
+        bridge_state.local_node_id = bridge.clone();
+        let bridge_to_target = connectivity_record(
+            &bridge_state,
+            &target_endpoint,
+            network::ClusterConnectivityState::Healthy,
+        );
+        network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[local_to_target, local_to_bridge],
+        )
+        .expect("write local connectivity");
+        network::write_local_cluster_connectivity_record_set(&paths, &bridge, &[bridge_to_target])
+            .expect("write bridge connectivity");
+
+        let targets = dfs_unavailable_repair_targets_from_state(&paths, &state);
+
+        assert!(
+            !targets.contains(&target),
+            "a degraded direct repair target with a healthy route must remain available: {targets:?}"
+        );
     }
 
     #[test]
