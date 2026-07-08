@@ -28073,6 +28073,35 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
         Err(DfsPosixError::NotFound { .. })
     ));
 
+    // A canonical renamed file can be unlinked immediately after the caller
+    // observes the rename result. This is the same shape as the cluster
+    // read-your-write probe: write -> rename -> read -> unlink.
+    let delete_bytes = b"rename then delete canonical file".to_vec();
+    writer
+        .posix_write_file(
+            "/users/routed-dir/delete-source.txt",
+            &delete_bytes,
+            DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
+        )
+        .expect("routed delete-source write");
+    let delete_renamed = "/users/routed-dir/delete-renamed.txt";
+    writer
+        .posix_rename("/users/routed-dir/delete-source.txt", delete_renamed)
+        .expect("routed rename before canonical unlink");
+    assert_eq!(
+        writer
+            .posix_read_file(delete_renamed)
+            .expect("read renamed before canonical unlink"),
+        delete_bytes
+    );
+    writer
+        .posix_unlink(delete_renamed)
+        .expect("unlink canonical renamed file");
+    assert!(matches!(
+        writer.posix_stat(delete_renamed),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
     // hardlink routes and updates the link count everywhere it is observed.
     let link_stat = writer
         .posix_hardlink("/users/routed-dir/renamed.txt", "/users/routed-dir/link")
@@ -29415,6 +29444,85 @@ fn sifs_cluster_posix_rename_across_shard_primaries_moves_object_transactionally
     });
 
     std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_services_routed_rename_then_unlink_is_read_your_write() {
+    let cluster = sifs_two_primary_cluster("sifs-services-rename-unlink-ryw");
+    let SifsTwoPrimaryCluster {
+        root,
+        users_primary,
+        services_primary,
+        mut replica,
+        replica_node,
+        rejections,
+        ..
+    } = cluster;
+    assert!(
+        rejections.is_empty(),
+        "two-primary setup must not reject journal batches: {rejections:?}"
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let users_stop = Arc::clone(&stop);
+    let users_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(users_primary, users_stop));
+    let services_stop = Arc::clone(&stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+
+    let base = "/services/cluster-tests";
+    let path = "/services/cluster-tests/ryw.txt";
+    let renamed = "/services/cluster-tests/ryw-renamed.txt";
+    let bytes = b"services routed rename unlink read-your-write".to_vec();
+
+    replica
+        .posix_mkdir_all(base)
+        .expect("routed mkdir_all base");
+    replica
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![replica_node.clone()]),
+        )
+        .expect("routed services write");
+    assert_eq!(
+        replica.posix_read_file(path).expect("read before rename"),
+        bytes
+    );
+
+    replica
+        .posix_rename(path, renamed)
+        .expect("routed services rename");
+    assert_eq!(
+        replica
+            .posix_read_file(renamed)
+            .expect("read renamed before unlink"),
+        bytes
+    );
+    assert!(matches!(
+        replica.posix_stat(path),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
+    let unlinked = replica
+        .posix_unlink(renamed)
+        .expect("unlink routed renamed services file");
+    assert_eq!(unlinked.kind, DfsObjectKind::Tombstone);
+    assert!(matches!(
+        replica.posix_stat(renamed),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
+    stop.store(true, Ordering::SeqCst);
+    let users_primary = users_thread.join().expect("users thread");
+    let services_primary = services_thread.join().expect("services thread");
+    assert!(matches!(
+        services_primary.posix_stat(renamed),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    std::fs::remove_dir_all(&root).ok();
+    drop(users_primary);
 }
 
 #[test]

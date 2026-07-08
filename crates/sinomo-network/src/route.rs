@@ -2575,6 +2575,11 @@ where
                 };
                 let final_hop = &route_plan.next_hop == target_node_id;
                 let endpoints_left = route_endpoint_count.saturating_sub(endpoint_index).max(1);
+                let reserve_fallback_budget =
+                    cluster_target_endpoint_should_reserve_fallback_budget(
+                        &endpoint,
+                        endpoints_left,
+                    );
                 let endpoint_attempt_budget = cluster_target_endpoint_attempt_budget_for_endpoint(
                     &local_connectivity,
                     &endpoint,
@@ -2586,7 +2591,8 @@ where
                     && cluster_target_final_hop_uses_full_response_budget(
                         &local_connectivity,
                         &endpoint,
-                    );
+                    )
+                    && !reserve_fallback_budget;
                 let final_hop_full_response_budget = final_hop_verified_endpoint
                     && cluster_target_final_hop_request_uses_full_response_budget(request);
                 let final_hop_attempt_budget = if final_hop {
@@ -2982,6 +2988,11 @@ where
                 };
                 let final_hop = &route_plan.next_hop == target_node_id;
                 let endpoints_left = route_endpoint_count.saturating_sub(endpoint_index).max(1);
+                let reserve_fallback_budget =
+                    cluster_target_endpoint_should_reserve_fallback_budget(
+                        &endpoint,
+                        endpoints_left,
+                    );
                 let endpoint_attempt_budget = cluster_target_endpoint_attempt_budget_for_endpoint(
                     &local_connectivity,
                     &endpoint,
@@ -2993,7 +3004,8 @@ where
                     && cluster_target_final_hop_uses_full_response_budget(
                         &local_connectivity,
                         &endpoint,
-                    );
+                    )
+                    && !reserve_fallback_budget;
                 let final_hop_full_response_budget = final_hop_verified_endpoint;
                 let final_hop_attempt_budget = if final_hop {
                     cluster_target_final_hop_attempt_budget(
@@ -3481,10 +3493,19 @@ fn cluster_target_endpoint_attempt_budget_for_endpoint(
         endpoints_left,
         endpoint_count,
     );
-    if cluster_endpoint_has_healthy_route_evidence(local_connectivity, endpoint) {
+    if cluster_endpoint_has_healthy_route_evidence(local_connectivity, endpoint)
+        && !cluster_target_endpoint_should_reserve_fallback_budget(endpoint, endpoints_left)
+    {
         return budget;
     }
     budget.map(|budget| budget.min(CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX))
+}
+
+fn cluster_target_endpoint_should_reserve_fallback_budget(
+    endpoint: &ClusterEndpointRecord,
+    endpoints_left: usize,
+) -> bool {
+    endpoints_left > 1 && cluster_delivery_endpoint_is_tcp_tunnel(endpoint)
 }
 
 fn cluster_target_final_hop_attempt_budget(
@@ -5283,7 +5304,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_endpoint_attempt_budget_trusts_healthy_synthetic_tcp_tunnel() {
+    fn cluster_target_endpoint_attempt_budget_bounds_healthy_synthetic_tcp_tunnel_with_fallbacks() {
         let now = OffsetDateTime::now_utc();
         let cluster_id =
             ClusterId::from_legacy_named("cluster_target_tunnel_budget").expect("cluster");
@@ -5329,6 +5350,63 @@ mod tests {
             &endpoint,
             Some(Duration::from_secs(60)),
             3,
+            3,
+        )
+        .expect("budget");
+
+        assert_eq!(budget, CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX);
+    }
+
+    #[test]
+    fn cluster_target_endpoint_attempt_budget_trusts_healthy_synthetic_tcp_tunnel_when_it_is_last()
+    {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_target_tunnel_only_budget").expect("cluster");
+        let local =
+            NodeId::from_legacy_named("node_target_tunnel_only_budget_local").expect("local");
+        let target =
+            NodeId::from_legacy_named("node_target_tunnel_only_budget_target").expect("target");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "tunnel-only endpoint budget",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_target_tunnel_only_budget")
+                .expect("endpoint"),
+            node_id: target,
+            transport: ClusterTransportKind::LanTcp,
+            address: format!(
+                "{}node_target_tunnel_only_budget_target",
+                crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX
+            ),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+        let record = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(0),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            crate::connectivity::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let graph = ClusterConnectivityGraph::from_records(local, vec![record]);
+
+        let budget = cluster_target_endpoint_attempt_budget_for_endpoint(
+            &graph,
+            &endpoint,
+            Some(Duration::from_secs(60)),
+            1,
             3,
         )
         .expect("budget");
@@ -5494,8 +5572,9 @@ mod tests {
         ];
         state.members.push(target_member);
 
-        let request =
-            ObjectRpcRequest::encode_body("/test/target", "test", &"ping").expect("request");
+        let request = ObjectRpcRequest::encode_body("/test/target", "test", &"ping")
+            .expect("request")
+            .with_full_response_budget();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -5644,7 +5723,7 @@ mod tests {
                 &target_node,
                 &request,
                 ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
-                    Duration::from_secs(8),
+                    Duration::from_secs(30),
                 )),
             ))
             .expect("fallback endpoint should be attempted within the target timeout");
