@@ -3,10 +3,11 @@ use super::{
     AgentReadinessOptions, AgentRunOptions, AgentSessionCliCommand, AgentSessionInspectOptions,
     AgentSessionMessageOptions, AgentSessionProgressOptions, AgentSessionResumeOptions,
     AgentSessionTerminalResultsOptions, AgentValidateOptions, BUILTIN_TOP_LEVEL_USAGE_COMMANDS,
-    CliClusterMemberMutationHost, CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand,
-    ClusterInitOptions, ClusterInviteOptions, ClusterJoinOptions, ClusterMigrateCommand,
-    ClusterMigrationPlanOptions, ClusterPaths, ClusterRemoveOptions, ClusterRenameOptions,
-    ClusterRoleOptions, ClusterRolloutBuildRequest, ClusterStateAuthorityOptions, DaemonCliCommand,
+    CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT, CLUSTER_HEALTH_PROBE_TIMEOUT, CliClusterMemberMutationHost,
+    CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand, ClusterInitOptions,
+    ClusterInviteOptions, ClusterJoinOptions, ClusterMigrateCommand, ClusterMigrationPlanOptions,
+    ClusterPaths, ClusterRemoveOptions, ClusterRenameOptions, ClusterRoleOptions,
+    ClusterRolloutBuildRequest, ClusterStateAuthorityOptions, DaemonCliCommand,
     DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
     DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsConflictResolveOptions,
     DfsConflictSaveVersionOptions, DfsConflictUseVersionOptions, DfsConflictVersionsOptions,
@@ -939,6 +940,14 @@ fn top_level_cli_parser_routes_subcommands() {
             })
     ));
     assert!(parse_cli_command(&["evolve".to_string()]).is_err());
+}
+
+#[test]
+fn cluster_health_daemon_rpc_timeout_covers_health_probe_budget() {
+    assert!(
+        CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT >= CLUSTER_HEALTH_PROBE_TIMEOUT,
+        "cluster health must not time out the daemon aggregation before the bounded health probe budget elapses"
+    );
 }
 
 #[test]
