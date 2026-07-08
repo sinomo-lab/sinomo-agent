@@ -3,6 +3,7 @@
 /modules/*/*/target/
 /tmp
 /benchmark-results
+/.codegraph/
 
 /.claude/settings.local.json
 /.claude/worktrees/
