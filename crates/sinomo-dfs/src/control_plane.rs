@@ -93,6 +93,10 @@ pub enum DfsMetadataShardAssignment {
 }
 
 pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
+    fn refresh_latest(&mut self) -> Result<(), KvError> {
+        Ok(())
+    }
+
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError>;
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError>;
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError>;
@@ -103,6 +107,10 @@ pub type DfsControlPlaneKvFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, KvError>> + Send + 'a>>;
 
 pub trait AsyncDfsControlPlaneKvClient: std::fmt::Debug + Send {
+    fn refresh_latest_async<'a>(&'a mut self) -> DfsControlPlaneKvFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn get_async<'a>(&'a self, key: &'a str) -> DfsControlPlaneKvFuture<'a, Option<KvEntry>>;
 
     fn range_prefix_async<'a>(
@@ -141,6 +149,15 @@ impl<C> DfsControlPlaneKvClient for SharedDfsControlPlaneKvClient<C>
 where
     C: DfsControlPlaneKvClient + Send,
 {
+    fn refresh_latest(&mut self) -> Result<(), KvError> {
+        self.inner
+            .lock()
+            .map_err(|_| KvError::Serialization {
+                detail: "control-plane KV client lock poisoned".to_string(),
+            })?
+            .refresh_latest()
+    }
+
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
         self.inner
             .lock()

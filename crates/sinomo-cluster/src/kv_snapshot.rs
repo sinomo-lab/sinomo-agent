@@ -132,12 +132,28 @@ where
     }
 }
 
+pub struct ClusterKvSnapshotRefreshOutcome {
+    pub store: InProcessKvStore,
+    pub fetched_remote: bool,
+    pub restored_newer_snapshot: bool,
+}
+
 pub fn refresh_current_cluster_kv_store_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     options: ClusterKvSnapshotRefreshOptions,
     host: &mut impl ClusterKvSnapshotRefreshHost,
 ) -> Result<InProcessKvStore, NetworkError> {
+    refresh_current_cluster_kv_store_with_outcome(paths, state, options, host)
+        .map(|outcome| outcome.store)
+}
+
+pub fn refresh_current_cluster_kv_store_with_outcome(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    options: ClusterKvSnapshotRefreshOptions,
+    host: &mut impl ClusterKvSnapshotRefreshHost,
+) -> Result<ClusterKvSnapshotRefreshOutcome, NetworkError> {
     let mut snapshots = Vec::new();
     if let Ok(snapshot) = read_cluster_kv_snapshot(paths) {
         snapshots.push(snapshot);
@@ -186,6 +202,7 @@ pub fn refresh_current_cluster_kv_store_with_host(
                 host,
             ) {
                 snapshots.push(snapshot);
+                fetched_remote = true;
                 break 'node_targets;
             }
         }
@@ -197,8 +214,17 @@ pub fn refresh_current_cluster_kv_store_with_host(
             detail: "no local or reachable cluster KV snapshot is available".to_string(),
         })?;
     write_imported_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
-    host.restore_cluster_kv_from_snapshot_if_newer(paths, &state.local_node_id, snapshot.clone())?;
-    InProcessKvStore::restore(snapshot).map_err(kv_err)
+    let restored_newer_snapshot = host.restore_cluster_kv_from_snapshot_if_newer(
+        paths,
+        &state.local_node_id,
+        snapshot.clone(),
+    )?;
+    let store = InProcessKvStore::restore(snapshot).map_err(kv_err)?;
+    Ok(ClusterKvSnapshotRefreshOutcome {
+        store,
+        fetched_remote,
+        restored_newer_snapshot,
+    })
 }
 
 fn fetch_cluster_kv_snapshot_from_state_authority_node(

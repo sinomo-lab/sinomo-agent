@@ -3968,6 +3968,62 @@ fn file_system(owner: NodeId) -> DfsFileSystem {
     }
 }
 
+#[derive(Debug)]
+struct RefreshingDfsControlPlaneKvClient {
+    inner: InProcessKvStore,
+    current: SharedDfsControlPlaneKvClient<InProcessKvStore>,
+    refreshes: Arc<AtomicUsize>,
+}
+
+impl RefreshingDfsControlPlaneKvClient {
+    fn new(
+        inner: InProcessKvStore,
+        current: SharedDfsControlPlaneKvClient<InProcessKvStore>,
+        refreshes: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            inner,
+            current,
+            refreshes,
+        }
+    }
+}
+
+impl DfsControlPlaneKvClient for RefreshingDfsControlPlaneKvClient {
+    fn refresh_latest(&mut self) -> Result<(), sinomo_core::kv::KvError> {
+        let snapshot = self.current.with_client(|kv| kv.try_snapshot())?;
+        self.inner = InProcessKvStore::restore(snapshot)?;
+        self.refreshes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn get(&self, key: &str) -> Result<Option<sinomo_core::kv::KvEntry>, sinomo_core::kv::KvError> {
+        DfsControlPlaneKvClient::get(&self.inner, key)
+    }
+
+    fn range_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<sinomo_core::kv::KvEntry>, sinomo_core::kv::KvError> {
+        DfsControlPlaneKvClient::range_prefix(&self.inner, prefix)
+    }
+
+    fn put(
+        &mut self,
+        key: String,
+        value: Vec<u8>,
+    ) -> Result<sinomo_core::kv::KvRevision, sinomo_core::kv::KvError> {
+        DfsControlPlaneKvClient::put(&mut self.inner, key, value)
+    }
+
+    fn txn(
+        &mut self,
+        txn: sinomo_core::kv::KvTxn,
+    ) -> Result<sinomo_core::kv::KvTxnResponse, sinomo_core::kv::KvError> {
+        DfsControlPlaneKvClient::txn(&mut self.inner, txn)
+    }
+}
+
 fn file_metadata(owner: NodeId) -> DfsObjectMetadata {
     DfsObjectMetadata {
         object_id: DfsObjectId::from_legacy_named("obj_file").expect("object"),
@@ -31874,6 +31930,163 @@ fn sifs_routed_write_follows_authority_redirect() {
     stop.store(true, Ordering::SeqCst);
     old_thread.join().expect("old primary thread");
     new_thread.join().expect("new primary thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_routed_write_refreshes_stale_receiver_control_plane() {
+    let root = temp_root("sifs-write-refresh-stale-receiver");
+    let old_primary_node =
+        NodeId::from_legacy_named("node_sifs_write_refresh_old_primary").expect("old primary");
+    let current_primary_node = NodeId::from_legacy_named("node_sifs_write_refresh_current_primary")
+        .expect("current primary");
+    let requester_node =
+        NodeId::from_legacy_named("node_sifs_write_refresh_requester").expect("requester");
+
+    let network = InProcessNetwork::new();
+    let shard_config = |primary: &NodeId, epoch: u64| DfsMetadataShardConfig {
+        file_system_id: sifs_file_system_id(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![old_primary_node.clone(), current_primary_node.clone()],
+        epoch,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let put_control_plane = |kv_client: &SharedDfsControlPlaneKvClient<InProcessKvStore>,
+                             primary: &NodeId,
+                             epoch: u64| {
+        kv_client.with_client(|kv| {
+            let mut control = DfsControlPlaneStore::new(kv);
+            control
+                .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                    current_primary_node.clone(),
+                )))
+                .expect("filesystem config");
+            control
+                .put_metadata_shard(&shard_config(primary, epoch))
+                .expect("shard config");
+        });
+    };
+
+    let kv_current = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    put_control_plane(&kv_current, &current_primary_node, 2);
+    let kv_old_primary = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    put_control_plane(&kv_old_primary, &current_primary_node, 2);
+    let kv_requester = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    put_control_plane(&kv_requester, &old_primary_node, 1);
+
+    let refreshes = Arc::new(AtomicUsize::new(0));
+
+    let mut old_primary = sifs_posix_cluster_node(
+        &network,
+        &kv_old_primary,
+        &root,
+        "old-primary",
+        old_primary_node.clone(),
+    );
+    let mut current_primary = sifs_posix_cluster_node(
+        &network,
+        &kv_old_primary,
+        &root,
+        "current-primary",
+        current_primary_node.clone(),
+    );
+    let mut requester = sifs_posix_cluster_node(
+        &network,
+        &kv_requester,
+        &root,
+        "requester",
+        requester_node.clone(),
+    );
+    current_primary
+        .bootstrap_distributed_sifs()
+        .expect("current primary SIFS bootstrap");
+
+    let parent_stop = Arc::new(AtomicBool::new(false));
+    let old_parent_stop = Arc::clone(&parent_stop);
+    let old_parent_thread = std::thread::spawn(move || {
+        let mut node = old_primary;
+        while !old_parent_stop.load(Ordering::SeqCst) {
+            node.process_incoming().expect("old primary parent pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        node
+    });
+    let current_parent_stop = Arc::clone(&parent_stop);
+    let current_parent_thread = std::thread::spawn(move || {
+        let mut node = current_primary;
+        while !current_parent_stop.load(Ordering::SeqCst) {
+            node.process_incoming()
+                .expect("current primary parent pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        node
+    });
+    requester
+        .posix_mkdir_all("/users")
+        .expect("requester creates parent through current primary");
+    parent_stop.store(true, Ordering::SeqCst);
+    old_primary = old_parent_thread.join().expect("old primary parent thread");
+    current_primary = current_parent_thread
+        .join()
+        .expect("current primary parent thread");
+
+    let mut stale_current_store = InProcessKvStore::new();
+    {
+        let mut control = DfsControlPlaneStore::new(&mut stale_current_store);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                current_primary_node.clone(),
+            )))
+            .expect("stale receiver filesystem config");
+        control
+            .put_metadata_shard(&shard_config(&old_primary_node, 1))
+            .expect("stale receiver shard config");
+    }
+    let refreshing_current_control = RefreshingDfsControlPlaneKvClient::new(
+        stale_current_store,
+        kv_current,
+        Arc::clone(&refreshes),
+    );
+    current_primary =
+        current_primary.with_boxed_control_plane(Box::new(refreshing_current_control));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let old_stop = Arc::clone(&stop);
+    let old_thread = std::thread::spawn(move || {
+        let mut node = old_primary;
+        while !old_stop.load(Ordering::SeqCst) {
+            node.process_incoming().expect("old primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let current_stop = Arc::clone(&stop);
+    let current_thread = std::thread::spawn(move || {
+        let mut node = current_primary;
+        while !current_stop.load(Ordering::SeqCst) {
+            node.process_incoming().expect("current primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let path = "/users/write-refreshes-stale-receiver.txt";
+    let bytes = b"stale receiver refreshes control plane".to_vec();
+    requester
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![requester_node, current_primary_node]),
+        )
+        .expect("routed write refreshes stale receiver control plane");
+    assert!(
+        refreshes.load(Ordering::SeqCst) > 0,
+        "current primary should refresh its stale control-plane view"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    old_thread.join().expect("old primary thread");
+    current_thread.join().expect("current primary thread");
     std::fs::remove_dir_all(&root).ok();
 }
 

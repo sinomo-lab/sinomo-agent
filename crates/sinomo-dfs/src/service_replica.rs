@@ -26,20 +26,43 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map_err(DfsError::from)
     }
 
+    pub(crate) fn local_metadata_owner_epoch_for_object(
+        &mut self,
+        object: &DfsObjectMetadata,
+    ) -> Result<u64, DfsError> {
+        let Some(mut shard) = self.select_metadata_shard_for_object(object)? else {
+            return Ok(0);
+        };
+        if shard.primary_node_id != self.node_id {
+            self.refresh_control_plane_latest()?;
+            let Some(refreshed) = self.select_metadata_shard_for_object(object)? else {
+                return Ok(0);
+            };
+            shard = refreshed;
+        }
+        if shard.primary_node_id != self.node_id {
+            return Err(DfsError::StaleOwnerEpoch {
+                file_system_id: object.file_system_id.clone(),
+                local_node_id: self.node_id.clone(),
+                primary_node_id: shard.primary_node_id,
+                epoch: shard.epoch,
+            });
+        }
+        Ok(shard.epoch)
+    }
+
     pub(crate) fn ensure_intent_epoch_current(
         &mut self,
         intent: &DistributedWriteIntent,
     ) -> Result<(), DfsError> {
         let object = self.current_read_object_metadata(&intent.object_id)?;
-        let Some(shard) = self.select_metadata_shard_for_object(&object)? else {
-            return Ok(());
-        };
-        if shard.primary_node_id != self.node_id || shard.epoch != intent.owner_epoch {
+        let owner_epoch = self.local_metadata_owner_epoch_for_object(&object)?;
+        if owner_epoch != intent.owner_epoch {
             return Err(DfsError::StaleOwnerEpoch {
                 file_system_id: intent.file_system_id.clone(),
                 local_node_id: self.node_id.clone(),
-                primary_node_id: shard.primary_node_id,
-                epoch: shard.epoch,
+                primary_node_id: self.node_id.clone(),
+                epoch: owner_epoch,
             });
         }
         Ok(())

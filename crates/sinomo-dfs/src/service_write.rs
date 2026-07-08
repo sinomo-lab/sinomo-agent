@@ -1134,18 +1134,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .to_string(),
             });
         }
-        let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
-            Some(shard) if shard.primary_node_id != self.node_id => {
-                return Err(DfsError::StaleOwnerEpoch {
-                    file_system_id: object.file_system_id,
-                    local_node_id: self.node_id.clone(),
-                    primary_node_id: shard.primary_node_id,
-                    epoch: shard.epoch,
-                });
-            }
-            Some(shard) => shard.epoch,
-            None => 0,
-        };
+        let owner_epoch = self.local_metadata_owner_epoch_for_object(&object)?;
 
         if expected_base_version
             .as_ref()

@@ -781,7 +781,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        let Some(shard) = self.select_metadata_shard_for_object(object)? else {
+        let Some(mut shard) = self.select_metadata_shard_for_object(object)? else {
             return Err(DfsError::Distributed {
                 message: format!(
                     "routed write for {} has no metadata shard assignment",
@@ -789,6 +789,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         };
+        if shard.primary_node_id != self.node_id {
+            self.refresh_control_plane_latest()?;
+            let Some(refreshed) = self.select_metadata_shard_for_object(object)? else {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "routed write for {} has no metadata shard assignment",
+                        request.object_id
+                    ),
+                });
+            };
+            shard = refreshed;
+        }
         if shard.primary_node_id != self.node_id {
             return Err(DfsError::StaleOwnerEpoch {
                 file_system_id: object.file_system_id.clone(),

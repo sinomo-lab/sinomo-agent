@@ -139,9 +139,10 @@ pub use kv_read_model::{
     read_cluster_members_from_snapshot, read_cluster_node_statuses_from_kv,
 };
 pub use kv_snapshot::{
-    ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions,
+    ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions, ClusterKvSnapshotRefreshOutcome,
     refresh_current_cluster_kv_store_with_host,
     refresh_current_cluster_kv_store_with_local_storage_and_transport,
+    refresh_current_cluster_kv_store_with_outcome,
 };
 pub use kv_txn_quorum::{
     ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost,

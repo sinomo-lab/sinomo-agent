@@ -209,6 +209,15 @@ impl DaemonDfsControlPlaneKvClient {
 }
 
 impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
+    fn refresh_latest(&mut self) -> Result<(), KvError> {
+        crate::cluster::refresh_cluster_kv_store_from_peers_on_runtime(
+            &self.cluster_paths,
+            &self.runtime,
+        )
+        .map(drop)
+        .map_err(|source| self.daemon_error(source))
+    }
+
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
         sinomo_core::cluster::read_cluster_kv_latest_observed_entry(&self.cluster_paths, key)
             .map_err(|source| self.daemon_error(source.into()))
@@ -247,6 +256,18 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
 }
 
 impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
+    fn refresh_latest_async<'a>(&'a mut self) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, ()> {
+        Box::pin(async move {
+            crate::cluster::refresh_cluster_kv_store_from_peers_async_on_runtime(
+                &self.cluster_paths,
+                &self.runtime,
+            )
+            .await
+            .map(drop)
+            .map_err(|source| self.daemon_error(source))
+        })
+    }
+
     fn get_async<'a>(
         &'a self,
         key: &'a str,
