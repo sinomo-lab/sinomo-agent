@@ -56,7 +56,7 @@ use sinomo_runtime::test::{
     SinomoTestContext, SinomoTestError, SinomoTestOutcome, SinomoTestRegistryBuilder,
     SinomoTestRequirement, SinomoTestResult,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -431,6 +431,8 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         ctx,
         dfs_routed_status_targets_from_state(&cluster_paths, &state),
     )?;
+    let unavailable_repair_targets =
+        dfs_unavailable_repair_targets_from_state(&cluster_paths, &state);
     ctx.record("target_count", targets.len());
     ctx.record(
         "targets",
@@ -469,7 +471,10 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ) {
                 Ok(response) => match dfs::decode_dfs_status_rpc_response(&response) {
                     Ok(status) => {
-                        statuses.insert(target.to_string(), dfs_status_probe_summary(&status));
+                        statuses.insert(
+                            target.to_string(),
+                            dfs_status_probe_summary(&status, &unavailable_repair_targets),
+                        );
                     }
                     Err(error) => failures.push(format!("{target}: decode failed: {error}")),
                 },
@@ -536,6 +541,22 @@ fn dfs_routed_status_targets_from_state(
     targets
 }
 
+fn dfs_unavailable_repair_targets_from_state(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+) -> BTreeSet<NodeId> {
+    state
+        .members
+        .iter()
+        .filter(|member| {
+            member.state.is_authorized()
+                && network::cluster_member_main_daemon_connectivity(cluster_paths, state, member)
+                    == network::ClusterMemberMainDaemonConnectivity::Unreachable
+        })
+        .map(|member| member.node_id.clone())
+        .collect()
+}
+
 fn filter_dfs_routed_status_targets(
     ctx: &SinomoTestContext,
     targets: Vec<NodeId>,
@@ -570,14 +591,49 @@ fn filter_dfs_routed_status_targets(
     Ok(filtered)
 }
 
-fn dfs_status_probe_summary(status: &DfsOperatorStatus) -> BTreeMap<&'static str, u64> {
+fn dfs_status_probe_summary(
+    status: &DfsOperatorStatus,
+    unavailable_repair_targets: &BTreeSet<NodeId>,
+) -> BTreeMap<&'static str, u64> {
+    let unavailable_pending_repairs =
+        dfs_unavailable_pending_repair_count(status, unavailable_repair_targets);
+    let active_pending_repairs = status
+        .pending_repair_count
+        .saturating_sub(unavailable_pending_repairs);
     BTreeMap::from([
         ("file_systems", status.file_system_count as u64),
         ("objects", status.object_count as u64),
         ("pending_writes", status.pending_write_count as u64),
         ("open_conflicts", status.open_conflict_count as u64),
-        ("pending_repairs", status.pending_repair_count as u64),
+        ("pending_repairs", active_pending_repairs as u64),
+        ("total_pending_repairs", status.pending_repair_count as u64),
+        (
+            "unavailable_pending_repairs",
+            unavailable_pending_repairs as u64,
+        ),
     ])
+}
+
+fn dfs_unavailable_pending_repair_count(
+    status: &DfsOperatorStatus,
+    unavailable_repair_targets: &BTreeSet<NodeId>,
+) -> usize {
+    if status.pending_repair_count == 0 || unavailable_repair_targets.is_empty() {
+        return 0;
+    }
+    let unavailable_repairs = status
+        .repair_attempts
+        .iter()
+        .filter(|attempt| unavailable_repair_targets.contains(&attempt.missing_replica_node_id))
+        .map(|attempt| {
+            (
+                attempt.intent_id.clone(),
+                attempt.missing_replica_node_id.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .len();
+    unavailable_repairs.min(status.pending_repair_count)
 }
 
 fn run_service_advertisements(ctx: &mut SinomoTestContext) -> SinomoTestResult {
@@ -694,8 +750,16 @@ fn routed_status_dirty_summaries(
                 || pending_writes > max_remote_pending_writes as u64
                 || pending_repairs > max_remote_pending_repairs as u64
             {
+                let total_pending_repairs = status
+                    .get("total_pending_repairs")
+                    .copied()
+                    .unwrap_or(pending_repairs);
+                let unavailable_pending_repairs = status
+                    .get("unavailable_pending_repairs")
+                    .copied()
+                    .unwrap_or(0);
                 Some(format!(
-                    "{target}: open_conflicts={open_conflicts}, pending_writes={pending_writes}, pending_repairs={pending_repairs}"
+                    "{target}: open_conflicts={open_conflicts}, pending_writes={pending_writes}, pending_repairs={pending_repairs}, total_pending_repairs={total_pending_repairs}, unavailable_pending_repairs={unavailable_pending_repairs}"
                 ))
             } else {
                 None
@@ -3241,4 +3305,64 @@ fn probe_nonce() -> String {
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
     format!("{nanos:x}-{:x}", std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repair_attempt(
+        intent_id: &str,
+        missing_replica_node_id: NodeId,
+    ) -> dfs::DfsRepairAttemptRecord {
+        dfs::DfsRepairAttemptRecord {
+            intent_id: intent_id.to_string(),
+            object_id: DfsObjectId::from_legacy_named(format!("object_{intent_id}"))
+                .expect("object id"),
+            version: DfsVersion::from_legacy_named(format!("version_{intent_id}"))
+                .expect("version"),
+            content_hash: format!("blake3:{intent_id}"),
+            missing_replica_node_id,
+            attempts: 1,
+            in_flight: false,
+            last_attempt_unix_nanos: 1,
+            next_retry_unix_nanos: 2,
+            next_chunk_index: None,
+            last_error: Some("network error at cluster target rpc: no usable route".to_string()),
+        }
+    }
+
+    #[test]
+    fn dfs_status_summary_excludes_unavailable_repair_targets_from_active_debt() {
+        let unavailable =
+            NodeId::from_legacy_named("node_dfs_unavailable_repair_target").expect("node");
+        let reachable =
+            NodeId::from_legacy_named("node_dfs_reachable_repair_target").expect("node");
+        let mut unavailable_repair_targets = BTreeSet::new();
+        unavailable_repair_targets.insert(unavailable.clone());
+        let status = DfsOperatorStatus {
+            file_system_count: 1,
+            object_count: 2,
+            version_count: 3,
+            receipt_count: 4,
+            intent_count: 5,
+            pending_write_count: 0,
+            open_conflict_count: 0,
+            pending_repair_count: 2,
+            repair_attempt_count: 2,
+            pending_namespace_job_count: 0,
+            failed_namespace_job_count: 0,
+            metadata_shards: Vec::new(),
+            repair_attempts: vec![
+                repair_attempt("offline_replica", unavailable),
+                repair_attempt("reachable_replica", reachable),
+            ],
+        };
+
+        let summary = dfs_status_probe_summary(&status, &unavailable_repair_targets);
+
+        assert_eq!(summary.get("pending_repairs"), Some(&1));
+        assert_eq!(summary.get("total_pending_repairs"), Some(&2));
+        assert_eq!(summary.get("unavailable_pending_repairs"), Some(&1));
+    }
 }
