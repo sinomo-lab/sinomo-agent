@@ -867,25 +867,9 @@ fn cluster_delivery_route_candidates(
                 cost: edge_cost.saturating_add(path.cost),
                 complete: true,
             });
-        } else {
-            let path = cluster_delivery_two_node_path(local_node_id, next_hop)?;
-            crate::object::try_reserve_vec(
-                &mut candidates,
-                1,
-                "cluster delivery route candidates",
-            )?;
-            candidates.push(ClusterDeliveryRouteCandidate {
-                plan: ClusterDeliveryRoutePlan {
-                    next_hop: try_clone_route_node_id(next_hop, "cluster delivery next hop")?,
-                    endpoints,
-                    path: try_clone_route_node_ids(&path, "cluster delivery route plan path")?,
-                },
-                path,
-                first_hop_cost: edge_cost,
-                cost: edge_cost,
-                complete: false,
-            });
         }
+        // Do not synthesize an incomplete relay hop here. A non-target next hop is only a
+        // valid route when the connectivity graph proves it can reach the target.
     }
     candidates.sort_by(
         |left, right| match (left.verified_complete(), right.verified_complete()) {
@@ -6589,7 +6573,7 @@ mod tests {
     }
 
     #[test]
-    fn route_candidates_do_not_complete_by_returning_through_origin() {
+    fn route_candidates_reject_relay_without_verified_path_to_target() {
         let local = NodeId::from_legacy_named("node_route_hairpin_origin").expect("local node");
         let neighbor =
             NodeId::from_legacy_named("node_route_hairpin_neighbor").expect("neighbor node");
@@ -6613,10 +6597,41 @@ mod tests {
         let candidates =
             cluster_delivery_route_candidates(&graph, &local, &target).expect("route candidates");
 
+        assert!(
+            candidates.is_empty(),
+            "a relay candidate must have a graph-proven path to the target"
+        );
+    }
+
+    #[test]
+    fn route_candidates_use_relay_with_verified_path_to_target() {
+        let local = NodeId::from_legacy_named("node_route_verified_origin").expect("local node");
+        let bridge = NodeId::from_legacy_named("node_route_verified_bridge").expect("bridge node");
+        let target = NodeId::from_legacy_named("node_route_verified_target").expect("target node");
+        let bridge_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &bridge,
+            "bridge.example.test:21353".to_string(),
+            0,
+        );
+        let mut graph = ClusterDeliveryRouteGraph::default();
+        graph
+            .push_edge_clone(&local, &bridge, Some(&bridge_endpoint), 10)
+            .expect("local to bridge");
+        graph
+            .push_edge_clone(&bridge, &target, None, 20)
+            .expect("bridge to target");
+
+        let candidates =
+            cluster_delivery_route_candidates(&graph, &local, &target).expect("route candidates");
+
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].plan.next_hop, neighbor);
-        assert_eq!(candidates[0].path, vec![local, neighbor]);
-        assert!(!candidates[0].complete);
+        assert_eq!(candidates[0].plan.next_hop, bridge);
+        assert_eq!(
+            candidates[0].path,
+            vec![local.clone(), bridge.clone(), target.clone()]
+        );
+        assert_eq!(candidates[0].cost, 30);
+        assert!(candidates[0].complete);
     }
 
     #[test]
@@ -7628,6 +7643,100 @@ mod tests {
         assert!(
             plan.is_none(),
             "a known-unreachable neighbor must not become a relay fallback"
+        );
+    }
+
+    #[test]
+    fn route_plan_does_not_use_unproven_neighbor_as_relay_after_target_edge_fails() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-route-unproven-relay");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_route_unproven_relay").expect("cluster");
+        let local_node =
+            NodeId::from_legacy_named("node_route_unproven_relay_local").expect("local");
+        let target_node =
+            NodeId::from_legacy_named("node_route_unproven_relay_target").expect("target");
+        let relay_node =
+            NodeId::from_legacy_named("node_route_unproven_relay_neighbor").expect("relay");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "route unproven relay",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut target_member = ClusterMemberRecord::local_voter(
+            state.cluster_id.clone(),
+            target_node.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "target.example.test:21353".to_string(),
+            0,
+        )];
+        let mut relay_member = ClusterMemberRecord::local_voter(
+            state.cluster_id.clone(),
+            relay_node.clone(),
+            "relay",
+            "pk-relay",
+            now,
+        );
+        relay_member.capabilities = main_daemon_capabilities(&relay_member.role);
+        relay_member.allowed_capabilities = relay_member.capabilities.clone();
+        let relay_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &relay_node,
+            "relay.example.test:21353".to_string(),
+            0,
+        );
+        relay_member.endpoints = vec![relay_endpoint.clone()];
+        state.members.push(target_member);
+        state.members.push(relay_member);
+
+        let relay_reachable = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &relay_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(5),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            60,
+        );
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[relay_reachable],
+        )
+        .expect("write local connectivity");
+
+        let mut failed_edges = ClusterDeliveryFailedEdges::default();
+        failed_edges
+            .try_insert(&local_node, &target_node)
+            .expect("failed target edge");
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local_node,
+            &target_node,
+            &failed_edges,
+            &[],
+        );
+
+        assert!(
+            plan.is_none(),
+            "a reachable neighbor without a graph path to the target must not become a relay fallback"
         );
     }
 
