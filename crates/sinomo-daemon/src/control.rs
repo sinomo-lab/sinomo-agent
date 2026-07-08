@@ -3922,6 +3922,7 @@ pub(crate) fn open_daemon_sandbox_dfs_service_on_runtime(
         daemon_dfs_endpoint_transport_on_runtime(
             state.local_node_id.clone(),
             peer_node_ids,
+            &data_dir,
             runtime,
         )
     } else {

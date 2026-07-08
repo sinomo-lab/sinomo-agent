@@ -173,12 +173,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             write_foreground_replica_repair,
                         )
                     } else {
-                        self.write_distributed_eventual_with_base_and_repair_mode(
+                        self.write_distributed_eventual_with_base_and_parent_touch_and_repair_mode(
                             command.request,
                             command.expected_base_version,
                             command.bytes,
                             command.desired_replica_nodes,
                             command.policy,
+                            touch_parent_on_create,
                             write_foreground_replica_repair,
                         )
                     }

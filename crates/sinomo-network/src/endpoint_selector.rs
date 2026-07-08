@@ -117,6 +117,14 @@ struct EndpointRouteKey {
     address: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClusterMemberMainDaemonConnectivity {
+    Healthy,
+    Degraded,
+    Unreachable,
+    Unknown,
+}
+
 impl Ord for EndpointRouteKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (&self.node_id, self.transport_rank, &self.address).cmp(&(
@@ -278,6 +286,11 @@ fn cluster_endpoint_transport_is_currently_dialable(transport: &ClusterTransport
 fn cluster_endpoint_is_currently_dialable(endpoint: &ClusterEndpointRecord) -> bool {
     cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
         && !cluster_endpoint_uses_tcp_tunnel_address(endpoint)
+}
+
+fn cluster_endpoint_is_rollout_candidate(endpoint: &ClusterEndpointRecord) -> bool {
+    endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+        && cluster_endpoint_transport_is_currently_dialable(&endpoint.transport)
 }
 
 fn cluster_endpoint_is_probeable(endpoint: &ClusterEndpointRecord) -> bool {
@@ -888,27 +901,67 @@ pub fn cluster_node_blocks_leader_preference(
 /// `observed_at` (which is no longer periodically refreshed), it reflects whether
 /// we can actually reach the peer right now. A member we have never probed (no
 /// connectivity record yet) is not reported unreachable.
-pub(crate) fn cluster_member_unreachable_via_connectivity(
+pub fn cluster_member_unreachable_via_connectivity(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
 ) -> bool {
+    cluster_member_main_daemon_connectivity(paths, state, member)
+        == ClusterMemberMainDaemonConnectivity::Unreachable
+}
+
+pub fn cluster_member_main_daemon_connectivity(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+) -> ClusterMemberMainDaemonConnectivity {
     if cluster_member_is_local_process(state, member) {
-        return false;
+        return ClusterMemberMainDaemonConnectivity::Healthy;
     }
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
+    if graph
+        .best_healthy_endpoint(&state.local_node_id, &member.node_id)
+        .as_ref()
+        .is_some_and(cluster_endpoint_can_carry_main_daemon_rpc)
+    {
+        return ClusterMemberMainDaemonConnectivity::Healthy;
+    }
+    if graph
+        .best_reachable_endpoint(&state.local_node_id, &member.node_id)
+        .is_some()
+    {
+        return ClusterMemberMainDaemonConnectivity::Degraded;
+    }
     let mut has_probeable_endpoint = false;
+    let mut has_unknown_endpoint = false;
+    let mut has_degraded_endpoint = false;
+    let mut has_unreachable_endpoint = false;
     for endpoint in &member.endpoints {
-        if !cluster_endpoint_is_probeable(endpoint) {
+        if !cluster_endpoint_is_probeable(endpoint)
+            || !cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
+        {
             continue;
         }
         has_probeable_endpoint = true;
-        if graph.unavailability_rank(endpoint) == 0 {
-            // At least one probeable endpoint is not marked unreachable.
-            return false;
+        match graph.state_for_endpoint(endpoint) {
+            Some(ClusterConnectivityState::Healthy) => {
+                return ClusterMemberMainDaemonConnectivity::Healthy;
+            }
+            Some(ClusterConnectivityState::Degraded) => has_degraded_endpoint = true,
+            Some(ClusterConnectivityState::Unreachable) => has_unreachable_endpoint = true,
+            None => has_unknown_endpoint = true,
         }
     }
-    has_probeable_endpoint
+    if !has_probeable_endpoint || has_unknown_endpoint {
+        return ClusterMemberMainDaemonConnectivity::Unknown;
+    }
+    if has_degraded_endpoint {
+        return ClusterMemberMainDaemonConnectivity::Degraded;
+    }
+    if has_unreachable_endpoint {
+        return ClusterMemberMainDaemonConnectivity::Unreachable;
+    }
+    ClusterMemberMainDaemonConnectivity::Unknown
 }
 
 pub(crate) fn try_cluster_daemon_command_targets_impl(
@@ -1428,10 +1481,11 @@ pub(crate) fn try_cluster_rollout_endpoint_targets_impl(
         if member.node_id == state.local_node_id || !member.state.is_authorized() {
             continue;
         }
-        for endpoint in member.endpoints.iter().filter(|endpoint| {
-            endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
-                && cluster_endpoint_is_currently_dialable(endpoint)
-        }) {
+        for endpoint in member
+            .endpoints
+            .iter()
+            .filter(|endpoint| cluster_endpoint_is_rollout_candidate(endpoint))
+        {
             if !endpoint_ids.try_insert_clone(&endpoint.endpoint_id, "collect rollout endpoints")? {
                 continue;
             }
@@ -1445,8 +1499,7 @@ pub(crate) fn try_cluster_rollout_endpoint_targets_impl(
     match cluster_directory_for(paths).endpoints() {
         Ok(kv_endpoints) => {
             for endpoint in kv_endpoints {
-                if endpoint.privacy == ClusterEndpointPrivacy::LocalOnly
-                    || !cluster_endpoint_is_currently_dialable(&endpoint)
+                if !cluster_endpoint_is_rollout_candidate(&endpoint)
                     || !endpoint_ids
                         .try_insert_clone(&endpoint.endpoint_id, "collect rollout kv endpoints")?
                 {
@@ -1460,6 +1513,29 @@ pub(crate) fn try_cluster_rollout_endpoint_targets_impl(
         Err(_) => {}
     }
     let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
+    for member in &state.members {
+        if member.node_id == state.local_node_id || !member.state.is_authorized() {
+            continue;
+        }
+        for endpoint in graph.reachable_endpoints_matching(
+            &state.local_node_id,
+            &member.node_id,
+            cluster_endpoint_is_rollout_candidate,
+        ) {
+            if !endpoint_ids.try_insert_clone(
+                &endpoint.endpoint_id,
+                "collect rollout local connectivity endpoints",
+            )? {
+                continue;
+            }
+            crate::object::try_reserve_vec(
+                &mut endpoints,
+                1,
+                "collect rollout local connectivity endpoints",
+            )?;
+            endpoints.push(endpoint);
+        }
+    }
     sort_cluster_rollout_endpoints(&graph, &mut endpoints);
     Ok(endpoints)
 }

@@ -1,7 +1,7 @@
 use crate::control::DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL;
 use crate::{
-    DaemonError, DaemonPaths, DaemonRunOptions, send_object_rpc_to_target_async,
-    send_object_rpc_to_target_on_runtime,
+    DaemonError, DaemonPaths, DaemonRunOptions, send_object_rpc_to_target_async_with_daemon_paths,
+    send_object_rpc_to_target_on_runtime_with_daemon_paths,
 };
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
@@ -418,10 +418,11 @@ pub(crate) fn daemon_dfs_endpoint_transport(
 pub(crate) fn daemon_dfs_endpoint_transport_on_runtime(
     local_node_id: sinomo_core::node::NodeId,
     peer_node_ids: impl IntoIterator<Item = NodeId>,
+    data_dir: &SinomoDataDir,
     runtime: &tokio::runtime::Handle,
 ) -> DfsEndpointTransport {
-    let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(runtime);
-    let async_peer_transport = daemon_dfs_async_peer_transport(runtime);
+    let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(data_dir, runtime);
+    let async_peer_transport = daemon_dfs_async_peer_transport(data_dir, runtime);
     DfsEndpointTransport::with_peer_transports_for_nodes(
         local_node_id,
         peer_node_ids,
@@ -433,11 +434,13 @@ pub(crate) fn daemon_dfs_endpoint_transport_on_runtime(
 
 #[derive(Clone, Debug)]
 struct DaemonDfsBlockingPeerTransport {
+    paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
 }
 
 #[derive(Clone, Debug)]
 struct DaemonDfsAsyncPeerTransport {
+    paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
 }
 
@@ -482,7 +485,8 @@ impl DfsPeerTransport for DaemonDfsBlockingPeerTransport {
         request: &sinomo_core::network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> Result<sinomo_core::network::ObjectRpcResponse, DfsPeerTransportError> {
-        send_object_rpc_to_target_on_runtime(
+        send_object_rpc_to_target_on_runtime_with_daemon_paths(
+            &self.paths,
             target_node_id,
             request,
             options.connect_timeout,
@@ -504,8 +508,10 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsAsyncPeerTransport {
         Result<sinomo_core::network::ObjectRpcResponse, DfsPeerTransportError>,
     > {
         let runtime = self.runtime.clone();
+        let paths = self.paths.clone();
         Box::pin(async move {
-            send_object_rpc_to_target_async(
+            send_object_rpc_to_target_async_with_daemon_paths(
+                &paths,
                 target_node_id,
                 request,
                 options.connect_timeout,
@@ -519,17 +525,21 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsAsyncPeerTransport {
 }
 
 fn daemon_dfs_blocking_peer_transport_on_runtime(
+    data_dir: &SinomoDataDir,
     runtime: &tokio::runtime::Handle,
 ) -> Arc<dyn DfsPeerTransport> {
     Arc::new(DaemonDfsBlockingPeerTransport {
+        paths: DaemonPaths::new(data_dir),
         runtime: runtime.clone(),
     })
 }
 
 fn daemon_dfs_async_peer_transport(
+    data_dir: &SinomoDataDir,
     runtime: &tokio::runtime::Handle,
 ) -> Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> {
     Arc::new(DaemonDfsAsyncPeerTransport {
+        paths: DaemonPaths::new(data_dir),
         runtime: runtime.clone(),
     })
 }
@@ -717,7 +727,7 @@ fn open_daemon_dfs_message_service_lane(
     let transport = DfsEndpointServedMessageTransport::new_with_peer_transport_for_nodes(
         local_node_id.clone(),
         peer_node_ids,
-        daemon_dfs_blocking_peer_transport_on_runtime(runtime),
+        daemon_dfs_blocking_peer_transport_on_runtime(data_dir, runtime),
         sinomo_dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
     );
     let service = NetworkedDfsService::new(transport, content);
@@ -936,12 +946,14 @@ async fn handle_daemon_dfs_message_async(
     let should_publish_metadata = sinomo_dfs::dfs_events_should_publish_metadata(&events);
     if should_publish_metadata {
         notify_daemon_dfs_maintenance_work();
+        let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime);
+        let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
         sinomo_dfs::schedule_cluster_dfs_metadata_publish_after_events_with_peer_transports_on_runtime(
             runtime.clone(),
             data_dir,
             cluster_paths,
-            daemon_dfs_blocking_peer_transport_on_runtime(runtime),
-            daemon_dfs_async_peer_transport(runtime),
+            peer_transport,
+            async_peer_transport,
             &events,
             daemon_dfs_metadata_publish_schedule_options(),
             daemon_dfs_metadata_replication_options(),
@@ -984,7 +996,7 @@ fn handle_daemon_dfs_message_on_runtime(
     sinomo_dfs::run_cluster_dfs_metadata_publish_after_events_with_peer_transport(
         &data_dir,
         &cluster_paths,
-        daemon_dfs_blocking_peer_transport_on_runtime(runtime),
+        daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime),
         &events,
         daemon_dfs_metadata_replication_options(),
         log_dfs_metadata_replication_report,
@@ -1037,12 +1049,14 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     if let Some(stats) = crate::process_idle_stats() {
         stats.incr_disk_reads_dfs_metadata();
     }
+    let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime);
+    let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
     let report = sinomo_dfs::run_cluster_dfs_maintenance_tick_with_async_peer_transport(
         runtime,
         data_dir,
         cluster_paths.clone(),
-        daemon_dfs_blocking_peer_transport_on_runtime(runtime),
-        daemon_dfs_async_peer_transport(runtime),
+        peer_transport,
+        async_peer_transport,
         daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime)),
         daemon_dfs_maintenance_tick_options(),
     )
@@ -1166,7 +1180,7 @@ async fn run_daemon_dfs_smoke_async(
         sinomo_dfs::run_default_cluster_dfs_smoke_with_peer_transport(
             &data_dir,
             &cluster_paths,
-            daemon_dfs_blocking_peer_transport_on_runtime(&runtime),
+            daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, &runtime),
             Box::new(DaemonDfsControlPlaneKvClient::new_on_runtime(
                 &cluster_paths,
                 &runtime,

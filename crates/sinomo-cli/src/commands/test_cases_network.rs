@@ -120,7 +120,8 @@ fn run_network_state_hygiene(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     })?;
     let cluster_state = cluster::read_cluster_state(&cluster_paths)
         .map_err(|error| SinomoTestError::failed(error.to_string()))?;
-    let targets = network_ping_targets_from_state(&cluster_state)?;
+    let targets =
+        filter_network_test_targets(ctx, network_ping_targets_from_state(&cluster_state)?)?;
     ctx.record("target_count", targets.len());
     ctx.record(
         "targets",
@@ -150,9 +151,7 @@ fn run_network_state_hygiene(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         &local_records,
         &kv_records,
         &active_records,
-        NetworkHygieneOptions {
-            require_active_routes,
-        },
+        NetworkHygieneOptions::for_targets(require_active_routes, targets.iter().cloned()),
     );
     ctx.record("local_connectivity_records", local_records.len());
     ctx.record("kv_connectivity_records", kv_records.len());
@@ -187,7 +186,8 @@ fn run_network_state_hygiene_dirty_fixture(ctx: &mut SinomoTestContext) -> Sinom
     })?;
     let cluster_state = cluster::read_cluster_state(&cluster_paths)
         .map_err(|error| SinomoTestError::failed(error.to_string()))?;
-    let targets = network_ping_targets_from_state(&cluster_state)?;
+    let targets =
+        filter_network_test_targets(ctx, network_ping_targets_from_state(&cluster_state)?)?;
     ctx.record("target_count", targets.len());
     ctx.record(
         "targets",
@@ -316,9 +316,7 @@ fn run_network_state_hygiene_dirty_fixture_probe(
         &local_records,
         &kv_records,
         &active_records,
-        NetworkHygieneOptions {
-            require_active_routes: false,
-        },
+        NetworkHygieneOptions::unscoped(false),
     ))
 }
 
@@ -389,7 +387,8 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         cluster::read_cluster_state(&cluster_paths)
             .map_err(|error| SinomoTestError::failed(error.to_string()))?,
     );
-    let targets = network_ping_targets_from_state(&cluster_state)?;
+    let targets =
+        filter_network_test_targets(ctx, network_ping_targets_from_state(&cluster_state)?)?;
     let target_count = targets.len();
     ctx.record("target_count", target_count);
     ctx.record(
@@ -1137,6 +1136,40 @@ fn network_ping_targets_from_state(
     Ok(targets)
 }
 
+fn filter_network_test_targets(
+    ctx: &SinomoTestContext,
+    targets: Vec<NodeId>,
+) -> Result<Vec<NodeId>, SinomoTestError> {
+    let Some(target_node_id) = ctx.parameter("target-node-id") else {
+        return Ok(targets);
+    };
+    let target_node_id = target_node_id.trim();
+    if target_node_id.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "target-node-id".to_string(),
+            detail: "must not be empty".to_string(),
+        });
+    }
+    let target_node_id =
+        target_node_id
+            .parse::<NodeId>()
+            .map_err(|source| SinomoTestError::InvalidParameter {
+                name: "target-node-id".to_string(),
+                detail: source.to_string(),
+            })?;
+    let filtered = targets
+        .into_iter()
+        .filter(|target| target == &target_node_id)
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "target-node-id".to_string(),
+            detail: format!("no network test target matched {target_node_id}"),
+        });
+    }
+    Ok(filtered)
+}
+
 fn member_has_main_daemon(member: &ClusterMemberRecord) -> bool {
     member
         .capabilities
@@ -1144,9 +1177,26 @@ fn member_has_main_daemon(member: &ClusterMemberRecord) -> bool {
         .any(|capability| capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct NetworkHygieneOptions {
     require_active_routes: bool,
+    active_route_targets: Option<BTreeSet<NodeId>>,
+}
+
+impl NetworkHygieneOptions {
+    fn unscoped(require_active_routes: bool) -> Self {
+        Self {
+            require_active_routes,
+            active_route_targets: None,
+        }
+    }
+
+    fn for_targets(require_active_routes: bool, targets: impl IntoIterator<Item = NodeId>) -> Self {
+        Self {
+            require_active_routes,
+            active_route_targets: Some(targets.into_iter().collect()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1188,7 +1238,12 @@ fn network_hygiene_findings(
         &mut findings,
     );
     if options.require_active_routes {
-        collect_active_route_hygiene_findings(state, active_records, &mut findings);
+        collect_active_route_hygiene_findings(
+            state,
+            active_records,
+            options.active_route_targets.as_ref(),
+            &mut findings,
+        );
     }
     findings.sort();
     findings.dedup();
@@ -1369,13 +1424,18 @@ fn synthetic_tcp_tunnel_record_targets_peer(record: &network::ClusterConnectivit
 fn collect_active_route_hygiene_findings(
     state: &ClusterBootstrapState,
     active_records: &[network::ClusterConnectivityRecord],
+    active_route_targets: Option<&BTreeSet<NodeId>>,
     findings: &mut Vec<String>,
 ) {
     let graph = network::ClusterConnectivityGraph::from_records(
         state.local_node_id.clone(),
         active_records.to_vec(),
     );
-    for target in network_ping_targets_from_state(state).unwrap_or_default() {
+    let targets = match active_route_targets {
+        Some(targets) => targets.iter().cloned().collect::<Vec<_>>(),
+        None => network_ping_targets_from_state(state).unwrap_or_default(),
+    };
+    for target in targets {
         if network::cluster_route_next_hop(&graph, &state.local_node_id, &target).is_none() {
             findings.push(format!(
                 "active connectivity graph has no route from {} to remote main {}",
@@ -1732,6 +1792,21 @@ mod tests {
         state
     }
 
+    fn add_remote_main(state: &mut ClusterBootstrapState, name: &str) -> NodeId {
+        let now = OffsetDateTime::now_utc();
+        let node = NodeId::from_legacy_named(name).expect("node");
+        let mut member = ClusterMemberRecord::local_voter(
+            state.cluster_id.clone(),
+            node.clone(),
+            name,
+            format!("{name}-public-key"),
+            now,
+        );
+        member.capabilities.push(main_daemon_capability());
+        state.members.push(member);
+        node
+    }
+
     fn main_daemon_capability() -> CapabilityName {
         CapabilityName::new(sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY)
             .expect("main daemon capability")
@@ -1815,9 +1890,7 @@ mod tests {
             &[],
             &[],
             &[],
-            NetworkHygieneOptions {
-                require_active_routes: false,
-            },
+            NetworkHygieneOptions::unscoped(false),
         );
 
         assert!(
@@ -1844,9 +1917,7 @@ mod tests {
             &[record],
             &[],
             &[],
-            NetworkHygieneOptions {
-                require_active_routes: false,
-            },
+            NetworkHygieneOptions::unscoped(false),
         );
 
         assert!(
@@ -1861,15 +1932,8 @@ mod tests {
     fn network_hygiene_flags_missing_active_route_to_remote_main() {
         let state = test_state();
 
-        let findings = network_hygiene_findings(
-            &state,
-            &[],
-            &[],
-            &[],
-            NetworkHygieneOptions {
-                require_active_routes: true,
-            },
-        );
+        let findings =
+            network_hygiene_findings(&state, &[], &[], &[], NetworkHygieneOptions::unscoped(true));
 
         assert!(
             findings
@@ -1896,9 +1960,7 @@ mod tests {
             &[record.clone()],
             &[],
             &[record],
-            NetworkHygieneOptions {
-                require_active_routes: true,
-            },
+            NetworkHygieneOptions::unscoped(true),
         );
 
         assert!(findings.is_empty(), "{findings:?}");
@@ -1915,9 +1977,7 @@ mod tests {
             &[record.clone()],
             &[],
             &[record],
-            NetworkHygieneOptions {
-                require_active_routes: true,
-            },
+            NetworkHygieneOptions::unscoped(true),
         );
 
         assert!(findings.is_empty(), "{findings:?}");
@@ -1939,9 +1999,7 @@ mod tests {
             &[],
             &[],
             &[],
-            NetworkHygieneOptions {
-                require_active_routes: false,
-            },
+            NetworkHygieneOptions::unscoped(false),
         );
 
         assert!(
@@ -1970,11 +2028,83 @@ mod tests {
             &[],
             &[],
             &[],
-            NetworkHygieneOptions {
-                require_active_routes: false,
-            },
+            NetworkHygieneOptions::unscoped(false),
         );
 
         assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn network_target_filter_selects_requested_remote_main() {
+        let mut state = test_state();
+        let selected = state.members[1].node_id.clone();
+        let other = add_remote_main(&mut state, "node_network_hygiene_roaming_remote");
+        let targets = network_ping_targets_from_state(&state).expect("targets");
+        assert_eq!(targets.len(), 2);
+        assert!(targets.contains(&selected), "{targets:?}");
+        assert!(targets.contains(&other), "{targets:?}");
+
+        let ctx =
+            SinomoTestContext::new("/tmp").with_parameter("target-node-id", selected.to_string());
+        let filtered = filter_network_test_targets(&ctx, targets).expect("filter");
+
+        assert_eq!(filtered, vec![selected]);
+    }
+
+    #[test]
+    fn network_target_filter_rejects_unavailable_target() {
+        let state = test_state();
+        let missing = NodeId::from_legacy_named("node_network_hygiene_missing").expect("node");
+        let targets = network_ping_targets_from_state(&state).expect("targets");
+        let ctx =
+            SinomoTestContext::new("/tmp").with_parameter("target-node-id", missing.to_string());
+
+        let error = filter_network_test_targets(&ctx, targets).expect_err("missing target");
+
+        assert!(
+            matches!(
+                error,
+                SinomoTestError::InvalidParameter { ref name, .. } if name == "target-node-id"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn network_hygiene_scoped_active_route_ignores_unselected_roaming_node() {
+        let mut state = test_state();
+        let selected = state.members[1].node_id.clone();
+        let roaming = add_remote_main(&mut state, "node_network_hygiene_roaming_remote");
+        let endpoint = test_endpoint(
+            &selected,
+            "endpoint_network_hygiene_selected",
+            "selected.example.test:21353",
+        );
+        let record = test_connectivity_record(&state, &endpoint);
+        state.members[1].endpoints.push(endpoint);
+
+        let unscoped_findings = network_hygiene_findings(
+            &state,
+            &[record.clone()],
+            &[],
+            &[record.clone()],
+            NetworkHygieneOptions::unscoped(true),
+        );
+        assert!(
+            unscoped_findings
+                .iter()
+                .any(|finding| finding.contains(roaming.as_str())),
+            "{unscoped_findings:?}"
+        );
+
+        let scoped_findings = network_hygiene_findings(
+            &state,
+            &[record.clone()],
+            &[],
+            &[record],
+            NetworkHygieneOptions::for_targets(true, [selected]),
+        );
+
+        assert!(scoped_findings.is_empty(), "{scoped_findings:?}");
     }
 }

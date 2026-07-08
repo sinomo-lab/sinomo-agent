@@ -393,7 +393,7 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 }
 
 fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    let timeout_ms = optional_u64_parameter(ctx, "timeout-ms")?.unwrap_or(5_000);
+    let timeout_ms = optional_u64_parameter(ctx, "timeout-ms")?.unwrap_or(10_000);
     let timeout = expect_timeout(ctx)?;
     let expected_targets = optional_usize_parameter(ctx, "expected-targets", 1)?;
     let max_remote_open_conflicts =
@@ -411,7 +411,8 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     })?;
     let state = cluster::read_cluster_state(&cluster_paths)
         .map_err(|error| SinomoTestError::failed(error.to_string()))?;
-    let targets = dfs_routed_status_targets_from_state(&state);
+    let targets =
+        filter_dfs_routed_status_targets(ctx, dfs_routed_status_targets_from_state(&state))?;
     ctx.record("target_count", targets.len());
     ctx.record(
         "targets",
@@ -442,7 +443,7 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         let mut statuses = BTreeMap::new();
         let mut failures = Vec::new();
         for target in &targets {
-            match daemon_client.object_rpc_to_target(
+            match daemon_client.dfs_object_rpc_to_target(
                 target,
                 &request,
                 Duration::from_millis(timeout_ms),
@@ -512,6 +513,40 @@ fn dfs_routed_status_targets_from_state(
         .collect::<Vec<_>>();
     targets.sort();
     targets
+}
+
+fn filter_dfs_routed_status_targets(
+    ctx: &SinomoTestContext,
+    targets: Vec<NodeId>,
+) -> Result<Vec<NodeId>, SinomoTestError> {
+    let Some(target_node_id) = ctx.parameter("target-node-id") else {
+        return Ok(targets);
+    };
+    let target_node_id = target_node_id.trim();
+    if target_node_id.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "target-node-id".to_string(),
+            detail: "must not be empty".to_string(),
+        });
+    }
+    let target_node_id =
+        target_node_id
+            .parse::<NodeId>()
+            .map_err(|source| SinomoTestError::InvalidParameter {
+                name: "target-node-id".to_string(),
+                detail: source.to_string(),
+            })?;
+    let filtered = targets
+        .into_iter()
+        .filter(|target| target == &target_node_id)
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "target-node-id".to_string(),
+            detail: format!("no routed DFS status target matched {target_node_id}"),
+        });
+    }
+    Ok(filtered)
 }
 
 fn dfs_status_probe_summary(status: &DfsOperatorStatus) -> BTreeMap<&'static str, u64> {

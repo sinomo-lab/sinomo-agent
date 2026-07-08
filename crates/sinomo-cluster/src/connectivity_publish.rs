@@ -214,11 +214,12 @@ where
             )?,
         };
         if success.is_empty() {
-            host.remember_published_connectivity_record_set(paths, source_node_id, &records);
+            if latest.is_some() {
+                host.remember_published_connectivity_record_set(paths, source_node_id, &records);
+            }
             return Ok(latest);
         }
         if previous_ops.as_ref() == Some(&success) {
-            host.remember_published_connectivity_record_set(paths, source_node_id, &records);
             return Ok(latest);
         }
         previous_ops = Some(success.clone());
@@ -380,13 +381,17 @@ where
             }
         };
         if success.is_empty() {
-            host.remember_published_connectivity_record_set_async(paths, source_node_id, &records)
+            if latest.is_some() {
+                host.remember_published_connectivity_record_set_async(
+                    paths,
+                    source_node_id,
+                    &records,
+                )
                 .await?;
+            }
             return Ok(latest);
         }
         if previous_ops.as_ref() == Some(&success) {
-            host.remember_published_connectivity_record_set_async(paths, source_node_id, &records)
-                .await?;
             return Ok(latest);
         }
         previous_ops = Some(success.clone());

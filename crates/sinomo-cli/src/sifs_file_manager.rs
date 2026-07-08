@@ -1301,7 +1301,7 @@ fn sifs_send_dfs_object_rpc_via_daemon(
     };
     Some(
         client
-            .object_rpc_to_target(
+            .dfs_object_rpc_to_target(
                 target_node_id,
                 request,
                 options.connect_timeout,

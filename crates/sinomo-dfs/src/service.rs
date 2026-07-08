@@ -18,7 +18,7 @@ use sinomo_core::cluster::ClusterKvPathsExt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
@@ -79,7 +79,7 @@ fn dfs_service_route(route: &'static str) -> ServiceRoute {
         .object_rpc_route_descriptor(route)
         .expect("DFS module surfaces should be valid")
         .unwrap_or_else(|| panic!("unknown DFS service route {route}"));
-    ServiceRoute::from_route_metadata(
+    let mut route = ServiceRoute::from_route_metadata(
         descriptor.route,
         descriptor.category,
         descriptor.auth_scope,
@@ -88,7 +88,11 @@ fn dfs_service_route(route: &'static str) -> ServiceRoute {
             .into_iter()
             .map(|capability| capability.to_string()),
     )
-    .with_concurrency_limit(dfs_service_route_concurrency_limit(route))
+    .with_concurrency_limit(dfs_service_route_concurrency_limit(route));
+    if let Some(timeout) = dfs_service_route_timeout(route.route.as_str()) {
+        route = route.with_timeout(timeout);
+    }
+    route
 }
 
 fn dfs_service_route_concurrency_limit(route: &str) -> usize {
@@ -96,6 +100,14 @@ fn dfs_service_route_concurrency_limit(route: &str) -> usize {
         DFS_DATA_PLANE_ROUTE_CONCURRENCY_LIMIT
     } else {
         DFS_DEFAULT_ROUTE_CONCURRENCY_LIMIT
+    }
+}
+
+fn dfs_service_route_timeout(route: &str) -> Option<Duration> {
+    if route == DFS_STATUS_ROUTE {
+        Some(Duration::from_secs(5))
+    } else {
+        None
     }
 }
 
@@ -167,7 +179,12 @@ impl Service for DfsService {
                     let started_at = Instant::now();
                     let _: () = request.decode_body()?;
                     let status_started_at = Instant::now();
-                    let status = dfs_status(&ctx.data_dir)?;
+                    let data_dir = Arc::clone(&ctx.data_dir);
+                    let status = tokio::task::spawn_blocking(move || dfs_status(&data_dir))
+                        .await
+                        .map_err(|source| {
+                            ServiceError::Service(format!("DFS status task failed: {source}"))
+                        })??;
                     let status_ms = status_started_at.elapsed().as_millis();
                     let response = ObjectRpcResponse::encode_body(DFS_STATUS_ROUTE, &status)?;
                     dfs_service_perf_trace(format_args!(
@@ -657,6 +674,11 @@ mod tests {
             assert_eq!(
                 service_route.concurrency_limit,
                 Some(dfs_service_route_concurrency_limit(route))
+            );
+            assert_eq!(
+                service_route.timeout_ms,
+                dfs_service_route_timeout(route)
+                    .map(|timeout| timeout.as_millis().min(u128::from(u64::MAX)) as u64)
             );
         }
     }

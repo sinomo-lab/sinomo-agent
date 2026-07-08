@@ -2319,7 +2319,7 @@ impl sinomo_runtime::dfs::DfsPeerTransport for CliDfsPeerTransport {
         sinomo_runtime::network::ObjectRpcResponse,
         sinomo_runtime::dfs::DfsPeerTransportError,
     > {
-        daemon_object_rpc_to_target(
+        daemon_dfs_object_rpc_to_target(
             target_node_id,
             request,
             options.connect_timeout,
@@ -2329,7 +2329,7 @@ impl sinomo_runtime::dfs::DfsPeerTransport for CliDfsPeerTransport {
     }
 }
 
-fn daemon_object_rpc_to_target(
+fn daemon_dfs_object_rpc_to_target(
     target_node_id: &sinomo_runtime::node::NodeId,
     request: &sinomo_runtime::network::ObjectRpcRequest,
     timeout: std::time::Duration,
@@ -2340,7 +2340,7 @@ fn daemon_object_rpc_to_target(
         detail: "DFS cluster object RPC requires the local daemon to be running".to_string(),
     })?;
     DaemonApiClient::at_address(status.address)
-        .object_rpc_to_target(target_node_id, request, timeout, observe_connectivity)
+        .dfs_object_rpc_to_target(target_node_id, request, timeout, observe_connectivity)
         .map_err(CliError::from)
 }
 
@@ -2512,24 +2512,30 @@ struct DfsServiceAdvertisements {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct DfsClusterStatusReport {
-    nodes: Vec<DfsClusterNodeStatus>,
+pub(crate) struct DfsClusterStatusReport {
+    pub(crate) nodes: Vec<DfsClusterNodeStatus>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct DfsClusterNodeStatus {
-    node_id: NodeId,
-    local: bool,
-    endpoint: Option<String>,
-    status: Option<sinomo_runtime::dfs::DfsOperatorStatus>,
-    error: Option<String>,
+pub(crate) struct DfsClusterNodeStatus {
+    pub(crate) node_id: NodeId,
+    pub(crate) local: bool,
+    pub(crate) endpoint: Option<String>,
+    pub(crate) status: Option<sinomo_runtime::dfs::DfsOperatorStatus>,
+    pub(crate) error: Option<String>,
 }
 
-fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
+pub(crate) fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    inspect_cluster_dfs_status_with_data_dir(data_dir)
+}
+
+pub(crate) fn inspect_cluster_dfs_status_with_data_dir(
+    data_dir: SinomoDataDir,
+) -> Result<DfsClusterStatusReport, CliError> {
     let trace = dfs_cluster_status_trace_enabled();
     let started_at = std::time::Instant::now();
     trace_dfs_cluster_status(trace, started_at, "start");
-    let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
     let cluster_paths = ClusterPaths::new(&data_dir);
     let state = read_cluster_state(&cluster_paths)?;
@@ -2573,6 +2579,18 @@ fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
     let remote_timeout = DFS_CLUSTER_STATUS_REMOTE_TIMEOUT;
     let mut probes = Vec::new();
     for node_id in remote_node_ids {
+        if let Some(error) =
+            dfs_cluster_status_known_unavailable_node_error(&cluster_paths, &state, &node_id)
+        {
+            nodes.push(DfsClusterNodeStatus {
+                node_id,
+                local: false,
+                endpoint: None,
+                status: None,
+                error: Some(error),
+            });
+            continue;
+        }
         probes.push(spawn_dfs_status_probe(
             &cluster_paths,
             &state,
@@ -2623,6 +2641,32 @@ fn dfs_cluster_status_remote_main_node_ids(
         })
         .map(|member| member.node_id.clone())
         .collect()
+}
+
+fn dfs_cluster_status_known_unavailable_node_error(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+    node_id: &NodeId,
+) -> Option<String> {
+    let member = state
+        .members
+        .iter()
+        .find(|member| member.node_id == *node_id)?;
+    match sinomo_runtime::network::cluster_member_main_daemon_connectivity(
+        cluster_paths,
+        state,
+        member,
+    ) {
+        sinomo_runtime::network::ClusterMemberMainDaemonConnectivity::Healthy
+        | sinomo_runtime::network::ClusterMemberMainDaemonConnectivity::Unknown => None,
+        sinomo_runtime::network::ClusterMemberMainDaemonConnectivity::Degraded => Some(
+            "node has no currently healthy main-daemon route according to cluster connectivity probes"
+                .to_string(),
+        ),
+        sinomo_runtime::network::ClusterMemberMainDaemonConnectivity::Unreachable => Some(
+            "node is currently unavailable according to cluster connectivity probes".to_string(),
+        ),
+    }
 }
 
 struct DfsStatusProbe {
@@ -2763,7 +2807,7 @@ fn fetch_dfs_status_from_node_blocking(
             started_at.elapsed().as_millis()
         );
     }
-    let response = daemon_object_rpc_to_target(node_id, &rpc_request, timeout, true);
+    let response = daemon_dfs_object_rpc_to_target(node_id, &rpc_request, timeout, true);
     if trace {
         let outcome = if response.is_ok() { "ok" } else { "error" };
         eprintln!(

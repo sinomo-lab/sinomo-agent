@@ -261,7 +261,10 @@ pub fn authorize_authenticated_daemon_command(
         route if route == crate::DAEMON_SHUTDOWN_ROUTE => {
             authenticated.signer.can_run_local_command()
         }
-        route if route == crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE => {
+        route
+            if route == crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE
+                || route == crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE =>
+        {
             authenticated.signer.can_run_local_command()
         }
         route if route == ROLLOUT_FINALIZE_SHADOW_ROUTE => {
@@ -1663,20 +1666,24 @@ mod tests {
 
     #[test]
     fn daemon_object_rpc_forward_authorizes_only_local_signer() {
-        let route = crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE;
-        authorize_authenticated_daemon_command(&authenticated_command(
-            route.to_string(),
-            DaemonSignerAuthority::Local,
-        ))
-        .expect("local operators must be able to forward object RPCs through the daemon");
-        for signer in [
-            DaemonSignerAuthority::Voter,
-            DaemonSignerAuthority::Member,
-            DaemonSignerAuthority::JoinCandidate,
-            DaemonSignerAuthority::StatusProbe,
+        for route in [
+            crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+            crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
         ] {
-            let authenticated = authenticated_command(route.to_string(), signer);
-            assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+            authorize_authenticated_daemon_command(&authenticated_command(
+                route.to_string(),
+                DaemonSignerAuthority::Local,
+            ))
+            .expect("local operators must be able to forward object RPCs through the daemon");
+            for signer in [
+                DaemonSignerAuthority::Voter,
+                DaemonSignerAuthority::Member,
+                DaemonSignerAuthority::JoinCandidate,
+                DaemonSignerAuthority::StatusProbe,
+            ] {
+                let authenticated = authenticated_command(route.to_string(), signer);
+                assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+            }
         }
     }
 

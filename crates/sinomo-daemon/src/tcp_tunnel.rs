@@ -137,6 +137,26 @@ impl TcpTunnelRegistry {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn insert_test_tcp_tunnel(node_id: NodeId, tx: mpsc::Sender<ClusterTcpTunnelFrame>) {
+    let handle = Arc::new(TcpTunnelHandle {
+        peer_node_id: node_id,
+        tx,
+        pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        next_request_id: AtomicU64::new(1),
+        active_requests: AtomicUsize::new(0),
+        clean_shutdown: AtomicBool::new(false),
+    });
+    TCP_TUNNELS.insert(handle);
+}
+
+#[cfg(test)]
+pub(crate) fn remove_test_tcp_tunnel(node_id: &NodeId) {
+    if let Some(handle) = TCP_TUNNELS.remove(node_id) {
+        handle.request_close("test cleanup".to_string());
+    }
+}
+
 struct TcpTunnelHandle {
     peer_node_id: NodeId,
     tx: mpsc::Sender<ClusterTcpTunnelFrame>,
@@ -847,7 +867,9 @@ async fn send_over_tcp_tunnel_handle_once(
     timeouts: DaemonRpcTimeouts,
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let result = handle.send(request, timeouts).await;
-    if let Err(error) = result.as_ref() {
+    if let Err(error) = result.as_ref()
+        && tcp_tunnel_request_error_should_evict(error)
+    {
         TCP_TUNNELS.remove_if_same(&handle);
         let detail = format!("tcp tunnel evicted after request failure: {error}");
         handle.request_close(detail.clone());
@@ -916,7 +938,11 @@ async fn forward_stream_over_tcp_tunnel_handle_once(
             max_response_bytes,
         )
         .await;
-    if result.is_err() {
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(tcp_tunnel_request_error_should_evict)
+    {
         TCP_TUNNELS.remove_if_same(&handle);
         let detail = result
             .as_ref()
@@ -927,6 +953,19 @@ async fn forward_stream_over_tcp_tunnel_handle_once(
         handle.fail_pending(detail).await;
     }
     result
+}
+
+fn tcp_tunnel_request_error_should_evict(error: &NetworkError) -> bool {
+    match error {
+        NetworkError::Io { operation, detail } => match operation.as_str() {
+            "send tcp tunnel request" => true,
+            "read tcp tunnel response" | "read tcp tunnel stream" => {
+                !detail.starts_with("timed out after ")
+            }
+            _ => true,
+        },
+        _ => true,
+    }
 }
 
 async fn send_tcp_tunnel_stream_response(
@@ -1878,6 +1917,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_tunnel_response_timeout_retains_handle() {
+        let (tx, _rx) = mpsc::channel(1);
+        let node_name = "tcp_tunnel_response_timeout_retains_handle";
+        let node_id = NodeId::from_legacy_named(node_name).expect("test node id");
+        let handle = test_tunnel_handle(node_name, tx);
+        TCP_TUNNELS.insert(handle.clone());
+
+        let result = send_over_tcp_tunnel_handle(
+            handle.clone(),
+            test_rpc_request(),
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(1)),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(NetworkError::Io { operation, .. }) if operation == "read tcp tunnel response"
+        ));
+        assert!(Arc::ptr_eq(
+            &TCP_TUNNELS.get(&node_id).expect("tunnel retained"),
+            &handle
+        ));
+        assert!(handle.pending.lock().await.is_empty());
+        assert!(!handle.clean_shutdown.load(Ordering::Relaxed));
+
+        TCP_TUNNELS.remove(&node_id);
+    }
+
+    #[tokio::test]
     async fn tcp_tunnel_send_retries_current_handle_after_idle_replacement() {
         let (old_tx, old_rx) = mpsc::channel(1);
         drop(old_rx);
@@ -2101,9 +2169,14 @@ mod tests {
         .await;
 
         assert!(result.is_none());
-        assert!(TCP_TUNNELS.get(&node_id).is_none());
+        assert!(Arc::ptr_eq(
+            &TCP_TUNNELS.get(&node_id).expect("tunnel retained"),
+            &handle
+        ));
         assert!(handle.pending.lock().await.is_empty());
-        assert!(handle.clean_shutdown.load(Ordering::Relaxed));
+        assert!(!handle.clean_shutdown.load(Ordering::Relaxed));
+
+        TCP_TUNNELS.remove(&node_id);
     }
 
     #[tokio::test]

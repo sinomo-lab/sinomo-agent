@@ -48,8 +48,8 @@ pub use connectivity::{
     ClusterConnectivityRecordQuery, ClusterConnectivityState,
     MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, apply_cluster_connectivity_probe_results,
     cluster_connectivity_probe_due_with_graph, cluster_connectivity_probe_due_with_startup_settle,
-    cluster_connectivity_record, cluster_connectivity_record_for_probe_observation,
-    select_cluster_connectivity_probe_batch,
+    cluster_connectivity_record, cluster_connectivity_record_for_command_auth_denied,
+    cluster_connectivity_record_for_probe_observation, select_cluster_connectivity_probe_batch,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use connectivity::{
@@ -62,7 +62,10 @@ pub use connectivity::{
     cluster_connectivity_stable_eq, validate_cluster_connectivity_records_for_source,
 };
 pub use connectivity_store::{
+    prune_local_cluster_connectivity_records_for_state,
+    prune_local_cluster_connectivity_records_for_state_async,
     read_local_cluster_connectivity_records, read_local_cluster_connectivity_records_for_source,
+    record_local_cluster_endpoint_command_auth_denied,
     record_local_cluster_endpoint_command_connectivity, write_local_cluster_connectivity_records,
 };
 pub use connectivity_store::{
@@ -98,8 +101,9 @@ pub use endpoint_records::cluster_endpoint_module_url_identity;
 pub use endpoint_records::upsert_member_endpoint;
 pub use endpoint_records::{cluster_is_settled_solo, cluster_state_needs_join_registration};
 pub use endpoint_selector::{
-    ClusterEndpointInternalSelectionPurpose, cluster_node_blocks_leader_preference,
-    cluster_node_blocks_leader_preference_async,
+    ClusterEndpointInternalSelectionPurpose, ClusterMemberMainDaemonConnectivity,
+    cluster_member_main_daemon_connectivity, cluster_member_unreachable_via_connectivity,
+    cluster_node_blocks_leader_preference, cluster_node_blocks_leader_preference_async,
 };
 pub use endpoint_selector::{
     ClusterEndpointSelectionPurpose, ClusterEndpointSelector, ClusterEndpointTransferProfile,

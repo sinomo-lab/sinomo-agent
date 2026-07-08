@@ -11927,6 +11927,207 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
 }
 
 #[test]
+fn rollout_targets_prefer_local_tcp_tunnel_connectivity() {
+    crate::ensure_cluster_directory_installed();
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-tcp-tunnel-connectivity");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_rollout_tcp_tunnel_connectivity").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("node_rollout_tcp_tunnel_connectivity_local").expect("node");
+    let remote_node_id =
+        NodeId::from_legacy_named("node_rollout_tcp_tunnel_connectivity_remote").expect("node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "rollout tcp tunnel connectivity",
+        local_node_id.clone(),
+        "local",
+        "local-public-key",
+        OffsetDateTime::now_utc(),
+    );
+    let private_endpoint =
+        invite_introducer_endpoint(&remote_node_id, "10.0.0.42:21353".to_string());
+    let tunnel_endpoint = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named(
+            "endpoint_rollout_tcp_tunnel_connectivity",
+        )
+        .expect("endpoint"),
+        node_id: remote_node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: format!(
+            "{}{}",
+            network::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX,
+            remote_node_id.as_str()
+        ),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+    let mut remote = ClusterMemberRecord::local_voter(
+        cluster_id,
+        remote_node_id.clone(),
+        "remote",
+        "remote-public-key",
+        OffsetDateTime::now_utc(),
+    );
+    remote.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    remote.allowed_capabilities = remote.capabilities.clone();
+    remote.endpoints = vec![private_endpoint.clone()];
+    state.members.push(remote);
+    sinomo_runtime::cluster::write_cluster_state(&paths, &state).expect("write state");
+    sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+        .expect("sync state");
+
+    let now = OffsetDateTime::now_utc();
+    let records = vec![
+        sinomo_runtime::network::cluster_connectivity_record(
+            &state,
+            &private_endpoint,
+            sinomo_runtime::network::ClusterConnectivityState::Degraded,
+            None,
+            2,
+            None,
+            Some(now.to_string()),
+            now,
+            120,
+        ),
+        sinomo_runtime::network::cluster_connectivity_record(
+            &state,
+            &tunnel_endpoint,
+            sinomo_runtime::network::ClusterConnectivityState::Healthy,
+            Some(0),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            120,
+        ),
+    ];
+    network::write_local_cluster_connectivity_records(&paths, &local_node_id, &records)
+        .expect("local connectivity records");
+
+    let endpoints = network::ClusterEndpointSelector::new(&paths, &state)
+        .select(network::ClusterEndpointSelectionPurpose::Rollout);
+    assert_eq!(
+        endpoints.first().expect("endpoint").endpoint_id,
+        tunnel_endpoint.endpoint_id
+    );
+
+    let targets = rollout_cluster_targets_from_state(&paths, &state, None);
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].address, tunnel_endpoint.address);
+    assert_eq!(targets[0].rollout_node_id.as_ref(), Some(&remote_node_id));
+}
+
+#[test]
+fn dfs_cluster_status_skips_members_without_healthy_connectivity() {
+    crate::ensure_cluster_directory_installed();
+    for (label, connectivity_state, expected_error) in [
+        (
+            "degraded",
+            sinomo_runtime::network::ClusterConnectivityState::Degraded,
+            "no currently healthy main-daemon route",
+        ),
+        (
+            "unreachable",
+            sinomo_runtime::network::ClusterConnectivityState::Unreachable,
+            "currently unavailable",
+        ),
+    ] {
+        let root_name = format!("sinomo-cli-dfs-status-{label}-member");
+        let root = sinomo_testdir::TestDir::new(&root_name);
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        data_dir.ensure_root_layout().expect("data dir");
+
+        let cluster_id =
+            ClusterId::from_legacy_named(format!("cluster_dfs_status_{label}")).expect("cluster");
+        let local_node_id = NodeId::from_legacy_named(format!("node_dfs_status_{label}_local"))
+            .expect("local node");
+        let remote_node_id = NodeId::from_legacy_named(format!("node_dfs_status_{label}_remote"))
+            .expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            format!("dfs status {label}"),
+            local_node_id.clone(),
+            "local",
+            "local-public-key",
+            OffsetDateTime::now_utc(),
+        );
+        let remote_endpoint =
+            daemon_lan_endpoint(&remote_node_id, "198.51.100.42:21353".to_string(), 0);
+        let mut remote = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote_node_id.clone(),
+            "remote",
+            "remote-public-key",
+            OffsetDateTime::now_utc(),
+        );
+        remote.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+        remote.allowed_capabilities = remote.capabilities.clone();
+        remote.endpoints = vec![remote_endpoint.clone()];
+        state.members.push(remote);
+        sinomo_runtime::cluster::write_cluster_state(&paths, &state).expect("write state");
+        sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+            .expect("sync state");
+
+        let now = OffsetDateTime::now_utc();
+        let consecutive_failures = if connectivity_state
+            == sinomo_runtime::network::ClusterConnectivityState::Unreachable
+        {
+            3
+        } else {
+            2
+        };
+        let record = sinomo_runtime::network::cluster_connectivity_record(
+            &state,
+            &remote_endpoint,
+            connectivity_state,
+            None,
+            consecutive_failures,
+            None,
+            Some(now.to_string()),
+            now,
+            120,
+        );
+        sinomo_runtime::cluster::sync_cluster_connectivity_records_to_kv(
+            &paths,
+            &local_node_id,
+            vec![record],
+        )
+        .expect("sync connectivity");
+
+        let started = std::time::Instant::now();
+        let report =
+            crate::inspect_cluster_dfs_status_with_data_dir(data_dir).expect("dfs cluster status");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{label} member should be reported without spending the remote RPC timeout"
+        );
+        let remote_row = report
+            .nodes
+            .iter()
+            .find(|row| row.node_id == remote_node_id)
+            .expect("remote row");
+        assert!(remote_row.status.is_none());
+        assert!(
+            remote_row
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains(expected_error)),
+            "unexpected error for {label}: {:?}",
+            remote_row.error
+        );
+    }
+}
+
+#[test]
 fn rollout_target_uses_main_endpoint_when_shadow_is_unreachable() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-main-fallback");
     let data_dir = SinomoDataDir::new(&root);

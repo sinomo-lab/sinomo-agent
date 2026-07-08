@@ -299,6 +299,15 @@ pub fn inspect_cluster_aware_dfs_status(
     let mut status = DfsOperatorInspector::new(metadata.as_ref()).status()?;
     attach_cluster_aware_dfs_maintenance_observations(&mut status, data_dir)?;
     if let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths) {
+        let shards = cluster_dfs_metadata_shards(cluster_paths, &sifs_file_system_id())?;
+        if !shards.is_empty() {
+            attach_primary_owned_operational_status(
+                &mut status,
+                data_dir,
+                &state.local_node_id,
+                &shards,
+            )?;
+        }
         for shard in &mut status.metadata_shards {
             if shard.primary_node_id.as_ref() == Some(&state.local_node_id) {
                 shard.replay_cursors.clear();
@@ -308,6 +317,38 @@ pub fn inspect_cluster_aware_dfs_status(
         }
     }
     Ok(status)
+}
+
+fn attach_primary_owned_operational_status(
+    status: &mut DfsOperatorStatus,
+    data_dir: &SinomoDataDir,
+    local_node_id: &NodeId,
+    shards: &[DfsMetadataShardConfig],
+) -> Result<(), DfsError> {
+    let primary_shards = shards
+        .iter()
+        .filter(|shard| shard.primary_node_id == *local_node_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    if primary_shards.is_empty() {
+        status.pending_write_count = 0;
+        status.open_conflict_count = 0;
+        status.pending_repair_count = 0;
+        status.pending_namespace_job_count = 0;
+        status.failed_namespace_job_count = 0;
+        return Ok(());
+    }
+    let primary_metadata = open_local_sharded_metadata_backend(
+        default_dfs_metadata_shards_root(data_dir),
+        primary_shards,
+    )?;
+    let primary_summary = primary_metadata.metadata_summary()?;
+    status.pending_write_count = primary_summary.pending_write_count;
+    status.open_conflict_count = primary_summary.open_conflict_count;
+    status.pending_repair_count = primary_summary.pending_repair_count;
+    status.pending_namespace_job_count = primary_summary.pending_namespace_job_count;
+    status.failed_namespace_job_count = primary_summary.failed_namespace_job_count;
+    Ok(())
 }
 
 fn attach_cluster_aware_dfs_maintenance_observations(
@@ -416,4 +457,88 @@ pub fn inspect_cluster_aware_dfs(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control_plane::DfsMetadataShardAssignment;
+    use sinomo_core::DfsObjectPolicy;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_node(value: &str) -> NodeId {
+        NodeId::from_legacy_named(value).expect("node id")
+    }
+
+    fn empty_status() -> DfsOperatorStatus {
+        DfsOperatorStatus {
+            file_system_count: 1,
+            object_count: 0,
+            version_count: 0,
+            receipt_count: 0,
+            intent_count: 0,
+            pending_write_count: 1,
+            open_conflict_count: 1,
+            pending_repair_count: 1,
+            repair_attempt_count: 0,
+            pending_namespace_job_count: 1,
+            failed_namespace_job_count: 1,
+            metadata_shards: Vec::new(),
+            repair_attempts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn primary_owned_operational_status_ignores_replica_only_backlog() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-dfs-primary-owned-status-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let local = test_node("node_primary_status_local");
+        let remote = test_node("node_primary_status_remote");
+        let file_system_id = sifs_file_system_id();
+        let local_primary = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![remote.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let local_replica = DfsMetadataShardConfig {
+            file_system_id,
+            shard_id: "services".to_string(),
+            primary_node_id: remote,
+            replica_node_ids: vec![local.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut status = empty_status();
+
+        attach_primary_owned_operational_status(
+            &mut status,
+            &data_dir,
+            &local,
+            &[local_primary, local_replica],
+        )
+        .expect("primary-owned status");
+
+        assert_eq!(status.pending_write_count, 0);
+        assert_eq!(status.open_conflict_count, 0);
+        assert_eq!(status.pending_repair_count, 0);
+        assert_eq!(status.pending_namespace_job_count, 0);
+        assert_eq!(status.failed_namespace_job_count, 0);
+        std::fs::remove_dir_all(root).ok();
+    }
 }

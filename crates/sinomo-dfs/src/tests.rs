@@ -9644,6 +9644,97 @@ fn posix_routed_strict_write_prefers_metadata_primary_replica() {
 }
 
 #[test]
+fn posix_routed_small_write_sends_inline_bytes_request() {
+    let root = temp_root("posix-routed-small-inline-bytes");
+    let writer = NodeId::from_legacy_named("node_posix_routed_inline_writer").expect("writer");
+    let primary = NodeId::from_legacy_named("node_posix_routed_inline_primary").expect("primary");
+    let file_system = file_system(primary.clone());
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: primary.clone(),
+                replica_node_ids: vec![writer.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+
+    let captured_command = Arc::new(Mutex::new(None::<DfsDistributedWriteCommand>));
+    let captured_command_for_sender = Arc::clone(&captured_command);
+    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+        if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
+            &command.routed_message.message
+        {
+            *captured_command_for_sender.lock().expect("capture") = Some(write_command.clone());
+        }
+        Ok(DfsMessageResponse {
+            request_id: command.request_id.clone(),
+            outbound_messages: Vec::new(),
+        })
+    });
+    let transport = DfsEndpointTransport::with_connect_timeout(
+        writer.clone(),
+        vec![test_endpoint(&primary, "192.0.2.68:21353")],
+        Duration::from_millis(1),
+        sender,
+    );
+    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
+    let mut dfs =
+        NetworkedDfsService::new(transport, writer_content).with_control_plane(control_plane);
+    dfs.add_file_system(file_system.clone())
+        .expect("writer filesystem");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = "/routed-small-inline.txt".to_string();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(object).expect("writer object");
+
+    let bytes = b"small routed POSIX bytes".to_vec();
+    let expected_hash = content_hash(&bytes);
+    dfs.posix_write_file(
+        "/routed-small-inline.txt",
+        &bytes,
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
+            replica_candidates: vec![writer.clone(), primary.clone()],
+            wait_for_commit: false,
+            foreground_replica_repair: true,
+        },
+    )
+    .expect("pending routed write returns stat for existing object");
+
+    let command = captured_command
+        .lock()
+        .expect("capture")
+        .clone()
+        .expect("captured routed write command");
+    assert_eq!(command.bytes, bytes);
+    assert_eq!(command.content_hash, None);
+    assert_eq!(command.content_size_bytes, None);
+    assert_eq!(command.desired_replica_nodes, vec![writer.clone(), primary]);
+    assert_eq!(
+        dfs.content
+            .read_blob(&expected_hash)
+            .expect("writer retained local blob"),
+        b"small routed POSIX bytes"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn posix_routed_large_write_sends_manifest_only_request() {
     let root = temp_root("posix-routed-large-manifest-only");
     let writer = NodeId::from_legacy_named("node_posix_routed_manifest_writer").expect("writer");
@@ -10084,6 +10175,7 @@ fn routed_inline_write_preserves_nonforeground_repair_mode() {
         DfsReplicationPolicy::new(1, 2).expect("policy"),
         object,
         shard,
+        true,
         false,
     )
     .expect("route inline nonforeground write");

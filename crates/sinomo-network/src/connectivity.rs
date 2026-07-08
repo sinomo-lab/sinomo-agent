@@ -72,6 +72,7 @@ pub enum ClusterConnectivityState {
 #[serde(rename_all = "kebab-case")]
 pub enum ClusterConnectivityFailureReason {
     IdentityMismatch,
+    CommandAuthDenied,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -807,6 +808,27 @@ pub fn cluster_connectivity_record_for_identity_mismatch(
         CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
     );
     record.failure_reason = Some(ClusterConnectivityFailureReason::IdentityMismatch);
+    record
+}
+
+pub fn cluster_connectivity_record_for_command_auth_denied(
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    timestamp: &str,
+    now: OffsetDateTime,
+) -> ClusterConnectivityRecord {
+    let mut record = cluster_connectivity_record(
+        state,
+        endpoint,
+        ClusterConnectivityState::Unreachable,
+        None,
+        CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
+        None,
+        Some(timestamp.to_string()),
+        now,
+        CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
+    );
+    record.failure_reason = Some(ClusterConnectivityFailureReason::CommandAuthDenied);
     record
 }
 

@@ -6164,7 +6164,7 @@ fn rollout_target_selection_applies_connectivity_to_equivalent_tcp_route() {
         ClusterId::from_legacy_named("cluster_network_rollout_equivalent").expect("cluster");
     let local = NodeId::from_legacy_named("node_network_rollout_equivalent_local").expect("local");
     let main = NodeId::from_legacy_named("node_network_rollout_equivalent_main").expect("main");
-    let state = ClusterBootstrapState::initialized_locally(
+    let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id,
         "network rollout equivalent",
         local.clone(),
@@ -6172,14 +6172,25 @@ fn rollout_target_selection_applies_connectivity_to_equivalent_tcp_route() {
         "pk-local",
         now,
     );
-    write_cluster_state(&paths, &state).expect("write state");
-    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
     let private_recorded = daemon_lan_endpoint(&main, "10.0.0.41:21353".to_string(), 10);
     let mut private_readvertised = private_recorded.clone();
     private_readvertised.endpoint_id =
         ClusterEndpointId::from_legacy_named("endpoint_rollout_equivalent_readvertised")
             .expect("endpoint");
     let public = daemon_lan_endpoint(&main, "203.0.113.41:21353".to_string(), 20);
+    let mut main_member = ClusterMemberRecord::local_non_voting(
+        state.cluster_id.clone(),
+        main.clone(),
+        "main",
+        "pk-main",
+        now,
+    );
+    main_member.capabilities = main_daemon_capabilities(&main_member.role);
+    main_member.allowed_capabilities = main_member.capabilities.clone();
+    main_member.endpoints = vec![private_readvertised.clone(), public.clone()];
+    state.members.push(main_member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
     sync_cluster_connectivity_records_to_kv(
         &paths,
         &local,
@@ -21727,6 +21738,98 @@ fn connectivity_quorum_sync_driver_delegates_commits_and_remembers() {
     assert_eq!(host.remembers, 1, "cache-hit path should not re-remember");
 }
 
+#[test]
+fn connectivity_quorum_sync_does_not_cache_uncommitted_ttl_refresh() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-noop-cache");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_noop_cache").expect("cluster");
+    let source_node =
+        NodeId::from_legacy_named("node_connectivity_noop_cache_source").expect("source");
+    let target_node =
+        NodeId::from_legacy_named("node_connectivity_noop_cache_target").expect("target");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity noop cache",
+        source_node.clone(),
+        "source",
+        "pk-source",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state to kv");
+
+    let endpoint = daemon_lan_endpoint(&target_node, "10.54.0.2:21353".to_string(), 10);
+    let stored = cluster_connectivity_record(
+        &state,
+        &endpoint,
+        ClusterConnectivityState::Healthy,
+        Some(6),
+        0,
+        Some("stored".to_string()),
+        None,
+        now,
+        600,
+    );
+    let key = cluster_connectivity_key(
+        &stored.source_node_id,
+        &stored.target_node_id,
+        &stored.endpoint_id,
+    );
+    append_cluster_raft_command(
+        &paths,
+        &source_node,
+        KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::put_serde(&key, &stored, None).expect("stored put")],
+            failure: Vec::new(),
+        }),
+    )
+    .expect("seed connectivity");
+
+    let mut refreshed = cluster_connectivity_record(
+        &state,
+        &endpoint,
+        ClusterConnectivityState::Healthy,
+        Some(1),
+        0,
+        Some("refreshed".to_string()),
+        None,
+        now + time::Duration::seconds(60),
+        900,
+    );
+    refreshed.latency_ms = Some(1);
+    let mut host = RecordingClusterConnectivityPublishHost::default();
+    let result = sync_cluster_connectivity_records_to_quorum_with_host(
+        &paths,
+        &source_node,
+        vec![refreshed],
+        &mut host,
+    )
+    .expect("connectivity quorum sync");
+
+    assert!(
+        result.is_none(),
+        "fresh stable KV records should not be rewritten"
+    );
+    assert_eq!(host.cache_checks, 1);
+    assert_eq!(host.commits, Vec::<usize>::new());
+    assert_eq!(
+        host.remembers, 0,
+        "a stable no-op must not remember the refreshed incoming TTL as published"
+    );
+    let snapshot = read_cluster_kv_current_snapshot(&paths).expect("snapshot");
+    let kept = snapshot
+        .get(&key)
+        .expect("stored connectivity")
+        .decode::<ClusterConnectivityRecord>()
+        .expect("decode stored connectivity");
+    assert_eq!(kept.expires_at, stored.expires_at);
+}
+
 /// Simulates a forwarding learner: commits land in the "voter's" in-memory
 /// store and the response snapshot reflects them, but the local paths-backed
 /// KV never advances (no fan-out, no import). The async sync loop must
@@ -33868,16 +33971,6 @@ mod route_cache_tests {
                 good_endpoint.clone(),
             ],
         );
-        mark_local_endpoints_healthy(
-            &paths,
-            &state,
-            &[
-                stale_endpoint,
-                stale_endpoint_2,
-                stale_endpoint_3,
-                good_endpoint,
-            ],
-        );
         let runtime = tokio::runtime::Handle::current();
         let mut host = RecordingTargetHost::new([
             SendOutcome::Error("stale endpoint hung"),
@@ -33909,18 +34002,18 @@ mod route_cache_tests {
             .connect_timeout
             .expect("first endpoint budget");
         assert!(
-            first_budget <= Duration::from_millis(3_750)
-                && first_budget >= Duration::from_millis(3_000),
-            "first endpoint budget should reserve time for the remaining candidates: {first_budget:?}"
+            first_budget <= Duration::from_millis(2_100)
+                && first_budget >= Duration::from_millis(1_500),
+            "unverified first endpoint budget should be capped tightly: {first_budget:?}"
         );
         let second_budget = host.sent[1]
             .3
             .connect_timeout
             .expect("second endpoint budget");
         assert!(
-            second_budget <= CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX
-                && second_budget >= Duration::from_millis(4_000),
-            "second endpoint budget should be capped near the per-endpoint max: {second_budget:?}"
+            second_budget <= Duration::from_millis(2_100)
+                && second_budget >= Duration::from_millis(1_500),
+            "unverified second endpoint budget should be capped tightly: {second_budget:?}"
         );
     }
 
@@ -34345,7 +34438,7 @@ mod route_cache_tests {
     }
 
     #[test]
-    fn stable_connectivity_refresh_does_not_bump_route_generation() {
+    fn stable_connectivity_refresh_bumps_route_generation() {
         let (_root, paths) = test_paths("sinomo-network-stable-connectivity-generation");
         let cluster_id = cid("cluster_stable_connectivity_generation");
         let local = nid("node_stable_connectivity_generation_local");
@@ -34393,7 +34486,7 @@ mod route_cache_tests {
         )
         .expect("write stable connectivity refresh");
 
-        assert_eq!(
+        assert_ne!(
             sinomo_network::local_cluster_connectivity_content_generation(&paths),
             generation_after_first
         );

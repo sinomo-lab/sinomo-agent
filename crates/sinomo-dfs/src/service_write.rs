@@ -1317,6 +1317,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         policy: DfsReplicationPolicy,
         foreground_replica_repair: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        self.write_distributed_eventual_with_base_and_parent_touch_and_repair_mode(
+            request,
+            expected_base_version,
+            bytes,
+            desired_replica_nodes,
+            policy,
+            true,
+            foreground_replica_repair,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_with_base_and_parent_touch_and_repair_mode(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        bytes: Vec<u8>,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        foreground_replica_repair: bool,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let object = self.current_object_for_write(&request.object_id)?;
         if !matches!(
             object.policy,
@@ -1370,6 +1392,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     policy,
                     object,
                     shard,
+                    touch_parent_on_create,
                     foreground_replica_repair,
                 );
             }
@@ -1617,6 +1640,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         policy: DfsReplicationPolicy,
         object: DfsObjectMetadata,
         shard: DfsMetadataShardConfig,
+        touch_parent_on_create: bool,
         foreground_replica_repair: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let request_id = self.next_request_id();
@@ -1644,7 +1668,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             object_metadata: Some(object.clone()),
-            touch_parent_on_create: true,
+            touch_parent_on_create,
             foreground_replica_repair,
         };
         let sent = self.send_dfs_message_if_routable(

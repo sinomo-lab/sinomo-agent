@@ -152,12 +152,10 @@ fn cached_daemon_signing_identity(
         .get(&root)
         .cloned();
     if let Some(cached) = cached {
-        if cached.node_id != "node_local" {
+        let Some(node_id) = local_cluster_node_id(data_dir) else {
             return Ok(cached);
-        }
-        if let Some(node_id) = local_cluster_node_id(data_dir)
-            && node_id != cached.node_id
-        {
+        };
+        if node_id != cached.node_id {
             let refreshed = CachedDaemonSigningIdentity { node_id, ..cached };
             DAEMON_SIGNING_IDENTITIES
                 .get_or_init(|| Mutex::new(HashMap::new()))
@@ -266,7 +264,9 @@ fn auth_nonce_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ObjectRpcRequest;
     use std::collections::BTreeSet;
+    use time::OffsetDateTime;
 
     #[test]
     fn daemon_auth_nonce_suffix_is_unique_under_concurrent_signing() {
@@ -287,5 +287,56 @@ mod tests {
                 assert!(seen.insert(value), "duplicate daemon auth nonce suffix");
             }
         }
+    }
+
+    #[test]
+    fn cached_daemon_signing_identity_refreshes_changed_cluster_node_id() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-daemon-auth-node-id-refresh");
+        let data_dir = SinomoDataDir::new(root.path());
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let cluster_id =
+            sinomo_node::ClusterId::from_legacy_named("cluster_daemon_auth_node_id_refresh")
+                .expect("cluster id");
+        let first_node =
+            sinomo_node::NodeId::from_legacy_named("node_daemon_auth_node_id_refresh_first")
+                .expect("first node");
+        let second_node =
+            sinomo_node::NodeId::from_legacy_named("node_daemon_auth_node_id_refresh_second")
+                .expect("second node");
+        let now = OffsetDateTime::now_utc();
+        let mut state = sinomo_base::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "auth node id refresh",
+            first_node.clone(),
+            "first",
+            "pk-first",
+            now,
+        );
+        crate::object_file_store::write_object_file(&cluster_paths.state, &state)
+            .expect("write first state");
+        let request =
+            ObjectRpcRequest::encode_body("/test/daemon-auth", "test", &()).expect("request");
+
+        let first_auth =
+            sign_daemon_rpc_request_from_data_dir(&data_dir, &request).expect("first auth");
+        let first_envelope: SignedDaemonCommand = SinomoObjectCodec::default()
+            .decode(&first_auth)
+            .expect("decode first envelope");
+        assert_eq!(first_envelope.node_id, first_node.to_string());
+
+        state.local_node_id = second_node.clone();
+        state.members[0].node_id = second_node.clone();
+        state.members[0].display_name = "second".to_string();
+        crate::object_file_store::write_object_file(&cluster_paths.state, &state)
+            .expect("write second state");
+
+        let second_auth =
+            sign_daemon_rpc_request_from_data_dir(&data_dir, &request).expect("second auth");
+        let second_envelope: SignedDaemonCommand = SinomoObjectCodec::default()
+            .decode(&second_auth)
+            .expect("decode second envelope");
+        assert_eq!(second_envelope.node_id, second_node.to_string());
     }
 }
