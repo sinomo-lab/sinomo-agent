@@ -29,14 +29,12 @@ use crate::{
     DfsMetadataJournalBatchResponse, DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand,
     DfsMetadataSnapshotInstallResponse, DfsOperatorInspector, DfsOperatorStatus, DfsSmokeReport,
     decode_dfs_message_rpc_request, default_dfs_metadata_root, default_dfs_metadata_shards_root,
-    default_dfs_repair_attempt_snapshot_path, dfs_module_surfaces, dfs_route_is_message_data_plane,
+    dfs_module_surfaces, dfs_route_is_message_data_plane,
     ensure_default_cluster_aware_dfs_expose_config, handle_dfs_direct_read_rpc_request,
-    handle_dfs_direct_read_stream_rpc_request, metadata_shards_prefix,
-    open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    read_dfs_repair_attempt_snapshot, resolve_dfs_conflicts, sifs_file_system_id,
-    use_dfs_conflict_version,
+    handle_dfs_direct_read_stream_rpc_request, inspect_cluster_aware_dfs_status,
+    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
+    resolve_dfs_conflicts, sifs_file_system_id, use_dfs_conflict_version,
 };
-use sinomo_core::cluster::read_cluster_state_without_kv;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{ClusterPaths, ObjectRpcRequest, ObjectRpcResponse};
 
@@ -337,52 +335,16 @@ fn dfs_status(data_dir: &SinomoDataDir) -> Result<DfsOperatorStatus, ServiceErro
         "status ensure_layout_ms={}",
         started_at.elapsed().as_millis()
     ));
-    let metadata_started_at = Instant::now();
-    let metadata = open_metadata_backend(data_dir)?;
-    dfs_service_perf_trace(format_args!(
-        "status open_metadata_ms={} total_ms={}",
-        metadata_started_at.elapsed().as_millis(),
-        started_at.elapsed().as_millis()
-    ));
-    let inspector_started_at = Instant::now();
-    let mut status = DfsOperatorInspector::new(metadata.as_ref())
-        .status()
-        .map_err(service_error)?;
-    attach_dfs_service_maintenance_observations(&mut status, data_dir)?;
-    dfs_service_perf_trace(format_args!(
-        "status inspector_ms={} total_ms={}",
-        inspector_started_at.elapsed().as_millis(),
-        started_at.elapsed().as_millis()
-    ));
+    let status_started_at = Instant::now();
     let cluster_paths = ClusterPaths::new(data_dir);
-    let trim_started_at = Instant::now();
-    if let Ok(state) = read_cluster_state_without_kv(&cluster_paths) {
-        for shard in &mut status.metadata_shards {
-            if shard.primary_node_id.as_ref() == Some(&state.local_node_id) {
-                shard.replay_cursors.clear();
-            } else {
-                shard.replica_lag.clear();
-            }
-        }
-    }
+    let status =
+        inspect_cluster_aware_dfs_status(data_dir, &cluster_paths).map_err(service_error)?;
     dfs_service_perf_trace(format_args!(
-        "status trim_ms={} total_ms={}",
-        trim_started_at.elapsed().as_millis(),
+        "status cluster_aware_ms={} total_ms={}",
+        status_started_at.elapsed().as_millis(),
         started_at.elapsed().as_millis()
     ));
     Ok(status)
-}
-
-fn attach_dfs_service_maintenance_observations(
-    status: &mut DfsOperatorStatus,
-    data_dir: &SinomoDataDir,
-) -> Result<(), ServiceError> {
-    status.repair_attempts =
-        read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(data_dir))
-            .map_err(service_error)?
-            .map(|snapshot| snapshot.records)
-            .unwrap_or_default();
-    Ok(())
 }
 
 /// Serve a DFS operator inspection request against the local metadata backend.
@@ -395,8 +357,7 @@ fn dfs_inspection(
     let inspector = DfsOperatorInspector::new(metadata.as_ref());
     let response = match request {
         DaemonDfsInspectionRequest::Status => {
-            let mut status = inspector.status().map_err(service_error)?;
-            attach_dfs_service_maintenance_observations(&mut status, data_dir)?;
+            let status = dfs_status(data_dir)?;
             DaemonDfsInspectionResponse::Status { status }
         }
         DaemonDfsInspectionRequest::FileSystem { file_system_id } => {
@@ -524,14 +485,20 @@ mod tests {
     use super::*;
     use crate::{DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY};
     use crate::{
-        DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsExposeConfig,
-        DfsMetadataJournalBatch, DfsMetadataJournalReplicationReport, DfsMetadataShardId,
-        DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
-        DfsMetadataSnapshotInstallResult, DfsObjectId, DfsSmokeAttempt, DfsVersion,
-        LocalSobjMetadataBackend, sifs_file_system_id,
+        DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsExposeConfig, DfsFileSystem,
+        DfsMetadataJournalBatch, DfsMetadataJournalReplicationReport, DfsMetadataShardAssignment,
+        DfsMetadataShardId, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
+        DfsMetadataSnapshotInstallResult, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
+        DfsObjectVersionRecord, DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsSmokeAttempt,
+        DfsVersion, DfsWriteIntentRecord, DfsWriteIntentStatus, LocalSobjMetadataBackend,
+        metadata_shard_key, sifs_file_system_id,
     };
+    use sinomo_core::DfsObjectPolicy;
+    use sinomo_core::cluster::ClusterKvPathsExt;
+    use sinomo_core::node::NodeId;
     use sinomo_core::service::{ResponseSink, ServiceRegistry, ServiceSigner};
     use std::sync::{Arc, Mutex};
+    use time::OffsetDateTime;
 
     #[derive(Clone, Default)]
     struct VecSink {
@@ -692,6 +659,160 @@ mod tests {
         };
         assert_eq!(disposition, ServiceDisposition::Continue);
         let _status: DfsOperatorStatus = response.decode_body().expect("decode status");
+    }
+
+    #[tokio::test]
+    async fn dfs_status_route_scopes_operational_counts_to_primary_shards() {
+        let registry = register_services(ServiceRegistry::builder()).build();
+        let (_root, data_dir) = temp_data_dir();
+        let cluster_paths = ClusterPaths::new(data_dir.as_ref());
+        let now = OffsetDateTime::now_utc();
+        let local = NodeId::from_legacy_named("node_dfs_status_scope_local").expect("local");
+        let primary = NodeId::from_legacy_named("node_dfs_status_scope_primary").expect("primary");
+        let missing = NodeId::from_legacy_named("node_dfs_status_scope_missing").expect("missing");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_status_scope")
+                .expect("cluster");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "dfs status scope",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("cluster kv state");
+
+        let file_system = DfsFileSystem::sifs(local.clone());
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: primary,
+            replica_node_ids: vec![local.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut cluster_kv = sinomo_core::kv::InProcessKvStore::restore(
+            sinomo_core::kv::read_cluster_kv_cached_snapshot(&cluster_paths.kv_paths())
+                .expect("cluster kv snapshot"),
+        )
+        .expect("cluster kv store");
+        cluster_kv
+            .put_serde(
+                metadata_shard_key(&file_system.file_system_id, "root"),
+                &shard,
+                None,
+            )
+            .expect("shard op");
+        let snapshot = cluster_kv.snapshot().expect("cluster kv snapshot");
+        sinomo_core::kv::write_cluster_kv_snapshot(&cluster_paths.kv_paths(), &snapshot)
+            .expect("write shard config");
+
+        let object_id =
+            DfsObjectId::from_legacy_named("obj_dfs_status_scope_repair").expect("object");
+        let version = DfsVersion::from_legacy_named("version_dfs_status_scope").expect("version");
+        let content_hash = "blake3:status-scope".to_string();
+        let mut backend = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            default_dfs_metadata_shards_root(data_dir.as_ref()).join("root"),
+        )
+        .expect("metadata backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        let object = DfsObjectMetadata {
+            object_id: object_id.clone(),
+            file_system_id: file_system.file_system_id.clone(),
+            path: "/services/cluster-tests/status-scope.txt".to_string(),
+            kind: DfsObjectKind::File,
+            owner_node_id: local.clone(),
+            current_locations: vec![local.clone()],
+            content_hash: Some(content_hash.clone()),
+            content_size_bytes: Some(12),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: version.clone(),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        backend.put_object(&object).expect("object");
+        backend
+            .put_version(&DfsObjectVersionRecord {
+                file_system_id: file_system.file_system_id.clone(),
+                object_id: object_id.clone(),
+                version: version.clone(),
+                content_hash: Some(content_hash.clone()),
+                size_bytes: Some(12),
+                locations: vec![local.clone()],
+                created_by_event_id: None,
+                created_at: now,
+                visible: true,
+            })
+            .expect("version");
+        backend
+            .put_intent(&DfsWriteIntentRecord {
+                intent_id: "intent_dfs_status_scope".to_string(),
+                file_system_id: file_system.file_system_id.clone(),
+                object_id: object_id.clone(),
+                base_version: None,
+                target_version: version.clone(),
+                coordinator_node_id: local.clone(),
+                owner_epoch: 1,
+                desired_replica_node_ids: vec![local.clone(), missing.clone()],
+                policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+                status: DfsWriteIntentStatus::Committed,
+                content_hash: Some(content_hash.clone()),
+                object_metadata: Some(object),
+                created_at: now,
+                updated_at: Some(now),
+            })
+            .expect("intent");
+        backend
+            .put_receipt(&DfsReplicaReceiptRecord {
+                receipt: sinomo_core::DfsWriteReceipt {
+                    file_system_id: file_system.file_system_id.clone().into(),
+                    object_id: object_id.clone().into(),
+                    committed_version: version.clone().into(),
+                    owner_node_id: local.clone().into(),
+                    event_id: sinomo_core::Id::generate(),
+                },
+                replica_node_id: local,
+                content_hash: Some(content_hash),
+                received_at: now,
+            })
+            .expect("receipt");
+        drop(backend);
+
+        let (disposition, response) =
+            dispatch_local(&registry, Arc::clone(&data_dir), DFS_STATUS_ROUTE, &()).await;
+        assert_eq!(disposition, ServiceDisposition::Continue);
+        let status: DfsOperatorStatus = response.decode_body().expect("decode status");
+        assert_eq!(status.object_count, 1);
+        assert_eq!(status.pending_repair_count, 0);
+
+        let (disposition, response) = dispatch_local(
+            &registry,
+            data_dir,
+            DFS_INSPECTION_ROUTE,
+            &DaemonDfsInspectionRequest::Status,
+        )
+        .await;
+        assert_eq!(disposition, ServiceDisposition::Continue);
+        let response: DaemonDfsInspectionResponse =
+            response.decode_body().expect("decode inspection");
+        let DaemonDfsInspectionResponse::Status { status } = response else {
+            panic!("expected status response");
+        };
+        assert_eq!(status.object_count, 1);
+        assert_eq!(status.pending_repair_count, 0);
     }
 
     #[tokio::test]

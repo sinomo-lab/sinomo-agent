@@ -462,6 +462,7 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     loop {
         attempts = attempts.saturating_add(1);
         let mut statuses = BTreeMap::new();
+        let mut repair_details = BTreeMap::new();
         let mut failures = Vec::new();
         for target in &targets {
             match daemon_client.dfs_object_rpc_to_target(
@@ -490,6 +491,15 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                         } else {
                             Vec::new()
                         };
+                        if !repairs.is_empty() {
+                            repair_details.insert(
+                                target.to_string(),
+                                repairs
+                                    .iter()
+                                    .map(dfs_repair_probe_summary)
+                                    .collect::<Vec<_>>(),
+                            );
+                        }
                         statuses.insert(
                             target.to_string(),
                             dfs_status_probe_summary(
@@ -523,6 +533,9 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ctx.record("statuses", &statuses);
             ctx.record("attempts", attempts);
             ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+            if !repair_details.is_empty() {
+                ctx.record("repair_details", &repair_details);
+            }
             if !failures.is_empty() {
                 ctx.record("failures", failures.clone());
                 return Ok(SinomoTestOutcome::failed(format!(
@@ -657,6 +670,23 @@ fn fetch_dfs_repair_views_for_status(
         DaemonDfsInspectionResponse::Repair { repairs, .. } => Ok(repairs),
         other => Err(format!("unexpected DFS inspection response: {other:?}")),
     }
+}
+
+fn dfs_repair_probe_summary(repair: &DfsOperatorRepairView) -> BTreeMap<&'static str, String> {
+    BTreeMap::from([
+        ("intent_id", repair.intent_id.clone()),
+        ("file_system_id", repair.file_system_id.to_string()),
+        ("object_id", repair.object_id.to_string()),
+        ("version", repair.version.to_string()),
+        (
+            "content_hash",
+            repair.content_hash.clone().unwrap_or_default(),
+        ),
+        (
+            "missing_replica_node_id",
+            repair.missing_replica_node_id.to_string(),
+        ),
+    ])
 }
 
 fn dfs_status_probe_summary(

@@ -561,6 +561,72 @@ run_large_routed_dfs() {
     --param "max-proc-write-bytes=$LARGE_MAX_READ_PROC_WRITE_BYTES"
 }
 
+run_two_online_one_offline_dfs_probe() {
+  local path_a path_b payload_a payload_b
+
+  log "checking DFS quorum with node3 offline"
+  compose stop node3 >/dev/null
+
+  run_probe node1 cluster.network.ping-benchmark \
+    --param expected-targets=1 \
+    --param "requests-per-target=$NETWORK_REQUESTS_PER_TARGET" \
+    --param "warmup-requests-per-target=$NETWORK_WARMUP_REQUESTS_PER_TARGET" \
+    --param "concurrency=$NETWORK_CONCURRENCY" \
+    --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
+    --param max-failures=0 \
+    --param max-p50-ms=1000 \
+    --param max-p95-ms=3000 \
+    --param max-p50-us=0 \
+    --param max-p95-us=0 \
+    --param min-requests-per-second=1
+  run_probe node2 cluster.network.ping-benchmark \
+    --param expected-targets=1 \
+    --param "requests-per-target=$NETWORK_REQUESTS_PER_TARGET" \
+    --param "warmup-requests-per-target=$NETWORK_WARMUP_REQUESTS_PER_TARGET" \
+    --param "concurrency=$NETWORK_CONCURRENCY" \
+    --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
+    --param max-failures=0 \
+    --param max-p50-ms=1000 \
+    --param max-p95-ms=3000 \
+    --param max-p50-us=0 \
+    --param max-p95-us=0 \
+    --param min-requests-per-second=1
+  run_probe node1 cluster.dfs.routed-status \
+    --param expected-targets=1 \
+    --param max-remote-open-conflicts=0 \
+    --param max-remote-pending-writes=0 \
+    --param max-remote-pending-repairs=0 \
+    --param "timeout-ms=$NETWORK_TIMEOUT_MS"
+
+  path_a="/services/routing-scenario/$RUN_ID/offline-node3-node1-to-node2.txt"
+  path_b="/services/routing-scenario/$RUN_ID/offline-node3-node2-to-node1.txt"
+  payload_a="routing-scenario node1 node2 with node3 offline $RUN_ID"
+  payload_b="routing-scenario node2 node1 with node3 offline $RUN_ID"
+  run_probe node1 cluster.dfs.write \
+    --param "path=$path_a" \
+    --param "payload=$payload_a" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT"
+  run_probe node2 cluster.dfs.expect-file \
+    --param "path=$path_a" \
+    --param "payload=$payload_a" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT"
+  run_probe node2 cluster.dfs.write \
+    --param "path=$path_b" \
+    --param "payload=$payload_b" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT"
+  run_probe node1 cluster.dfs.expect-file \
+    --param "path=$path_b" \
+    --param "payload=$payload_b" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT"
+
+  compose start node3 >/dev/null
+  wait_for_node_daemons node3
+  wait_for_network_ready
+  run_dfs_routed_status_probe node1
+  run_dfs_routed_status_probe node2
+  run_dfs_routed_status_probe node3
+}
+
 wait_for_node_daemons() {
   local node="$1" deadline
   deadline=$(( $(date +%s) + NODE_RESTART_WAIT ))
@@ -689,6 +755,7 @@ assert_forwarded_endpoint_active
 run_concurrent_duplex_dfs_probe
 run_cross_segment_dfs
 run_large_routed_dfs
+run_two_online_one_offline_dfs_probe
 run_restart_recovery_probe node3
 
 log "PASS; artifacts in $ARTIFACTS"
