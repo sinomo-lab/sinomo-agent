@@ -75,6 +75,7 @@ pub struct ClusterRaftCommittedFanoutOptions {
 pub struct ClusterRaftLeaderElectionOptions {
     pub kv: ClusterKvRaftLeaderElectionOptions,
     pub timeout: Duration,
+    pub campaign_jitter_max: Duration,
     pub tcp_command_timeout: Duration,
     pub iroh_command_timeout: Duration,
     pub tcp_foreground_attempt_timeout: Duration,
@@ -146,6 +147,8 @@ pub const DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT: Durat
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT: Duration =
     Duration::from_millis(1500);
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_CAMPAIGN_JITTER_MAX: Duration =
+    Duration::from_millis(750);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterControlPlaneTimeouts {
@@ -153,6 +156,7 @@ pub struct ClusterControlPlaneTimeouts {
     pub raft_append_timeout: Duration,
     pub rpc_timeout: Duration,
     pub membership_rpc_timeout: Duration,
+    pub raft_campaign_jitter_max: Duration,
     pub tcp_command_timeout: Duration,
     pub iroh_command_timeout: Duration,
     pub tcp_foreground_attempt_timeout: Duration,
@@ -167,6 +171,7 @@ impl ClusterControlPlaneTimeouts {
             raft_append_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
             rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RPC_TIMEOUT,
             membership_rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
+            raft_campaign_jitter_max: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_CAMPAIGN_JITTER_MAX,
             tcp_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT,
             iroh_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
             tcp_foreground_attempt_timeout:
@@ -216,6 +221,7 @@ impl ClusterControlPlaneTimeouts {
                 max_attempts: sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,
             },
             timeout: self.raft_append_timeout,
+            campaign_jitter_max: self.raft_campaign_jitter_max,
             tcp_command_timeout: self.tcp_command_timeout,
             iroh_command_timeout: self.iroh_command_timeout,
             tcp_foreground_attempt_timeout: self.tcp_foreground_attempt_timeout,

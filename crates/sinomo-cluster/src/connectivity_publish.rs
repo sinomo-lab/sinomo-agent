@@ -191,6 +191,9 @@ where
     H: ClusterConnectivityPublishHost,
 {
     write_local_cluster_connectivity_record_set(paths, source_node_id, &records)?;
+    if host.published_connectivity_record_set_matches(paths, source_node_id, &records) {
+        return Ok(None);
+    }
     let mut state = None;
     let mut latest = None;
     let mut previous_ops: Option<Vec<KvOp>> = None;
@@ -311,6 +314,13 @@ where
             })
         })?
         .map_err(H::Error::from)?;
+
+    if host
+        .published_connectivity_record_set_matches_async(paths, source_node_id, &records)
+        .await?
+    {
+        return Ok(None);
+    }
 
     let mut state = initial_state;
     let mut latest: Option<KvSnapshot> = None;

@@ -62,7 +62,7 @@ use sinomo_cluster::{
 };
 use sinomo_cluster::{
     ClusterRaftAppendReplicationOptions, ClusterRaftCommittedFanoutOptions,
-    ClusterRaftLeaderElectionOptions,
+    ClusterRaftLeaderElectionOptions, DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_CAMPAIGN_JITTER_MAX,
 };
 use sinomo_cluster::{
     LocalClusterRaftCommandStorage, cluster_member_removal_txns_from_store,
@@ -4801,6 +4801,7 @@ fn connectivity_graph_uses_local_bootstrap_for_sources_missing_from_kv() {
         "pk-a",
         now,
     );
+    write_cluster_state(&paths, &state).expect("write state");
     let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.1.22:21353".to_string(), 10);
     let endpoint_c = daemon_lan_endpoint(&node_c, "10.0.1.23:21353".to_string(), 10);
     let local_a_record = cluster_connectivity_record(
@@ -9757,6 +9758,7 @@ fn leader_election_test_options() -> ClusterRaftLeaderElectionOptions {
     ClusterRaftLeaderElectionOptions {
         kv: ClusterKvRaftLeaderElectionOptions { max_attempts: 1 },
         timeout: Duration::from_secs(10),
+        campaign_jitter_max: Duration::ZERO,
         tcp_command_timeout: Duration::from_secs(8),
         iroh_command_timeout: Duration::from_secs(6),
         tcp_foreground_attempt_timeout: Duration::from_secs(2),
@@ -9813,6 +9815,7 @@ fn cluster_control_plane_timeouts_derive_driver_options() {
             raft_append_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
             rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RPC_TIMEOUT,
             membership_rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
+            raft_campaign_jitter_max: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_CAMPAIGN_JITTER_MAX,
             tcp_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT,
             iroh_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
             tcp_foreground_attempt_timeout:
@@ -9829,6 +9832,7 @@ fn cluster_control_plane_timeouts_derive_driver_options() {
         raft_append_timeout: Duration::from_secs(10),
         rpc_timeout: Duration::from_secs(2),
         membership_rpc_timeout: Duration::from_secs(15),
+        raft_campaign_jitter_max: Duration::from_millis(17),
         tcp_command_timeout: Duration::from_secs(8),
         iroh_command_timeout: Duration::from_secs(6),
         tcp_foreground_attempt_timeout: Duration::from_secs(3),
@@ -11438,6 +11442,7 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
                 max_attempts: sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,
             },
             timeout: Duration::from_secs(5),
+            campaign_jitter_max: Duration::ZERO,
             tcp_command_timeout: Duration::from_secs(5),
             iroh_command_timeout: Duration::from_secs(3),
             tcp_foreground_attempt_timeout: Duration::from_secs(1),
@@ -11499,6 +11504,7 @@ fn cluster_raft_leader_election_retries_next_endpoint_for_same_remote_voter() {
                 max_attempts: sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,
             },
             timeout: Duration::from_secs(5),
+            campaign_jitter_max: Duration::ZERO,
             tcp_command_timeout: Duration::from_secs(5),
             iroh_command_timeout: Duration::from_secs(3),
             tcp_foreground_attempt_timeout: Duration::from_secs(1),
@@ -18804,6 +18810,7 @@ fn async_cluster_raft_append_replication_retries_from_rejected_match_index() {
                 raft_append_timeout: Duration::from_secs(5),
                 rpc_timeout: Duration::from_secs(5),
                 membership_rpc_timeout: Duration::from_secs(5),
+                raft_campaign_jitter_max: Duration::ZERO,
             },
             Duration::from_secs(5),
             &mut host,

@@ -12,7 +12,10 @@ use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_network::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub trait ClusterRaftVoteTransportHost {
     fn send_raft_vote(
@@ -34,6 +37,25 @@ pub(crate) trait ClusterRaftVoteTransportAsyncHost {
 
 fn try_clone_network_node_id(node_id: &NodeId, operation: &str) -> Result<NodeId, NetworkError> {
     sinomo_network::try_clone_id(node_id, operation)
+}
+
+fn cluster_raft_campaign_jitter_for_node(node_id: &NodeId, max: Duration) -> Duration {
+    if max.is_zero() {
+        return Duration::ZERO;
+    }
+    let max_nanos = max.as_nanos().min(u128::from(u64::MAX)) as u64;
+    if max_nanos == 0 {
+        return Duration::ZERO;
+    }
+    let time_bucket = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        / u128::from(max_nanos);
+    let mut hasher = DefaultHasher::new();
+    node_id.to_string().hash(&mut hasher);
+    time_bucket.hash(&mut hasher);
+    Duration::from_nanos(hasher.finish() % max_nanos)
 }
 
 struct NetworkClusterKvRaftLeaderElectionHost<'a, H> {
@@ -75,6 +97,13 @@ where
     }
 
     fn begin_election_attempt(&mut self) -> Result<(), Self::Error> {
+        let jitter = cluster_raft_campaign_jitter_for_node(
+            &self.state.local_node_id,
+            self.options.campaign_jitter_max,
+        );
+        if !jitter.is_zero() {
+            std::thread::sleep(jitter);
+        }
         self.attempt_deadline = Instant::now() + self.options.timeout;
         Ok(())
     }
@@ -196,6 +225,13 @@ where
         &'a mut self,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
         Box::pin(async move {
+            let jitter = cluster_raft_campaign_jitter_for_node(
+                &self.state.local_node_id,
+                self.options.campaign_jitter_max,
+            );
+            if !jitter.is_zero() {
+                tokio::time::sleep(jitter).await;
+            }
             self.attempt_deadline = Instant::now() + self.options.timeout;
             Ok(())
         })

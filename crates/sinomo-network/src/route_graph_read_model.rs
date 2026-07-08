@@ -322,7 +322,19 @@ pub fn read_cluster_connectivity_graph_with_query<Q>(
 where
     Q: ClusterConnectivityRecordQuery + ?Sized,
 {
-    read_cluster_connectivity_graph_with_bootstrap_and_query(paths, None, None, None, query)
+    let state =
+        crate::object_file_store::read_optional_object_file::<ClusterBootstrapState>(&paths.state)
+            .ok()
+            .flatten();
+    let cluster_id = state.as_ref().map(|state| &state.cluster_id);
+    let local_source_node_id = state.as_ref().map(|state| &state.local_node_id);
+    read_cluster_connectivity_graph_with_bootstrap_and_query(
+        paths,
+        cluster_id,
+        local_source_node_id,
+        state.as_ref(),
+        query,
+    )
 }
 
 pub(crate) fn read_cluster_connectivity_graph_for_state(

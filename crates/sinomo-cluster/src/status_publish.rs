@@ -165,6 +165,9 @@ pub fn cluster_node_status_publish_matches_with_host<H>(
 where
     H: ClusterNodeStatusPublishHost,
 {
+    if host.published_node_status_matches(paths, status) {
+        return Ok(true);
+    }
     if stored_cluster_node_status_matches(paths, status)? {
         host.remember_published_node_status(paths, status);
         return Ok(true);
@@ -207,6 +210,12 @@ pub(crate) async fn cluster_node_status_publish_matches_async_with_host<H>(
 where
     H: ClusterNodeStatusPublishAsyncHost,
 {
+    if host
+        .published_node_status_matches_async(paths, status)
+        .await?
+    {
+        return Ok(true);
+    }
     let match_paths = paths.clone();
     let match_status = status.clone();
     let stored_matches = runtime
@@ -297,6 +306,9 @@ pub fn cluster_network_info_publish_matches_with_host<H>(
 where
     H: ClusterNetworkInfoPublishHost,
 {
+    if host.published_network_info_matches(paths, info) {
+        return Ok(true);
+    }
     if stored_cluster_network_info_matches(paths, info)? {
         host.remember_published_network_info(paths, info);
         return Ok(true);
@@ -341,6 +353,12 @@ pub(crate) async fn cluster_network_info_publish_matches_async_with_host<H>(
 where
     H: ClusterNetworkInfoPublishAsyncHost,
 {
+    if host
+        .published_network_info_matches_async(paths, info)
+        .await?
+    {
+        return Ok(true);
+    }
     let match_paths = paths.clone();
     let match_info = info.clone();
     let stored_matches = runtime

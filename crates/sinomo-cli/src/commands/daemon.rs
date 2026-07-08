@@ -711,6 +711,7 @@ fn cli_cluster_control_plane_timeouts() -> cluster::ClusterControlPlaneTimeouts 
         raft_append_timeout: Duration::from_secs(10),
         rpc_timeout: Duration::from_secs(5),
         membership_rpc_timeout: Duration::from_secs(10),
+        raft_campaign_jitter_max: Duration::ZERO,
         tcp_command_timeout: Duration::from_secs(8),
         iroh_command_timeout: Duration::from_secs(6),
         tcp_foreground_attempt_timeout: Duration::from_secs(2),
