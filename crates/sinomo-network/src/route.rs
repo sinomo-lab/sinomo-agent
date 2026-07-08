@@ -39,6 +39,8 @@ const CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED: Duration =
     Duration::from_millis(3500);
 const CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_FALLBACK_RESERVE: Duration =
     Duration::from_millis(500);
+const CLUSTER_TARGET_FULL_RESPONSE_ENDPOINT_ATTEMPT_PREFERRED: Duration =
+    CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX;
 const CLUSTER_DELIVERY_DEGRADED_LINK_COST: u64 = 50_000;
 const CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST: u64 = CLUSTER_DELIVERY_DEGRADED_LINK_COST / 2;
 const CLUSTER_DELIVERY_UNOBSERVED_NEIGHBOR_COST: u64 = 75_000;
@@ -2586,19 +2588,19 @@ where
                     endpoints_left,
                     route_endpoint_count,
                 );
-                let final_hop_verified_direct = final_hop
+                let final_hop_verified_endpoint = final_hop
                     && cluster_target_final_hop_uses_full_response_budget(
                         &local_connectivity,
                         &endpoint,
                     );
-                let final_hop_full_response_budget = final_hop_verified_direct
+                let final_hop_full_response_budget = final_hop_verified_endpoint
                     && cluster_target_final_hop_request_uses_full_response_budget(request);
                 let final_hop_attempt_budget = if final_hop {
                     cluster_target_final_hop_attempt_budget(
                         remaining,
                         endpoints_left,
                         endpoint_attempt_budget,
-                        final_hop_verified_direct,
+                        final_hop_verified_endpoint,
                         final_hop_full_response_budget,
                     )
                 } else {
@@ -2993,18 +2995,18 @@ where
                     endpoints_left,
                     route_endpoint_count,
                 );
-                let final_hop_verified_direct = final_hop
+                let final_hop_verified_endpoint = final_hop
                     && cluster_target_final_hop_uses_full_response_budget(
                         &local_connectivity,
                         &endpoint,
                     );
-                let final_hop_full_response_budget = final_hop_verified_direct;
+                let final_hop_full_response_budget = final_hop_verified_endpoint;
                 let final_hop_attempt_budget = if final_hop {
                     cluster_target_final_hop_attempt_budget(
                         remaining,
                         endpoints_left,
                         endpoint_attempt_budget,
-                        final_hop_verified_direct,
+                        final_hop_verified_endpoint,
                         final_hop_full_response_budget,
                     )
                 } else {
@@ -3453,18 +3455,11 @@ fn cluster_target_final_hop_uses_full_response_budget(
     endpoint: &ClusterEndpointRecord,
 ) -> bool {
     cluster_endpoint_has_healthy_route_evidence(local_connectivity, endpoint)
-        && !cluster_endpoint_is_tcp_tunnel(endpoint)
 }
 
 fn cluster_target_final_hop_request_uses_full_response_budget(request: &ObjectRpcRequest) -> bool {
     crate::object_rpc_request_stream_mode(request).expects_raw_streamed_response()
         || request.uses_full_response_budget()
-}
-
-fn cluster_endpoint_is_tcp_tunnel(endpoint: &ClusterEndpointRecord) -> bool {
-    endpoint
-        .address
-        .starts_with(crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
 }
 
 fn cluster_target_endpoint_attempt_budget(
@@ -3492,9 +3487,6 @@ fn cluster_target_endpoint_attempt_budget_for_endpoint(
         endpoints_left,
         endpoint_count,
     );
-    if cluster_endpoint_is_tcp_tunnel(endpoint) {
-        return budget.map(|budget| budget.min(CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX));
-    }
     if cluster_endpoint_has_healthy_route_evidence(local_connectivity, endpoint) {
         return budget;
     }
@@ -3505,13 +3497,21 @@ fn cluster_target_final_hop_attempt_budget(
     remaining_route_budget: Option<Duration>,
     endpoints_left: usize,
     endpoint_attempt_budget: Option<Duration>,
-    verified_direct_endpoint: bool,
+    verified_endpoint: bool,
     use_full_response_budget: bool,
 ) -> Option<Duration> {
     if use_full_response_budget && endpoints_left <= 1 {
         return remaining_route_budget;
     }
-    if verified_direct_endpoint
+    if use_full_response_budget && let Some(remaining) = remaining_route_budget {
+        let preferred =
+            cluster_target_full_response_endpoint_attempt_preferred(remaining, endpoints_left);
+        let baseline = endpoint_attempt_budget.unwrap_or(Duration::ZERO);
+        if preferred > Duration::ZERO && preferred >= baseline {
+            return Some(preferred.min(remaining));
+        }
+    }
+    if verified_endpoint
         && let (Some(budget), Some(remaining)) = (endpoint_attempt_budget, remaining_route_budget)
     {
         let preferred =
@@ -3536,6 +3536,21 @@ fn cluster_target_verified_direct_endpoint_attempt_preferred(
     remaining_route_budget
         .saturating_sub(fallback_reserve)
         .min(CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED)
+}
+
+fn cluster_target_full_response_endpoint_attempt_preferred(
+    remaining_route_budget: Duration,
+    endpoints_left: usize,
+) -> Duration {
+    let fallback_reserve = if endpoints_left > 1 {
+        CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX
+            .saturating_mul(endpoints_left.saturating_sub(1) as u32)
+    } else {
+        Duration::ZERO
+    };
+    remaining_route_budget
+        .saturating_sub(fallback_reserve)
+        .min(CLUSTER_TARGET_FULL_RESPONSE_ENDPOINT_ATTEMPT_PREFERRED)
 }
 
 fn cluster_endpoint_has_healthy_route_evidence(
@@ -5274,7 +5289,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_endpoint_attempt_budget_caps_synthetic_tcp_tunnel_even_when_healthy() {
+    fn cluster_target_endpoint_attempt_budget_trusts_healthy_synthetic_tcp_tunnel() {
         let now = OffsetDateTime::now_utc();
         let cluster_id =
             ClusterId::from_legacy_named("cluster_target_tunnel_budget").expect("cluster");
@@ -5324,7 +5339,7 @@ mod tests {
         )
         .expect("budget");
 
-        assert_eq!(budget, CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX);
+        assert_eq!(budget, CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX);
     }
 
     #[test]
@@ -5404,7 +5419,7 @@ mod tests {
         .expect("streamed budget");
         assert_eq!(
             streamed,
-            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
+            CLUSTER_TARGET_FULL_RESPONSE_ENDPOINT_ATTEMPT_PREFERRED
         );
     }
 
@@ -5431,7 +5446,7 @@ mod tests {
         .expect("data-plane budget");
         assert_eq!(
             budget,
-            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
+            CLUSTER_TARGET_FULL_RESPONSE_ENDPOINT_ATTEMPT_PREFERRED
         );
 
         let last_endpoint_budget = cluster_target_final_hop_attempt_budget(
