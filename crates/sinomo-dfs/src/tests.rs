@@ -28605,7 +28605,7 @@ fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
 }
 
 #[test]
-fn sifs_cluster_posix_mkdir_all_remote_primary_skips_when_local_chain_exists() {
+fn sifs_cluster_posix_mkdir_all_remote_primary_falls_back_when_local_chain_exists() {
     let root = temp_root("sifs-mkdir-all-local-chain");
     let local_node =
         NodeId::from_legacy_named("node_sifs_mkdir_all_local_chain_local").expect("local");
@@ -28656,6 +28656,62 @@ fn sifs_cluster_posix_mkdir_all_remote_primary_skips_when_local_chain_exists() {
         .posix_mkdir_all_without_local_replay("/services/dfs-smoke")
         .expect("idempotent mkdir_all without replay should not require remote primary");
 
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_cluster_routed_mkdir_all_repairs_primary_when_local_chain_exists() {
+    let cluster = sifs_two_primary_cluster("sifs-routed-mkdir-all-primary-repair");
+    let SifsTwoPrimaryCluster {
+        root,
+        services_primary,
+        services_primary_node,
+        mut replica,
+        replica_node,
+        rejections,
+        ..
+    } = cluster;
+    assert!(
+        rejections.is_empty(),
+        "two-primary setup must not reject journal batches: {rejections:?}"
+    );
+
+    let base = "/services/cluster-tests";
+    let path = "/services/cluster-tests/primary-repair.txt";
+    replica
+        .posix_mkdir_all_local(base)
+        .expect("replica has stale local chain");
+    assert!(
+        replica.posix_stat(base).is_ok(),
+        "replica precondition should have local parent"
+    );
+    assert!(
+        matches!(
+            services_primary.posix_stat(base),
+            Err(DfsPosixError::NotFound { .. })
+        ),
+        "services primary precondition should lack the parent"
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+
+    replica
+        .posix_mkdir_all(base)
+        .expect("routed mkdir_all should repair primary despite local chain");
+    let mut write_options =
+        DfsWriteOptions::replicated_eventual(vec![replica_node, services_primary_node]);
+    write_options.foreground_replica_repair = false;
+    replica
+        .posix_write_file(path, b"child", write_options)
+        .expect("child write after authoritative mkdir_all");
+
+    stop.store(true, Ordering::SeqCst);
+    let services_primary = services_thread.join().expect("services thread");
+    assert!(services_primary.posix_stat(base).is_ok());
+    assert!(services_primary.posix_stat(path).is_ok());
     std::fs::remove_dir_all(&root).ok();
 }
 
