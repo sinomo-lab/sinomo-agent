@@ -5,7 +5,7 @@ description = "Sinomo"
 authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
-include = ["**/*.rs", "Cargo.toml"]
+include = ["**/*.rs", "build.rs", "Cargo.toml"]
 
 [package.metadata.sinomo]
 ring = "application"
@@ -20,6 +20,7 @@ native-devices = ["sinomo-cli/native-devices"]
 [dependencies]
 sinomo-cli = { path = "../sinomo-cli", default-features = false }
 sinomo-evolution = { path = "../sinomo-evolution" }
+sinomo-runtime = { path = "../sinomo-runtime" }
 
 [dev-dependencies]
 serde_json.workspace = true
