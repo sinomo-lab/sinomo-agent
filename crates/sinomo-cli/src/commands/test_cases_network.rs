@@ -44,6 +44,7 @@ pub fn register_network_cluster_test_cases(
         .register(network_state_hygiene_dirty_fixture())
         .register(network_endpoint_error_fallback())
         .register(network_tcp_tunnel_stale_fallback())
+        .register(network_stale_direct_timeout_demotion())
 }
 
 sinomo_runtime::test::sinomo_test_case! {
@@ -102,6 +103,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_network_tcp_tunnel_stale_fallback(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn network_stale_direct_timeout_demotion(ctx) {
+        id: "cluster.network.stale-direct-timeout-demotion",
+        summary: "A routed timeout demotes stale healthy direct endpoint evidence before follow-up RPCs",
+        tags: ["cluster-network", "probe", "routing", "failure-mode"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_network_stale_direct_timeout_demotion(ctx)
         }
     }
 }
@@ -905,9 +918,19 @@ fn run_network_tcp_tunnel_stale_fallback(ctx: &mut SinomoTestContext) -> SinomoT
                 && member.state.is_authorized()
                 && member_has_main_daemon(member)
         })
+        .or_else(|| {
+            cluster_state.members.iter().find(|member| {
+                member.state.is_authorized()
+                    && member_has_main_daemon(member)
+                    && member
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.address == stall_endpoint_address)
+            })
+        })
         .ok_or_else(|| {
             SinomoTestError::failed(format!(
-                "cannot find authorized main daemon target named {target_name}"
+                "cannot find authorized main daemon target named {target_name} or advertising stale direct endpoint {stall_endpoint_address}"
             ))
         })?;
     let stall_endpoint = target
@@ -949,6 +972,155 @@ fn run_network_tcp_tunnel_stale_fallback(ctx: &mut SinomoTestContext) -> SinomoT
     Ok(SinomoTestOutcome::passed(
         "routed RPC recovered from a stalled tcp tunnel by using direct RPC on the same endpoint",
     ))
+}
+
+fn run_network_stale_direct_timeout_demotion(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let target_name = ctx.required_parameter("target-name")?.trim().to_string();
+    let stall_endpoint_address = ctx
+        .required_parameter("stall-endpoint-address")?
+        .trim()
+        .to_string();
+    if target_name.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "target-name".to_string(),
+            detail: "must not be empty".to_string(),
+        });
+    }
+    if stall_endpoint_address.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "stall-endpoint-address".to_string(),
+            detail: "must not be empty".to_string(),
+        });
+    }
+    let timeout_ms = optional_u64_parameter(ctx, "timeout-ms", DEFAULT_TIMEOUT_MS)?;
+    let followup_max_ms = optional_u64_parameter(ctx, "followup-max-ms", 1_000)?;
+
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot refresh cluster snapshot before stale direct demotion probe: {error}"
+        ))
+    })?;
+    let cluster_state = cluster::read_cluster_state(&cluster_paths)
+        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+    let target = cluster_state
+        .members
+        .iter()
+        .find(|member| {
+            member.display_name == target_name
+                && member.state.is_authorized()
+                && member_has_main_daemon(member)
+        })
+        .or_else(|| {
+            cluster_state.members.iter().find(|member| {
+                member.state.is_authorized()
+                    && member_has_main_daemon(member)
+                    && member
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.address == stall_endpoint_address)
+            })
+        })
+        .ok_or_else(|| {
+            SinomoTestError::failed(format!(
+                "cannot find authorized main daemon target named {target_name} or advertising stale direct endpoint {stall_endpoint_address}"
+            ))
+        })?;
+    let stall_endpoint = target
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.address == stall_endpoint_address)
+        .cloned()
+        .ok_or_else(|| {
+            let addresses = target
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.address.clone())
+                .collect::<Vec<_>>();
+            SinomoTestError::failed(format!(
+                "target {target_name} does not advertise stale direct endpoint {stall_endpoint_address}; addresses={addresses:?}"
+            ))
+        })?;
+
+    let original_connectivity = cluster_connectivity_records_for_source_with_bootstrap_fallback(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+    )
+    .map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot snapshot KV connectivity before stale direct demotion probe: {error}"
+        ))
+    })?;
+    let seed_records = endpoint_error_fallback_seed_records(
+        &cluster_state,
+        target,
+        &stall_endpoint,
+        original_connectivity.clone(),
+    );
+    sync_connectivity_fixture_to_quorum(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+        seed_records,
+        "seed stale direct endpoint preference",
+    )?;
+
+    let probe_result = (|| -> Result<(SinomoTestOutcome, Duration, Duration), SinomoTestError> {
+        let (first_outcome, first_elapsed) =
+            run_network_target_ping_timed(target, timeout_ms, "stale-direct-timeout-demotion")?;
+        if !matches!(
+            first_outcome.status,
+            sinomo_runtime::test::SinomoTestStatus::Passed
+        ) {
+            return Ok((first_outcome, first_elapsed, Duration::ZERO));
+        }
+        let (followup_outcome, followup_elapsed) =
+            run_network_target_ping_timed(target, timeout_ms, "stale-direct-followup")?;
+        if !matches!(
+            followup_outcome.status,
+            sinomo_runtime::test::SinomoTestStatus::Passed
+        ) {
+            return Ok((followup_outcome, first_elapsed, followup_elapsed));
+        }
+        Ok((followup_outcome, first_elapsed, followup_elapsed))
+    })();
+
+    let restore_result = sync_connectivity_fixture_to_quorum(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+        original_connectivity,
+        "restore connectivity after stale direct demotion probe",
+    );
+    restore_result?;
+
+    let (probe_outcome, first_elapsed, followup_elapsed) = probe_result?;
+    if !matches!(
+        probe_outcome.status,
+        sinomo_runtime::test::SinomoTestStatus::Passed
+    ) {
+        return Ok(probe_outcome);
+    }
+    if followup_elapsed > Duration::from_millis(followup_max_ms) {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "follow-up routed RPC took {}ms after stale endpoint demotion, above allowed {followup_max_ms}ms",
+            followup_elapsed.as_millis()
+        )));
+    }
+
+    ctx.record("target_name", target_name);
+    ctx.record("target_node_id", target.node_id.to_string());
+    ctx.record("stall_endpoint_address", stall_endpoint_address);
+    ctx.record(
+        "seeded_stall_endpoint_id",
+        stall_endpoint.endpoint_id.to_string(),
+    );
+    ctx.record("first_rpc_ms", first_elapsed.as_millis().to_string());
+    ctx.record("followup_rpc_ms", followup_elapsed.as_millis().to_string());
+    Ok(SinomoTestOutcome::passed(format!(
+        "stale direct endpoint timed out once in {}ms and follow-up routed RPC completed in {}ms",
+        first_elapsed.as_millis(),
+        followup_elapsed.as_millis()
+    )))
 }
 
 fn endpoint_error_fallback_seed_records(
@@ -1021,6 +1193,61 @@ fn endpoint_error_fallback_seed_records(
     });
     records.push(bad_preference);
     records
+}
+
+fn run_network_target_ping_timed(
+    target: &ClusterMemberRecord,
+    timeout_ms: u64,
+    nonce_prefix: &str,
+) -> Result<(SinomoTestOutcome, Duration), SinomoTestError> {
+    let nonce = format!("{nonce_prefix}-{}-{}", current_millis(), std::process::id());
+    let request = cluster::cluster_network_ping_rpc_request_with_response_payload(&nonce, 0, 0)
+        .map_err(|source| {
+            SinomoTestError::failed(format!("cannot prepare routed ping request: {source}"))
+        })?;
+    let daemon_client = DaemonApiClient::connect()
+        .map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot connect to local daemon for routed ping probe: {source}"
+            ))
+        })?
+        .with_timeout(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1)));
+    let started = Instant::now();
+    let response = daemon_client
+        .object_rpc_to_target(
+            &target.node_id,
+            &request,
+            Duration::from_millis(timeout_ms),
+            true,
+        )
+        .map_err(|source| {
+            SinomoTestError::failed(format!(
+                "routed ping RPC to {} failed: {source}",
+                target.display_name
+            ))
+        })?;
+    let elapsed = started.elapsed();
+    let response = cluster::decode_cluster_network_ping_rpc_response(&response)
+        .map_err(|source| SinomoTestError::failed(source.to_string()))?;
+    if response.nonce != nonce {
+        return Ok((
+            SinomoTestOutcome::failed(format!(
+                "nonce mismatch: got {}, expected {}",
+                response.nonce, nonce
+            )),
+            elapsed,
+        ));
+    }
+    if response.responder_node_id != target.node_id {
+        return Ok((
+            SinomoTestOutcome::failed(format!(
+                "responder mismatch: got {}, expected {}",
+                response.responder_node_id, target.node_id
+            )),
+            elapsed,
+        ));
+    }
+    Ok((SinomoTestOutcome::passed(""), elapsed))
 }
 
 fn run_network_endpoint_error_fallback_probe(

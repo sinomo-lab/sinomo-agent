@@ -2830,6 +2830,15 @@ where
                         return Ok(response);
                     }
                     Err(error) => {
+                        if cluster_object_rpc_error_is_route_attempt_timeout(&error) {
+                            let _ = self
+                                .host
+                                .observe_signed_endpoint_rpc_async(
+                                    &endpoint,
+                                    ClusterSignedEndpointRpcObservation::io_failure(),
+                                )
+                                .await;
+                        }
                         let attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at);
                         let total_us = cluster_object_rpc_elapsed_us(call_started_at);
                         metrics::histogram!(
@@ -3232,6 +3241,15 @@ where
                         return Ok(response);
                     }
                     Err(error) => {
+                        if cluster_object_rpc_error_is_route_attempt_timeout(&error) {
+                            let _ = self
+                                .host
+                                .observe_signed_endpoint_rpc_async(
+                                    &endpoint,
+                                    ClusterSignedEndpointRpcObservation::io_failure(),
+                                )
+                                .await;
+                        }
                         let attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at);
                         let total_us = cluster_object_rpc_elapsed_us(call_started_at);
                         metrics::histogram!(
@@ -3583,6 +3601,13 @@ fn cluster_object_rpc_attempt_timeout_error(
             timeout.as_millis()
         ),
     }
+}
+
+fn cluster_object_rpc_error_is_route_attempt_timeout(error: &NetworkError) -> bool {
+    matches!(
+        error,
+        NetworkError::Io { operation, .. } if operation == "cluster endpoint rpc attempt"
+    )
 }
 
 pub(crate) fn relay_envelope_hop_transport_timeouts(
@@ -4756,12 +4781,14 @@ mod tests {
         target_auths: Vec<Vec<u8>>,
         stream_target_sends: Vec<(ClusterEndpointRecord, ObjectRpcRequest, DaemonRpcTimeouts)>,
         stream_target_auths: Vec<Vec<u8>>,
+        observations: Vec<(ClusterEndpointRecord, ClusterSignedEndpointRpcObservation)>,
         signed_routes: Vec<String>,
         signed_requests: Vec<ObjectRpcRequest>,
         fail_first_send: bool,
         error_first_send: bool,
         stream_error_first_send: bool,
         stall_first_send: Option<Duration>,
+        stall_first_stream_send: Option<Duration>,
     }
 
     impl ClusterSignedEndpointRpcAsyncHost for RecordingSignedHost {
@@ -4774,6 +4801,19 @@ mod tests {
             self.signed_requests.push(request.clone());
             let auth = format!("test-auth-{next}").into_bytes();
             Box::pin(async move { Ok(auth) })
+        }
+
+        fn observe_signed_endpoint_rpc_async<'a>(
+            &'a mut self,
+            endpoint: &'a ClusterEndpointRecord,
+            observation: ClusterSignedEndpointRpcObservation,
+        ) -> ClusterSignedEndpointRpcFuture<'a, ()> {
+            let endpoint = endpoint.clone();
+            let observations = &mut self.observations;
+            Box::pin(async move {
+                observations.push((endpoint, observation));
+                Ok(())
+            })
         }
 
         fn send_signed_endpoint_rpc_async<'a>(
@@ -4825,12 +4865,18 @@ mod tests {
             let endpoint = endpoint.clone();
             let request = request.clone();
             let should_error = self.stream_error_first_send && self.stream_target_sends.is_empty();
+            let stall = self
+                .stall_first_stream_send
+                .filter(|_| self.stream_target_sends.is_empty());
             let sends = &mut self.stream_target_sends;
             let auths = &mut self.stream_target_auths;
             let auth = _auth.to_vec();
             Box::pin(async move {
                 sends.push((endpoint, request, timeouts));
                 auths.push(auth);
+                if let Some(stall) = stall {
+                    tokio::time::sleep(stall).await;
+                }
                 if should_error {
                     let response = ObjectRpcResponse::encode_error(
                         "/test/stream-target",
@@ -5803,6 +5849,12 @@ mod tests {
             host.target_sends[1].0.endpoint_id,
             fallback_endpoint.endpoint_id
         );
+        assert_eq!(host.observations.len(), 1);
+        assert_eq!(
+            host.observations[0].0.endpoint_id,
+            public_endpoint.endpoint_id
+        );
+        assert!(host.observations[0].1.is_io_failure());
     }
 
     #[test]
@@ -6113,6 +6165,93 @@ mod tests {
             host.stream_target_auths[0], host.stream_target_auths[1],
             "each streamed endpoint retry must carry a fresh daemon auth nonce"
         );
+    }
+
+    #[test]
+    fn cluster_target_stream_records_route_timeout_observation_before_retry() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-target-stream-timeout-observe");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_target_stream_timeout_observe")
+            .expect("cluster id");
+        let local_node = NodeId::from_legacy_named("node_target_stream_timeout_observe_local")
+            .expect("local node");
+        let target_node = NodeId::from_legacy_named("node_target_stream_timeout_observe_target")
+            .expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "target stream timeout observation",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let stalling_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "stream-stall-target.test:21353".to_string(),
+            0,
+        );
+        let fallback_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "stream-fallback-target.test:21353".to_string(),
+            10,
+        );
+        let mut target_member =
+            ClusterMemberRecord::local_voter(cluster_id, target_node.clone(), "target", "pk", now);
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![stalling_endpoint.clone(), fallback_endpoint.clone()];
+        state.members.push(target_member);
+
+        let mut request =
+            ObjectRpcRequest::encode_body("/test/stream-target", "test", &"ping").expect("request");
+        crate::set_object_rpc_request_stream_mode(
+            &mut request,
+            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut host = RecordingSignedHost {
+            stall_first_stream_send: Some(Duration::from_secs(60)),
+            ..RecordingSignedHost::default()
+        };
+        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
+
+        let mut response = runtime
+            .block_on(client.call_target_stream(
+                &state,
+                &target_node,
+                &request,
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
+                    Duration::from_secs(4),
+                )),
+            ))
+            .expect("fallback stream endpoint should be attempted");
+        let body = runtime
+            .block_on(response.body.collect_to_vec())
+            .expect("stream body");
+
+        assert_eq!(body, b"stream-body");
+        assert_eq!(host.stream_target_sends.len(), 2);
+        assert_eq!(
+            host.stream_target_sends[0].0.endpoint_id,
+            stalling_endpoint.endpoint_id
+        );
+        assert_eq!(
+            host.stream_target_sends[1].0.endpoint_id,
+            fallback_endpoint.endpoint_id
+        );
+        assert_eq!(host.observations.len(), 1);
+        assert_eq!(
+            host.observations[0].0.endpoint_id,
+            stalling_endpoint.endpoint_id
+        );
+        assert!(host.observations[0].1.is_io_failure());
     }
 
     #[test]
