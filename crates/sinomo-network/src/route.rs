@@ -3470,6 +3470,9 @@ fn cluster_target_endpoint_attempt_budget_for_endpoint(
         endpoints_left,
         endpoint_count,
     );
+    if cluster_endpoint_is_tcp_tunnel(endpoint) {
+        return budget.map(|budget| budget.min(CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX));
+    }
     if cluster_endpoint_has_healthy_route_evidence(local_connectivity, endpoint) {
         return budget;
     }
@@ -3491,7 +3494,10 @@ fn cluster_target_final_hop_attempt_budget(
     {
         let preferred =
             cluster_target_verified_direct_endpoint_attempt_preferred(remaining, endpoints_left);
-        return Some(budget.max(preferred).min(remaining));
+        if preferred > Duration::ZERO {
+            return Some(preferred.min(remaining));
+        }
+        return Some(budget.min(remaining));
     }
     endpoint_attempt_budget
 }
@@ -5218,6 +5224,60 @@ mod tests {
     }
 
     #[test]
+    fn cluster_target_endpoint_attempt_budget_caps_synthetic_tcp_tunnel_even_when_healthy() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_target_tunnel_budget").expect("cluster");
+        let local = NodeId::from_legacy_named("node_target_tunnel_budget_local").expect("local");
+        let target = NodeId::from_legacy_named("node_target_tunnel_budget_target").expect("target");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "tunnel endpoint budget",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_target_tunnel_budget")
+                .expect("endpoint"),
+            node_id: target,
+            transport: ClusterTransportKind::LanTcp,
+            address: format!(
+                "{}node_target_tunnel_budget_target",
+                crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX
+            ),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+        let record = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(0),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            crate::connectivity::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let graph = ClusterConnectivityGraph::from_records(local, vec![record]);
+
+        let budget = cluster_target_endpoint_attempt_budget_for_endpoint(
+            &graph,
+            &endpoint,
+            Some(Duration::from_secs(60)),
+            3,
+            3,
+        )
+        .expect("budget");
+
+        assert_eq!(budget, CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX);
+    }
+
+    #[test]
     fn cluster_target_final_hop_attempt_budget_expands_verified_direct_response_window() {
         let split_budget = Some(Duration::from_millis(800));
         let preferred = cluster_target_final_hop_attempt_budget(
@@ -5253,6 +5313,33 @@ mod tests {
         )
         .expect("streamed budget");
         assert_eq!(streamed, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn cluster_target_final_hop_attempt_budget_caps_long_ordinary_verified_endpoint() {
+        let budget = cluster_target_final_hop_attempt_budget(
+            Some(Duration::from_secs(60)),
+            3,
+            Some(CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX),
+            true,
+            false,
+        )
+        .expect("ordinary budget");
+
+        assert_eq!(
+            budget,
+            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
+        );
+
+        let streamed = cluster_target_final_hop_attempt_budget(
+            Some(Duration::from_secs(60)),
+            3,
+            Some(CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX),
+            true,
+            true,
+        )
+        .expect("streamed budget");
+        assert_eq!(streamed, Duration::from_secs(60));
     }
 
     #[test]
