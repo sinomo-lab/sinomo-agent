@@ -50,7 +50,7 @@ use sinomo_runtime::dfs::{
     DfsStageBlobChunkCommand, DfsVersion, SIFS_FILE_SYSTEM_ID,
 };
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::ClusterPaths;
+use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
 use sinomo_runtime::test::{
     SinomoTestContext, SinomoTestError, SinomoTestOutcome, SinomoTestRegistryBuilder,
@@ -427,8 +427,10 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     })?;
     let state = cluster::read_cluster_state(&cluster_paths)
         .map_err(|error| SinomoTestError::failed(error.to_string()))?;
-    let targets =
-        filter_dfs_routed_status_targets(ctx, dfs_routed_status_targets_from_state(&state))?;
+    let targets = filter_dfs_routed_status_targets(
+        ctx,
+        dfs_routed_status_targets_from_state(&cluster_paths, &state),
+    )?;
     ctx.record("target_count", targets.len());
     ctx.record(
         "targets",
@@ -513,6 +515,7 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 }
 
 fn dfs_routed_status_targets_from_state(
+    cluster_paths: &ClusterPaths,
     state: &sinomo_runtime::core::ClusterBootstrapState,
 ) -> Vec<NodeId> {
     let mut targets = state
@@ -524,6 +527,8 @@ fn dfs_routed_status_targets_from_state(
                 && member.capabilities.iter().any(|capability| {
                     capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY
                 })
+                && network::cluster_member_main_daemon_connectivity(cluster_paths, state, member)
+                    != network::ClusterMemberMainDaemonConnectivity::Unreachable
         })
         .map(|member| member.node_id.clone())
         .collect::<Vec<_>>();

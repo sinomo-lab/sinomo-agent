@@ -136,8 +136,10 @@ fn run_network_state_hygiene(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     })?;
     let cluster_state = cluster::read_cluster_state(&cluster_paths)
         .map_err(|error| SinomoTestError::failed(error.to_string()))?;
-    let targets =
-        filter_network_test_targets(ctx, network_ping_targets_from_state(&cluster_state)?)?;
+    let targets = filter_network_test_targets(
+        ctx,
+        network_ping_targets_from_state(&cluster_paths, &cluster_state)?,
+    )?;
     ctx.record("target_count", targets.len());
     ctx.record(
         "targets",
@@ -202,8 +204,10 @@ fn run_network_state_hygiene_dirty_fixture(ctx: &mut SinomoTestContext) -> Sinom
     })?;
     let cluster_state = cluster::read_cluster_state(&cluster_paths)
         .map_err(|error| SinomoTestError::failed(error.to_string()))?;
-    let targets =
-        filter_network_test_targets(ctx, network_ping_targets_from_state(&cluster_state)?)?;
+    let targets = filter_network_test_targets(
+        ctx,
+        network_ping_targets_from_state(&cluster_paths, &cluster_state)?,
+    )?;
     ctx.record("target_count", targets.len());
     ctx.record(
         "targets",
@@ -403,8 +407,10 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         cluster::read_cluster_state(&cluster_paths)
             .map_err(|error| SinomoTestError::failed(error.to_string()))?,
     );
-    let targets =
-        filter_network_test_targets(ctx, network_ping_targets_from_state(&cluster_state)?)?;
+    let targets = filter_network_test_targets(
+        ctx,
+        network_ping_targets_from_state(&cluster_paths, &cluster_state)?,
+    )?;
     let target_count = targets.len();
     ctx.record("target_count", target_count);
     ctx.record(
@@ -1353,6 +1359,32 @@ fn run_network_tcp_tunnel_stale_fallback_probe(
 }
 
 fn network_ping_targets_from_state(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Vec<NodeId>, SinomoTestError> {
+    let targets = network_test_member_targets_from_state(state)?;
+    Ok(targets
+        .into_iter()
+        .filter(|target| network_ping_target_is_not_unreachable(paths, state, target))
+        .collect())
+}
+
+fn network_ping_target_is_not_unreachable(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    target: &NodeId,
+) -> bool {
+    state
+        .members
+        .iter()
+        .find(|member| member.node_id == *target)
+        .is_none_or(|member| {
+            network::cluster_member_main_daemon_connectivity(paths, state, member)
+                != network::ClusterMemberMainDaemonConnectivity::Unreachable
+        })
+}
+
+fn network_test_member_targets_from_state(
     state: &ClusterBootstrapState,
 ) -> Result<Vec<NodeId>, SinomoTestError> {
     let mut targets = Vec::new();
@@ -1666,7 +1698,7 @@ fn collect_active_route_hygiene_findings(
     );
     let targets = match active_route_targets {
         Some(targets) => targets.iter().cloned().collect::<Vec<_>>(),
-        None => network_ping_targets_from_state(state).unwrap_or_default(),
+        None => network_test_member_targets_from_state(state).unwrap_or_default(),
     };
     for target in targets {
         if network::cluster_route_next_hop(&graph, &state.local_node_id, &target).is_none() {
@@ -2299,7 +2331,7 @@ mod tests {
         let mut state = test_state();
         let selected = state.members[1].node_id.clone();
         let other = add_remote_main(&mut state, "node_network_hygiene_roaming_remote");
-        let targets = network_ping_targets_from_state(&state).expect("targets");
+        let targets = network_test_member_targets_from_state(&state).expect("targets");
         assert_eq!(targets.len(), 2);
         assert!(targets.contains(&selected), "{targets:?}");
         assert!(targets.contains(&other), "{targets:?}");
@@ -2315,7 +2347,7 @@ mod tests {
     fn network_target_filter_rejects_unavailable_target() {
         let state = test_state();
         let missing = NodeId::from_legacy_named("node_network_hygiene_missing").expect("node");
-        let targets = network_ping_targets_from_state(&state).expect("targets");
+        let targets = network_test_member_targets_from_state(&state).expect("targets");
         let ctx =
             SinomoTestContext::new("/tmp").with_parameter("target-node-id", missing.to_string());
 
@@ -2327,6 +2359,63 @@ mod tests {
                 SinomoTestError::InvalidParameter { ref name, .. } if name == "target-node-id"
             ),
             "{error:?}"
+        );
+    }
+
+    #[test]
+    fn network_ping_targets_exclude_shadow_only_degraded_main() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-ping-target-shadow-only");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let mut state = test_state();
+        let remote = state.members[1].node_id.clone();
+        let main_endpoint = test_endpoint(
+            &remote,
+            "endpoint_network_ping_shadow_main",
+            "remote.test:21353",
+        );
+        let shadow_endpoint = test_endpoint(
+            &remote,
+            "endpoint_network_ping_shadow_shadow",
+            "remote.test:21354",
+        );
+        state.members[1].endpoints = vec![main_endpoint.clone(), shadow_endpoint.clone()];
+        let now = OffsetDateTime::now_utc();
+        let main_connectivity = network::cluster_connectivity_record(
+            &state,
+            &main_endpoint,
+            network::ClusterConnectivityState::Unreachable,
+            None,
+            3,
+            None,
+            Some(now.to_string()),
+            now,
+            network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let shadow_connectivity = network::cluster_connectivity_record(
+            &state,
+            &shadow_endpoint,
+            network::ClusterConnectivityState::Degraded,
+            Some(50),
+            1,
+            Some(now.to_string()),
+            None,
+            now,
+            network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[main_connectivity, shadow_connectivity],
+        )
+        .expect("write connectivity");
+
+        let targets = network_ping_targets_from_state(&paths, &state).expect("targets");
+
+        assert!(
+            targets.is_empty(),
+            "shadow-only degraded connectivity must not make a main daemon benchmark targetable: {targets:?}"
         );
     }
 
