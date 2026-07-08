@@ -3508,7 +3508,7 @@ fn cluster_target_final_hop_attempt_budget(
     verified_direct_endpoint: bool,
     use_full_response_budget: bool,
 ) -> Option<Duration> {
-    if use_full_response_budget {
+    if use_full_response_budget && endpoints_left <= 1 {
         return remaining_route_budget;
     }
     if verified_direct_endpoint
@@ -5362,7 +5362,20 @@ mod tests {
             true,
         )
         .expect("streamed budget");
-        assert_eq!(streamed, Duration::from_secs(4));
+        assert_eq!(
+            streamed,
+            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
+        );
+
+        let streamed_last_endpoint = cluster_target_final_hop_attempt_budget(
+            Some(Duration::from_secs(4)),
+            1,
+            split_budget,
+            true,
+            true,
+        )
+        .expect("streamed last endpoint budget");
+        assert_eq!(streamed_last_endpoint, Duration::from_secs(4));
     }
 
     #[test]
@@ -5389,7 +5402,10 @@ mod tests {
             true,
         )
         .expect("streamed budget");
-        assert_eq!(streamed, Duration::from_secs(60));
+        assert_eq!(
+            streamed,
+            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
+        );
     }
 
     #[test]
@@ -5413,7 +5429,20 @@ mod tests {
             cluster_target_final_hop_request_uses_full_response_budget(&data_plane),
         )
         .expect("data-plane budget");
-        assert_eq!(budget, Duration::from_secs(60));
+        assert_eq!(
+            budget,
+            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
+        );
+
+        let last_endpoint_budget = cluster_target_final_hop_attempt_budget(
+            Some(Duration::from_secs(60)),
+            1,
+            Some(CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX),
+            true,
+            cluster_target_final_hop_request_uses_full_response_budget(&data_plane),
+        )
+        .expect("data-plane last endpoint budget");
+        assert_eq!(last_endpoint_budget, Duration::from_secs(60));
     }
 
     #[test]
