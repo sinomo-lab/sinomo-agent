@@ -28,6 +28,7 @@ mod readiness;
 mod service;
 mod session_store;
 mod skill_catalog;
+mod time_serde;
 pub mod tools;
 
 pub use agent::*;

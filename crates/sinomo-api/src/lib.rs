@@ -21,12 +21,13 @@ pub use error::DaemonApiError;
 pub use idle_stats::IdleStatsSnapshot;
 pub use paths::{DaemonPaths, daemon_paths_from_data_dir, shadow_daemon_paths_from_data_dir};
 pub use status::{
-    DaemonClusterStatus, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
+    DaemonBuildInfo, DaemonClusterStatus, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
     SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
-    cluster_node_status_from_daemon_status, daemon_bind_address, daemon_connect_address,
-    daemon_data_dir_from_paths, daemon_git_commit, daemon_hostname, daemon_options_from_status,
-    daemon_package_version, daemon_status_matches_options, default_main_daemon_status,
-    probe_daemon_status, probe_daemon_status_async, probe_daemon_status_at_address,
+    cluster_node_status_from_daemon_status, daemon_bind_address, daemon_build_info,
+    daemon_connect_address, daemon_data_dir_from_paths, daemon_git_commit, daemon_hostname,
+    daemon_options_from_status, daemon_package_version, daemon_status_matches_options,
+    default_main_daemon_status, install_daemon_build_info, probe_daemon_status,
+    probe_daemon_status_async, probe_daemon_status_at_address,
     probe_daemon_status_at_address_on_runtime, probe_daemon_status_at_address_with_timeouts_async,
     probe_daemon_status_on_runtime, probe_daemon_status_with_timeouts_async, read_daemon_status,
     write_daemon_status,

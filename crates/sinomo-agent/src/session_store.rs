@@ -74,7 +74,7 @@ impl AgentSessionSnapshot {
 pub struct AgentSessionStoreRecord {
     pub record_id: TaskId,
     pub session_id: SessionId,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub recorded_at: time::OffsetDateTime,
     pub record: AgentSessionStoreRecordKind,
 }
@@ -94,7 +94,7 @@ impl AgentSessionStoreRecord {
 pub struct AgentSessionItemRecord {
     pub record_id: TaskId,
     pub session_id: SessionId,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub recorded_at: time::OffsetDateTime,
     pub item_id: TaskId,
     pub item: AgentItem,
@@ -117,7 +117,7 @@ impl AgentSessionItemRecord {
 pub struct AgentSessionProjectionRecord {
     pub record_id: TaskId,
     pub session_id: SessionId,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub recorded_at: time::OffsetDateTime,
     pub projection: AgentSessionProjection,
 }
@@ -199,7 +199,7 @@ pub struct AgentAudioSegmentRecord {
     pub schema_version: u32,
     pub segment_id: TaskId,
     pub session_id: SessionId,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub recorded_at: time::OffsetDateTime,
     pub direction: AgentAudioDirection,
     pub sequence: u64,
@@ -312,7 +312,7 @@ pub struct AgentVideoFrameRecord {
     pub schema_version: u32,
     pub frame_id: TaskId,
     pub session_id: SessionId,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub recorded_at: time::OffsetDateTime,
     pub direction: AgentVideoDirection,
     pub sequence: u64,

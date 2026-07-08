@@ -24,11 +24,11 @@ pub struct AgentChannel {
     pub title: String,
     #[serde(default)]
     pub channel_kind: AgentChannelKind,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub updated_at: time::OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(with = "crate::time_serde::rfc3339::option")]
     pub deleted_at: Option<time::OffsetDateTime>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub users: Vec<AgentChannelUser>,
@@ -373,7 +373,7 @@ pub struct AgentChannelMessage {
     #[serde(default)]
     pub message_kind: AgentChannelMessageKind,
     pub content: String,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
     pub source: AgentChannelSource,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -389,7 +389,7 @@ pub struct AgentChannelAttachment {
     pub size_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
     pub source: AgentChannelSource,
 }
@@ -484,7 +484,7 @@ pub struct AgentChannelTurn {
     pub response_message_ids: Vec<TaskId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_message_ids: Vec<TaskId>,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
 }
 
