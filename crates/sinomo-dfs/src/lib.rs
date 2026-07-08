@@ -150,7 +150,7 @@ pub(crate) use direct_read::{
 };
 pub use discovery::{
     DfsClusterView, DfsNodeAdvertisement, content_service_key, content_services_prefix,
-    metadata_service_key, metadata_services_prefix,
+    dfs_cluster_node_endpoint, metadata_service_key, metadata_services_prefix,
 };
 pub use distributed::{
     DfsDistributedError, DfsReplicaCandidate, DfsReplicaPlacementPlan, DfsReplicaPlacementRequest,

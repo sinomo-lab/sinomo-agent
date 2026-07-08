@@ -4075,7 +4075,7 @@ mod tests {
     }
 
     #[test]
-    fn dfs_service_endpoint_prefers_internet_direct_for_remote_members() {
+    fn dfs_service_endpoint_uses_logical_node_endpoint_for_remote_members() {
         let now = OffsetDateTime::now_utc();
         let cluster_id =
             sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_service_endpoint")
@@ -4104,7 +4104,7 @@ mod tests {
                     "endpoint_dfs_service_internet_direct",
                 )
                 .expect("endpoint id"),
-                node_id: remote,
+                node_id: remote.clone(),
                 transport: sinomo_core::ClusterTransportKind::LanTcp,
                 address: "198.18.0.76:21353".to_string(),
                 source: sinomo_core::ClusterEndpointSource::Observed,
@@ -4120,7 +4120,7 @@ mod tests {
                 &member,
                 "loopback://127.0.0.1:21353"
             ),
-            "198.18.0.76:21353"
+            sinomo_dfs::dfs_cluster_node_endpoint(&remote)
         );
     }
 

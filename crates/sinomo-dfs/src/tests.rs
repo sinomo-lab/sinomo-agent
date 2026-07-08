@@ -1466,19 +1466,18 @@ fn served_message_transport_returns_response_frames_inline() {
 }
 
 #[test]
-fn dfs_service_endpoint_for_member_ignores_shadow_daemon_endpoints() {
+fn dfs_service_endpoint_for_member_uses_logical_node_endpoint() {
     let now = OffsetDateTime::now_utc();
-    let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(
-        "cluster_dfs_service_endpoint_shadow_filter",
-    )
-    .expect("cluster");
+    let cluster_id =
+        sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_service_endpoint_logical")
+            .expect("cluster");
     let local =
-        NodeId::from_legacy_named("node_dfs_service_endpoint_shadow_filter_local").expect("local");
-    let remote = NodeId::from_legacy_named("node_dfs_service_endpoint_shadow_filter_remote")
-        .expect("remote");
+        NodeId::from_legacy_named("node_dfs_service_endpoint_logical_local").expect("local");
+    let remote =
+        NodeId::from_legacy_named("node_dfs_service_endpoint_logical_remote").expect("remote");
     let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
         cluster_id.clone(),
-        "dfs service endpoint shadow filter",
+        "dfs service endpoint logical",
         local,
         "local",
         "pk-local",
@@ -1501,28 +1500,28 @@ fn dfs_service_endpoint_for_member_ignores_shadow_daemon_endpoints() {
 
     assert_eq!(
         dfs_service_endpoint_for_member(&state, &member, "loopback://127.0.0.1:21353"),
-        main_endpoint.address
+        dfs_cluster_node_endpoint(&remote)
     );
 
     member.endpoints = vec![folded_shadow_endpoint];
     assert_eq!(
         dfs_service_endpoint_for_member(&state, &member, "loopback://127.0.0.1:21353"),
-        format!("cluster-member://{remote}")
+        dfs_cluster_node_endpoint(&remote)
     );
 }
 
 #[test]
-fn dfs_service_endpoint_for_local_member_prefers_routable_endpoint_over_loopback() {
+fn dfs_service_endpoint_for_local_member_does_not_publish_loopback() {
     let now = OffsetDateTime::now_utc();
     let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(
-        "cluster_dfs_service_endpoint_local_routable",
+        "cluster_dfs_service_endpoint_local_logical",
     )
     .expect("cluster");
     let local =
-        NodeId::from_legacy_named("node_dfs_service_endpoint_local_routable").expect("local");
+        NodeId::from_legacy_named("node_dfs_service_endpoint_local_logical").expect("local");
     let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
         cluster_id,
-        "dfs service endpoint local routable",
+        "dfs service endpoint local logical",
         local.clone(),
         "local",
         "pk-local",
@@ -1537,23 +1536,23 @@ fn dfs_service_endpoint_for_local_member_prefers_routable_endpoint_over_loopback
 
     assert_eq!(
         dfs_service_endpoint_for_member(&state, &local_member, "loopback://127.0.0.1:21353"),
-        "10.14.1.11:21353"
+        dfs_cluster_node_endpoint(&local)
     );
 }
 
 #[test]
-fn dfs_service_endpoint_for_member_prefers_healthy_lan_endpoint_over_public() {
+fn dfs_service_endpoint_for_member_ignores_concrete_route_rank() {
     let now = OffsetDateTime::now_utc();
     let cluster_id =
-        sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_service_endpoint_healthy_lan")
+        sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_service_endpoint_route_rank")
             .expect("cluster");
     let local =
-        NodeId::from_legacy_named("node_dfs_service_endpoint_healthy_lan_local").expect("local");
+        NodeId::from_legacy_named("node_dfs_service_endpoint_route_rank_local").expect("local");
     let remote =
-        NodeId::from_legacy_named("node_dfs_service_endpoint_healthy_lan_remote").expect("remote");
+        NodeId::from_legacy_named("node_dfs_service_endpoint_route_rank_remote").expect("remote");
     let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
         cluster_id.clone(),
-        "dfs service endpoint healthy lan",
+        "dfs service endpoint route rank",
         local.clone(),
         "local",
         "pk-local",
@@ -1565,36 +1564,18 @@ fn dfs_service_endpoint_for_member_prefers_healthy_lan_endpoint_over_public() {
     let lan_endpoint = test_endpoint(&remote, "10.0.0.41:21353");
     let mut member = sinomo_core::ClusterMemberRecord::local_voter(
         cluster_id,
-        remote,
+        remote.clone(),
         "remote",
         "pk-remote",
         now,
     );
     member.endpoints = vec![public_endpoint, lan_endpoint.clone()];
     state.members.push(member.clone());
-    let graph = sinomo_core::network::ClusterConnectivityGraph::from_records(
-        local,
-        vec![sinomo_core::network::cluster_connectivity_record(
-            &state,
-            &lan_endpoint,
-            sinomo_core::network::ClusterConnectivityState::Healthy,
-            Some(3),
-            0,
-            Some(now.to_string()),
-            None,
-            now,
-            60,
-        )],
-    );
 
-    let endpoint = crate::default_cluster::dfs_service_endpoint_for_member_with_graph(
-        &state,
-        &member,
-        "loopback://127.0.0.1:21353",
-        Some(&graph),
+    assert_eq!(
+        dfs_service_endpoint_for_member(&state, &member, "loopback://127.0.0.1:21353"),
+        dfs_cluster_node_endpoint(&remote)
     );
-
-    assert_eq!(endpoint, "10.0.0.41:21353");
 }
 
 #[test]
@@ -5597,6 +5578,19 @@ fn control_plane_default_bootstrap_host_writes_default_dfs_records() {
         now,
     );
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    let mut stale_writer = control_plane.clone();
+    DfsControlPlaneKvClient::put(
+        &mut stale_writer,
+        metadata_service_key(&local),
+        b"legacy metadata advertisement".to_vec(),
+    )
+    .expect("write stale metadata advertisement");
+    DfsControlPlaneKvClient::put(
+        &mut stale_writer,
+        content_service_key(&local),
+        b"legacy content advertisement".to_vec(),
+    )
+    .expect("write stale content advertisement");
     let mut host = DfsControlPlaneDefaultClusterBootstrapHost::new(
         data_dir.clone(),
         cluster_paths,
@@ -5639,6 +5633,22 @@ fn control_plane_default_bootstrap_host_writes_default_dfs_records() {
             .expect("content advertisements")
             .into_iter()
             .any(|entry| entry.decode::<DfsNodeAdvertisement>().is_ok())
+    );
+    let metadata_advertisement = store
+        .metadata_service(&local)
+        .expect("metadata advertisement")
+        .expect("metadata advertisement present");
+    assert_eq!(
+        metadata_advertisement.endpoint,
+        dfs_cluster_node_endpoint(&local)
+    );
+    let content_advertisement = store
+        .content_service(&local)
+        .expect("content advertisement")
+        .expect("content advertisement present");
+    assert_eq!(
+        content_advertisement.endpoint,
+        dfs_cluster_node_endpoint(&local)
     );
 
     std::fs::remove_dir_all(root).ok();

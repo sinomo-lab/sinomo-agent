@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::{
     AsyncDfsPeerTransport, DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT, DfsControlPlaneKvClient,
     DfsEndpointTransport, DfsError, DfsMessageSender, DfsPeerTransport, LocalContentStore,
-    NetworkedDfsService, open_cluster_aware_dfs_metadata_backend,
+    NetworkedDfsService, dfs_cluster_node_endpoint, open_cluster_aware_dfs_metadata_backend,
 };
 
 pub fn cluster_dfs_data_endpoints(
@@ -45,7 +45,7 @@ fn cluster_dfs_logical_peer_endpoint(node_id: NodeId) -> ClusterEndpointRecord {
         ),
         node_id: node_id.clone(),
         transport: ClusterTransportKind::InProcess,
-        address: format!("cluster-node://{node_id}"),
+        address: dfs_cluster_node_endpoint(&node_id),
         source: ClusterEndpointSource::Static,
         privacy: ClusterEndpointPrivacy::Lan,
         priority: 0,

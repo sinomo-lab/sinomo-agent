@@ -24,8 +24,8 @@ use crate::{
     DfsMetadataJournalBatchSender, DfsMetadataShardAssignment, DfsMetadataShardConfig,
     DfsMetadataShardId, DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement, DfsPeerTransport,
     DfsSmokeOptions, DfsSmokeReport, DfsSubtreePolicy, SIFS_SERVICES_PATH, SIFS_USERS_PATH,
-    content_service_key, default_dfs_metadata_shards_root, dfs_message_sender_from_peer_transport,
-    dfs_metadata_journal_batch_sender_from_peer_transport,
+    content_service_key, default_dfs_metadata_shards_root, dfs_cluster_node_endpoint,
+    dfs_message_sender_from_peer_transport, dfs_metadata_journal_batch_sender_from_peer_transport,
     dfs_metadata_snapshot_install_sender_from_peer_transport, distributed_sifs,
     file_system_config_key, materialize_default_sifs_metadata,
     materialize_default_sifs_metadata_on_shards, metadata_service_key, metadata_shard_key,
@@ -333,14 +333,10 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
         &self,
         key: &str,
     ) -> Result<Option<DfsNodeAdvertisement>, DfsError> {
-        self.control_plane
-            .get(key)?
-            .map(|entry| {
-                entry
-                    .decode::<DfsNodeAdvertisement>()
-                    .map_err(DfsError::from)
-            })
-            .transpose()
+        let Some(entry) = self.control_plane.get(key)? else {
+            return Ok(None);
+        };
+        Ok(entry.decode::<DfsNodeAdvertisement>().ok())
     }
 
     fn put_node_advertisement(
@@ -474,15 +470,10 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
         key: String,
     ) -> DfsDefaultClusterBootstrapFuture<'a, Option<DfsNodeAdvertisement>> {
         Box::pin(async move {
-            self.control_plane
-                .get_async(&key)
-                .await?
-                .map(|entry| {
-                    entry
-                        .decode::<DfsNodeAdvertisement>()
-                        .map_err(DfsError::from)
-                })
-                .transpose()
+            let Some(entry) = self.control_plane.get_async(&key).await? else {
+                return Ok(None);
+            };
+            Ok(entry.decode::<DfsNodeAdvertisement>().ok())
         })
     }
 
@@ -1156,57 +1147,11 @@ pub fn dfs_service_members(state: &ClusterBootstrapState) -> Vec<&ClusterMemberR
 }
 
 pub fn dfs_service_endpoint_for_member(
-    state: &ClusterBootstrapState,
+    _state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
-    local_endpoint: &str,
+    _local_endpoint: &str,
 ) -> String {
-    dfs_service_endpoint_for_member_with_graph(state, member, local_endpoint, None)
-}
-
-pub(crate) fn dfs_service_endpoint_for_member_with_graph(
-    state: &ClusterBootstrapState,
-    member: &ClusterMemberRecord,
-    local_endpoint: &str,
-    graph: Option<&ClusterConnectivityGraph>,
-) -> String {
-    let selected = member
-        .endpoints
-        .iter()
-        .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
-        .filter(|endpoint| {
-            sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
-        })
-        .min_by_key(|endpoint| dfs_service_endpoint_route_rank(graph, endpoint))
-        .or_else(|| {
-            member
-                .endpoints
-                .iter()
-                .filter(|endpoint| {
-                    sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
-                })
-                .min_by_key(|endpoint| dfs_service_endpoint_route_rank(graph, endpoint))
-        });
-    if let Some(endpoint) = selected {
-        return endpoint.address.clone();
-    }
-    if member.node_id == state.local_node_id {
-        return local_endpoint.to_string();
-    }
-    format!("cluster-member://{}", member.node_id)
-}
-
-fn dfs_service_endpoint_route_rank(
-    graph: Option<&ClusterConnectivityGraph>,
-    endpoint: &ClusterEndpointRecord,
-) -> (u8, u8, u16, String) {
-    let connectivity_rank = match graph.and_then(|graph| graph.state_for_endpoint(endpoint)) {
-        Some(sinomo_core::network::ClusterConnectivityState::Healthy) => 0,
-        Some(sinomo_core::network::ClusterConnectivityState::Degraded) => 1,
-        None => 2,
-        Some(sinomo_core::network::ClusterConnectivityState::Unreachable) => 3,
-    };
-    let (privacy_rank, priority, address) = dfs_service_endpoint_rank(endpoint);
-    (connectivity_rank, privacy_rank, priority, address)
+    dfs_cluster_node_endpoint(&member.node_id)
 }
 
 pub fn dfs_service_endpoint_rank(endpoint: &ClusterEndpointRecord) -> (u8, u16, String) {
@@ -1224,14 +1169,8 @@ fn publish_dfs_service_advertisements_with_host(
     state: &ClusterBootstrapState,
     local_endpoint: &str,
 ) -> Result<(), DfsError> {
-    let graph = host.connectivity_graph(state);
     for member in dfs_service_members(state) {
-        let endpoint = dfs_service_endpoint_for_member_with_graph(
-            state,
-            member,
-            local_endpoint,
-            graph.as_ref(),
-        );
+        let endpoint = dfs_service_endpoint_for_member(state, member, local_endpoint);
         let metadata_key = metadata_service_key(&member.node_id);
         let content_key = content_service_key(&member.node_id);
         let metadata = stable_dfs_advertisement(
@@ -1255,14 +1194,8 @@ async fn publish_dfs_service_advertisements_with_async_host(
     state: &ClusterBootstrapState,
     local_endpoint: &str,
 ) -> Result<(), DfsError> {
-    let graph = host.connectivity_graph(state);
     for member in dfs_service_members(state) {
-        let endpoint = dfs_service_endpoint_for_member_with_graph(
-            state,
-            member,
-            local_endpoint,
-            graph.as_ref(),
-        );
+        let endpoint = dfs_service_endpoint_for_member(state, member, local_endpoint);
         let metadata_key = metadata_service_key(&member.node_id);
         let content_key = content_service_key(&member.node_id);
         let metadata = stable_dfs_advertisement_async(

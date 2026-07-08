@@ -1,8 +1,10 @@
 //! DFS node discovery and service advertisements stored in the DFS control plane.
 //!
-//! These records are intentionally compact. They advertise where DFS metadata
-//! and content services run; namespace, inode, object, version, and receipt
-//! metadata remains in DFS metadata shards.
+//! These records are intentionally compact. They advertise which nodes host DFS
+//! metadata and content services; namespace, inode, object, version, and receipt
+//! metadata remains in DFS metadata shards. DFS data traffic is routed by
+//! `sinomo-network`, so the advertisement endpoint is a logical node endpoint
+//! rather than a concrete dial target.
 
 use crate::control_plane::DfsControlPlaneStore;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -11,6 +13,11 @@ use sinomo_core::node::NodeId;
 use time::OffsetDateTime;
 
 const DFS_KV_PREFIX: &str = "/dfs";
+const DFS_CLUSTER_NODE_ENDPOINT_SCHEME: &str = "cluster-node";
+
+pub fn dfs_cluster_node_endpoint(node_id: &NodeId) -> String {
+    format!("{DFS_CLUSTER_NODE_ENDPOINT_SCHEME}://{node_id}")
+}
 
 pub fn metadata_service_key(node_id: &NodeId) -> String {
     format!("{DFS_KV_PREFIX}/services/metadata/{node_id}")

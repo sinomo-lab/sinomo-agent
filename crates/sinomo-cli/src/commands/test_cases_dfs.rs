@@ -10,6 +10,8 @@
 //! - `cluster.dfs.routed-status` — route a signed DFS status RPC to every
 //!   remote main daemon; this catches DFS route auth/routing regressions that a
 //!   generic network ping can miss.
+//! - `cluster.dfs.service-advertisements` — verify DFS service discovery
+//!   records advertise node identities instead of concrete network routes.
 //! - `cluster.dfs.invariants` — operational-metric sweep: no open conflicts,
 //!   no stuck routed namespace ops, no leaked cross-shard locks.
 //! - `cluster.dfs.lightweight-latency` — warmed SIFS stat/list/read-prefix
@@ -41,6 +43,7 @@ use crate::file_manager::FileManagerBackend;
 use crate::sifs_file_manager::SifsFileManagerBackend;
 use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster;
+use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::dfs::{
     self, DfsFetchBlobResponseChunk, DfsFileSystemId, DfsMessageCommand, DfsNetworkMessage,
     DfsObjectId, DfsOperatorStatus, DfsReadResponseChunk, DfsRoutedMessage,
@@ -77,6 +80,7 @@ pub fn register_dfs_cluster_test_cases(
     builder
         .register(dfs_read_your_write())
         .register(dfs_routed_status())
+        .register(dfs_service_advertisements())
         .register(dfs_concurrent_file_race())
         .register(dfs_concurrent_dir_race())
         .register(dfs_failover_current_read())
@@ -118,6 +122,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_routed_status(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_service_advertisements(ctx) {
+        id: "cluster.dfs.service-advertisements",
+        summary: "Verify DFS service advertisements use network-routed node endpoints",
+        tags: ["cluster-dfs", "probe", "routing", "cluster-network-dfs-acceptance"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_service_advertisements(ctx)
         }
     }
 }
@@ -556,6 +572,109 @@ fn dfs_status_probe_summary(status: &DfsOperatorStatus) -> BTreeMap<&'static str
         ("pending_writes", status.pending_write_count as u64),
         ("open_conflicts", status.open_conflict_count as u64),
         ("pending_repairs", status.pending_repair_count as u64),
+    ])
+}
+
+fn run_service_advertisements(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let expected_nodes = optional_usize_parameter(ctx, "expected-nodes", 1)?;
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot refresh cluster snapshot before DFS service advertisement check: {error}"
+        ))
+    })?;
+
+    let metadata = read_dfs_service_advertisements(&cluster_paths, dfs::metadata_services_prefix())
+        .map_err(SinomoTestError::failed)?;
+    let content = read_dfs_service_advertisements(&cluster_paths, dfs::content_services_prefix())
+        .map_err(SinomoTestError::failed)?;
+    let bad = metadata
+        .iter()
+        .chain(content.iter())
+        .filter_map(|advertisement| {
+            (!dfs_service_advertisement_endpoint_is_logical(&advertisement.endpoint)).then(|| {
+                format!(
+                    "{} endpoint={}",
+                    advertisement.node_id, advertisement.endpoint
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    ctx.record("metadata_count", metadata.len());
+    ctx.record("content_count", content.len());
+    ctx.record(
+        "metadata_endpoints",
+        metadata
+            .iter()
+            .map(dfs_service_advertisement_summary)
+            .collect::<Vec<_>>(),
+    );
+    ctx.record(
+        "content_endpoints",
+        content
+            .iter()
+            .map(dfs_service_advertisement_summary)
+            .collect::<Vec<_>>(),
+    );
+
+    if !bad.is_empty() {
+        ctx.record("bad_endpoints", &bad);
+        return Ok(SinomoTestOutcome::failed(format!(
+            "DFS service advertisements contain {} concrete or local endpoint(s)",
+            bad.len()
+        )));
+    }
+    if metadata.len() < expected_nodes || content.len() < expected_nodes {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "DFS service advertisements saw metadata={} content={}, expected at least {expected_nodes} each",
+            metadata.len(),
+            content.len()
+        )));
+    }
+
+    Ok(SinomoTestOutcome::passed(format!(
+        "DFS service advertisements are logical for {} metadata and {} content node(s)",
+        metadata.len(),
+        content.len()
+    )))
+}
+
+fn read_dfs_service_advertisements(
+    cluster_paths: &ClusterPaths,
+    prefix: &str,
+) -> Result<Vec<dfs::DfsNodeAdvertisement>, String> {
+    let mut advertisements: Vec<dfs::DfsNodeAdvertisement> = Vec::new();
+    for entry in
+        sinomo_runtime::kv::read_cluster_kv_prefix_entries(&cluster_paths.kv_paths(), prefix)
+            .map_err(|error| error.to_string())?
+    {
+        advertisements.push(entry.decode().map_err(|error| {
+            format!(
+                "cannot decode DFS service advertisement {}: {error}",
+                entry.key
+            )
+        })?);
+    }
+    advertisements.sort_by(|left, right| {
+        left.node_id
+            .cmp(&right.node_id)
+            .then_with(|| left.endpoint.cmp(&right.endpoint))
+    });
+    Ok(advertisements)
+}
+
+fn dfs_service_advertisement_endpoint_is_logical(endpoint: &str) -> bool {
+    endpoint.starts_with("cluster-node://")
+}
+
+fn dfs_service_advertisement_summary(
+    advertisement: &dfs::DfsNodeAdvertisement,
+) -> BTreeMap<&'static str, String> {
+    BTreeMap::from([
+        ("node_id", advertisement.node_id.to_string()),
+        ("endpoint", advertisement.endpoint.clone()),
     ])
 }
 
