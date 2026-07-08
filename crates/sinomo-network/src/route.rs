@@ -3563,9 +3563,14 @@ fn cluster_target_full_response_endpoint_attempt_preferred(
     } else {
         Duration::ZERO
     };
+    let response_cap = if endpoints_left > 1 {
+        CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
+    } else {
+        CLUSTER_TARGET_FULL_RESPONSE_ENDPOINT_ATTEMPT_PREFERRED
+    };
     remaining_route_budget
         .saturating_sub(fallback_reserve)
-        .min(CLUSTER_TARGET_FULL_RESPONSE_ENDPOINT_ATTEMPT_PREFERRED)
+        .min(response_cap)
 }
 
 fn cluster_endpoint_has_healthy_route_evidence(
@@ -5491,7 +5496,7 @@ mod tests {
         .expect("streamed budget");
         assert_eq!(
             streamed,
-            CLUSTER_TARGET_FULL_RESPONSE_ENDPOINT_ATTEMPT_PREFERRED
+            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
         );
     }
 
@@ -5518,7 +5523,7 @@ mod tests {
         .expect("data-plane budget");
         assert_eq!(
             budget,
-            CLUSTER_TARGET_FULL_RESPONSE_ENDPOINT_ATTEMPT_PREFERRED
+            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
         );
 
         let last_endpoint_budget = cluster_target_final_hop_attempt_budget(
@@ -5738,6 +5743,101 @@ mod tests {
             tunnel_endpoint.endpoint_id
         );
         assert_eq!(host.target_sends[1].0.address, "198.51.100.76:21353");
+    }
+
+    #[test]
+    fn cluster_target_rpc_does_not_let_healthy_direct_full_response_starve_fallbacks() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-target-direct-timeout-retry");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_target_direct_timeout_retry")
+            .expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_target_direct_timeout_local").expect("local node");
+        let target_node =
+            NodeId::from_legacy_named("node_target_direct_timeout_target").expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "target healthy direct timeout retry",
+            local_node,
+            "local",
+            "pk-local",
+            now,
+        );
+        let direct_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "198.51.100.88:21353".to_string(),
+            0,
+        );
+        let fallback_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "fallback-direct.test:21353".to_string(),
+            10,
+        );
+        let mut target_member =
+            ClusterMemberRecord::local_voter(cluster_id, target_node.clone(), "target", "pk", now);
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![direct_endpoint.clone(), fallback_endpoint.clone()];
+        state.members.push(target_member);
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[crate::connectivity::cluster_connectivity_record(
+                &state,
+                &direct_endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(4),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            )],
+        )
+        .expect("write local connectivity");
+
+        let request = ObjectRpcRequest::encode_body("/test/data", "test", &"ping")
+            .expect("request")
+            .with_full_response_budget();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut host = RecordingSignedHost {
+            stall_first_send: Some(Duration::from_secs(60)),
+            ..RecordingSignedHost::default()
+        };
+        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
+        let started = Instant::now();
+
+        runtime
+            .block_on(client.call_target(
+                &state,
+                &target_node,
+                &request,
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
+                    Duration::from_secs(30),
+                )),
+            ))
+            .expect("fallback endpoint should be attempted within the target timeout");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a stale healthy direct full-response endpoint must not spend the 10s response window before fallback"
+        );
+        assert_eq!(host.target_sends.len(), 2);
+        assert_eq!(
+            host.target_sends[0].0.endpoint_id,
+            direct_endpoint.endpoint_id
+        );
+        assert_eq!(
+            host.target_sends[1].0.endpoint_id,
+            fallback_endpoint.endpoint_id
+        );
     }
 
     #[test]

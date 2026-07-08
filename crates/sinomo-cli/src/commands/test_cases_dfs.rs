@@ -3517,6 +3517,36 @@ mod tests {
         )
     }
 
+    fn synthetic_tcp_tunnel_record(
+        state: &ClusterBootstrapState,
+        target: &NodeId,
+    ) -> network::ClusterConnectivityRecord {
+        let now = time::OffsetDateTime::now_utc();
+        network::ClusterConnectivityRecord {
+            cluster_id: state.cluster_id.clone(),
+            source_node_id: state.local_node_id.clone(),
+            target_node_id: target.clone(),
+            endpoint_id: network::ClusterEndpointId::derived(
+                "sinomo.test.dfs.synthetic.tcp-tunnel",
+                format!("{}\0{}", state.local_node_id.as_str(), target.as_str()),
+            ),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!(
+                "{}{}",
+                network::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX,
+                target.as_str()
+            ),
+            state: network::ClusterConnectivityState::Healthy,
+            latency_ms: Some(1),
+            consecutive_failures: 0,
+            last_success_at: Some(now.to_string()),
+            last_failure_at: None,
+            failure_reason: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(network::CLUSTER_CONNECTIVITY_TTL_SECONDS),
+        }
+    }
+
     #[test]
     fn dfs_unavailable_repair_targets_include_degraded_main_without_route() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-degraded-repair-target");
@@ -3603,6 +3633,46 @@ mod tests {
         assert!(
             !targets.contains(&target),
             "a degraded direct repair target with a healthy route must remain available: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn dfs_routed_status_targets_include_degraded_main_with_healthy_synthetic_tunnel() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-synthetic-tunnel-status-target");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let mut state = test_state();
+        let target = state.members[1].node_id.clone();
+        let endpoint = test_endpoint(
+            &target,
+            "endpoint_dfs_synthetic_tunnel_status_target",
+            "target.test:21353",
+        );
+        state.members[1].endpoints = vec![endpoint.clone()];
+        let degraded = connectivity_record(
+            &state,
+            &endpoint,
+            network::ClusterConnectivityState::Degraded,
+        );
+        let tunnel = synthetic_tcp_tunnel_record(&state, &target);
+        network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[degraded, tunnel],
+        )
+        .expect("write connectivity");
+
+        let targets = dfs_routed_status_targets_from_state(&paths, &state);
+        let unavailable_repair_targets = dfs_unavailable_repair_targets_from_state(&paths, &state);
+
+        assert!(
+            targets.contains(&target),
+            "a degraded direct DFS target with a healthy synthetic tunnel must stay targetable: {targets:?}"
+        );
+        assert!(
+            !unavailable_repair_targets.contains(&target),
+            "a healthy synthetic tunnel must keep repair accounting from marking the target unavailable: {unavailable_repair_targets:?}"
         );
     }
 

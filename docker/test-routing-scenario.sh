@@ -32,6 +32,7 @@ NETWORK_PAYLOAD_RESPONSE_BYTES="${SINOMO_SCENARIO_NETWORK_PAYLOAD_RESPONSE_BYTES
 NETWORK_PAYLOAD_MIN_BYTES_PER_SEC="${SINOMO_SCENARIO_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC:-8388608}"
 NETWORK_READY_WAIT="${SINOMO_SCENARIO_NETWORK_READY_WAIT:-20}"
 NETWORK_READY_PROBE_TIMEOUT="${SINOMO_SCENARIO_NETWORK_READY_PROBE_TIMEOUT:-$(( NETWORK_TIMEOUT_MS / 1000 + 6 ))}"
+NODE_RESTART_WAIT="${SINOMO_SCENARIO_NODE_RESTART_WAIT:-30}"
 ARTIFACT_COMMAND_TIMEOUT="${SINOMO_SCENARIO_ARTIFACT_COMMAND_TIMEOUT:-10}"
 ENDPOINT_FALLBACK_TIMEOUT_MS="${SINOMO_SCENARIO_ENDPOINT_FALLBACK_TIMEOUT_MS:-5000}"
 TUNNEL_STALE_FALLBACK_TIMEOUT_MS="${SINOMO_SCENARIO_TUNNEL_STALE_FALLBACK_TIMEOUT_MS:-5000}"
@@ -560,6 +561,38 @@ run_large_routed_dfs() {
     --param "max-proc-write-bytes=$LARGE_MAX_READ_PROC_WRITE_BYTES"
 }
 
+wait_for_node_daemons() {
+  local node="$1" deadline
+  deadline=$(( $(date +%s) + NODE_RESTART_WAIT ))
+  log "waiting for $node main/shadow daemons after restart (<=${NODE_RESTART_WAIT}s)"
+  while :; do
+    if compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo daemon status \
+        >"$ARTIFACTS/restart-$node-main.last.txt" 2>&1 \
+      && compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo daemon shadow status \
+        >"$ARTIFACTS/restart-$node-shadow.last.txt" 2>&1; then
+      log "  daemons-ready: $node"
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      log "daemon restart timed out for $node"
+      sed 's/^/[routing-scenario]   main: /' "$ARTIFACTS/restart-$node-main.last.txt" | tail -12 || true
+      sed 's/^/[routing-scenario]   shadow: /' "$ARTIFACTS/restart-$node-shadow.last.txt" | tail -12 || true
+      return 1
+    fi
+    sleep "$POLL_INTERVAL"
+  done
+}
+
+run_restart_recovery_probe() {
+  local node="$1"
+  log "checking network/DFS recovery after restarting $node"
+  compose restart "$node"
+  wait_for_node_daemons "$node"
+  wait_for_network_ready
+  run_network_payload_probe "$node"
+  run_dfs_routed_status_probe "$node"
+}
+
 run_concurrent_duplex_dfs_probe() {
   local pids labels logs failed index
   pids=""
@@ -656,5 +689,6 @@ assert_forwarded_endpoint_active
 run_concurrent_duplex_dfs_probe
 run_cross_segment_dfs
 run_large_routed_dfs
+run_restart_recovery_probe node3
 
 log "PASS; artifacts in $ARTIFACTS"

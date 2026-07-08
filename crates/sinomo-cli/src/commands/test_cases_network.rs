@@ -2550,6 +2550,48 @@ mod tests {
     }
 
     #[test]
+    fn network_ping_targets_include_degraded_main_with_healthy_synthetic_tunnel() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-ping-target-synthetic-tunnel-main");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let mut state = test_state();
+        let target = state.members[1].node_id.clone();
+        let main_endpoint = test_endpoint(
+            &target,
+            "endpoint_network_ping_synthetic_tunnel_main",
+            "target.example.test:21353",
+        );
+        state.members[1].endpoints = vec![main_endpoint.clone()];
+        let now = OffsetDateTime::now_utc();
+        let degraded_main = network::cluster_connectivity_record(
+            &state,
+            &main_endpoint,
+            network::ClusterConnectivityState::Degraded,
+            Some(80),
+            2,
+            Some(now.to_string()),
+            None,
+            now,
+            network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let synthetic_tunnel = test_synthetic_tcp_tunnel_record(&state, &target);
+        network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[degraded_main, synthetic_tunnel],
+        )
+        .expect("write local connectivity");
+
+        let targets = network_ping_targets_from_state(&paths, &state).expect("targets");
+
+        assert!(
+            targets.contains(&target),
+            "degraded direct connectivity must stay targetable when a healthy synthetic tunnel exists: {targets:?}"
+        );
+    }
+
+    #[test]
     fn network_hygiene_scoped_active_route_ignores_unselected_roaming_node() {
         let mut state = test_state();
         let selected = state.members[1].node_id.clone();
