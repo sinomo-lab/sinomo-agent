@@ -263,6 +263,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &object_id,
             &result,
             metadata_journal_after_sequence,
+            if command.foreground_replica_repair {
+                DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT
+            } else {
+                DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT
+            },
         )?;
         let journal_elapsed = journal_started.elapsed();
         let metadata_journal_batch_count = metadata_journal_batches.len();
@@ -699,6 +704,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &pending.object_id,
                 &result,
                 pending.metadata_journal_after_sequence,
+                if pending.foreground_replica_repair {
+                    DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT
+                } else {
+                    DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT
+                },
             )?;
             self.send_dfs_message_if_routable(
                 &pending.requester_node_id,
@@ -743,8 +753,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(());
         }
         let result = DfsDistributedWriteResult::Outcome { outcome };
-        let metadata_journal_batches =
-            self.routed_write_response_metadata_journal_batches(object_id, &result, None)?;
+        let metadata_journal_batches = self.routed_write_response_metadata_journal_batches(
+            object_id,
+            &result,
+            None,
+            DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT,
+        )?;
         self.send_dfs_message_if_routable(
             &intent.requesting_node_id,
             DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {

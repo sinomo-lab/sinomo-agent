@@ -168,7 +168,9 @@ impl SifsFileManagerBackend {
                 .flush_detached_transport_sends()
                 .map_err(|error| error.to_string())?;
             service
-                .process_incoming()
+                .process_incoming_until_pending_routed_writes_ready(
+                    SIFS_FOREGROUND_METADATA_PUBLISH_ATTEMPT_TIMEOUT,
+                )
                 .map_err(|error| error.to_string())?;
         }
         Ok(())

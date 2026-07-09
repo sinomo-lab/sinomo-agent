@@ -1654,7 +1654,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let request_id = self.next_request_id();
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
         let metadata_journal_after_sequence = if !detach_request && replay_response_journal {
-            self.metadata_journal_last_sequence_for_shard(&shard_id)?
+            self.local_metadata_journal_after_sequence_for_shard(&shard_id)?
         } else {
             None
         };
@@ -1716,7 +1716,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let request_id = self.next_request_id();
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
         let metadata_journal_after_sequence = if !detach_request && replay_response_journal {
-            self.metadata_journal_last_sequence_for_shard(&shard_id)?
+            self.local_metadata_journal_after_sequence_for_shard(&shard_id)?
         } else {
             None
         };
@@ -1789,7 +1789,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
         let metadata_sequence_started = Instant::now();
         let metadata_journal_after_sequence =
-            self.metadata_journal_last_sequence_for_shard(&shard_id)?;
+            self.local_metadata_journal_after_sequence_for_shard(&shard_id)?;
         let metadata_sequence_elapsed = metadata_sequence_started.elapsed();
         let primary_node_id = shard.primary_node_id.clone();
         let (bytes, content_hash, content_size_bytes) = if manifest.size_bytes

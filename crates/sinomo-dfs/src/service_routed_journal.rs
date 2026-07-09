@@ -10,11 +10,22 @@ use sinomo_core::node::NodeId;
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    pub(crate) fn local_metadata_journal_after_sequence_for_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<u64>, DfsError> {
+        if let Some(after_sequence) = self.local_metadata_journal_cursors.get(shard_id) {
+            return Ok(Some(*after_sequence));
+        }
+        self.metadata_journal_last_sequence_for_shard(shard_id)
+    }
+
     pub(crate) fn routed_write_response_metadata_journal_batches(
         &mut self,
         object_id: &DfsObjectId,
         result: &DfsDistributedWriteResult,
         after_sequence: Option<u64>,
+        max_batches: usize,
     ) -> Result<Vec<DfsMetadataJournalBatch>, DfsError> {
         let Some(after_sequence) = after_sequence else {
             return Ok(Vec::new());
@@ -34,25 +45,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if shard.primary_node_id != self.node_id {
             return Ok(Vec::new());
         }
-        self.metadata_journal_batches_for_shard_since(
+        self.metadata_journal_batches_for_shard_since_limited(
             &DfsMetadataShardId::new(shard.shard_id),
             after_sequence,
-        )
-    }
-
-    /// Collect consecutive journal batches for a shard from `after_sequence`
-    /// toward the journal head, bounded per response. Requesters that remain
-    /// behind continue catching up through follow-up sync rounds or regular
-    /// publication.
-    pub(crate) fn metadata_journal_batches_for_shard_since(
-        &self,
-        shard_id: &DfsMetadataShardId,
-        after_sequence: u64,
-    ) -> Result<Vec<DfsMetadataJournalBatch>, DfsError> {
-        self.metadata_journal_batches_for_shard_since_limited(
-            shard_id,
-            after_sequence,
-            DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT,
+            max_batches,
         )
     }
 

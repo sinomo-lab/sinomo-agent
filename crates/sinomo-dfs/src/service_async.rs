@@ -93,8 +93,12 @@ where
                 continue;
             }
             let result = DfsDistributedWriteResult::Outcome { outcome };
-            let metadata_journal_batches =
-                self.routed_write_response_metadata_journal_batches(&object_id, &result, None)?;
+            let metadata_journal_batches = self.routed_write_response_metadata_journal_batches(
+                &object_id,
+                &result,
+                None,
+                DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT,
+            )?;
             let sent = self
                 .send_dfs_message_if_routable_async(
                     &intent.requesting_node_id,
