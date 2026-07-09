@@ -134,6 +134,20 @@ pub(crate) fn default_main_daemon_status() -> Result<Option<DaemonStatus>, CliEr
     daemon_default_main_daemon_status(DAEMON_PROBE_TIMEOUT).map_err(Into::into)
 }
 
+/// Probe the main daemon that owns `data_dir` — not the env/home default.
+/// Callers operating on a foreign data directory (tests, tooling) must never
+/// observe another data dir's daemon as their own.
+pub(crate) fn main_daemon_status_for_data_dir(
+    data_dir: &SinomoDataDir,
+) -> Result<Option<DaemonStatus>, CliError> {
+    Ok(
+        match probe_daemon_status(&DaemonPaths::new(data_dir), DAEMON_PROBE_TIMEOUT) {
+            DaemonProbeStatus::Running(status) => Some(status),
+            DaemonProbeStatus::Locked { .. } | DaemonProbeStatus::NotRunning => None,
+        },
+    )
+}
+
 pub(crate) fn shadow_daemon_paths_from_defaults() -> Result<DaemonPaths, CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
