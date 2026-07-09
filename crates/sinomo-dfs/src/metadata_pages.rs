@@ -26,6 +26,7 @@ use crate::metadata_records::{
     DfsWriteIntentScanCursor, DfsWriteIntentScanPage,
 };
 use crate::metadata_tables::DfsMetadataTables;
+use crate::metadata_visible_commit::object_by_path_from_tables;
 use crate::posix_path::posix_path_is_at_or_under_prefix;
 use crate::{DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion};
 
@@ -290,6 +291,9 @@ pub(crate) fn child_objects_for_directory_from_tables(
         {
             continue;
         }
+        if !object_is_visible_at_path_from_tables(tables, file_system_id, &object) {
+            continue;
+        }
         objects.push(object);
     }
     objects.sort_by(|left, right| {
@@ -354,6 +358,9 @@ pub(crate) fn child_objects_for_directory_page_entries_from_tables(
         {
             continue;
         }
+        if !object_is_visible_at_path_from_tables(tables, file_system_id, &object) {
+            continue;
+        }
         if after.and_then(|cursor| cursor.dentry.as_ref()).is_none()
             && let Some(after) = after
             && directory_page_key(&object) <= (&after.path, &after.object_id)
@@ -376,6 +383,16 @@ pub(crate) fn child_objects_for_directory_page_entries_from_tables(
         entries,
         next_cursor,
     }
+}
+
+fn object_is_visible_at_path_from_tables(
+    tables: &DfsMetadataTables,
+    file_system_id: &DfsFileSystemId,
+    object: &DfsObjectMetadata,
+) -> bool {
+    object_by_path_from_tables(tables, file_system_id, &object.path).is_some_and(|visible| {
+        visible.kind != DfsObjectKind::Tombstone && visible.object_id == object.object_id
+    })
 }
 
 pub(crate) fn hardlinks_to_object_page_from_tables(

@@ -55,6 +55,8 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             control_plane: None,
             cached_sifs_metadata_shards: None,
             metadata_backend: None,
+            metadata_lookup_cache: std::sync::Mutex::new(BTreeMap::new()),
+            metadata_lookup_cache_depth: std::sync::Mutex::new(0),
             active_replica_stages: BTreeMap::new(),
             pending_writes: BTreeMap::new(),
             pending_reads: BTreeMap::new(),
@@ -110,6 +112,52 @@ where
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    pub(crate) fn clear_metadata_lookup_cache(&self) {
+        if let Ok(mut cache) = self.metadata_lookup_cache.lock() {
+            cache.clear();
+        }
+    }
+
+    pub(crate) fn metadata_lookup_cache_is_active(&self) -> bool {
+        self.metadata_lookup_cache_depth
+            .lock()
+            .map(|depth| *depth > 0)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn with_metadata_lookup_cache<R>(&self, operation: impl FnOnce(&Self) -> R) -> R {
+        let outer = self.enter_metadata_lookup_cache_scope();
+        let result = operation(self);
+        self.exit_metadata_lookup_cache_scope(outer);
+        result
+    }
+
+    fn enter_metadata_lookup_cache_scope(&self) -> bool {
+        let outer = if let Ok(mut depth) = self.metadata_lookup_cache_depth.lock() {
+            let outer = *depth == 0;
+            *depth = depth.saturating_add(1);
+            outer
+        } else {
+            true
+        };
+        if outer {
+            self.clear_metadata_lookup_cache();
+        }
+        outer
+    }
+
+    fn exit_metadata_lookup_cache_scope(&self, outer: bool) {
+        let should_clear = if let Ok(mut depth) = self.metadata_lookup_cache_depth.lock() {
+            *depth = depth.saturating_sub(1);
+            *depth == 0
+        } else {
+            true
+        };
+        if outer || should_clear {
+            self.clear_metadata_lookup_cache();
+        }
+    }
+
     pub(crate) fn adaptive_stage_chunk_window(
         &self,
         target_node_id: &NodeId,

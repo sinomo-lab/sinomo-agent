@@ -44,9 +44,7 @@ fn metadata_path_is_direct_child_of_posix_dir(directory_path: &str, metadata_pat
 fn namespace_operation_should_replay_journal_batches(operation: &DfsNamespaceOperation) -> bool {
     !matches!(
         operation,
-        DfsNamespaceOperation::LookupPath { .. }
-            | DfsNamespaceOperation::LookupPaths { .. }
-            | DfsNamespaceOperation::SyncPath { .. }
+        DfsNamespaceOperation::LookupPath { .. } | DfsNamespaceOperation::LookupPaths { .. }
     )
 }
 

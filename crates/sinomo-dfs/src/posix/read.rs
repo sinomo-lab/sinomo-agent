@@ -87,19 +87,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_read_file(&self, path: &str) -> Result<Vec<u8>> {
-        let (path, object) = self.local_posix_file_content_object(path, true)?;
-        match self.read_object_metadata_local_content_with_state(&object, false)? {
-            NetworkedDfsReadOutcome::Found {
-                data: DfsReadData { bytes, .. },
-                ..
-            } => Ok(bytes),
-            NetworkedDfsReadOutcome::PendingReplication { .. }
-            | NetworkedDfsReadOutcome::NotConfirmed { .. }
-            | NetworkedDfsReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
-            NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
-                Err(read_conflict_error(path, conflicts))
+        self.with_metadata_lookup_cache(|service| {
+            let (path, object) = service.local_posix_file_content_object(path, true)?;
+            match service.read_object_metadata_local_content_with_state(&object, false)? {
+                NetworkedDfsReadOutcome::Found {
+                    data: DfsReadData { bytes, .. },
+                    ..
+                } => Ok(bytes),
+                NetworkedDfsReadOutcome::PendingReplication { .. }
+                | NetworkedDfsReadOutcome::NotConfirmed { .. }
+                | NetworkedDfsReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
+                NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
+                    Err(read_conflict_error(path, conflicts))
+                }
             }
-        }
+        })
     }
 
     pub fn posix_read_file_range(
@@ -108,19 +110,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<Vec<u8>> {
-        let (path, object) = self.local_posix_file_content_object(path, true)?;
-        match self.read_object_metadata_local_range_with_state(&object, offset, max_bytes, false)? {
-            NetworkedDfsRangeReadOutcome::Found {
-                data: DfsReadRangeData { bytes, .. },
-                ..
-            } => Ok(bytes),
-            NetworkedDfsRangeReadOutcome::PendingReplication { .. }
-            | NetworkedDfsRangeReadOutcome::NotConfirmed { .. }
-            | NetworkedDfsRangeReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
-            NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
-                Err(read_conflict_error(path, conflicts))
+        self.with_metadata_lookup_cache(|service| {
+            let (path, object) = service.local_posix_file_content_object(path, true)?;
+            match service
+                .read_object_metadata_local_range_with_state(&object, offset, max_bytes, false)?
+            {
+                NetworkedDfsRangeReadOutcome::Found {
+                    data: DfsReadRangeData { bytes, .. },
+                    ..
+                } => Ok(bytes),
+                NetworkedDfsRangeReadOutcome::PendingReplication { .. }
+                | NetworkedDfsRangeReadOutcome::NotConfirmed { .. }
+                | NetworkedDfsRangeReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
+                NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
+                    Err(read_conflict_error(path, conflicts))
+                }
             }
-        }
+        })
     }
 
     pub fn posix_open_file_stream(&self, path: &str) -> Result<DfsPosixFileReadStream> {

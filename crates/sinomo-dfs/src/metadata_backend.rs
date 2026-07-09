@@ -69,8 +69,8 @@ use crate::metadata_table_store::{
     read_metadata_table_state_lenient,
 };
 use crate::metadata_tables::{
-    DfsMetadataTableRollback, DfsMetadataTables, MetadataTableReadSnapshotCache,
-    MetadataTableSnapshotFingerprint,
+    DfsMetadataTableRollback, DfsMetadataTables, DfsMetadataTablesSnapshot,
+    MetadataTableReadSnapshotCache, MetadataTableSnapshotFingerprint,
 };
 use crate::metadata_tombstone::{metadata_now_unix_nanos, plan_tombstone_compaction};
 use crate::metadata_visible_commit::{
@@ -87,7 +87,6 @@ use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
 #[cfg(test)]
 use sinomo_core::object::serde_ext as sinomo_object_serde;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::fs;
@@ -1125,7 +1124,7 @@ impl LocalSobjMetadataBackend {
         )
     }
 
-    pub(crate) fn current_tables_snapshot(&self) -> Result<Cow<'_, DfsMetadataTables>> {
+    pub(crate) fn current_tables_snapshot(&self) -> Result<DfsMetadataTablesSnapshot<'_>> {
         metadata_read_snapshot::current_tables_snapshot(
             &self.root,
             &self.tables,

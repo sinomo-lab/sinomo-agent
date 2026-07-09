@@ -70,6 +70,10 @@ pub(crate) fn object_index_table_ops_with_previous(
         stored_path_record_for_object(tables, previous)
             .unwrap_or_else(|| path_record_for_object(previous))
     });
+    let existing_path_record = tables
+        .paths
+        .get(&(object.file_system_id.clone(), normalize_path(&object.path)))
+        .cloned();
     let path_record = if object.kind == DfsObjectKind::Tombstone {
         path_record_for_object(&object)
     } else if let Some(previous_path_record) = previous_path_record.as_ref()
@@ -152,7 +156,12 @@ pub(crate) fn object_index_table_ops_with_previous(
         });
     }
     if object.kind == DfsObjectKind::Tombstone {
-        remove_dentry_index_ops(tables, &path_record, &mut table_ops);
+        if let Some(existing_path_record) = existing_path_record.as_ref() {
+            remove_dentry_index_ops(tables, existing_path_record, &mut table_ops);
+        }
+        if existing_path_record.as_ref() != Some(&path_record) {
+            remove_dentry_index_ops(tables, &path_record, &mut table_ops);
+        }
         table_ops.push(DfsMetadataTableOp::PutPath { path_record });
         return table_ops;
     }
@@ -341,5 +350,38 @@ mod tests {
         let path_record = path_record_for_object(&object);
         tables.dentries.remove(&dentry_key(&path_record));
         assert!(!object_indexes_are_materialized(&tables, &object));
+    }
+
+    #[test]
+    fn tombstone_with_new_object_id_removes_existing_path_dentry() {
+        let object = object("/docs/readme.md");
+        let mut tables = DfsMetadataTables::default();
+        for op in object_index_table_ops_with_previous(&tables, &object, None) {
+            tables.apply(op);
+        }
+        let live_path_record = path_record_for_object(&object);
+        assert!(tables.dentries.contains_key(&dentry_key(&live_path_record)));
+
+        let mut tombstone = object.clone();
+        tombstone.object_id = object_id("obj_tombstone");
+        tombstone.kind = DfsObjectKind::Tombstone;
+        tombstone.content_hash = None;
+        tombstone.content_size_bytes = None;
+        tombstone.current_locations = vec![node("node_owner")];
+        tombstone.version = version("version_object_index_tombstone");
+
+        for op in object_index_table_ops_with_previous(&tables, &tombstone, None) {
+            tables.apply(op);
+        }
+
+        assert!(!tables.dentries.contains_key(&dentry_key(&live_path_record)));
+        let tombstone_path_record = path_record_for_object(&tombstone);
+        assert_eq!(
+            tables
+                .paths
+                .get(&(tombstone.file_system_id.clone(), tombstone_path_record.path))
+                .map(|record| record.object_id.clone()),
+            Some(tombstone.object_id)
+        );
     }
 }

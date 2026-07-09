@@ -292,6 +292,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 break;
             };
+            if self.is_local_metadata_replica_for_shard(&shard)
+                && let Some(object) = local_object.as_ref()
+                && object.kind != DfsObjectKind::Tombstone
+            {
+                return Ok((resolved, local_object));
+            }
             if shard.primary_node_id != self.node_id {
                 match self.route_namespace_lookup_path_to_metadata_primary(
                     sifs_file_system_id(),

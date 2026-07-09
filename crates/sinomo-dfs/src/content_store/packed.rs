@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 pub(super) const PACKED_BLOB_INDEX_VERSION: u32 = 1;
@@ -56,7 +57,7 @@ pub(super) struct PackedBlobIndexCache {
 struct PackedBlobIndexCacheEntry {
     loaded_at: Instant,
     fingerprint: PackedBlobIndexCacheFingerprint,
-    index: PackedBlobIndex,
+    index: Arc<PackedBlobIndex>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -172,7 +173,7 @@ impl LocalContentStore {
         Ok(index)
     }
 
-    fn read_cached_packed_blob_index_for_read(&self) -> Result<PackedBlobIndex> {
+    fn read_cached_packed_blob_index_for_read(&self) -> Result<Arc<PackedBlobIndex>> {
         let now = Instant::now();
         let fingerprint = self.packed_blob_index_cache_fingerprint()?;
         {
@@ -184,12 +185,12 @@ impl LocalContentStore {
                 && now.saturating_duration_since(entry.loaded_at) <= PACKED_BLOB_INDEX_CACHE_TTL
                 && entry.fingerprint == fingerprint
             {
-                return Ok(entry.index.clone());
+                return Ok(Arc::clone(&entry.index));
             }
         }
 
         let _lock = self.lock_packed_blobs_for_read()?;
-        let index = self.read_packed_blob_index_unlocked()?;
+        let index = Arc::new(self.read_packed_blob_index_unlocked()?);
         let fingerprint = self.packed_blob_index_cache_fingerprint()?;
         let mut cache = self
             .packed_index_cache
@@ -198,7 +199,7 @@ impl LocalContentStore {
         cache.entry = Some(PackedBlobIndexCacheEntry {
             loaded_at: now,
             fingerprint,
-            index: index.clone(),
+            index: Arc::clone(&index),
         });
         Ok(index)
     }

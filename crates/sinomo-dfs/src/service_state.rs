@@ -1,8 +1,8 @@
 //! Networked DFS service state, outcome, event, and pending-state types.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,9 @@ pub struct NetworkedDfsService<T> {
     pub(crate) control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
     pub(crate) cached_sifs_metadata_shards: Option<CachedSifsMetadataShards>,
     pub(crate) metadata_backend: Option<Box<dyn DfsMetadataBackend>>,
+    pub(crate) metadata_lookup_cache:
+        Mutex<BTreeMap<(DfsFileSystemId, String), Option<DfsObjectMetadata>>>,
+    pub(crate) metadata_lookup_cache_depth: Mutex<usize>,
     pub(crate) active_replica_stages: BTreeMap<DfsObjectId, ActiveReplicaStage>,
     pub(crate) pending_writes: BTreeMap<String, PendingNetworkedWrite>,
     pub(crate) pending_reads: BTreeMap<String, PendingNetworkedRead>,

@@ -244,20 +244,34 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) -> Result<Option<DfsObjectMetadata>> {
+        let cache_active = self.metadata_lookup_cache_is_active();
+        let normalized_metadata_path = metadata_path(path);
+        let cache_key = (file_system_id.clone(), normalized_metadata_path.clone());
+        if cache_active
+            && let Ok(cache) = self.metadata_lookup_cache.lock()
+            && let Some(cached) = cache.get(&cache_key)
+        {
+            return Ok(cached.clone());
+        }
+
         if let Some(tombstone) = self
             .tombstones_by_metadata_path
-            .get(&(file_system_id.clone(), metadata_path(path)))
+            .get(&(file_system_id.clone(), normalized_metadata_path.clone()))
         {
-            return Ok(Some(tombstone.clone()));
+            let object = Some(tombstone.clone());
+            if cache_active && let Ok(mut cache) = self.metadata_lookup_cache.lock() {
+                cache.insert(cache_key, object.clone());
+            }
+            return Ok(object);
         }
         let memory_object = self
             .metadata
             .object_by_normalized_posix_path(file_system_id, path)
             .cloned();
-        if let Some(backend) = self.metadata_backend.as_ref() {
+        let object = if let Some(backend) = self.metadata_backend.as_ref() {
             let backend_object =
-                backend.get_object_by_path(file_system_id, &metadata_path(path))?;
-            let object = match (memory_object.as_ref(), backend_object.as_ref()) {
+                backend.get_object_by_path(file_system_id, &normalized_metadata_path)?;
+            match (memory_object.as_ref(), backend_object.as_ref()) {
                 (Some(memory_object), Some(backend_object)) => {
                     Some(self.resolve_authoritative_object_metadata(
                         &backend_object.object_id,
@@ -268,13 +282,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 (Some(memory_object), None) => Some(memory_object.clone()),
                 (_, Some(backend_object)) => Some(backend_object.clone()),
                 (None, None) => None,
-            };
-            return object
-                .map(|object| self.object_metadata_with_receipt_locations(object))
-                .transpose()
-                .map_err(Into::into);
+            }
+            .map(|object| self.object_metadata_with_receipt_locations(object))
+            .transpose()
+            .map_err(DfsPosixError::from)?
+        } else {
+            memory_object
+        };
+        if cache_active && let Ok(mut cache) = self.metadata_lookup_cache.lock() {
+            cache.insert(cache_key, object.clone());
         }
-        Ok(memory_object)
+        Ok(object)
     }
 
     fn has_tombstone_ancestor(&self, file_system_id: &DfsFileSystemId, path: &str) -> Result<bool> {
@@ -335,9 +353,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             format!("{}/", path.trim_end_matches('/'))
         };
-        let mut live_children = Vec::new();
         let mut tombstone_object_ids = Vec::new();
         let mut tombstone_paths = Vec::new();
+        for ((tombstone_file_system_id, _), tombstone) in &self.tombstones_by_metadata_path {
+            if tombstone_file_system_id != file_system_id {
+                continue;
+            }
+            let Some(tombstone_path) =
+                sifs_dir_direct_child_path(file_system_id, path, &prefix, tombstone)
+            else {
+                continue;
+            };
+            tombstone_object_ids.push(tombstone.object_id.clone());
+            tombstone_paths.push(tombstone_path);
+        }
+        let mut live_children = Vec::new();
         for object in self.metadata.objects.values() {
             let Some(object_path) =
                 sifs_dir_direct_child_path(file_system_id, path, &prefix, object)
@@ -345,8 +375,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 continue;
             };
             if object.kind == DfsObjectKind::Tombstone {
-                tombstone_object_ids.push(object.object_id.clone());
-                tombstone_paths.push(object_path);
+                continue;
+            } else if tombstone_paths
+                .iter()
+                .any(|tombstone_path| tombstone_path == &object_path)
+            {
+                continue;
             } else {
                 live_children.push((object_path, object.clone()));
             }

@@ -4,7 +4,6 @@
 //! when the durable snapshot/log fingerprints still match, or build/cache an
 //! owned table snapshot when another process has appended table batches.
 
-use std::borrow::Cow;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -16,8 +15,8 @@ use crate::metadata_table_store::{
     read_metadata_table_state_lenient, replay_metadata_table_batches_from,
 };
 use crate::metadata_tables::{
-    DfsMetadataTableState, DfsMetadataTables, MetadataTableReadSnapshotCache,
-    MetadataTableSnapshotFingerprint, max_optional_sequence,
+    DfsMetadataTableState, DfsMetadataTables, DfsMetadataTablesSnapshot,
+    MetadataTableReadSnapshotCache, MetadataTableSnapshotFingerprint, max_optional_sequence,
 };
 
 pub(crate) fn refresh_metadata_tables(
@@ -66,7 +65,7 @@ pub(crate) fn current_tables_snapshot<'a>(
     materialized_through_sequence: u64,
     table_snapshot_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
     read_snapshot_cache: &Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
-) -> Result<Cow<'a, DfsMetadataTables>> {
+) -> Result<DfsMetadataTablesSnapshot<'a>> {
     let path = metadata_table_path(root);
     let current_snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
     let metadata = match fs::metadata(&path) {
@@ -78,18 +77,19 @@ pub(crate) fn current_tables_snapshot<'a>(
     };
     if current_snapshot_fingerprint == *table_snapshot_fingerprint {
         match metadata.as_ref().map(fs::Metadata::len) {
-            None => return Ok(Cow::Borrowed(live_tables)),
-            Some(len) if len == table_log_offset => return Ok(Cow::Borrowed(live_tables)),
+            None => return Ok(DfsMetadataTablesSnapshot::Borrowed(live_tables)),
+            Some(len) if len == table_log_offset => {
+                return Ok(DfsMetadataTablesSnapshot::Borrowed(live_tables));
+            }
             Some(len) => {
                 if let Some(tables) =
                     cached_read_snapshot(read_snapshot_cache, &current_snapshot_fingerprint, len)
                 {
-                    return Ok(Cow::Owned(tables));
+                    return Ok(DfsMetadataTablesSnapshot::Shared(tables));
                 }
                 if len < table_log_offset {
                     let state = read_metadata_table_state_lenient(root)?;
-                    store_read_snapshot(read_snapshot_cache, &state);
-                    return Ok(Cow::Owned(state.tables));
+                    return Ok(snapshot_from_state(read_snapshot_cache, state));
                 }
                 let mut tables = live_tables.clone();
                 let replay =
@@ -104,8 +104,7 @@ pub(crate) fn current_tables_snapshot<'a>(
                     snapshot_format_version: None,
                     snapshot_fingerprint: current_snapshot_fingerprint,
                 };
-                store_read_snapshot(read_snapshot_cache, &state);
-                return Ok(Cow::Owned(state.tables));
+                return Ok(snapshot_from_state(read_snapshot_cache, state));
             }
         }
     }
@@ -115,39 +114,40 @@ pub(crate) fn current_tables_snapshot<'a>(
         &current_snapshot_fingerprint,
         table_log_offset,
     ) {
-        return Ok(Cow::Owned(tables));
+        return Ok(DfsMetadataTablesSnapshot::Shared(tables));
     }
     let state = read_metadata_table_state_lenient(root)?;
-    store_read_snapshot(read_snapshot_cache, &state);
-    Ok(Cow::Owned(state.tables))
+    Ok(snapshot_from_state(read_snapshot_cache, state))
 }
 
 fn cached_read_snapshot(
     read_snapshot_cache: &Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
     snapshot_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
     table_log_offset: u64,
-) -> Option<DfsMetadataTables> {
+) -> Option<Arc<DfsMetadataTables>> {
     let cache = read_snapshot_cache.lock().ok()?;
     let cache = cache.as_ref()?;
     if cache.snapshot_fingerprint == *snapshot_fingerprint
         && cache.table_log_offset == table_log_offset
     {
-        return Some(cache.tables.clone());
+        return Some(Arc::clone(&cache.tables));
     }
     None
 }
 
-fn store_read_snapshot(
+fn snapshot_from_state<'a>(
     read_snapshot_cache: &Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
-    state: &DfsMetadataTableState,
-) {
+    state: DfsMetadataTableState,
+) -> DfsMetadataTablesSnapshot<'a> {
+    let tables = Arc::new(state.tables);
     if let Ok(mut cache) = read_snapshot_cache.lock() {
         *cache = Some(MetadataTableReadSnapshotCache {
             snapshot_fingerprint: state.snapshot_fingerprint.clone(),
             table_log_offset: state.table_log_offset,
-            tables: state.tables.clone(),
+            tables: Arc::clone(&tables),
         });
     }
+    DfsMetadataTablesSnapshot::Shared(tables)
 }
 
 fn reload_metadata_tables_if_snapshot_changed(

@@ -5,6 +5,8 @@
 //! materializing journal entries.
 
 use std::collections::BTreeMap;
+use std::ops::Deref;
+use std::sync::Arc;
 
 use sinomo_core::node::NodeId;
 use time::OffsetDateTime;
@@ -65,7 +67,23 @@ pub(crate) struct MetadataTableSnapshotFingerprint {
 pub(crate) struct MetadataTableReadSnapshotCache {
     pub(crate) snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
     pub(crate) table_log_offset: u64,
-    pub(crate) tables: DfsMetadataTables,
+    pub(crate) tables: Arc<DfsMetadataTables>,
+}
+
+pub(crate) enum DfsMetadataTablesSnapshot<'a> {
+    Borrowed(&'a DfsMetadataTables),
+    Shared(Arc<DfsMetadataTables>),
+}
+
+impl Deref for DfsMetadataTablesSnapshot<'_> {
+    type Target = DfsMetadataTables;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(tables) => tables,
+            Self::Shared(tables) => tables,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

@@ -23,6 +23,7 @@ use crate::{
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn add_file_system(&mut self, file_system: DfsFileSystem) -> Result<(), DfsError> {
+        self.clear_metadata_lookup_cache();
         if let Some(kv) = self.control_plane.as_mut() {
             let file_system_config = DfsFileSystemConfig::from(&file_system);
             let mut store = DfsControlPlaneStore::new(kv.as_mut());
@@ -36,10 +37,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             backend.ensure_file_system(&file_system)?;
         }
         self.metadata.add_file_system(file_system);
+        self.clear_metadata_lookup_cache();
         Ok(())
     }
 
     pub fn add_object_metadata(&mut self, object: DfsObjectMetadata) -> Result<(), DfsError> {
+        self.clear_metadata_lookup_cache();
         self.put_visible_object_in_metadata_backend(&object)?;
         self.coordinator.set_committed_version(
             object.file_system_id.clone(),
@@ -47,13 +50,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object.version.clone(),
         );
         self.track_metadata_tombstone(&object);
-        self.metadata.add_object(object)
+        let result = self.metadata.add_object(object);
+        self.clear_metadata_lookup_cache();
+        result
     }
 
     pub fn add_object_metadata_batch(
         &mut self,
         objects: impl IntoIterator<Item = DfsObjectMetadata>,
     ) -> Result<(), DfsError> {
+        self.clear_metadata_lookup_cache();
         let mut grouped =
             BTreeMap::<DfsFileSystemId, Vec<(DfsObjectMetadata, DfsObjectVersionRecord)>>::new();
         for mut object in objects {
@@ -137,6 +143,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.metadata.add_object(object)?;
             }
         }
+        self.clear_metadata_lookup_cache();
         Ok(())
     }
 
@@ -144,8 +151,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         object: DfsObjectMetadata,
     ) -> Result<(), DfsError> {
+        self.clear_metadata_lookup_cache();
         self.track_metadata_tombstone(&object);
-        self.metadata.add_object(object)
+        let result = self.metadata.add_object(object);
+        self.clear_metadata_lookup_cache();
+        result
     }
 
     pub(crate) fn track_metadata_tombstone(&mut self, object: &DfsObjectMetadata) {
@@ -187,7 +197,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn remove_transient_object_metadata(&mut self, object_id: &DfsObjectId) {
+        self.clear_metadata_lookup_cache();
         self.metadata.remove_object(object_id);
+        self.clear_metadata_lookup_cache();
     }
 
     // Shared metadata-backend read helpers for service paths that need durable

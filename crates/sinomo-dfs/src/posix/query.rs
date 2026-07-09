@@ -94,8 +94,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_stat(&self, path: &str) -> Result<DfsStat> {
-        let path = self.resolve_existing_posix_path(path, true)?;
-        self.posix_lstat(&path)
+        self.with_metadata_lookup_cache(|service| {
+            let path = service.resolve_existing_posix_path(path, true)?;
+            service.posix_lstat(&path)
+        })
     }
 
     pub fn posix_stat_distributed(&mut self, path: &str) -> Result<DfsStat> {
@@ -105,14 +107,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_lstat(&self, path: &str) -> Result<DfsStat> {
-        let path = self.resolve_existing_posix_path(path, false)?;
-        let object = self
-            .lookup_sifs_path(&path)?
-            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-        if object.kind == DfsObjectKind::Tombstone {
-            return Err(DfsPosixError::NotFound { path });
-        }
-        self.stat_object_for_path(&object, &path)
+        self.with_metadata_lookup_cache(|service| {
+            let path = service.resolve_existing_posix_path(path, false)?;
+            let object = service
+                .lookup_sifs_path(&path)?
+                .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+            if object.kind == DfsObjectKind::Tombstone {
+                return Err(DfsPosixError::NotFound { path });
+            }
+            service.stat_object_for_path(&object, &path)
+        })
     }
 
     pub fn posix_lstat_distributed(&mut self, path: &str) -> Result<DfsStat> {
@@ -135,13 +139,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_list_dir(&self, path: &str) -> Result<Vec<DfsDirEntry>> {
-        let path = self.resolve_existing_posix_path(path, true)?;
-        self.posix_collect_resolved_dir(&path)
+        self.with_metadata_lookup_cache(|service| {
+            let path = service.resolve_existing_posix_path(path, true)?;
+            service.posix_collect_resolved_dir(&path)
+        })
     }
 
     pub fn posix_list_dir_distributed(&mut self, path: &str) -> Result<Vec<DfsDirEntry>> {
         self.check_cancelled("distributed list")?;
         let path = self.resolve_existing_posix_path_distributed(path, true)?;
+        if self.local_metadata_replica_can_list_resolved_dir(&path)? {
+            return self.posix_collect_resolved_dir(&path);
+        }
         self.sync_remote_namespace_path_until_quiet(&path)?;
         self.posix_collect_resolved_dir(&path)
     }
@@ -152,8 +161,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         after: Option<&DfsDirectoryPageCursor>,
         max_entries: usize,
     ) -> Result<DfsDirEntryPage> {
-        let path = self.resolve_existing_posix_path(path, true)?;
-        self.posix_list_resolved_dir_page(&path, after, max_entries)
+        self.with_metadata_lookup_cache(|service| {
+            let path = service.resolve_existing_posix_path(path, true)?;
+            service.posix_list_resolved_dir_page(&path, after, max_entries)
+        })
     }
 
     pub fn posix_list_dir_distributed_page(
@@ -163,8 +174,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_entries: usize,
     ) -> Result<DfsDirEntryPage> {
         let path = self.resolve_existing_posix_path_distributed(path, true)?;
+        if self.local_metadata_replica_can_list_resolved_dir(&path)? {
+            return self.posix_list_resolved_dir_page(&path, after, max_entries);
+        }
         self.sync_remote_namespace_path_until_quiet(&path)?;
         self.posix_list_resolved_dir_page(&path, after, max_entries)
+    }
+
+    fn local_metadata_replica_can_list_resolved_dir(&mut self, path: &str) -> Result<bool> {
+        let Some(shard) = self.routed_namespace_shard_for_path(path)? else {
+            return Ok(true);
+        };
+        if !self.is_local_metadata_replica_for_shard(&shard) {
+            return Ok(false);
+        }
+        Ok(self
+            .lookup_sifs_path(path)?
+            .is_some_and(|object| object.kind == DfsObjectKind::Directory))
     }
 
     fn posix_collect_resolved_dir(&self, path: &str) -> Result<Vec<DfsDirEntry>> {
