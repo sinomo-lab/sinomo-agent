@@ -1459,6 +1459,103 @@ mod tests {
     }
 
     #[test]
+    fn metadata_primary_failover_matrix_matches_safety_rules() {
+        let state = test_cluster_state_with_members(
+            "cluster_dfs_quint_failover_matrix",
+            "node_dfs_quint_failover_local",
+            &[
+                "node_dfs_quint_failover_current",
+                "node_dfs_quint_failover_default",
+            ],
+        );
+        let service_nodes = stable_dfs_service_node_ids(&state);
+        let current_primary =
+            NodeId::from_legacy_named("node_dfs_quint_failover_current").expect("current primary");
+        let default_primary =
+            NodeId::from_legacy_named("node_dfs_quint_failover_default").expect("default primary");
+        let file_system = default_cluster_sifs(&state);
+        let current = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "services".to_string(),
+            primary_node_id: current_primary.clone(),
+            replica_node_ids: vec![default_primary.clone(), state.local_node_id.clone()],
+            epoch: 3,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: SIFS_SERVICES_PATH.to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let healthy_graph = ClusterConnectivityGraph::from_records(
+            state.local_node_id.clone(),
+            vec![test_connectivity_record(
+                &state,
+                &state.local_node_id,
+                &current_primary,
+                "current-primary",
+                ClusterConnectivityState::Healthy,
+            )],
+        );
+        let current_unreachable_graph = ClusterConnectivityGraph::from_records(
+            state.local_node_id.clone(),
+            vec![test_connectivity_record(
+                &state,
+                &state.local_node_id,
+                &default_primary,
+                "default-primary",
+                ClusterConnectivityState::Healthy,
+            )],
+        );
+
+        assert_eq!(
+            default_metadata_shard_target_primary_node_id(
+                Some(&healthy_graph),
+                &state,
+                &service_nodes,
+                default_primary.clone(),
+                &current,
+            ),
+            default_primary,
+            "reachable current primary keeps normal default placement"
+        );
+        assert_eq!(
+            default_metadata_shard_target_primary_node_id(
+                None,
+                &state,
+                &service_nodes,
+                default_primary.clone(),
+                &current,
+            ),
+            default_primary,
+            "missing connectivity graph is not enough evidence for local promotion"
+        );
+        assert_eq!(
+            default_metadata_shard_target_primary_node_id(
+                Some(&current_unreachable_graph),
+                &state,
+                &service_nodes,
+                default_primary.clone(),
+                &DfsMetadataShardConfig {
+                    replica_node_ids: vec![default_primary.clone()],
+                    ..current.clone()
+                },
+            ),
+            default_primary,
+            "non-replica local node cannot self-promote"
+        );
+        assert_eq!(
+            default_metadata_shard_target_primary_node_id(
+                Some(&current_unreachable_graph),
+                &state,
+                &service_nodes,
+                default_primary,
+                &current,
+            ),
+            state.local_node_id,
+            "unreachable current primary lets the local replica become target primary"
+        );
+    }
+
+    #[test]
     fn metadata_shard_local_replica_failover_ready_requires_local_shard_status() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-default-local-failover-ready");
         let data_dir = SinomoDataDir::new(root.join("data"));

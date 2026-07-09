@@ -121,12 +121,25 @@ module network_route_planning {
   pure def relayCost(states: Edge -> EdgeState): int =
     stateCost(states.get(RelayN1N3)) + stateCost(states.get(RelayN3N2))
 
+  /// Direct target endpoints are preferred over relayed routes when the direct
+  /// target edge is healthy. Relay latency can be lower, but a verified direct
+  /// data path should not be starved behind a tunnel/relay fallback.
+  pure def healthyDirectTargetPreferred(
+    states: Edge -> EdgeState,
+    failed: Set[Edge],
+    visited: Set[Node]
+  ): bool =
+    directAllowed(states, failed, visited)
+      and states.get(DirectN1N2) == Healthy
+
   pure def plannedRoute(
     states: Edge -> EdgeState,
     failed: Set[Edge],
     visited: Set[Node]
   ): RoutePlan =
-    if (
+    if (healthyDirectTargetPreferred(states, failed, visited)) {
+      DirectRoute
+    } else if (
       directAllowed(states, failed, visited)
         and (not(relayAllowed(states, failed, visited))
           or directCost(states) <= relayCost(states))
@@ -255,6 +268,13 @@ module network_route_planning {
       directCost(edgeState) <= relayCost(edgeState),
     } implies selectedPlan == DirectRoute
 
+  def healthyDirectPreferredEvenWhenRelayIsCheaper: bool =
+    all {
+      healthyDirectTargetPreferred(edgeState, failedEdges, visitedNodes),
+      relayAllowed(edgeState, failedEdges, visitedNodes),
+      relayCost(edgeState) < directCost(edgeState),
+    } implies selectedPlan == DirectRoute
+
   def relayChosenAfterFailedDirectWhenAvailable: bool =
     all {
       failedEdges.contains(DirectN1N2),
@@ -287,6 +307,7 @@ module network_route_planning {
     relayRouteRequiresCompletePath,
     directRouteRequiresDirectEdge,
     directPreferredWhenNoMoreExpensive,
+    healthyDirectPreferredEvenWhenRelayIsCheaper,
     relayChosenAfterFailedDirectWhenAvailable,
     noRouteOnlyWhenNoCompatiblePath,
     routePlanMatchesAlgorithm,

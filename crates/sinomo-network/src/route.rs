@@ -5650,6 +5650,97 @@ mod tests {
     }
 
     #[test]
+    fn network_attempt_budget_matches_bounded_model_cases() {
+        let ordinary_unverified = cluster_target_final_hop_attempt_budget(
+            Some(Duration::from_secs(5)),
+            5,
+            Some(Duration::from_secs(1)),
+            false,
+            false,
+        )
+        .expect("ordinary unverified budget");
+        assert_eq!(ordinary_unverified, Duration::from_secs(1));
+
+        let full_response_unverified = cluster_target_final_hop_attempt_budget(
+            Some(Duration::from_secs(5)),
+            5,
+            Some(Duration::from_secs(1)),
+            false,
+            true,
+        )
+        .expect("full response unverified budget");
+        assert_eq!(full_response_unverified, Duration::from_millis(4500));
+
+        let verified_direct = cluster_target_final_hop_attempt_budget(
+            Some(Duration::from_secs(5)),
+            5,
+            Some(Duration::from_secs(1)),
+            true,
+            false,
+        )
+        .expect("verified direct budget");
+        assert_eq!(
+            verified_direct,
+            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
+        );
+
+        let full_response_last_endpoint = cluster_target_final_hop_attempt_budget(
+            Some(Duration::from_secs(5)),
+            1,
+            Some(Duration::from_secs(1)),
+            false,
+            true,
+        )
+        .expect("last endpoint full response budget");
+        assert_eq!(full_response_last_endpoint, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn network_endpoint_order_keeps_tunnel_as_fallback() {
+        let target =
+            NodeId::from_legacy_named("node_quint_route_endpoint_order_target").expect("target");
+        let direct_endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(
+                "endpoint_quint_route_endpoint_order_direct",
+            )
+            .expect("direct endpoint"),
+            node_id: target.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "10.0.0.42:21353".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+        let tunnel_endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(
+                "endpoint_quint_route_endpoint_order_tunnel",
+            )
+            .expect("tunnel endpoint"),
+            node_id: target,
+            transport: ClusterTransportKind::LanTcp,
+            address: format!(
+                "{}node_quint_route_endpoint_order_target",
+                crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX
+            ),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+
+        assert!(
+            cluster_delivery_endpoint_attempt_sort_rank(&direct_endpoint)
+                < cluster_delivery_endpoint_attempt_sort_rank(&tunnel_endpoint),
+            "real direct endpoints must be attempted before synthetic tunnel fallbacks"
+        );
+        assert!(cluster_target_endpoint_should_reserve_fallback_budget(
+            &tunnel_endpoint,
+            2
+        ));
+    }
+
+    #[test]
     fn cluster_target_rpc_retries_after_unverified_endpoint_timeout() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-target-unverified-timeout-retry");
         let data_dir = SinomoDataDir::new(&root);

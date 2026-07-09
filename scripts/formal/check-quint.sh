@@ -10,9 +10,12 @@ membership_kv_verify_steps="${QUINT_MEMBERSHIP_KV_VERIFY_MAX_STEPS:-4}"
 network_endpoint_verify_steps="${QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS:-4}"
 network_route_verify_steps="${QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS:-4}"
 network_delivery_verify_steps="${QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS:-5}"
+network_attempt_budget_verify_steps="${QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS:-3}"
 system_smoke_run_steps="${QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS:-80}"
 system_smoke_run_samples="${QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES:-500}"
 dfs_routing_verify_steps="${QUINT_DFS_ROUTING_VERIFY_MAX_STEPS:-$verify_steps}"
+dfs_read_freshness_verify_steps="${QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS:-3}"
+dfs_primary_failover_verify_steps="${QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS:-3}"
 dfs_namespace_verify_steps="${QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS:-$verify_steps}"
 dfs_sharded_namespace_verify_steps="${QUINT_DFS_SHARDED_NAMESPACE_VERIFY_MAX_STEPS:-$verify_steps}"
 dfs_journal_verify_steps="${QUINT_DFS_JOURNAL_VERIFY_MAX_STEPS:-$verify_steps}"
@@ -32,6 +35,7 @@ quint typecheck specs/quint/network.qnt
 quint typecheck specs/quint/network_endpoint_selection.qnt
 quint typecheck specs/quint/network_route_planning.qnt
 quint typecheck specs/quint/network_delivery_retry.qnt
+quint typecheck specs/quint/network_attempt_budget.qnt
 quint typecheck specs/quint/system_base.qnt
 quint typecheck specs/quint/system_guarantees.qnt
 quint typecheck specs/quint/system_smoke.qnt
@@ -40,6 +44,8 @@ quint typecheck specs/quint/membership.qnt
 quint typecheck specs/quint/membership_kv.qnt
 quint typecheck specs/quint/dfs_metadata.qnt
 quint typecheck specs/quint/dfs_authority_routing.qnt
+quint typecheck specs/quint/dfs_read_freshness.qnt
+quint typecheck specs/quint/dfs_metadata_primary_failover.qnt
 quint typecheck specs/quint/dfs_namespace_transaction.qnt
 quint typecheck specs/quint/dfs_sharded_namespace_transaction.qnt
 quint typecheck specs/quint/dfs_metadata_journal_source.qnt
@@ -82,6 +88,12 @@ quint run specs/quint/network_delivery_retry.qnt \
   --max-steps="$run_steps" \
   --max-samples="$run_samples" \
   --verbosity=1
+quint run specs/quint/network_attempt_budget.qnt \
+  --main=network_attempt_budget \
+  --invariant=safety \
+  --max-steps="$run_steps" \
+  --max-samples="$run_samples" \
+  --verbosity=1
 quint run specs/quint/system_smoke.qnt \
   --main=system_smoke \
   --invariant=safety \
@@ -109,6 +121,18 @@ quint run specs/quint/dfs_metadata.qnt \
   --verbosity=1
 quint run specs/quint/dfs_authority_routing.qnt \
   --main=dfs_authority_routing \
+  --invariant=safety \
+  --max-steps="$run_steps" \
+  --max-samples="$run_samples" \
+  --verbosity=1
+quint run specs/quint/dfs_read_freshness.qnt \
+  --main=dfs_read_freshness \
+  --invariant=safety \
+  --max-steps="$run_steps" \
+  --max-samples="$run_samples" \
+  --verbosity=1
+quint run specs/quint/dfs_metadata_primary_failover.qnt \
+  --main=dfs_metadata_primary_failover \
   --invariant=safety \
   --max-steps="$run_steps" \
   --max-samples="$run_samples" \
@@ -205,6 +229,11 @@ quint verify specs/quint/network_delivery_retry.qnt \
   --invariant=safety \
   --max-steps="$network_delivery_verify_steps" \
   --verbosity=1
+quint verify specs/quint/network_attempt_budget.qnt \
+  --main=network_attempt_budget \
+  --invariant=safety \
+  --max-steps="$network_attempt_budget_verify_steps" \
+  --verbosity=1
 quint verify specs/quint/membership.qnt \
   --main=membership \
   --invariant=safety \
@@ -226,6 +255,16 @@ quint verify specs/quint/dfs_authority_routing.qnt \
   --main=dfs_authority_routing \
   --invariant=safety \
   --max-steps="$dfs_routing_verify_steps" \
+  --verbosity=1
+quint verify specs/quint/dfs_read_freshness.qnt \
+  --main=dfs_read_freshness \
+  --invariant=safety \
+  --max-steps="$dfs_read_freshness_verify_steps" \
+  --verbosity=1
+quint verify specs/quint/dfs_metadata_primary_failover.qnt \
+  --main=dfs_metadata_primary_failover \
+  --invariant=safety \
+  --max-steps="$dfs_primary_failover_verify_steps" \
   --verbosity=1
 quint verify specs/quint/dfs_namespace_transaction.qnt \
   --main=dfs_namespace_transaction \

@@ -6261,6 +6261,108 @@ fn networked_dfs_read_state_distinguishes_pending_and_stale_cache() {
 }
 
 #[test]
+fn dfs_read_freshness_distinguishes_current_and_local_mirror_reads() {
+    let owner = NodeId::from_legacy_named("node_quint_read_owner").expect("owner");
+    let replica = NodeId::from_legacy_named("node_quint_read_replica").expect("replica");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_quint_read_artifact").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let root = temp_root("dfs_read_freshness_current_vs_local_mirror");
+    let network = InProcessNetwork::new();
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
+    );
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "quint read freshness".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    replica_dfs
+        .add_file_system(file_system)
+        .expect("filesystem");
+    replica_dfs
+        .put_local_object_version(
+            DfsObjectMetadata {
+                object_id: object_id.clone(),
+                file_system_id: file_system_id.clone(),
+                path: "artifact.bin".to_string(),
+                kind: DfsObjectKind::Artifact,
+                owner_node_id: owner.clone(),
+                current_locations: vec![owner.clone(), replica.clone()],
+                content_hash: Some(content_hash(b"old cached bytes")),
+                content_size_bytes: Some(b"old cached bytes".len() as u64),
+                link_target_object_id: None,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                accessed_at_unix_nanos: 0,
+                modified_at_unix_nanos: 0,
+                created_at_unix_nanos: 0,
+                changed_at_unix_nanos: 0,
+                version: version_1.clone(),
+                policy: DfsObjectPolicy::ReplicatedEventual,
+                created_by_event_id: None,
+                last_modified_by_event_id: None,
+            },
+            b"old cached bytes",
+        )
+        .expect("seed stale local cache");
+    replica_dfs
+        .add_object_metadata(DfsObjectMetadata {
+            object_id: object_id.clone(),
+            file_system_id,
+            path: "artifact.bin".to_string(),
+            kind: DfsObjectKind::Artifact,
+            owner_node_id: owner,
+            current_locations: Vec::new(),
+            content_hash: Some(content_hash(b"new current bytes")),
+            content_size_bytes: Some(b"new current bytes".len() as u64),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: version_2.clone(),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        })
+        .expect("publish newer current metadata");
+
+    let distributed_current = replica_dfs
+        .read_local_object_with_state(&object_id, false)
+        .expect("distributed current read");
+    assert!(matches!(
+        distributed_current,
+        NetworkedDfsReadOutcome::PendingReplication { version, .. } if version == version_2
+    ));
+
+    let local_mirror = replica_dfs
+        .read_local_object_with_state(&object_id, true)
+        .expect("local mirror read");
+    assert!(matches!(
+        local_mirror,
+        NetworkedDfsReadOutcome::Found {
+            data,
+            freshness: NetworkedDfsReadFreshness::Stale {
+                current_version,
+                ..
+            },
+        } if data.version == version_1
+            && data.bytes == b"old cached bytes"
+            && current_version == version_2
+    ));
+
+    cleanup(&root);
+}
+
+#[test]
 fn networked_dfs_deduplicates_inflight_remote_object_reads() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
     let reader = NodeId::from_legacy_named("node_reader").expect("node");
