@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub fn stage_rollout_bytes(bytes: &[u8], destination: &Path) -> Result<(), RolloutError> {
     if bytes.is_empty() {
@@ -19,14 +19,26 @@ pub fn stage_rollout_bytes(bytes: &[u8], destination: &Path) -> Result<(), Rollo
             detail: source.to_string(),
         })?;
     }
-    if let Err(source) = fs::write(destination, bytes) {
-        let _ = fs::remove_file(destination);
+    let next = staged_rollout_temp_path(destination);
+    if let Err(source) = fs::write(&next, bytes) {
+        let _ = fs::remove_file(&next);
         return Err(RolloutError::Io {
-            path: destination.display().to_string(),
+            path: next.display().to_string(),
             detail: source.to_string(),
         });
     }
-    set_executable(destination)
+    if let Err(error) = set_executable(&next) {
+        let _ = fs::remove_file(&next);
+        return Err(error);
+    }
+    remove_staged_file_if_present(destination)?;
+    fs::rename(&next, destination).map_err(|source| {
+        let _ = fs::remove_file(&next);
+        RolloutError::Io {
+            path: format!("{} -> {}", next.display(), destination.display()),
+            detail: source.to_string(),
+        }
+    })
 }
 
 pub fn stage_rollout_file(source: &Path, destination: &Path) -> Result<(), RolloutError> {
@@ -37,18 +49,30 @@ pub fn stage_rollout_file(source: &Path, destination: &Path) -> Result<(), Rollo
             detail: source.to_string(),
         })?;
     }
-    if let Err(error) = fs::copy(source, destination) {
-        let _ = fs::remove_file(destination);
+    let next = staged_rollout_temp_path(destination);
+    if let Err(error) = fs::copy(source, &next) {
+        let _ = fs::remove_file(&next);
         return Err(RolloutError::Io {
-            path: format!("{} -> {}", source.display(), destination.display()),
+            path: format!("{} -> {}", source.display(), next.display()),
             detail: error.to_string(),
         });
     }
-    if let Err(error) = ensure_non_empty_rollout_artifact(destination) {
-        let _ = fs::remove_file(destination);
+    if let Err(error) = ensure_non_empty_rollout_artifact(&next) {
+        let _ = fs::remove_file(&next);
         return Err(error);
     }
-    set_executable(destination)
+    if let Err(error) = set_executable(&next) {
+        let _ = fs::remove_file(&next);
+        return Err(error);
+    }
+    remove_staged_file_if_present(destination)?;
+    fs::rename(&next, destination).map_err(|source| {
+        let _ = fs::remove_file(&next);
+        RolloutError::Io {
+            path: format!("{} -> {}", next.display(), destination.display()),
+            detail: source.to_string(),
+        }
+    })
 }
 
 pub fn stage_rollout_bytes_pair(
@@ -57,7 +81,7 @@ pub fn stage_rollout_bytes_pair(
     linked_destination: &Path,
 ) -> Result<(), RolloutError> {
     stage_rollout_bytes(bytes, primary_destination)?;
-    stage_rollout_link_or_copy(primary_destination, linked_destination)
+    stage_rollout_file(primary_destination, linked_destination)
 }
 
 pub fn stage_rollout_file_pair(
@@ -66,21 +90,7 @@ pub fn stage_rollout_file_pair(
     linked_destination: &Path,
 ) -> Result<(), RolloutError> {
     stage_rollout_file(source, primary_destination)?;
-    stage_rollout_link_or_copy(primary_destination, linked_destination)
-}
-
-fn stage_rollout_link_or_copy(source: &Path, destination: &Path) -> Result<(), RolloutError> {
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|source| RolloutError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    remove_staged_file_if_present(destination)?;
-    match fs::hard_link(source, destination) {
-        Ok(()) => set_executable(destination),
-        Err(_) => stage_rollout_file(source, destination),
-    }
+    stage_rollout_file(source, linked_destination)
 }
 
 fn remove_staged_file_if_present(destination: &Path) -> Result<(), RolloutError> {
@@ -92,6 +102,18 @@ fn remove_staged_file_if_present(destination: &Path) -> Result<(), RolloutError>
             detail: error.to_string(),
         }),
     }
+}
+
+fn staged_rollout_temp_path(destination: &Path) -> PathBuf {
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("candidate");
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    destination.with_file_name(format!("{file_name}.next-{}-{suffix}", std::process::id()))
 }
 
 pub fn stage_rollout_file_with_retry(
@@ -318,6 +340,8 @@ fn set_executable(_destination: &Path) -> Result<(), RolloutError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
 
     #[test]
     fn install_binary_atomically_preserves_executable_suffix_in_previous_backup() {
@@ -357,6 +381,59 @@ mod tests {
         assert_eq!(
             fs::read(&staged_shadow).expect("shadow bytes"),
             b"candidate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_rollout_file_pair_stages_independent_executable_inodes() {
+        let root = sinomo_testdir::TestDir::new("sinomo-rollout-stage-pair-inodes");
+        let source = root.join("candidate");
+        let staged_main = root.join("staged").join("sinomo-main");
+        let staged_shadow = root.join("staged").join("sinomo-shadow");
+        fs::write(&source, b"candidate").expect("source");
+
+        stage_rollout_file_pair(&source, &staged_main, &staged_shadow).expect("stage pair");
+
+        let main_metadata = fs::metadata(&staged_main).expect("main metadata");
+        let shadow_metadata = fs::metadata(&staged_shadow).expect("shadow metadata");
+        assert_ne!(main_metadata.ino(), shadow_metadata.ino());
+        assert_eq!(fs::read(&staged_main).expect("main bytes"), b"candidate");
+        assert_eq!(
+            fs::read(&staged_shadow).expect("shadow bytes"),
+            b"candidate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_rollout_file_replaces_stale_hard_link_without_mutating_linked_file() {
+        let root = sinomo_testdir::TestDir::new("sinomo-rollout-stage-hardlink");
+        let source = root.join("candidate");
+        let linked_original = root.join("linked-original");
+        let staged = root.join("staged").join("sinomo");
+        fs::create_dir_all(staged.parent().expect("staged parent")).expect("staged parent");
+        fs::write(&source, b"candidate").expect("source");
+        fs::write(&linked_original, b"previous").expect("linked original");
+        fs::hard_link(&linked_original, &staged).expect("stale hard link");
+        let original_inode = fs::metadata(&linked_original)
+            .expect("linked original metadata")
+            .ino();
+        assert_eq!(
+            original_inode,
+            fs::metadata(&staged).expect("staged metadata").ino()
+        );
+
+        stage_rollout_file(&source, &staged).expect("stage file");
+
+        assert_eq!(
+            fs::read(&linked_original).expect("linked original bytes"),
+            b"previous"
+        );
+        assert_eq!(fs::read(&staged).expect("staged bytes"), b"candidate");
+        assert_ne!(
+            original_inode,
+            fs::metadata(&staged).expect("staged metadata").ino()
         );
     }
 
