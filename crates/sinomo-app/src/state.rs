@@ -430,8 +430,10 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         shared.borrow_mut().connect_rx = Some(rx);
 
-        tx.send(ConnectEvent::Status("Starting the chat engine…".to_string()))
-            .expect("send status");
+        tx.send(ConnectEvent::Status(
+            "Starting the chat engine…".to_string(),
+        ))
+        .expect("send status");
         let (changed, became_ready) = shared.pump_connect();
         assert!(changed);
         assert!(!became_ready);
@@ -441,8 +443,10 @@ mod tests {
 
         // The same status again must not reset the step clock — the elapsed time
         // is what makes a stalled step visible on the loading screen.
-        tx.send(ConnectEvent::Status("Starting the chat engine…".to_string()))
-            .expect("send status");
+        tx.send(ConnectEvent::Status(
+            "Starting the chat engine…".to_string(),
+        ))
+        .expect("send status");
         let (changed, _) = shared.pump_connect();
         assert!(changed);
         assert_eq!(shared.borrow().status_since, Some(first_since));

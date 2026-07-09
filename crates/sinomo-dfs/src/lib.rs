@@ -443,12 +443,12 @@ pub(crate) use service_state::{
     retained_networked_dfs_service_events,
 };
 pub use service_state::{
-    DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT,
-    DfsCancellationFlag, DfsConfirmedTimeoutAction, DfsConfirmedTimeoutOutcome,
-    DfsConflictReadView, DfsMessageProcessResult, DfsMetadataReplicationOutcome,
-    DfsOwnerHandoffOutcome, DfsReconnectReconciliation, NetworkedDfsRangeReadOutcome,
-    NetworkedDfsReadFreshness, NetworkedDfsReadOutcome, NetworkedDfsService,
-    NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
+    DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT, DfsCancellationFlag,
+    DfsConfirmedTimeoutAction, DfsConfirmedTimeoutOutcome, DfsConflictReadView,
+    DfsMessageProcessResult, DfsMetadataReplicationOutcome, DfsOwnerHandoffOutcome,
+    DfsReconnectReconciliation, NetworkedDfsRangeReadOutcome, NetworkedDfsReadFreshness,
+    NetworkedDfsReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
+    NetworkedDfsWriteOutcome,
 };
 pub(crate) use service_trace::{
     dfs_distributed_write_result_trace_label, dfs_namespace_operation_trace_label,

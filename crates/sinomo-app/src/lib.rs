@@ -78,12 +78,15 @@ pub fn run() -> sui::Result<()> {
                 tracing::info!(mode = %backend.mode_label(), "sinomo-app connected");
                 let _ = tx.send(ConnectEvent::Status("Loading workspace…".to_string()));
                 ui.wake();
-                let ready =
-                    ReadyState::build_with_waker_and_progress(backend, Some(ui.clone()), |status| {
+                let ready = ReadyState::build_with_waker_and_progress(
+                    backend,
+                    Some(ui.clone()),
+                    |status| {
                         tracing::info!(%status, "sinomo-app launch step");
                         let _ = tx.send(ConnectEvent::Status(status.to_string()));
                         ui.wake();
-                    });
+                    },
+                );
                 let _ = tx.send(ConnectEvent::Connected(Box::new(ready)));
                 ui.wake();
             })
@@ -111,12 +114,15 @@ pub fn run_android(android_app: sui::AndroidApp) -> sui::Result<()> {
                 tracing::info!(mode = %backend.mode_label(), "sinomo-app connected");
                 let _ = tx.send(ConnectEvent::Status("Loading workspace…".to_string()));
                 ui.wake();
-                let ready =
-                    ReadyState::build_with_waker_and_progress(backend, Some(ui.clone()), |status| {
+                let ready = ReadyState::build_with_waker_and_progress(
+                    backend,
+                    Some(ui.clone()),
+                    |status| {
                         tracing::info!(%status, "sinomo-app launch step");
                         let _ = tx.send(ConnectEvent::Status(status.to_string()));
                         ui.wake();
-                    });
+                    },
+                );
                 let _ = tx.send(ConnectEvent::Connected(Box::new(ready)));
                 ui.wake();
             })

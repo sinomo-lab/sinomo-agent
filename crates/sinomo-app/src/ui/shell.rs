@@ -569,7 +569,10 @@ impl Widget for Shell {
                     let agents_changed = chat.pump_agent_list();
                     let list_changed = chat.pump_session_list();
                     let delete_changed = chat.pump_delete();
-                    worker_changed || providers_changed || agents_changed || list_changed
+                    worker_changed
+                        || providers_changed
+                        || agents_changed
+                        || list_changed
                         || delete_changed
                 } else {
                     false
@@ -726,12 +729,7 @@ impl Shell {
         let ty = cy + 10.0 - th / 2.0;
         widgets::draw_text_in(ctx, Rect::new(tx, ty, tw + 4.0, th + 4.0), &status, style);
 
-        for (line_index, line) in self
-            .loading_stall_lines()
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
+        for (line_index, line) in self.loading_stall_lines().into_iter().flatten().enumerate() {
             let hint_style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_muted);
             let hint_w = ctx
                 .measure_text(line.clone(), hint_style.clone())
@@ -1313,8 +1311,7 @@ mod tests {
         {
             let mut app = shared.borrow_mut();
             app.status = "Starting the chat engine…".to_string();
-            app.status_since =
-                Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
+            app.status_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
         }
         let shell = Shell::new(shared.clone());
 
