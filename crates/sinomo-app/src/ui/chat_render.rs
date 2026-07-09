@@ -3,23 +3,433 @@ use std::sync::OnceLock;
 use pulldown_cmark::{
     CodeBlockKind, Event as MarkdownEvent, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
+use std::ops::Range;
+use sui::{
+    FontStyle, FontWeight, RichTextSourceMap, RichTextSourceSpan, TextDocument, TextParagraph,
+    TextSpan, TextStyle,
+};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
 use syntect::parsing::SyntaxSet;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ChatRenderBlock {
-    Paragraph(String),
-    Heading { level: u8, text: String },
-    ListItem { marker: String, text: String },
-    Code(ChatCodeBlock),
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ChatCodeBlock {
     pub language: Option<String>,
     pub text: String,
     pub is_diff: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ChatRichRenderBlock {
+    Text {
+        document: TextDocument,
+        display_range: Range<usize>,
+    },
+    Code {
+        code: ChatCodeBlock,
+        display_range: Range<usize>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ChatMarkdownRender {
+    pub blocks: Vec<ChatRichRenderBlock>,
+    pub source_map: RichTextSourceMap,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ChatMarkdownStyles {
+    pub body: TextStyle,
+    pub headings: [TextStyle; 6],
+    pub inline_code: TextStyle,
+    pub link: TextStyle,
+}
+
+/// Parse Markdown into SUI rich-text documents while retaining a mapping from
+/// rendered character offsets to the original Markdown source.
+pub(crate) fn markdown_rich_render(
+    markdown: &str,
+    styles: ChatMarkdownStyles,
+) -> ChatMarkdownRender {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let mut builder = RichMarkdownBuilder::new(markdown, styles);
+    for (event, source_range) in Parser::new_ext(markdown, options).into_offset_iter() {
+        builder.event(event, source_range);
+    }
+    builder.finish()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RichBlockKind {
+    Paragraph,
+    Heading(u8),
+    Item,
+}
+
+struct RichMarkdownBuilder<'a> {
+    source: &'a str,
+    styles: ChatMarkdownStyles,
+    blocks: Vec<ChatRichRenderBlock>,
+    rendered: String,
+    source_spans: Vec<RichTextSourceSpan>,
+    current_kind: Option<RichBlockKind>,
+    current_spans: Vec<TextSpan>,
+    current_display_start: usize,
+    pending_source_start: Option<usize>,
+    strong_depth: usize,
+    emphasis_depth: usize,
+    link_depth: usize,
+    lists: Vec<Option<u64>>,
+    code_language: Option<String>,
+    code_text: String,
+    code_source_start: Option<usize>,
+    code_content_range: Option<Range<usize>>,
+    table_cell_index: usize,
+}
+
+impl<'a> RichMarkdownBuilder<'a> {
+    fn new(source: &'a str, styles: ChatMarkdownStyles) -> Self {
+        Self {
+            source,
+            styles,
+            blocks: Vec::new(),
+            rendered: String::new(),
+            source_spans: Vec::new(),
+            current_kind: None,
+            current_spans: Vec::new(),
+            current_display_start: 0,
+            pending_source_start: None,
+            strong_depth: 0,
+            emphasis_depth: 0,
+            link_depth: 0,
+            lists: Vec::new(),
+            code_language: None,
+            code_text: String::new(),
+            code_source_start: None,
+            code_content_range: None,
+            table_cell_index: 0,
+        }
+    }
+
+    fn event(&mut self, event: MarkdownEvent<'_>, source_range: Range<usize>) {
+        match event {
+            MarkdownEvent::Start(Tag::Paragraph) => {
+                self.start_block(RichBlockKind::Paragraph, source_range.start)
+            }
+            MarkdownEvent::End(TagEnd::Paragraph) => self.finish_text_block(source_range.end),
+            MarkdownEvent::Start(Tag::Heading { level, .. }) => self.start_block(
+                RichBlockKind::Heading(heading_level(level)),
+                source_range.start,
+            ),
+            MarkdownEvent::End(TagEnd::Heading(_)) => self.finish_text_block(source_range.end),
+            MarkdownEvent::Start(Tag::List(start)) => self.lists.push(start),
+            MarkdownEvent::End(TagEnd::List(_)) => {
+                self.finish_text_block(source_range.end);
+                self.lists.pop();
+            }
+            MarkdownEvent::Start(Tag::Item) => {
+                self.start_block(RichBlockKind::Item, source_range.start);
+                let marker = self.next_list_marker();
+                self.append_mapped_text(&marker, source_range.clone(), source_range);
+            }
+            MarkdownEvent::End(TagEnd::Item) => self.finish_text_block(source_range.end),
+            MarkdownEvent::Start(Tag::Table(_)) => {
+                self.start_block(RichBlockKind::Paragraph, source_range.start);
+                self.table_cell_index = 0;
+            }
+            MarkdownEvent::End(TagEnd::Table) => self.finish_text_block(source_range.end),
+            MarkdownEvent::Start(Tag::TableHead | Tag::TableRow) => {
+                self.table_cell_index = 0;
+            }
+            MarkdownEvent::End(TagEnd::TableHead | TagEnd::TableRow) => {
+                self.append_mapped_text("\n", source_range.clone(), source_range);
+                self.table_cell_index = 0;
+            }
+            MarkdownEvent::Start(Tag::TableCell) => {
+                if self.table_cell_index > 0 {
+                    self.append_mapped_text("  |  ", source_range.clone(), source_range);
+                }
+            }
+            MarkdownEvent::End(TagEnd::TableCell) => {
+                self.table_cell_index += 1;
+            }
+            MarkdownEvent::Start(Tag::Strong) => {
+                self.strong_depth += 1;
+                self.note_source_start(source_range.start);
+            }
+            MarkdownEvent::End(TagEnd::Strong) => {
+                self.strong_depth = self.strong_depth.saturating_sub(1);
+                self.extend_last_source_span(source_range.end);
+            }
+            MarkdownEvent::Start(Tag::Emphasis) => {
+                self.emphasis_depth += 1;
+                self.note_source_start(source_range.start);
+            }
+            MarkdownEvent::End(TagEnd::Emphasis) => {
+                self.emphasis_depth = self.emphasis_depth.saturating_sub(1);
+                self.extend_last_source_span(source_range.end);
+            }
+            MarkdownEvent::Start(Tag::Strikethrough) => self.note_source_start(source_range.start),
+            MarkdownEvent::End(TagEnd::Strikethrough) => {
+                self.extend_last_source_span(source_range.end)
+            }
+            MarkdownEvent::Start(Tag::Link { .. }) => {
+                self.link_depth += 1;
+                self.note_source_start(source_range.start);
+            }
+            MarkdownEvent::End(TagEnd::Link) => {
+                self.link_depth = self.link_depth.saturating_sub(1);
+                self.extend_last_source_span(source_range.end);
+            }
+            MarkdownEvent::Start(Tag::CodeBlock(kind)) => {
+                self.finish_text_block(source_range.start);
+                self.code_language = code_block_language(kind);
+                self.code_text.clear();
+                self.code_source_start = Some(source_range.start);
+                self.code_content_range = None;
+            }
+            MarkdownEvent::End(TagEnd::CodeBlock) => self.finish_code_block(source_range.end),
+            MarkdownEvent::Text(text) => {
+                if self.code_source_start.is_some() {
+                    self.code_text.push_str(&text);
+                    self.code_content_range = Some(match self.code_content_range.take() {
+                        Some(range) => {
+                            range.start.min(source_range.start)..range.end.max(source_range.end)
+                        }
+                        None => source_range,
+                    });
+                } else {
+                    self.ensure_text_block(source_range.start);
+                    self.append_mapped_text(&text, source_range.clone(), source_range);
+                }
+            }
+            MarkdownEvent::Code(code) => {
+                self.ensure_text_block(source_range.start);
+                let content_range = markdown_inline_content_range(self.source, &source_range);
+                let mut style = self.styles.inline_code.clone();
+                self.apply_inline_style(&mut style);
+                self.append_mapped_span(&code, style, source_range.clone(), content_range);
+            }
+            MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => {
+                self.ensure_text_block(source_range.start);
+                self.append_mapped_text("\n", source_range.clone(), source_range);
+            }
+            MarkdownEvent::Rule => {
+                self.start_block(RichBlockKind::Paragraph, source_range.start);
+                self.append_mapped_text("---", source_range.clone(), source_range.clone());
+                self.finish_text_block(source_range.end);
+            }
+            MarkdownEvent::TaskListMarker(checked) => {
+                self.ensure_text_block(source_range.start);
+                self.append_mapped_text(
+                    if checked { "[x] " } else { "[ ] " },
+                    source_range.clone(),
+                    source_range,
+                );
+            }
+            MarkdownEvent::Html(html) | MarkdownEvent::InlineHtml(html) => {
+                self.ensure_text_block(source_range.start);
+                self.append_mapped_text(&html, source_range.clone(), source_range);
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(mut self) -> ChatMarkdownRender {
+        self.finish_text_block(self.source.len());
+        if self.code_source_start.is_some() {
+            self.finish_code_block(self.source.len());
+        }
+        if self.blocks.is_empty() && !self.source.is_empty() {
+            self.start_block(RichBlockKind::Paragraph, 0);
+            self.append_mapped_text(self.source, 0..self.source.len(), 0..self.source.len());
+            self.finish_text_block(self.source.len());
+        }
+        ChatMarkdownRender {
+            blocks: self.blocks,
+            source_map: RichTextSourceMap::new(self.source, self.rendered, self.source_spans),
+        }
+    }
+
+    fn start_block(&mut self, kind: RichBlockKind, source_start: usize) {
+        self.finish_text_block(source_start);
+        if !self.rendered.is_empty() {
+            self.rendered.push_str("\n\n");
+        }
+        self.current_kind = Some(kind);
+        self.current_display_start = self.rendered.len();
+        self.current_spans.clear();
+        self.note_source_start(source_start);
+    }
+
+    fn ensure_text_block(&mut self, source_start: usize) {
+        if self.current_kind.is_none() {
+            self.start_block(RichBlockKind::Paragraph, source_start);
+        }
+    }
+
+    fn finish_text_block(&mut self, source_end: usize) {
+        let Some(_kind) = self.current_kind.take() else {
+            return;
+        };
+        self.extend_last_source_span(source_end);
+        if self.current_spans.is_empty() {
+            self.pending_source_start = None;
+            return;
+        }
+        let display_range = self.current_display_start..self.rendered.len();
+        let spans = std::mem::take(&mut self.current_spans);
+        self.blocks.push(ChatRichRenderBlock::Text {
+            document: TextDocument {
+                paragraphs: vec![TextParagraph::from_spans(spans)],
+            },
+            display_range,
+        });
+        self.pending_source_start = None;
+    }
+
+    fn finish_code_block(&mut self, source_end: usize) {
+        let Some(source_start) = self.code_source_start.take() else {
+            return;
+        };
+        if !self.rendered.is_empty() {
+            self.rendered.push_str("\n\n");
+        }
+        let raw_text = std::mem::take(&mut self.code_text);
+        let text = raw_text.trim_end_matches('\n').to_string();
+        let trailing_bytes = raw_text.len().saturating_sub(text.len());
+        let display_start = self.rendered.len();
+        self.rendered.push_str(&text);
+        let display_range = display_start..self.rendered.len();
+        let mut content_range = self
+            .code_content_range
+            .take()
+            .unwrap_or(source_start..source_end);
+        content_range.end = content_range
+            .end
+            .saturating_sub(trailing_bytes)
+            .max(content_range.start);
+        self.source_spans.push(RichTextSourceSpan::new(
+            display_range.clone(),
+            source_start..source_end,
+            content_range,
+        ));
+        let language = self.code_language.take();
+        let is_diff = language
+            .as_deref()
+            .is_some_and(|language| matches!(language, "diff" | "patch"))
+            || looks_like_diff(&text);
+        self.blocks.push(ChatRichRenderBlock::Code {
+            code: ChatCodeBlock {
+                language,
+                text,
+                is_diff,
+            },
+            display_range,
+        });
+    }
+
+    fn current_style(&self) -> TextStyle {
+        let mut style = match self.current_kind.unwrap_or(RichBlockKind::Paragraph) {
+            RichBlockKind::Heading(level) => self.styles.headings
+                [usize::from(level.saturating_sub(1)).min(self.styles.headings.len() - 1)]
+            .clone(),
+            RichBlockKind::Paragraph | RichBlockKind::Item => self.styles.body.clone(),
+        };
+        self.apply_inline_style(&mut style);
+        style
+    }
+
+    fn apply_inline_style(&self, style: &mut TextStyle) {
+        if self.strong_depth > 0 {
+            style.weight = FontWeight::BOLD;
+        }
+        if self.emphasis_depth > 0 {
+            style.style = FontStyle::Italic;
+        }
+        if self.link_depth > 0 {
+            style.color = self.styles.link.color;
+        }
+    }
+
+    fn append_mapped_text(
+        &mut self,
+        text: &str,
+        source_range: Range<usize>,
+        content_source_range: Range<usize>,
+    ) {
+        self.append_mapped_span(
+            text,
+            self.current_style(),
+            source_range,
+            content_source_range,
+        );
+    }
+
+    fn append_mapped_span(
+        &mut self,
+        text: &str,
+        style: TextStyle,
+        mut source_range: Range<usize>,
+        content_source_range: Range<usize>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(pending) = self.pending_source_start.take() {
+            source_range.start = source_range.start.min(pending);
+        }
+        let display_start = self.rendered.len();
+        self.rendered.push_str(text);
+        let display_range = display_start..self.rendered.len();
+        self.current_spans.push(TextSpan::new(text, style));
+        self.source_spans.push(RichTextSourceSpan::new(
+            display_range,
+            source_range,
+            content_source_range,
+        ));
+    }
+
+    fn note_source_start(&mut self, source_start: usize) {
+        self.pending_source_start = Some(
+            self.pending_source_start
+                .map(|pending| pending.min(source_start))
+                .unwrap_or(source_start),
+        );
+    }
+
+    fn extend_last_source_span(&mut self, source_end: usize) {
+        if let Some(span) = self.source_spans.last_mut() {
+            span.source_range.end = span.source_range.end.max(source_end);
+        }
+    }
+
+    fn next_list_marker(&mut self) -> String {
+        let indent = "  ".repeat(self.lists.len().saturating_sub(1));
+        match self.lists.last_mut().and_then(Option::as_mut) {
+            Some(next) => {
+                let current = *next;
+                *next += 1;
+                format!("{indent}{current}. ")
+            }
+            None => format!("{indent}- "),
+        }
+    }
+}
+
+fn markdown_inline_content_range(source: &str, range: &Range<usize>) -> Range<usize> {
+    let Some(fragment) = source.get(range.clone()) else {
+        return range.clone();
+    };
+    let leading = fragment.chars().take_while(|ch| *ch == '`').count();
+    let trailing = fragment.chars().rev().take_while(|ch| *ch == '`').count();
+    let start = (range.start + leading).min(range.end);
+    let end = range.end.saturating_sub(trailing).max(start);
+    start..end
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,98 +442,6 @@ pub(crate) struct HighlightSpan {
 pub(crate) struct FileEditRender {
     pub title: String,
     pub code: ChatCodeBlock,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MarkdownBlockKind {
-    Paragraph,
-    Heading(u8),
-    Item,
-}
-
-#[derive(Default)]
-struct MarkdownBlockBuilder {
-    blocks: Vec<ChatRenderBlock>,
-    current: Option<MarkdownBlockKind>,
-    text: String,
-    code_language: Option<String>,
-    code: String,
-    lists: Vec<Option<u64>>,
-}
-
-pub(crate) fn markdown_blocks(markdown: &str) -> Vec<ChatRenderBlock> {
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    options.insert(Options::ENABLE_TABLES);
-
-    let mut builder = MarkdownBlockBuilder::default();
-    for event in Parser::new_ext(markdown, options) {
-        match event {
-            MarkdownEvent::Start(Tag::Paragraph) => {
-                if builder.current.is_none() {
-                    builder.start(MarkdownBlockKind::Paragraph);
-                }
-            }
-            MarkdownEvent::End(TagEnd::Paragraph) => {
-                if !matches!(builder.current, Some(MarkdownBlockKind::Item)) {
-                    builder.finish();
-                }
-            }
-            MarkdownEvent::Start(Tag::Heading { level, .. }) => {
-                builder.start(MarkdownBlockKind::Heading(heading_level(level)));
-            }
-            MarkdownEvent::End(TagEnd::Heading(_)) => builder.finish(),
-            MarkdownEvent::Start(Tag::List(start)) => builder.lists.push(start),
-            MarkdownEvent::End(TagEnd::List(_)) => {
-                builder.finish();
-                builder.lists.pop();
-            }
-            MarkdownEvent::Start(Tag::Item) => {
-                let marker = builder.next_list_marker();
-                builder.start(MarkdownBlockKind::Item);
-                builder.text.push_str(&marker);
-                builder.text.push(' ');
-            }
-            MarkdownEvent::End(TagEnd::Item) => builder.finish(),
-            MarkdownEvent::Start(Tag::CodeBlock(kind)) => {
-                builder.finish();
-                builder.code_language = code_block_language(kind);
-                builder.code.clear();
-            }
-            MarkdownEvent::End(TagEnd::CodeBlock) => builder.finish_code(),
-            MarkdownEvent::Text(text) => {
-                if builder.code_language.is_some() || !builder.code.is_empty() {
-                    builder.code.push_str(&text);
-                } else {
-                    builder.add_text(&text);
-                }
-            }
-            MarkdownEvent::Code(code) => {
-                builder.add_text("`");
-                builder.add_text(&code);
-                builder.add_text("`");
-            }
-            MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => builder.add_text("\n"),
-            MarkdownEvent::Rule => {
-                builder.finish();
-                builder
-                    .blocks
-                    .push(ChatRenderBlock::Paragraph("---".to_string()));
-            }
-            _ => {}
-        }
-    }
-
-    builder.finish();
-    if builder.code_language.is_some() || !builder.code.is_empty() {
-        builder.finish_code();
-    }
-    if builder.blocks.is_empty() && !markdown.trim().is_empty() {
-        builder
-            .blocks
-            .push(ChatRenderBlock::Paragraph(markdown.trim().to_string()));
-    }
-    builder.blocks
 }
 
 pub(crate) fn highlight_code(
@@ -272,74 +590,6 @@ pub(crate) fn language_for_path(path: &str) -> Option<&'static str> {
     }
 }
 
-impl MarkdownBlockBuilder {
-    fn start(&mut self, kind: MarkdownBlockKind) {
-        self.finish();
-        self.current = Some(kind);
-        self.text.clear();
-    }
-
-    fn add_text(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        if self.current.is_none() {
-            self.start(MarkdownBlockKind::Paragraph);
-        }
-        self.text.push_str(text);
-    }
-
-    fn finish(&mut self) {
-        let Some(kind) = self.current.take() else {
-            return;
-        };
-        let text = self.text.trim().to_string();
-        self.text.clear();
-        if text.is_empty() {
-            return;
-        }
-        match kind {
-            MarkdownBlockKind::Paragraph => self.blocks.push(ChatRenderBlock::Paragraph(text)),
-            MarkdownBlockKind::Heading(level) => {
-                self.blocks.push(ChatRenderBlock::Heading { level, text });
-            }
-            MarkdownBlockKind::Item => {
-                let (marker, text) = split_list_marker(&text);
-                self.blocks.push(ChatRenderBlock::ListItem { marker, text });
-            }
-        }
-    }
-
-    fn finish_code(&mut self) {
-        let text = std::mem::take(&mut self.code);
-        let language = self.code_language.take();
-        if text.trim().is_empty() {
-            return;
-        }
-        let is_diff = language
-            .as_deref()
-            .is_some_and(|language| matches!(language, "diff" | "patch"))
-            || looks_like_diff(&text);
-        self.blocks.push(ChatRenderBlock::Code(ChatCodeBlock {
-            language,
-            text: text.trim_matches('\n').to_string(),
-            is_diff,
-        }));
-    }
-
-    fn next_list_marker(&mut self) -> String {
-        let indent = "  ".repeat(self.lists.len().saturating_sub(1));
-        match self.lists.last_mut().and_then(Option::as_mut) {
-            Some(next) => {
-                let current = *next;
-                *next += 1;
-                format!("{indent}{current}.")
-            }
-            None => format!("{indent}-"),
-        }
-    }
-}
-
 fn heading_level(level: HeadingLevel) -> u8 {
     match level {
         HeadingLevel::H1 => 1,
@@ -360,13 +610,6 @@ fn code_block_language(kind: CodeBlockKind<'_>) -> Option<String> {
             .map(str::to_string)
             .filter(|language| !language.is_empty()),
     }
-}
-
-fn split_list_marker(text: &str) -> (String, String) {
-    let mut parts = text.splitn(2, ' ');
-    let marker = parts.next().unwrap_or("-").to_string();
-    let body = parts.next().unwrap_or_default().trim().to_string();
-    (marker, body)
 }
 
 fn looks_like_diff(text: &str) -> bool {
@@ -464,26 +707,80 @@ fn theme_set() -> &'static ThemeSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sui::Color;
+
+    fn markdown_styles() -> ChatMarkdownStyles {
+        let body = TextStyle::new(Color::WHITE);
+        let headings = std::array::from_fn(|_| {
+            let mut style = body.clone();
+            style.weight = FontWeight::BOLD;
+            style
+        });
+        let mut inline_code = body.clone();
+        inline_code.font_size = 12.0;
+        let mut link = body.clone();
+        link.color = Color::rgba(0.2, 0.7, 0.9, 1.0);
+        ChatMarkdownStyles {
+            body,
+            headings,
+            inline_code,
+            link,
+        }
+    }
 
     #[test]
-    fn markdown_blocks_keep_headings_lists_and_code() {
-        let blocks =
-            markdown_blocks("# Plan\n\n- Read files\n- Patch code\n\n```rust\nfn main() {}\n```");
+    fn markdown_rich_render_keeps_blocks_inline_styles_and_source() {
+        let source = "# Plan\n\nUse **strong** and `code`.\n\n```rust\nfn main() {}\n```";
+        let render = markdown_rich_render(source, markdown_styles());
+        let rendered = render.source_map.rendered();
 
         assert!(matches!(
-            blocks.first(),
-            Some(ChatRenderBlock::Heading { level: 1, text }) if text == "Plan"
+            render.blocks.first(),
+            Some(ChatRichRenderBlock::Text { document, .. })
+                if document.plain_text() == "Plan"
+                    && document.paragraphs[0].spans[0].style.weight == FontWeight::BOLD
         ));
+        assert!(render.blocks.iter().any(|block| matches!(
+            block,
+            ChatRichRenderBlock::Text { document, .. }
+                if document.paragraphs[0]
+                    .spans
+                    .iter()
+                    .any(|span| span.text == "strong" && span.style.weight == FontWeight::BOLD)
+        )));
         assert!(matches!(
-            blocks.get(1),
-            Some(ChatRenderBlock::ListItem { marker, text })
-                if marker == "-" && text == "Read files"
-        ));
-        assert!(matches!(
-            blocks.last(),
-            Some(ChatRenderBlock::Code(code))
+            render.blocks.last(),
+            Some(ChatRichRenderBlock::Code { code, .. })
                 if code.language.as_deref() == Some("rust") && code.text.contains("fn main")
         ));
+
+        let strong_start = rendered.find("strong").expect("rendered strong");
+        assert_eq!(
+            render
+                .source_map
+                .copy_range(strong_start..strong_start + "strong".len()),
+            "**strong**"
+        );
+        let code_start = rendered.find("fn main").expect("rendered code block");
+        assert_eq!(
+            render
+                .source_map
+                .copy_range(code_start..code_start + "fn main() {}".len()),
+            "```rust\nfn main() {}\n```"
+        );
+    }
+
+    #[test]
+    fn markdown_rich_render_preserves_table_structure() {
+        let render = markdown_rich_render(
+            "| Name | State |\n| --- | --- |\n| alpha | ready |",
+            markdown_styles(),
+        );
+        let rendered = render.source_map.rendered();
+
+        assert!(rendered.contains("Name  |  State"), "{rendered:?}");
+        assert!(rendered.contains("alpha  |  ready"), "{rendered:?}");
+        assert!(rendered.contains('\n'), "{rendered:?}");
     }
 
     #[test]

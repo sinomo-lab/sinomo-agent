@@ -51,12 +51,13 @@ use sui::{
     DefaultTheme, DisclosureButtonPaint, Dock, EmptyStatePaint, Event, EventCtx, FixedPaneSplit,
     Flex, FlexItem, FlexWrap, FontWeight, Icon, IconButton, IconButtonPaint, IconGlyph, Insets,
     KeyState, Label, ListItem, ListView, MeasureCtx, MeasuredBottomDock, MenuItem, PaintCtx, Point,
-    PointerButton, PointerEventKind, RebuildOnChange, RebuildOnConstraints, Rect, ScrollBar,
-    ScrollDelta, ScrollState, ScrollView, SectionLabel, SectionPanelPaint, SegmentedControl,
-    SegmentedControlItem, SelectionScope, SemanticRegion, SemanticTone, SemanticsAction,
-    SemanticsCtx, SemanticsNode, SemanticsRole, Separator, SignalMeter, Size, SizedBox, Stack,
-    StackHostOptions, StatusBadge, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextArea,
-    TextBlockPaint, TextCellPaint, TextCommand, TextDocument, TextInput, TextLayoutRequest,
+    PointerButton, PointerEventKind, RebuildOnChange, RebuildOnConstraints, Rect,
+    RichTextSourceMap, ScrollBar, ScrollDelta, ScrollState, ScrollView, SectionLabel,
+    SectionPanelPaint, SegmentedControl, SegmentedControlItem, SelectionScope, SemanticRegion,
+    SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator,
+    SignalMeter, Size, SizedBox, Stack, StackHostOptions, StatusBadge, Surface, SurfaceBorder,
+    SurfaceRole, SwitchView, TextArea, TextBlockPaint, TextCellPaint, TextCommand, TextDocument,
+    TextInput, TextLayout, TextLayoutRequest, TextParagraph, TextParagraphStyle, TextSpan,
     TextStyle, TextWrap, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
     containers::Padding as WidgetPadding, draw_glyph, paint_action_tile, paint_callout,
     paint_code_lines, paint_code_panel, paint_command_button, paint_disclosure_button,
@@ -88,7 +89,9 @@ use crate::backend::chat_engine::{
 use crate::backend::sifs::SifsDaemonAccess;
 use crate::state::{Shared, Tab};
 use crate::theme::Palette;
-use crate::ui::chat_render::{self, ChatCodeBlock, ChatRenderBlock};
+use crate::ui::chat_render::{
+    self, ChatCodeBlock, ChatMarkdownRender, ChatMarkdownStyles, ChatRichRenderBlock,
+};
 use crate::ui::settings::SettingsSection;
 use crate::ui::widgets;
 
@@ -9199,13 +9202,14 @@ impl TranscriptLayoutMode {
 #[derive(Clone, Debug)]
 enum TranscriptLaidBlock {
     Text {
-        kind: TranscriptTextStyleKind,
-        lines: Vec<String>,
-        line_widths: Vec<f32>,
+        layout: TextLayout,
+        display_range: std::ops::Range<usize>,
         height: f32,
     },
     Code {
         code: ChatCodeBlock,
+        layout: TextLayout,
+        display_range: std::ops::Range<usize>,
         height: f32,
     },
 }
@@ -9218,6 +9222,7 @@ struct TranscriptLaidMessage {
     bubble_w: f32,
     bubble_h: f32,
     action: Option<RecoveryCardAction>,
+    source_map: RichTextSourceMap,
 }
 
 #[derive(Clone, Debug)]
@@ -9264,18 +9269,27 @@ enum RuntimeTranscriptAction {
 /// text of the message under the right-click.
 const CHAT_COPY_MESSAGE_EVENT: &str = "sinomo.chat.copy-message";
 
-/// Stable identity of one painted transcript text line: the owning message's
-/// selection key plus the line's running index within that message.
-type TranscriptLineRef = (u64, u32);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TranscriptTextPoint {
+    message_key: u64,
+    offset: usize,
+}
 
-/// One laid-out transcript text line (painted or scrolled away), recorded
-/// during paint so pointer events can hit-test selection without a text
-/// system. Selection is line-granular: a drag selects whole visual lines.
+/// One rich-text layout in the painted transcript. The retained SUI layout is
+/// used for character hit-testing and selection geometry.
 #[derive(Clone, Debug)]
-struct TranscriptLineHit {
-    line: TranscriptLineRef,
+struct TranscriptTextHit {
+    message_key: u64,
+    display_range: std::ops::Range<usize>,
     rect: Rect,
-    text: String,
+    origin: Point,
+    layout: TextLayout,
+}
+
+#[derive(Clone, Debug)]
+struct TranscriptMessageSource {
+    message_key: u64,
+    source_map: RichTextSourceMap,
 }
 
 /// Selection key for a message: the backend sequence when present, otherwise a
@@ -9311,8 +9325,9 @@ struct TranscriptView {
     pressed_runtime_action: RefCell<Option<RuntimeTranscriptAction>>,
     transcript_recovery_actions: RefCell<Vec<(RecoveryCardAction, Rect)>>,
     runtime_actions: RefCell<Vec<(RuntimeTranscriptAction, Rect)>>,
-    transcript_lines: RefCell<Vec<TranscriptLineHit>>,
-    selection: Cell<Option<(TranscriptLineRef, TranscriptLineRef)>>,
+    transcript_text_hits: RefCell<Vec<TranscriptTextHit>>,
+    transcript_message_sources: RefCell<Vec<TranscriptMessageSource>>,
+    selection: Cell<Option<(TranscriptTextPoint, TranscriptTextPoint)>>,
     dragging_selection: Cell<bool>,
     menu_target_key: Cell<Option<u64>>,
 }
@@ -9333,7 +9348,8 @@ impl TranscriptView {
             pressed_runtime_action: RefCell::new(None),
             transcript_recovery_actions: RefCell::new(Vec::new()),
             runtime_actions: RefCell::new(Vec::new()),
-            transcript_lines: RefCell::new(Vec::new()),
+            transcript_text_hits: RefCell::new(Vec::new()),
+            transcript_message_sources: RefCell::new(Vec::new()),
             selection: Cell::new(None),
             dragging_selection: Cell::new(false),
             menu_target_key: Cell::new(None),
@@ -9342,73 +9358,108 @@ impl TranscriptView {
 
     /// Line under the pointer, requiring a hit inside (a slightly padded copy
     /// of) the painted line rect — used to start a selection drag.
-    fn line_ref_at(&self, position: Point) -> Option<TranscriptLineRef> {
+    fn point_in_text_hit(hit: &TranscriptTextHit, position: Point) -> TranscriptTextPoint {
+        let cursor = hit.layout.hit_test_point(Point::new(
+            position.x - hit.origin.x,
+            position.y - hit.origin.y,
+        ));
+        TranscriptTextPoint {
+            message_key: hit.message_key,
+            offset: hit.display_range.start + cursor.utf8_offset.min(hit.display_range.len()),
+        }
+    }
+
+    fn text_point_at(&self, position: Point) -> Option<TranscriptTextPoint> {
         const SLACK: f32 = 4.0;
-        self.transcript_lines
+        self.transcript_text_hits
             .borrow()
             .iter()
             .find(|hit| {
-                let r = hit.rect;
-                position.y >= r.y() - SLACK
-                    && position.y < r.max_y() + SLACK
-                    && position.x >= r.x() - SLACK
-                    && position.x < r.max_x() + SLACK
+                position.y >= hit.rect.y() - SLACK
+                    && position.y < hit.rect.max_y() + SLACK
+                    && position.x >= hit.rect.x() - SLACK
+                    && position.x < hit.rect.max_x() + SLACK
             })
-            .map(|hit| hit.line)
+            .map(|hit| Self::point_in_text_hit(hit, position))
     }
 
     /// Line nearest the pointer's vertical position — used while extending a
     /// selection drag, so dragging past a bubble edge keeps selecting.
-    fn nearest_line_ref(&self, position: Point) -> Option<TranscriptLineRef> {
-        let lines = self.transcript_lines.borrow();
-        lines
+    fn nearest_text_point(&self, position: Point) -> Option<TranscriptTextPoint> {
+        self.transcript_text_hits
+            .borrow()
             .iter()
             .min_by(|a, b| {
                 vertical_distance(a.rect, position.y)
                     .total_cmp(&vertical_distance(b.rect, position.y))
             })
-            .map(|hit| hit.line)
+            .map(|hit| Self::point_in_text_hit(hit, position))
     }
 
     /// Message selection key for the bubble line band under the pointer.
     fn message_key_at(&self, position: Point) -> Option<u64> {
         const SLACK: f32 = 12.0;
-        self.transcript_lines
+        self.transcript_text_hits
             .borrow()
             .iter()
             .find(|hit| position.y >= hit.rect.y() - SLACK && position.y < hit.rect.max_y() + SLACK)
-            .map(|hit| hit.line.0)
+            .map(|hit| hit.message_key)
     }
 
-    fn ordered_selection(&self) -> Option<(usize, usize)> {
+    fn ordered_selection(&self) -> Option<(TranscriptTextPoint, TranscriptTextPoint)> {
         let (anchor, focus) = self.selection.get()?;
-        let lines = self.transcript_lines.borrow();
-        let anchor_index = lines.iter().position(|hit| hit.line == anchor)?;
-        let focus_index = lines.iter().position(|hit| hit.line == focus)?;
-        Some((anchor_index.min(focus_index), anchor_index.max(focus_index)))
+        let sources = self.transcript_message_sources.borrow();
+        let anchor_index = sources
+            .iter()
+            .position(|source| source.message_key == anchor.message_key)?;
+        let focus_index = sources
+            .iter()
+            .position(|source| source.message_key == focus.message_key)?;
+        if (anchor_index, anchor.offset) <= (focus_index, focus.offset) {
+            Some((anchor, focus))
+        } else {
+            Some((focus, anchor))
+        }
     }
 
     /// Selected transcript text: selected lines joined with newlines, with a
     /// blank line between messages.
     fn selection_text(&self) -> Option<String> {
         let (start, end) = self.ordered_selection()?;
-        let lines = self.transcript_lines.borrow();
-        let mut text = String::new();
-        let mut previous_message: Option<u64> = None;
-        for hit in &lines[start..=end] {
-            if let Some(previous) = previous_message {
-                text.push_str(if previous == hit.line.0 { "\n" } else { "\n\n" });
+        let sources = self.transcript_message_sources.borrow();
+        let start_index = sources
+            .iter()
+            .position(|source| source.message_key == start.message_key)?;
+        let end_index = sources
+            .iter()
+            .position(|source| source.message_key == end.message_key)?;
+        let mut selected = Vec::new();
+        for (index, source) in sources[start_index..=end_index].iter().enumerate() {
+            let absolute_index = start_index + index;
+            let rendered_len = source.source_map.rendered().len();
+            let range_start = if absolute_index == start_index {
+                start.offset.min(rendered_len)
+            } else {
+                0
+            };
+            let range_end = if absolute_index == end_index {
+                end.offset.min(rendered_len)
+            } else {
+                rendered_len
+            };
+            let text = source.source_map.copy_range(range_start..range_end);
+            if !text.is_empty() {
+                selected.push(text);
             }
-            text.push_str(&hit.text);
-            previous_message = Some(hit.line.0);
         }
+        let text = selected.join("\n\n");
         (!text.trim().is_empty()).then_some(text)
     }
 
     fn set_selection(
         &self,
         ctx: &mut EventCtx,
-        selection: Option<(TranscriptLineRef, TranscriptLineRef)>,
+        selection: Option<(TranscriptTextPoint, TranscriptTextPoint)>,
     ) {
         if self.selection.get() == selection {
             return;
@@ -9441,13 +9492,22 @@ impl TranscriptView {
         }
     }
 
-    fn select_all_lines(&self, ctx: &mut EventCtx) {
-        let lines = self.transcript_lines.borrow();
-        let selection = match (lines.first(), lines.last()) {
-            (Some(first), Some(last)) => Some((first.line, last.line)),
+    fn select_all_text(&self, ctx: &mut EventCtx) {
+        let sources = self.transcript_message_sources.borrow();
+        let selection = match (sources.first(), sources.last()) {
+            (Some(first), Some(last)) => Some((
+                TranscriptTextPoint {
+                    message_key: first.message_key,
+                    offset: 0,
+                },
+                TranscriptTextPoint {
+                    message_key: last.message_key,
+                    offset: last.source_map.rendered().len(),
+                },
+            )),
             _ => None,
         };
-        drop(lines);
+        drop(sources);
         self.set_selection(ctx, selection);
     }
 
@@ -9905,25 +9965,60 @@ impl TranscriptView {
         }
     }
 
-    fn measure_text_width(ctx: &mut PaintCtx, text: &str, style: sui::TextStyle) -> f32 {
-        ctx.measure_text(text, style)
-            .map(|measurement| measurement.width)
-            .unwrap_or(0.0)
+    fn markdown_styles(
+        pal: &Palette,
+        theme: &sui::DefaultTheme,
+        text_color: Color,
+    ) -> ChatMarkdownStyles {
+        let body =
+            Self::transcript_text_style(pal, theme, TranscriptTextStyleKind::Body, text_color);
+        let headings = std::array::from_fn(|index| {
+            Self::transcript_text_style(
+                pal,
+                theme,
+                TranscriptTextStyleKind::Heading((index + 1) as u8),
+                text_color,
+            )
+        });
+        let mut inline_code = body.clone();
+        inline_code.font_size = theme.text.sm.size;
+        inline_code.line_height = theme.text.base.line_height;
+        inline_code.weight = FontWeight::MEDIUM;
+        let mut link = body.clone();
+        link.color = pal.accent;
+        ChatMarkdownStyles {
+            body,
+            headings,
+            inline_code,
+            link,
+        }
     }
 
-    fn message_render_blocks(message: &ChatMessage) -> Vec<ChatRenderBlock> {
+    fn plain_rich_render(text: String, style: TextStyle) -> ChatMarkdownRender {
+        let len = text.len();
+        ChatMarkdownRender {
+            blocks: vec![ChatRichRenderBlock::Text {
+                document: TextDocument::from_plain_text(text.clone(), style),
+                display_range: 0..len,
+            }],
+            source_map: RichTextSourceMap::identity(text),
+        }
+    }
+
+    fn message_rich_render(
+        message: &ChatMessage,
+        styles: ChatMarkdownStyles,
+    ) -> ChatMarkdownRender {
         if message.kind == ChatMessageKind::Error {
-            return vec![ChatRenderBlock::Paragraph(transcript_message_display_text(
-                message,
-            ))];
+            return Self::plain_rich_render(transcript_message_display_text(message), styles.body);
         }
 
         if message.source == ChatMessageSource::Model {
             let text = visible_model_message_text(&message.text);
             if text.trim().is_empty() {
-                return vec![ChatRenderBlock::Paragraph("…".to_string())];
+                return Self::plain_rich_render("…".to_string(), styles.body);
             }
-            return chat_render::markdown_blocks(&text);
+            return chat_render::markdown_rich_render(&text, styles);
         }
 
         let text = if message.text.is_empty() {
@@ -9931,7 +10026,48 @@ impl TranscriptView {
         } else {
             message.text.clone()
         };
-        vec![ChatRenderBlock::Paragraph(text)]
+        Self::plain_rich_render(text, styles.body)
+    }
+
+    fn code_text_document(code: &ChatCodeBlock, dark: bool, pal: &Palette) -> TextDocument {
+        let highlighted = chat_render::highlight_code(code.language.as_deref(), &code.text, dark);
+        let source_lines = code.text.split('\n').collect::<Vec<_>>();
+        let mut paragraphs = highlighted
+            .iter()
+            .enumerate()
+            .map(|(index, spans)| {
+                let source = source_lines.get(index).copied().unwrap_or_default();
+                let fallback = if code.is_diff {
+                    diff_line_color(source, pal)
+                } else {
+                    pal.text
+                };
+                let spans = spans
+                    .iter()
+                    .map(|span| {
+                        let color = span.rgb.map(color_from_rgb).unwrap_or(fallback);
+                        let mut style = TextStyle::new(color);
+                        style.font_size = 12.0;
+                        style.line_height = 17.0;
+                        TextSpan::new(&span.text, style)
+                    })
+                    .collect::<Vec<_>>();
+                TextParagraph {
+                    style: TextParagraphStyle {
+                        wrap: TextWrap::NoWrap,
+                        ..TextParagraphStyle::default()
+                    },
+                    spans,
+                }
+            })
+            .collect::<Vec<_>>();
+        if paragraphs.is_empty() {
+            let mut style = TextStyle::new(pal.text);
+            style.font_size = 12.0;
+            style.line_height = 17.0;
+            paragraphs.push(TextParagraph::new("", style));
+        }
+        TextDocument { paragraphs }
     }
 
     fn layout_message(
@@ -9942,95 +10078,53 @@ impl TranscriptView {
         inner_w: f32,
     ) -> TranscriptLaidMessage {
         let is_user = message.role == ChatRole::User;
-        let text_color = if is_user { pal.on_accent } else { pal.text };
+        let text_color = pal.text;
+        let render =
+            Self::message_rich_render(message, Self::markdown_styles(pal, theme, text_color));
         let mut blocks = Vec::new();
         let mut widest = 0.0_f32;
         let mut height = 0.0_f32;
 
-        for block in Self::message_render_blocks(message) {
+        for block in render.blocks {
             match block {
-                ChatRenderBlock::Paragraph(text) => {
-                    let kind = TranscriptTextStyleKind::Body;
-                    let style = Self::transcript_text_style(pal, theme, kind, text_color);
-                    let line_h = style.line_height;
-                    let measure_style = style.clone();
-                    let lines = wrap_text_lines(&text, inner_w, |s| {
-                        ctx.measure_text(s, measure_style.clone())
-                            .map(|m| m.width)
-                            .unwrap_or(0.0)
-                    });
-                    let line_widths = lines
-                        .iter()
-                        .map(|line| Self::measure_text_width(ctx, line, style.clone()))
-                        .collect::<Vec<_>>();
-                    let width = line_widths.iter().copied().fold(0.0_f32, f32::max);
-                    let block_h = lines.len().max(1) as f32 * line_h + 5.0;
-                    widest = widest.max(width);
+                ChatRichRenderBlock::Text {
+                    document,
+                    display_range,
+                } => {
+                    let layout = ctx
+                        .layout_text_document(
+                            TextLayoutRequest::new(document)
+                                .with_box_size(Size::new(inner_w.max(1.0), 1.0)),
+                        )
+                        .expect("chat rich-text layout should succeed");
+                    let measurement = layout.measurement();
+                    let block_h = measurement.height.max(theme.text.base.line_height) + 6.0;
+                    widest = widest.max(measurement.width.min(inner_w));
                     height += block_h;
                     blocks.push(TranscriptLaidBlock::Text {
-                        kind,
-                        lines,
-                        line_widths,
+                        layout,
+                        display_range,
                         height: block_h,
                     });
                 }
-                ChatRenderBlock::Heading { level, text } => {
-                    let kind = TranscriptTextStyleKind::Heading(level);
-                    let style = Self::transcript_text_style(pal, theme, kind, text_color);
-                    let line_h = style.line_height;
-                    let measure_style = style.clone();
-                    let lines = wrap_text_lines(&text, inner_w, |s| {
-                        ctx.measure_text(s, measure_style.clone())
-                            .map(|m| m.width)
-                            .unwrap_or(0.0)
-                    });
-                    let line_widths = lines
-                        .iter()
-                        .map(|line| Self::measure_text_width(ctx, line, style.clone()))
-                        .collect::<Vec<_>>();
-                    let width = line_widths.iter().copied().fold(0.0_f32, f32::max);
-                    let block_h = lines.len().max(1) as f32 * line_h + 7.0;
-                    widest = widest.max(width);
-                    height += block_h;
-                    blocks.push(TranscriptLaidBlock::Text {
-                        kind,
-                        lines,
-                        line_widths,
-                        height: block_h,
-                    });
-                }
-                ChatRenderBlock::ListItem { marker, text } => {
-                    let kind = TranscriptTextStyleKind::Body;
-                    let text = format!("{marker} {text}");
-                    let style = Self::transcript_text_style(pal, theme, kind, text_color);
-                    let line_h = style.line_height;
-                    let measure_style = style.clone();
-                    let lines = wrap_text_lines(&text, inner_w, |s| {
-                        ctx.measure_text(s, measure_style.clone())
-                            .map(|m| m.width)
-                            .unwrap_or(0.0)
-                    });
-                    let line_widths = lines
-                        .iter()
-                        .map(|line| Self::measure_text_width(ctx, line, style.clone()))
-                        .collect::<Vec<_>>();
-                    let width = line_widths.iter().copied().fold(0.0_f32, f32::max);
-                    let block_h = lines.len().max(1) as f32 * line_h + 3.0;
-                    widest = widest.max(width);
-                    height += block_h;
-                    blocks.push(TranscriptLaidBlock::Text {
-                        kind,
-                        lines,
-                        line_widths,
-                        height: block_h,
-                    });
-                }
-                ChatRenderBlock::Code(code) => {
-                    let code_h = Self::code_block_height(&code);
+                ChatRichRenderBlock::Code {
+                    code,
+                    display_range,
+                } => {
+                    let document = Self::code_text_document(&code, pal.dark, pal);
+                    let layout = ctx
+                        .layout_text_document(
+                            TextLayoutRequest::new(document)
+                                .with_box_size(Size::new((inner_w - 20.0).max(1.0), 1.0)),
+                        )
+                        .expect("chat code layout should succeed");
+                    let code_h = 36.0 + layout.measurement().height.max(17.0) + 8.0;
                     widest = widest.max(inner_w);
                     height += code_h + 6.0;
                     blocks.push(TranscriptLaidBlock::Code {
                         code,
+                        layout,
+                        display_range,
                         height: code_h,
                     });
                 }
@@ -10051,6 +10145,7 @@ impl TranscriptView {
             bubble_w,
             bubble_h,
             action,
+            source_map: render.source_map,
         }
     }
 
@@ -10299,11 +10394,25 @@ impl TranscriptView {
         }
     }
 
-    /// Record the selectable line rects for one laid message, mirroring the
-    /// exact per-line geometry `paint_laid_message` paints.
-    fn record_message_lines(
-        lines_out: &mut Vec<TranscriptLineHit>,
-        theme: &sui::DefaultTheme,
+    fn text_layout_origin(x: f32, y: f32, layout: &TextLayout) -> Point {
+        let bounds = layout.measurement().bounds;
+        Point::new(x - bounds.x(), y - bounds.y())
+    }
+
+    fn text_layout_rect(origin: Point, layout: &TextLayout) -> Rect {
+        let bounds = layout.measurement().bounds;
+        Rect::new(
+            origin.x + bounds.x(),
+            origin.y + bounds.y(),
+            bounds.width().max(1.0),
+            bounds.height().max(1.0),
+        )
+    }
+
+    /// Retain each SUI rich-text layout at its painted origin so pointer events
+    /// and selection overlays use the exact same shaped character geometry.
+    fn record_message_text_hits(
+        hits_out: &mut Vec<TranscriptTextHit>,
         area: Rect,
         item: &TranscriptLaidMessage,
         y: f32,
@@ -10312,59 +10421,111 @@ impl TranscriptView {
     ) {
         let (container, content_x, content_w, row_mode) =
             Self::message_content_geometry(area, item, y, mode);
-        let mut line_counter: u32 = 0;
         let mut ty = container.y() + 10.0;
         for block in &item.blocks {
             match block {
                 TranscriptLaidBlock::Text {
-                    kind,
-                    lines,
-                    line_widths,
+                    layout,
+                    display_range,
                     height,
                 } => {
-                    let (token, _) = Self::transcript_text_token(theme, *kind);
-                    let line_h = token.line_height;
-                    for (index, line) in lines.iter().enumerate() {
-                        let width = line_widths
-                            .get(index)
-                            .copied()
-                            .unwrap_or(content_w)
-                            .min(content_w)
-                            .max(8.0);
-                        lines_out.push(TranscriptLineHit {
-                            line: (message_key, line_counter),
-                            rect: Rect::new(content_x, ty + index as f32 * line_h, width, line_h),
-                            text: line.clone(),
-                        });
-                        line_counter += 1;
-                    }
+                    let origin = Self::text_layout_origin(content_x, ty, layout);
+                    hits_out.push(TranscriptTextHit {
+                        message_key,
+                        display_range: display_range.clone(),
+                        rect: Self::text_layout_rect(origin, layout),
+                        origin,
+                        layout: layout.clone(),
+                    });
                     ty += *height;
                 }
-                TranscriptLaidBlock::Code { code, height } => {
+                TranscriptLaidBlock::Code {
+                    layout,
+                    display_range,
+                    height,
+                    ..
+                } => {
                     let rect = if row_mode {
                         Rect::new(content_x, ty, content_w, *height)
                     } else {
                         Rect::new(container.x() + 8.0, ty, container.width() - 16.0, *height)
                     };
-                    // Mirrors `paint_code_block`: a 24px header band, then
-                    // 17px source lines inside the panel.
-                    let code_line_h = 17.0;
-                    for (index, line) in code.text.lines().enumerate() {
-                        lines_out.push(TranscriptLineHit {
-                            line: (message_key, line_counter),
-                            rect: Rect::new(
-                                rect.x() + 10.0,
-                                rect.y() + 28.0 + index as f32 * code_line_h,
-                                (rect.width() - 20.0).max(8.0),
-                                code_line_h,
-                            ),
-                            text: line.to_string(),
-                        });
-                        line_counter += 1;
-                    }
+                    let origin = Self::text_layout_origin(rect.x() + 10.0, rect.y() + 28.0, layout);
+                    hits_out.push(TranscriptTextHit {
+                        message_key,
+                        display_range: display_range.clone(),
+                        rect: Self::text_layout_rect(origin, layout),
+                        origin,
+                        layout: layout.clone(),
+                    });
                     ty += *height + 6.0;
                 }
             }
+        }
+    }
+
+    fn selected_range_for_message(
+        &self,
+        message_key: u64,
+        rendered_len: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        let (start, end) = self.ordered_selection()?;
+        let sources = self.transcript_message_sources.borrow();
+        let start_index = sources
+            .iter()
+            .position(|source| source.message_key == start.message_key)?;
+        let end_index = sources
+            .iter()
+            .position(|source| source.message_key == end.message_key)?;
+        let index = sources
+            .iter()
+            .position(|source| source.message_key == message_key)?;
+        if index < start_index || index > end_index {
+            return None;
+        }
+        let range_start = if index == start_index {
+            start.offset.min(rendered_len)
+        } else {
+            0
+        };
+        let range_end = if index == end_index {
+            end.offset.min(rendered_len)
+        } else {
+            rendered_len
+        };
+        (range_start < range_end).then_some(range_start..range_end)
+    }
+
+    fn paint_rich_selection(
+        ctx: &mut PaintCtx,
+        layout: &TextLayout,
+        origin: Point,
+        display_range: &std::ops::Range<usize>,
+        selection: Option<&std::ops::Range<usize>>,
+        fill: Color,
+    ) {
+        let Some(selection) = selection else {
+            return;
+        };
+        let start = selection.start.max(display_range.start);
+        let end = selection.end.min(display_range.end);
+        if start >= end {
+            return;
+        }
+        let local =
+            start.saturating_sub(display_range.start)..end.saturating_sub(display_range.start);
+        for rect in layout.selection_rects(local) {
+            paint_rounded_rect(
+                ctx,
+                Rect::new(
+                    origin.x + rect.x(),
+                    origin.y + rect.y(),
+                    rect.width().max(1.0),
+                    rect.height(),
+                ),
+                fill,
+                2.0,
+            );
         }
     }
 
@@ -10379,14 +10540,13 @@ impl TranscriptView {
         y: f32,
         mode: TranscriptLayoutMode,
         message_key: u64,
-        selected_lines: Option<&BTreeSet<TranscriptLineRef>>,
         action_rects: &mut Vec<(RecoveryCardAction, Rect)>,
     ) {
         let is_error = item.kind == ChatMessageKind::Error;
         let bubble_radius = theme.radius._2xl.min(14.0);
         let (container, content_x, content_w, row_mode) =
             Self::message_content_geometry(area, item, y, mode);
-        let (bubble_color, text_color) = if row_mode {
+        let bubble_color = if row_mode {
             // Wide transcripts read as a log row: quiet surface, subtle
             // hairline, the agent's identity hue on the rail glyph.
             let radius = theme.radius.md.min(6.0);
@@ -10397,11 +10557,11 @@ impl TranscriptView {
                 Rect::new(container.x() + 5.0, container.y() + 10.0, 14.0, 14.0),
                 pal.agent[0],
             );
-            (pal.panel, pal.text)
+            pal.panel
         } else {
             // Mesh bubbles: user rides the accent wash with an accent border,
             // the agent stays on the quiet surface tier, errors go danger-soft.
-            let (bubble_color, text_color, border) = if item.is_user {
+            let (bubble_color, _text_color, border) = if item.is_user {
                 (pal.accent_soft, pal.text, Some(pal.accent_border))
             } else if is_error {
                 (pal.danger_soft, pal.text, Some(pal.bad))
@@ -10412,7 +10572,7 @@ impl TranscriptView {
                 Some(bc) => paint_rounded_panel(ctx, container, bubble_color, bc, bubble_radius),
                 None => paint_rounded_rect(ctx, container, bubble_color, bubble_radius),
             }
-            (bubble_color, text_color)
+            bubble_color
         };
 
         // Selection highlight: flattened accent wash painted between the
@@ -10423,95 +10583,86 @@ impl TranscriptView {
             .with_alpha(if pal.dark { 0.38 } else { 0.26 })
             .over(bubble_color);
 
-        let dark = widgets::theme_is_dark(&self.shared);
-        let mut line_counter: u32 = 0;
+        let selected =
+            self.selected_range_for_message(message_key, item.source_map.rendered().len());
         let mut ty = container.y() + 10.0;
         for block in &item.blocks {
             match block {
                 TranscriptLaidBlock::Text {
-                    kind,
-                    lines,
-                    line_widths,
+                    layout,
+                    display_range,
                     height,
                 } => {
-                    let color = match kind {
-                        TranscriptTextStyleKind::Muted => pal.text_faint,
-                        _ => text_color,
-                    };
-                    let (token, weight) = Self::transcript_text_token(theme, *kind);
-                    if let Some(selected) = selected_lines {
-                        let line_h = token.line_height;
-                        for (index, _) in lines.iter().enumerate() {
-                            if selected.contains(&(message_key, line_counter + index as u32)) {
-                                let width = line_widths
-                                    .get(index)
-                                    .copied()
-                                    .unwrap_or(content_w)
-                                    .min(content_w)
-                                    .max(8.0);
-                                paint_rounded_rect(
-                                    ctx,
-                                    Rect::new(
-                                        content_x - 2.0,
-                                        ty + index as f32 * line_h,
-                                        width + 4.0,
-                                        line_h,
-                                    ),
-                                    selection_fill,
-                                    3.0,
-                                );
-                            }
-                        }
-                    }
-                    line_counter += lines.len() as u32;
-                    let text = lines.join("\n");
-                    paint_text_block(
+                    let origin = Self::text_layout_origin(content_x, ty, layout);
+                    Self::paint_rich_selection(
                         ctx,
-                        theme,
-                        Rect::new(content_x, ty, content_w, *height),
-                        &text,
-                        TextBlockPaint::new()
-                            .text_token(token)
-                            .color(color)
-                            .weight(weight)
-                            .wrap(TextWrap::NoWrap),
+                        layout,
+                        origin,
+                        display_range,
+                        selected.as_ref(),
+                        selection_fill,
                     );
+                    ctx.draw_text_layout(origin, layout);
                     ty += *height;
                 }
-                TranscriptLaidBlock::Code { code, height } => {
+                TranscriptLaidBlock::Code {
+                    code,
+                    layout,
+                    display_range,
+                    height,
+                } => {
                     let rect = if row_mode {
                         Rect::new(content_x, ty, content_w, *height)
                     } else {
                         Rect::new(container.x() + 8.0, ty, container.width() - 16.0, *height)
                     };
-                    Self::paint_code_block(ctx, pal, theme, rect, code, dark);
-                    if let Some(selected) = selected_lines {
-                        // Code text is painted by the panel above, so selected
-                        // code lines get a flattened wash over the code fill.
-                        let code_fill = if pal.dark { pal.field } else { pal.bg_subtle };
-                        let code_selection_fill = pal
-                            .accent
-                            .with_alpha(if pal.dark { 0.34 } else { 0.22 })
-                            .over(code_fill)
-                            .with_alpha(if pal.dark { 0.55 } else { 0.45 });
-                        let code_line_h = 17.0;
-                        for (index, _) in code.text.lines().enumerate() {
-                            if selected.contains(&(message_key, line_counter + index as u32)) {
-                                paint_rounded_rect(
-                                    ctx,
+                    let label = code.language.as_deref().unwrap_or(if code.is_diff {
+                        "diff"
+                    } else {
+                        "text"
+                    });
+                    paint_code_panel(
+                        ctx,
+                        theme,
+                        rect,
+                        label,
+                        CodePanelPaint::new()
+                            .fill(if pal.dark { pal.field } else { pal.bg_subtle })
+                            .border(pal.border)
+                            .header_fill(pal.surface_2)
+                            .label_color(pal.text_faint)
+                            .radius(theme.radius.md.min(6.0))
+                            .header_height(24.0),
+                    );
+                    let origin = Self::text_layout_origin(rect.x() + 10.0, rect.y() + 28.0, layout);
+                    if code.is_diff {
+                        for (line, source) in layout.lines().iter().zip(code.text.split('\n')) {
+                            if let Some(background) = diff_line_background(source, pal) {
+                                ctx.fill_rect(
                                     Rect::new(
-                                        rect.x() + 10.0,
-                                        rect.y() + 28.0 + index as f32 * code_line_h,
-                                        (rect.width() - 20.0).max(8.0),
-                                        code_line_h,
+                                        rect.x() + 6.0,
+                                        origin.y + line.rect.y(),
+                                        (rect.width() - 12.0).max(1.0),
+                                        line.rect.height(),
                                     ),
-                                    code_selection_fill,
-                                    3.0,
+                                    background,
                                 );
                             }
                         }
                     }
-                    line_counter += code.text.lines().count() as u32;
+                    let code_selection_fill = pal
+                        .accent
+                        .with_alpha(if pal.dark { 0.38 } else { 0.24 })
+                        .over(if pal.dark { pal.field } else { pal.bg_subtle });
+                    Self::paint_rich_selection(
+                        ctx,
+                        layout,
+                        origin,
+                        display_range,
+                        selected.as_ref(),
+                        code_selection_fill,
+                    );
+                    ctx.draw_text_layout(origin, layout);
                     ty += *height + 6.0;
                 }
             }
@@ -10844,7 +10995,7 @@ impl Widget for TranscriptView {
                 }
                 if self.dragging_selection.get()
                     && pointer.buttons.contains(PointerButton::Primary)
-                    && let Some(focus) = self.nearest_line_ref(pointer.position)
+                    && let Some(focus) = self.nearest_text_point(pointer.position)
                 {
                     let anchor = self
                         .selection
@@ -10874,10 +11025,10 @@ impl Widget for TranscriptView {
                     ctx.request_pointer_capture(pointer.pointer_id);
                     ctx.request_paint();
                     ctx.set_handled();
-                } else if let Some(line) = self.line_ref_at(pointer.position) {
-                    // Start a line-granular selection drag on message text.
+                } else if let Some(point) = self.text_point_at(pointer.position) {
+                    // Start a character-granular selection drag on rich text.
                     self.dragging_selection.set(true);
-                    self.set_selection(ctx, Some((line, line)));
+                    self.set_selection(ctx, Some((point, point)));
                     ctx.request_pointer_capture(pointer.pointer_id);
                     ctx.request_focus();
                     ctx.set_handled();
@@ -11000,7 +11151,7 @@ impl Widget for TranscriptView {
                         }
                     }
                     "a" | "A" if command_modifier => {
-                        self.select_all_lines(ctx);
+                        self.select_all_text(ctx);
                         ctx.set_handled();
                     }
                     "Escape" if self.selection.get().is_some() => {
@@ -11019,7 +11170,7 @@ impl Widget for TranscriptView {
                             }
                         }
                         TextCommand::SelectAll => {
-                            self.select_all_lines(ctx);
+                            self.select_all_text(ctx);
                             ctx.set_handled();
                         }
                         // The transcript is read-only.
@@ -11059,7 +11210,8 @@ impl Widget for TranscriptView {
 
         let chat = self.shared.chat();
         if chat.messages.is_empty() {
-            self.transcript_lines.borrow_mut().clear();
+            self.transcript_text_hits.borrow_mut().clear();
+            self.transcript_message_sources.borrow_mut().clear();
             self.selection.set(None);
             self.paint_empty_state(ctx, &theme, &pal, area, &chat);
             return;
@@ -11111,16 +11263,27 @@ impl Widget for TranscriptView {
             chat.scroll.clamp(0.0, max_scroll)
         };
 
-        // Record the selectable line geometry for every message (even the
-        // scrolled-away ones, so Select All / drag past the viewport work),
-        // then resolve the selected line set once for the draw pass.
-        let mut recorded_lines = Vec::new();
+        let message_sources = chat
+            .messages
+            .iter()
+            .zip(&laid)
+            .enumerate()
+            .map(|(index, (message, item))| TranscriptMessageSource {
+                message_key: transcript_message_selection_key(index, message),
+                source_map: item.source_map.clone(),
+            })
+            .collect();
+        *self.transcript_message_sources.borrow_mut() = message_sources;
+
+        // Retain rich-text geometry for every message, including content that
+        // is currently scrolled away, so drag extension and Select All keep a
+        // stable character range across the full transcript.
+        let mut text_hits = Vec::new();
         {
             let mut record_y = area.y() + PAD - scroll + timeline_header_h;
             for (index, (message, item)) in chat.messages.iter().zip(&laid).enumerate() {
-                Self::record_message_lines(
-                    &mut recorded_lines,
-                    &theme,
+                Self::record_message_text_hits(
+                    &mut text_hits,
                     area,
                     item,
                     record_y,
@@ -11130,13 +11293,7 @@ impl Widget for TranscriptView {
                 record_y += item.bubble_h + message_gap;
             }
         }
-        *self.transcript_lines.borrow_mut() = recorded_lines;
-        let selected_lines = self.ordered_selection().map(|(start, end)| {
-            self.transcript_lines.borrow()[start..=end]
-                .iter()
-                .map(|hit| hit.line)
-                .collect::<BTreeSet<_>>()
-        });
+        *self.transcript_text_hits.borrow_mut() = text_hits;
 
         // Draw pass: only mutable ctx ops here.
         let mut action_rects = Vec::new();
@@ -11159,7 +11316,6 @@ impl Widget for TranscriptView {
                     y,
                     layout_mode,
                     transcript_message_selection_key(index, message),
-                    selected_lines.as_ref(),
                     &mut action_rects,
                 );
             }
@@ -13688,6 +13844,52 @@ mod tests {
             },
         ];
         state.info.agent = "main-agent".to_string();
+    }
+
+    #[test]
+    fn transcript_character_selection_copies_original_markdown() {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let theme = shared.theme();
+        let pal = palette(&shared);
+        let source = "Use **strong** and `code`.\n\n```rust\nfn main() {}\n```";
+        let render = chat_render::markdown_rich_render(
+            source,
+            TranscriptView::markdown_styles(&pal, &theme, pal.text),
+        );
+        let rendered = render.source_map.rendered().to_string();
+        let strong_start = rendered.find("strong").expect("rendered strong");
+
+        let transcript = TranscriptView::new(shared, SelectionScope::new());
+        transcript
+            .transcript_message_sources
+            .borrow_mut()
+            .push(TranscriptMessageSource {
+                message_key: 7,
+                source_map: render.source_map,
+            });
+        transcript.selection.set(Some((
+            TranscriptTextPoint {
+                message_key: 7,
+                offset: strong_start,
+            },
+            TranscriptTextPoint {
+                message_key: 7,
+                offset: strong_start + "strong".len(),
+            },
+        )));
+        assert_eq!(transcript.selection_text().as_deref(), Some("**strong**"));
+
+        transcript.selection.set(Some((
+            TranscriptTextPoint {
+                message_key: 7,
+                offset: strong_start + 2,
+            },
+            TranscriptTextPoint {
+                message_key: 7,
+                offset: strong_start + 5,
+            },
+        )));
+        assert_eq!(transcript.selection_text().as_deref(), Some("ron"));
     }
 
     #[test]
