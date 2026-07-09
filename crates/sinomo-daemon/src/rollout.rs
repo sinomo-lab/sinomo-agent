@@ -2286,10 +2286,10 @@ pub fn stage_rollout_main_activation(
     let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
     let current_daemon_is_shadow = paths_equivalent(&current_daemon_paths.root, &shadow_paths.root);
     let shadow_running = current_daemon_is_shadow
-        || matches!(
-            probe_daemon_status(&shadow_paths, CLUSTER_HEALTH_PROBE_TIMEOUT),
-            DaemonProbeStatus::Running(_)
-        );
+        || daemon_probe_indicates_process_present(probe_daemon_status(
+            &shadow_paths,
+            CLUSTER_HEALTH_PROBE_TIMEOUT,
+        ));
     if !shadow_running {
         stage_main_only_rollout_without_existing_shadow(data_dir, rollout_paths, activation)?;
         return Ok(RolloutActivationStrategy::MainOnlyShadowBootstrap);
@@ -2309,6 +2309,13 @@ pub fn stage_rollout_main_activation(
         }
     }
     Ok(RolloutActivationStrategy::ShadowSupervised)
+}
+
+fn daemon_probe_indicates_process_present(status: DaemonProbeStatus) -> bool {
+    matches!(
+        status,
+        DaemonProbeStatus::Running(_) | DaemonProbeStatus::Locked { .. }
+    )
 }
 
 fn staged_main_activation_shutdown_action(
@@ -4101,6 +4108,46 @@ mod tests {
             .expect("read activation")
             .expect("activation staged");
         assert_eq!(staged, activation);
+    }
+
+    #[test]
+    fn stage_rollout_main_activation_treats_locked_shadow_as_existing_shadow() {
+        let root = temp_rollout_test_root("locked-shadow-existing");
+        std::fs::create_dir_all(root.join("daemon")).expect("main root");
+        std::fs::create_dir_all(root.join("shadow-daemon")).expect("shadow root");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let main_paths = DaemonPaths::with_root(root.join("daemon"));
+        let shadow_paths = DaemonPaths::with_root(root.join("shadow-daemon"));
+        let _shadow_lock = DaemonLock::acquire(
+            &shadow_paths,
+            &crate::DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21354,
+            },
+            None,
+        )
+        .expect("shadow lock");
+        let staged_main = rollout_staged_main_binary(&rollout_paths);
+        let staged_shadow = rollout_staged_shadow_binary(&rollout_paths);
+        std::fs::create_dir_all(staged_main.parent().expect("staged parent"))
+            .expect("staged parent dir");
+        std::fs::write(&staged_main, b"candidate-main").expect("staged main");
+        std::fs::write(&staged_shadow, b"candidate-shadow").expect("staged shadow");
+        let mut activation = test_main_activation(&rollout_paths);
+        activation.staged_main_binary = Some(staged_main.clone());
+        activation.staged_shadow_binary = Some(staged_shadow.clone());
+
+        let strategy =
+            stage_rollout_main_activation(&main_paths, &root, &rollout_paths, activation)
+                .expect("locked shadow should be treated as existing shadow");
+
+        assert_eq!(strategy, RolloutActivationStrategy::ShadowSupervised);
+        assert_eq!(
+            std::fs::read(&staged_shadow).expect("staged shadow preserved"),
+            b"candidate-shadow"
+        );
+        assert!(!rollout_paths.shadow_binary.exists());
     }
 
     #[test]

@@ -8,6 +8,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub fn stage_rollout_bytes(bytes: &[u8], destination: &Path) -> Result<(), RolloutError> {
+    if bytes.is_empty() {
+        return Err(RolloutError::InvalidArtifact {
+            detail: format!("candidate binary for {} is empty", destination.display()),
+        });
+    }
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|source| RolloutError::Io {
             path: parent.display().to_string(),
@@ -25,6 +30,7 @@ pub fn stage_rollout_bytes(bytes: &[u8], destination: &Path) -> Result<(), Rollo
 }
 
 pub fn stage_rollout_file(source: &Path, destination: &Path) -> Result<(), RolloutError> {
+    ensure_non_empty_rollout_artifact(source)?;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|source| RolloutError::Io {
             path: parent.display().to_string(),
@@ -37,6 +43,10 @@ pub fn stage_rollout_file(source: &Path, destination: &Path) -> Result<(), Rollo
             path: format!("{} -> {}", source.display(), destination.display()),
             detail: error.to_string(),
         });
+    }
+    if let Err(error) = ensure_non_empty_rollout_artifact(destination) {
+        let _ = fs::remove_file(destination);
+        return Err(error);
     }
     set_executable(destination)
 }
@@ -189,6 +199,7 @@ pub fn activate_staged_rollout_binary(
     if !staged.exists() {
         return Ok(None);
     }
+    ensure_non_empty_rollout_artifact(staged)?;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|source| RolloutError::Io {
             path: parent.display().to_string(),
@@ -196,18 +207,36 @@ pub fn activate_staged_rollout_binary(
         })?;
     }
     let previous = rollout_previous_binary_path(destination);
-    let _ = fs::remove_file(&previous);
+    let mut backup = if previous.exists() {
+        ensure_non_empty_rollout_artifact(&previous)?;
+        Some(previous.clone())
+    } else {
+        None
+    };
     if destination.exists() {
-        fs::rename(destination, &previous).map_err(|source| RolloutError::Io {
-            path: format!("{} -> {}", destination.display(), previous.display()),
-            detail: source.to_string(),
-        })?;
+        match ensure_non_empty_rollout_artifact(destination) {
+            Ok(()) => {
+                let _ = fs::remove_file(&previous);
+                fs::rename(destination, &previous).map_err(|source| RolloutError::Io {
+                    path: format!("{} -> {}", destination.display(), previous.display()),
+                    detail: source.to_string(),
+                })?;
+                backup = Some(previous.clone());
+            }
+            Err(RolloutError::InvalidArtifact { .. }) => {
+                fs::remove_file(destination).map_err(|source| RolloutError::Io {
+                    path: destination.display().to_string(),
+                    detail: source.to_string(),
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
     }
     fs::rename(staged, destination).map_err(|source| RolloutError::Io {
         path: format!("{} -> {}", staged.display(), destination.display()),
         detail: source.to_string(),
     })?;
-    Ok(Some(previous))
+    Ok(backup)
 }
 
 pub fn restore_rollout_binary_from_backup(
@@ -217,6 +246,7 @@ pub fn restore_rollout_binary_from_backup(
     if !backup.exists() {
         return Ok(());
     }
+    ensure_non_empty_rollout_artifact(backup)?;
     let failed = destination.with_file_name(format!(
         "{}.failed",
         destination
@@ -235,6 +265,24 @@ pub fn restore_rollout_binary_from_backup(
         path: format!("{} -> {}", backup.display(), destination.display()),
         detail: source.to_string(),
     })
+}
+
+fn ensure_non_empty_rollout_artifact(path: &Path) -> Result<(), RolloutError> {
+    let metadata = fs::metadata(path).map_err(|source| RolloutError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    if !metadata.is_file() {
+        return Err(RolloutError::InvalidArtifact {
+            detail: format!("{} is not a regular file", path.display()),
+        });
+    }
+    if metadata.len() == 0 {
+        return Err(RolloutError::InvalidArtifact {
+            detail: format!("{} is empty", path.display()),
+        });
+    }
+    Ok(())
 }
 
 pub fn rollout_previous_binary_path(destination: &Path) -> PathBuf {
@@ -315,6 +363,67 @@ mod tests {
         assert_eq!(
             fs::read(&staged_shadow).expect("shadow bytes"),
             b"candidate"
+        );
+    }
+
+    #[test]
+    fn stage_rollout_rejects_empty_candidate_artifacts() {
+        let root = sinomo_testdir::TestDir::new("sinomo-rollout-empty-artifact");
+        let empty_source = root.join("empty");
+        let staged = root.join("staged").join("sinomo");
+        fs::write(&empty_source, []).expect("empty source");
+
+        let file_error =
+            stage_rollout_file(&empty_source, &staged).expect_err("empty file rejected");
+        assert!(matches!(file_error, RolloutError::InvalidArtifact { .. }));
+        assert!(!staged.exists());
+
+        let bytes_error = stage_rollout_bytes(&[], &staged).expect_err("empty bytes rejected");
+        assert!(matches!(bytes_error, RolloutError::InvalidArtifact { .. }));
+        assert!(!staged.exists());
+    }
+
+    #[test]
+    fn activate_staged_rollout_binary_preserves_existing_backup_when_destination_is_empty() {
+        let root = sinomo_testdir::TestDir::new("sinomo-rollout-empty-destination");
+        let staged = root.join("staged").join("sinomo");
+        let destination = root.join("bin").join("sinomo");
+        let previous = rollout_previous_binary_path(&destination);
+        fs::create_dir_all(staged.parent().expect("staged parent")).expect("staged parent");
+        fs::create_dir_all(destination.parent().expect("bin parent")).expect("bin parent");
+        fs::write(&staged, b"candidate").expect("staged");
+        fs::write(&destination, []).expect("empty installed destination");
+        fs::write(&previous, b"previous-good").expect("previous backup");
+
+        let backup =
+            activate_staged_rollout_binary(&staged, &destination).expect("activate staged");
+
+        assert_eq!(backup.as_deref(), Some(previous.as_path()));
+        assert_eq!(
+            fs::read(&destination).expect("destination bytes"),
+            b"candidate"
+        );
+        assert_eq!(
+            fs::read(&previous).expect("previous bytes"),
+            b"previous-good"
+        );
+    }
+
+    #[test]
+    fn restore_rollout_binary_from_backup_rejects_empty_backup() {
+        let root = sinomo_testdir::TestDir::new("sinomo-rollout-empty-backup");
+        let backup = root.join("sinomo.previous");
+        let destination = root.join("sinomo");
+        fs::write(&backup, []).expect("empty backup");
+        fs::write(&destination, b"current").expect("current destination");
+
+        let error = restore_rollout_binary_from_backup(&backup, &destination)
+            .expect_err("empty backup rejected");
+
+        assert!(matches!(error, RolloutError::InvalidArtifact { .. }));
+        assert_eq!(
+            fs::read(&destination).expect("destination bytes"),
+            b"current"
         );
     }
 }
