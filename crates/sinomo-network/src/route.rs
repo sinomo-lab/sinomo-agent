@@ -1652,6 +1652,7 @@ fn cluster_delivery_sort_route_endpoints_for_attempt(
     endpoints.sort_by(|left, right| {
         (
             graph.unavailability_rank(left),
+            cluster_delivery_endpoint_attempt_sort_rank(left),
             graph.quality_rank(left),
             cluster_delivery_endpoint_path_cost(&left.transport, &left.address, &left.privacy),
             left.priority,
@@ -1660,6 +1661,7 @@ fn cluster_delivery_sort_route_endpoints_for_attempt(
         )
             .cmp(&(
                 graph.unavailability_rank(right),
+                cluster_delivery_endpoint_attempt_sort_rank(right),
                 graph.quality_rank(right),
                 cluster_delivery_endpoint_path_cost(
                     &right.transport,
@@ -1671,6 +1673,14 @@ fn cluster_delivery_sort_route_endpoints_for_attempt(
                 right.address.as_str(),
             ))
     });
+}
+
+fn cluster_delivery_endpoint_attempt_sort_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+    if cluster_delivery_endpoint_is_tcp_tunnel(endpoint) {
+        1
+    } else {
+        0
+    }
 }
 
 fn cluster_delivery_endpoint_is_tcp_tunnel(endpoint: &ClusterEndpointRecord) -> bool {
@@ -3615,8 +3625,7 @@ fn cluster_target_full_response_endpoint_attempt_preferred(
     endpoints_left: usize,
 ) -> Duration {
     let fallback_reserve = if endpoints_left > 1 {
-        CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX
-            .saturating_mul(endpoints_left.saturating_sub(1) as u32)
+        CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_FALLBACK_RESERVE
     } else {
         Duration::ZERO
     };
@@ -5559,6 +5568,21 @@ mod tests {
     }
 
     #[test]
+    fn cluster_target_final_hop_attempt_budget_preserves_full_response_under_short_gate() {
+        let split_budget = Some(Duration::from_millis(1000));
+        let budget = cluster_target_final_hop_attempt_budget(
+            Some(Duration::from_secs(5)),
+            5,
+            split_budget,
+            false,
+            true,
+        )
+        .expect("full response budget");
+
+        assert_eq!(budget, Duration::from_millis(4500));
+    }
+
+    #[test]
     fn cluster_target_final_hop_attempt_budget_caps_long_ordinary_verified_endpoint() {
         let budget = cluster_target_final_hop_attempt_budget(
             Some(Duration::from_secs(60)),
@@ -5997,11 +6021,14 @@ mod tests {
             "a stale preferred endpoint must not spend most of the route timeout"
         );
         assert_eq!(host.target_sends.len(), 2);
-        assert_eq!(
-            host.target_sends[0].0.endpoint_id,
-            tunnel_endpoint.endpoint_id
+        assert_ne!(
+            host.target_sends[0].0.endpoint_id, tunnel_endpoint.endpoint_id,
+            "synthetic tunnel should remain a fallback behind real endpoints"
         );
-        assert_eq!(host.target_sends[1].0.address, "198.51.100.76:21353");
+        assert_ne!(
+            host.target_sends[1].0.endpoint_id, tunnel_endpoint.endpoint_id,
+            "a real endpoint fallback should be attempted before the synthetic tunnel"
+        );
     }
 
     #[test]
@@ -6132,22 +6159,24 @@ mod tests {
             "slow data-plane endpoint should not consume the caller's 60s timeout before fallback"
         );
         assert_eq!(host.target_sends.len(), 3);
-        assert_eq!(
-            host.target_sends[0].0.endpoint_id,
-            tunnel_endpoint.endpoint_id
+        assert_ne!(
+            host.target_sends[0].0.endpoint_id, tunnel_endpoint.endpoint_id,
+            "synthetic tunnel should remain behind real endpoints"
         );
-        assert_eq!(
-            host.target_sends[1].0.endpoint_id,
-            direct_endpoint.endpoint_id
+        assert!(
+            host.target_sends
+                .iter()
+                .any(|(endpoint, _, _)| endpoint.address == "fallback-target.example.test:21353"),
+            "fallback endpoint should be attempted"
         );
-        assert_eq!(
-            host.target_sends[2].0.address,
-            "fallback-target.example.test:21353"
-        );
-        let direct_idle_timeout = host.target_sends[1]
+        let direct_idle_timeout = host
+            .target_sends
+            .iter()
+            .find(|(endpoint, _, _)| endpoint.endpoint_id == direct_endpoint.endpoint_id)
+            .expect("direct endpoint send")
             .2
             .idle_timeout
-            .expect("second idle timeout");
+            .expect("direct idle timeout");
         assert!(
             direct_idle_timeout <= CLUSTER_TARGET_ROUTE_DEADLINE_MAX,
             "direct data-plane idle timeout should stay inside route budget, got {direct_idle_timeout:?}"
@@ -7665,7 +7694,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_rpc_resorts_cached_route_endpoints_by_live_connectivity() {
+    fn cluster_target_rpc_keeps_real_endpoint_before_synthetic_tunnel_fallback() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-target-resort-cached-endpoints");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -7813,9 +7842,9 @@ mod tests {
         assert_eq!(host.target_sends.len(), 1);
         assert_eq!(
             host.target_sends[0].0.endpoint_id,
-            tunnel_endpoint.endpoint_id
+            direct_endpoint.endpoint_id
         );
-        assert_eq!(host.target_sends[0].0.address, tunnel_endpoint.address);
+        assert_eq!(host.target_sends[0].0.address, direct_endpoint.address);
     }
 
     #[test]

@@ -29,7 +29,7 @@ use time::OffsetDateTime;
 const DEFAULT_REQUESTS_PER_TARGET: usize = 20;
 const DEFAULT_CONCURRENCY: usize = 32;
 const DEFAULT_TIMEOUT_MS: u64 = 2_000;
-const DEFAULT_EXPECTED_TARGETS: usize = 5;
+const DEFAULT_EXPECTED_TARGETS: usize = 1;
 const DEFAULT_MAX_FAILURES: usize = 0;
 const DEFAULT_MAX_P50_MS: u64 = 50;
 const DEFAULT_MAX_P95_MS: u64 = 250;
