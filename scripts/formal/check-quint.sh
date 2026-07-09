@@ -15,6 +15,11 @@ system_smoke_run_steps="${QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS:-80}"
 system_smoke_run_samples="${QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES:-500}"
 dfs_routing_verify_steps="${QUINT_DFS_ROUTING_VERIFY_MAX_STEPS:-$verify_steps}"
 dfs_read_freshness_verify_steps="${QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS:-3}"
+dfs_routed_namespace_verify_steps="${QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS:-3}"
+dfs_posix_namespace_verify_steps="${QUINT_DFS_POSIX_NAMESPACE_VERIFY_MAX_STEPS:-2}"
+dfs_posix_links_verify_steps="${QUINT_DFS_POSIX_LINKS_VERIFY_MAX_STEPS:-2}"
+dfs_posix_cross_shard_verify_steps="${QUINT_DFS_POSIX_CROSS_SHARD_VERIFY_MAX_STEPS:-3}"
+dfs_posix_read_write_verify_steps="${QUINT_DFS_POSIX_READ_WRITE_VERIFY_MAX_STEPS:-2}"
 dfs_primary_failover_verify_steps="${QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS:-3}"
 dfs_namespace_verify_steps="${QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS:-$verify_steps}"
 dfs_sharded_namespace_verify_steps="${QUINT_DFS_SHARDED_NAMESPACE_VERIFY_MAX_STEPS:-$verify_steps}"
@@ -45,6 +50,11 @@ quint typecheck specs/quint/membership_kv.qnt
 quint typecheck specs/quint/dfs_metadata.qnt
 quint typecheck specs/quint/dfs_authority_routing.qnt
 quint typecheck specs/quint/dfs_read_freshness.qnt
+quint typecheck specs/quint/dfs_routed_namespace_freshness.qnt
+quint typecheck specs/quint/dfs_posix_namespace.qnt
+quint typecheck specs/quint/dfs_posix_links.qnt
+quint typecheck specs/quint/dfs_posix_cross_shard_namespace.qnt
+quint typecheck specs/quint/dfs_posix_read_write_visibility.qnt
 quint typecheck specs/quint/dfs_metadata_primary_failover.qnt
 quint typecheck specs/quint/dfs_namespace_transaction.qnt
 quint typecheck specs/quint/dfs_sharded_namespace_transaction.qnt
@@ -127,6 +137,36 @@ quint run specs/quint/dfs_authority_routing.qnt \
   --verbosity=1
 quint run specs/quint/dfs_read_freshness.qnt \
   --main=dfs_read_freshness \
+  --invariant=safety \
+  --max-steps="$run_steps" \
+  --max-samples="$run_samples" \
+  --verbosity=1
+quint run specs/quint/dfs_routed_namespace_freshness.qnt \
+  --main=dfs_routed_namespace_freshness \
+  --invariant=safety \
+  --max-steps="$run_steps" \
+  --max-samples="$run_samples" \
+  --verbosity=1
+quint run specs/quint/dfs_posix_namespace.qnt \
+  --main=dfs_posix_namespace \
+  --invariant=safety \
+  --max-steps="$run_steps" \
+  --max-samples="$run_samples" \
+  --verbosity=1
+quint run specs/quint/dfs_posix_links.qnt \
+  --main=dfs_posix_links \
+  --invariant=safety \
+  --max-steps="$run_steps" \
+  --max-samples="$run_samples" \
+  --verbosity=1
+quint run specs/quint/dfs_posix_cross_shard_namespace.qnt \
+  --main=dfs_posix_cross_shard_namespace \
+  --invariant=safety \
+  --max-steps="$run_steps" \
+  --max-samples="$run_samples" \
+  --verbosity=1
+quint run specs/quint/dfs_posix_read_write_visibility.qnt \
+  --main=dfs_posix_read_write_visibility \
   --invariant=safety \
   --max-steps="$run_steps" \
   --max-samples="$run_samples" \
@@ -260,6 +300,31 @@ quint verify specs/quint/dfs_read_freshness.qnt \
   --main=dfs_read_freshness \
   --invariant=safety \
   --max-steps="$dfs_read_freshness_verify_steps" \
+  --verbosity=1
+quint verify specs/quint/dfs_routed_namespace_freshness.qnt \
+  --main=dfs_routed_namespace_freshness \
+  --invariant=safety \
+  --max-steps="$dfs_routed_namespace_verify_steps" \
+  --verbosity=1
+quint verify specs/quint/dfs_posix_namespace.qnt \
+  --main=dfs_posix_namespace \
+  --invariant=safety \
+  --max-steps="$dfs_posix_namespace_verify_steps" \
+  --verbosity=1
+quint verify specs/quint/dfs_posix_links.qnt \
+  --main=dfs_posix_links \
+  --invariant=safety \
+  --max-steps="$dfs_posix_links_verify_steps" \
+  --verbosity=1
+quint verify specs/quint/dfs_posix_cross_shard_namespace.qnt \
+  --main=dfs_posix_cross_shard_namespace \
+  --invariant=safety \
+  --max-steps="$dfs_posix_cross_shard_verify_steps" \
+  --verbosity=1
+quint verify specs/quint/dfs_posix_read_write_visibility.qnt \
+  --main=dfs_posix_read_write_visibility \
+  --invariant=safety \
+  --max-steps="$dfs_posix_read_write_verify_steps" \
   --verbosity=1
 quint verify specs/quint/dfs_metadata_primary_failover.qnt \
   --main=dfs_metadata_primary_failover \

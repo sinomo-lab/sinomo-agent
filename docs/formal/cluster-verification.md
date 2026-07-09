@@ -43,6 +43,9 @@ workflows, and rollout.
   feedback: stable delivery keys, fallback attempts, identity-mismatch
   suppression, TTL/deadline terminal failures, and replay-cache duplicate
   suppression.
+- `specs/quint/network_attempt_budget.qnt` models bounded endpoint-attempt
+  budgets: direct-endpoint priority, unverified/tunnel caps, full-response
+  fallback reserves, and last-endpoint budget use.
 - `specs/quint/system_base.qnt` defines the shared integration vocabulary for a
   full-system smoke model: membership, endpoint identity, connectivity
   observations, route selection, delivery keys, DFS metadata authority, and
@@ -69,6 +72,34 @@ workflows, and rollout.
   redirect limits, unroutable redirects, late or mismatched response discard, and
   the namespace lookup shortcut that serves locally after a redirect to the
   requester.
+- `specs/quint/dfs_read_freshness.qnt` models DFS current-read freshness versus
+  explicit local-mirror reads: distributed current reads must refresh to the
+  authoritative visible version when available, while local mirrors may serve
+  intentionally stale cached content.
+- `specs/quint/dfs_routed_namespace_freshness.qnt` models requester-side
+  freshness after routed namespace mutations and distributed current lookups:
+  primary-sourced journal catch-up, SyncPath path-object installation,
+  non-replica mirror restrictions, tombstone precedence, and partial-batch
+  non-completion.
+- `specs/quint/dfs_posix_namespace.qnt` models the POSIX namespace facade over
+  a finite SIFS path tree: mkdir, mkdir_all, unlink, rmdir, rename, stat/list
+  agreement, failed-operation immutability, directory-parent validity, and
+  recursive directory move preservation within the model tree.
+- `specs/quint/dfs_posix_links.qnt` models POSIX hardlink and symlink rules:
+  hardlink rejection for directories and missing targets, hardlink unlink
+  preservation, reported link-count agreement, readlink/lstat behavior, and
+  bounded symlink-loop rejection.
+- `specs/quint/dfs_posix_cross_shard_namespace.qnt` models distributed POSIX
+  rename/hardlink jobs that cross metadata shards: source/destination shard
+  split, idempotent adoption/finalization, conflict blocking, recoverable
+  failure states, and no terminal half-visible rename.
+- `specs/quint/dfs_posix_read_write_visibility.qnt` models POSIX read/write
+  visibility above lower DFS freshness guarantees: blocking write then
+  distributed read, stale local-mirror reads, tombstone reads, stat/content
+  agreement, and range-read slice behavior.
+- `specs/quint/dfs_metadata_primary_failover.qnt` models safe local metadata
+  primary promotion: local promotion requires current-primary unreachability,
+  configured replica membership, and durable local shard evidence.
 - `specs/quint/dfs_namespace_transaction.qnt` models shard-local first
   publication through `DfsNamespaceTransaction`: a durable transaction record,
   object-row materialization, visible-version-row materialization, interrupted
@@ -653,6 +684,7 @@ quint typecheck specs/quint/network.qnt
 quint typecheck specs/quint/network_endpoint_selection.qnt
 quint typecheck specs/quint/network_route_planning.qnt
 quint typecheck specs/quint/network_delivery_retry.qnt
+quint typecheck specs/quint/network_attempt_budget.qnt
 quint typecheck specs/quint/system_base.qnt
 quint typecheck specs/quint/system_guarantees.qnt
 quint typecheck specs/quint/system_smoke.qnt
@@ -661,6 +693,13 @@ quint typecheck specs/quint/membership.qnt
 quint typecheck specs/quint/membership_kv.qnt
 quint typecheck specs/quint/dfs_metadata.qnt
 quint typecheck specs/quint/dfs_authority_routing.qnt
+quint typecheck specs/quint/dfs_read_freshness.qnt
+quint typecheck specs/quint/dfs_routed_namespace_freshness.qnt
+quint typecheck specs/quint/dfs_posix_namespace.qnt
+quint typecheck specs/quint/dfs_posix_links.qnt
+quint typecheck specs/quint/dfs_posix_cross_shard_namespace.qnt
+quint typecheck specs/quint/dfs_posix_read_write_visibility.qnt
+quint typecheck specs/quint/dfs_metadata_primary_failover.qnt
 quint typecheck specs/quint/dfs_namespace_transaction.qnt
 quint typecheck specs/quint/dfs_sharded_namespace_transaction.qnt
 quint typecheck specs/quint/dfs_metadata_journal_source.qnt
@@ -677,11 +716,19 @@ quint run specs/quint/network.qnt --main=network --invariant=safety --max-steps=
 quint run specs/quint/network_endpoint_selection.qnt --main=network_endpoint_selection --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/network_route_planning.qnt --main=network_route_planning --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/network_delivery_retry.qnt --main=network_delivery_retry --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
+quint run specs/quint/network_attempt_budget.qnt --main=network_attempt_budget --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/system_smoke.qnt --main=system_smoke --invariant=safety --max-steps=80 --max-samples=500 --verbosity=1
 quint run specs/quint/membership.qnt --main=membership --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/membership_kv.qnt --main=membership_kv --step=step --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/dfs_metadata.qnt --main=dfs_metadata --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/dfs_authority_routing.qnt --main=dfs_authority_routing --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
+quint run specs/quint/dfs_read_freshness.qnt --main=dfs_read_freshness --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
+quint run specs/quint/dfs_routed_namespace_freshness.qnt --main=dfs_routed_namespace_freshness --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
+quint run specs/quint/dfs_posix_namespace.qnt --main=dfs_posix_namespace --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
+quint run specs/quint/dfs_posix_links.qnt --main=dfs_posix_links --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
+quint run specs/quint/dfs_posix_cross_shard_namespace.qnt --main=dfs_posix_cross_shard_namespace --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
+quint run specs/quint/dfs_posix_read_write_visibility.qnt --main=dfs_posix_read_write_visibility --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
+quint run specs/quint/dfs_metadata_primary_failover.qnt --main=dfs_metadata_primary_failover --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/dfs_namespace_transaction.qnt --main=dfs_namespace_transaction --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/dfs_sharded_namespace_transaction.qnt --main=dfs_sharded_namespace_transaction --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/dfs_metadata_journal_source.qnt --main=dfs_metadata_journal_source --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
@@ -698,10 +745,18 @@ quint verify specs/quint/network.qnt --main=network --invariant=safety --max-ste
 quint verify specs/quint/network_endpoint_selection.qnt --main=network_endpoint_selection --invariant=safety --max-steps=4 --verbosity=1
 quint verify specs/quint/network_route_planning.qnt --main=network_route_planning --invariant=safety --max-steps=4 --verbosity=1
 quint verify specs/quint/network_delivery_retry.qnt --main=network_delivery_retry --invariant=safety --max-steps=5 --verbosity=1
+quint verify specs/quint/network_attempt_budget.qnt --main=network_attempt_budget --invariant=safety --max-steps=3 --verbosity=1
 quint verify specs/quint/membership.qnt --main=membership --invariant=safety --max-steps=4 --verbosity=1
 quint verify specs/quint/membership_kv.qnt --backend=tlc --main=membership_kv --step=stepCore --invariant=safety --max-steps=4 --verbosity=1
 quint verify specs/quint/dfs_metadata.qnt --main=dfs_metadata --invariant=safety --max-steps=5 --verbosity=1
 quint verify specs/quint/dfs_authority_routing.qnt --main=dfs_authority_routing --invariant=safety --max-steps=5 --verbosity=1
+quint verify specs/quint/dfs_read_freshness.qnt --main=dfs_read_freshness --invariant=safety --max-steps=3 --verbosity=1
+quint verify specs/quint/dfs_routed_namespace_freshness.qnt --main=dfs_routed_namespace_freshness --invariant=safety --max-steps=3 --verbosity=1
+quint verify specs/quint/dfs_posix_namespace.qnt --main=dfs_posix_namespace --invariant=safety --max-steps=2 --verbosity=1
+quint verify specs/quint/dfs_posix_links.qnt --main=dfs_posix_links --invariant=safety --max-steps=2 --verbosity=1
+quint verify specs/quint/dfs_posix_cross_shard_namespace.qnt --main=dfs_posix_cross_shard_namespace --invariant=safety --max-steps=3 --verbosity=1
+quint verify specs/quint/dfs_posix_read_write_visibility.qnt --main=dfs_posix_read_write_visibility --invariant=safety --max-steps=2 --verbosity=1
+quint verify specs/quint/dfs_metadata_primary_failover.qnt --main=dfs_metadata_primary_failover --invariant=safety --max-steps=3 --verbosity=1
 quint verify specs/quint/dfs_namespace_transaction.qnt --main=dfs_namespace_transaction --invariant=safety --max-steps=5 --verbosity=1
 quint verify specs/quint/dfs_sharded_namespace_transaction.qnt --main=dfs_sharded_namespace_transaction --invariant=safety --max-steps=5 --verbosity=1
 quint verify specs/quint/dfs_metadata_journal_source.qnt --main=dfs_metadata_journal_source --invariant=safety --max-steps=5 --verbosity=1
@@ -725,7 +780,22 @@ its 4-step symbolic check passed in about 10 seconds. The network route
 planning spec uses `QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS`, defaulting to 4; its
 4-step symbolic check passed in about 5 seconds. The network delivery retry spec
 uses `QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS`, defaulting to 5; its isolated
-6-step symbolic check passed in about 6 seconds. The namespace
+6-step symbolic check passed in about 6 seconds. The network attempt-budget spec
+uses `QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS`, defaulting to 3. The
+read-freshness, routed namespace-freshness, and metadata-primary failover specs
+use `QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS`,
+`QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS`, and
+`QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS`, respectively; each defaults to 3
+because they are compact decision/protocol-slice models. The POSIX namespace,
+links, cross-shard namespace, and read/write visibility specs use
+`QUINT_DFS_POSIX_NAMESPACE_VERIFY_MAX_STEPS`,
+`QUINT_DFS_POSIX_LINKS_VERIFY_MAX_STEPS`,
+`QUINT_DFS_POSIX_CROSS_SHARD_VERIFY_MAX_STEPS`, and
+`QUINT_DFS_POSIX_READ_WRITE_VERIFY_MAX_STEPS`; the defaults are 2, 2, 3, and 2,
+respectively. The namespace model is deliberately wider because it tracks a
+finite tree and previous-state immutability; its 2-step symbolic check passed
+locally in about one minute, while a 3-step attempt progressed through many
+obligations before Z3 reported `UNKNOWN`. The namespace
 transaction spec can be overridden with `QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS`;
 its 5-step symbolic check passed in about 21 seconds. The journal source spec
 can be overridden with `QUINT_DFS_JOURNAL_VERIFY_MAX_STEPS`; its 5-step symbolic
@@ -762,7 +832,7 @@ broader random exploration and seed-based replay.
 Use larger bounds for local audit runs, not as a routine CI gate:
 
 ```bash
-QUINT_VERIFY_MAX_STEPS=8 QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS=6 QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS=240 QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES=10000 QUINT_DFS_ROUTING_VERIFY_MAX_STEPS=6 QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_SHARDED_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_JOURNAL_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_VERIFY_MAX_STEPS=6 QUINT_DFS_REPLICATION_VERIFY_MAX_STEPS=6 QUINT_DFS_NO_CONFLICT_VERIFY_MAX_STEPS=6 QUINT_DFS_PENDING_VERIFY_MAX_STEPS=4 QUINT_DFS_REPAIR_CONTENT_VERIFY_MAX_STEPS=6 QUINT_DFS_CHUNKED_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_LOST_AUTHORITY_VERIFY_MAX_STEPS=5 QUINT_DFS_ANTI_ENTROPY_VERIFY_MAX_STEPS=6 QUINT_MEMBERSHIP_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_KV_VERIFY_MAX_STEPS=5 bash scripts/formal/check-quint.sh
+QUINT_VERIFY_MAX_STEPS=8 QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS=6 QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS=4 QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS=240 QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES=10000 QUINT_DFS_ROUTING_VERIFY_MAX_STEPS=6 QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS=4 QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_NAMESPACE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_LINKS_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_CROSS_SHARD_VERIFY_MAX_STEPS=3 QUINT_DFS_POSIX_READ_WRITE_VERIFY_MAX_STEPS=2 QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS=4 QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_SHARDED_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_JOURNAL_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_VERIFY_MAX_STEPS=6 QUINT_DFS_REPLICATION_VERIFY_MAX_STEPS=6 QUINT_DFS_NO_CONFLICT_VERIFY_MAX_STEPS=6 QUINT_DFS_PENDING_VERIFY_MAX_STEPS=4 QUINT_DFS_REPAIR_CONTENT_VERIFY_MAX_STEPS=6 QUINT_DFS_CHUNKED_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_LOST_AUTHORITY_VERIFY_MAX_STEPS=5 QUINT_DFS_ANTI_ENTROPY_VERIFY_MAX_STEPS=6 QUINT_MEMBERSHIP_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_KV_VERIFY_MAX_STEPS=5 bash scripts/formal/check-quint.sh
 ```
 
 ## Current Abstractions
@@ -868,7 +938,8 @@ scratch.
    new-primary model that can rediscover committed pending work and schedule
    repair. Prove quiescence on the old primary plus eventual scheduling on the
    new primary under fairness.
-7. **POSIX multi-object namespace operations.** Model rename/unlink/mkdir sagas,
-   directory locks, by-id resolution, tombstones, and rollback on aborted moves.
-   Prove that failed operations release locks and leave the live namespace
-   internally consistent.
+7. **POSIX refinement and conformance tests.** The first POSIX Quint layer now
+   models namespace, links, cross-shard jobs, and read/write visibility. The next
+   step is finite Rust conformance tests that replay those scenarios against
+   `NetworkedDfsService`, plus deeper models for directory fragments, by-id
+   resolution, and namespace-job lock release under aborted moves.
