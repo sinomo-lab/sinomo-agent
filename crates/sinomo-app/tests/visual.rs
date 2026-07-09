@@ -2369,3 +2369,224 @@ fn pump_relayouts_composer_when_streaming_flips() {
          pointer gesture; got {diff} changed pixels"
     );
 }
+
+fn command_key(root: &sui_testing::Locator, key: &str) {
+    use sui::{Event, KeyState, KeyboardEvent};
+    let mut event = KeyboardEvent::new(key, KeyState::Pressed);
+    event.modifiers.control = true;
+    root.dispatch_event(Event::Keyboard(event)).expect("key");
+}
+
+fn right_click_at(root: &sui_testing::Locator, x: f32, y: f32) {
+    use sui::{Event, Point, PointerButton, PointerButtons, PointerEvent, PointerEventKind};
+    let pos = Point::new(x, y);
+    let mut down = PointerEvent::new(PointerEventKind::Down, pos);
+    down.button = Some(PointerButton::Secondary);
+    down.buttons = PointerButtons::new(2);
+    root.dispatch_event(Event::Pointer(down)).expect("down");
+    let mut up = PointerEvent::new(PointerEventKind::Up, pos);
+    up.button = Some(PointerButton::Secondary);
+    root.dispatch_event(Event::Pointer(up)).expect("up");
+}
+
+/// Composer clipboard flow: select-all + copy puts the draft on the runtime
+/// clipboard; paste replaces the selection from it.
+#[test]
+#[ignore = "SUI interaction smoke; run explicitly with --ignored --nocapture"]
+fn composer_copy_paste_round_trip_through_runtime_clipboard() {
+    use sui::{Event, KeyState, KeyboardEvent, SemanticsRole};
+
+    let shared = boot(Tab::Sinomo);
+    seed_chat_providers(&shared);
+    let runtime = build_runtime(shared.clone()).expect("build runtime");
+    let clipboard = runtime.clipboard();
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    let root = window.root();
+    app.run_until_idle().expect("settle initial layout");
+
+    window
+        .get_by_role(SemanticsRole::TextInput)
+        .with_name("chat-input")
+        .click()
+        .expect("focus composer input");
+    for key in ["H", "e", "l", "l", "o"] {
+        root.dispatch_event(Event::Keyboard(KeyboardEvent::new(key, KeyState::Pressed)))
+            .expect("key");
+    }
+    app.run_until_idle().expect("settle typed draft");
+    assert_eq!(shared.chat().input, "Hello");
+
+    command_key(&root, "a");
+    command_key(&root, "c");
+    assert_eq!(
+        clipboard.text().as_deref(),
+        Some("Hello"),
+        "Ctrl+C must copy the composer selection to the runtime clipboard"
+    );
+
+    clipboard.set_text("pasted text");
+    command_key(&root, "a");
+    command_key(&root, "v");
+    app.run_until_idle().expect("settle pasted draft");
+    assert_eq!(
+        shared.chat().input,
+        "pasted text",
+        "Ctrl+V must replace the selection with the clipboard text"
+    );
+
+    command_key(&root, "a");
+    command_key(&root, "x");
+    app.run_until_idle().expect("settle cut draft");
+    assert_eq!(
+        clipboard.text().as_deref(),
+        Some("pasted text"),
+        "Ctrl+X must copy the selection before deleting it"
+    );
+    assert_eq!(
+        shared.chat().input,
+        "",
+        "Ctrl+X must delete the selected draft"
+    );
+
+    // Menu-driven paste: right-click the (empty) composer, where Paste is the
+    // first enabled item, and activate it with Enter.
+    clipboard.set_text("pasted from menu");
+    right_click_at(&root, 700.0, 626.0);
+    app.run_until_idle().expect("settle composer menu");
+    root.dispatch_event(Event::Keyboard(KeyboardEvent::new(
+        "Enter",
+        KeyState::Pressed,
+    )))
+    .expect("activate Paste");
+    app.run_until_idle().expect("settle menu paste");
+    assert_eq!(
+        shared.chat().input,
+        "pasted from menu",
+        "the context menu Paste must insert the clipboard text into the draft"
+    );
+}
+
+/// Transcript context-menu flow: right-click opens the menu over a bubble,
+/// Select All selects every transcript line, and Copy puts the joined
+/// message text on the runtime clipboard.
+#[test]
+#[ignore = "SUI interaction smoke; run explicitly with --ignored --nocapture"]
+fn transcript_context_menu_select_all_then_copy() {
+    use sinomo_app::ui::chat::ChatMessage;
+    use sui::{Event, KeyState, KeyboardEvent};
+
+    let shared = boot(Tab::Sinomo);
+    seed_chat_providers(&shared);
+    {
+        let mut chat = shared.chat_mut();
+        chat.messages = vec![
+            ChatMessage::user("alpha question"),
+            ChatMessage::model("beta answer"),
+        ];
+    }
+    let runtime = build_runtime(shared.clone()).expect("build runtime");
+    let clipboard = runtime.clipboard();
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    let root = window.root();
+    app.run_until_idle().expect("settle initial layout");
+
+    // Right-click over the transcript (the first bubble paints near the top
+    // of the work area, right of the 250px sidebar in the 1280x720 window).
+    right_click_at(&root, 400.0, 60.0);
+    app.run_until_idle().expect("settle opened menu");
+
+    // No selection yet: "Copy" is disabled, so the menu highlights
+    // "Copy Message" first; one step down reaches "Select All".
+    root.dispatch_event(Event::Keyboard(KeyboardEvent::new(
+        "ArrowDown",
+        KeyState::Pressed,
+    )))
+    .expect("arrow down");
+    root.dispatch_event(Event::Keyboard(KeyboardEvent::new(
+        "Enter",
+        KeyState::Pressed,
+    )))
+    .expect("activate Select All");
+    app.run_until_idle().expect("settle selection");
+
+    // With a live selection "Copy" is the first enabled item.
+    right_click_at(&root, 400.0, 60.0);
+    app.run_until_idle().expect("settle reopened menu");
+    root.dispatch_event(Event::Keyboard(KeyboardEvent::new(
+        "Enter",
+        KeyState::Pressed,
+    )))
+    .expect("activate Copy");
+
+    let copied = clipboard.text().unwrap_or_default();
+    assert!(
+        copied.contains("alpha question") && copied.contains("beta answer"),
+        "Select All + Copy must place both transcript messages on the clipboard, got {copied:?}"
+    );
+    assert!(
+        copied.contains("\n\n"),
+        "messages should be separated by a blank line, got {copied:?}"
+    );
+}
+
+/// Transcript selection + context menu, for visual inspection: seeds a short
+/// conversation, selects every line, then re-opens the right-click menu.
+#[test]
+#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
+fn capture_chat_selection_menu() {
+    use sinomo_app::ui::chat::ChatMessage;
+    use sui::{Event, KeyState, KeyboardEvent};
+
+    let dir = shots_dir();
+    std::fs::create_dir_all(&dir).expect("create shots dir");
+
+    let shared = boot(Tab::Sinomo);
+    seed_chat_providers(&shared);
+    {
+        let mut chat = shared.chat_mut();
+        chat.messages = vec![
+            ChatMessage::user("How do I share a folder over SIFS?"),
+            ChatMessage::model(
+                "Mount the namespace first, then publish the folder:\n\n```sh\nsinomo sifs mount ~/mesh\nsinomo sifs share ~/mesh/docs\n```\n\nThe share stays writable while the node is online.",
+            ),
+        ];
+    }
+    let runtime = build_runtime(shared).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    let root = window.root();
+    app.run_until_idle().expect("settle initial layout");
+
+    // Select the whole transcript through the right-click menu, then capture
+    // the line highlights.
+    right_click_at(&root, 400.0, 60.0);
+    app.run_until_idle().expect("settle opened menu");
+    root.dispatch_event(Event::Keyboard(KeyboardEvent::new(
+        "ArrowDown",
+        KeyState::Pressed,
+    )))
+    .expect("arrow down");
+    root.dispatch_event(Event::Keyboard(KeyboardEvent::new(
+        "Enter",
+        KeyState::Pressed,
+    )))
+    .expect("activate Select All");
+    app.run_until_idle().expect("settle selection");
+    let shot = window.capture_screenshot().expect("capture selection");
+    let path = dir.join("sinomo-app-chat-selection.png");
+    shot.write_png(&path).expect("write png");
+    println!("wrote {}", path.display());
+
+    // Re-open the menu over the selection for the menu capture; advance time
+    // so the entrance animation completes before the shot.
+    right_click_at(&root, 400.0, 60.0);
+    app.run_until_idle().expect("settle reopened menu");
+    app.advance_time(0.4).expect("advance menu entrance");
+    app.run_until_idle().expect("settle menu entrance");
+    let shot = window.capture_screenshot().expect("capture menu");
+    let path = dir.join("sinomo-app-chat-selection-menu.png");
+    shot.write_png(&path).expect("write png");
+    println!("wrote {}", path.display());
+}
