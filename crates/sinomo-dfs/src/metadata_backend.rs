@@ -22,8 +22,8 @@ use crate::metadata_journal::persist_replayed_journal_entry;
 use crate::metadata_journal::{
     DfsMetadataReplayCursor, bounded_metadata_journal_batch, journal_entries_since_limited,
     journal_entries_since_limited_with_next_sequence, migrate_legacy_journal_entries,
-    persist_replayed_journal_entries, recover_next_journal_sequence, write_local_journal_entries,
-    write_local_journal_entry,
+    persist_replayed_journal_entries, read_next_journal_sequence_lenient,
+    recover_next_journal_sequence, write_local_journal_entries, write_local_journal_entry,
 };
 use crate::metadata_limits::{
     DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, OBJECT_LOCAL_METADATA_PAGE_SIZE,
@@ -66,6 +66,7 @@ use crate::metadata_table_store::{
     METADATA_TABLE_SNAPSHOT_FORMAT_VERSION, archive_metadata_backend_state,
     load_or_migrate_metadata_tables, metadata_table_snapshot_fingerprint,
     metadata_tables_from_table_snapshot, metadata_tables_snapshot, persist_metadata_table_snapshot,
+    read_metadata_table_state_lenient,
 };
 use crate::metadata_tables::{
     DfsMetadataTableRollback, DfsMetadataTables, MetadataTableReadSnapshotCache,
@@ -170,6 +171,33 @@ impl LocalSobjMetadataBackend {
         backend.recover_visible_version_commits()?;
         backend.recover_object_locations_from_visible_versions()?;
         Ok(backend)
+    }
+
+    /// Open a shard for read-only inspection/status.
+    ///
+    /// Unlike [`Self::new`], this does not take write locks, repair cursors,
+    /// migrate legacy tables, or replay recovery transactions. Status RPCs use
+    /// this path so probing a live daemon does not turn into a recovery pass.
+    pub fn open_for_inspection(
+        shard_id: DfsMetadataShardId,
+        root: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let root = root.into();
+        let state = read_metadata_table_state_lenient(&root)?;
+        let materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
+        let next_sequence = read_next_journal_sequence_lenient(&root)?
+            .max(materialized_through_sequence.saturating_add(1))
+            .max(1);
+        Ok(Self {
+            shard_id,
+            root,
+            next_sequence,
+            tables: state.tables,
+            table_log_offset: state.table_log_offset,
+            materialized_through_sequence,
+            table_snapshot_fingerprint: state.snapshot_fingerprint,
+            read_snapshot_cache: Arc::new(Mutex::new(None)),
+        })
     }
 
     /// Metadata shard owned by this local backend handle.
@@ -5382,6 +5410,42 @@ mod tests {
         let reopened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen");
         assert_eq!(reopened.journal_since(0).expect("journal").len(), 2);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_open_for_inspection_does_not_repair_materialization_cursor() {
+        let root = temp_root("local_backend_open_for_inspection_is_read_only");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        let object = object(version("version_1"));
+        backend.put_object(&object).expect("object");
+
+        let cursor_path = backend.local_materialization_cursor_path();
+        remove_file_if_exists(&cursor_path).expect("remove materialization cursor");
+        assert!(
+            !cursor_path.exists(),
+            "test fixture should remove the recovery cursor before inspection open"
+        );
+        drop(backend);
+
+        let inspected = LocalSobjMetadataBackend::open_for_inspection(shard_id, &root)
+            .expect("inspection open");
+        assert!(
+            !cursor_path.exists(),
+            "inspection open must not repair or recreate recovery cursors"
+        );
+        let summary = inspected.metadata_summary().expect("summary");
+        assert_eq!(summary.object_count, 1);
+        assert!(
+            inspected
+                .metadata_shard_statuses()
+                .expect("shard status")
+                .first()
+                .is_some_and(|status| status.journal_next_sequence >= 1)
+        );
 
         cleanup(&root);
     }

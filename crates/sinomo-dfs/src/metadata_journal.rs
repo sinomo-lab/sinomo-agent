@@ -62,6 +62,18 @@ pub(crate) fn recover_next_journal_sequence(root: &Path) -> Result<u64> {
     Ok(next_sequence)
 }
 
+pub(crate) fn read_next_journal_sequence_lenient(root: &Path) -> Result<u64> {
+    if let Some(next_sequence) = journal_head_next_sequence(root)? {
+        return Ok(next_sequence.max(1));
+    }
+
+    let mut max_sequence = max_segmented_journal_sequence(root)?;
+    for (sequence, _, _) in legacy_journal_entry_paths_since(root, 0)? {
+        max_sequence = max_sequence.max(sequence);
+    }
+    Ok(max_sequence.saturating_add(1).max(1))
+}
+
 fn journal_head_matches_local_materialization_cursor(
     root: &Path,
     head_next_sequence: u64,

@@ -9,7 +9,8 @@
 //!   roundtrip; read-your-write must hold immediately on the writing node.
 //! - `cluster.dfs.routed-status` — route a signed DFS status RPC to every
 //!   remote main daemon; this catches DFS route auth/routing regressions that a
-//!   generic network ping can miss.
+//!   generic network ping can miss. Route/RPC failures are hard-gated by
+//!   default; dirty DFS status may still poll for convergence.
 //! - `cluster.dfs.service-advertisements` — verify DFS service discovery
 //!   records advertise node identities instead of concrete network routes.
 //! - `cluster.dfs.invariants` — operational-metric sweep: no open conflicts,
@@ -64,6 +65,7 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_EXPECT_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_ROUTED_STATUS_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_BULK_FILE_COUNT: usize = 128;
 const DEFAULT_BULK_FILE_BYTES: usize = 4 * 1024;
 const DEFAULT_LIGHTWEIGHT_LATENCY_ITERATIONS: usize = 128;
@@ -410,7 +412,9 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 }
 
 fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    let timeout_ms = optional_u64_parameter(ctx, "timeout-ms")?.unwrap_or(10_000);
+    let timeout_ms =
+        optional_u64_parameter(ctx, "timeout-ms")?.unwrap_or(DEFAULT_ROUTED_STATUS_TIMEOUT_MS);
+    let gate = DfsRoutedStatusGate::from_context(ctx, timeout_ms)?;
     let timeout = expect_timeout(ctx)?;
     let expected_targets = optional_usize_parameter(ctx, "expected-targets", 1)?;
     let max_remote_open_conflicts =
@@ -453,13 +457,18 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 "cannot connect to local daemon for DFS routed status: {source}"
             ))
         })?
-        .with_timeout(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1)));
+        .with_timeout(Duration::from_millis(timeout_ms));
     let request = dfs::dfs_status_rpc_request()
         .map_err(|source| SinomoTestError::failed(source.to_string()))?;
 
     let started = Instant::now();
     let deadline = started + timeout;
     let mut attempts = 0usize;
+    let mut failure_history = Vec::new();
+    let mut dirty_status_history = Vec::new();
+    ctx.record("timeout_ms", timeout_ms);
+    ctx.record("max_attempts", gate.max_attempts);
+    ctx.record("max_elapsed_ms", gate.max_elapsed.as_millis() as u64);
     loop {
         attempts = attempts.saturating_add(1);
         let mut statuses = BTreeMap::new();
@@ -521,24 +530,65 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             max_remote_pending_writes,
             max_remote_pending_repairs,
         );
+        let elapsed = started.elapsed();
+        if !failures.is_empty() {
+            failure_history.extend(
+                failures
+                    .iter()
+                    .map(|failure| format!("attempt {attempts}: {failure}")),
+            );
+        }
+        if !dirty_statuses.is_empty() {
+            dirty_status_history.extend(
+                dirty_statuses
+                    .iter()
+                    .map(|dirty| format!("attempt {attempts}: {dirty}")),
+            );
+        }
         if failures.is_empty() && dirty_statuses.is_empty() {
             ctx.record("statuses", &statuses);
             ctx.record("attempts", attempts);
-            ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+            ctx.record("elapsed_ms", elapsed.as_millis() as u64);
+            if !failure_history.is_empty() {
+                ctx.record("failure_history", &failure_history);
+            }
+            if !dirty_status_history.is_empty() {
+                ctx.record("dirty_status_history", &dirty_status_history);
+            }
+            if failure_history.is_empty()
+                && dirty_status_history.is_empty()
+                && gate.success_exceeded(attempts, elapsed)
+            {
+                return Ok(SinomoTestOutcome::failed(format!(
+                    "DFS routed status succeeded in {}ms, exceeding the {}ms route/RPC gate",
+                    elapsed.as_millis(),
+                    gate.max_elapsed.as_millis()
+                )));
+            }
+            if !failure_history.is_empty() && gate.success_exceeded(attempts, elapsed) {
+                return Ok(SinomoTestOutcome::failed(format!(
+                    "DFS routed status recovered from route/RPC failures after {attempts} attempt(s) in {}ms, exceeding the gate of {} attempt(s) in {}ms",
+                    elapsed.as_millis(),
+                    gate.max_attempts,
+                    gate.max_elapsed.as_millis()
+                )));
+            }
             return Ok(SinomoTestOutcome::passed(format!(
                 "DFS routed status succeeded for {} remote main daemon(s)",
                 targets.len()
             )));
         }
-        if Instant::now() >= deadline {
+        if (!failures.is_empty() && gate.exhausted(attempts, elapsed)) || Instant::now() >= deadline
+        {
             ctx.record("statuses", &statuses);
             ctx.record("attempts", attempts);
-            ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+            ctx.record("elapsed_ms", elapsed.as_millis() as u64);
             if !repair_details.is_empty() {
                 ctx.record("repair_details", &repair_details);
             }
             if !failures.is_empty() {
                 ctx.record("failures", failures.clone());
+                ctx.record("failure_history", &failure_history);
                 return Ok(SinomoTestOutcome::failed(format!(
                     "DFS routed status failed for {}/{} targets",
                     failures.len(),
@@ -546,6 +596,7 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 )));
             }
             ctx.record("dirty_statuses", dirty_statuses.clone());
+            ctx.record("dirty_status_history", &dirty_status_history);
             return Ok(SinomoTestOutcome::failed(format!(
                 "DFS routed status found dirty status on {}/{} target(s)",
                 dirty_statuses.len(),
@@ -553,6 +604,38 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             )));
         }
         std::thread::sleep(EXPECT_POLL_INTERVAL);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DfsRoutedStatusGate {
+    max_attempts: usize,
+    max_elapsed: Duration,
+}
+
+impl DfsRoutedStatusGate {
+    fn from_context(ctx: &SinomoTestContext, timeout_ms: u64) -> Result<Self, SinomoTestError> {
+        let max_attempts = optional_usize_parameter(ctx, "max-attempts", 1)?;
+        require_positive("max-attempts", max_attempts)?;
+        let max_elapsed_ms = optional_u64_parameter(ctx, "max-elapsed-ms")?.unwrap_or(timeout_ms);
+        if max_elapsed_ms == 0 {
+            return Err(SinomoTestError::InvalidParameter {
+                name: "max-elapsed-ms".to_string(),
+                detail: "must be greater than zero".to_string(),
+            });
+        }
+        Ok(Self {
+            max_attempts,
+            max_elapsed: Duration::from_millis(max_elapsed_ms),
+        })
+    }
+
+    fn exhausted(&self, attempts: usize, elapsed: Duration) -> bool {
+        attempts >= self.max_attempts || elapsed >= self.max_elapsed
+    }
+
+    fn success_exceeded(&self, attempts: usize, elapsed: Duration) -> bool {
+        attempts > self.max_attempts || elapsed > self.max_elapsed
     }
 }
 
@@ -3636,6 +3719,65 @@ mod tests {
             observed_at: now,
             expires_at: now + time::Duration::seconds(network::CLUSTER_CONNECTIVITY_TTL_SECONDS),
         }
+    }
+
+    #[test]
+    fn dfs_routed_status_gate_defaults_to_single_five_second_attempt() {
+        let ctx = SinomoTestContext::new("unused");
+
+        let gate =
+            DfsRoutedStatusGate::from_context(&ctx, DEFAULT_ROUTED_STATUS_TIMEOUT_MS).unwrap();
+
+        assert_eq!(
+            gate,
+            DfsRoutedStatusGate {
+                max_attempts: 1,
+                max_elapsed: Duration::from_millis(DEFAULT_ROUTED_STATUS_TIMEOUT_MS),
+            }
+        );
+        assert!(!gate.exhausted(0, Duration::from_millis(4_999)));
+        assert!(gate.exhausted(1, Duration::from_millis(1)));
+        assert!(gate.exhausted(0, Duration::from_millis(5_000)));
+        assert!(!gate.success_exceeded(1, Duration::from_millis(5_000)));
+        assert!(gate.success_exceeded(2, Duration::from_millis(1)));
+        assert!(gate.success_exceeded(1, Duration::from_millis(5_001)));
+    }
+
+    #[test]
+    fn dfs_routed_status_gate_accepts_explicit_polling_budget() {
+        let ctx = SinomoTestContext::new("unused")
+            .with_parameter("max-attempts", "3")
+            .with_parameter("max-elapsed-ms", "7000");
+
+        let gate = DfsRoutedStatusGate::from_context(&ctx, 5_000).unwrap();
+
+        assert_eq!(
+            gate,
+            DfsRoutedStatusGate {
+                max_attempts: 3,
+                max_elapsed: Duration::from_millis(7_000),
+            }
+        );
+        assert!(!gate.exhausted(2, Duration::from_millis(6_999)));
+        assert!(gate.exhausted(3, Duration::from_millis(1)));
+        assert!(gate.exhausted(1, Duration::from_millis(7_000)));
+    }
+
+    #[test]
+    fn dfs_routed_status_gate_rejects_zero_limits() {
+        let attempts_ctx = SinomoTestContext::new("unused").with_parameter("max-attempts", "0");
+        let attempts_error = DfsRoutedStatusGate::from_context(&attempts_ctx, 5_000).unwrap_err();
+        assert!(matches!(
+            attempts_error,
+            SinomoTestError::InvalidParameter { ref name, .. } if name == "max-attempts"
+        ));
+
+        let elapsed_ctx = SinomoTestContext::new("unused").with_parameter("max-elapsed-ms", "0");
+        let elapsed_error = DfsRoutedStatusGate::from_context(&elapsed_ctx, 5_000).unwrap_err();
+        assert!(matches!(
+            elapsed_error,
+            SinomoTestError::InvalidParameter { ref name, .. } if name == "max-elapsed-ms"
+        ));
     }
 
     #[test]
