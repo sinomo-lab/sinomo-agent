@@ -208,8 +208,17 @@ pub fn activate_staged_rollout_binary(
     }
     let previous = rollout_previous_binary_path(destination);
     let mut backup = if previous.exists() {
-        ensure_non_empty_rollout_artifact(&previous)?;
-        Some(previous.clone())
+        match ensure_non_empty_rollout_artifact(&previous) {
+            Ok(()) => Some(previous.clone()),
+            Err(RolloutError::InvalidArtifact { .. }) => {
+                fs::remove_file(&previous).map_err(|source| RolloutError::Io {
+                    path: previous.display().to_string(),
+                    detail: source.to_string(),
+                })?;
+                None
+            }
+            Err(error) => return Err(error),
+        }
     } else {
         None
     };
@@ -407,6 +416,28 @@ mod tests {
             fs::read(&previous).expect("previous bytes"),
             b"previous-good"
         );
+    }
+
+    #[test]
+    fn activate_staged_rollout_binary_ignores_empty_previous_backup() {
+        let root = sinomo_testdir::TestDir::new("sinomo-rollout-empty-previous");
+        let staged = root.join("staged").join("sinomo");
+        let destination = root.join("bin").join("sinomo");
+        let previous = rollout_previous_binary_path(&destination);
+        fs::create_dir_all(staged.parent().expect("staged parent")).expect("staged parent");
+        fs::create_dir_all(destination.parent().expect("bin parent")).expect("bin parent");
+        fs::write(&staged, b"candidate").expect("staged");
+        fs::write(&previous, []).expect("empty previous backup");
+
+        let backup =
+            activate_staged_rollout_binary(&staged, &destination).expect("activate staged");
+
+        assert!(backup.is_none());
+        assert_eq!(
+            fs::read(&destination).expect("destination bytes"),
+            b"candidate"
+        );
+        assert!(!previous.exists());
     }
 
     #[test]
