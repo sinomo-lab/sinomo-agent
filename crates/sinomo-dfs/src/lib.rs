@@ -316,7 +316,10 @@ pub use module_surface::{
     SINOMO_DFS_MODULE_OWNER, SINOMO_DFS_NATIVE_REGISTRATION_KEY, dfs_module_capabilities,
     dfs_module_id, dfs_module_registration, dfs_module_surfaces, register_storage_paths,
 };
-pub use mounted_sifs::{MountedSifsService, OpenedMountedSifsService, open_mounted_sifs_service};
+pub use mounted_sifs::{
+    MountedSifsService, OpenedMountedSifsService, open_mounted_sifs_service,
+    open_mounted_sifs_service_with_cancellation,
+};
 pub use namespace::{
     SIFS_NODES_PATH, SIFS_ROOT_PATH, SIFS_SERVICES_PATH, SIFS_SINOMO_PATH, SIFS_USERS_PATH,
     directory_object, distributed_sifs, distributed_sifs_bootstrap_objects,
@@ -441,11 +444,11 @@ pub(crate) use service_state::{
 };
 pub use service_state::{
     DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT,
-    DfsConfirmedTimeoutAction, DfsConfirmedTimeoutOutcome, DfsConflictReadView,
-    DfsMessageProcessResult, DfsMetadataReplicationOutcome, DfsOwnerHandoffOutcome,
-    DfsReconnectReconciliation, NetworkedDfsRangeReadOutcome, NetworkedDfsReadFreshness,
-    NetworkedDfsReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
-    NetworkedDfsWriteOutcome,
+    DfsCancellationFlag, DfsConfirmedTimeoutAction, DfsConfirmedTimeoutOutcome,
+    DfsConflictReadView, DfsMessageProcessResult, DfsMetadataReplicationOutcome,
+    DfsOwnerHandoffOutcome, DfsReconnectReconciliation, NetworkedDfsRangeReadOutcome,
+    NetworkedDfsReadFreshness, NetworkedDfsReadOutcome, NetworkedDfsService,
+    NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
 };
 pub(crate) use service_trace::{
     dfs_distributed_write_result_trace_label, dfs_namespace_operation_trace_label,

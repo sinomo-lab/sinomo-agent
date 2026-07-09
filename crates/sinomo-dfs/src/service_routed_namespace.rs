@@ -731,6 +731,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
         let started_at = Instant::now();
         loop {
+            if let Err(cancelled) = self.check_cancelled("routed namespace settle") {
+                self.pending_routed_namespace_ops.remove(request_id);
+                return Err(cancelled);
+            }
             let events = match self.process_incoming() {
                 Ok(events) => events,
                 Err(error) => {

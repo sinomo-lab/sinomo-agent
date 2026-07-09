@@ -99,6 +99,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_stat_distributed(&mut self, path: &str) -> Result<DfsStat> {
+        self.check_cancelled("distributed stat")?;
         let path = self.resolve_existing_posix_path_distributed(path, true)?;
         self.posix_lstat_distributed(&path)
     }
@@ -139,6 +140,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_list_dir_distributed(&mut self, path: &str) -> Result<Vec<DfsDirEntry>> {
+        self.check_cancelled("distributed list")?;
         let path = self.resolve_existing_posix_path_distributed(path, true)?;
         self.posix_collect_resolved_dir(&path)
     }

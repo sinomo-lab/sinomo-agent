@@ -256,10 +256,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replica_node_id: NodeId,
         allow_unknown_intent: bool,
     ) -> Result<(), DfsError> {
-        match self
-            .coordinator
-            .restore_durable_receipt(intent_id, replica_node_id)
-        {
+        self.restore_backend_durable_receipt_with_repair_rebuild(
+            intent_id,
+            replica_node_id,
+            allow_unknown_intent,
+            true,
+        )
+    }
+
+    /// `rebuild_repair_jobs` selects between the eager per-receipt repair
+    /// rebuild and the deferred one for bulk restore loops: hydration restores
+    /// every receipt of an unsettled-write backlog, and rebuilding per receipt
+    /// made SIFS opens burn seconds of CPU once a degraded cluster link had
+    /// let that backlog accumulate.
+    pub(crate) fn restore_backend_durable_receipt_with_repair_rebuild(
+        &mut self,
+        intent_id: &str,
+        replica_node_id: NodeId,
+        allow_unknown_intent: bool,
+        rebuild_repair_jobs: bool,
+    ) -> Result<(), DfsError> {
+        let restored = if rebuild_repair_jobs {
+            self.coordinator
+                .restore_durable_receipt(intent_id, replica_node_id)
+        } else {
+            self.coordinator
+                .restore_durable_receipt_deferring_repair_rebuild(intent_id, replica_node_id)
+                .map(drop)
+        };
+        match restored {
             Ok(()) => Ok(()),
             Err(DfsDistributedError::UnknownIntent { .. }) if allow_unknown_intent => Ok(()),
             Err(
@@ -273,6 +298,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn restore_backend_receipt_pages_for_intent(
         &mut self,
         intent_record: &DfsWriteIntentRecord,
+        rebuild_repair_jobs: bool,
     ) -> Result<(), DfsError> {
         for receipt in self
             .backend_receipts_for_version(&intent_record.object_id, &intent_record.target_version)?
@@ -282,10 +308,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 continue;
             }
-            self.restore_backend_durable_receipt(
+            self.restore_backend_durable_receipt_with_repair_rebuild(
                 &intent_record.intent_id,
                 receipt.replica_node_id,
                 false,
+                rebuild_repair_jobs,
             )?;
         }
         Ok(())

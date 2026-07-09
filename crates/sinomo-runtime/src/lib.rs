@@ -61,7 +61,9 @@ pub mod r1 {
     pub mod vfs {
         pub use sinomo_vfs::*;
         pub use sinomo_vfs_sifs::{
-            DaemonSifsVfsBackend, MountedSifsVfsBackend, daemon_sifs, mounted_sifs,
+            DaemonSifsVfsBackend, DfsCancellationFlag, MountedSifsOpenOptions,
+            MountedSifsReadMode, MountedSifsVfsBackend, daemon_sifs, mounted_sifs,
+            mounted_sifs_local_reads, mounted_sifs_with_cancellation,
         };
     }
 

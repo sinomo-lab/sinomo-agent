@@ -371,7 +371,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self.coordinator.intent(intent_id).is_none() {
             self.coordinator
                 .restore_intent(distributed_intent_from_record(&record))?;
-            self.restore_backend_receipt_pages_for_intent(&record)?;
+            self.restore_backend_receipt_pages_for_intent(&record, true)?;
         }
         let intent =
             self.coordinator

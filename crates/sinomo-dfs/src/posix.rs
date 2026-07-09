@@ -101,6 +101,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let started_at = Instant::now();
         let mut ready_drains = 0;
         loop {
+            self.check_cancelled("write settle")?;
             let mut events = self.process_incoming()?;
             let outcome = self.write_outcome(&intent_id)?;
             if let NetworkedDfsWriteOutcome::Pending {
@@ -120,7 +121,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 return Ok(outcome);
             }
-            let (scheduled, repair_events) = if foreground_replica_repair {
+            let (_scheduled, repair_events) = if foreground_replica_repair {
                 self.retry_pending_repairs_best_effort()
             } else {
                 (Vec::new(), Vec::new())
@@ -129,17 +130,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 events.extend(repair_events);
                 self.last_events = events.clone();
             }
-            if (events.is_empty() && scheduled.is_empty())
-                || ready_drains >= POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT
-            {
+            // Re-scheduled repairs alone are not progress: on a degraded cluster
+            // every retry fails fast and reschedules, and treating that churn as
+            // activity turned this wait into a hot spin (a full core per pending
+            // write). Only incoming events skip the pacing wait — which wakes
+            // early on arrival, so healthy-path settle latency is unchanged.
+            if events.is_empty() || ready_drains >= POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT {
                 let elapsed = started_at.elapsed();
                 if elapsed >= POSIX_WAIT_FOR_COMMIT_TIMEOUT {
                     return Ok(outcome);
                 }
-                std::thread::sleep(
-                    POSIX_WAIT_FOR_COMMIT_IDLE_SLEEP
-                        .min(POSIX_WAIT_FOR_COMMIT_TIMEOUT.saturating_sub(elapsed)),
-                );
+                let wait = POSIX_WAIT_FOR_COMMIT_IDLE_SLEEP
+                    .min(POSIX_WAIT_FOR_COMMIT_TIMEOUT.saturating_sub(elapsed));
+                self.transport
+                    .wait_for_incoming(wait)
+                    .map_err(DfsError::from_network)?;
                 ready_drains = 0;
             } else {
                 ready_drains += 1;

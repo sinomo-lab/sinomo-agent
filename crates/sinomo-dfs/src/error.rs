@@ -57,6 +57,12 @@ pub enum DfsError {
     Busy { path: String },
     #[error("directory is not empty: {path}")]
     DirectoryNotEmpty { path: String },
+    /// The caller cancelled the operation through the service's
+    /// [`DfsCancellationFlag`](crate::DfsCancellationFlag) — typically a budgeted
+    /// load giving up while the cluster/DFS link is degraded. Distributed wait
+    /// and retry loops return this instead of running out their full timeouts.
+    #[error("DFS operation cancelled: {operation}")]
+    Cancelled { operation: &'static str },
 }
 
 impl DfsError {

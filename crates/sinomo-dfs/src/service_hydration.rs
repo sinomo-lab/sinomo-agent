@@ -123,7 +123,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 self.repair_visible_committed_pending_intent_record(&mut intent_record)?;
                 let intent = distributed_intent_from_record(&intent_record);
-                match self.coordinator.restore_intent(intent) {
+                // Bulk restore: repair jobs are rebuilt once after the scan.
+                // Rebuilding per restored intent/receipt made hydration
+                // quadratic over an unsettled-write backlog and burned seconds
+                // of CPU on every SIFS open of an affected data dir.
+                match self.coordinator.restore_intent_deferring_repair_rebuild(intent) {
                     Ok(()) => {}
                     Err(DfsDistributedError::PendingIntentConflict { .. })
                         if matches!(
@@ -147,8 +151,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         )
                                 })
                         {
-                            self.restore_visible_committed_object_location_receipts(
+                            self.restore_visible_committed_object_location_receipts_with_repair_rebuild(
                                 &intent_record,
+                                false,
                             )?;
                             continue;
                         }
@@ -157,8 +162,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     Err(error) => return Err(DfsError::from(error)),
                 }
-                self.restore_backend_receipt_pages_for_intent(&intent_record)?;
-                self.restore_visible_committed_object_location_receipts(&intent_record)?;
+                self.restore_backend_receipt_pages_for_intent(&intent_record, false)?;
+                self.restore_visible_committed_object_location_receipts_with_repair_rebuild(
+                    &intent_record,
+                    false,
+                )?;
                 if matches!(
                     intent_record.status,
                     DfsWriteIntentStatus::Staging
@@ -170,6 +178,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             Ok(intent_page.next_cursor)
         })?;
+        self.coordinator.rebuild_repair_jobs_after_bulk_restore();
 
         let repair_intent_ids: BTreeSet<String> = self
             .coordinator
@@ -307,6 +316,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         intent_record: &DfsWriteIntentRecord,
     ) -> Result<(), DfsError> {
+        self.restore_visible_committed_object_location_receipts_with_repair_rebuild(
+            intent_record,
+            true,
+        )
+    }
+
+    /// See [`restore_backend_durable_receipt_with_repair_rebuild`](Self::restore_backend_durable_receipt_with_repair_rebuild)
+    /// for the `rebuild_repair_jobs` contract; bulk hydration passes `false`
+    /// and rebuilds once afterwards.
+    pub(crate) fn restore_visible_committed_object_location_receipts_with_repair_rebuild(
+        &mut self,
+        intent_record: &DfsWriteIntentRecord,
+        rebuild_repair_jobs: bool,
+    ) -> Result<(), DfsError> {
         if !matches!(intent_record.status, DfsWriteIntentStatus::Committed) {
             return Ok(());
         }
@@ -337,10 +360,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 continue;
             }
             existing_receipts.insert(receipt.replica_node_id.clone());
-            self.restore_backend_durable_receipt(
+            self.restore_backend_durable_receipt_with_repair_rebuild(
                 &intent_record.intent_id,
                 receipt.replica_node_id,
                 false,
+                rebuild_repair_jobs,
             )?;
         }
 
@@ -373,10 +397,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 existing_receipts.insert(replica_node_id.clone());
             }
             if existing_receipts.contains(&replica_node_id) {
-                self.restore_backend_durable_receipt(
+                self.restore_backend_durable_receipt_with_repair_rebuild(
                     &intent_record.intent_id,
                     replica_node_id,
                     false,
+                    rebuild_repair_jobs,
                 )?;
             }
         }
