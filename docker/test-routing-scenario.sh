@@ -651,7 +651,9 @@ wait_for_node_daemons() {
     if compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo daemon status \
         >"$ARTIFACTS/restart-$node-main.last.txt" 2>&1 \
       && compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo daemon shadow status \
-        >"$ARTIFACTS/restart-$node-shadow.last.txt" 2>&1; then
+        >"$ARTIFACTS/restart-$node-shadow.last.txt" 2>&1 \
+      && grep -F "sinomo daemon is running" "$ARTIFACTS/restart-$node-main.last.txt" >/dev/null \
+      && grep -F "sinomo shadow daemon is running" "$ARTIFACTS/restart-$node-shadow.last.txt" >/dev/null; then
       log "  daemons-ready: $node"
       return 0
     fi
