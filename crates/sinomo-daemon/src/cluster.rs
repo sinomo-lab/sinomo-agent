@@ -13903,8 +13903,8 @@ mod tests {
         assert_eq!(record.consecutive_failures, 0);
         assert_eq!(record.latency_ms, Some(8));
         assert!(
-            cached_connectivity_matches(&paths, &record),
-            "command-path observations should update the local connectivity publish cache for dedupe"
+            !cached_connectivity_matches(&paths, &record),
+            "command-path observations must not masquerade as quorum-published connectivity"
         );
 
         remember_cluster_endpoint_command_connectivity(

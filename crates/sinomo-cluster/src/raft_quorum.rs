@@ -602,6 +602,11 @@ fn remote_voter_node_targets(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Vec<NodeId>, NetworkError> {
+    if sinomo_kv::cluster_kv_raft_local_is_voter(state)
+        && sinomo_kv::cluster_kv_raft_quorum_size_for_state(state) <= 1
+    {
+        return Ok(Vec::new());
+    }
     let mut targets = ClusterEndpointSelector::new(paths, state)
         .try_select_internal_unique_node_ids(
             ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
@@ -942,6 +947,11 @@ where
         let runtime = self.runtime;
         let paths = self.paths;
         Box::pin(async move {
+            if sinomo_kv::cluster_kv_raft_local_is_voter(state)
+                && sinomo_kv::cluster_kv_raft_quorum_size_for_state(state) <= 1
+            {
+                return Ok(Vec::new());
+            }
             let mut targets = ClusterEndpointSelector::select_internal_unique_node_ids_async(
                 runtime,
                 paths,

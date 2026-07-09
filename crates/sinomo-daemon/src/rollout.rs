@@ -6,6 +6,7 @@ use crate::{
     spawn_candidate_main_daemon_process, spawn_main_daemon_process,
     spawn_shadow_rollout_recovery_helper_process,
 };
+use fs2::FileExt;
 #[cfg(test)]
 use sinomo_rollout::read_rollout_status;
 use sinomo_rollout::{
@@ -34,7 +35,7 @@ use sinomo_rollout::{
     write_main_activation, write_rollout_status,
 };
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -306,6 +307,10 @@ pub enum PendingShadowMainExit {
         main_binary: PathBuf,
         main_options: crate::DaemonRunOptions,
         main_probe_status: DaemonProbeStatus,
+    },
+    RetryCandidate {
+        child: Child,
+        monitor: ShadowMainRolloutMonitor,
     },
     Recovered {
         child: Option<Child>,
@@ -968,6 +973,7 @@ pub fn run_shadow_daemon_supervision_loop(
         if should_shadow_start_main(main_restart_suppressed, pending_main_activation)
             && supervised_main.is_none()
             && matches!(main_probe_status, DaemonProbeStatus::NotRunning)
+            && (!pending_main_activation || main_data_owner_lock_released(&main_paths))
             && (pending_main_activation || main_restart_backoff.can_restart(now))
         {
             if pending_main_activation {
@@ -1113,6 +1119,28 @@ pub fn run_shadow_daemon_supervision_loop(
                                 serde_json::json!({
                                     "source": pending.activation.source,
                                     "requested_at": pending.activation.requested_at,
+                                    "main_binary": main_binary.display().to_string(),
+                                }),
+                            );
+                        }
+                        PendingShadowMainExit::RetryCandidate { child, monitor } => {
+                            supervised_main = Some(child);
+                            supervised_main_started_at = Some(Instant::now());
+                            pending_rollout = Some(monitor);
+                            main_probe_status = DaemonProbeStatus::NotRunning;
+                            last_main_probe = Instant::now() - shadow_main_probe_interval(true);
+                            main_restart_backoff.clear_schedule();
+                            crate::append_operational_event_best_effort(
+                                &shadow_paths,
+                                crate::OperationalSeverity::Warn,
+                                "shadow-daemon",
+                                "rollout.stage.retry",
+                                "candidate main exited cleanly before health; retrying within activation deadline",
+                                pending_rollout
+                                    .as_ref()
+                                    .map(|pending| pending.activation.requested_at.as_str()),
+                                serde_json::json!({
+                                    "source": pending_rollout.as_ref().map(|pending| pending.activation.source.as_str()),
                                     "main_binary": main_binary.display().to_string(),
                                 }),
                             );
@@ -1350,6 +1378,30 @@ fn pending_rollout_probe_matches_candidate(
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingShadowCandidateExitAction {
+    Promote,
+    Retry,
+    Recover,
+}
+
+fn pending_shadow_candidate_exit_action(
+    probe_status: &DaemonProbeStatus,
+    candidate_pid: Option<u32>,
+    observation: MainExitObservation,
+    now: Instant,
+    deadline: Instant,
+) -> PendingShadowCandidateExitAction {
+    let clean_exit = observation.exit_code == Some(0) && observation.signal.is_none();
+    if clean_exit && pending_rollout_probe_matches_candidate(probe_status, candidate_pid) {
+        return PendingShadowCandidateExitAction::Promote;
+    }
+    if clean_exit && now < deadline {
+        return PendingShadowCandidateExitAction::Retry;
+    }
+    PendingShadowCandidateExitAction::Recover
+}
+
 fn pending_main_activation_ready_for_shutdown(rollout_paths: &SelfRolloutPaths) -> bool {
     let path = rollout_main_activation_path(rollout_paths);
     let Ok(metadata) = fs::metadata(path) else {
@@ -1361,6 +1413,28 @@ fn pending_main_activation_ready_for_shutdown(rollout_paths: &SelfRolloutPaths) 
     modified_at
         .elapsed()
         .is_ok_and(|age| age >= MAIN_ACTIVATION_SHUTDOWN_GRACE)
+}
+
+fn main_data_owner_lock_released(main_paths: &DaemonPaths) -> bool {
+    if !main_paths.data_owner_lock.exists() {
+        return true;
+    }
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&main_paths.data_owner_lock)
+    else {
+        return true;
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = file.unlock();
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn terminate_pending_main_activation(
@@ -3100,21 +3174,56 @@ pub fn handle_pending_shadow_main_process_exit(
     probe_timeout: Duration,
 ) -> Result<PendingShadowMainExit, DaemonError> {
     let observation = crate::main_exit_observation_from_status(status);
-    if observation.exit_code == Some(0)
-        && observation.signal.is_none()
-        && pending_rollout_probe_matches_candidate(
-            &probe_daemon_status(main_paths, probe_timeout),
-            Some(candidate_pid),
-        )
-    {
-        let main_options =
-            promote_shadow_main_rollout(rollout_paths, pending, shadow_host, shadow_port)?;
-        let main_probe_status = probe_daemon_status(main_paths, probe_timeout);
-        return Ok(PendingShadowMainExit::Promoted {
-            main_binary: pending.activation.main_binary.clone(),
-            main_options,
-            main_probe_status,
-        });
+    let probe_status = probe_daemon_status(main_paths, probe_timeout);
+    match pending_shadow_candidate_exit_action(
+        &probe_status,
+        Some(candidate_pid),
+        observation,
+        Instant::now(),
+        pending.deadline,
+    ) {
+        PendingShadowCandidateExitAction::Promote => {
+            let main_options =
+                promote_shadow_main_rollout(rollout_paths, pending, shadow_host, shadow_port)?;
+            let main_probe_status = probe_daemon_status(main_paths, probe_timeout);
+            return Ok(PendingShadowMainExit::Promoted {
+                main_binary: pending.activation.main_binary.clone(),
+                main_options,
+                main_probe_status,
+            });
+        }
+        PendingShadowCandidateExitAction::Retry => {
+            match spawn_candidate_main_daemon_process(
+                &pending.activation.main_binary,
+                &pending.main_options,
+                rollout_paths,
+            ) {
+                Ok((child, diagnostics)) => {
+                    let mut monitor = pending.clone();
+                    monitor.diagnostics = diagnostics;
+                    return Ok(PendingShadowMainExit::RetryCandidate { child, monitor });
+                }
+                Err(error) => {
+                    let detail = format!(
+                        "candidate main exited before health check and retry spawn failed: {error}"
+                    );
+                    let main_binary = recover_failed_shadow_main_rollout(
+                        rollout_paths,
+                        pending,
+                        &detail,
+                        Some(observation),
+                    )?;
+                    let main_options = pending.main_options.clone();
+                    let child = spawn_main_daemon_process(&main_binary, &main_options).ok();
+                    return Ok(PendingShadowMainExit::Recovered {
+                        child,
+                        main_binary,
+                        main_options,
+                    });
+                }
+            }
+        }
+        PendingShadowCandidateExitAction::Recover => {}
     }
 
     let detail = format!(
@@ -3786,6 +3895,55 @@ mod tests {
         assert!(!pending_main_activation_stop_target(
             &DaemonProbeStatus::NotRunning
         ));
+    }
+
+    #[test]
+    fn pending_candidate_clean_exit_retries_before_activation_deadline() {
+        let now = Instant::now();
+        let observation = MainExitObservation::exit_code(0);
+
+        assert_eq!(
+            pending_shadow_candidate_exit_action(
+                &DaemonProbeStatus::NotRunning,
+                Some(42),
+                observation,
+                now,
+                now + Duration::from_secs(30)
+            ),
+            PendingShadowCandidateExitAction::Retry
+        );
+        assert_eq!(
+            pending_shadow_candidate_exit_action(
+                &DaemonProbeStatus::NotRunning,
+                Some(42),
+                observation,
+                now,
+                now
+            ),
+            PendingShadowCandidateExitAction::Recover
+        );
+        assert_eq!(
+            pending_shadow_candidate_exit_action(
+                &DaemonProbeStatus::Running(test_daemon_status(42)),
+                Some(42),
+                observation,
+                now,
+                now
+            ),
+            PendingShadowCandidateExitAction::Promote
+        );
+    }
+
+    #[test]
+    fn pending_candidate_start_waits_for_main_data_owner_lock_release() {
+        let root = temp_rollout_test_root("activation-data-owner-lock");
+        let paths = DaemonPaths::with_root(root.join("daemon"));
+
+        assert!(main_data_owner_lock_released(&paths));
+        let owner = crate::DaemonDataOwnerLock::acquire(&paths).expect("owner lock");
+        assert!(!main_data_owner_lock_released(&paths));
+        drop(owner);
+        assert!(main_data_owner_lock_released(&paths));
     }
 
     #[test]
