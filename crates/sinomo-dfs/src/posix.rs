@@ -829,8 +829,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let detach_request = !options.wait_for_commit && !options.foreground_replica_repair;
         let inline_remote_primary_write = match self.select_metadata_shard_for_object(&object) {
             Ok(Some(shard)) => {
-                !detach_request
-                    && shard.primary_node_id != self.node_id
+                shard.primary_node_id != self.node_id
                     && (bytes.len() as u64) <= crate::DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT
             }
             Ok(None) => false,

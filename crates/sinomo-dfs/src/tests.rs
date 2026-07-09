@@ -9785,6 +9785,109 @@ fn posix_routed_large_write_sends_manifest_only_request() {
 }
 
 #[test]
+fn posix_remote_primary_deferred_small_write_inlines_payload() {
+    let root = temp_root("posix-remote-primary-deferred-small-inline");
+    let writer =
+        NodeId::from_legacy_named("node_posix_remote_deferred_small_writer").expect("writer");
+    let primary =
+        NodeId::from_legacy_named("node_posix_remote_deferred_small_primary").expect("primary");
+    let file_system = file_system(primary.clone());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![writer.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control.put_metadata_shard(&shard).expect("metadata shard");
+    });
+
+    let captured_command = Arc::new(Mutex::new(None::<DfsDistributedWriteCommand>));
+    let captured_command_for_sender = Arc::clone(&captured_command);
+    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
+        if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
+            &command.routed_message.message
+        {
+            *captured_command_for_sender.lock().expect("capture") = Some(write_command.clone());
+        }
+        Ok(DfsMessageResponse {
+            request_id: command.request_id.clone(),
+            outbound_messages: Vec::new(),
+        })
+    });
+    let transport = DfsNodeTransport::with_connect_timeout(
+        writer.clone(),
+        vec![primary.clone()],
+        Duration::from_millis(1),
+        sender,
+    );
+    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(transport, writer_content)
+        .with_control_plane(control_plane)
+        .with_metadata_backend(
+            open_local_sharded_metadata_backend(root.join("metadata"), vec![shard])
+                .expect("metadata backend"),
+        )
+        .expect("attach metadata backend");
+    dfs.add_file_system(file_system.clone())
+        .expect("writer filesystem");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+
+    let path = "/routed-small-deferred-inline.bin";
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = path.to_string();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(object).expect("writer object");
+
+    let bytes = b"small deferred remote primary write should be inline".to_vec();
+    let expected_hash = content_hash(&bytes);
+    let stat = dfs
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+                replica_candidates: vec![writer.clone(), primary.clone()],
+                wait_for_commit: false,
+                foreground_replica_repair: false,
+            },
+        )
+        .expect("pending routed write returns stat for existing object");
+    dfs.flush_detached_transport_sends()
+        .expect("no detached send should be queued");
+
+    assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
+    let command = captured_command
+        .lock()
+        .expect("capture")
+        .clone()
+        .expect("captured routed write command");
+    assert_eq!(command.bytes, bytes);
+    assert_eq!(
+        command.content_hash, None,
+        "small remote-primary POSIX writes should not require a follow-up blob fetch"
+    );
+    assert_eq!(command.content_size_bytes, None);
+    assert_eq!(command.desired_replica_nodes, vec![writer, primary]);
+    assert!(
+        !command.foreground_replica_repair,
+        "deferred publish must preserve nonforeground repair mode"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without_self_rpc() {
     let root = temp_root("posix-local-primary-detached-manifest");
     let local =
