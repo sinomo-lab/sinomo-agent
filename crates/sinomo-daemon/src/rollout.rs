@@ -60,6 +60,12 @@ const PENDING_MAIN_ACTIVATION_FORCE_TERMINATE_AFTER: Duration = Duration::from_s
 const PENDING_MAIN_ACTIVATION_TERMINATE_WAIT: Duration = Duration::from_secs(5);
 const ROLLOUT_DAEMON_TERMINATE_WAIT: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RolloutTerminationMode {
+    ProcessOnly,
+    ProcessTree,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_cluster_rollout_progress(
     daemon_paths: &DaemonPaths,
@@ -1446,7 +1452,7 @@ fn terminate_pending_main_activation(
         Ok(status) if status_is_main_daemon(&status) => status,
         _ => return Ok(None),
     };
-    terminate_process_for_rollout_stop(status.pid)?;
+    terminate_process_for_rollout_stop(status.pid, RolloutTerminationMode::ProcessTree)?;
     let deadline = Instant::now() + wait_timeout;
     while Instant::now() < deadline {
         if matches!(
@@ -1468,7 +1474,10 @@ fn status_is_main_daemon(status: &DaemonStatus) -> bool {
 }
 
 #[cfg(unix)]
-fn terminate_process_for_rollout_stop(pid: u32) -> Result<(), DaemonError> {
+fn terminate_process_for_rollout_stop(
+    pid: u32,
+    _mode: RolloutTerminationMode,
+) -> Result<(), DaemonError> {
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
@@ -1484,9 +1493,13 @@ fn terminate_process_for_rollout_stop(pid: u32) -> Result<(), DaemonError> {
 }
 
 #[cfg(windows)]
-fn terminate_process_for_rollout_stop(pid: u32) -> Result<(), DaemonError> {
+fn terminate_process_for_rollout_stop(
+    pid: u32,
+    mode: RolloutTerminationMode,
+) -> Result<(), DaemonError> {
+    let args = windows_taskkill_args_for_rollout_stop(pid, mode);
     let output = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .args(args.iter().map(String::as_str))
         .output()
         .map_err(|source| DaemonError::Io {
             path: "taskkill".to_string(),
@@ -1503,8 +1516,21 @@ fn terminate_process_for_rollout_stop(pid: u32) -> Result<(), DaemonError> {
     })
 }
 
+#[cfg(any(test, windows))]
+fn windows_taskkill_args_for_rollout_stop(pid: u32, mode: RolloutTerminationMode) -> Vec<String> {
+    let mut args = vec!["/PID".to_string(), pid.to_string()];
+    if mode == RolloutTerminationMode::ProcessTree {
+        args.push("/T".to_string());
+    }
+    args.push("/F".to_string());
+    args
+}
+
 #[cfg(not(any(unix, windows)))]
-fn terminate_process_for_rollout_stop(_pid: u32) -> Result<(), DaemonError> {
+fn terminate_process_for_rollout_stop(
+    _pid: u32,
+    _mode: RolloutTerminationMode,
+) -> Result<(), DaemonError> {
     Ok(())
 }
 
@@ -2466,6 +2492,7 @@ fn stop_daemon_for_rollout(
     host: &str,
     port: u16,
     label: &str,
+    termination_mode: RolloutTerminationMode,
     timeout: Duration,
     probe_timeout: Duration,
 ) -> Result<(), DaemonError> {
@@ -2508,7 +2535,7 @@ fn stop_daemon_for_rollout(
                     status.pid,
                     timeout.as_millis()
                 );
-                terminate_process_for_rollout_stop(status.pid)?;
+                terminate_process_for_rollout_stop(status.pid, termination_mode)?;
                 let terminate_deadline = Instant::now() + ROLLOUT_DAEMON_TERMINATE_WAIT;
                 while Instant::now() < terminate_deadline {
                     match probe_daemon_status(daemon_paths, probe_timeout) {
@@ -2545,6 +2572,7 @@ fn stop_shadow_supervisor_for_rollout(
         shadow_host,
         shadow_port,
         "shadow supervisor",
+        RolloutTerminationMode::ProcessOnly,
         timeout,
         probe_timeout,
     )
@@ -2562,6 +2590,7 @@ fn stop_main_daemon_for_rollout(
         main_host,
         main_port,
         "main daemon",
+        RolloutTerminationMode::ProcessTree,
         timeout,
         probe_timeout,
     )
@@ -3951,6 +3980,18 @@ mod tests {
         assert!(PENDING_MAIN_ACTIVATION_FORCE_TERMINATE_AFTER <= Duration::from_secs(10));
         assert!(PENDING_MAIN_ACTIVATION_TERMINATE_WAIT <= Duration::from_secs(5));
         assert!(ROLLOUT_DAEMON_TERMINATE_WAIT <= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn shadow_force_stop_does_not_terminate_supervised_main_tree() {
+        assert_eq!(
+            windows_taskkill_args_for_rollout_stop(42, RolloutTerminationMode::ProcessOnly),
+            vec!["/PID", "42", "/F"]
+        );
+        assert_eq!(
+            windows_taskkill_args_for_rollout_stop(42, RolloutTerminationMode::ProcessTree),
+            vec!["/PID", "42", "/T", "/F"]
+        );
     }
 
     #[test]
