@@ -973,7 +973,8 @@ pub fn cluster_member_main_daemon_connectivity(
     }
     if graph
         .best_reachable_endpoint(&state.local_node_id, &member.node_id)
-        .is_some()
+        .as_ref()
+        .is_some_and(cluster_endpoint_can_carry_main_daemon_rpc)
     {
         return ClusterMemberMainDaemonConnectivity::Degraded;
     }
@@ -2239,6 +2240,88 @@ mod tests {
         assert!(
             targets.is_empty(),
             "synthetic tcp-tunnel route endpoints are route-layer evidence, not raw bootstrap sockets"
+        );
+    }
+
+    #[test]
+    fn main_daemon_connectivity_ignores_shadow_only_degraded_endpoint() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-main-connectivity-shadow-only");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_main_connectivity_shadow_only")
+            .expect("cluster id");
+        let local =
+            NodeId::from_legacy_named("node_main_connectivity_shadow_local").expect("local node");
+        let remote =
+            NodeId::from_legacy_named("node_main_connectivity_shadow_remote").expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "main connectivity shadow-only",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let main_endpoint = selector_test_endpoint(
+            &remote,
+            "remote.example.test:21353",
+            ClusterEndpointPrivacy::Lan,
+            0,
+        );
+        let shadow_endpoint = selector_test_endpoint(
+            &remote,
+            "remote.example.test:21354",
+            ClusterEndpointPrivacy::Lan,
+            0,
+        );
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
+        member.endpoints = vec![main_endpoint.clone(), shadow_endpoint.clone()];
+        state.members.push(member);
+        let main_connectivity = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &main_endpoint,
+            ClusterConnectivityState::Unreachable,
+            None,
+            3,
+            None,
+            Some(now.to_string()),
+            now,
+            60,
+        );
+        let shadow_connectivity = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &shadow_endpoint,
+            ClusterConnectivityState::Degraded,
+            Some(50),
+            1,
+            Some(now.to_string()),
+            None,
+            now,
+            60,
+        );
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            &[main_connectivity, shadow_connectivity],
+        )
+        .expect("write local connectivity");
+
+        let connectivity =
+            cluster_member_main_daemon_connectivity(&paths, &state, &state.members[1]);
+
+        assert_eq!(
+            connectivity,
+            ClusterMemberMainDaemonConnectivity::Unreachable,
+            "a degraded shadow endpoint must not make the main daemon look reachable"
         );
     }
 }

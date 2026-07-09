@@ -102,6 +102,7 @@ pub struct NetworkedDfsService<T> {
     pub(crate) incoming_fetch_transfers: BTreeMap<String, InProgressFetchBlobTransfer>,
     pub(crate) incoming_blob_transfers: BTreeMap<String, InProgressBlobTransfer>,
     pub(crate) incoming_patch_transfers: BTreeMap<String, InProgressPatchTransfer>,
+    pub(crate) local_metadata_journal_cursors: BTreeMap<DfsMetadataShardId, u64>,
     pub(crate) metadata_replication_cursors: BTreeMap<(NodeId, DfsMetadataShardId), u64>,
     pub(crate) recent_namespace_freshness_syncs:
         BTreeMap<(DfsFileSystemId, DfsMetadataShardId, NodeId), Instant>,

@@ -24,7 +24,7 @@ use crate::{
     content_service_key, default_dfs_metadata_shards_root, dfs_message_sender_from_peer_transport,
     dfs_metadata_journal_batch_sender_from_peer_transport,
     dfs_metadata_snapshot_install_sender_from_peer_transport, distributed_sifs,
-    file_system_config_key, materialize_default_sifs_metadata,
+    file_system_config_key, local_dfs_metadata_shard_path, materialize_default_sifs_metadata,
     materialize_default_sifs_metadata_on_shards, metadata_service_key, metadata_shard_key,
     open_cluster_aware_dfs_metadata_backend, open_local_metadata_shard_backend,
     open_local_sharded_metadata_backend, run_cluster_dfs_smoke_with_message_sender,
@@ -572,11 +572,14 @@ fn metadata_shard_local_replica_failover_ready_from_local_backend(
         return Ok(false);
     }
     let shard_id = DfsMetadataShardId::new(current.shard_id.clone());
+    if !local_dfs_metadata_shard_path(data_dir, &shard_id).exists() {
+        return Ok(false);
+    }
     let backend = open_local_metadata_shard_backend(data_dir, shard_id.clone())?;
     Ok(backend
         .metadata_shard_statuses()?
         .into_iter()
-        .any(|status| status.shard_id == shard_id))
+        .any(|status| status.shard_id == shard_id && status.journal_last_sequence > 0))
 }
 
 fn metadata_shard_primary_route_unhealthy(
@@ -966,18 +969,19 @@ pub fn default_cluster_metadata_shard_with_host(
     let service_node_ids =
         host.metadata_service_node_ids(state, stable_dfs_service_node_ids(state));
     let bootstrap_primary_node_id = default_cluster_sifs_owner(state);
-    let target_primary_node_id = default_metadata_shard_primary_node_id(
+    let default_target_primary_node_id = default_metadata_shard_primary_node_id(
         &service_node_ids,
         &bootstrap_primary_node_id,
         primary_offset,
     );
-    let target_replica_node_ids =
-        default_metadata_shard_replica_node_ids(&service_node_ids, &target_primary_node_id);
     let mut desired = DfsMetadataShardConfig {
         file_system_id: file_system.file_system_id.clone(),
         shard_id: shard_id.to_string(),
-        primary_node_id: target_primary_node_id,
-        replica_node_ids: target_replica_node_ids,
+        primary_node_id: default_target_primary_node_id.clone(),
+        replica_node_ids: default_metadata_shard_replica_node_ids(
+            &service_node_ids,
+            &default_target_primary_node_id,
+        ),
         epoch: 1,
         assignment,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
@@ -988,6 +992,16 @@ pub fn default_cluster_metadata_shard_with_host(
             default_metadata_shard_replica_node_ids(&service_node_ids, &bootstrap_primary_node_id);
         return Ok(desired);
     };
+    let connectivity_graph = host.connectivity_graph(state);
+    desired.primary_node_id = default_metadata_shard_target_primary_node_id(
+        connectivity_graph.as_ref(),
+        state,
+        &service_node_ids,
+        default_target_primary_node_id,
+        &current,
+    );
+    desired.replica_node_ids =
+        default_metadata_shard_replica_node_ids(&service_node_ids, &desired.primary_node_id);
     if current.primary_node_id != desired.primary_node_id
         && !host.metadata_shard_primary_transfer_ready(&current, &desired.primary_node_id)?
     {
@@ -1019,18 +1033,19 @@ pub async fn default_cluster_metadata_shard_with_async_host(
     let service_node_ids =
         host.metadata_service_node_ids(state, stable_dfs_service_node_ids(state));
     let bootstrap_primary_node_id = default_cluster_sifs_owner(state);
-    let target_primary_node_id = default_metadata_shard_primary_node_id(
+    let default_target_primary_node_id = default_metadata_shard_primary_node_id(
         &service_node_ids,
         &bootstrap_primary_node_id,
         primary_offset,
     );
-    let target_replica_node_ids =
-        default_metadata_shard_replica_node_ids(&service_node_ids, &target_primary_node_id);
     let mut desired = DfsMetadataShardConfig {
         file_system_id: file_system.file_system_id.clone(),
         shard_id: shard_id.to_string(),
-        primary_node_id: target_primary_node_id,
-        replica_node_ids: target_replica_node_ids,
+        primary_node_id: default_target_primary_node_id.clone(),
+        replica_node_ids: default_metadata_shard_replica_node_ids(
+            &service_node_ids,
+            &default_target_primary_node_id,
+        ),
         epoch: 1,
         assignment,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
@@ -1044,6 +1059,16 @@ pub async fn default_cluster_metadata_shard_with_async_host(
             default_metadata_shard_replica_node_ids(&service_node_ids, &bootstrap_primary_node_id);
         return Ok(desired);
     };
+    let connectivity_graph = host.connectivity_graph(state);
+    desired.primary_node_id = default_metadata_shard_target_primary_node_id(
+        connectivity_graph.as_ref(),
+        state,
+        &service_node_ids,
+        default_target_primary_node_id,
+        &current,
+    );
+    desired.replica_node_ids =
+        default_metadata_shard_replica_node_ids(&service_node_ids, &desired.primary_node_id);
     if current.primary_node_id != desired.primary_node_id
         && !host
             .metadata_shard_primary_transfer_ready_async(
@@ -1067,6 +1092,40 @@ pub async fn default_cluster_metadata_shard_with_async_host(
     }
     desired.epoch = current.epoch.saturating_add(1);
     Ok(desired)
+}
+
+fn default_metadata_shard_target_primary_node_id(
+    connectivity_graph: Option<&ClusterConnectivityGraph>,
+    state: &ClusterBootstrapState,
+    service_node_ids: &[NodeId],
+    default_target_primary_node_id: NodeId,
+    current: &DfsMetadataShardConfig,
+) -> NodeId {
+    if current.primary_node_id == state.local_node_id {
+        return default_target_primary_node_id;
+    }
+    if !service_node_ids
+        .iter()
+        .any(|node_id| node_id == &state.local_node_id)
+    {
+        return default_target_primary_node_id;
+    }
+    if !current
+        .replica_node_ids
+        .iter()
+        .any(|node_id| node_id == &state.local_node_id)
+    {
+        return default_target_primary_node_id;
+    }
+    let Some(graph) = connectivity_graph else {
+        return default_target_primary_node_id;
+    };
+    if cluster_healthy_route_next_hop(graph, &state.local_node_id, &current.primary_node_id)
+        .is_some()
+    {
+        return default_target_primary_node_id;
+    }
+    state.local_node_id.clone()
 }
 
 pub fn default_metadata_shard_primary_node_id(
@@ -1227,4 +1286,297 @@ async fn stable_dfs_advertisement_async(
         return Ok(current);
     }
     Ok(desired)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_core::ClusterTransportKind;
+    use sinomo_core::network::{
+        ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState,
+        ClusterEndpointId,
+    };
+    use sinomo_core::node::ClusterId;
+
+    #[derive(Debug)]
+    struct TestDefaultClusterBootstrapHost {
+        current_shard: Option<DfsMetadataShardConfig>,
+        connectivity_graph: Option<ClusterConnectivityGraph>,
+        primary_transfer_ready: bool,
+        primary_transfer_targets: Vec<NodeId>,
+    }
+
+    impl DfsDefaultClusterBootstrapHost for TestDefaultClusterBootstrapHost {
+        fn connectivity_graph(
+            &self,
+            _state: &ClusterBootstrapState,
+        ) -> Option<ClusterConnectivityGraph> {
+            self.connectivity_graph.clone()
+        }
+
+        fn current_metadata_shard(
+            &self,
+            _file_system_id: &DfsFileSystemId,
+            _shard_id: &str,
+        ) -> Result<Option<DfsMetadataShardConfig>, DfsError> {
+            Ok(self.current_shard.clone())
+        }
+
+        fn metadata_shard_primary_transfer_ready(
+            &mut self,
+            _current: &DfsMetadataShardConfig,
+            target_primary_node_id: &NodeId,
+        ) -> Result<bool, DfsError> {
+            self.primary_transfer_targets
+                .push(target_primary_node_id.clone());
+            Ok(self.primary_transfer_ready)
+        }
+
+        fn put_file_system_config(
+            &mut self,
+            _config: &DfsFileSystemConfig,
+        ) -> Result<(), DfsError> {
+            Ok(())
+        }
+
+        fn put_metadata_shard(&mut self, _shard: &DfsMetadataShardConfig) -> Result<(), DfsError> {
+            Ok(())
+        }
+
+        fn current_node_advertisement(
+            &self,
+            _key: &str,
+        ) -> Result<Option<DfsNodeAdvertisement>, DfsError> {
+            Ok(None)
+        }
+
+        fn put_node_advertisement(
+            &mut self,
+            _key: String,
+            _advertisement: &DfsNodeAdvertisement,
+        ) -> Result<(), DfsError> {
+            Ok(())
+        }
+
+        fn materialize_default_sifs_metadata(
+            &mut self,
+            _file_system: &DfsFileSystem,
+            _bootstrap_owner_node_ids: Vec<NodeId>,
+            _fallback_owner_node_id: NodeId,
+        ) -> Result<(), DfsError> {
+            Ok(())
+        }
+
+        fn materialize_default_sifs_metadata_on_shards(
+            &mut self,
+            _file_system: &DfsFileSystem,
+            _shards: Vec<DfsMetadataShardConfig>,
+            _bootstrap_owner_node_ids: Vec<NodeId>,
+            _fallback_owner_node_id: NodeId,
+        ) -> Result<(), DfsError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn metadata_shard_failover_targets_local_replica_when_current_primary_unhealthy() {
+        let state = test_cluster_state_with_members(
+            "cluster_dfs_default_unhealthy_primary",
+            "node_dfs_unhealthy_primary_c",
+            &[
+                "node_dfs_unhealthy_primary_a",
+                "node_dfs_unhealthy_primary_b",
+            ],
+        );
+        let service_nodes = stable_dfs_service_node_ids(&state);
+        assert_eq!(service_nodes.len(), 3);
+        let local_index = service_nodes
+            .iter()
+            .position(|node_id| node_id == &state.local_node_id)
+            .expect("local service node");
+        let unreachable_index = (local_index + 1) % service_nodes.len();
+        let unreachable_primary = service_nodes[unreachable_index].clone();
+        let bootstrap_primary = service_nodes
+            .iter()
+            .find(|node_id| *node_id != &state.local_node_id && *node_id != &unreachable_primary)
+            .cloned()
+            .expect("bootstrap peer");
+
+        let file_system = default_cluster_sifs(&state);
+        let current = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "services".to_string(),
+            primary_node_id: unreachable_primary.clone(),
+            replica_node_ids: vec![bootstrap_primary.clone(), state.local_node_id.clone()],
+            epoch: 7,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: SIFS_SERVICES_PATH.to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let graph = ClusterConnectivityGraph::from_records(
+            state.local_node_id.clone(),
+            vec![test_connectivity_record(
+                &state,
+                &state.local_node_id,
+                &bootstrap_primary,
+                "reachable-peer",
+                ClusterConnectivityState::Healthy,
+            )],
+        );
+        let mut host = TestDefaultClusterBootstrapHost {
+            current_shard: Some(current.clone()),
+            connectivity_graph: Some(graph),
+            primary_transfer_ready: true,
+            primary_transfer_targets: Vec::new(),
+        };
+
+        let shard = default_cluster_metadata_shard_with_host(
+            &mut host,
+            &state,
+            &file_system,
+            "services",
+            DfsMetadataShardAssignment::PathPrefix {
+                prefix: SIFS_SERVICES_PATH.to_string(),
+            },
+            unreachable_index,
+        )
+        .expect("services shard");
+
+        assert_eq!(shard.primary_node_id, state.local_node_id);
+        assert_eq!(shard.epoch, current.epoch + 1);
+        assert_eq!(
+            host.primary_transfer_targets,
+            vec![state.local_node_id.clone()]
+        );
+        assert!(
+            shard
+                .replica_node_ids
+                .iter()
+                .any(|node_id| node_id == &unreachable_primary),
+            "offline members stay in the replica set so they can catch up after recovery"
+        );
+    }
+
+    #[test]
+    fn metadata_shard_local_replica_failover_ready_requires_local_shard_status() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-default-local-failover-ready");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("root layout");
+        let local = NodeId::from_legacy_named("node_dfs_failover_ready_local").expect("local");
+        let remote_primary =
+            NodeId::from_legacy_named("node_dfs_failover_ready_remote").expect("remote");
+        let non_replica =
+            NodeId::from_legacy_named("node_dfs_failover_ready_non_replica").expect("non replica");
+        let file_system = distributed_sifs(remote_primary.clone());
+        let current = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: remote_primary.clone(),
+            replica_node_ids: vec![local.clone()],
+            epoch: 5,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+
+        assert!(
+            !metadata_shard_local_replica_failover_ready_from_local_backend(
+                &data_dir, &local, &current, &local,
+            )
+            .expect("empty local shard is not promotable")
+        );
+        assert!(
+            !metadata_shard_local_replica_failover_ready_from_local_backend(
+                &data_dir,
+                &local,
+                &DfsMetadataShardConfig {
+                    replica_node_ids: vec![non_replica],
+                    ..current.clone()
+                },
+                &local,
+            )
+            .expect("non replica cannot self-promote")
+        );
+        assert!(
+            !metadata_shard_local_replica_failover_ready_from_local_backend(
+                &data_dir,
+                &local,
+                &current,
+                &remote_primary,
+            )
+            .expect("local replica only proves local promotion")
+        );
+
+        let mut backend =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
+                .expect("local root shard");
+        backend.put_file_system(&file_system).expect("filesystem");
+        drop(backend);
+
+        assert!(
+            metadata_shard_local_replica_failover_ready_from_local_backend(
+                &data_dir, &local, &current, &local,
+            )
+            .expect("local shard status makes replica promotable")
+        );
+    }
+
+    fn test_cluster_state_with_members(
+        cluster_name: &str,
+        local_name: &str,
+        remote_names: &[&str],
+    ) -> ClusterBootstrapState {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named(cluster_name).expect("cluster id");
+        let local = NodeId::from_legacy_named(local_name).expect("local node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "dfs default cluster test",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        for remote_name in remote_names {
+            let node_id = NodeId::from_legacy_named(*remote_name).expect("remote node");
+            state.members.push(ClusterMemberRecord::local_voter(
+                cluster_id.clone(),
+                node_id,
+                *remote_name,
+                format!("pk-{remote_name}"),
+                now,
+            ));
+        }
+        state
+    }
+
+    fn test_connectivity_record(
+        state: &ClusterBootstrapState,
+        source: &NodeId,
+        target: &NodeId,
+        endpoint_name: &str,
+        connectivity_state: ClusterConnectivityState,
+    ) -> ClusterConnectivityRecord {
+        let now = OffsetDateTime::now_utc();
+        let healthy = connectivity_state == ClusterConnectivityState::Healthy;
+        ClusterConnectivityRecord {
+            cluster_id: state.cluster_id.clone(),
+            source_node_id: source.clone(),
+            target_node_id: target.clone(),
+            endpoint_id: ClusterEndpointId::derived(
+                "sinomo.test.dfs.metadata-primary",
+                format!("{}\0{}\0{endpoint_name}", source.as_str(), target.as_str()),
+            ),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!("{endpoint_name}.example.test:21353"),
+            state: connectivity_state,
+            latency_ms: healthy.then_some(2),
+            consecutive_failures: if healthy { 0 } else { 1 },
+            last_success_at: healthy.then(|| now.to_string()),
+            last_failure_at: (!healthy).then(|| now.to_string()),
+            failure_reason: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(900),
+        }
+    }
 }

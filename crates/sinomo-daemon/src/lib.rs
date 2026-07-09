@@ -220,6 +220,8 @@ pub use install::{UserPathUpdate, ensure_windows_user_path_contains};
 pub(crate) use observe::{
     OperationalSeverity, append_operational_event_best_effort, append_operational_log_best_effort,
 };
+#[cfg(not(unix))]
+pub(crate) use process::spawn_shadow_rollout_completion_helper_process;
 pub(crate) use process::{
     CandidateMainDiagnostics, build_daemon_async_runtime, main_exit_observation_from_status,
     prepare_background_command, spawn_candidate_main_daemon_process, spawn_main_daemon_process,

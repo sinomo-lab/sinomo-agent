@@ -1318,10 +1318,10 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
                         );
                     } else {
                         println!("{}: {}", target.label(), response.status);
-                        if response.status == "accepted"
-                            && let Some(node_id) = target.rollout_node_id()
-                        {
-                            completed_rollout_nodes.insert(node_id.clone());
+                        if response.status == "accepted" {
+                            if let Some(node_id) = target.rollout_node_id() {
+                                completed_rollout_nodes.insert(node_id.clone());
+                            }
                         }
                     }
                     if !response.detail.is_empty() {
@@ -1364,10 +1364,10 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
         match send_prepared_daemon_rollout_binary(&target, request) {
             Ok(response) => {
                 println!("{}: {}", target.label(), response.status);
-                if response.status == "accepted"
-                    && let Some(node_id) = target.rollout_node_id()
-                {
-                    completed_rollout_nodes.insert(node_id.clone());
+                if response.status == "accepted" {
+                    if let Some(node_id) = target.rollout_node_id() {
+                        completed_rollout_nodes.insert(node_id.clone());
+                    }
                 }
                 if !response.detail.is_empty() {
                     println!("  {}", response.detail);
@@ -1620,6 +1620,23 @@ const ROLLOUT_TERMINAL_STATUS_GRACE: Duration = Duration::from_secs(45);
 const ROLLOUT_ACTIVE_STATUS_ERROR_GRACE: Duration = Duration::from_secs(15 * 60);
 const ROLLOUT_PROGRESS_BAR_WIDTH: usize = 24;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RolloutProgressTiming {
+    pub(crate) poll_interval: Duration,
+    pub(crate) terminal_status_grace: Duration,
+    pub(crate) active_status_error_grace: Duration,
+}
+
+impl RolloutProgressTiming {
+    fn production() -> Self {
+        Self {
+            poll_interval: ROLLOUT_PROGRESS_POLL_INTERVAL,
+            terminal_status_grace: ROLLOUT_TERMINAL_STATUS_GRACE,
+            active_status_error_grace: ROLLOUT_ACTIVE_STATUS_ERROR_GRACE,
+        }
+    }
+}
+
 pub(crate) fn rollout_progress_bar(status: Option<&ClusterNodeRolloutStatus>) -> String {
     let Some(status) = status else {
         return format!("[{}]   -", ".".repeat(ROLLOUT_PROGRESS_BAR_WIDTH));
@@ -1735,25 +1752,45 @@ pub(crate) fn rollout_terminal_response(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn rollout_pending_error_grace(
     status: Option<&ClusterNodeRolloutStatus>,
     expectation: &RolloutProgressExpectation,
 ) -> Duration {
-    let Some(status) = status else {
-        return ROLLOUT_TERMINAL_STATUS_GRACE;
-    };
-    if !expectation.matches(status) || rollout_terminal_response(status, expectation).is_some() {
-        return ROLLOUT_TERMINAL_STATUS_GRACE;
-    }
-    ROLLOUT_ACTIVE_STATUS_ERROR_GRACE
+    rollout_pending_error_grace_with_timing(
+        status,
+        expectation,
+        RolloutProgressTiming::production(),
+    )
 }
 
-pub(crate) fn rollout_missing_status_grace(has_seen_matching_status: bool) -> Duration {
-    if has_seen_matching_status {
-        ROLLOUT_TERMINAL_STATUS_GRACE
-    } else {
-        ROLLOUT_ACTIVE_STATUS_ERROR_GRACE
+fn rollout_pending_error_grace_with_timing(
+    status: Option<&ClusterNodeRolloutStatus>,
+    expectation: &RolloutProgressExpectation,
+    timing: RolloutProgressTiming,
+) -> Duration {
+    let Some(status) = status else {
+        return timing.terminal_status_grace;
+    };
+    if !expectation.matches(status) || rollout_terminal_response(status, expectation).is_some() {
+        return timing.terminal_status_grace;
     }
+    timing.active_status_error_grace
+}
+
+#[cfg(test)]
+pub(crate) fn rollout_missing_status_grace(has_seen_matching_status: bool) -> Duration {
+    rollout_missing_status_grace_with_timing(
+        has_seen_matching_status,
+        RolloutProgressTiming::production(),
+    )
+}
+
+fn rollout_missing_status_grace_with_timing(
+    _has_seen_matching_status: bool,
+    timing: RolloutProgressTiming,
+) -> Duration {
+    timing.active_status_error_grace
 }
 
 fn send_rollout_request_with_progress<F>(
@@ -1764,6 +1801,30 @@ fn send_rollout_request_with_progress<F>(
 ) -> Result<ClusterRolloutBinaryResponse, CliError>
 where
     F: FnOnce(RolloutTarget) -> Result<ClusterRolloutBinaryResponse, CliError> + Send + 'static,
+{
+    send_rollout_request_with_progress_inner(
+        target,
+        operation,
+        expectation,
+        send,
+        |target| read_rollout_target_status(target).map(|status| status.rollout),
+        RolloutProgressTiming::production(),
+        true,
+    )
+}
+
+fn send_rollout_request_with_progress_inner<F, R>(
+    target: &RolloutTarget,
+    operation: &'static str,
+    expectation: RolloutProgressExpectation,
+    send: F,
+    mut read_status: R,
+    timing: RolloutProgressTiming,
+    emit_progress: bool,
+) -> Result<ClusterRolloutBinaryResponse, CliError>
+where
+    F: FnOnce(RolloutTarget) -> Result<ClusterRolloutBinaryResponse, CliError> + Send + 'static,
+    R: FnMut(&RolloutTarget) -> Result<Option<ClusterNodeRolloutStatus>, CliError>,
 {
     let target_for_send = target.clone();
     let target_for_poll = target.clone();
@@ -1781,9 +1842,9 @@ where
     let mut missing_status_started_at: Option<Instant> = None;
     loop {
         if pending_error.is_none() {
-            match result_rx.recv_timeout(ROLLOUT_PROGRESS_POLL_INTERVAL) {
+            match result_rx.recv_timeout(timing.poll_interval) {
                 Ok(Ok(response)) => {
-                    if drew_progress {
+                    if emit_progress && drew_progress {
                         println!();
                     }
                     return Ok(response);
@@ -1802,12 +1863,12 @@ where
                 }
             }
         } else {
-            thread::sleep(ROLLOUT_PROGRESS_POLL_INTERVAL);
+            thread::sleep(timing.poll_interval);
         }
 
-        let rollout_status = read_rollout_target_status(&target_for_poll)
+        let rollout_status = read_status(&target_for_poll)
             .ok()
-            .and_then(|status| status.rollout)
+            .flatten()
             .filter(|status| rollout_status_matches_expectation(status, &expectation));
         if rollout_status.is_some() {
             has_seen_matching_status = true;
@@ -1815,9 +1876,9 @@ where
         } else {
             let missing_started_at = *missing_status_started_at.get_or_insert_with(Instant::now);
             if missing_started_at.elapsed()
-                >= rollout_missing_status_grace(has_seen_matching_status)
+                >= rollout_missing_status_grace_with_timing(has_seen_matching_status, timing)
             {
-                if drew_progress {
+                if emit_progress && drew_progress {
                     println!();
                 }
                 return Err(CliError::Network {
@@ -1836,33 +1897,65 @@ where
                 });
             }
         }
-        let line = format_rollout_progress_line(
-            target.label(),
-            operation,
-            rollout_status.as_ref(),
-            started.elapsed(),
-        );
-        write_rollout_progress_line(&line, &mut last_len)?;
-        drew_progress = true;
+        if emit_progress {
+            let line = format_rollout_progress_line(
+                target.label(),
+                operation,
+                rollout_status.as_ref(),
+                started.elapsed(),
+            );
+            write_rollout_progress_line(&line, &mut last_len)?;
+            drew_progress = true;
+        }
         if let Some(response) = rollout_status
             .as_ref()
             .and_then(|status| rollout_terminal_response(status, &expectation))
         {
-            println!();
+            if emit_progress {
+                println!();
+            }
             return Ok(response);
         }
-        if pending_error_started_at.is_some_and(|started_at| {
-            started_at.elapsed()
-                >= rollout_pending_error_grace(rollout_status.as_ref(), &expectation)
-        }) {
+        let pending_error_grace = if rollout_status.is_none() && has_seen_matching_status {
+            timing.active_status_error_grace
+        } else {
+            rollout_pending_error_grace_with_timing(rollout_status.as_ref(), &expectation, timing)
+        };
+        if pending_error_started_at
+            .is_some_and(|started_at| started_at.elapsed() >= pending_error_grace)
+        {
             if let Some(error) = pending_error {
-                if drew_progress {
+                if emit_progress && drew_progress {
                     println!();
                 }
                 return Err(error);
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn send_rollout_request_with_progress_for_test<F, R>(
+    target: &RolloutTarget,
+    operation: &'static str,
+    expectation: RolloutProgressExpectation,
+    send: F,
+    read_status: R,
+    timing: RolloutProgressTiming,
+) -> Result<ClusterRolloutBinaryResponse, CliError>
+where
+    F: FnOnce(RolloutTarget) -> Result<ClusterRolloutBinaryResponse, CliError> + Send + 'static,
+    R: FnMut(&RolloutTarget) -> Result<Option<ClusterNodeRolloutStatus>, CliError>,
+{
+    send_rollout_request_with_progress_inner(
+        target,
+        operation,
+        expectation,
+        send,
+        read_status,
+        timing,
+        false,
+    )
 }
 
 pub(crate) fn read_rollout_target_status(target: &RolloutTarget) -> Result<DaemonStatus, CliError> {

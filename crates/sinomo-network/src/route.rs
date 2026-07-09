@@ -33,7 +33,8 @@ pub const CLUSTER_ROUTING_RPC_ROUTE_METADATA: &[(&str, &str)] =
 const CLUSTER_RELAY_DEFAULT_TTL: u8 = 8;
 const CLUSTER_RELAY_MAX_FAILURE_DETAILS: usize = 8;
 const CLUSTER_RELAY_FAILURE_DETAIL_MAX_CHARS: usize = 512;
-pub const CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX: Duration = Duration::from_secs(10);
+pub const CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX: Duration = Duration::from_secs(5);
+const CLUSTER_TARGET_ROUTE_DEADLINE_MAX: Duration = Duration::from_secs(5);
 const CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX: Duration = Duration::from_secs(2);
 const CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED: Duration =
     Duration::from_millis(3500);
@@ -867,33 +868,24 @@ fn cluster_delivery_route_candidates(
                 cost: edge_cost.saturating_add(path.cost),
                 complete: true,
             });
-        } else {
-            let path = cluster_delivery_two_node_path(local_node_id, next_hop)?;
-            crate::object::try_reserve_vec(
-                &mut candidates,
-                1,
-                "cluster delivery route candidates",
-            )?;
-            candidates.push(ClusterDeliveryRouteCandidate {
-                plan: ClusterDeliveryRoutePlan {
-                    next_hop: try_clone_route_node_id(next_hop, "cluster delivery next hop")?,
-                    endpoints,
-                    path: try_clone_route_node_ids(&path, "cluster delivery route plan path")?,
-                },
-                path,
-                first_hop_cost: edge_cost,
-                cost: edge_cost,
-                complete: false,
-            });
         }
+        // Do not synthesize an incomplete relay hop here. A non-target next hop is only a
+        // valid route when the connectivity graph proves it can reach the target.
     }
     candidates.sort_by(
         |left, right| match (left.verified_complete(), right.verified_complete()) {
-            (true, true) => (left.cost, left.first_hop_cost, left.plan.next_hop.as_str()).cmp(&(
-                right.cost,
-                right.first_hop_cost,
-                right.plan.next_hop.as_str(),
-            )),
+            (true, true) => (
+                cluster_delivery_route_candidate_hop_rank(left, target_node_id),
+                left.cost,
+                left.first_hop_cost,
+                left.plan.next_hop.as_str(),
+            )
+                .cmp(&(
+                    cluster_delivery_route_candidate_hop_rank(right, target_node_id),
+                    right.cost,
+                    right.first_hop_cost,
+                    right.plan.next_hop.as_str(),
+                )),
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
             (false, false) => (
@@ -911,6 +903,17 @@ fn cluster_delivery_route_candidates(
         },
     );
     Ok(candidates)
+}
+
+fn cluster_delivery_route_candidate_hop_rank(
+    candidate: &ClusterDeliveryRouteCandidate,
+    target_node_id: &NodeId,
+) -> u8 {
+    if candidate.plan.next_hop == *target_node_id {
+        0
+    } else {
+        1
+    }
 }
 
 fn cluster_delivery_two_node_path(
@@ -1649,6 +1652,7 @@ fn cluster_delivery_sort_route_endpoints_for_attempt(
     endpoints.sort_by(|left, right| {
         (
             graph.unavailability_rank(left),
+            cluster_delivery_endpoint_attempt_sort_rank(left),
             graph.quality_rank(left),
             cluster_delivery_endpoint_path_cost(&left.transport, &left.address, &left.privacy),
             left.priority,
@@ -1657,6 +1661,7 @@ fn cluster_delivery_sort_route_endpoints_for_attempt(
         )
             .cmp(&(
                 graph.unavailability_rank(right),
+                cluster_delivery_endpoint_attempt_sort_rank(right),
                 graph.quality_rank(right),
                 cluster_delivery_endpoint_path_cost(
                     &right.transport,
@@ -1668,6 +1673,14 @@ fn cluster_delivery_sort_route_endpoints_for_attempt(
                 right.address.as_str(),
             ))
     });
+}
+
+fn cluster_delivery_endpoint_attempt_sort_rank(endpoint: &ClusterEndpointRecord) -> u8 {
+    if cluster_delivery_endpoint_is_tcp_tunnel(endpoint) {
+        1
+    } else {
+        0
+    }
 }
 
 fn cluster_delivery_endpoint_is_tcp_tunnel(endpoint: &ClusterEndpointRecord) -> bool {
@@ -2500,7 +2513,8 @@ where
     ) -> Result<ObjectRpcResponse, NetworkError> {
         let traceparent = request.traceparent().unwrap_or_default().to_string();
         let call_started_at = Instant::now();
-        let deadline = ClusterEndpointRpcDeadline::new(options.timeouts.connect_timeout);
+        let route_timeout = cluster_target_route_timeout(options.timeouts.connect_timeout);
+        let deadline = ClusterEndpointRpcDeadline::new(route_timeout);
         let mut failed_edges = ClusterDeliveryFailedEdges::default();
         let mut failures = Vec::new();
         let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
@@ -2563,18 +2577,31 @@ where
                 &local_connectivity,
                 &mut route_endpoints,
             );
+            let relay_target_endpoints = if &route_plan.next_hop == target_node_id {
+                Vec::new()
+            } else {
+                cluster_delivery_target_endpoint_hints(paths, state, target_node_id)?
+            };
+            let relay_has_direct_target_fallback = relay_target_endpoints.iter().any(|endpoint| {
+                cluster_delivery_local_endpoint_is_usable(&state.local_node_id, endpoint)
+            });
             let route_endpoint_count = route_endpoints.len();
             for (endpoint_index, endpoint) in route_endpoints.into_iter().enumerate() {
                 let attempt_started_at = Instant::now();
                 let Some(remaining) = deadline.checked_remaining() else {
                     return Err(cluster_target_rpc_timeout_error(
                         target_node_id,
-                        options.timeouts.connect_timeout,
+                        route_timeout,
                         &failures,
                     ));
                 };
                 let final_hop = &route_plan.next_hop == target_node_id;
                 let endpoints_left = route_endpoint_count.saturating_sub(endpoint_index).max(1);
+                let reserve_fallback_budget =
+                    cluster_target_endpoint_should_reserve_fallback_budget(
+                        &endpoint,
+                        endpoints_left,
+                    );
                 let endpoint_attempt_budget = cluster_target_endpoint_attempt_budget_for_endpoint(
                     &local_connectivity,
                     &endpoint,
@@ -2582,12 +2609,25 @@ where
                     endpoints_left,
                     route_endpoint_count,
                 );
+                let endpoint_attempt_budget = if final_hop {
+                    endpoint_attempt_budget
+                } else {
+                    cluster_target_relay_endpoint_attempt_budget(
+                        endpoint_attempt_budget,
+                        remaining,
+                        endpoints_left,
+                        relay_has_direct_target_fallback,
+                    )
+                };
                 let final_hop_verified_endpoint = final_hop
-                    && cluster_target_final_hop_uses_full_response_budget(
+                    && cluster_endpoint_has_healthy_route_evidence(&local_connectivity, &endpoint)
+                    && !reserve_fallback_budget;
+                let final_hop_full_response_budget = final_hop
+                    && !reserve_fallback_budget
+                    && cluster_endpoint_has_reachable_route_evidence(
                         &local_connectivity,
                         &endpoint,
-                    );
-                let final_hop_full_response_budget = final_hop_verified_endpoint
+                    )
                     && cluster_target_final_hop_request_uses_full_response_budget(request);
                 let final_hop_attempt_budget = if final_hop {
                     cluster_target_final_hop_attempt_budget(
@@ -2642,8 +2682,6 @@ where
                     )
                 } else {
                     let outer_build_started_at = Instant::now();
-                    let target_endpoints =
-                        cluster_delivery_target_endpoint_hints(paths, state, target_node_id)?;
                     let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
                         &state.cluster_id,
                         target_node_id,
@@ -2651,8 +2689,8 @@ where
                         request_auth.clone(),
                         std::iter::once(state.local_node_id.clone()),
                         &route_plan.path,
-                        &target_endpoints,
-                        options.timeouts.connect_timeout,
+                        &relay_target_endpoints,
+                        route_timeout,
                     )?;
                     let outer_build_us = cluster_object_rpc_elapsed_us(outer_build_started_at);
                     let outer_sign_started_at = Instant::now();
@@ -2905,7 +2943,8 @@ where
     ) -> Result<crate::ObjectRpcStreamResponse, NetworkError> {
         let traceparent = request.traceparent().unwrap_or_default().to_string();
         let call_started_at = Instant::now();
-        let deadline = ClusterEndpointRpcDeadline::new(options.timeouts.connect_timeout);
+        let route_timeout = cluster_target_route_timeout(options.timeouts.connect_timeout);
+        let deadline = ClusterEndpointRpcDeadline::new(route_timeout);
         let mut failed_edges = ClusterDeliveryFailedEdges::default();
         let mut failures = Vec::new();
         let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
@@ -2970,18 +3009,31 @@ where
                 &local_connectivity,
                 &mut route_endpoints,
             );
+            let relay_target_endpoints = if &route_plan.next_hop == target_node_id {
+                Vec::new()
+            } else {
+                cluster_delivery_target_endpoint_hints(paths, state, target_node_id)?
+            };
+            let relay_has_direct_target_fallback = relay_target_endpoints.iter().any(|endpoint| {
+                cluster_delivery_local_endpoint_is_usable(&state.local_node_id, endpoint)
+            });
             let route_endpoint_count = route_endpoints.len();
             for (endpoint_index, endpoint) in route_endpoints.into_iter().enumerate() {
                 let attempt_started_at = Instant::now();
                 let Some(remaining) = deadline.checked_remaining() else {
                     return Err(cluster_target_rpc_timeout_error(
                         target_node_id,
-                        options.timeouts.connect_timeout,
+                        route_timeout,
                         &failures,
                     ));
                 };
                 let final_hop = &route_plan.next_hop == target_node_id;
                 let endpoints_left = route_endpoint_count.saturating_sub(endpoint_index).max(1);
+                let reserve_fallback_budget =
+                    cluster_target_endpoint_should_reserve_fallback_budget(
+                        &endpoint,
+                        endpoints_left,
+                    );
                 let endpoint_attempt_budget = cluster_target_endpoint_attempt_budget_for_endpoint(
                     &local_connectivity,
                     &endpoint,
@@ -2989,12 +3041,25 @@ where
                     endpoints_left,
                     route_endpoint_count,
                 );
+                let endpoint_attempt_budget = if final_hop {
+                    endpoint_attempt_budget
+                } else {
+                    cluster_target_relay_endpoint_attempt_budget(
+                        endpoint_attempt_budget,
+                        remaining,
+                        endpoints_left,
+                        relay_has_direct_target_fallback,
+                    )
+                };
                 let final_hop_verified_endpoint = final_hop
-                    && cluster_target_final_hop_uses_full_response_budget(
+                    && cluster_endpoint_has_healthy_route_evidence(&local_connectivity, &endpoint)
+                    && !reserve_fallback_budget;
+                let final_hop_full_response_budget = final_hop
+                    && !reserve_fallback_budget
+                    && cluster_endpoint_has_reachable_route_evidence(
                         &local_connectivity,
                         &endpoint,
                     );
-                let final_hop_full_response_budget = final_hop_verified_endpoint;
                 let final_hop_attempt_budget = if final_hop {
                     cluster_target_final_hop_attempt_budget(
                         remaining,
@@ -3048,8 +3113,6 @@ where
                     )
                 } else {
                     let outer_build_started_at = Instant::now();
-                    let target_endpoints =
-                        cluster_delivery_target_endpoint_hints(paths, state, target_node_id)?;
                     let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
                         &state.cluster_id,
                         target_node_id,
@@ -3057,8 +3120,8 @@ where
                         request_auth.clone(),
                         std::iter::once(state.local_node_id.clone()),
                         &route_plan.path,
-                        &target_endpoints,
-                        options.timeouts.connect_timeout,
+                        &relay_target_endpoints,
+                        route_timeout,
                     )?;
                     let outer_build_us = cluster_object_rpc_elapsed_us(outer_build_started_at);
                     let outer_sign_started_at = Instant::now();
@@ -3444,13 +3507,6 @@ fn cluster_target_final_hop_transport_timeouts(
         .with_idle_timeout(idle_timeout)
 }
 
-fn cluster_target_final_hop_uses_full_response_budget(
-    local_connectivity: &ClusterConnectivityGraph,
-    endpoint: &ClusterEndpointRecord,
-) -> bool {
-    cluster_endpoint_has_healthy_route_evidence(local_connectivity, endpoint)
-}
-
 fn cluster_target_final_hop_request_uses_full_response_budget(request: &ObjectRpcRequest) -> bool {
     crate::object_rpc_request_stream_mode(request).expects_raw_streamed_response()
         || request.uses_full_response_budget()
@@ -3481,10 +3537,39 @@ fn cluster_target_endpoint_attempt_budget_for_endpoint(
         endpoints_left,
         endpoint_count,
     );
-    if cluster_endpoint_has_healthy_route_evidence(local_connectivity, endpoint) {
+    if cluster_endpoint_has_healthy_route_evidence(local_connectivity, endpoint)
+        && !cluster_target_endpoint_should_reserve_fallback_budget(endpoint, endpoints_left)
+    {
         return budget;
     }
     budget.map(|budget| budget.min(CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX))
+}
+
+fn cluster_target_relay_endpoint_attempt_budget(
+    endpoint_attempt_budget: Option<Duration>,
+    remaining_route_budget: Option<Duration>,
+    endpoints_left: usize,
+    has_direct_target_fallback: bool,
+) -> Option<Duration> {
+    if !has_direct_target_fallback {
+        return endpoint_attempt_budget;
+    }
+    let Some(remaining) = remaining_route_budget else {
+        return endpoint_attempt_budget;
+    };
+    let budget_with_fallback_slot =
+        duration_div_ceil(remaining, endpoints_left.saturating_add(1).max(1));
+    Some(match endpoint_attempt_budget {
+        Some(endpoint_attempt_budget) => endpoint_attempt_budget.min(budget_with_fallback_slot),
+        None => budget_with_fallback_slot,
+    })
+}
+
+fn cluster_target_endpoint_should_reserve_fallback_budget(
+    endpoint: &ClusterEndpointRecord,
+    endpoints_left: usize,
+) -> bool {
+    endpoints_left > 1 && cluster_delivery_endpoint_is_tcp_tunnel(endpoint)
 }
 
 fn cluster_target_final_hop_attempt_budget(
@@ -3497,7 +3582,10 @@ fn cluster_target_final_hop_attempt_budget(
     if use_full_response_budget && endpoints_left <= 1 {
         return remaining_route_budget;
     }
-    if use_full_response_budget && let Some(remaining) = remaining_route_budget {
+    if use_full_response_budget
+        && !verified_endpoint
+        && let Some(remaining) = remaining_route_budget
+    {
         let preferred =
             cluster_target_full_response_endpoint_attempt_preferred(remaining, endpoints_left);
         let baseline = endpoint_attempt_budget.unwrap_or(Duration::ZERO);
@@ -3537,14 +3625,34 @@ fn cluster_target_full_response_endpoint_attempt_preferred(
     endpoints_left: usize,
 ) -> Duration {
     let fallback_reserve = if endpoints_left > 1 {
-        CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX
-            .saturating_mul(endpoints_left.saturating_sub(1) as u32)
+        CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_FALLBACK_RESERVE
     } else {
         Duration::ZERO
     };
+    let response_cap = CLUSTER_TARGET_FULL_RESPONSE_ENDPOINT_ATTEMPT_PREFERRED;
     remaining_route_budget
         .saturating_sub(fallback_reserve)
-        .min(CLUSTER_TARGET_FULL_RESPONSE_ENDPOINT_ATTEMPT_PREFERRED)
+        .min(response_cap)
+}
+
+fn cluster_endpoint_has_reachable_route_evidence(
+    local_connectivity: &ClusterConnectivityGraph,
+    endpoint: &ClusterEndpointRecord,
+) -> bool {
+    if matches!(
+        endpoint.transport,
+        ClusterTransportKind::InProcess | ClusterTransportKind::Loopback
+    ) {
+        return true;
+    }
+    local_connectivity
+        .record_for_endpoint(endpoint)
+        .is_some_and(|record| {
+            record.state != ClusterConnectivityState::Unreachable
+                && !crate::connectivity::cluster_connectivity_failure_reason_is_identity_mismatch(
+                    record,
+                )
+        })
 }
 
 fn cluster_endpoint_has_healthy_route_evidence(
@@ -3630,6 +3738,14 @@ fn relay_envelope_hop_timeout(envelope: &RelayEnvelope) -> Option<Duration> {
     envelope
         .max_hop_timeout_ms
         .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)))
+}
+
+fn cluster_target_route_timeout(timeout: Option<Duration>) -> Option<Duration> {
+    Some(
+        timeout
+            .unwrap_or(CLUSTER_TARGET_ROUTE_DEADLINE_MAX)
+            .min(CLUSTER_TARGET_ROUTE_DEADLINE_MAX),
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4797,6 +4913,7 @@ mod tests {
         error_first_send: bool,
         stream_error_first_send: bool,
         stall_first_send: Option<Duration>,
+        stall_second_send: Option<Duration>,
         stall_first_stream_send: Option<Duration>,
     }
 
@@ -4839,6 +4956,9 @@ mod tests {
             let stall = self
                 .stall_first_send
                 .filter(|_| self.target_sends.is_empty());
+            let stall_second = self
+                .stall_second_send
+                .filter(|_| self.target_sends.len() == 1);
             let sends = &mut self.target_sends;
             let auths = &mut self.target_auths;
             let auth = _auth.to_vec();
@@ -4846,6 +4966,9 @@ mod tests {
                 sends.push((endpoint, request, timeouts));
                 auths.push(auth);
                 if let Some(stall) = stall {
+                    tokio::time::sleep(stall).await;
+                }
+                if let Some(stall) = stall_second {
                     tokio::time::sleep(stall).await;
                 }
                 if should_fail {
@@ -5283,7 +5406,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_endpoint_attempt_budget_trusts_healthy_synthetic_tcp_tunnel() {
+    fn cluster_target_endpoint_attempt_budget_bounds_healthy_synthetic_tcp_tunnel_with_fallbacks() {
         let now = OffsetDateTime::now_utc();
         let cluster_id =
             ClusterId::from_legacy_named("cluster_target_tunnel_budget").expect("cluster");
@@ -5329,6 +5452,63 @@ mod tests {
             &endpoint,
             Some(Duration::from_secs(60)),
             3,
+            3,
+        )
+        .expect("budget");
+
+        assert_eq!(budget, CLUSTER_TARGET_UNVERIFIED_ENDPOINT_ATTEMPT_MAX);
+    }
+
+    #[test]
+    fn cluster_target_endpoint_attempt_budget_trusts_healthy_synthetic_tcp_tunnel_when_it_is_last()
+    {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_target_tunnel_only_budget").expect("cluster");
+        let local =
+            NodeId::from_legacy_named("node_target_tunnel_only_budget_local").expect("local");
+        let target =
+            NodeId::from_legacy_named("node_target_tunnel_only_budget_target").expect("target");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "tunnel-only endpoint budget",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_target_tunnel_only_budget")
+                .expect("endpoint"),
+            node_id: target,
+            transport: ClusterTransportKind::LanTcp,
+            address: format!(
+                "{}node_target_tunnel_only_budget_target",
+                crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX
+            ),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+        let record = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(0),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            crate::connectivity::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let graph = ClusterConnectivityGraph::from_records(local, vec![record]);
+
+        let budget = cluster_target_endpoint_attempt_budget_for_endpoint(
+            &graph,
+            &endpoint,
+            Some(Duration::from_secs(60)),
+            1,
             3,
         )
         .expect("budget");
@@ -5388,6 +5568,21 @@ mod tests {
     }
 
     #[test]
+    fn cluster_target_final_hop_attempt_budget_preserves_full_response_under_short_gate() {
+        let split_budget = Some(Duration::from_millis(1000));
+        let budget = cluster_target_final_hop_attempt_budget(
+            Some(Duration::from_secs(5)),
+            5,
+            split_budget,
+            false,
+            true,
+        )
+        .expect("full response budget");
+
+        assert_eq!(budget, Duration::from_millis(4500));
+    }
+
+    #[test]
     fn cluster_target_final_hop_attempt_budget_caps_long_ordinary_verified_endpoint() {
         let budget = cluster_target_final_hop_attempt_budget(
             Some(Duration::from_secs(60)),
@@ -5413,7 +5608,7 @@ mod tests {
         .expect("streamed budget");
         assert_eq!(
             streamed,
-            CLUSTER_TARGET_FULL_RESPONSE_ENDPOINT_ATTEMPT_PREFERRED
+            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
         );
     }
 
@@ -5440,7 +5635,7 @@ mod tests {
         .expect("data-plane budget");
         assert_eq!(
             budget,
-            CLUSTER_TARGET_FULL_RESPONSE_ENDPOINT_ATTEMPT_PREFERRED
+            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
         );
 
         let last_endpoint_budget = cluster_target_final_hop_attempt_budget(
@@ -5494,8 +5689,9 @@ mod tests {
         ];
         state.members.push(target_member);
 
-        let request =
-            ObjectRpcRequest::encode_body("/test/target", "test", &"ping").expect("request");
+        let request = ObjectRpcRequest::encode_body("/test/target", "test", &"ping")
+            .expect("request")
+            .with_full_response_budget();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -5525,6 +5721,177 @@ mod tests {
         assert_eq!(host.target_sends.len(), 2);
         assert_eq!(host.target_sends[0].0.address, "stalling-target.test:21353");
         assert_eq!(host.target_sends[1].0.address, "retry-target.test:21353");
+    }
+
+    #[test]
+    fn cluster_target_rpc_relay_timeouts_preserve_direct_target_fallback_budget() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-target-relay-fallback-budget");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_target_relay_fallback_budget")
+            .expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_target_relay_fallback_local").expect("local node");
+        let relay_node =
+            NodeId::from_legacy_named("node_target_relay_fallback_relay").expect("relay node");
+        let target_node =
+            NodeId::from_legacy_named("node_target_relay_fallback_target").expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "target relay fallback budget",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+
+        let relay_lan_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &relay_node,
+            "relay-a.example.test:21353".to_string(),
+            0,
+        );
+        let relay_tunnel_endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(
+                "endpoint_target_relay_fallback_tunnel",
+            )
+            .expect("relay tunnel endpoint"),
+            node_id: relay_node.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!(
+                "{}node_target_relay_fallback_relay",
+                crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX
+            ),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 10,
+            last_observed_latency_ms: None,
+        };
+        let direct_target_endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(
+                "endpoint_target_relay_fallback_direct",
+            )
+            .expect("direct target endpoint"),
+            node_id: target_node.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "203.0.113.77:21353".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+
+        let mut relay_member = ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            relay_node.clone(),
+            "relay",
+            "pk-relay",
+            now,
+        );
+        relay_member.capabilities = main_daemon_capabilities(&relay_member.role);
+        relay_member.allowed_capabilities = relay_member.capabilities.clone();
+        relay_member.endpoints = vec![relay_lan_endpoint.clone(), relay_tunnel_endpoint.clone()];
+        state.members.push(relay_member);
+
+        let mut target_member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            target_node.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![direct_target_endpoint.clone()];
+        state.members.push(target_member);
+
+        let local_to_relay_lan = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &relay_lan_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            crate::connectivity::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let local_to_relay_tunnel = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &relay_tunnel_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(2),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            crate::connectivity::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[local_to_relay_lan, local_to_relay_tunnel],
+        )
+        .expect("write local connectivity");
+
+        let mut relay_state = state.clone();
+        relay_state.local_node_id = relay_node.clone();
+        let relay_to_target = crate::connectivity::cluster_connectivity_record(
+            &relay_state,
+            &direct_target_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            crate::connectivity::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        crate::connectivity_store::write_local_cluster_connectivity_record_set(
+            &paths,
+            &relay_node,
+            &[relay_to_target],
+        )
+        .expect("write relay connectivity");
+
+        let request =
+            ObjectRpcRequest::encode_body("/test/target", "test", &"ping").expect("request");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut host = RecordingSignedHost {
+            stall_first_send: Some(Duration::from_secs(60)),
+            stall_second_send: Some(Duration::from_secs(60)),
+            ..RecordingSignedHost::default()
+        };
+        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
+        let started = Instant::now();
+
+        runtime
+            .block_on(client.call_target(
+                &state,
+                &target_node,
+                &request,
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
+                    Duration::from_secs(5),
+                )),
+            ))
+            .expect("direct target fallback should retain budget after relay timeouts");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "relay endpoints must not consume the whole target timeout before direct fallback"
+        );
+        assert_eq!(host.target_sends.len(), 3);
+        assert_eq!(host.target_sends[0].0.node_id, relay_node);
+        assert_eq!(host.target_sends[1].0.node_id, relay_node);
+        assert_eq!(
+            host.target_sends[2].0.endpoint_id,
+            direct_target_endpoint.endpoint_id
+        );
     }
 
     #[test]
@@ -5644,7 +6011,7 @@ mod tests {
                 &target_node,
                 &request,
                 ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
-                    Duration::from_secs(8),
+                    Duration::from_secs(30),
                 )),
             ))
             .expect("fallback endpoint should be attempted within the target timeout");
@@ -5654,11 +6021,348 @@ mod tests {
             "a stale preferred endpoint must not spend most of the route timeout"
         );
         assert_eq!(host.target_sends.len(), 2);
+        assert_ne!(
+            host.target_sends[0].0.endpoint_id, tunnel_endpoint.endpoint_id,
+            "synthetic tunnel should remain a fallback behind real endpoints"
+        );
+        assert_ne!(
+            host.target_sends[1].0.endpoint_id, tunnel_endpoint.endpoint_id,
+            "a real endpoint fallback should be attempted before the synthetic tunnel"
+        );
+    }
+
+    #[test]
+    fn cluster_target_rpc_does_not_let_slow_reachable_data_plane_endpoint_starve_fallback() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-target-data-plane-budget");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_target_data_plane_budget").expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_target_data_plane_budget_local").expect("local node");
+        let target_node =
+            NodeId::from_legacy_named("node_target_data_plane_budget_target").expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "target data-plane budget",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let tunnel_endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(
+                "endpoint_target_data_plane_budget_tunnel",
+            )
+            .expect("endpoint"),
+            node_id: target_node.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!(
+                "{}{}",
+                crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX,
+                target_node.as_str()
+            ),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+        let direct_endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(
+                "endpoint_target_data_plane_budget_direct",
+            )
+            .expect("endpoint"),
+            node_id: target_node.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "direct-target.example.test:21353".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 10,
+            last_observed_latency_ms: None,
+        };
+        let fallback_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "fallback-target.example.test:21353".to_string(),
+            20,
+        );
+        let mut target_member =
+            ClusterMemberRecord::local_voter(cluster_id, target_node.clone(), "target", "pk", now);
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![
+            tunnel_endpoint.clone(),
+            direct_endpoint.clone(),
+            fallback_endpoint,
+        ];
+        state.members.push(target_member);
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[
+                crate::connectivity::cluster_connectivity_record(
+                    &state,
+                    &tunnel_endpoint,
+                    ClusterConnectivityState::Healthy,
+                    Some(0),
+                    0,
+                    Some("ok".to_string()),
+                    None,
+                    now,
+                    60,
+                ),
+                crate::connectivity::cluster_connectivity_record(
+                    &state,
+                    &direct_endpoint,
+                    ClusterConnectivityState::Degraded,
+                    None,
+                    1,
+                    Some("ok".to_string()),
+                    Some("slow".to_string()),
+                    now,
+                    60,
+                ),
+            ],
+        )
+        .expect("write local connectivity");
+
+        let request = ObjectRpcRequest::encode_body("/test/data", "test", &"ping")
+            .expect("request")
+            .with_full_response_budget();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut host = RecordingSignedHost {
+            stall_first_send: Some(Duration::from_secs(60)),
+            stall_second_send: Some(Duration::from_secs(5)),
+            ..RecordingSignedHost::default()
+        };
+        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
+        let started = Instant::now();
+
+        runtime
+            .block_on(client.call_target(
+                &state,
+                &target_node,
+                &request,
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
+                    Duration::from_secs(60),
+                )),
+            ))
+            .expect("fallback endpoint should be attempted inside the route budget");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "slow data-plane endpoint should not consume the caller's 60s timeout before fallback"
+        );
+        assert_eq!(host.target_sends.len(), 3);
+        assert_ne!(
+            host.target_sends[0].0.endpoint_id, tunnel_endpoint.endpoint_id,
+            "synthetic tunnel should remain behind real endpoints"
+        );
+        assert!(
+            host.target_sends
+                .iter()
+                .any(|(endpoint, _, _)| endpoint.address == "fallback-target.example.test:21353"),
+            "fallback endpoint should be attempted"
+        );
+        let direct_idle_timeout = host
+            .target_sends
+            .iter()
+            .find(|(endpoint, _, _)| endpoint.endpoint_id == direct_endpoint.endpoint_id)
+            .expect("direct endpoint send")
+            .2
+            .idle_timeout
+            .expect("direct idle timeout");
+        assert!(
+            direct_idle_timeout <= CLUSTER_TARGET_ROUTE_DEADLINE_MAX,
+            "direct data-plane idle timeout should stay inside route budget, got {direct_idle_timeout:?}"
+        );
+    }
+
+    #[test]
+    fn cluster_target_rpc_caps_long_caller_timeout_to_route_budget() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-target-route-budget-cap");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_target_route_budget_cap").expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_target_route_budget_cap_local").expect("local node");
+        let target_node =
+            NodeId::from_legacy_named("node_target_route_budget_cap_target").expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "target route budget cap",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "198.51.100.44:21353".to_string(),
+            0,
+        );
+        let mut target_member =
+            ClusterMemberRecord::local_voter(cluster_id, target_node.clone(), "target", "pk", now);
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![endpoint.clone()];
+        state.members.push(target_member);
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[crate::connectivity::cluster_connectivity_record(
+                &state,
+                &endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(5),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            )],
+        )
+        .expect("write local connectivity");
+
+        let request = ObjectRpcRequest::encode_body("/test/data", "test", &"ping")
+            .expect("request")
+            .with_full_response_budget();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut host = RecordingSignedHost::default();
+        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
+
+        runtime
+            .block_on(client.call_target(
+                &state,
+                &target_node,
+                &request,
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
+                    Duration::from_secs(60),
+                )),
+            ))
+            .expect("target rpc");
+
+        assert_eq!(host.target_sends.len(), 1);
+        let connect_timeout = host.target_sends[0]
+            .2
+            .connect_timeout
+            .expect("connect timeout");
+        let idle_timeout = host.target_sends[0].2.idle_timeout.expect("idle timeout");
+        assert!(
+            connect_timeout <= CLUSTER_TARGET_ROUTE_DEADLINE_MAX,
+            "connect timeout should be capped by route budget, got {connect_timeout:?}"
+        );
+        assert!(
+            idle_timeout <= CLUSTER_TARGET_ROUTE_DEADLINE_MAX,
+            "idle timeout should be capped by route budget, got {idle_timeout:?}"
+        );
+    }
+
+    #[test]
+    fn cluster_target_rpc_does_not_let_healthy_direct_full_response_starve_fallbacks() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-target-direct-timeout-retry");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_target_direct_timeout_retry")
+            .expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_target_direct_timeout_local").expect("local node");
+        let target_node =
+            NodeId::from_legacy_named("node_target_direct_timeout_target").expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "target healthy direct timeout retry",
+            local_node,
+            "local",
+            "pk-local",
+            now,
+        );
+        let direct_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "198.51.100.88:21353".to_string(),
+            0,
+        );
+        let fallback_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "fallback-direct.test:21353".to_string(),
+            10,
+        );
+        let mut target_member =
+            ClusterMemberRecord::local_voter(cluster_id, target_node.clone(), "target", "pk", now);
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![direct_endpoint.clone(), fallback_endpoint.clone()];
+        state.members.push(target_member);
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[crate::connectivity::cluster_connectivity_record(
+                &state,
+                &direct_endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(4),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            )],
+        )
+        .expect("write local connectivity");
+
+        let request = ObjectRpcRequest::encode_body("/test/data", "test", &"ping")
+            .expect("request")
+            .with_full_response_budget();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut host = RecordingSignedHost {
+            stall_first_send: Some(Duration::from_secs(60)),
+            ..RecordingSignedHost::default()
+        };
+        let mut client = ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
+        let started = Instant::now();
+
+        runtime
+            .block_on(client.call_target(
+                &state,
+                &target_node,
+                &request,
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
+                    Duration::from_secs(30),
+                )),
+            ))
+            .expect("fallback endpoint should be attempted within the target timeout");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a stale healthy direct full-response endpoint must not spend the 10s response window before fallback"
+        );
+        assert_eq!(host.target_sends.len(), 2);
         assert_eq!(
             host.target_sends[0].0.endpoint_id,
-            tunnel_endpoint.endpoint_id
+            direct_endpoint.endpoint_id
         );
-        assert_eq!(host.target_sends[1].0.address, "198.51.100.76:21353");
+        assert_eq!(
+            host.target_sends[1].0.endpoint_id,
+            fallback_endpoint.endpoint_id
+        );
     }
 
     #[test]
@@ -6410,7 +7114,7 @@ mod tests {
     }
 
     #[test]
-    fn route_candidates_do_not_complete_by_returning_through_origin() {
+    fn route_candidates_reject_relay_without_verified_path_to_target() {
         let local = NodeId::from_legacy_named("node_route_hairpin_origin").expect("local node");
         let neighbor =
             NodeId::from_legacy_named("node_route_hairpin_neighbor").expect("neighbor node");
@@ -6434,10 +7138,41 @@ mod tests {
         let candidates =
             cluster_delivery_route_candidates(&graph, &local, &target).expect("route candidates");
 
+        assert!(
+            candidates.is_empty(),
+            "a relay candidate must have a graph-proven path to the target"
+        );
+    }
+
+    #[test]
+    fn route_candidates_use_relay_with_verified_path_to_target() {
+        let local = NodeId::from_legacy_named("node_route_verified_origin").expect("local node");
+        let bridge = NodeId::from_legacy_named("node_route_verified_bridge").expect("bridge node");
+        let target = NodeId::from_legacy_named("node_route_verified_target").expect("target node");
+        let bridge_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &bridge,
+            "bridge.example.test:21353".to_string(),
+            0,
+        );
+        let mut graph = ClusterDeliveryRouteGraph::default();
+        graph
+            .push_edge_clone(&local, &bridge, Some(&bridge_endpoint), 10)
+            .expect("local to bridge");
+        graph
+            .push_edge_clone(&bridge, &target, None, 20)
+            .expect("bridge to target");
+
+        let candidates =
+            cluster_delivery_route_candidates(&graph, &local, &target).expect("route candidates");
+
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].plan.next_hop, neighbor);
-        assert_eq!(candidates[0].path, vec![local, neighbor]);
-        assert!(!candidates[0].complete);
+        assert_eq!(candidates[0].plan.next_hop, bridge);
+        assert_eq!(
+            candidates[0].path,
+            vec![local.clone(), bridge.clone(), target.clone()]
+        );
+        assert_eq!(candidates[0].cost, 30);
+        assert!(candidates[0].complete);
     }
 
     #[test]
@@ -6823,7 +7558,143 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_rpc_resorts_cached_route_endpoints_by_live_connectivity() {
+    fn route_plan_prefers_healthy_direct_target_before_verified_relay() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-route-direct-before-relay");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_route_direct_before_relay").expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_route_direct_before_relay_local").expect("local node");
+        let relay_node =
+            NodeId::from_legacy_named("node_route_direct_before_relay_relay").expect("relay node");
+        let target_node = NodeId::from_legacy_named("node_route_direct_before_relay_target")
+            .expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "route direct before relay",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let relay_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &relay_node,
+            "relay-lan.example.test:21353".to_string(),
+            0,
+        );
+        let direct_target_endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(
+                "endpoint_route_direct_before_relay_target",
+            )
+            .expect("target endpoint"),
+            node_id: target_node.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "target-public.example.test:21353".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+
+        let mut relay_member = ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            relay_node.clone(),
+            "relay",
+            "pk-relay",
+            now,
+        );
+        relay_member.capabilities = main_daemon_capabilities(&relay_member.role);
+        relay_member.allowed_capabilities = relay_member.capabilities.clone();
+        relay_member.endpoints = vec![relay_endpoint.clone()];
+        state.members.push(relay_member);
+
+        let mut target_member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            target_node.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![direct_target_endpoint.clone()];
+        state.members.push(target_member);
+        crate::write_object_file(&paths.state, &state).expect("write state");
+
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[
+                crate::connectivity::cluster_connectivity_record(
+                    &state,
+                    &direct_target_endpoint,
+                    ClusterConnectivityState::Healthy,
+                    Some(400),
+                    0,
+                    Some(now.to_string()),
+                    None,
+                    now,
+                    60,
+                ),
+                crate::connectivity::cluster_connectivity_record(
+                    &state,
+                    &relay_endpoint,
+                    ClusterConnectivityState::Healthy,
+                    Some(1),
+                    0,
+                    Some(now.to_string()),
+                    None,
+                    now,
+                    60,
+                ),
+            ],
+        )
+        .expect("write local connectivity");
+
+        let mut relay_state = state.clone();
+        relay_state.local_node_id = relay_node.clone();
+        let relay_to_target = crate::connectivity::cluster_connectivity_record(
+            &relay_state,
+            &direct_target_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            60,
+        );
+        crate::connectivity_store::write_local_cluster_connectivity_record_set(
+            &paths,
+            &relay_node,
+            &[relay_to_target],
+        )
+        .expect("write relay connectivity");
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local_node,
+            &target_node,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
+
+        assert_eq!(plan.next_hop, target_node);
+        assert_eq!(plan.endpoints.len(), 1);
+        assert_eq!(
+            plan.endpoints[0].endpoint_id,
+            direct_target_endpoint.endpoint_id
+        );
+    }
+
+    #[test]
+    fn cluster_target_rpc_keeps_real_endpoint_before_synthetic_tunnel_fallback() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-target-resort-cached-endpoints");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -6971,9 +7842,9 @@ mod tests {
         assert_eq!(host.target_sends.len(), 1);
         assert_eq!(
             host.target_sends[0].0.endpoint_id,
-            tunnel_endpoint.endpoint_id
+            direct_endpoint.endpoint_id
         );
-        assert_eq!(host.target_sends[0].0.address, tunnel_endpoint.address);
+        assert_eq!(host.target_sends[0].0.address, direct_endpoint.address);
     }
 
     #[test]
@@ -7449,6 +8320,100 @@ mod tests {
         assert!(
             plan.is_none(),
             "a known-unreachable neighbor must not become a relay fallback"
+        );
+    }
+
+    #[test]
+    fn route_plan_does_not_use_unproven_neighbor_as_relay_after_target_edge_fails() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-route-unproven-relay");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_route_unproven_relay").expect("cluster");
+        let local_node =
+            NodeId::from_legacy_named("node_route_unproven_relay_local").expect("local");
+        let target_node =
+            NodeId::from_legacy_named("node_route_unproven_relay_target").expect("target");
+        let relay_node =
+            NodeId::from_legacy_named("node_route_unproven_relay_neighbor").expect("relay");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "route unproven relay",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut target_member = ClusterMemberRecord::local_voter(
+            state.cluster_id.clone(),
+            target_node.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![crate::endpoint_advertisement::daemon_lan_endpoint(
+            &target_node,
+            "target.example.test:21353".to_string(),
+            0,
+        )];
+        let mut relay_member = ClusterMemberRecord::local_voter(
+            state.cluster_id.clone(),
+            relay_node.clone(),
+            "relay",
+            "pk-relay",
+            now,
+        );
+        relay_member.capabilities = main_daemon_capabilities(&relay_member.role);
+        relay_member.allowed_capabilities = relay_member.capabilities.clone();
+        let relay_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &relay_node,
+            "relay.example.test:21353".to_string(),
+            0,
+        );
+        relay_member.endpoints = vec![relay_endpoint.clone()];
+        state.members.push(target_member);
+        state.members.push(relay_member);
+
+        let relay_reachable = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &relay_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(5),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            60,
+        );
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[relay_reachable],
+        )
+        .expect("write local connectivity");
+
+        let mut failed_edges = ClusterDeliveryFailedEdges::default();
+        failed_edges
+            .try_insert(&local_node, &target_node)
+            .expect("failed target edge");
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local_node,
+            &target_node,
+            &failed_edges,
+            &[],
+        );
+
+        assert!(
+            plan.is_none(),
+            "a reachable neighbor without a graph path to the target must not become a relay fallback"
         );
     }
 

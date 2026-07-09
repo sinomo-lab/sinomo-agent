@@ -88,6 +88,10 @@ fn posix_error_is_stale_write_base(error: &DfsPosixError) -> bool {
     )
 }
 
+fn posix_error_is_routed_namespace_unavailable(error: &DfsPosixError) -> bool {
+    matches!(error, DfsPosixError::Dfs(DfsError::Network { .. }))
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn settle_ready_write_outcome(
         &mut self,
@@ -263,18 +267,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_mkdir_all(&mut self, path: &str) -> Result<()> {
         let normalized = normalize_posix_path(path)?;
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
-            if self.posix_mkdir_all_chain_exists_locally(&normalized)? {
-                return Ok(());
-            }
-            self.route_namespace_operation(
+            let local_chain_exists = self.posix_mkdir_all_chain_exists_locally(&normalized)?;
+            match self.route_namespace_operation(
                 primary,
                 DfsNamespaceOperation::MkdirAll {
                     path: path.to_string(),
                 },
-            )?;
-            self.stat_routed_namespace_result(&normalized, false)
-                .map(drop)?;
-            return Ok(());
+            ) {
+                Ok(()) => {
+                    self.stat_routed_namespace_result(&normalized, false)
+                        .map(drop)?;
+                    return Ok(());
+                }
+                Err(error)
+                    if local_chain_exists
+                        && posix_error_is_routed_namespace_unavailable(&error) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
         }
         self.posix_mkdir_all_local(path)
     }
@@ -282,15 +294,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_mkdir_all_without_local_replay(&mut self, path: &str) -> Result<()> {
         let normalized = normalize_posix_path(path)?;
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
-            if self.posix_mkdir_all_chain_exists_locally(&normalized)? {
-                return Ok(());
-            }
-            return self.route_namespace_operation_without_local_replay(
+            let local_chain_exists = self.posix_mkdir_all_chain_exists_locally(&normalized)?;
+            match self.route_namespace_operation_without_local_replay(
                 primary,
                 DfsNamespaceOperation::MkdirAll {
                     path: path.to_string(),
                 },
-            );
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if local_chain_exists
+                        && posix_error_is_routed_namespace_unavailable(&error) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
         }
         self.posix_mkdir_all_local(path)
     }

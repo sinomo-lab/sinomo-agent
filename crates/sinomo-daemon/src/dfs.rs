@@ -147,6 +147,7 @@ pub(crate) struct DaemonDfsPendingMaintenanceWork {
     pub unattempted_repair_count: usize,
     pub next_repair_retry_unix_nanos: Option<u64>,
     pub pending_namespace_job_count: usize,
+    pub metadata_replica_lag_count: usize,
 }
 
 impl DaemonDfsPendingMaintenanceWork {
@@ -155,6 +156,7 @@ impl DaemonDfsPendingMaintenanceWork {
         self.pending_write_count > 0
             || self.pending_repair_count > 0
             || self.pending_namespace_job_count > 0
+            || self.metadata_replica_lag_count > 0
     }
 
     pub(crate) fn should_trigger_background_maintenance(self) -> bool {
@@ -164,6 +166,7 @@ impl DaemonDfsPendingMaintenanceWork {
         // replicas from hot-looping.
         self.pending_write_count > 0
             || self.pending_namespace_job_count > 0
+            || self.metadata_replica_lag_count > 0
             || self.due_repair_attempt_count > 0
             || self.unattempted_repair_count > 0
     }
@@ -590,6 +593,15 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
     }
     let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
     let summary = metadata.metadata_summary()?;
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+        .map_err(DaemonError::from)?;
+    let metadata_replica_lag_count = metadata
+        .metadata_shard_statuses()?
+        .into_iter()
+        .filter(|status| status.primary_node_id.as_ref() == Some(&state.local_node_id))
+        .flat_map(|status| status.replica_lag)
+        .filter(|lag| lag.lag_entries > 0)
+        .count();
     let repair_attempt_records =
         read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
             .map(|snapshot| snapshot.records)
@@ -621,6 +633,7 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         unattempted_repair_count,
         next_repair_retry_unix_nanos,
         pending_namespace_job_count: summary.pending_namespace_job_count,
+        metadata_replica_lag_count,
     })
 }
 
@@ -1728,6 +1741,7 @@ mod tests {
         assert_eq!(pending.due_repair_attempt_count, 0);
         assert_eq!(pending.unattempted_repair_count, 0);
         assert_eq!(pending.next_repair_retry_unix_nanos, None);
+        assert_eq!(pending.metadata_replica_lag_count, 0);
         assert!(pending.has_work());
         assert!(pending.should_trigger_background_maintenance());
 
@@ -1780,6 +1794,7 @@ mod tests {
             unattempted_repair_count: 0,
             next_repair_retry_unix_nanos: Some(42),
             pending_namespace_job_count: 0,
+            metadata_replica_lag_count: 0,
         };
 
         assert!(pending.has_work());
@@ -1796,6 +1811,7 @@ mod tests {
             unattempted_repair_count: 0,
             next_repair_retry_unix_nanos: None,
             pending_namespace_job_count: 0,
+            metadata_replica_lag_count: 0,
         };
 
         assert!(pending.has_work());
@@ -1812,6 +1828,7 @@ mod tests {
             unattempted_repair_count: 4,
             next_repair_retry_unix_nanos: Some(42),
             pending_namespace_job_count: 0,
+            metadata_replica_lag_count: 0,
         };
 
         assert!(pending.has_work());
@@ -1828,6 +1845,24 @@ mod tests {
             unattempted_repair_count: 0,
             next_repair_retry_unix_nanos: None,
             pending_namespace_job_count: 0,
+            metadata_replica_lag_count: 0,
+        };
+
+        assert!(pending.has_work());
+        assert!(pending.should_trigger_background_maintenance());
+    }
+
+    #[test]
+    fn daemon_dfs_metadata_replica_lag_forces_triggered_loop() {
+        let pending = DaemonDfsPendingMaintenanceWork {
+            pending_write_count: 0,
+            pending_repair_count: 0,
+            repair_attempt_count: 0,
+            due_repair_attempt_count: 0,
+            unattempted_repair_count: 0,
+            next_repair_retry_unix_nanos: None,
+            pending_namespace_job_count: 0,
+            metadata_replica_lag_count: 1,
         };
 
         assert!(pending.has_work());
@@ -1949,6 +1984,7 @@ mod tests {
     fn daemon_dfs_status_reads_configured_sharded_metadata_backend() {
         let root = temp_root("daemon_dfs_status_sharded");
         let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
         let data_dir = SinomoDataDir::new(&data_root);
         data_dir.ensure_root_layout().expect("root layout");
         let cluster_paths = ClusterPaths::new(&data_dir);
@@ -2064,11 +2100,17 @@ mod tests {
         assert_eq!(
             services_status.replica_lag[0],
             sinomo_dfs::DfsMetadataReplicaLagStatus {
-                target_node_id: remote_node_id,
+                target_node_id: remote_node_id.clone(),
                 replicated_through_sequence: 1,
                 lag_entries: 2,
             }
         );
+        let pending = daemon_dfs_pending_maintenance_work(&paths).expect("pending maintenance");
+        assert_eq!(pending.pending_write_count, 0);
+        assert_eq!(pending.pending_repair_count, 0);
+        assert_eq!(pending.pending_namespace_job_count, 0);
+        assert_eq!(pending.metadata_replica_lag_count, 2);
+        assert!(pending.should_trigger_background_maintenance());
         let DaemonDfsInspectionResponse::FileSystem {
             file_system: Some(file_system_view),
         } = sinomo_dfs::inspect_cluster_aware_dfs(

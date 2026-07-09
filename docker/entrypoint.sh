@@ -30,6 +30,7 @@ NODE_NAME="${NODE_NAME:-$(hostname)}"
 JOIN_TIMEOUT="${JOIN_TIMEOUT:-60}"
 JOIN_WAIT_INTERVAL="${JOIN_WAIT_INTERVAL:-0.1}"
 JOIN_WAIT_TICKS_PER_SECOND="${JOIN_WAIT_TICKS_PER_SECOND:-10}"
+CLUSTER_STATUS_TIMEOUT="${CLUSTER_STATUS_TIMEOUT:-5}"
 MAIN_PORT="${MAIN_PORT:-21353}"
 JOIN_READY_DIR="${JOIN_READY_DIR:-/shared}"
 WAIT_FOR_INTRODUCER_READY="${WAIT_FOR_INTRODUCER_READY:-0}"
@@ -99,7 +100,8 @@ wait_for_tcp() {
 }
 
 cluster_join_status() {
-  "$BIN" cluster status 2>/dev/null | awk '/^status:/{print $2; exit}'
+  timeout --foreground "${CLUSTER_STATUS_TIMEOUT}s" "$BIN" cluster status 2>/dev/null \
+    | awk '/^status:/{print $2; exit}'
 }
 
 cluster_join_already_accepted() {

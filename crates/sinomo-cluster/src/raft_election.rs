@@ -411,15 +411,21 @@ pub fn elect_cluster_raft_leader_with_host(
 ) -> Result<bool, NetworkError> {
     let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
     let mut remote_vote_targets = Vec::new();
-    for node_id in ClusterEndpointSelector::new(paths, state)
-        .select_internal_unique_node_ids(
-            ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
-        )
-        .into_iter()
-        .filter(|node_id| node_id != &state.local_node_id && voter_ids.contains(node_id))
-    {
-        sinomo_network::try_reserve_vec(&mut remote_vote_targets, 1, "collect raft vote targets")?;
-        remote_vote_targets.push(node_id);
+    if !(voter_ids.len() == 1 && voter_ids.first() == Some(&state.local_node_id)) {
+        for node_id in ClusterEndpointSelector::new(paths, state)
+            .select_internal_unique_node_ids(
+                ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+            )
+            .into_iter()
+            .filter(|node_id| node_id != &state.local_node_id && voter_ids.contains(node_id))
+        {
+            sinomo_network::try_reserve_vec(
+                &mut remote_vote_targets,
+                1,
+                "collect raft vote targets",
+            )?;
+            remote_vote_targets.push(node_id);
+        }
     }
     let remote_vote_target_ids = remote_vote_targets.clone();
     let mut election_host = NetworkClusterKvRaftLeaderElectionHost::new(
@@ -447,22 +453,24 @@ pub(crate) async fn elect_cluster_raft_leader_async_with_host(
 ) -> Result<bool, NetworkError> {
     let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
     let mut remote_vote_targets = Vec::new();
-    for node_id in ClusterEndpointSelector::select_internal_unique_node_ids_async(
-        runtime,
-        paths,
-        state,
-        ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
-    )
-    .await?
-    .into_iter()
-    .filter(|node_id| node_id != &state.local_node_id && voter_ids.contains(node_id))
-    {
-        sinomo_network::try_reserve_vec(
-            &mut remote_vote_targets,
-            1,
-            "collect async raft vote targets",
-        )?;
-        remote_vote_targets.push(node_id);
+    if !(voter_ids.len() == 1 && voter_ids.first() == Some(&state.local_node_id)) {
+        for node_id in ClusterEndpointSelector::select_internal_unique_node_ids_async(
+            runtime,
+            paths,
+            state,
+            ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+        )
+        .await?
+        .into_iter()
+        .filter(|node_id| node_id != &state.local_node_id && voter_ids.contains(node_id))
+        {
+            sinomo_network::try_reserve_vec(
+                &mut remote_vote_targets,
+                1,
+                "collect async raft vote targets",
+            )?;
+            remote_vote_targets.push(node_id);
+        }
     }
     let remote_vote_target_ids = remote_vote_targets.clone();
     let mut election_host = NetworkClusterKvRaftLeaderElectionAsyncHost::new(

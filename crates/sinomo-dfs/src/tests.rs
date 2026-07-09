@@ -1526,6 +1526,150 @@ fn node_transport_transfer_profile_keeps_remote_sizing_network_neutral() {
     );
 }
 
+#[test]
+fn routed_namespace_sync_drains_limited_response_backlog() {
+    let writer = NodeId::from_legacy_named("node_routed_sync_writer").expect("writer");
+    let primary = NodeId::from_legacy_named("node_routed_sync_primary").expect("primary");
+    let file_system_id = sifs_file_system_id();
+    let root = temp_root("routed_namespace_sync_synced_path_backlog");
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: primary.clone(),
+                replica_node_ids: vec![writer.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "sifs".to_string(),
+        owner_node_id: primary.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let primary_sender: DfsMessageSender = Arc::new(|target_node_id, command, _timeout| {
+        Err(DfsPeerTransportError::new(format!(
+            "unexpected primary-side send to {target_node_id} for {}",
+            command.request_id
+        )))
+    });
+    let primary_transport = DfsNodeServedMessageTransport::new_with_message_sender(
+        primary.clone(),
+        vec![writer.clone()],
+        primary_sender,
+        DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+    );
+    let primary_backend = LocalSobjMetadataBackend::new(
+        DfsMetadataShardId::new("services"),
+        root.join("primary-metadata"),
+    )
+    .expect("primary metadata backend");
+    let mut primary_service = NetworkedDfsService::new(
+        primary_transport,
+        LocalContentStore::new(root.join("primary-content")).expect("primary content"),
+    )
+    .with_control_plane(control_plane.clone())
+    .with_metadata_backend(primary_backend)
+    .expect("primary metadata");
+    primary_service
+        .bootstrap_distributed_sifs()
+        .expect("primary bootstrap");
+    for index in 0..(DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT + 8) {
+        let mut object = file_metadata(primary.clone());
+        object.object_id =
+            DfsObjectId::from_legacy_named(format!("obj_routed_sync_backlog_{index}"))
+                .expect("object");
+        object.path = format!("/services/backlog-seed-{index}.txt");
+        object.version =
+            DfsVersion::from_legacy_named(format!("version_routed_sync_{index}")).expect("version");
+        object.content_hash = Some(format!("blake3:routed-sync-{index}"));
+        object.content_size_bytes = Some(index as u64);
+        object.policy = DfsObjectPolicy::ReplicatedEventual;
+        primary_service
+            .add_object_metadata(object)
+            .expect("primary backlog object");
+    }
+    let primary_service = Arc::new(Mutex::new(primary_service));
+    let namespace_calls = Arc::new(Mutex::new(Vec::new()));
+    let primary_for_sender = primary.clone();
+    let primary_service_for_sender = Arc::clone(&primary_service);
+    let namespace_calls_for_sender = Arc::clone(&namespace_calls);
+    let writer_sender: DfsMessageSender = Arc::new(move |target_node_id, command, _timeout| {
+        if target_node_id != &primary_for_sender {
+            return Err(DfsPeerTransportError::new(format!(
+                "unexpected target {target_node_id}"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        if let DfsNetworkMessage::NamespaceRequest(namespace) = &command.routed_message.message {
+            let label = match &namespace.operation {
+                DfsNamespaceOperation::MkdirAll { .. } => "mkdir-all",
+                DfsNamespaceOperation::SyncPath { .. } => "sync-path",
+                _ => "other-namespace",
+            };
+            namespace_calls_for_sender
+                .lock()
+                .expect("namespace calls")
+                .push(label.to_string());
+        }
+        let result = primary_service_for_sender
+            .lock()
+            .expect("primary service")
+            .process_message_command(command.clone())
+            .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
+        Ok(result.response)
+    });
+    let writer_transport = DfsNodeTransport::with_message_sender_for_nodes(
+        writer.clone(),
+        vec![primary.clone()],
+        Duration::from_millis(20),
+        writer_sender,
+    );
+    let mut writer_service = NetworkedDfsService::new(
+        writer_transport,
+        LocalContentStore::new(root.join("writer-content")).expect("writer content"),
+    )
+    .with_control_plane(control_plane);
+    writer_service
+        .add_file_system(file_system)
+        .expect("writer filesystem");
+    for object in crate::namespace::distributed_sifs_bootstrap_objects(primary.clone()) {
+        writer_service
+            .add_object_metadata(object)
+            .expect("writer bootstrap object");
+    }
+    writer_service
+        .posix_mkdir_all("/services/routed-sync-backlog/new-dir")
+        .expect("routed mkdir should drain bounded response backlog");
+
+    let calls = namespace_calls.lock().expect("namespace calls").clone();
+    assert_eq!(
+        calls.first().map(String::as_str),
+        Some("mkdir-all"),
+        "the mutating operation should be sent first"
+    );
+    assert!(
+        calls.iter().any(|call| call == "sync-path"),
+        "bounded response replay should continue with follow-up sync-path calls"
+    );
+    assert!(
+        writer_service
+            .posix_stat(&format!(
+                "/services/backlog-seed-{}.txt",
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT + 7
+            ))
+            .is_ok(),
+        "latest backlog entry should be visible after routed mkdir returns"
+    );
+}
+
 #[derive(Default)]
 struct RecordingPeerTransport {
     calls: Mutex<Vec<String>>,
@@ -26574,6 +26718,217 @@ fn sifs_cluster_posix_contract_stale_cache_current_read_invalidation() {
 }
 
 #[test]
+fn sharded_lazy_reader_sees_sibling_visible_overwrite() {
+    let root = temp_root("sifs-sharded-lazy-reader-current");
+    let node = NodeId::from_legacy_named("node_sifs_sharded_lazy_reader").expect("node");
+    let shards = sifs_two_primary_shard_configs(&node, &node, 1, Vec::new(), Vec::new());
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(node.clone())))
+            .expect("sifs filesystem config");
+        for shard in &shards {
+            control.put_metadata_shard(shard).expect("metadata shard");
+        }
+    });
+    let network = InProcessNetwork::new();
+    let content_root = root.join("content");
+    let metadata_root = root.join("metadata");
+    let mut writer = NetworkedDfsService::new(
+        network.add_node(node.clone()),
+        LocalContentStore::new(&content_root).expect("writer content"),
+    )
+    .with_control_plane(shared_kv.clone())
+    .with_metadata_backend_lazy(
+        open_local_sharded_metadata_backend(&metadata_root, shards.clone())
+            .expect("writer metadata"),
+    )
+    .expect("writer metadata backend");
+    writer
+        .bootstrap_distributed_sifs()
+        .expect("writer bootstrap");
+
+    let path = "/services/current-read-refresh.txt";
+    let old = b"old sharded lazy reader payload".to_vec();
+    let new = b"new sharded lazy reader payload".to_vec();
+    writer
+        .posix_write_file(
+            path,
+            &old,
+            DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+        )
+        .expect("initial write");
+
+    let mut reader = NetworkedDfsService::new(
+        network.add_node(node.clone()),
+        LocalContentStore::new(&content_root).expect("reader content"),
+    )
+    .with_control_plane(shared_kv)
+    .with_metadata_backend_lazy(
+        open_local_sharded_metadata_backend(&metadata_root, shards).expect("reader metadata"),
+    )
+    .expect("reader metadata backend");
+    reader
+        .bootstrap_distributed_sifs()
+        .expect("reader bootstrap");
+    assert_eq!(
+        reader
+            .posix_read_file_distributed(path)
+            .expect("reader old payload"),
+        old
+    );
+
+    writer
+        .posix_write_file(
+            path,
+            &new,
+            DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+        )
+        .expect("overwrite");
+
+    assert_eq!(
+        reader
+            .posix_read_file_distributed(path)
+            .expect("reader current payload"),
+        new
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sharded_lazy_reader_refreshes_after_remote_primary_overwrite() {
+    let root = temp_root("sifs-sharded-lazy-reader-remote-primary");
+    let primary_node = NodeId::from_legacy_named("node_sifs_lazy_remote_primary").expect("primary");
+    let writer_node = NodeId::from_legacy_named("node_sifs_lazy_remote_writer").expect("writer");
+    let shards = sifs_two_primary_shard_configs(
+        &primary_node,
+        &primary_node,
+        1,
+        vec![writer_node.clone()],
+        vec![writer_node.clone()],
+    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                primary_node.clone(),
+            )))
+            .expect("sifs filesystem config");
+        for shard in &shards {
+            control.put_metadata_shard(shard).expect("metadata shard");
+        }
+    });
+    let network = InProcessNetwork::new();
+    let primary_root = root.join("primary");
+    let writer_root = root.join("writer");
+    let mut primary = NetworkedDfsService::new(
+        network.add_node(primary_node.clone()),
+        LocalContentStore::new(primary_root.join("content")).expect("primary content"),
+    )
+    .with_control_plane(shared_kv.clone())
+    .with_metadata_backend_lazy(
+        open_local_sharded_metadata_backend(primary_root.join("metadata"), shards.clone())
+            .expect("primary metadata"),
+    )
+    .expect("primary metadata backend");
+    let mut writer = NetworkedDfsService::new(
+        network.add_node(writer_node.clone()),
+        LocalContentStore::new(writer_root.join("content")).expect("writer content"),
+    )
+    .with_control_plane(shared_kv.clone())
+    .with_metadata_backend_lazy(
+        open_local_sharded_metadata_backend(writer_root.join("metadata"), shards.clone())
+            .expect("writer metadata"),
+    )
+    .expect("writer metadata backend");
+    primary
+        .bootstrap_distributed_sifs()
+        .expect("primary bootstrap");
+
+    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    loop {
+        primary
+            .replicate_configured_metadata_shards(&sifs_file_system_id())
+            .expect("primary publish");
+        primary.process_incoming().expect("primary pump");
+        writer.process_incoming().expect("writer pump");
+        if writer.posix_stat(SIFS_SERVICES_PATH).is_ok() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("writer did not learn SIFS services namespace");
+        }
+        std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+    }
+    writer
+        .bootstrap_distributed_sifs()
+        .expect("writer bootstrap");
+
+    let stop_primary = Arc::new(AtomicBool::new(false));
+    let primary_stop = Arc::clone(&stop_primary);
+    let primary_thread = std::thread::spawn(move || {
+        let mut primary = primary;
+        while !primary_stop.load(Ordering::SeqCst) {
+            primary.process_incoming().expect("primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        primary
+    });
+
+    let path = "/services/current-read-remote-primary.txt";
+    let old = b"old remote primary reader payload".to_vec();
+    let new = b"new remote primary reader payload".to_vec();
+    writer
+        .posix_write_file(
+            path,
+            &old,
+            DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
+        )
+        .expect("initial remote-primary write");
+
+    let mut reader = NetworkedDfsService::new(
+        network.add_node(writer_node.clone()),
+        LocalContentStore::new(writer_root.join("content")).expect("reader content"),
+    )
+    .with_control_plane(shared_kv)
+    .with_metadata_backend_lazy(
+        open_local_sharded_metadata_backend(writer_root.join("metadata"), shards)
+            .expect("reader metadata"),
+    )
+    .expect("reader metadata backend");
+    reader
+        .bootstrap_distributed_sifs()
+        .expect("reader bootstrap");
+    assert_eq!(
+        reader
+            .posix_read_file_distributed(path)
+            .expect("reader old payload"),
+        old
+    );
+
+    writer
+        .posix_write_file(
+            path,
+            &new,
+            DfsWriteOptions::replicated_eventual(vec![writer_node]),
+        )
+        .expect("remote-primary overwrite");
+
+    assert_eq!(
+        reader
+            .posix_read_file_distributed(path)
+            .expect("reader current payload"),
+        new
+    );
+
+    stop_primary.store(true, Ordering::SeqCst);
+    primary_thread.join().expect("primary thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn sifs_cluster_posix_contract_damaged_replica_under_concurrent_reads() {
     let mut cluster = sifs_posix_cluster("sifs-contract-damaged-replica");
     let scenario = "damaged-replica-under-concurrent-reads";
@@ -28073,6 +28428,35 @@ fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
         Err(DfsPosixError::NotFound { .. })
     ));
 
+    // A canonical renamed file can be unlinked immediately after the caller
+    // observes the rename result. This is the same shape as the cluster
+    // read-your-write probe: write -> rename -> read -> unlink.
+    let delete_bytes = b"rename then delete canonical file".to_vec();
+    writer
+        .posix_write_file(
+            "/users/routed-dir/delete-source.txt",
+            &delete_bytes,
+            DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
+        )
+        .expect("routed delete-source write");
+    let delete_renamed = "/users/routed-dir/delete-renamed.txt";
+    writer
+        .posix_rename("/users/routed-dir/delete-source.txt", delete_renamed)
+        .expect("routed rename before canonical unlink");
+    assert_eq!(
+        writer
+            .posix_read_file(delete_renamed)
+            .expect("read renamed before canonical unlink"),
+        delete_bytes
+    );
+    writer
+        .posix_unlink(delete_renamed)
+        .expect("unlink canonical renamed file");
+    assert!(matches!(
+        writer.posix_stat(delete_renamed),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
     // hardlink routes and updates the link count everywhere it is observed.
     let link_stat = writer
         .posix_hardlink("/users/routed-dir/renamed.txt", "/users/routed-dir/link")
@@ -28576,7 +28960,7 @@ fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
 }
 
 #[test]
-fn sifs_cluster_posix_mkdir_all_remote_primary_skips_when_local_chain_exists() {
+fn sifs_cluster_posix_mkdir_all_remote_primary_falls_back_when_local_chain_exists() {
     let root = temp_root("sifs-mkdir-all-local-chain");
     let local_node =
         NodeId::from_legacy_named("node_sifs_mkdir_all_local_chain_local").expect("local");
@@ -28627,6 +29011,62 @@ fn sifs_cluster_posix_mkdir_all_remote_primary_skips_when_local_chain_exists() {
         .posix_mkdir_all_without_local_replay("/services/dfs-smoke")
         .expect("idempotent mkdir_all without replay should not require remote primary");
 
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_cluster_routed_mkdir_all_repairs_primary_when_local_chain_exists() {
+    let cluster = sifs_two_primary_cluster("sifs-routed-mkdir-all-primary-repair");
+    let SifsTwoPrimaryCluster {
+        root,
+        services_primary,
+        services_primary_node,
+        mut replica,
+        replica_node,
+        rejections,
+        ..
+    } = cluster;
+    assert!(
+        rejections.is_empty(),
+        "two-primary setup must not reject journal batches: {rejections:?}"
+    );
+
+    let base = "/services/cluster-tests";
+    let path = "/services/cluster-tests/primary-repair.txt";
+    replica
+        .posix_mkdir_all_local(base)
+        .expect("replica has stale local chain");
+    assert!(
+        replica.posix_stat(base).is_ok(),
+        "replica precondition should have local parent"
+    );
+    assert!(
+        matches!(
+            services_primary.posix_stat(base),
+            Err(DfsPosixError::NotFound { .. })
+        ),
+        "services primary precondition should lack the parent"
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+
+    replica
+        .posix_mkdir_all(base)
+        .expect("routed mkdir_all should repair primary despite local chain");
+    let mut write_options =
+        DfsWriteOptions::replicated_eventual(vec![replica_node, services_primary_node]);
+    write_options.foreground_replica_repair = false;
+    replica
+        .posix_write_file(path, b"child", write_options)
+        .expect("child write after authoritative mkdir_all");
+
+    stop.store(true, Ordering::SeqCst);
+    let services_primary = services_thread.join().expect("services thread");
+    assert!(services_primary.posix_stat(base).is_ok());
+    assert!(services_primary.posix_stat(path).is_ok());
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -29415,6 +29855,85 @@ fn sifs_cluster_posix_rename_across_shard_primaries_moves_object_transactionally
     });
 
     std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_services_routed_rename_then_unlink_is_read_your_write() {
+    let cluster = sifs_two_primary_cluster("sifs-services-rename-unlink-ryw");
+    let SifsTwoPrimaryCluster {
+        root,
+        users_primary,
+        services_primary,
+        mut replica,
+        replica_node,
+        rejections,
+        ..
+    } = cluster;
+    assert!(
+        rejections.is_empty(),
+        "two-primary setup must not reject journal batches: {rejections:?}"
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let users_stop = Arc::clone(&stop);
+    let users_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(users_primary, users_stop));
+    let services_stop = Arc::clone(&stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+
+    let base = "/services/cluster-tests";
+    let path = "/services/cluster-tests/ryw.txt";
+    let renamed = "/services/cluster-tests/ryw-renamed.txt";
+    let bytes = b"services routed rename unlink read-your-write".to_vec();
+
+    replica
+        .posix_mkdir_all(base)
+        .expect("routed mkdir_all base");
+    replica
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![replica_node.clone()]),
+        )
+        .expect("routed services write");
+    assert_eq!(
+        replica.posix_read_file(path).expect("read before rename"),
+        bytes
+    );
+
+    replica
+        .posix_rename(path, renamed)
+        .expect("routed services rename");
+    assert_eq!(
+        replica
+            .posix_read_file(renamed)
+            .expect("read renamed before unlink"),
+        bytes
+    );
+    assert!(matches!(
+        replica.posix_stat(path),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
+    let unlinked = replica
+        .posix_unlink(renamed)
+        .expect("unlink routed renamed services file");
+    assert_eq!(unlinked.kind, DfsObjectKind::Tombstone);
+    assert!(matches!(
+        replica.posix_stat(renamed),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
+    stop.store(true, Ordering::SeqCst);
+    let users_primary = users_thread.join().expect("users thread");
+    let services_primary = services_thread.join().expect("services thread");
+    assert!(matches!(
+        services_primary.posix_stat(renamed),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    std::fs::remove_dir_all(&root).ok();
+    drop(users_primary);
 }
 
 #[test]

@@ -9,7 +9,8 @@
 //!   roundtrip; read-your-write must hold immediately on the writing node.
 //! - `cluster.dfs.routed-status` — route a signed DFS status RPC to every
 //!   remote main daemon; this catches DFS route auth/routing regressions that a
-//!   generic network ping can miss.
+//!   generic network ping can miss. Route/RPC failures are hard-gated by
+//!   default; dirty DFS status may still poll for convergence.
 //! - `cluster.dfs.service-advertisements` — verify DFS service discovery
 //!   records advertise node identities instead of concrete network routes.
 //! - `cluster.dfs.invariants` — operational-metric sweep: no open conflicts,
@@ -45,24 +46,26 @@ use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::dfs::{
-    self, DfsFetchBlobResponseChunk, DfsFileSystemId, DfsMessageCommand, DfsNetworkMessage,
-    DfsObjectId, DfsOperatorStatus, DfsReadResponseChunk, DfsRoutedMessage,
-    DfsStageBlobChunkCommand, DfsVersion, SIFS_FILE_SYSTEM_ID,
+    self, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsFetchBlobResponseChunk,
+    DfsFileSystemId, DfsMessageCommand, DfsNetworkMessage, DfsObjectId, DfsOperatorRepairView,
+    DfsOperatorStatus, DfsReadResponseChunk, DfsRoutedMessage, DfsStageBlobChunkCommand,
+    DfsVersion, SIFS_FILE_SYSTEM_ID,
 };
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::ClusterPaths;
+use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
 use sinomo_runtime::test::{
     SinomoTestContext, SinomoTestError, SinomoTestOutcome, SinomoTestRegistryBuilder,
     SinomoTestRequirement, SinomoTestResult,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_EXPECT_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_ROUTED_STATUS_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_BULK_FILE_COUNT: usize = 128;
 const DEFAULT_BULK_FILE_BYTES: usize = 4 * 1024;
 const DEFAULT_LIGHTWEIGHT_LATENCY_ITERATIONS: usize = 128;
@@ -387,7 +390,7 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
     retry_bulk_mutation(
         deadline,
-        || backend.write_file(&path, payload.as_bytes()),
+        || backend.write_file_with_deadline(&path, payload.as_bytes(), deadline),
         || format!("cannot write SIFS file {path}"),
     )?;
     expect_payload_now(&backend, &path, payload.as_bytes(), "after write")?;
@@ -409,7 +412,9 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 }
 
 fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    let timeout_ms = optional_u64_parameter(ctx, "timeout-ms")?.unwrap_or(10_000);
+    let timeout_ms =
+        optional_u64_parameter(ctx, "timeout-ms")?.unwrap_or(DEFAULT_ROUTED_STATUS_TIMEOUT_MS);
+    let gate = DfsRoutedStatusGate::from_context(ctx, timeout_ms)?;
     let timeout = expect_timeout(ctx)?;
     let expected_targets = optional_usize_parameter(ctx, "expected-targets", 1)?;
     let max_remote_open_conflicts =
@@ -427,8 +432,13 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     })?;
     let state = cluster::read_cluster_state(&cluster_paths)
         .map_err(|error| SinomoTestError::failed(error.to_string()))?;
-    let targets =
-        filter_dfs_routed_status_targets(ctx, dfs_routed_status_targets_from_state(&state))?;
+    let targets = filter_dfs_routed_status_targets(
+        ctx,
+        &state,
+        dfs_routed_status_targets_from_state(&cluster_paths, &state),
+    )?;
+    let unavailable_repair_targets =
+        dfs_unavailable_repair_targets_from_state(&cluster_paths, &state);
     ctx.record("target_count", targets.len());
     ctx.record(
         "targets",
@@ -447,16 +457,22 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 "cannot connect to local daemon for DFS routed status: {source}"
             ))
         })?
-        .with_timeout(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1)));
+        .with_timeout(Duration::from_millis(timeout_ms));
     let request = dfs::dfs_status_rpc_request()
         .map_err(|source| SinomoTestError::failed(source.to_string()))?;
 
     let started = Instant::now();
     let deadline = started + timeout;
     let mut attempts = 0usize;
+    let mut failure_history = Vec::new();
+    let mut dirty_status_history = Vec::new();
+    ctx.record("timeout_ms", timeout_ms);
+    ctx.record("max_attempts", gate.max_attempts);
+    ctx.record("max_elapsed_ms", gate.max_elapsed.as_millis() as u64);
     loop {
         attempts = attempts.saturating_add(1);
         let mut statuses = BTreeMap::new();
+        let mut repair_details = BTreeMap::new();
         let mut failures = Vec::new();
         for target in &targets {
             match daemon_client.dfs_object_rpc_to_target(
@@ -467,7 +483,41 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ) {
                 Ok(response) => match dfs::decode_dfs_status_rpc_response(&response) {
                     Ok(status) => {
-                        statuses.insert(target.to_string(), dfs_status_probe_summary(&status));
+                        let repairs = if status.pending_repair_count > 0 {
+                            match fetch_dfs_repair_views_for_status(
+                                &daemon_client,
+                                target,
+                                Duration::from_millis(timeout_ms),
+                                status.pending_repair_count,
+                            ) {
+                                Ok(repairs) => repairs,
+                                Err(error) => {
+                                    failures.push(format!(
+                                        "{target}: repair inspection failed: {error}"
+                                    ));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        if !repairs.is_empty() {
+                            repair_details.insert(
+                                target.to_string(),
+                                repairs
+                                    .iter()
+                                    .map(dfs_repair_probe_summary)
+                                    .collect::<Vec<_>>(),
+                            );
+                        }
+                        statuses.insert(
+                            target.to_string(),
+                            dfs_status_probe_summary(
+                                &status,
+                                &repairs,
+                                &unavailable_repair_targets,
+                            ),
+                        );
                     }
                     Err(error) => failures.push(format!("{target}: decode failed: {error}")),
                 },
@@ -480,21 +530,65 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             max_remote_pending_writes,
             max_remote_pending_repairs,
         );
+        let elapsed = started.elapsed();
+        if !failures.is_empty() {
+            failure_history.extend(
+                failures
+                    .iter()
+                    .map(|failure| format!("attempt {attempts}: {failure}")),
+            );
+        }
+        if !dirty_statuses.is_empty() {
+            dirty_status_history.extend(
+                dirty_statuses
+                    .iter()
+                    .map(|dirty| format!("attempt {attempts}: {dirty}")),
+            );
+        }
         if failures.is_empty() && dirty_statuses.is_empty() {
             ctx.record("statuses", &statuses);
             ctx.record("attempts", attempts);
-            ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+            ctx.record("elapsed_ms", elapsed.as_millis() as u64);
+            if !failure_history.is_empty() {
+                ctx.record("failure_history", &failure_history);
+            }
+            if !dirty_status_history.is_empty() {
+                ctx.record("dirty_status_history", &dirty_status_history);
+            }
+            if failure_history.is_empty()
+                && dirty_status_history.is_empty()
+                && gate.success_exceeded(attempts, elapsed)
+            {
+                return Ok(SinomoTestOutcome::failed(format!(
+                    "DFS routed status succeeded in {}ms, exceeding the {}ms route/RPC gate",
+                    elapsed.as_millis(),
+                    gate.max_elapsed.as_millis()
+                )));
+            }
+            if !failure_history.is_empty() && gate.success_exceeded(attempts, elapsed) {
+                return Ok(SinomoTestOutcome::failed(format!(
+                    "DFS routed status recovered from route/RPC failures after {attempts} attempt(s) in {}ms, exceeding the gate of {} attempt(s) in {}ms",
+                    elapsed.as_millis(),
+                    gate.max_attempts,
+                    gate.max_elapsed.as_millis()
+                )));
+            }
             return Ok(SinomoTestOutcome::passed(format!(
                 "DFS routed status succeeded for {} remote main daemon(s)",
                 targets.len()
             )));
         }
-        if Instant::now() >= deadline {
+        if (!failures.is_empty() && gate.exhausted(attempts, elapsed)) || Instant::now() >= deadline
+        {
             ctx.record("statuses", &statuses);
             ctx.record("attempts", attempts);
-            ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+            ctx.record("elapsed_ms", elapsed.as_millis() as u64);
+            if !repair_details.is_empty() {
+                ctx.record("repair_details", &repair_details);
+            }
             if !failures.is_empty() {
                 ctx.record("failures", failures.clone());
+                ctx.record("failure_history", &failure_history);
                 return Ok(SinomoTestOutcome::failed(format!(
                     "DFS routed status failed for {}/{} targets",
                     failures.len(),
@@ -502,6 +596,7 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 )));
             }
             ctx.record("dirty_statuses", dirty_statuses.clone());
+            ctx.record("dirty_status_history", &dirty_status_history);
             return Ok(SinomoTestOutcome::failed(format!(
                 "DFS routed status found dirty status on {}/{} target(s)",
                 dirty_statuses.len(),
@@ -512,7 +607,40 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DfsRoutedStatusGate {
+    max_attempts: usize,
+    max_elapsed: Duration,
+}
+
+impl DfsRoutedStatusGate {
+    fn from_context(ctx: &SinomoTestContext, timeout_ms: u64) -> Result<Self, SinomoTestError> {
+        let max_attempts = optional_usize_parameter(ctx, "max-attempts", 1)?;
+        require_positive("max-attempts", max_attempts)?;
+        let max_elapsed_ms = optional_u64_parameter(ctx, "max-elapsed-ms")?.unwrap_or(timeout_ms);
+        if max_elapsed_ms == 0 {
+            return Err(SinomoTestError::InvalidParameter {
+                name: "max-elapsed-ms".to_string(),
+                detail: "must be greater than zero".to_string(),
+            });
+        }
+        Ok(Self {
+            max_attempts,
+            max_elapsed: Duration::from_millis(max_elapsed_ms),
+        })
+    }
+
+    fn exhausted(&self, attempts: usize, elapsed: Duration) -> bool {
+        attempts >= self.max_attempts || elapsed >= self.max_elapsed
+    }
+
+    fn success_exceeded(&self, attempts: usize, elapsed: Duration) -> bool {
+        attempts > self.max_attempts || elapsed > self.max_elapsed
+    }
+}
+
 fn dfs_routed_status_targets_from_state(
+    cluster_paths: &ClusterPaths,
     state: &sinomo_runtime::core::ClusterBootstrapState,
 ) -> Vec<NodeId> {
     let mut targets = state
@@ -524,6 +652,7 @@ fn dfs_routed_status_targets_from_state(
                 && member.capabilities.iter().any(|capability| {
                     capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY
                 })
+                && dfs_member_available_for_route(cluster_paths, state, member)
         })
         .map(|member| member.node_id.clone())
         .collect::<Vec<_>>();
@@ -531,27 +660,60 @@ fn dfs_routed_status_targets_from_state(
     targets
 }
 
+fn dfs_member_available_for_route(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+    member: &sinomo_runtime::core::ClusterMemberRecord,
+) -> bool {
+    match network::cluster_member_main_daemon_connectivity(cluster_paths, state, member) {
+        network::ClusterMemberMainDaemonConnectivity::Healthy
+        | network::ClusterMemberMainDaemonConnectivity::Unknown => true,
+        network::ClusterMemberMainDaemonConnectivity::Degraded
+        | network::ClusterMemberMainDaemonConnectivity::Unreachable => {
+            dfs_target_has_healthy_route(cluster_paths, state, &member.node_id)
+        }
+    }
+}
+
+fn dfs_target_has_healthy_route(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+    target: &NodeId,
+) -> bool {
+    let graph = network::ClusterConnectivityGraph::read_for_local(cluster_paths, state);
+    network::cluster_healthy_route_next_hop(&graph, &state.local_node_id, target).is_some()
+}
+
+fn dfs_unavailable_repair_targets_from_state(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+) -> BTreeSet<NodeId> {
+    state
+        .members
+        .iter()
+        .filter(|member| {
+            member.state.is_authorized()
+                && !dfs_member_available_for_route(cluster_paths, state, member)
+        })
+        .map(|member| member.node_id.clone())
+        .collect()
+}
+
 fn filter_dfs_routed_status_targets(
     ctx: &SinomoTestContext,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
     targets: Vec<NodeId>,
 ) -> Result<Vec<NodeId>, SinomoTestError> {
-    let Some(target_node_id) = ctx.parameter("target-node-id") else {
-        return Ok(targets);
-    };
-    let target_node_id = target_node_id.trim();
-    if target_node_id.is_empty() {
+    if ctx.parameter("target-node-id").is_some() && ctx.parameter("target-name").is_some() {
         return Err(SinomoTestError::InvalidParameter {
             name: "target-node-id".to_string(),
-            detail: "must not be empty".to_string(),
+            detail: "cannot be combined with target-name".to_string(),
         });
     }
-    let target_node_id =
-        target_node_id
-            .parse::<NodeId>()
-            .map_err(|source| SinomoTestError::InvalidParameter {
-                name: "target-node-id".to_string(),
-                detail: source.to_string(),
-            })?;
+
+    let Some(target_node_id) = dfs_target_filter_node_id(ctx, state)? else {
+        return Ok(targets);
+    };
     let filtered = targets
         .into_iter()
         .filter(|target| target == &target_node_id)
@@ -565,14 +727,150 @@ fn filter_dfs_routed_status_targets(
     Ok(filtered)
 }
 
-fn dfs_status_probe_summary(status: &DfsOperatorStatus) -> BTreeMap<&'static str, u64> {
+fn dfs_target_filter_node_id(
+    ctx: &SinomoTestContext,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+) -> Result<Option<NodeId>, SinomoTestError> {
+    if let Some(target_node_id) = ctx.parameter("target-node-id") {
+        let target_node_id = target_node_id.trim();
+        if target_node_id.is_empty() {
+            return Err(SinomoTestError::InvalidParameter {
+                name: "target-node-id".to_string(),
+                detail: "must not be empty".to_string(),
+            });
+        }
+        return target_node_id
+            .parse::<NodeId>()
+            .map(Some)
+            .map_err(|source| SinomoTestError::InvalidParameter {
+                name: "target-node-id".to_string(),
+                detail: source.to_string(),
+            });
+    }
+
+    let Some(target_name) = ctx.parameter("target-name") else {
+        return Ok(None);
+    };
+    let target_name = target_name.trim();
+    if target_name.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "target-name".to_string(),
+            detail: "must not be empty".to_string(),
+        });
+    }
+    let matches = state
+        .members
+        .iter()
+        .filter(|member| member.display_name == target_name)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [member] => Ok(Some(member.node_id.clone())),
+        [] => Err(SinomoTestError::InvalidParameter {
+            name: "target-name".to_string(),
+            detail: format!("no cluster member is named {target_name}"),
+        }),
+        _ => Err(SinomoTestError::InvalidParameter {
+            name: "target-name".to_string(),
+            detail: format!("multiple cluster members are named {target_name}"),
+        }),
+    }
+}
+
+fn fetch_dfs_repair_views_for_status(
+    daemon_client: &DaemonApiClient,
+    target: &NodeId,
+    timeout: Duration,
+    pending_repair_count: usize,
+) -> Result<Vec<DfsOperatorRepairView>, String> {
+    let limit = pending_repair_count.max(1);
+    let request = dfs::dfs_inspection_rpc_request(&DaemonDfsInspectionRequest::Repair {
+        file_system_id: None,
+        object_id: None,
+        limit: Some(limit),
+        cursor: None,
+    })
+    .map_err(|error| error.to_string())?;
+    let response = daemon_client
+        .dfs_object_rpc_to_target(target, &request, timeout, true)
+        .map_err(|error| error.to_string())?;
+    match dfs::decode_dfs_inspection_rpc_response(&response).map_err(|error| error.to_string())? {
+        DaemonDfsInspectionResponse::Repair { repairs, .. } => Ok(repairs),
+        other => Err(format!("unexpected DFS inspection response: {other:?}")),
+    }
+}
+
+fn dfs_repair_probe_summary(repair: &DfsOperatorRepairView) -> BTreeMap<&'static str, String> {
+    BTreeMap::from([
+        ("intent_id", repair.intent_id.clone()),
+        ("file_system_id", repair.file_system_id.to_string()),
+        ("object_id", repair.object_id.to_string()),
+        ("version", repair.version.to_string()),
+        (
+            "content_hash",
+            repair.content_hash.clone().unwrap_or_default(),
+        ),
+        (
+            "missing_replica_node_id",
+            repair.missing_replica_node_id.to_string(),
+        ),
+    ])
+}
+
+fn dfs_status_probe_summary(
+    status: &DfsOperatorStatus,
+    repairs: &[DfsOperatorRepairView],
+    unavailable_repair_targets: &BTreeSet<NodeId>,
+) -> BTreeMap<&'static str, u64> {
+    let unavailable_pending_repairs =
+        dfs_unavailable_pending_repair_count(status, repairs, unavailable_repair_targets);
+    let active_pending_repairs = status
+        .pending_repair_count
+        .saturating_sub(unavailable_pending_repairs);
     BTreeMap::from([
         ("file_systems", status.file_system_count as u64),
         ("objects", status.object_count as u64),
         ("pending_writes", status.pending_write_count as u64),
         ("open_conflicts", status.open_conflict_count as u64),
-        ("pending_repairs", status.pending_repair_count as u64),
+        ("pending_repairs", active_pending_repairs as u64),
+        ("total_pending_repairs", status.pending_repair_count as u64),
+        (
+            "unavailable_pending_repairs",
+            unavailable_pending_repairs as u64,
+        ),
     ])
+}
+
+fn dfs_unavailable_pending_repair_count(
+    status: &DfsOperatorStatus,
+    repairs: &[DfsOperatorRepairView],
+    unavailable_repair_targets: &BTreeSet<NodeId>,
+) -> usize {
+    if status.pending_repair_count == 0 || unavailable_repair_targets.is_empty() {
+        return 0;
+    }
+    let mut unavailable_repairs = status
+        .repair_attempts
+        .iter()
+        .filter(|attempt| unavailable_repair_targets.contains(&attempt.missing_replica_node_id))
+        .map(|attempt| {
+            (
+                attempt.intent_id.clone(),
+                attempt.missing_replica_node_id.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    unavailable_repairs.extend(
+        repairs
+            .iter()
+            .filter(|repair| unavailable_repair_targets.contains(&repair.missing_replica_node_id))
+            .map(|repair| {
+                (
+                    repair.intent_id.clone(),
+                    repair.missing_replica_node_id.clone(),
+                )
+            }),
+    );
+    unavailable_repairs.len().min(status.pending_repair_count)
 }
 
 fn run_service_advertisements(ctx: &mut SinomoTestContext) -> SinomoTestResult {
@@ -689,8 +987,16 @@ fn routed_status_dirty_summaries(
                 || pending_writes > max_remote_pending_writes as u64
                 || pending_repairs > max_remote_pending_repairs as u64
             {
+                let total_pending_repairs = status
+                    .get("total_pending_repairs")
+                    .copied()
+                    .unwrap_or(pending_repairs);
+                let unavailable_pending_repairs = status
+                    .get("unavailable_pending_repairs")
+                    .copied()
+                    .unwrap_or(0);
                 Some(format!(
-                    "{target}: open_conflicts={open_conflicts}, pending_writes={pending_writes}, pending_repairs={pending_repairs}"
+                    "{target}: open_conflicts={open_conflicts}, pending_writes={pending_writes}, pending_repairs={pending_repairs}, total_pending_repairs={total_pending_repairs}, unavailable_pending_repairs={unavailable_pending_repairs}"
                 ))
             } else {
                 None
@@ -718,27 +1024,43 @@ fn run_concurrent_file_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .create_dir_all(&base)
         .map_err(SinomoTestError::failed)?;
     backend
-        .write_file(&path, &seed)
+        .write_file_with_deadline(&path, &seed, Instant::now() + timeout)
         .map_err(SinomoTestError::failed)?;
     ctx.record("node", &node);
     ctx.record("path", &path);
 
     let started = Instant::now();
-    let run_writer =
-        |label: &'static str, data_dir: SinomoDataDir, path: String, bytes: Vec<u8>| {
-            std::thread::spawn(move || {
-                let started = Instant::now();
-                let result = SifsFileManagerBackend::open(&data_dir)
-                    .and_then(|backend| backend.write_file(&path, &bytes));
-                (
-                    label,
-                    result.map(|_| ()).map_err(|error| error.to_string()),
-                    started.elapsed().as_millis() as u64,
-                )
-            })
-        };
-    let thread_a = run_writer("writer-a", data_dir.clone(), path.clone(), writer_a.clone());
-    let thread_b = run_writer("writer-b", data_dir.clone(), path.clone(), writer_b.clone());
+    let deadline = started + timeout;
+    let run_writer = |label: &'static str,
+                      data_dir: SinomoDataDir,
+                      path: String,
+                      bytes: Vec<u8>,
+                      deadline: Instant| {
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = SifsFileManagerBackend::open(&data_dir)
+                .and_then(|backend| backend.write_file_with_deadline(&path, &bytes, deadline));
+            (
+                label,
+                result.map(|_| ()).map_err(|error| error.to_string()),
+                started.elapsed().as_millis() as u64,
+            )
+        })
+    };
+    let thread_a = run_writer(
+        "writer-a",
+        data_dir.clone(),
+        path.clone(),
+        writer_a.clone(),
+        deadline,
+    );
+    let thread_b = run_writer(
+        "writer-b",
+        data_dir.clone(),
+        path.clone(),
+        writer_b.clone(),
+        deadline,
+    );
     let results = vec![
         thread_a
             .join()
@@ -897,7 +1219,7 @@ fn run_failover_current_read(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let nonce = probe_nonce();
     let path = format!("{base}/current-read-{nonce}.txt");
     let old = format!("old current-read payload {nonce}");
-    let new = format!("new current-read payload {nonce}");
+    let new = format!("new current-read payload {nonce} refreshed");
     backend
         .write_file(&path, old.as_bytes())
         .map_err(SinomoTestError::failed)?;
@@ -923,10 +1245,18 @@ fn run_failover_current_read(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         let read = cached_reader
             .read_file(&path)
             .map_err(SinomoTestError::failed)?;
+        let payload = if read == old.as_bytes() {
+            "old"
+        } else if read == new.as_bytes() {
+            "new"
+        } else {
+            "other"
+        };
         observations.push(format!(
-            "elapsed_ms={}:bytes={}",
+            "elapsed_ms={}:bytes={}:payload={}",
             started.elapsed().as_millis(),
-            read.len()
+            read.len(),
+            payload
         ));
         if read == new.as_bytes() {
             ctx.record("node", &node);
@@ -1434,9 +1764,10 @@ fn run_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         deadline,
         || {
             if foreground_repair {
-                backend.write_file_with_foreground_replica_repair(&path, &payload)
+                backend
+                    .write_file_with_foreground_replica_repair_deadline(&path, &payload, deadline)
             } else {
-                backend.write_file(&path, &payload)
+                backend.write_file_with_deadline(&path, &payload, deadline)
             }
         },
         || format!("cannot write SIFS file {path}"),
@@ -1747,7 +2078,7 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let deadline = started + timeout;
     retry_bulk_mutation(
         deadline,
-        || backend.create_dir_all_deferred_local_replay(&base),
+        || backend.create_dir_all_deferred_local_replay_until(&base, deadline),
         || format!("cannot create SIFS directory {base}"),
     )?;
     let mkdir_elapsed = started.elapsed();
@@ -1760,7 +2091,7 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let write_started = Instant::now();
     retry_bulk_mutation(
         deadline,
-        || backend.write_files_with_known_parents_deferred_publish(&batch),
+        || backend.write_files_with_known_parents_deferred_publish_until(&batch, deadline),
         || format!("cannot write SIFS bulk batch under {base}"),
     )?;
     let write_elapsed = write_started.elapsed();
@@ -2072,7 +2403,7 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     if let Some(parent) = parent.as_deref() {
         retry_bulk_mutation(
             deadline,
-            || backend.create_dir_all_deferred_local_replay(parent),
+            || backend.create_dir_all_deferred_local_replay_until(parent, deadline),
             || format!("cannot create SIFS parent directory {parent}"),
         )?;
     }
@@ -2081,7 +2412,7 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let write_started = Instant::now();
     retry_bulk_mutation(
         deadline,
-        || backend.write_file_with_known_parent_deferred_publish(&path, &payload),
+        || backend.write_file_with_known_parent_deferred_publish_until(&path, &payload, deadline),
         || format!("cannot write large SIFS file {path}"),
     )?;
     let write_elapsed = write_started.elapsed();
@@ -3236,4 +3567,418 @@ fn probe_nonce() -> String {
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
     format!("{nanos:x}-{:x}", std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_runtime::core::{
+        CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
+        ClusterEndpointSource, ClusterMemberRecord, ClusterTransportKind,
+    };
+    use sinomo_runtime::node::ClusterId;
+
+    fn test_state() -> ClusterBootstrapState {
+        let now = time::OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_dfs_status_targets").expect("cluster id");
+        let local_node =
+            NodeId::from_legacy_named("node_dfs_status_targets_local").expect("local node");
+        let remote_node =
+            NodeId::from_legacy_named("node_dfs_status_targets_remote").expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "dfs status targets",
+            local_node,
+            "local",
+            "local-public-key",
+            now,
+        );
+        state.members[0].capabilities.push(main_daemon_capability());
+        let mut remote = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote_node,
+            "remote",
+            "remote-public-key",
+            now,
+        );
+        remote.capabilities.push(main_daemon_capability());
+        state.members.push(remote);
+        state
+    }
+
+    fn add_remote_main(state: &mut ClusterBootstrapState, name: &str) -> NodeId {
+        let now = time::OffsetDateTime::now_utc();
+        let node = NodeId::from_legacy_named(name).expect("node");
+        let mut member = ClusterMemberRecord::local_voter(
+            state.cluster_id.clone(),
+            node.clone(),
+            name,
+            format!("{name}-public-key"),
+            now,
+        );
+        member.capabilities.push(main_daemon_capability());
+        state.members.push(member);
+        node
+    }
+
+    fn main_daemon_capability() -> CapabilityName {
+        CapabilityName::new(sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY)
+            .expect("main daemon capability")
+    }
+
+    fn test_endpoint(node_id: &NodeId, name: &str, address: &str) -> ClusterEndpointRecord {
+        ClusterEndpointRecord {
+            endpoint_id: network::ClusterEndpointId::from_legacy_named(name).expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: address.to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        }
+    }
+
+    fn repair_attempt(
+        intent_id: &str,
+        missing_replica_node_id: NodeId,
+    ) -> dfs::DfsRepairAttemptRecord {
+        dfs::DfsRepairAttemptRecord {
+            intent_id: intent_id.to_string(),
+            object_id: DfsObjectId::from_legacy_named(format!("object_{intent_id}"))
+                .expect("object id"),
+            version: DfsVersion::from_legacy_named(format!("version_{intent_id}"))
+                .expect("version"),
+            content_hash: format!("blake3:{intent_id}"),
+            missing_replica_node_id,
+            attempts: 1,
+            in_flight: false,
+            last_attempt_unix_nanos: 1,
+            next_retry_unix_nanos: 2,
+            next_chunk_index: None,
+            last_error: Some("network error at cluster target rpc: no usable route".to_string()),
+        }
+    }
+
+    fn repair_view(intent_id: &str, missing_replica_node_id: NodeId) -> DfsOperatorRepairView {
+        DfsOperatorRepairView {
+            intent_id: intent_id.to_string(),
+            file_system_id: DfsFileSystemId::from_legacy_named("fs_dfs_repair_view")
+                .expect("file system id"),
+            object_id: DfsObjectId::from_legacy_named(format!("object_{intent_id}"))
+                .expect("object id"),
+            version: DfsVersion::from_legacy_named(format!("version_{intent_id}"))
+                .expect("version"),
+            content_hash: Some(format!("blake3:{intent_id}")),
+            missing_replica_node_id,
+        }
+    }
+
+    fn connectivity_record(
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        connectivity_state: network::ClusterConnectivityState,
+    ) -> network::ClusterConnectivityRecord {
+        let now = time::OffsetDateTime::now_utc();
+        let consecutive_failures = match connectivity_state {
+            network::ClusterConnectivityState::Healthy => 0,
+            network::ClusterConnectivityState::Degraded => 2,
+            network::ClusterConnectivityState::Unreachable => 3,
+        };
+        network::cluster_connectivity_record(
+            state,
+            endpoint,
+            connectivity_state,
+            Some(1),
+            consecutive_failures,
+            Some(now.to_string()),
+            None,
+            now,
+            network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        )
+    }
+
+    fn synthetic_tcp_tunnel_record(
+        state: &ClusterBootstrapState,
+        target: &NodeId,
+    ) -> network::ClusterConnectivityRecord {
+        let now = time::OffsetDateTime::now_utc();
+        network::ClusterConnectivityRecord {
+            cluster_id: state.cluster_id.clone(),
+            source_node_id: state.local_node_id.clone(),
+            target_node_id: target.clone(),
+            endpoint_id: network::ClusterEndpointId::derived(
+                "sinomo.test.dfs.synthetic.tcp-tunnel",
+                format!("{}\0{}", state.local_node_id.as_str(), target.as_str()),
+            ),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!(
+                "{}{}",
+                network::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX,
+                target.as_str()
+            ),
+            state: network::ClusterConnectivityState::Healthy,
+            latency_ms: Some(1),
+            consecutive_failures: 0,
+            last_success_at: Some(now.to_string()),
+            last_failure_at: None,
+            failure_reason: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(network::CLUSTER_CONNECTIVITY_TTL_SECONDS),
+        }
+    }
+
+    #[test]
+    fn dfs_routed_status_gate_defaults_to_single_five_second_attempt() {
+        let ctx = SinomoTestContext::new("unused");
+
+        let gate =
+            DfsRoutedStatusGate::from_context(&ctx, DEFAULT_ROUTED_STATUS_TIMEOUT_MS).unwrap();
+
+        assert_eq!(
+            gate,
+            DfsRoutedStatusGate {
+                max_attempts: 1,
+                max_elapsed: Duration::from_millis(DEFAULT_ROUTED_STATUS_TIMEOUT_MS),
+            }
+        );
+        assert!(!gate.exhausted(0, Duration::from_millis(4_999)));
+        assert!(gate.exhausted(1, Duration::from_millis(1)));
+        assert!(gate.exhausted(0, Duration::from_millis(5_000)));
+        assert!(!gate.success_exceeded(1, Duration::from_millis(5_000)));
+        assert!(gate.success_exceeded(2, Duration::from_millis(1)));
+        assert!(gate.success_exceeded(1, Duration::from_millis(5_001)));
+    }
+
+    #[test]
+    fn dfs_routed_status_gate_accepts_explicit_polling_budget() {
+        let ctx = SinomoTestContext::new("unused")
+            .with_parameter("max-attempts", "3")
+            .with_parameter("max-elapsed-ms", "7000");
+
+        let gate = DfsRoutedStatusGate::from_context(&ctx, 5_000).unwrap();
+
+        assert_eq!(
+            gate,
+            DfsRoutedStatusGate {
+                max_attempts: 3,
+                max_elapsed: Duration::from_millis(7_000),
+            }
+        );
+        assert!(!gate.exhausted(2, Duration::from_millis(6_999)));
+        assert!(gate.exhausted(3, Duration::from_millis(1)));
+        assert!(gate.exhausted(1, Duration::from_millis(7_000)));
+    }
+
+    #[test]
+    fn dfs_routed_status_gate_rejects_zero_limits() {
+        let attempts_ctx = SinomoTestContext::new("unused").with_parameter("max-attempts", "0");
+        let attempts_error = DfsRoutedStatusGate::from_context(&attempts_ctx, 5_000).unwrap_err();
+        assert!(matches!(
+            attempts_error,
+            SinomoTestError::InvalidParameter { ref name, .. } if name == "max-attempts"
+        ));
+
+        let elapsed_ctx = SinomoTestContext::new("unused").with_parameter("max-elapsed-ms", "0");
+        let elapsed_error = DfsRoutedStatusGate::from_context(&elapsed_ctx, 5_000).unwrap_err();
+        assert!(matches!(
+            elapsed_error,
+            SinomoTestError::InvalidParameter { ref name, .. } if name == "max-elapsed-ms"
+        ));
+    }
+
+    #[test]
+    fn dfs_unavailable_repair_targets_include_degraded_main_without_route() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-degraded-repair-target");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let mut state = test_state();
+        let unavailable = state.members[1].node_id.clone();
+        let endpoint = test_endpoint(
+            &unavailable,
+            "endpoint_dfs_degraded_repair_target",
+            "unavailable.test:21353",
+        );
+        state.members[1].endpoints = vec![endpoint.clone()];
+        let degraded = connectivity_record(
+            &state,
+            &endpoint,
+            network::ClusterConnectivityState::Degraded,
+        );
+        network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[degraded],
+        )
+        .expect("write connectivity");
+
+        let targets = dfs_unavailable_repair_targets_from_state(&paths, &state);
+
+        assert!(
+            targets.contains(&unavailable),
+            "a degraded main daemon with no healthy route must be treated as unavailable repair debt: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn dfs_unavailable_repair_targets_keep_routed_degraded_main_available() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-routed-repair-target");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let mut state = test_state();
+        let bridge = state.members[1].node_id.clone();
+        let target = add_remote_main(&mut state, "node_dfs_routed_repair_target");
+        let bridge_endpoint = test_endpoint(
+            &bridge,
+            "endpoint_dfs_routed_repair_bridge",
+            "bridge.test:21353",
+        );
+        let target_endpoint = test_endpoint(
+            &target,
+            "endpoint_dfs_routed_repair_target",
+            "target.test:21353",
+        );
+        state.members[1].endpoints = vec![bridge_endpoint.clone()];
+        state.members[2].endpoints = vec![target_endpoint.clone()];
+        let local_to_target = connectivity_record(
+            &state,
+            &target_endpoint,
+            network::ClusterConnectivityState::Degraded,
+        );
+        let local_to_bridge = connectivity_record(
+            &state,
+            &bridge_endpoint,
+            network::ClusterConnectivityState::Healthy,
+        );
+        let mut bridge_state = state.clone();
+        bridge_state.local_node_id = bridge.clone();
+        let bridge_to_target = connectivity_record(
+            &bridge_state,
+            &target_endpoint,
+            network::ClusterConnectivityState::Healthy,
+        );
+        network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[local_to_target, local_to_bridge],
+        )
+        .expect("write local connectivity");
+        network::write_local_cluster_connectivity_record_set(&paths, &bridge, &[bridge_to_target])
+            .expect("write bridge connectivity");
+
+        let targets = dfs_unavailable_repair_targets_from_state(&paths, &state);
+
+        assert!(
+            !targets.contains(&target),
+            "a degraded direct repair target with a healthy route must remain available: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn dfs_routed_status_targets_include_degraded_main_with_healthy_synthetic_tunnel() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-synthetic-tunnel-status-target");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let mut state = test_state();
+        let target = state.members[1].node_id.clone();
+        let endpoint = test_endpoint(
+            &target,
+            "endpoint_dfs_synthetic_tunnel_status_target",
+            "target.test:21353",
+        );
+        state.members[1].endpoints = vec![endpoint.clone()];
+        let degraded = connectivity_record(
+            &state,
+            &endpoint,
+            network::ClusterConnectivityState::Degraded,
+        );
+        let tunnel = synthetic_tcp_tunnel_record(&state, &target);
+        network::write_local_cluster_connectivity_records(
+            &paths,
+            &state.local_node_id,
+            &[degraded, tunnel],
+        )
+        .expect("write connectivity");
+
+        let targets = dfs_routed_status_targets_from_state(&paths, &state);
+        let unavailable_repair_targets = dfs_unavailable_repair_targets_from_state(&paths, &state);
+
+        assert!(
+            targets.contains(&target),
+            "a degraded direct DFS target with a healthy synthetic tunnel must stay targetable: {targets:?}"
+        );
+        assert!(
+            !unavailable_repair_targets.contains(&target),
+            "a healthy synthetic tunnel must keep repair accounting from marking the target unavailable: {unavailable_repair_targets:?}"
+        );
+    }
+
+    #[test]
+    fn dfs_status_summary_excludes_unavailable_repair_targets_from_active_debt() {
+        let unavailable =
+            NodeId::from_legacy_named("node_dfs_unavailable_repair_target").expect("node");
+        let reachable =
+            NodeId::from_legacy_named("node_dfs_reachable_repair_target").expect("node");
+        let mut unavailable_repair_targets = BTreeSet::new();
+        unavailable_repair_targets.insert(unavailable.clone());
+        let status = DfsOperatorStatus {
+            file_system_count: 1,
+            object_count: 2,
+            version_count: 3,
+            receipt_count: 4,
+            intent_count: 5,
+            pending_write_count: 0,
+            open_conflict_count: 0,
+            pending_repair_count: 2,
+            repair_attempt_count: 2,
+            pending_namespace_job_count: 0,
+            failed_namespace_job_count: 0,
+            metadata_shards: Vec::new(),
+            repair_attempts: vec![
+                repair_attempt("offline_replica", unavailable),
+                repair_attempt("reachable_replica", reachable),
+            ],
+        };
+        let repairs = Vec::new();
+
+        let summary = dfs_status_probe_summary(&status, &repairs, &unavailable_repair_targets);
+
+        assert_eq!(summary.get("pending_repairs"), Some(&1));
+        assert_eq!(summary.get("total_pending_repairs"), Some(&2));
+        assert_eq!(summary.get("unavailable_pending_repairs"), Some(&1));
+    }
+
+    #[test]
+    fn dfs_status_summary_uses_repair_views_when_attempt_records_are_absent() {
+        let unavailable =
+            NodeId::from_legacy_named("node_dfs_unavailable_repair_view_target").expect("node");
+        let mut unavailable_repair_targets = BTreeSet::new();
+        unavailable_repair_targets.insert(unavailable.clone());
+        let status = DfsOperatorStatus {
+            file_system_count: 1,
+            object_count: 2,
+            version_count: 3,
+            receipt_count: 4,
+            intent_count: 5,
+            pending_write_count: 0,
+            open_conflict_count: 0,
+            pending_repair_count: 1,
+            repair_attempt_count: 0,
+            pending_namespace_job_count: 0,
+            failed_namespace_job_count: 0,
+            metadata_shards: Vec::new(),
+            repair_attempts: Vec::new(),
+        };
+        let repairs = vec![repair_view("offline_replica_without_attempt", unavailable)];
+
+        let summary = dfs_status_probe_summary(&status, &repairs, &unavailable_repair_targets);
+
+        assert_eq!(summary.get("pending_repairs"), Some(&0));
+        assert_eq!(summary.get("total_pending_repairs"), Some(&1));
+        assert_eq!(summary.get("unavailable_pending_repairs"), Some(&1));
+    }
 }

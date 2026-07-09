@@ -3,10 +3,11 @@ use super::{
     AgentReadinessOptions, AgentRunOptions, AgentSessionCliCommand, AgentSessionInspectOptions,
     AgentSessionMessageOptions, AgentSessionProgressOptions, AgentSessionResumeOptions,
     AgentSessionTerminalResultsOptions, AgentValidateOptions, BUILTIN_TOP_LEVEL_USAGE_COMMANDS,
-    CliClusterMemberMutationHost, CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand,
-    ClusterInitOptions, ClusterInviteOptions, ClusterJoinOptions, ClusterMigrateCommand,
-    ClusterMigrationPlanOptions, ClusterPaths, ClusterRemoveOptions, ClusterRenameOptions,
-    ClusterRoleOptions, ClusterRolloutBuildRequest, ClusterStateAuthorityOptions, DaemonCliCommand,
+    CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT, CLUSTER_HEALTH_PROBE_TIMEOUT, CliClusterMemberMutationHost,
+    CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand, ClusterInitOptions,
+    ClusterInviteOptions, ClusterJoinOptions, ClusterMigrateCommand, ClusterMigrationPlanOptions,
+    ClusterPaths, ClusterRemoveOptions, ClusterRenameOptions, ClusterRoleOptions,
+    ClusterRolloutBuildRequest, ClusterStateAuthorityOptions, DaemonCliCommand,
     DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
     DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsConflictResolveOptions,
     DfsConflictSaveVersionOptions, DfsConflictUseVersionOptions, DfsConflictVersionsOptions,
@@ -17,15 +18,15 @@ use super::{
     ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions,
     ProviderName, RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation,
     RolloutModuleNativeDylibOptions, RolloutOptions, RolloutProgressExpectation,
-    RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
-    SkillActivateOptions, SkillCliCommand, SkillExportOptions, SkillImportOptions,
-    SkillListOptions, SkillShowOptions, TestCliCommand, UninstallOptions,
-    authenticate_daemon_control_request, build_cluster_raft_append_request_from_next_index,
-    cli_command_is_help, cli_command_requires_cluster_state,
-    cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
-    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_kv_state_authority_id, cluster_leave,
-    cluster_leave_with_paths, cluster_migration_plan_with_paths,
+    RolloutProgressTiming, RolloutTarget, RolloutTelemetryGateSetOptions,
+    RuntimeMainAgentInteractionHandler, SelfRolloutPaths, SkillActivateOptions, SkillCliCommand,
+    SkillExportOptions, SkillImportOptions, SkillListOptions, SkillShowOptions, TestCliCommand,
+    UninstallOptions, authenticate_daemon_control_request,
+    build_cluster_raft_append_request_from_next_index, cli_command_is_help,
+    cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
+    cli_invocation_force_local_mode, cluster_has_local_quorum, cluster_init_with_paths,
+    cluster_invite_with_paths, cluster_join_with_paths, cluster_kv_state_authority_id,
+    cluster_leave, cluster_leave_with_paths, cluster_migration_plan_with_paths,
     cluster_node_status_from_daemon_status, cluster_peer_members, cluster_rename,
     daemon_advertised_endpoints_for_state, daemon_endpoint_advertisement_config_file,
     daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
@@ -47,10 +48,11 @@ use super::{
     rollout_pending_error_grace, rollout_progress_bar, rollout_status_matches_expectation,
     rollout_target_endpoint_for_main_with_connectivity, rollout_telemetry_gates_set_with_data_dir,
     rollout_terminal_response, run_tui_with_handler_io, run_tui_with_handler_io_and_daemon,
-    shadow_daemon_node_id, sign_daemon_rpc_request_from_data_dir, stage_rollout_main_activation,
-    sync_cluster_state_to_kv, test_command_requires_cluster_state, tui_default_daemon_status,
-    uninstall_with_layout, with_cli_force_local_mode, write_daemon_status,
-    write_imported_cluster_kv_snapshot, write_model_runtime_config_for_node, write_rollout_status,
+    send_rollout_request_with_progress_for_test, shadow_daemon_node_id,
+    sign_daemon_rpc_request_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
+    test_command_requires_cluster_state, tui_default_daemon_status, uninstall_with_layout,
+    with_cli_force_local_mode, write_daemon_status, write_imported_cluster_kv_snapshot,
+    write_model_runtime_config_for_node, write_rollout_status,
 };
 use super::{
     daemon_handle_daemon_sandbox_http_fetch_to_file, daemon_handle_daemon_sandbox_import_busybox,
@@ -939,6 +941,18 @@ fn top_level_cli_parser_routes_subcommands() {
             })
     ));
     assert!(parse_cli_command(&["evolve".to_string()]).is_err());
+}
+
+#[test]
+fn cluster_health_daemon_rpc_timeout_covers_health_probe_budget() {
+    assert!(
+        CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT >= CLUSTER_HEALTH_PROBE_TIMEOUT,
+        "cluster health must not time out the daemon aggregation before the bounded health probe budget elapses"
+    );
+    assert!(
+        CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT <= std::time::Duration::from_secs(5),
+        "cluster health is a hard 5s gate"
+    );
 }
 
 #[test]
@@ -11574,12 +11588,96 @@ fn rollout_pending_error_grace_extends_for_matching_active_status() {
 }
 
 #[test]
-fn rollout_missing_status_grace_shortens_after_matching_progress() {
+fn rollout_missing_status_grace_stays_active_after_matching_progress() {
     assert_eq!(
         rollout_missing_status_grace(false),
         Duration::from_secs(15 * 60)
     );
-    assert_eq!(rollout_missing_status_grace(true), Duration::from_secs(45));
+    assert_eq!(
+        rollout_missing_status_grace(true),
+        Duration::from_secs(15 * 60)
+    );
+}
+
+#[test]
+fn rollout_progress_waits_for_terminal_status_after_handoff_route_gap() {
+    let expectation = RolloutProgressExpectation {
+        source: "repo-a".to_string(),
+        requested_at: "2026-06-02T00:00:01Z".to_string(),
+        source_head: Some("head-new".to_string()),
+    };
+    let active = sinomo_runtime::core::ClusterNodeRolloutStatus {
+        status: "in-progress".to_string(),
+        mode: Some("cluster-remote-build".to_string()),
+        detail: Some("preparing activation".to_string()),
+        phase: Some("preparing-activation".to_string()),
+        progress_current: Some(4),
+        progress_total: Some(5),
+        progress_message: Some("preparing activation".to_string()),
+        source: Some("repo-a".to_string()),
+        requested_at: Some("2026-06-02T00:00:01Z".to_string()),
+        staged_at: None,
+        updated_at: None,
+        failed_at: None,
+        diagnostics: None,
+        stdout_log: None,
+        stderr_log: None,
+        stdout_tail: None,
+        stderr_tail: None,
+    };
+    let terminal = sinomo_runtime::core::ClusterNodeRolloutStatus {
+        status: "accepted".to_string(),
+        mode: Some("cluster-remote-build".to_string()),
+        detail: Some("shadow rollout finalized".to_string()),
+        phase: Some("shadow-finalized".to_string()),
+        progress_current: Some(5),
+        progress_total: Some(5),
+        progress_message: Some("shadow rollout finalized".to_string()),
+        source: Some("repo-a".to_string()),
+        requested_at: Some("2026-06-02T00:00:01Z".to_string()),
+        staged_at: None,
+        updated_at: None,
+        failed_at: None,
+        diagnostics: None,
+        stdout_log: None,
+        stderr_log: None,
+        stdout_tail: None,
+        stderr_tail: None,
+    };
+    let target = RolloutTarget::address("node.test:21353".to_string());
+    let mut polls = 0usize;
+
+    let response = send_rollout_request_with_progress_for_test(
+        &target,
+        "remote build",
+        expectation,
+        |_| {
+            Err(CliError::Network {
+                address: "node.test:21353".to_string(),
+                detail: "route unavailable during handoff".to_string(),
+            })
+        },
+        move |_| {
+            polls += 1;
+            match polls {
+                1 => Ok(Some(active.clone())),
+                2..=8 => Err(CliError::Network {
+                    address: "node.test:21353".to_string(),
+                    detail: "route unavailable during handoff".to_string(),
+                }),
+                _ => Ok(Some(terminal.clone())),
+            }
+        },
+        RolloutProgressTiming {
+            poll_interval: Duration::from_millis(5),
+            terminal_status_grace: Duration::from_millis(15),
+            active_status_error_grace: Duration::from_millis(250),
+        },
+    )
+    .expect("terminal status should win over transient handoff route loss");
+
+    assert_eq!(response.status, "accepted");
+    assert_eq!(response.source_head.as_deref(), Some("head-new"));
 }
 
 #[test]

@@ -399,7 +399,7 @@ impl DaemonApiClient {
     /// cluster KV. Foreground status readers should use that source of truth
     /// rather than spending their command budget on a live network sweep.
     pub fn cluster_health(&self) -> Result<Vec<ClusterHealthRow>, DaemonApiError> {
-        let request = sinomo_core::cluster::cluster_health_rpc_request_without_peer_views()?;
+        let request = cluster_health_snapshot_request()?;
         let response = self.call_request(&request)?;
         sinomo_core::cluster::decode_cluster_health_rpc_response(&response)
             .map_err(DaemonApiError::from)
@@ -409,11 +409,19 @@ impl DaemonApiClient {
     /// merging. This is useful for diagnostics but can be slower than the
     /// KV-backed snapshot used by [`Self::cluster_health`].
     pub fn cluster_health_with_peer_views(&self) -> Result<Vec<ClusterHealthRow>, DaemonApiError> {
-        let request = sinomo_core::cluster::cluster_health_rpc_request()?;
+        let request = cluster_health_live_request()?;
         let response = self.call_request(&request)?;
         sinomo_core::cluster::decode_cluster_health_rpc_response(&response)
             .map_err(DaemonApiError::from)
     }
+}
+
+fn cluster_health_snapshot_request() -> Result<ObjectRpcRequest, DaemonApiError> {
+    sinomo_core::cluster::cluster_health_rpc_request_without_peer_views().map_err(Into::into)
+}
+
+fn cluster_health_live_request() -> Result<ObjectRpcRequest, DaemonApiError> {
+    sinomo_core::cluster::cluster_health_rpc_request().map_err(Into::into)
 }
 
 fn object_rpc_forward_request(
@@ -788,6 +796,31 @@ mod tests {
             DaemonApiClient::at_address("127.0.0.1:21353").with_timeout(Duration::from_secs(5));
         assert_eq!(client.address(), "127.0.0.1:21353");
         assert_eq!(client.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn cluster_health_live_request_keeps_peer_views_enabled() {
+        let request = cluster_health_live_request().expect("cluster health request");
+        assert_eq!(request.route, sinomo_core::network::CLUSTER_HEALTH_ROUTE);
+        assert!(
+            !request
+                .metadata
+                .contains_key(sinomo_core::network::CLUSTER_HEALTH_INCLUDE_PEER_VIEWS_METADATA_KEY),
+            "live cluster health must not opt out of peer views"
+        );
+    }
+
+    #[test]
+    fn cluster_health_snapshot_request_disables_peer_views() {
+        let request = cluster_health_snapshot_request().expect("cluster health request");
+        assert_eq!(request.route, sinomo_core::network::CLUSTER_HEALTH_ROUTE);
+        assert_eq!(
+            request
+                .metadata
+                .get(sinomo_core::network::CLUSTER_HEALTH_INCLUDE_PEER_VIEWS_METADATA_KEY)
+                .map(String::as_str),
+            Some("false")
+        );
     }
 
     #[test]

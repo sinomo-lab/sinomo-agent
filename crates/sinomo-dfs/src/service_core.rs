@@ -65,6 +65,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             incoming_fetch_transfers: BTreeMap::new(),
             incoming_blob_transfers: BTreeMap::new(),
             incoming_patch_transfers: BTreeMap::new(),
+            local_metadata_journal_cursors: BTreeMap::new(),
             metadata_replication_cursors: BTreeMap::new(),
             recent_namespace_freshness_syncs: BTreeMap::new(),
             pending_metadata_replications: BTreeMap::new(),

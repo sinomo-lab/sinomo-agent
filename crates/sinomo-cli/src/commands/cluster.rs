@@ -2127,7 +2127,7 @@ fn try_fetch_daemon_cluster_health_rows() -> Result<Option<Vec<ClusterHealthRow>
     };
     Ok(client
         .with_timeout(CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT)
-        .cluster_health()
+        .cluster_health_with_peer_views()
         .ok())
 }
 

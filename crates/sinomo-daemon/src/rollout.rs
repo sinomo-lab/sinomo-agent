@@ -1,4 +1,6 @@
 use crate::cluster::{CLUSTER_HEALTH_PROBE_TIMEOUT, start_shadow_daemon_status_publisher};
+#[cfg(not(unix))]
+use crate::spawn_shadow_rollout_completion_helper_process;
 use crate::{
     CandidateMainDiagnostics, DaemonClusterStatus, DaemonError, DaemonLock, DaemonPaths,
     DaemonProbeStatus, DaemonStatus, daemon_connect_address, prepare_background_command,
@@ -6,6 +8,7 @@ use crate::{
     spawn_candidate_main_daemon_process, spawn_main_daemon_process,
     spawn_shadow_rollout_recovery_helper_process,
 };
+use fs2::FileExt;
 #[cfg(test)]
 use sinomo_rollout::read_rollout_status;
 use sinomo_rollout::{
@@ -34,7 +37,7 @@ use sinomo_rollout::{
     write_main_activation, write_rollout_status,
 };
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -58,6 +61,18 @@ const SHADOW_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const PENDING_MAIN_ACTIVATION_FORCE_TERMINATE_AFTER: Duration = Duration::from_secs(10);
 const PENDING_MAIN_ACTIVATION_TERMINATE_WAIT: Duration = Duration::from_secs(5);
 const ROLLOUT_DAEMON_TERMINATE_WAIT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RolloutTerminationMode {
+    ProcessOnly,
+    ProcessTree,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StagedMainActivationShutdown {
+    Immediate,
+    DeferredSelf,
+}
 
 #[allow(clippy::too_many_arguments)]
 fn write_cluster_rollout_progress(
@@ -306,6 +321,10 @@ pub enum PendingShadowMainExit {
         main_binary: PathBuf,
         main_options: crate::DaemonRunOptions,
         main_probe_status: DaemonProbeStatus,
+    },
+    RetryCandidate {
+        child: Child,
+        monitor: ShadowMainRolloutMonitor,
     },
     Recovered {
         child: Option<Child>,
@@ -968,6 +987,7 @@ pub fn run_shadow_daemon_supervision_loop(
         if should_shadow_start_main(main_restart_suppressed, pending_main_activation)
             && supervised_main.is_none()
             && matches!(main_probe_status, DaemonProbeStatus::NotRunning)
+            && (!pending_main_activation || main_data_owner_lock_released(&main_paths))
             && (pending_main_activation || main_restart_backoff.can_restart(now))
         {
             if pending_main_activation {
@@ -1117,6 +1137,28 @@ pub fn run_shadow_daemon_supervision_loop(
                                 }),
                             );
                         }
+                        PendingShadowMainExit::RetryCandidate { child, monitor } => {
+                            supervised_main = Some(child);
+                            supervised_main_started_at = Some(Instant::now());
+                            pending_rollout = Some(monitor);
+                            main_probe_status = DaemonProbeStatus::NotRunning;
+                            last_main_probe = Instant::now() - shadow_main_probe_interval(true);
+                            main_restart_backoff.clear_schedule();
+                            crate::append_operational_event_best_effort(
+                                &shadow_paths,
+                                crate::OperationalSeverity::Warn,
+                                "shadow-daemon",
+                                "rollout.stage.retry",
+                                "candidate main exited cleanly before health; retrying within activation deadline",
+                                pending_rollout
+                                    .as_ref()
+                                    .map(|pending| pending.activation.requested_at.as_str()),
+                                serde_json::json!({
+                                    "source": pending_rollout.as_ref().map(|pending| pending.activation.source.as_str()),
+                                    "main_binary": main_binary.display().to_string(),
+                                }),
+                            );
+                        }
                         PendingShadowMainExit::Recovered {
                             child,
                             main_binary: recovered_main_binary,
@@ -1258,16 +1300,8 @@ pub fn run_shadow_daemon_supervision_loop(
         }
         #[cfg(not(unix))]
         {
-            let (child, _) = spawn_shadow_for_cluster_rollout(
-                &target,
-                &installed_main_binary,
-                &main_options.host,
-                main_options.port,
-                &options.host,
-                options.port,
-                &rollout_paths,
-            )?;
-            reap_detached_shadow_supervisor(child);
+            let _ = target;
+            spawn_shadow_rollout_completion_helper_process(&installed_main_binary)?;
         }
     }
 
@@ -1350,6 +1384,30 @@ fn pending_rollout_probe_matches_candidate(
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingShadowCandidateExitAction {
+    Promote,
+    Retry,
+    Recover,
+}
+
+fn pending_shadow_candidate_exit_action(
+    probe_status: &DaemonProbeStatus,
+    candidate_pid: Option<u32>,
+    observation: MainExitObservation,
+    now: Instant,
+    deadline: Instant,
+) -> PendingShadowCandidateExitAction {
+    let clean_exit = observation.exit_code == Some(0) && observation.signal.is_none();
+    if clean_exit && pending_rollout_probe_matches_candidate(probe_status, candidate_pid) {
+        return PendingShadowCandidateExitAction::Promote;
+    }
+    if clean_exit && now < deadline {
+        return PendingShadowCandidateExitAction::Retry;
+    }
+    PendingShadowCandidateExitAction::Recover
+}
+
 fn pending_main_activation_ready_for_shutdown(rollout_paths: &SelfRolloutPaths) -> bool {
     let path = rollout_main_activation_path(rollout_paths);
     let Ok(metadata) = fs::metadata(path) else {
@@ -1363,6 +1421,28 @@ fn pending_main_activation_ready_for_shutdown(rollout_paths: &SelfRolloutPaths) 
         .is_ok_and(|age| age >= MAIN_ACTIVATION_SHUTDOWN_GRACE)
 }
 
+fn main_data_owner_lock_released(main_paths: &DaemonPaths) -> bool {
+    if !main_paths.data_owner_lock.exists() {
+        return true;
+    }
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&main_paths.data_owner_lock)
+    else {
+        return true;
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = file.unlock();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 fn terminate_pending_main_activation(
     main_paths: &DaemonPaths,
     wait_timeout: Duration,
@@ -1372,7 +1452,7 @@ fn terminate_pending_main_activation(
         Ok(status) if status_is_main_daemon(&status) => status,
         _ => return Ok(None),
     };
-    terminate_process_for_rollout_stop(status.pid)?;
+    terminate_process_for_rollout_stop(status.pid, RolloutTerminationMode::ProcessTree)?;
     let deadline = Instant::now() + wait_timeout;
     while Instant::now() < deadline {
         if matches!(
@@ -1394,7 +1474,54 @@ fn status_is_main_daemon(status: &DaemonStatus) -> bool {
 }
 
 #[cfg(unix)]
-fn terminate_process_for_rollout_stop(pid: u32) -> Result<(), DaemonError> {
+fn rollout_process_is_running(pid: u32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe { kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn rollout_process_is_running(pid: u32) -> bool {
+    use std::ffi::c_void;
+    use std::ptr::null_mut;
+
+    type Bool = i32;
+    type Dword = u32;
+    type Handle = *mut c_void;
+
+    unsafe extern "system" {
+        fn OpenProcess(dwDesiredAccess: Dword, bInheritHandle: Bool, dwProcessId: Dword) -> Handle;
+        fn GetExitCodeProcess(hProcess: Handle, lpExitCode: *mut Dword) -> Bool;
+        fn CloseHandle(hObject: Handle) -> Bool;
+    }
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: Dword = 0x0000_1000;
+    const STILL_ACTIVE: Dword = 259;
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle == null_mut() {
+        return false;
+    }
+    let mut exit_code = 0;
+    let running =
+        unsafe { GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code == STILL_ACTIVE };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    running
+}
+
+#[cfg(not(any(unix, windows)))]
+fn rollout_process_is_running(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn terminate_process_for_rollout_stop(
+    pid: u32,
+    _mode: RolloutTerminationMode,
+) -> Result<(), DaemonError> {
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
@@ -1410,9 +1537,13 @@ fn terminate_process_for_rollout_stop(pid: u32) -> Result<(), DaemonError> {
 }
 
 #[cfg(windows)]
-fn terminate_process_for_rollout_stop(pid: u32) -> Result<(), DaemonError> {
+fn terminate_process_for_rollout_stop(
+    pid: u32,
+    mode: RolloutTerminationMode,
+) -> Result<(), DaemonError> {
+    let args = windows_taskkill_args_for_rollout_stop(pid, mode);
     let output = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .args(args.iter().map(String::as_str))
         .output()
         .map_err(|source| DaemonError::Io {
             path: "taskkill".to_string(),
@@ -1429,8 +1560,21 @@ fn terminate_process_for_rollout_stop(pid: u32) -> Result<(), DaemonError> {
     })
 }
 
+#[cfg(any(test, windows))]
+fn windows_taskkill_args_for_rollout_stop(pid: u32, mode: RolloutTerminationMode) -> Vec<String> {
+    let mut args = vec!["/PID".to_string(), pid.to_string()];
+    if mode == RolloutTerminationMode::ProcessTree {
+        args.push("/T".to_string());
+    }
+    args.push("/F".to_string());
+    args
+}
+
 #[cfg(not(any(unix, windows)))]
-fn terminate_process_for_rollout_stop(_pid: u32) -> Result<(), DaemonError> {
+fn terminate_process_for_rollout_stop(
+    _pid: u32,
+    _mode: RolloutTerminationMode,
+) -> Result<(), DaemonError> {
     Ok(())
 }
 
@@ -2180,20 +2324,46 @@ pub fn stage_rollout_main_activation(
     let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
     let current_daemon_is_shadow = paths_equivalent(&current_daemon_paths.root, &shadow_paths.root);
     let shadow_running = current_daemon_is_shadow
-        || matches!(
-            probe_daemon_status(&shadow_paths, CLUSTER_HEALTH_PROBE_TIMEOUT),
-            DaemonProbeStatus::Running(_)
-        );
+        || daemon_probe_indicates_process_present(probe_daemon_status(
+            &shadow_paths,
+            CLUSTER_HEALTH_PROBE_TIMEOUT,
+        ));
     if !shadow_running {
         stage_main_only_rollout_without_existing_shadow(data_dir, rollout_paths, activation)?;
         return Ok(RolloutActivationStrategy::MainOnlyShadowBootstrap);
     }
     write_main_activation(rollout_paths, &activation)?;
     record_main_activation_staged(rollout_paths, &activation)?;
-    if current_daemon_is_shadow {
-        request_main_shutdown_for_shadow_rollout(data_dir, &activation)?;
+    match staged_main_activation_shutdown_action(current_daemon_is_shadow) {
+        StagedMainActivationShutdown::Immediate => {
+            request_main_shutdown_for_shadow_rollout(data_dir, &activation)?;
+        }
+        StagedMainActivationShutdown::DeferredSelf => {
+            request_main_shutdown_for_shadow_rollout_deferred(
+                data_dir.to_path_buf(),
+                rollout_paths.clone(),
+                activation.clone(),
+            );
+        }
     }
     Ok(RolloutActivationStrategy::ShadowSupervised)
+}
+
+fn daemon_probe_indicates_process_present(status: DaemonProbeStatus) -> bool {
+    matches!(
+        status,
+        DaemonProbeStatus::Running(_) | DaemonProbeStatus::Locked { .. }
+    )
+}
+
+fn staged_main_activation_shutdown_action(
+    current_daemon_is_shadow: bool,
+) -> StagedMainActivationShutdown {
+    if current_daemon_is_shadow {
+        StagedMainActivationShutdown::Immediate
+    } else {
+        StagedMainActivationShutdown::DeferredSelf
+    }
 }
 
 fn stage_main_only_rollout_without_existing_shadow(
@@ -2293,6 +2463,35 @@ fn request_main_shutdown_for_shadow_rollout(
     Ok(())
 }
 
+fn request_main_shutdown_for_shadow_rollout_deferred(
+    data_dir: PathBuf,
+    rollout_paths: SelfRolloutPaths,
+    activation: RolloutMainActivation,
+) {
+    #[cfg(test)]
+    {
+        let _ = (data_dir, rollout_paths, activation);
+    }
+    #[cfg(not(test))]
+    {
+        if let Err(error) = thread::Builder::new()
+            .name("sinomo-rollout-main-yield".to_string())
+            .spawn(move || {
+                thread::sleep(MAIN_ACTIVATION_SHUTDOWN_GRACE);
+                if !rollout_main_activation_path(&rollout_paths).exists() {
+                    return;
+                }
+                if let Err(error) = request_main_shutdown_for_shadow_rollout(&data_dir, &activation)
+                {
+                    tracing::warn!("deferred rollout main shutdown request failed: {error}");
+                }
+            })
+        {
+            tracing::warn!("deferred rollout main shutdown task spawn failed: {error}");
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ClusterRolloutMainActivationPlan {
     activation: RolloutMainActivation,
@@ -2387,11 +2586,30 @@ fn daemon_control_port_released(host: &str, port: u16) -> bool {
     std::net::TcpListener::bind(daemon_connect_address(host, port)).is_ok()
 }
 
+fn rollout_stop_ready_for_binary_activation(
+    control_listener_released: bool,
+    previous_process_running: bool,
+) -> bool {
+    control_listener_released && !previous_process_running
+}
+
+fn daemon_released_for_rollout_stop(
+    host: &str,
+    port: u16,
+    last_status: Option<&DaemonStatus>,
+) -> bool {
+    rollout_stop_ready_for_binary_activation(
+        daemon_control_port_released(host, port),
+        last_status.is_some_and(|status| rollout_process_is_running(status.pid)),
+    )
+}
+
 fn stop_daemon_for_rollout(
     daemon_paths: &DaemonPaths,
     host: &str,
     port: u16,
     label: &str,
+    termination_mode: RolloutTerminationMode,
     timeout: Duration,
     probe_timeout: Duration,
 ) -> Result<(), DaemonError> {
@@ -2417,12 +2635,12 @@ fn stop_daemon_for_rollout(
                 }
             }
             DaemonProbeStatus::Locked { status: None } => {
-                if daemon_control_port_released(host, port) {
+                if daemon_released_for_rollout_stop(host, port, last_status.as_ref()) {
                     return Ok(());
                 }
             }
             DaemonProbeStatus::NotRunning => {
-                if daemon_control_port_released(host, port) {
+                if daemon_released_for_rollout_stop(host, port, last_status.as_ref()) {
                     return Ok(());
                 }
             }
@@ -2434,7 +2652,7 @@ fn stop_daemon_for_rollout(
                     status.pid,
                     timeout.as_millis()
                 );
-                terminate_process_for_rollout_stop(status.pid)?;
+                terminate_process_for_rollout_stop(status.pid, termination_mode)?;
                 let terminate_deadline = Instant::now() + ROLLOUT_DAEMON_TERMINATE_WAIT;
                 while Instant::now() < terminate_deadline {
                     match probe_daemon_status(daemon_paths, probe_timeout) {
@@ -2442,7 +2660,7 @@ fn stop_daemon_for_rollout(
                         | DaemonProbeStatus::Locked { status: Some(_) } => {}
                         DaemonProbeStatus::Locked { status: None }
                         | DaemonProbeStatus::NotRunning => {
-                            if daemon_control_port_released(host, port) {
+                            if daemon_released_for_rollout_stop(host, port, last_status.as_ref()) {
                                 return Ok(());
                             }
                         }
@@ -2471,6 +2689,7 @@ fn stop_shadow_supervisor_for_rollout(
         shadow_host,
         shadow_port,
         "shadow supervisor",
+        RolloutTerminationMode::ProcessOnly,
         timeout,
         probe_timeout,
     )
@@ -2488,6 +2707,7 @@ fn stop_main_daemon_for_rollout(
         main_host,
         main_port,
         "main daemon",
+        RolloutTerminationMode::ProcessTree,
         timeout,
         probe_timeout,
     )
@@ -3100,21 +3320,56 @@ pub fn handle_pending_shadow_main_process_exit(
     probe_timeout: Duration,
 ) -> Result<PendingShadowMainExit, DaemonError> {
     let observation = crate::main_exit_observation_from_status(status);
-    if observation.exit_code == Some(0)
-        && observation.signal.is_none()
-        && pending_rollout_probe_matches_candidate(
-            &probe_daemon_status(main_paths, probe_timeout),
-            Some(candidate_pid),
-        )
-    {
-        let main_options =
-            promote_shadow_main_rollout(rollout_paths, pending, shadow_host, shadow_port)?;
-        let main_probe_status = probe_daemon_status(main_paths, probe_timeout);
-        return Ok(PendingShadowMainExit::Promoted {
-            main_binary: pending.activation.main_binary.clone(),
-            main_options,
-            main_probe_status,
-        });
+    let probe_status = probe_daemon_status(main_paths, probe_timeout);
+    match pending_shadow_candidate_exit_action(
+        &probe_status,
+        Some(candidate_pid),
+        observation,
+        Instant::now(),
+        pending.deadline,
+    ) {
+        PendingShadowCandidateExitAction::Promote => {
+            let main_options =
+                promote_shadow_main_rollout(rollout_paths, pending, shadow_host, shadow_port)?;
+            let main_probe_status = probe_daemon_status(main_paths, probe_timeout);
+            return Ok(PendingShadowMainExit::Promoted {
+                main_binary: pending.activation.main_binary.clone(),
+                main_options,
+                main_probe_status,
+            });
+        }
+        PendingShadowCandidateExitAction::Retry => {
+            match spawn_candidate_main_daemon_process(
+                &pending.activation.main_binary,
+                &pending.main_options,
+                rollout_paths,
+            ) {
+                Ok((child, diagnostics)) => {
+                    let mut monitor = pending.clone();
+                    monitor.diagnostics = diagnostics;
+                    return Ok(PendingShadowMainExit::RetryCandidate { child, monitor });
+                }
+                Err(error) => {
+                    let detail = format!(
+                        "candidate main exited before health check and retry spawn failed: {error}"
+                    );
+                    let main_binary = recover_failed_shadow_main_rollout(
+                        rollout_paths,
+                        pending,
+                        &detail,
+                        Some(observation),
+                    )?;
+                    let main_options = pending.main_options.clone();
+                    let child = spawn_main_daemon_process(&main_binary, &main_options).ok();
+                    return Ok(PendingShadowMainExit::Recovered {
+                        child,
+                        main_binary,
+                        main_options,
+                    });
+                }
+            }
+        }
+        PendingShadowCandidateExitAction::Recover => {}
     }
 
     let detail = format!(
@@ -3789,10 +4044,95 @@ mod tests {
     }
 
     #[test]
+    fn staged_main_activation_shutdown_is_deferred_when_main_handles_request() {
+        assert_eq!(
+            staged_main_activation_shutdown_action(false),
+            StagedMainActivationShutdown::DeferredSelf
+        );
+        assert_eq!(
+            staged_main_activation_shutdown_action(true),
+            StagedMainActivationShutdown::Immediate
+        );
+    }
+
+    #[test]
+    fn pending_candidate_clean_exit_retries_before_activation_deadline() {
+        let now = Instant::now();
+        let observation = MainExitObservation::exit_code(0);
+
+        assert_eq!(
+            pending_shadow_candidate_exit_action(
+                &DaemonProbeStatus::NotRunning,
+                Some(42),
+                observation,
+                now,
+                now + Duration::from_secs(30)
+            ),
+            PendingShadowCandidateExitAction::Retry
+        );
+        assert_eq!(
+            pending_shadow_candidate_exit_action(
+                &DaemonProbeStatus::NotRunning,
+                Some(42),
+                observation,
+                now,
+                now
+            ),
+            PendingShadowCandidateExitAction::Recover
+        );
+        assert_eq!(
+            pending_shadow_candidate_exit_action(
+                &DaemonProbeStatus::Running(test_daemon_status(42)),
+                Some(42),
+                observation,
+                now,
+                now
+            ),
+            PendingShadowCandidateExitAction::Promote
+        );
+    }
+
+    #[test]
+    fn pending_candidate_start_waits_for_main_data_owner_lock_release() {
+        let root = temp_rollout_test_root("activation-data-owner-lock");
+        let paths = DaemonPaths::with_root(root.join("daemon"));
+
+        assert!(main_data_owner_lock_released(&paths));
+        let owner = crate::DaemonDataOwnerLock::acquire(&paths).expect("owner lock");
+        assert!(!main_data_owner_lock_released(&paths));
+        drop(owner);
+        assert!(main_data_owner_lock_released(&paths));
+    }
+
+    #[test]
     fn rollout_stop_force_termination_wait_is_bounded() {
         assert!(PENDING_MAIN_ACTIVATION_FORCE_TERMINATE_AFTER <= Duration::from_secs(10));
         assert!(PENDING_MAIN_ACTIVATION_TERMINATE_WAIT <= Duration::from_secs(5));
         assert!(ROLLOUT_DAEMON_TERMINATE_WAIT <= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn rollout_stop_waits_for_previous_pid_before_binary_activation() {
+        assert!(rollout_stop_ready_for_binary_activation(true, false));
+        assert!(!rollout_stop_ready_for_binary_activation(false, false));
+        assert!(!rollout_stop_ready_for_binary_activation(true, true));
+    }
+
+    #[test]
+    fn rollout_process_liveness_detects_current_process() {
+        assert!(rollout_process_is_running(std::process::id()));
+    }
+
+    #[test]
+    fn shadow_force_stop_does_not_terminate_supervised_main_tree() {
+        assert_eq!(
+            windows_taskkill_args_for_rollout_stop(42, RolloutTerminationMode::ProcessOnly),
+            vec!["/PID", "42", "/F"]
+        );
+        assert_eq!(
+            windows_taskkill_args_for_rollout_stop(42, RolloutTerminationMode::ProcessTree),
+            vec!["/PID", "42", "/T", "/F"]
+        );
     }
 
     #[test]
@@ -3836,6 +4176,46 @@ mod tests {
             .expect("read activation")
             .expect("activation staged");
         assert_eq!(staged, activation);
+    }
+
+    #[test]
+    fn stage_rollout_main_activation_treats_locked_shadow_as_existing_shadow() {
+        let root = temp_rollout_test_root("locked-shadow-existing");
+        std::fs::create_dir_all(root.join("daemon")).expect("main root");
+        std::fs::create_dir_all(root.join("shadow-daemon")).expect("shadow root");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let main_paths = DaemonPaths::with_root(root.join("daemon"));
+        let shadow_paths = DaemonPaths::with_root(root.join("shadow-daemon"));
+        let _shadow_lock = DaemonLock::acquire(
+            &shadow_paths,
+            &crate::DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21354,
+            },
+            None,
+        )
+        .expect("shadow lock");
+        let staged_main = rollout_staged_main_binary(&rollout_paths);
+        let staged_shadow = rollout_staged_shadow_binary(&rollout_paths);
+        std::fs::create_dir_all(staged_main.parent().expect("staged parent"))
+            .expect("staged parent dir");
+        std::fs::write(&staged_main, b"candidate-main").expect("staged main");
+        std::fs::write(&staged_shadow, b"candidate-shadow").expect("staged shadow");
+        let mut activation = test_main_activation(&rollout_paths);
+        activation.staged_main_binary = Some(staged_main.clone());
+        activation.staged_shadow_binary = Some(staged_shadow.clone());
+
+        let strategy =
+            stage_rollout_main_activation(&main_paths, &root, &rollout_paths, activation)
+                .expect("locked shadow should be treated as existing shadow");
+
+        assert_eq!(strategy, RolloutActivationStrategy::ShadowSupervised);
+        assert_eq!(
+            std::fs::read(&staged_shadow).expect("staged shadow preserved"),
+            b"candidate-shadow"
+        );
+        assert!(!rollout_paths.shadow_binary.exists());
     }
 
     #[test]

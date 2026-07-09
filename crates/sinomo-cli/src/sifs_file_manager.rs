@@ -1,5 +1,6 @@
 use crate::commands::{
-    cli_commit_cluster_kv_txn_with_quorum_response, refresh_cluster_kv_from_local_daemon_for_data_dir,
+    cli_commit_cluster_kv_txn_with_quorum_response,
+    refresh_cluster_kv_from_local_daemon_for_data_dir,
 };
 use crate::file_manager::{
     FileManagerBackend, FileManagerEntry, FileManagerEntryKind, FileManagerMetadata,
@@ -289,15 +290,25 @@ impl SifsFileManagerBackend {
     }
 
     pub(crate) fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
-        self.write_file_with_options(path, bytes, false, true)
+        self.write_file_with_options(path, bytes, false, true, None)
     }
 
-    pub(crate) fn write_file_with_foreground_replica_repair(
+    pub(crate) fn write_file_with_deadline(
         &self,
         path: &str,
         bytes: &[u8],
+        deadline: Instant,
     ) -> Result<(), String> {
-        self.write_file_with_options(path, bytes, true, true)
+        self.write_file_with_options(path, bytes, false, true, Some(deadline))
+    }
+
+    pub(crate) fn write_file_with_foreground_replica_repair_deadline(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), String> {
+        self.write_file_with_options(path, bytes, true, true, Some(deadline))
     }
 
     fn write_file_with_options(
@@ -306,21 +317,30 @@ impl SifsFileManagerBackend {
         bytes: &[u8],
         foreground_replica_repair: bool,
         publish_metadata: bool,
+        operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
         self.refresh_service_peer_targets(&mut service);
-        if let Some(parent) = parent_sifs_path(&path) {
+        let previous_deadline = operation_deadline
+            .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
+        let result = (|| {
+            if let Some(parent) = parent_sifs_path(&path) {
+                service
+                    .posix_mkdir_all(&parent)
+                    .map_err(|error| format!("cannot create SIFS directory {parent}: {error}"))?;
+            }
+            let mut options = sifs_write_options(&service, &self.replica_candidates);
+            options.foreground_replica_repair = foreground_replica_repair;
             service
-                .posix_mkdir_all(&parent)
-                .map_err(|error| format!("cannot create SIFS directory {parent}: {error}"))?;
+                .posix_write_file(&path, bytes, options)
+                .map(|_| ())
+                .map_err(|error| format!("cannot write SIFS file {path}: {error}"))
+        })();
+        if let Some(previous_deadline) = previous_deadline {
+            service.set_transport_operation_deadline(previous_deadline);
         }
-        let mut options = sifs_write_options(&service, &self.replica_candidates);
-        options.foreground_replica_repair = foreground_replica_repair;
-        service
-            .posix_write_file(&path, bytes, options)
-            .map(|_| ())
-            .map_err(|error| format!("cannot write SIFS file {path}: {error}"))?;
+        result?;
         drop(service);
         if publish_metadata {
             self.publish_metadata_after_mutation();
@@ -328,9 +348,18 @@ impl SifsFileManagerBackend {
         Ok(())
     }
 
-    pub(crate) fn write_files_with_known_parents_deferred_publish(
+    pub(crate) fn write_files_with_known_parents_deferred_publish_until(
         &self,
         files: &[(String, Vec<u8>)],
+        deadline: Instant,
+    ) -> Result<(), String> {
+        self.write_files_with_known_parents_deferred_publish_with_deadline(files, Some(deadline))
+    }
+
+    fn write_files_with_known_parents_deferred_publish_with_deadline(
+        &self,
+        files: &[(String, Vec<u8>)],
+        operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
         let normalized = files
             .iter()
@@ -338,31 +367,57 @@ impl SifsFileManagerBackend {
             .collect::<Result<Vec<_>, _>>()?;
         let mut service = self.lock_service()?;
         self.refresh_service_peer_targets(&mut service);
-        service
+        let previous_deadline = operation_deadline
+            .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
+        let result = service
             .posix_create_files_local_eventual_with_known_parents(
                 normalized
                     .iter()
                     .map(|(path, bytes)| (path.as_str(), *bytes)),
             )
             .map(|_| ())
-            .map_err(|error| format!("cannot write SIFS bulk batch: {error}"))?;
-        Ok(())
+            .map_err(|error| format!("cannot write SIFS bulk batch: {error}"));
+        if let Some(previous_deadline) = previous_deadline {
+            service.set_transport_operation_deadline(previous_deadline);
+        }
+        result
     }
 
-    pub(crate) fn write_file_with_known_parent_deferred_publish(
+    pub(crate) fn write_file_with_known_parent_deferred_publish_until(
         &self,
         path: &str,
         bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), String> {
+        self.write_file_with_known_parent_deferred_publish_with_deadline(
+            path,
+            bytes,
+            Some(deadline),
+        )
+    }
+
+    fn write_file_with_known_parent_deferred_publish_with_deadline(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
         self.refresh_service_peer_targets(&mut service);
-        let options = sifs_deferred_publish_write_options(&service, &self.replica_candidates);
-        service
-            .posix_write_file_with_known_parent_deferred_local_replay(&path, bytes, options)
-            .map(|_| ())
-            .map_err(|error| format!("cannot write SIFS file {path}: {error}"))?;
-        Ok(())
+        let previous_deadline = operation_deadline
+            .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
+        let result = (|| {
+            let options = sifs_deferred_publish_write_options(&service, &self.replica_candidates);
+            service
+                .posix_write_file_with_known_parent_deferred_local_replay(&path, bytes, options)
+                .map(|_| ())
+                .map_err(|error| format!("cannot write SIFS file {path}: {error}"))
+        })();
+        if let Some(previous_deadline) = previous_deadline {
+            service.set_transport_operation_deadline(previous_deadline);
+        }
+        result
     }
 
     pub(crate) fn operational_metrics(
@@ -522,13 +577,31 @@ impl SifsFileManagerBackend {
         Ok(())
     }
 
-    pub(crate) fn create_dir_all_deferred_local_replay(&self, path: &str) -> Result<(), String> {
+    pub(crate) fn create_dir_all_deferred_local_replay_until(
+        &self,
+        path: &str,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        self.create_dir_all_deferred_local_replay_with_deadline(path, Some(deadline))
+    }
+
+    fn create_dir_all_deferred_local_replay_with_deadline(
+        &self,
+        path: &str,
+        operation_deadline: Option<Instant>,
+    ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
         self.refresh_service_peer_targets(&mut service);
-        service
+        let previous_deadline = operation_deadline
+            .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
+        let result = service
             .posix_mkdir_all_without_local_replay(&path)
-            .map_err(|error| format!("cannot create SIFS directory {path}: {error}"))
+            .map_err(|error| format!("cannot create SIFS directory {path}: {error}"));
+        if let Some(previous_deadline) = previous_deadline {
+            service.set_transport_operation_deadline(previous_deadline);
+        }
+        result
     }
 
     pub(crate) fn pin_content(&self, path: &str) -> Result<String, String> {
@@ -940,7 +1013,10 @@ fn open_sifs_service_with_hydration(
         .ensure_root_layout()
         .map_err(|error| format!("cannot prepare Sinomo data directory: {error}"))?;
     let cluster_paths = ClusterPaths::new(data_dir);
-    let peer_transport = Arc::new(SifsDfsPeerTransport::new(rpc_runtime.clone(), data_dir.clone()));
+    let peer_transport = Arc::new(SifsDfsPeerTransport::new(
+        rpc_runtime.clone(),
+        data_dir.clone(),
+    ));
     let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
     let _ = refresh_sifs_cluster_kv_snapshot(data_dir, &cluster_paths);
     let _ = refresh_cluster_dfs_kv_snapshot_with_peer_transport(
@@ -1538,6 +1614,24 @@ mod tests {
         manager.delete_selected("DELETE").expect("delete file");
         manager.go_parent().expect("parent");
         manager.delete_selected("DELETE").expect("delete dir");
+    }
+
+    #[test]
+    fn sifs_read_only_backend_refreshes_visible_overwrite() {
+        let root = temp_sifs_data_dir("current-read-refresh");
+        let data_dir = SinomoDataDir::new(&root);
+        let writer = SifsFileManagerBackend::open(&data_dir).expect("writer");
+        let path = "/services/current-read-refresh.txt";
+        let old = b"old visible payload";
+        let new = b"new visible payload";
+
+        writer.write_file(path, old).expect("write old payload");
+        let reader = SifsFileManagerBackend::open_read_only(&data_dir).expect("reader");
+        assert_eq!(reader.read_file(path).expect("read old payload"), old);
+
+        writer.write_file(path, new).expect("write new payload");
+
+        assert_eq!(reader.read_file(path).expect("read new payload"), new);
     }
 
     #[test]

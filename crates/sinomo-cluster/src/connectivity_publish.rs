@@ -4,11 +4,13 @@ use crate::keyspace::{
 use crate::kv_local_store::ClusterKvPathsExt;
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
+#[cfg(any(test, feature = "test-support"))]
+use crate::kv_local_store::read_cluster_kv_current_snapshot_arc;
 use crate::kv_local_store::{
     append_cluster_raft_ops_in_batches, read_cluster_kv_current_or_empty_snapshot_arc,
-    read_cluster_kv_current_snapshot_arc, read_cluster_kv_snapshot,
+    read_cluster_kv_snapshot,
 };
-use crate::local_state_store::{read_cluster_state, read_cluster_state_without_kv};
+use crate::local_state_store::read_cluster_state_without_kv;
 use crate::prelude::*;
 use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvCompare, KvOp, KvSnapshot, KvTxn};
 use sinomo_network::ClusterMembershipRpcFuture;
@@ -127,7 +129,8 @@ pub fn sync_cluster_connectivity_records_to_kv(
 ) -> Result<KvSnapshot, NetworkError> {
     write_local_cluster_connectivity_record_set(paths, source_node_id, &records)?;
     let now = OffsetDateTime::now_utc();
-    let mut snapshot = read_cluster_kv_current_or_empty_snapshot_arc(paths)?;
+    let mut snapshot =
+        read_cluster_kv_current_or_empty_snapshot_arc_for_source(paths, source_node_id)?;
     let mut local_node_id = None;
     let mut appended = false;
     loop {
@@ -159,20 +162,12 @@ pub fn sync_cluster_connectivity_records_to_kv(
     }
 }
 
-fn empty_cluster_kv_snapshot_arc() -> Result<Arc<KvSnapshot>, NetworkError> {
-    Ok(Arc::new(
-        sinomo_kv::InProcessKvStore::new()
-            .try_snapshot()
-            .map_err(kv_err)?,
-    ))
-}
-
 fn read_cluster_kv_current_or_empty_snapshot_arc_for_source(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
 ) -> Result<Arc<KvSnapshot>, NetworkError> {
     if !paths.kv_paths().raft.exists() {
-        return empty_cluster_kv_snapshot_arc();
+        return read_cluster_kv_current_or_empty_snapshot_arc(paths);
     }
     sinomo_kv::read_cluster_kv_current_snapshot_arc_for_node(
         &paths.kv_paths(),
@@ -191,9 +186,6 @@ where
     H: ClusterConnectivityPublishHost,
 {
     write_local_cluster_connectivity_record_set(paths, source_node_id, &records)?;
-    if host.published_connectivity_record_set_matches(paths, source_node_id, &records) {
-        return Ok(None);
-    }
     let mut state = None;
     let mut latest = None;
     let mut previous_ops: Option<Vec<KvOp>> = None;
@@ -206,12 +198,19 @@ where
                 OffsetDateTime::now_utc(),
                 sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
             )?,
-            None => cluster_connectivity_full_sync_batch_ops(
-                paths,
-                source_node_id,
-                &records,
-                sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-            )?,
+            None => {
+                let snapshot = read_cluster_kv_current_or_empty_snapshot_arc_for_source(
+                    paths,
+                    source_node_id,
+                )?;
+                cluster_connectivity_full_sync_batch_ops_from_snapshot(
+                    snapshot.as_ref(),
+                    source_node_id,
+                    &records,
+                    OffsetDateTime::now_utc(),
+                    sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+                )?
+            }
         };
         if success.is_empty() {
             if latest.is_some() {
@@ -224,7 +223,7 @@ where
         }
         previous_ops = Some(success.clone());
         if state.is_none() {
-            state = Some(read_cluster_state(paths)?);
+            state = Some(read_cluster_state_without_kv(paths)?);
         }
         latest = Some(
             host.commit_cluster_kv_txn_with_quorum(
@@ -345,30 +344,19 @@ where
                 let batch_paths = paths.clone();
                 let batch_source_node_id = source_node_id.clone();
                 let batch_records = records.clone();
-                let read_by_source = state.is_some();
                 runtime
                     .spawn_blocking(move || {
-                        if read_by_source {
-                            let snapshot =
-                                read_cluster_kv_current_or_empty_snapshot_arc_for_source(
-                                    &batch_paths,
-                                    &batch_source_node_id,
-                                )?;
-                            cluster_connectivity_full_sync_batch_ops_from_snapshot(
-                                snapshot.as_ref(),
-                                &batch_source_node_id,
-                                &batch_records,
-                                OffsetDateTime::now_utc(),
-                                sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-                            )
-                        } else {
-                            cluster_connectivity_full_sync_batch_ops(
-                                &batch_paths,
-                                &batch_source_node_id,
-                                &batch_records,
-                                sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-                            )
-                        }
+                        let snapshot = read_cluster_kv_current_or_empty_snapshot_arc_for_source(
+                            &batch_paths,
+                            &batch_source_node_id,
+                        )?;
+                        cluster_connectivity_full_sync_batch_ops_from_snapshot(
+                            snapshot.as_ref(),
+                            &batch_source_node_id,
+                            &batch_records,
+                            OffsetDateTime::now_utc(),
+                            sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+                        )
                     })
                     .await
                     .map_err(|source| {
@@ -399,7 +387,7 @@ where
             let state_paths = paths.clone();
             state = Some(
                 runtime
-                    .spawn_blocking(move || read_cluster_state(&state_paths))
+                    .spawn_blocking(move || read_cluster_state_without_kv(&state_paths))
                     .await
                     .map_err(|source| {
                         H::Error::from(NetworkError::Io {
@@ -427,6 +415,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 pub fn cluster_connectivity_full_sync_batch_ops(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
@@ -435,7 +424,7 @@ pub fn cluster_connectivity_full_sync_batch_ops(
 ) -> Result<Vec<KvOp>, NetworkError> {
     validate_cluster_connectivity_records_for_source(source_node_id, records)?;
     let now = OffsetDateTime::now_utc();
-    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
+    let snapshot = read_cluster_kv_current_or_empty_snapshot_arc_for_source(paths, source_node_id)?;
     cluster_connectivity_full_sync_batch_ops_from_snapshot(
         snapshot.as_ref(),
         source_node_id,

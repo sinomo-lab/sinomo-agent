@@ -190,6 +190,12 @@ pub fn open_root_local_metadata_backend(
     LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.into())
 }
 
+pub fn open_root_local_metadata_backend_for_inspection(
+    root: impl Into<PathBuf>,
+) -> Result<LocalSobjMetadataBackend, MetadataBackendError> {
+    LocalSobjMetadataBackend::open_for_inspection(DfsMetadataShardId::new("root"), root.into())
+}
+
 pub fn open_local_sharded_metadata_backend(
     root: impl Into<PathBuf>,
     shards: Vec<DfsMetadataShardConfig>,
@@ -197,10 +203,17 @@ pub fn open_local_sharded_metadata_backend(
     LocalShardedMetadataBackend::new(root, shards)
 }
 
+pub fn open_local_sharded_metadata_backend_for_inspection(
+    root: impl Into<PathBuf>,
+    shards: Vec<DfsMetadataShardConfig>,
+) -> Result<LocalShardedMetadataBackend, MetadataBackendError> {
+    LocalShardedMetadataBackend::open_for_inspection(root, shards)
+}
+
 pub fn inspect_dfs_status(
     root: impl Into<PathBuf>,
 ) -> Result<DfsOperatorStatus, MetadataBackendError> {
-    let backend = open_root_local_metadata_backend(root)?;
+    let backend = open_root_local_metadata_backend_for_inspection(root)?;
     DfsOperatorInspector::new(&backend).status()
 }
 
@@ -261,6 +274,21 @@ pub fn open_cluster_aware_dfs_metadata_backend(
         .map_err(Into::into)
 }
 
+pub fn open_cluster_aware_dfs_metadata_backend_for_inspection(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+) -> Result<Box<dyn DfsMetadataBackend>, DfsError> {
+    if cluster_paths.state.exists()
+        && let Some(metadata) =
+            open_cluster_sharded_dfs_metadata_backend_for_inspection(data_dir, cluster_paths)?
+    {
+        return Ok(Box::new(metadata));
+    }
+    open_root_local_metadata_backend_for_inspection(default_dfs_metadata_root(data_dir))
+        .map(|backend| Box::new(backend) as Box<dyn DfsMetadataBackend>)
+        .map_err(Into::into)
+}
+
 pub fn open_cluster_sharded_dfs_metadata_backend(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -273,6 +301,23 @@ pub fn open_cluster_sharded_dfs_metadata_backend(
     open_local_sharded_metadata_backend(default_dfs_metadata_shards_root(data_dir), shards)
         .map(Some)
         .map_err(Into::into)
+}
+
+pub fn open_cluster_sharded_dfs_metadata_backend_for_inspection(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+) -> Result<Option<LocalShardedMetadataBackend>, DfsError> {
+    let file_system_id = sifs_file_system_id();
+    let shards = cluster_dfs_metadata_shards(cluster_paths, &file_system_id)?;
+    if shards.is_empty() {
+        return Ok(None);
+    }
+    open_local_sharded_metadata_backend_for_inspection(
+        default_dfs_metadata_shards_root(data_dir),
+        shards,
+    )
+    .map(Some)
+    .map_err(Into::into)
 }
 
 pub fn cluster_dfs_metadata_shards(
@@ -295,7 +340,7 @@ pub fn inspect_cluster_aware_dfs_status(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
 ) -> Result<DfsOperatorStatus, DfsError> {
-    let metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+    let metadata = open_cluster_aware_dfs_metadata_backend_for_inspection(data_dir, cluster_paths)?;
     let mut status = DfsOperatorInspector::new(metadata.as_ref()).status()?;
     attach_cluster_aware_dfs_maintenance_observations(&mut status, data_dir)?;
     if let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths) {
@@ -338,7 +383,7 @@ fn attach_primary_owned_operational_status(
         status.failed_namespace_job_count = 0;
         return Ok(());
     }
-    let primary_metadata = open_local_sharded_metadata_backend(
+    let primary_metadata = open_local_sharded_metadata_backend_for_inspection(
         default_dfs_metadata_shards_root(data_dir),
         primary_shards,
     )?;

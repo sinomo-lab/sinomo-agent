@@ -32,6 +32,7 @@ NETWORK_PAYLOAD_RESPONSE_BYTES="${SINOMO_SCENARIO_NETWORK_PAYLOAD_RESPONSE_BYTES
 NETWORK_PAYLOAD_MIN_BYTES_PER_SEC="${SINOMO_SCENARIO_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC:-8388608}"
 NETWORK_READY_WAIT="${SINOMO_SCENARIO_NETWORK_READY_WAIT:-20}"
 NETWORK_READY_PROBE_TIMEOUT="${SINOMO_SCENARIO_NETWORK_READY_PROBE_TIMEOUT:-$(( NETWORK_TIMEOUT_MS / 1000 + 6 ))}"
+NODE_RESTART_WAIT="${SINOMO_SCENARIO_NODE_RESTART_WAIT:-30}"
 ARTIFACT_COMMAND_TIMEOUT="${SINOMO_SCENARIO_ARTIFACT_COMMAND_TIMEOUT:-10}"
 ENDPOINT_FALLBACK_TIMEOUT_MS="${SINOMO_SCENARIO_ENDPOINT_FALLBACK_TIMEOUT_MS:-5000}"
 TUNNEL_STALE_FALLBACK_TIMEOUT_MS="${SINOMO_SCENARIO_TUNNEL_STALE_FALLBACK_TIMEOUT_MS:-5000}"
@@ -270,6 +271,17 @@ run_tag_probe() {
   log "  FAILED: $node tag:$tag $*"
   sed 's/^/[routing-scenario]   /' "$probe_log"
   return 1
+}
+
+cluster_local_node_id() {
+  local node="$1" node_id
+  node_id="$(compose exec -T "$node" sinomo cluster connectivity 2>/dev/null \
+    | awk '/^local node:/ { print $3; exit }')"
+  if [ -z "$node_id" ]; then
+    log "failed to resolve local node id for $node"
+    return 1
+  fi
+  printf '%s\n' "$node_id"
 }
 
 run_network_probe() {
@@ -560,6 +572,111 @@ run_large_routed_dfs() {
     --param "max-proc-write-bytes=$LARGE_MAX_READ_PROC_WRITE_BYTES"
 }
 
+run_two_online_one_offline_dfs_probe() {
+  local node1_id node2_id path_a path_b payload_a payload_b
+
+  log "checking DFS quorum with node3 offline"
+  node1_id="$(cluster_local_node_id node1)"
+  node2_id="$(cluster_local_node_id node2)"
+  compose stop node3 >/dev/null
+
+  run_probe node1 cluster.network.ping-benchmark \
+    --param "target-node-id=$node2_id" \
+    --param expected-targets=1 \
+    --param "requests-per-target=$NETWORK_REQUESTS_PER_TARGET" \
+    --param "warmup-requests-per-target=$NETWORK_WARMUP_REQUESTS_PER_TARGET" \
+    --param "concurrency=$NETWORK_CONCURRENCY" \
+    --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
+    --param max-failures=0 \
+    --param max-p50-ms=1000 \
+    --param max-p95-ms=3000 \
+    --param max-p50-us=0 \
+    --param max-p95-us=0 \
+    --param min-requests-per-second=1
+  run_probe node2 cluster.network.ping-benchmark \
+    --param "target-node-id=$node1_id" \
+    --param expected-targets=1 \
+    --param "requests-per-target=$NETWORK_REQUESTS_PER_TARGET" \
+    --param "warmup-requests-per-target=$NETWORK_WARMUP_REQUESTS_PER_TARGET" \
+    --param "concurrency=$NETWORK_CONCURRENCY" \
+    --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
+    --param max-failures=0 \
+    --param max-p50-ms=1000 \
+    --param max-p95-ms=3000 \
+    --param max-p50-us=0 \
+    --param max-p95-us=0 \
+    --param min-requests-per-second=1
+  run_probe node1 cluster.dfs.routed-status \
+    --param "target-node-id=$node2_id" \
+    --param expected-targets=1 \
+    --param max-remote-open-conflicts=0 \
+    --param max-remote-pending-writes=0 \
+    --param max-remote-pending-repairs=0 \
+    --param "timeout-ms=$NETWORK_TIMEOUT_MS"
+
+  path_a="/services/routing-scenario/$RUN_ID/offline-node3-node1-to-node2.txt"
+  path_b="/services/routing-scenario/$RUN_ID/offline-node3-node2-to-node1.txt"
+  payload_a="routing-scenario node1 node2 with node3 offline $RUN_ID"
+  payload_b="routing-scenario node2 node1 with node3 offline $RUN_ID"
+  run_probe node1 cluster.dfs.write \
+    --param "path=$path_a" \
+    --param "payload=$payload_a" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT"
+  run_probe node2 cluster.dfs.expect-file \
+    --param "path=$path_a" \
+    --param "payload=$payload_a" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT"
+  run_probe node2 cluster.dfs.write \
+    --param "path=$path_b" \
+    --param "payload=$payload_b" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT"
+  run_probe node1 cluster.dfs.expect-file \
+    --param "path=$path_b" \
+    --param "payload=$payload_b" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT"
+
+  compose start node3 >/dev/null
+  wait_for_node_daemons node3
+  wait_for_network_ready
+  run_dfs_routed_status_probe node1
+  run_dfs_routed_status_probe node2
+  run_dfs_routed_status_probe node3
+}
+
+wait_for_node_daemons() {
+  local node="$1" deadline
+  deadline=$(( $(date +%s) + NODE_RESTART_WAIT ))
+  log "waiting for $node main/shadow daemons after restart (<=${NODE_RESTART_WAIT}s)"
+  while :; do
+    if compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo daemon status \
+        >"$ARTIFACTS/restart-$node-main.last.txt" 2>&1 \
+      && compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo daemon shadow status \
+        >"$ARTIFACTS/restart-$node-shadow.last.txt" 2>&1 \
+      && grep -F "sinomo daemon is running" "$ARTIFACTS/restart-$node-main.last.txt" >/dev/null \
+      && grep -F "sinomo shadow daemon is running" "$ARTIFACTS/restart-$node-shadow.last.txt" >/dev/null; then
+      log "  daemons-ready: $node"
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      log "daemon restart timed out for $node"
+      sed 's/^/[routing-scenario]   main: /' "$ARTIFACTS/restart-$node-main.last.txt" | tail -12 || true
+      sed 's/^/[routing-scenario]   shadow: /' "$ARTIFACTS/restart-$node-shadow.last.txt" | tail -12 || true
+      return 1
+    fi
+    sleep "$POLL_INTERVAL"
+  done
+}
+
+run_restart_recovery_probe() {
+  local node="$1"
+  log "checking network/DFS recovery after restarting $node"
+  compose restart "$node"
+  wait_for_node_daemons "$node"
+  wait_for_network_ready
+  run_network_payload_probe "$node"
+  run_dfs_routed_status_probe "$node"
+}
+
 run_concurrent_duplex_dfs_probe() {
   local pids labels logs failed index
   pids=""
@@ -656,5 +773,7 @@ assert_forwarded_endpoint_active
 run_concurrent_duplex_dfs_probe
 run_cross_segment_dfs
 run_large_routed_dfs
+run_two_online_one_offline_dfs_probe
+run_restart_recovery_probe node3
 
 log "PASS; artifacts in $ARTIFACTS"

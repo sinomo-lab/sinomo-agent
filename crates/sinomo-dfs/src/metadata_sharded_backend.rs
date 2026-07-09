@@ -79,12 +79,34 @@ impl LocalShardedMetadataBackend {
     /// shard backend.
     pub fn new(root: impl Into<PathBuf>, shards: Vec<DfsMetadataShardConfig>) -> Result<Self> {
         let root = root.into();
+        Self::open_with(root, shards, true)
+    }
+
+    /// Open a sharded backend for read-only inspection/status.
+    ///
+    /// Shard-local backends use their inspection open mode, so this path avoids
+    /// recovery writes while still reading the durable materialized tables.
+    pub fn open_for_inspection(
+        root: impl Into<PathBuf>,
+        shards: Vec<DfsMetadataShardConfig>,
+    ) -> Result<Self> {
+        let root = root.into();
+        Self::open_with(root, shards, false)
+    }
+
+    fn open_with(
+        root: PathBuf,
+        shards: Vec<DfsMetadataShardConfig>,
+        initialize_layout: bool,
+    ) -> Result<Self> {
         if shards.is_empty() {
             return Err(MetadataBackendError::Serde(
                 "local sharded metadata backend requires at least one shard".to_string(),
             ));
         }
-        create_dir_all(root.join("shard-index").join("objects"))?;
+        if initialize_layout {
+            create_dir_all(root.join("shard-index").join("objects"))?;
+        }
         let mut shard_configs = BTreeMap::new();
         let mut backends = BTreeMap::new();
         for shard in shards {
@@ -98,10 +120,12 @@ impl LocalShardedMetadataBackend {
                     shard.shard_id
                 )));
             }
-            let backend = LocalSobjMetadataBackend::new(
-                shard_id.clone(),
-                root.join(key_segment(&shard_id.0)),
-            )?;
+            let shard_root = root.join(key_segment(&shard_id.0));
+            let backend = if initialize_layout {
+                LocalSobjMetadataBackend::new(shard_id.clone(), shard_root)?
+            } else {
+                LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), shard_root)?
+            };
             backends.insert(shard_id, backend);
         }
         Ok(Self {
