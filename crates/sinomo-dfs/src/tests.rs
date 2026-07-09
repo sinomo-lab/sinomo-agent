@@ -1526,6 +1526,140 @@ fn node_transport_transfer_profile_keeps_remote_sizing_network_neutral() {
     );
 }
 
+#[test]
+fn routed_namespace_sync_uses_synced_path_object_without_draining_backlog() {
+    let writer = NodeId::from_legacy_named("node_routed_sync_writer").expect("writer");
+    let primary = NodeId::from_legacy_named("node_routed_sync_primary").expect("primary");
+    let file_system_id = sifs_file_system_id();
+    let root = temp_root("routed_namespace_sync_synced_path_backlog");
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: primary.clone(),
+                replica_node_ids: vec![writer.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "sifs".to_string(),
+        owner_node_id: primary.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let primary_sender: DfsMessageSender = Arc::new(|target_node_id, command, _timeout| {
+        Err(DfsPeerTransportError::new(format!(
+            "unexpected primary-side send to {target_node_id} for {}",
+            command.request_id
+        )))
+    });
+    let primary_transport = DfsNodeServedMessageTransport::new_with_message_sender(
+        primary.clone(),
+        vec![writer.clone()],
+        primary_sender,
+        DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+    );
+    let primary_backend = LocalSobjMetadataBackend::new(
+        DfsMetadataShardId::new("services"),
+        root.join("primary-metadata"),
+    )
+    .expect("primary metadata backend");
+    let mut primary_service = NetworkedDfsService::new(
+        primary_transport,
+        LocalContentStore::new(root.join("primary-content")).expect("primary content"),
+    )
+    .with_control_plane(control_plane.clone())
+    .with_metadata_backend(primary_backend)
+    .expect("primary metadata");
+    primary_service
+        .bootstrap_distributed_sifs()
+        .expect("primary bootstrap");
+    for index in 0..(DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT + 8) {
+        let mut object = file_metadata(primary.clone());
+        object.object_id =
+            DfsObjectId::from_legacy_named(format!("obj_routed_sync_backlog_{index}"))
+                .expect("object");
+        object.path = format!("/services/backlog-seed-{index}.txt");
+        object.version =
+            DfsVersion::from_legacy_named(format!("version_routed_sync_{index}")).expect("version");
+        object.content_hash = Some(format!("blake3:routed-sync-{index}"));
+        object.content_size_bytes = Some(index as u64);
+        object.policy = DfsObjectPolicy::ReplicatedEventual;
+        primary_service
+            .add_object_metadata(object)
+            .expect("primary backlog object");
+    }
+    let primary_service = Arc::new(Mutex::new(primary_service));
+    let namespace_calls = Arc::new(Mutex::new(Vec::new()));
+    let primary_for_sender = primary.clone();
+    let primary_service_for_sender = Arc::clone(&primary_service);
+    let namespace_calls_for_sender = Arc::clone(&namespace_calls);
+    let writer_sender: DfsMessageSender = Arc::new(move |target_node_id, command, _timeout| {
+        if target_node_id != &primary_for_sender {
+            return Err(DfsPeerTransportError::new(format!(
+                "unexpected target {target_node_id}"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        if let DfsNetworkMessage::NamespaceRequest(namespace) = &command.routed_message.message {
+            let label = match &namespace.operation {
+                DfsNamespaceOperation::MkdirAll { .. } => "mkdir-all",
+                DfsNamespaceOperation::SyncPath { .. } => "sync-path",
+                _ => "other-namespace",
+            };
+            namespace_calls_for_sender
+                .lock()
+                .expect("namespace calls")
+                .push(label.to_string());
+        }
+        let result = primary_service_for_sender
+            .lock()
+            .expect("primary service")
+            .process_message_command(command.clone())
+            .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
+        Ok(result.response)
+    });
+    let writer_transport = DfsNodeTransport::with_message_sender_for_nodes(
+        writer.clone(),
+        vec![primary.clone()],
+        Duration::from_millis(20),
+        writer_sender,
+    );
+    let mut writer_service = NetworkedDfsService::new(
+        writer_transport,
+        LocalContentStore::new(root.join("writer-content")).expect("writer content"),
+    )
+    .with_control_plane(control_plane);
+    writer_service
+        .add_file_system(file_system)
+        .expect("writer filesystem");
+    for object in crate::namespace::distributed_sifs_bootstrap_objects(primary.clone()) {
+        writer_service
+            .add_object_metadata(object)
+            .expect("writer bootstrap object");
+    }
+    writer_service
+        .set_transport_operation_deadline(Some(Instant::now() + Duration::from_millis(80)));
+    writer_service
+        .posix_mkdir_all("/services/routed-sync-backlog/new-dir")
+        .expect("routed mkdir should use synced path object without draining backlog");
+    writer_service.set_transport_operation_deadline(None);
+
+    let calls = namespace_calls.lock().expect("namespace calls").clone();
+    assert_eq!(
+        calls,
+        vec!["mkdir-all".to_string()],
+        "path-level sync metadata should avoid foreground replay of unrelated journal backlog"
+    );
+}
+
 #[derive(Default)]
 struct RecordingPeerTransport {
     calls: Mutex<Vec<String>>,

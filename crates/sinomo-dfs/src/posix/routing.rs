@@ -416,6 +416,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         routed: &PendingRoutedNamespaceResult,
     ) -> Result<()> {
         if !routed.journal_batch_limit_reached
+            || routed_namespace_result_has_synced_path_object(routed)
             || matches!(
                 operation,
                 DfsNamespaceOperation::SyncPath { .. }
@@ -717,7 +718,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map_err(DfsPosixError::Dfs)?;
             match routed.result {
                 DfsNamespaceResult::Applied => {
-                    if !routed.journal_batch_limit_reached {
+                    if !routed.journal_batch_limit_reached
+                        || routed_namespace_result_has_synced_path_object(&routed)
+                    {
                         return Ok(());
                     }
                 }
@@ -765,6 +768,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.touch_directory_modified(&parent)
     }
+}
+
+fn routed_namespace_result_has_synced_path_object(routed: &PendingRoutedNamespaceResult) -> bool {
+    routed.synced_path_object.is_some() || !routed.synced_path_objects.is_empty()
 }
 
 fn default_sifs_split_shard_for_path(path: &str) -> Option<(&'static str, &'static str)> {
