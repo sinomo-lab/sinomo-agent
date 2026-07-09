@@ -11,6 +11,8 @@
 //!   remote main daemon; this catches DFS route auth/routing regressions that a
 //!   generic network ping can miss. Route/RPC failures are hard-gated by
 //!   default; dirty DFS status may still poll for convergence.
+//! - `cluster.dfs.remote-shard-write` — choose a metadata shard whose primary is
+//!   not this node, then write through that routed mutation path.
 //! - `cluster.dfs.service-advertisements` — verify DFS service discovery
 //!   records advertise node identities instead of concrete network routes.
 //! - `cluster.dfs.invariants` — operational-metric sweep: no open conflicts,
@@ -83,6 +85,7 @@ pub fn register_dfs_cluster_test_cases(
     builder
         .register(dfs_read_your_write())
         .register(dfs_routed_status())
+        .register(dfs_remote_shard_write())
         .register(dfs_service_advertisements())
         .register(dfs_concurrent_file_race())
         .register(dfs_concurrent_dir_race())
@@ -125,6 +128,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_routed_status(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_remote_shard_write(ctx) {
+        id: "cluster.dfs.remote-shard-write",
+        summary: "Write a SIFS file through a metadata shard whose primary is remote from this node",
+        tags: ["cluster-dfs", "probe", "routing", "cluster-network-dfs-acceptance"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_remote_shard_write(ctx)
         }
     }
 }
@@ -604,6 +619,276 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             )));
         }
         std::thread::sleep(EXPECT_POLL_INTERVAL);
+    }
+}
+
+fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let timeout = expect_timeout(ctx)?;
+    let split_diagnostics = optional_bool_parameter(ctx, "split-diagnostics", false)?;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let open_started = Instant::now();
+    let backend = open_backend(ctx)?;
+    let open_ms = open_started.elapsed().as_millis() as u64;
+    let node = backend.node_label();
+    let local_node_id = NodeId::new(node.clone()).map_err(|source| {
+        SinomoTestError::failed(format!("local SIFS node id `{node}` is invalid: {source}"))
+    })?;
+    let status_started = Instant::now();
+    let status = backend
+        .operator_status()
+        .map_err(SinomoTestError::failed)?
+        .ok_or_else(|| {
+            SinomoTestError::failed(
+                "cluster-aware SIFS operator status is unavailable for remote-shard probe",
+            )
+        })?;
+    let status_ms = status_started.elapsed().as_millis() as u64;
+    let file_system_id =
+        DfsFileSystemId::from_legacy_named(SIFS_FILE_SYSTEM_ID).map_err(|source| {
+            SinomoTestError::failed(format!("default SIFS filesystem id is invalid: {source}"))
+        })?;
+    let shard_summaries = status
+        .metadata_shards
+        .iter()
+        .map(|shard| {
+            format!(
+                "{} fs={} primary={} replicas={}",
+                shard.shard_id.0,
+                shard
+                    .file_system_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "<none>".to_string()),
+                shard
+                    .primary_node_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "<none>".to_string()),
+                shard
+                    .replica_node_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect::<Vec<_>>();
+    ctx.record("node", &node);
+    ctx.record("metadata_shards", &shard_summaries);
+
+    let Some(target) = status.metadata_shards.iter().find_map(|shard| {
+        if shard.file_system_id.as_ref() != Some(&file_system_id) {
+            return None;
+        }
+        let primary_node_id = shard.primary_node_id.as_ref()?;
+        if primary_node_id == &local_node_id {
+            return None;
+        }
+        let path_prefix = remote_shard_write_probe_prefix(&shard.shard_id.0)?;
+        Some((
+            shard.shard_id.0.clone(),
+            primary_node_id.clone(),
+            path_prefix,
+            shard.epoch,
+        ))
+    }) else {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "node {node} has no known SIFS metadata shard whose primary is remote"
+        )));
+    };
+
+    let nonce = probe_nonce();
+    let path = format!("{}/remote-shard-{nonce}.txt", target.2);
+    let deferred_path = format!("{}/remote-shard-deferred-{nonce}.txt", target.2);
+    let app_path = format!("{}/remote-shard-app-{nonce}.txt", target.2);
+    let payload = ctx
+        .parameter("payload")
+        .map(|payload| payload.as_bytes().to_vec())
+        .unwrap_or_else(|| {
+            format!(
+                "remote-shard-write node={node} shard={} primary={} nonce={nonce}",
+                target.0, target.1
+            )
+            .into_bytes()
+        });
+    let write_started = Instant::now();
+    let phase_timeout = timeout.min(Duration::from_secs(5));
+    let next_phase_deadline = || std::cmp::min(Instant::now() + phase_timeout, deadline);
+    let mut split_app_failure = None;
+    if split_diagnostics {
+        let create_parent_started = Instant::now();
+        let create_parent_deadline = next_phase_deadline();
+        retry_bulk_mutation(
+            create_parent_deadline,
+            || backend.create_dir_all_deferred_publish_until(target.2, create_parent_deadline),
+            || {
+                format!(
+                    "cannot create SIFS directory {} through remote metadata shard",
+                    target.2
+                )
+            },
+        )?;
+        let create_parent_ms = create_parent_started.elapsed().as_millis() as u64;
+        ctx.record("split_diagnostics", true);
+        ctx.record("create_parent_ms", create_parent_ms);
+
+        let app_write_started = Instant::now();
+        let app_write_deadline = next_phase_deadline();
+        let app_write_result = retry_bulk_mutation(
+            app_write_deadline,
+            || backend.write_file_with_deadline(&app_path, &payload, app_write_deadline),
+            || format!("cannot app-write SIFS file {app_path} through remote metadata shard"),
+        );
+        let app_write_ms = app_write_started.elapsed().as_millis() as u64;
+        ctx.record("app_path", &app_path);
+        ctx.record("app_write_ms", app_write_ms);
+        match app_write_result {
+            Ok(()) => {
+                let app_read_started = Instant::now();
+                let app_read = backend
+                    .read_file(&app_path)
+                    .map_err(SinomoTestError::failed)?;
+                let app_read_ms = app_read_started.elapsed().as_millis() as u64;
+                ctx.record("app_read_ms", app_read_ms);
+                if app_read != payload {
+                    ctx.record("app_read_bytes", app_read.len());
+                    split_app_failure = Some(format!(
+                        "remote-shard app write on node {node} read back {} bytes, expected {}",
+                        app_read.len(),
+                        payload.len()
+                    ));
+                }
+            }
+            Err(error) => {
+                let error = error.to_string();
+                ctx.record("app_write_error", &error);
+                split_app_failure = Some(error);
+            }
+        }
+
+        let known_parent_write_started = Instant::now();
+        let known_parent_write_deadline = next_phase_deadline();
+        let known_parent_write_result = retry_bulk_mutation(
+            known_parent_write_deadline,
+            || {
+                backend.write_file_with_known_parent_no_publish_until(
+                    &path,
+                    &payload,
+                    known_parent_write_deadline,
+                )
+            },
+            || format!("cannot write SIFS file {path} through remote metadata shard"),
+        );
+        let known_parent_write_ms = known_parent_write_started.elapsed().as_millis() as u64;
+        ctx.record("known_parent_path", &path);
+        ctx.record("known_parent_write_ms", known_parent_write_ms);
+        if let Err(error) = known_parent_write_result {
+            ctx.record("known_parent_write_error", error.to_string());
+        }
+
+        let deferred_write_started = Instant::now();
+        let deferred_write_deadline = next_phase_deadline();
+        let deferred_write_result = retry_bulk_mutation(
+            deferred_write_deadline,
+            || {
+                backend.write_file_with_known_parent_deferred_publish_until(
+                    &deferred_path,
+                    &payload,
+                    deferred_write_deadline,
+                )
+            },
+            || format!("cannot write SIFS file {deferred_path} through remote metadata shard"),
+        );
+        let deferred_write_ms = deferred_write_started.elapsed().as_millis() as u64;
+        ctx.record("deferred_path", &deferred_path);
+        ctx.record("deferred_write_ms", deferred_write_ms);
+        if let Err(error) = deferred_write_result {
+            ctx.record("deferred_write_error", error.to_string());
+        }
+
+        let publish_started = Instant::now();
+        let publish_report = backend.publish_metadata_after_mutation_report();
+        let publish_ms = publish_started.elapsed().as_millis() as u64;
+        ctx.record("publish_ms", publish_ms);
+        match publish_report {
+            Ok(report) => {
+                let publish_outcomes = report
+                    .outcomes
+                    .iter()
+                    .map(|outcome| format!("{outcome:?}"))
+                    .collect::<Vec<_>>();
+                ctx.record("publish_outcome_count", publish_outcomes.len());
+                ctx.record("publish_outcomes", publish_outcomes);
+            }
+            Err(error) => {
+                ctx.record("publish_error", error);
+            }
+        }
+    } else {
+        let write_deadline = next_phase_deadline();
+        retry_bulk_mutation(
+            write_deadline,
+            || backend.write_file_with_deadline(&path, &payload, write_deadline),
+            || format!("cannot write SIFS file {path} through remote metadata shard"),
+        )?;
+    }
+    let write_ms = write_started.elapsed().as_millis() as u64;
+    let read_path = if split_diagnostics {
+        app_path.as_str()
+    } else {
+        path.as_str()
+    };
+    if let Some(error) = split_app_failure {
+        ctx.record("shard_id", &target.0);
+        ctx.record("remote_primary_node_id", target.1.to_string());
+        ctx.record("shard_epoch", target.3);
+        ctx.record("path", read_path);
+        ctx.record("bytes", payload.len());
+        ctx.record("open_backend_ms", open_ms);
+        ctx.record("operator_status_ms", status_ms);
+        ctx.record("write_ms", write_ms);
+        ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+        return Ok(SinomoTestOutcome::failed(error));
+    }
+    let read_started = Instant::now();
+    let read = backend
+        .read_file(read_path)
+        .map_err(SinomoTestError::failed)?;
+    let read_ms = read_started.elapsed().as_millis() as u64;
+    if read != payload {
+        ctx.record("read_bytes", read.len());
+        return Ok(SinomoTestOutcome::failed(format!(
+            "remote-shard write on node {node} read back {} bytes, expected {}",
+            read.len(),
+            payload.len()
+        )));
+    }
+
+    ctx.record("shard_id", &target.0);
+    ctx.record("remote_primary_node_id", target.1.to_string());
+    ctx.record("shard_epoch", target.3);
+    ctx.record("path", read_path);
+    ctx.record("bytes", payload.len());
+    ctx.record("open_backend_ms", open_ms);
+    ctx.record("operator_status_ms", status_ms);
+    ctx.record("write_ms", write_ms);
+    ctx.record("read_ms", read_ms);
+    ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+    Ok(SinomoTestOutcome::passed(format!(
+        "wrote {} bytes from node {node} through remote SIFS metadata shard {} on {}",
+        payload.len(),
+        target.0,
+        target.1
+    )))
+}
+
+fn remote_shard_write_probe_prefix(shard_id: &str) -> Option<&'static str> {
+    match shard_id {
+        "root" => Some("/cluster-tests/remote-shard"),
+        "services" => Some("/services/cluster-tests/remote-shard"),
+        "users" => Some("/users/cluster-tests/remote-shard"),
+        _ => None,
     }
 }
 
@@ -2097,7 +2382,9 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let write_elapsed = write_started.elapsed();
     let proc_io_after_write = current_proc_io();
     let publish_started = Instant::now();
-    backend.publish_metadata_after_mutation();
+    backend
+        .publish_metadata_after_mutation()
+        .map_err(SinomoTestError::failed)?;
     let publish_elapsed = publish_started.elapsed();
     let proc_io_after_publish = current_proc_io();
     let elapsed = started.elapsed();
@@ -2418,7 +2705,9 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let write_elapsed = write_started.elapsed();
     let proc_io_after_write = current_proc_io();
     let publish_started = Instant::now();
-    backend.publish_metadata_after_mutation();
+    backend
+        .publish_metadata_after_mutation()
+        .map_err(SinomoTestError::failed)?;
     let publish_elapsed = publish_started.elapsed();
     let proc_io_after_publish = current_proc_io();
     let elapsed = started.elapsed();

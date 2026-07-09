@@ -152,6 +152,14 @@ fn run_network_state_hygiene(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             targets.len()
         )));
     }
+    let pruned_local_records =
+        network::prune_local_cluster_connectivity_records_for_state(&cluster_paths, &cluster_state)
+            .map_err(|error| {
+                SinomoTestError::failed(format!(
+                    "cannot prune stale local connectivity records before network hygiene: {error}"
+                ))
+            })?;
+    ctx.record("pruned_local_connectivity_records", pruned_local_records);
 
     let local_records =
         network::read_local_cluster_connectivity_records(&cluster_paths).map_err(|error| {

@@ -881,25 +881,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// the requester) through journal replay. Best effort: a primary that does
     /// not hold the parent directory record must still answer the committed
     /// write.
-    fn record_routed_create_parent_directory_touch(&mut self, path: &str, foreground: bool) {
-        if foreground
-            && !self
-                .transport
-                .can_return_committed_foreground_response_before_replica_repair()
-        {
-            self.touch_routed_create_parent_directory(path);
-        } else {
-            self.defer_routed_create_parent_directory_touch(path);
-        }
+    fn record_routed_create_parent_directory_touch(&mut self, path: &str, _foreground: bool) {
+        self.touch_routed_create_parent_directory(path);
     }
 
     fn touch_routed_create_parent_directory(&mut self, path: &str) {
         let _ = self.touch_parent_directory_modified(path);
-    }
-
-    fn defer_routed_create_parent_directory_touch(&mut self, path: &str) {
-        self.deferred_routed_create_parent_touches
-            .insert(path.to_string());
     }
 
     pub(crate) fn drain_deferred_routed_create_parent_touches(&mut self) {

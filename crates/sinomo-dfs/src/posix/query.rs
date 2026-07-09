@@ -142,6 +142,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_list_dir_distributed(&mut self, path: &str) -> Result<Vec<DfsDirEntry>> {
         self.check_cancelled("distributed list")?;
         let path = self.resolve_existing_posix_path_distributed(path, true)?;
+        self.sync_remote_namespace_path_until_quiet(&path)?;
         self.posix_collect_resolved_dir(&path)
     }
 
@@ -162,6 +163,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_entries: usize,
     ) -> Result<DfsDirEntryPage> {
         let path = self.resolve_existing_posix_path_distributed(path, true)?;
+        self.sync_remote_namespace_path_until_quiet(&path)?;
         self.posix_list_resolved_dir_page(&path, after, max_entries)
     }
 

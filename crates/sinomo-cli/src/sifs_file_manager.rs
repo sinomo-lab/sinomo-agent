@@ -11,14 +11,14 @@ use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::dfs::{
     AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsControlPlaneStore,
-    DfsMetadataJournalReplicationOptions, DfsMetadataShardConfig, DfsNodeAdvertisement,
-    DfsNodeTransport, DfsObjectKind, DfsObjectRpcSendOptions, DfsPeerTransport,
-    DfsPeerTransportError, DfsPeerTransportFuture, DfsPinAddRequest, DfsPinMode, DfsStat,
-    DfsWriteOptions, LocalContentStore, NetworkedDfsService, cluster_dfs_peer_node_ids,
-    content_services_prefix, default_dfs_metadata_root, default_dfs_metadata_shards_root,
-    default_dfs_pin_root, fallback_dfs_node_id, metadata_shards_prefix,
-    open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    publish_cluster_dfs_metadata_journal_with_peer_transport,
+    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    DfsMetadataShardConfig, DfsNodeAdvertisement, DfsNodeTransport, DfsObjectKind,
+    DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
+    DfsPinAddRequest, DfsPinMode, DfsPosixError, DfsStat, DfsWriteOptions, LocalContentStore,
+    NetworkedDfsService, cluster_dfs_peer_node_ids, content_services_prefix,
+    default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
+    fallback_dfs_node_id, metadata_shards_prefix, open_local_sharded_metadata_backend,
+    open_root_local_metadata_backend, publish_cluster_dfs_metadata_journal_with_peer_transport,
     refresh_cluster_dfs_kv_snapshot_with_peer_transport, sifs_file_system_id,
 };
 use sinomo_runtime::kv::{KvError, KvOp, KvTxn, KvTxnResponse};
@@ -140,16 +140,39 @@ impl SifsFileManagerBackend {
         true
     }
 
-    pub(crate) fn publish_metadata_after_mutation(&self) {
-        if let Ok(mut service) = self.lock_service() {
-            if service.flush_deferred_content_durability().is_err() {
-                return;
-            }
-            let _ = service.flush_detached_transport_sends();
-            let _ = service.process_incoming_without_deferred_parent_touches();
+    pub(crate) fn publish_metadata_after_mutation(&self) -> Result<(), String> {
+        self.prepare_metadata_after_mutation()?;
+        if request_sifs_daemon_maintenance_refresh(&self.data_dir) {
+            return Ok(());
         }
-        let _ = publish_sifs_metadata_journal_from_data_dir(&self.data_dir, &self.rpc_runtime);
-        request_sifs_daemon_maintenance_refresh(&self.data_dir);
+        publish_sifs_metadata_journal_from_data_dir(&self.data_dir, &self.rpc_runtime)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn publish_metadata_after_mutation_report(
+        &self,
+    ) -> Result<DfsMetadataJournalReplicationReport, String> {
+        self.prepare_metadata_after_mutation()?;
+        let report = publish_sifs_metadata_journal_from_data_dir(&self.data_dir, &self.rpc_runtime)
+            .map_err(|error| error.to_string())?;
+        let _ = request_sifs_daemon_maintenance_refresh(&self.data_dir);
+        Ok(report)
+    }
+
+    fn prepare_metadata_after_mutation(&self) -> Result<(), String> {
+        if let Ok(mut service) = self.lock_service() {
+            service
+                .flush_deferred_content_durability()
+                .map_err(|error| error.to_string())?;
+            service
+                .flush_detached_transport_sends()
+                .map_err(|error| error.to_string())?;
+            service
+                .process_incoming()
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// The node id objects written here are placed on (the local SIFS node).
@@ -311,6 +334,23 @@ impl SifsFileManagerBackend {
         self.write_file_with_options(path, bytes, true, true, Some(deadline))
     }
 
+    pub(crate) fn create_dir_all_deferred_publish_until(
+        &self,
+        path: &str,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let path = normalize_sifs_path(path)?;
+        let mut service = self.lock_service()?;
+        self.refresh_service_peer_targets(&mut service);
+        let previous_deadline = service.set_transport_operation_deadline(Some(deadline));
+        let result = service
+            .posix_mkdir_all(&path)
+            .map(|_| ())
+            .map_err(|error| format!("cannot create SIFS directory {path}: {error}"));
+        service.set_transport_operation_deadline(previous_deadline);
+        result
+    }
+
     fn write_file_with_options(
         &self,
         path: &str,
@@ -325,17 +365,42 @@ impl SifsFileManagerBackend {
         let previous_deadline = operation_deadline
             .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
         let result = (|| {
-            if let Some(parent) = parent_sifs_path(&path) {
-                service
-                    .posix_mkdir_all(&parent)
-                    .map_err(|error| format!("cannot create SIFS directory {parent}: {error}"))?;
-            }
-            let mut options = sifs_write_options(&service, &self.replica_candidates);
+            let mut options = if foreground_replica_repair {
+                sifs_write_options(&service, &self.replica_candidates)
+            } else {
+                sifs_deferred_publish_write_options(&service, &self.replica_candidates)
+            };
             options.foreground_replica_repair = foreground_replica_repair;
-            service
-                .posix_write_file(&path, bytes, options)
-                .map(|_| ())
-                .map_err(|error| format!("cannot write SIFS file {path}: {error}"))
+            if foreground_replica_repair {
+                if let Some(parent) = parent_sifs_path(&path) {
+                    service.posix_mkdir_all(&parent).map_err(|error| {
+                        format!("cannot create SIFS directory {parent}: {error}")
+                    })?;
+                }
+                service
+                    .posix_write_file(&path, bytes, options)
+                    .map(|_| ())
+                    .map_err(|error| format!("cannot write SIFS file {path}: {error}"))
+            } else {
+                if let Some(parent) = parent_sifs_path(&path) {
+                    ensure_sifs_parent_directory_for_write(&mut service, &parent)?;
+                }
+                match service.posix_write_file(&path, bytes, options.clone()) {
+                    Ok(_) => Ok(()),
+                    Err(error) if sifs_write_error_needs_parent_create(&error) => {
+                        if let Some(parent) = parent_sifs_path(&path) {
+                            service.posix_mkdir_all(&parent).map_err(|error| {
+                                format!("cannot create SIFS directory {parent}: {error}")
+                            })?;
+                        }
+                        service
+                            .posix_write_file(&path, bytes, options)
+                            .map(|_| ())
+                            .map_err(|error| format!("cannot write SIFS file {path}: {error}"))
+                    }
+                    Err(error) => Err(format!("cannot write SIFS file {path}: {error}")),
+                }
+            }
         })();
         if let Some(previous_deadline) = previous_deadline {
             service.set_transport_operation_deadline(previous_deadline);
@@ -343,7 +408,7 @@ impl SifsFileManagerBackend {
         result?;
         drop(service);
         if publish_metadata {
-            self.publish_metadata_after_mutation();
+            self.publish_metadata_after_mutation()?;
         }
         Ok(())
     }
@@ -394,6 +459,27 @@ impl SifsFileManagerBackend {
             bytes,
             Some(deadline),
         )
+    }
+
+    pub(crate) fn write_file_with_known_parent_no_publish_until(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let path = normalize_sifs_path(path)?;
+        let mut service = self.lock_service()?;
+        self.refresh_service_peer_targets(&mut service);
+        let previous_deadline = service.set_transport_operation_deadline(Some(deadline));
+        let result = (|| {
+            let options = sifs_write_options(&service, &self.replica_candidates);
+            service
+                .posix_write_file_with_known_parent(&path, bytes, options)
+                .map(|_| ())
+                .map_err(|error| format!("cannot write SIFS file {path}: {error}"))
+        })();
+        service.set_transport_operation_deadline(previous_deadline);
+        result
     }
 
     fn write_file_with_known_parent_deferred_publish_with_deadline(
@@ -573,7 +659,7 @@ impl SifsFileManagerBackend {
             .posix_mkdir_all(&path)
             .map_err(|error| format!("cannot create SIFS directory {path}: {error}"))?;
         drop(service);
-        self.publish_metadata_after_mutation();
+        self.publish_metadata_after_mutation()?;
         Ok(())
     }
 
@@ -853,7 +939,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
             .map(|_| ())
             .map_err(|error| format!("cannot create SIFS file {path}: {error}"))?;
         drop(service);
-        self.publish_metadata_after_mutation();
+        self.publish_metadata_after_mutation()?;
         Ok(())
     }
 
@@ -866,7 +952,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
             .map(|_| ())
             .map_err(|error| format!("cannot create SIFS directory {path}: {error}"))?;
         drop(service);
-        self.publish_metadata_after_mutation();
+        self.publish_metadata_after_mutation()?;
         Ok(())
     }
 
@@ -880,7 +966,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
             .map(|_| ())
             .map_err(|error| format!("cannot rename SIFS item {from} to {to}: {error}"))?;
         drop(service);
-        self.publish_metadata_after_mutation();
+        self.publish_metadata_after_mutation()?;
         Ok(())
     }
 
@@ -893,7 +979,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
             .map(|_| ())
             .map_err(|error| format!("cannot delete SIFS file {path}: {error}"))?;
         drop(service);
-        self.publish_metadata_after_mutation();
+        self.publish_metadata_after_mutation()?;
         Ok(())
     }
 
@@ -910,7 +996,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
                 )
             })?;
         drop(service);
-        self.publish_metadata_after_mutation();
+        self.publish_metadata_after_mutation()?;
         Ok(())
     }
 }
@@ -1435,7 +1521,7 @@ fn sifs_send_dfs_object_rpc_via_daemon(
 fn publish_sifs_metadata_journal_from_data_dir(
     data_dir: &SinomoDataDir,
     rpc_runtime: &SifsRpcRuntime,
-) -> Result<(), sinomo_runtime::dfs::DfsError> {
+) -> Result<DfsMetadataJournalReplicationReport, sinomo_runtime::dfs::DfsError> {
     let cluster_paths = ClusterPaths::new(data_dir);
     let peer_transport: Arc<dyn DfsPeerTransport> = Arc::new(SifsDfsPeerTransport::new(
         rpc_runtime.clone(),
@@ -1446,8 +1532,7 @@ fn publish_sifs_metadata_journal_from_data_dir(
         &cluster_paths,
         peer_transport,
         sifs_foreground_metadata_publish_options(),
-    )?;
-    Ok(())
+    )
 }
 
 fn sifs_foreground_metadata_publish_options() -> DfsMetadataJournalReplicationOptions {
@@ -1459,15 +1544,24 @@ fn sifs_foreground_metadata_publish_options() -> DfsMetadataJournalReplicationOp
     }
 }
 
-fn request_sifs_daemon_maintenance_refresh(data_dir: &SinomoDataDir) {
+fn request_sifs_daemon_maintenance_refresh(data_dir: &SinomoDataDir) -> bool {
     let paths = sinomo_runtime::daemon::DaemonPaths::new(data_dir);
-    let Ok(client) = sinomo_runtime::daemon::DaemonApiClient::connect_for_paths(&paths) else {
-        return;
+    if !paths.lock.exists() {
+        return false;
+    }
+    let Ok(status) = sinomo_runtime::daemon::read_daemon_status(&paths) else {
+        return false;
     };
-    let _ = sinomo_runtime::daemon::send_daemon_cluster_maintenance_refresh(
-        client.address(),
-        SIFS_MAINTENANCE_REFRESH_TIMEOUT,
-    );
+    let address = status.address;
+    std::thread::Builder::new()
+        .name("sifs-maintenance-refresh".to_string())
+        .spawn(move || {
+            let _ = sinomo_runtime::daemon::send_daemon_cluster_maintenance_refresh(
+                &address,
+                SIFS_MAINTENANCE_REFRESH_TIMEOUT,
+            );
+        })
+        .is_ok()
 }
 
 fn sifs_write_options(
@@ -1502,6 +1596,28 @@ fn sifs_deferred_publish_write_options_for_candidates(candidates: Vec<NodeId>) -
     let mut options = sifs_write_options_for_candidates(candidates);
     options.wait_for_commit = false;
     options
+}
+
+fn ensure_sifs_parent_directory_for_write(
+    service: &mut NetworkedDfsService<DfsNodeTransport>,
+    parent: &str,
+) -> Result<(), String> {
+    match service.posix_stat_distributed(parent) {
+        Ok(stat) if stat.kind == DfsObjectKind::Directory => Ok(()),
+        Ok(stat) => Err(format!(
+            "cannot create SIFS file under {parent}: parent is {:?}",
+            stat.kind
+        )),
+        Err(DfsPosixError::NotFound { .. } | DfsPosixError::MissingParent { .. }) => service
+            .posix_mkdir_all(parent)
+            .map(|_| ())
+            .map_err(|error| format!("cannot create SIFS directory {parent}: {error}")),
+        Err(error) => Err(format!("cannot inspect SIFS directory {parent}: {error}")),
+    }
+}
+
+fn sifs_write_error_needs_parent_create(error: &DfsPosixError) -> bool {
+    matches!(error, DfsPosixError::MissingParent { .. })
 }
 
 fn sifs_entry_kind(kind: &DfsObjectKind) -> FileManagerEntryKind {
