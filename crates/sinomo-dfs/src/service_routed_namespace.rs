@@ -12,6 +12,44 @@ use sinomo_core::node::NodeId;
 use crate::*;
 use crate::{posix_model, posix_path};
 
+fn dfs_error_from_posix_namespace_sync(error: posix_model::DfsPosixError) -> DfsError {
+    match error {
+        posix_model::DfsPosixError::Dfs(error) => error,
+        other => DfsError::Distributed {
+            message: other.to_string(),
+        },
+    }
+}
+
+fn metadata_path_is_direct_child_of_posix_dir(directory_path: &str, metadata_path: &str) -> bool {
+    let child_path = if metadata_path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{metadata_path}")
+    };
+    if child_path == directory_path {
+        return false;
+    }
+    let prefix = if directory_path == "/" {
+        "/".to_string()
+    } else {
+        format!("{}/", directory_path.trim_end_matches('/'))
+    };
+    let Some(rest) = child_path.strip_prefix(&prefix) else {
+        return false;
+    };
+    !rest.is_empty() && !rest.contains('/')
+}
+
+fn namespace_operation_should_replay_journal_batches(operation: &DfsNamespaceOperation) -> bool {
+    !matches!(
+        operation,
+        DfsNamespaceOperation::LookupPath { .. }
+            | DfsNamespaceOperation::LookupPaths { .. }
+            | DfsNamespaceOperation::SyncPath { .. }
+    )
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn synced_namespace_object_for_operation(
         &self,
@@ -22,6 +60,52 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .synced_namespace_objects_for_operation(file_system_id, operation)?
             .into_iter()
             .next())
+    }
+
+    fn synced_namespace_objects_for_sync_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Vec<DfsObjectMetadata>, DfsError> {
+        let Some(normalized_path) = posix_path::normalized_posix_path_key(path) else {
+            return Ok(Vec::new());
+        };
+        let mut objects = Vec::new();
+        let mut include_direct_children = false;
+        if let Some(object) =
+            self.synced_namespace_object_for_path(file_system_id, &normalized_path)?
+        {
+            include_direct_children =
+                object.kind == DfsObjectKind::Directory && file_system_id == &sifs_file_system_id();
+            objects.push(object);
+        }
+        if include_direct_children {
+            let children = self
+                .child_objects_for_sifs_dir(&normalized_path)
+                .map_err(dfs_error_from_posix_namespace_sync)?;
+            for object in children {
+                objects.push(self.object_metadata_with_receipt_locations(object)?);
+            }
+            objects.extend(
+                self.direct_child_tombstones_for_sifs_dir(file_system_id, &normalized_path)?,
+            );
+        }
+        Ok(objects)
+    }
+
+    fn direct_child_tombstones_for_sifs_dir(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        directory_path: &str,
+    ) -> Result<Vec<DfsObjectMetadata>, DfsError> {
+        self.tombstones_by_metadata_path
+            .iter()
+            .filter(|((tombstone_file_system_id, metadata_path), _)| {
+                tombstone_file_system_id == file_system_id
+                    && metadata_path_is_direct_child_of_posix_dir(directory_path, metadata_path)
+            })
+            .map(|(_, object)| self.object_metadata_with_receipt_locations(object.clone()))
+            .collect()
     }
 
     fn synced_mkdir_all_paths(path: &str) -> Vec<String> {
@@ -47,11 +131,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: &DfsNamespaceOperation,
     ) -> Result<Vec<DfsObjectMetadata>, DfsError> {
         let paths: Vec<String> = match operation {
-            DfsNamespaceOperation::SyncPath { path }
-            | DfsNamespaceOperation::LookupPath { path }
-            | DfsNamespaceOperation::Mkdir { path } => posix_path::normalized_posix_path_key(path)
-                .into_iter()
-                .collect(),
+            DfsNamespaceOperation::SyncPath { path } => {
+                return self.synced_namespace_objects_for_sync_path(file_system_id, path);
+            }
+            DfsNamespaceOperation::LookupPath { path } | DfsNamespaceOperation::Mkdir { path } => {
+                posix_path::normalized_posix_path_key(path)
+                    .into_iter()
+                    .collect()
+            }
             DfsNamespaceOperation::MkdirAll { path } => Self::synced_mkdir_all_paths(path),
             DfsNamespaceOperation::LookupPaths { paths } => paths
                 .iter()
@@ -232,11 +319,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let journal_started = Instant::now();
         let metadata_journal_batches = if command.include_metadata_journal_batches
             && matches!(result, DfsNamespaceResult::Applied)
-            && !matches!(
-                command.operation,
-                DfsNamespaceOperation::LookupPath { .. }
-                    | DfsNamespaceOperation::LookupPaths { .. }
-            ) {
+            && namespace_operation_should_replay_journal_batches(&command.operation)
+        {
             let mut batches = Vec::new();
             for shard_id in &affected_shard_ids {
                 let after_sequence = command
@@ -672,6 +756,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
+        let requested_deadline = Instant::now() + timeout;
+        let previous_deadline = self
+            .transport
+            .set_operation_deadline(Some(requested_deadline));
+        let effective_deadline = previous_deadline
+            .filter(|existing| *existing < requested_deadline)
+            .unwrap_or(requested_deadline);
+        if effective_deadline != requested_deadline {
+            self.transport
+                .set_operation_deadline(Some(effective_deadline));
+        }
+        let result = self.route_namespace_operation_to_metadata_primary_with_deadline(
+            file_system_id,
+            primary_node_id,
+            operation,
+            effective_deadline,
+            replay_journal_batches,
+            apply_synced_path_object,
+        );
+        self.transport.set_operation_deadline(previous_deadline);
+        result
+    }
+
+    fn route_namespace_operation_to_metadata_primary_with_deadline(
+        &mut self,
+        file_system_id: DfsFileSystemId,
+        primary_node_id: NodeId,
+        operation: DfsNamespaceOperation,
+        deadline: Instant,
+        replay_journal_batches: bool,
+        apply_synced_path_object: bool,
+    ) -> Result<PendingRoutedNamespaceResult, DfsError> {
         let request_id = self.next_request_id();
         let metadata_journal_after_sequences = if replay_journal_batches {
             self.local_metadata_shard_cursors()?
@@ -704,6 +820,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
+        let Some(remaining) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+        else {
+            self.cached_sifs_metadata_shards = None;
+            return Err(DfsError::Network {
+                message: format!(
+                    "routed namespace operation {request_id} timed out before response settle"
+                ),
+            });
+        };
         self.pending_routed_namespace_ops.insert(
             request_id.clone(),
             PendingRoutedNamespaceOp {
@@ -713,7 +840,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 result: None,
             },
         );
-        self.settle_routed_namespace_op(&request_id, timeout)
+        self.settle_routed_namespace_op(&request_id, remaining)
     }
 
     fn settle_routed_namespace_op(

@@ -705,14 +705,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(primary) => primary,
             None => return Ok(()),
         };
+        let deadline = Instant::now() + POSIX_READ_FRESHNESS_SYNC_TIMEOUT;
         for _ in 0..POSIX_ROUTED_DEEP_SYNC_ROUNDS {
             self.check_cancelled("routed namespace sync")?;
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(DfsPosixError::Dfs(DfsError::Network {
+                    message: format!(
+                        "routed namespace sync for {path} did not settle within {}ms",
+                        POSIX_READ_FRESHNESS_SYNC_TIMEOUT.as_millis()
+                    ),
+                }));
+            }
             let routed = self
                 .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
                     file_system_id.clone(),
                     primary.clone(),
                     operation.clone(),
-                    POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                    deadline.saturating_duration_since(now),
                     true,
                     true,
                 )
@@ -752,7 +762,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 } => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
             }
         }
-        Ok(())
+        Err(DfsPosixError::Dfs(DfsError::Network {
+            message: format!(
+                "routed namespace sync for {path} reached {POSIX_ROUTED_DEEP_SYNC_ROUNDS} batches before the journal settled"
+            ),
+        }))
     }
 
     /// Touches the parent directory mtime when this node is the metadata

@@ -142,12 +142,11 @@ impl SifsFileManagerBackend {
 
     pub(crate) fn publish_metadata_after_mutation(&self) -> Result<(), String> {
         self.prepare_metadata_after_mutation()?;
-        if request_sifs_daemon_maintenance_refresh(&self.data_dir) {
-            return Ok(());
-        }
-        publish_sifs_metadata_journal_from_data_dir(&self.data_dir, &self.rpc_runtime)
+        let result = publish_sifs_metadata_journal_from_data_dir(&self.data_dir, &self.rpc_runtime)
             .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string());
+        let _ = request_sifs_daemon_maintenance_refresh(&self.data_dir);
+        result
     }
 
     pub(crate) fn publish_metadata_after_mutation_report(

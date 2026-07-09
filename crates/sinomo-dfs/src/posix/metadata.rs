@@ -22,6 +22,28 @@ use crate::{
     NetworkedDfsReadOutcome, NetworkedDfsService, sifs_file_system_id,
 };
 
+fn sifs_dir_direct_child_path(
+    file_system_id: &DfsFileSystemId,
+    path: &str,
+    prefix: &str,
+    object: &DfsObjectMetadata,
+) -> Option<String> {
+    if object.file_system_id != *file_system_id {
+        return None;
+    }
+    let Ok(object_path) = normalize_posix_path(&object.path) else {
+        return None;
+    };
+    if object_path == path || !object_path.starts_with(prefix) {
+        return None;
+    }
+    let rest = object_path.trim_start_matches(prefix);
+    if rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    Some(object_path)
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(super) fn lookup_sifs_path(&self, path: &str) -> Result<Option<DfsObjectMetadata>> {
         self.lookup_metadata_path(&sifs_file_system_id(), path)
@@ -283,10 +305,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    pub(super) fn child_objects_for_sifs_dir(&self, path: &str) -> Result<Vec<DfsObjectMetadata>> {
+    pub(crate) fn child_objects_for_sifs_dir(&self, path: &str) -> Result<Vec<DfsObjectMetadata>> {
         let file_system_id = sifs_file_system_id();
+        let mut children = Vec::new();
         if let Some(backend) = self.metadata_backend.as_ref() {
-            let mut children = Vec::new();
             try_walk_metadata_pages(|cursor| {
                 let page = backend.child_objects_for_directory_page(
                     &file_system_id,
@@ -297,34 +319,68 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 children.extend(page.objects);
                 Ok::<_, DfsPosixError>(page.next_cursor)
             })?;
-            return Ok(children);
         }
+        self.merge_memory_child_overlay_for_sifs_dir(&file_system_id, path, &mut children)?;
+        Ok(children)
+    }
+
+    fn merge_memory_child_overlay_for_sifs_dir(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+        children: &mut Vec<DfsObjectMetadata>,
+    ) -> Result<()> {
         let prefix = if path == "/" {
             "/".to_string()
         } else {
             format!("{}/", path.trim_end_matches('/'))
         };
-        Ok(self
-            .metadata
-            .objects
-            .values()
-            .filter(|object| {
-                if object.file_system_id != file_system_id
-                    || object.kind == DfsObjectKind::Tombstone
-                {
-                    return false;
+        let mut live_children = Vec::new();
+        let mut tombstone_object_ids = Vec::new();
+        let mut tombstone_paths = Vec::new();
+        for object in self.metadata.objects.values() {
+            let Some(object_path) =
+                sifs_dir_direct_child_path(file_system_id, path, &prefix, object)
+            else {
+                continue;
+            };
+            if object.kind == DfsObjectKind::Tombstone {
+                tombstone_object_ids.push(object.object_id.clone());
+                tombstone_paths.push(object_path);
+            } else {
+                live_children.push((object_path, object.clone()));
+            }
+        }
+        children.retain(|existing| {
+            if tombstone_object_ids.contains(&existing.object_id) {
+                return false;
+            }
+            let Ok(existing_path) = normalize_posix_path(&existing.path) else {
+                return true;
+            };
+            let tombstoned_path = tombstone_paths
+                .iter()
+                .any(|tombstone_path| tombstone_path == &existing_path);
+            let live_path = live_children
+                .iter()
+                .any(|(live_path, _)| live_path == &existing_path);
+            !tombstoned_path || live_path
+        });
+        for (object_path, object) in live_children {
+            if let Some(existing) = children.iter_mut().find(|existing| {
+                if existing.object_id == object.object_id {
+                    return true;
                 }
-                let Ok(object_path) = normalize_posix_path(&object.path) else {
-                    return false;
-                };
-                if object_path == path || !object_path.starts_with(&prefix) {
-                    return false;
-                }
-                let rest = object_path.trim_start_matches(&prefix);
-                !rest.is_empty() && !rest.contains('/')
-            })
-            .cloned()
-            .collect())
+                normalize_posix_path(&existing.path)
+                    .map(|existing_path| existing_path == object_path)
+                    .unwrap_or(false)
+            }) {
+                *existing = object;
+            } else {
+                children.push(object);
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn child_objects_for_sifs_dir_page(
@@ -338,15 +394,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 objects: Vec::new(),
                 next_cursor: None,
             });
-        }
-        let file_system_id = sifs_file_system_id();
-        if let Some(backend) = self.metadata_backend.as_ref() {
-            return Ok(backend.child_objects_for_directory_page(
-                &file_system_id,
-                path,
-                after,
-                max_entries,
-            )?);
         }
         let mut objects = self.child_objects_for_sifs_dir(path)?;
         objects.sort_by(|left, right| {

@@ -1154,6 +1154,10 @@ impl DfsMessageTransport for DfsNodeTransport {
         Ok(Some(self.incoming_messages.len()))
     }
 
+    fn set_operation_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
+        DfsNodeTransport::set_operation_deadline(self, deadline)
+    }
+
     fn transfer_profile(&self, target_node_id: &NodeId) -> DfsTransferProfile {
         self.transfer_profile_for_target(target_node_id)
     }

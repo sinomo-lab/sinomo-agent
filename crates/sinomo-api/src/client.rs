@@ -121,7 +121,7 @@ impl DaemonApiClient {
         let idle_timeout = if self.timeout_overridden {
             self.timeout
         } else {
-            OBJECT_RPC_TRANSFER_IDLE_TIMEOUT.max(connect_timeout)
+            connect_timeout
         };
         sinomo_core::network::DaemonRpcTimeouts::connect_only(self.timeout)
             .with_idle_timeout(Some(idle_timeout))
@@ -853,14 +853,11 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_dfs_object_rpc_uses_transfer_idle_by_default() {
+    fn forwarded_dfs_object_rpc_uses_route_idle_by_default() {
         let client = DaemonApiClient::at_address("127.0.0.1:21353");
         let timeouts = client.dfs_object_rpc_forward_control_timeouts(Duration::from_secs(60));
         assert_eq!(timeouts.connect_timeout, Some(DAEMON_API_DEFAULT_TIMEOUT));
-        assert_eq!(
-            timeouts.idle_timeout,
-            Some(OBJECT_RPC_TRANSFER_IDLE_TIMEOUT)
-        );
+        assert_eq!(timeouts.idle_timeout, Some(Duration::from_secs(60)));
     }
 
     #[test]

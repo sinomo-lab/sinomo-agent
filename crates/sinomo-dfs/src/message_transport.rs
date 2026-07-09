@@ -6,7 +6,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sinomo_core::network::NetworkError;
 use sinomo_core::node::NodeId;
@@ -82,6 +82,10 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
 
     fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
         Ok(None)
+    }
+
+    fn set_operation_deadline(&mut self, _deadline: Option<Instant>) -> Option<Instant> {
+        None
     }
 
     fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {

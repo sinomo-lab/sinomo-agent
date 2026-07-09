@@ -34,10 +34,10 @@ pub(crate) const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 1024;
 pub(crate) const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 2;
 
 pub(crate) const DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT: usize = 8;
-// Cross-shard coordination (rename/hardlink sagas) does several primary-to-
-// primary roundtrips plus journal publication before the requester's answer;
-// over bridge-relayed segments that legitimately exceeds a small budget.
-pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(30);
+// Namespace RPCs are on the app-visible critical path. A cluster route that
+// cannot answer within this budget is treated as unhealthy rather than hidden
+// behind a long DFS wait.
+pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Nested coordination depth (serving a namespace request while settling
 /// another) beyond which new coordination rejects as Busy instead of growing
 /// the stack.
