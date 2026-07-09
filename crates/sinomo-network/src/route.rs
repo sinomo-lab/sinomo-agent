@@ -3571,6 +3571,9 @@ fn cluster_target_final_hop_attempt_budget(
     verified_endpoint: bool,
     use_full_response_budget: bool,
 ) -> Option<Duration> {
+    if use_full_response_budget && verified_endpoint {
+        return remaining_route_budget.or(endpoint_attempt_budget);
+    }
     if use_full_response_budget && endpoints_left <= 1 {
         return remaining_route_budget;
     }
@@ -5500,10 +5503,7 @@ mod tests {
             true,
         )
         .expect("streamed budget");
-        assert_eq!(
-            streamed,
-            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
-        );
+        assert_eq!(streamed, Duration::from_secs(4));
 
         let streamed_last_endpoint = cluster_target_final_hop_attempt_budget(
             Some(Duration::from_secs(4)),
@@ -5555,10 +5555,7 @@ mod tests {
             true,
         )
         .expect("streamed budget");
-        assert_eq!(
-            streamed,
-            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
-        );
+        assert_eq!(streamed, Duration::from_secs(60));
     }
 
     #[test]
@@ -5582,10 +5579,7 @@ mod tests {
             cluster_target_final_hop_request_uses_full_response_budget(&data_plane),
         )
         .expect("data-plane budget");
-        assert_eq!(
-            budget,
-            CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED
-        );
+        assert_eq!(budget, Duration::from_secs(60));
 
         let last_endpoint_budget = cluster_target_final_hop_attempt_budget(
             Some(Duration::from_secs(60)),
@@ -5642,6 +5636,16 @@ mod tests {
         )
         .expect("last endpoint full response budget");
         assert_eq!(full_response_last_endpoint, Duration::from_secs(5));
+
+        let full_response_verified_direct = cluster_target_final_hop_attempt_budget(
+            Some(Duration::from_secs(5)),
+            5,
+            Some(Duration::from_secs(1)),
+            true,
+            true,
+        )
+        .expect("verified full response budget");
+        assert_eq!(full_response_verified_direct, Duration::from_secs(5));
     }
 
     #[test]

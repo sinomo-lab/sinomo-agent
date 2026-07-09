@@ -2171,8 +2171,8 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         dfs_message_rpc_request(&namespace_command).expect("namespace message request");
     assert_eq!(namespace_request.route, DFS_DATA_NAMESPACE_ROUTE);
     assert!(
-        !namespace_request.uses_full_response_budget(),
-        "DFS namespace message RPCs should preserve normal route fallback budgets"
+        namespace_request.uses_full_response_budget(),
+        "DFS namespace message RPCs need the full verified final-hop response budget"
     );
     let mismatched_route_request = sinomo_core::network::ObjectRpcRequest::encode_body(
         DFS_DATA_WRITE_ROUTE,
