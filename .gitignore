@@ -4,6 +4,7 @@
 /tmp
 /benchmark-results
 /.codegraph/
+/_apalache-out/
 
 /.claude/settings.local.json
 /.claude/worktrees/
