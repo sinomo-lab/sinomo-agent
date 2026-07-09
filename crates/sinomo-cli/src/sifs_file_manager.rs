@@ -1601,6 +1601,12 @@ fn ensure_sifs_parent_directory_for_write(
     service: &mut NetworkedDfsService<DfsNodeTransport>,
     parent: &str,
 ) -> Result<(), String> {
+    if service
+        .posix_stat(parent)
+        .is_ok_and(|stat| stat.kind == DfsObjectKind::Directory)
+    {
+        return Ok(());
+    }
     match service.posix_stat_distributed(parent) {
         Ok(stat) if stat.kind == DfsObjectKind::Directory => Ok(()),
         Ok(stat) => Err(format!(
@@ -1747,6 +1753,44 @@ mod tests {
         writer.write_file(path, new).expect("write new payload");
 
         assert_eq!(reader.read_file(path).expect("read new payload"), new);
+    }
+
+    #[test]
+    fn sifs_write_parent_preflight_accepts_local_directory() {
+        let root = temp_sifs_data_dir("local-parent-preflight");
+        let data_dir = SinomoDataDir::new(&root);
+        let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
+        backend
+            .create_dir_all("/services/local-parent-preflight")
+            .expect("create parent");
+
+        let mut service = backend.lock_service().expect("service");
+        ensure_sifs_parent_directory_for_write(&mut service, "/services/local-parent-preflight")
+            .expect("local directory parent should not require distributed inspection");
+    }
+
+    #[test]
+    fn sifs_write_parent_preflight_rejects_local_file_parent() {
+        let root = temp_sifs_data_dir("local-file-parent-preflight");
+        let data_dir = SinomoDataDir::new(&root);
+        let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
+        backend
+            .write_file(
+                "/services/local-file-parent-preflight.txt",
+                b"not a directory",
+            )
+            .expect("create file");
+
+        let mut service = backend.lock_service().expect("service");
+        let error = ensure_sifs_parent_directory_for_write(
+            &mut service,
+            "/services/local-file-parent-preflight.txt",
+        )
+        .expect_err("file parent should be rejected locally");
+        assert!(
+            error.contains("parent is File"),
+            "unexpected parent preflight error: {error}"
+        );
     }
 
     #[test]
