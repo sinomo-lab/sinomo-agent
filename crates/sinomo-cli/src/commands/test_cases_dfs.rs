@@ -715,7 +715,7 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let write_started = Instant::now();
     let phase_timeout = timeout.min(Duration::from_secs(5));
     let next_phase_deadline = || std::cmp::min(Instant::now() + phase_timeout, deadline);
-    let mut split_app_failure = None;
+    let mut split_failures = Vec::new();
     if split_diagnostics {
         let create_parent_started = Instant::now();
         let create_parent_deadline = next_phase_deadline();
@@ -753,7 +753,7 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 ctx.record("app_read_ms", app_read_ms);
                 if app_read != payload {
                     ctx.record("app_read_bytes", app_read.len());
-                    split_app_failure = Some(format!(
+                    split_failures.push(format!(
                         "remote-shard app write on node {node} read back {} bytes, expected {}",
                         app_read.len(),
                         payload.len()
@@ -763,7 +763,7 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             Err(error) => {
                 let error = error.to_string();
                 ctx.record("app_write_error", &error);
-                split_app_failure = Some(error);
+                split_failures.push(error);
             }
         }
 
@@ -784,7 +784,9 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         ctx.record("known_parent_path", &path);
         ctx.record("known_parent_write_ms", known_parent_write_ms);
         if let Err(error) = known_parent_write_result {
-            ctx.record("known_parent_write_error", error.to_string());
+            let error = error.to_string();
+            ctx.record("known_parent_write_error", &error);
+            split_failures.push(error);
         }
 
         let deferred_write_started = Instant::now();
@@ -804,7 +806,9 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         ctx.record("deferred_path", &deferred_path);
         ctx.record("deferred_write_ms", deferred_write_ms);
         if let Err(error) = deferred_write_result {
-            ctx.record("deferred_write_error", error.to_string());
+            let error = error.to_string();
+            ctx.record("deferred_write_error", &error);
+            split_failures.push(error);
         }
 
         let publish_started = Instant::now();
@@ -839,7 +843,7 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     } else {
         path.as_str()
     };
-    if let Some(error) = split_app_failure {
+    if !split_failures.is_empty() {
         ctx.record("shard_id", &target.0);
         ctx.record("remote_primary_node_id", target.1.to_string());
         ctx.record("shard_epoch", target.3);
@@ -849,7 +853,10 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         ctx.record("operator_status_ms", status_ms);
         ctx.record("write_ms", write_ms);
         ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
-        return Ok(SinomoTestOutcome::failed(error));
+        return Ok(SinomoTestOutcome::failed(format!(
+            "remote-shard split diagnostics failed on node {node}: {}",
+            split_failures.join("; ")
+        )));
     }
     let read_started = Instant::now();
     let read = backend
@@ -1394,24 +1401,74 @@ fn run_concurrent_file_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let valid = [&writer_a, &writer_b];
     loop {
         let read = backend.read_file(&path).map_err(SinomoTestError::failed)?;
+        let read_class = classify_file_race_payload(&read, &seed, &writer_a, &writer_b);
         if valid
             .iter()
             .any(|candidate| candidate.as_slice() == read.as_slice())
         {
             ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
             ctx.record("final_bytes", read.len());
+            ctx.record("final_payload", read_class);
             return Ok(SinomoTestOutcome::passed(format!(
                 "concurrent file race on {node} ended with one complete payload at {path}"
             )));
         }
         if Instant::now() >= deadline {
             ctx.record("last_read_bytes", read.len());
+            ctx.record("last_read_payload", read_class);
+            ctx.record("last_read_profile", file_race_payload_profile(&read));
+            if let Ok(fresh_backend) = SifsFileManagerBackend::open(&data_dir)
+                && let Ok(fresh_read) = fresh_backend.read_file(&path)
+            {
+                ctx.record("fresh_read_bytes", fresh_read.len());
+                ctx.record(
+                    "fresh_read_payload",
+                    classify_file_race_payload(&fresh_read, &seed, &writer_a, &writer_b),
+                );
+                ctx.record("fresh_read_profile", file_race_payload_profile(&fresh_read));
+            }
             return Ok(SinomoTestOutcome::failed(format!(
                 "concurrent file race on {node} produced a non-serialized payload at {path}"
             )));
         }
         std::thread::sleep(EXPECT_POLL_INTERVAL);
     }
+}
+
+fn classify_file_race_payload(
+    read: &[u8],
+    seed: &[u8],
+    writer_a: &[u8],
+    writer_b: &[u8],
+) -> &'static str {
+    if read == seed {
+        "seed"
+    } else if read == writer_a {
+        "writer-a"
+    } else if read == writer_b {
+        "writer-b"
+    } else {
+        "mixed"
+    }
+}
+
+fn file_race_payload_profile(read: &[u8]) -> String {
+    let mut seed_bytes = 0usize;
+    let mut writer_a_bytes = 0usize;
+    let mut writer_b_bytes = 0usize;
+    let mut other_bytes = 0usize;
+    for byte in read {
+        match *byte {
+            b'A' => seed_bytes += 1,
+            b'B' => writer_a_bytes += 1,
+            b'C' => writer_b_bytes += 1,
+            _ => other_bytes += 1,
+        }
+    }
+    format!(
+        "A={seed_bytes},B={writer_a_bytes},C={writer_b_bytes},other={other_bytes},len={}",
+        read.len()
+    )
 }
 
 fn run_concurrent_dir_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {

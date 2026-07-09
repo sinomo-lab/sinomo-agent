@@ -826,12 +826,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let target_version = next_version(&object.version);
         let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
         let committed_locations = candidates.clone();
-        let detach_request = !options.wait_for_commit && !options.foreground_replica_repair;
-        let inline_remote_primary_write = match self.select_metadata_shard_for_object(&object) {
-            Ok(Some(shard)) => {
-                shard.primary_node_id != self.node_id
-                    && (bytes.len() as u64) <= crate::DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT
-            }
+        let remote_metadata_primary = match self.select_metadata_shard_for_object(&object) {
+            Ok(Some(shard)) => shard.primary_node_id != self.node_id,
             Ok(None) => false,
             Err(error) => {
                 if transient_create {
@@ -840,6 +836,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(error.into());
             }
         };
+        let detach_request = !options.wait_for_commit
+            && !options.foreground_replica_repair
+            && !remote_metadata_primary;
+        let inline_remote_primary_write = remote_metadata_primary
+            && (bytes.len() as u64) <= crate::DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT;
         let content_started = Instant::now();
         let manifest_result = if options.wait_for_commit {
             self.content.put_object_version_blob_only_durable(
@@ -880,6 +881,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 options.policy,
                 touch_parent_on_create,
                 options.foreground_replica_repair,
+                detach_request,
+                replay_response_journal,
             )
         } else {
             self.write_distributed_eventual_from_local_manifest_with_candidates_and_parent_touch(

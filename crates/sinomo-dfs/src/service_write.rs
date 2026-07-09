@@ -1325,6 +1325,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             policy,
             true,
             foreground_replica_repair,
+            false,
+            true,
         )
     }
 
@@ -1338,6 +1340,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         policy: DfsReplicationPolicy,
         touch_parent_on_create: bool,
         foreground_replica_repair: bool,
+        detach_remote_primary_request: bool,
+        replay_response_journal: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let object = self.current_object_for_write(&request.object_id)?;
         if !matches!(
@@ -1394,6 +1398,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     shard,
                     touch_parent_on_create,
                     foreground_replica_repair,
+                    detach_remote_primary_request,
+                    replay_response_journal,
                 );
             }
             Some(shard) => shard.epoch,
@@ -1642,11 +1648,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard: DfsMetadataShardConfig,
         touch_parent_on_create: bool,
         foreground_replica_repair: bool,
+        detach_request: bool,
+        replay_response_journal: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let request_id = self.next_request_id();
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
-        let metadata_journal_after_sequence =
-            self.metadata_journal_last_sequence_for_shard(&shard_id)?;
+        let metadata_journal_after_sequence = if !detach_request && replay_response_journal {
+            self.metadata_journal_last_sequence_for_shard(&shard_id)?
+        } else {
+            None
+        };
         let primary_node_id = shard.primary_node_id.clone();
         if request.requesting_node_id == self.node_id
             && desired_replica_nodes.contains(&self.node_id)
@@ -1671,10 +1682,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             touch_parent_on_create,
             foreground_replica_repair,
         };
-        let sent = self.send_dfs_message_if_routable(
-            &primary_node_id,
-            DfsNetworkMessage::DistributedWriteRequest(command.clone()),
-        )?;
+        let message = DfsNetworkMessage::DistributedWriteRequest(command.clone());
+        let sent = if detach_request {
+            self.send_dfs_message_if_routable_detached(&primary_node_id, message)?
+        } else {
+            self.send_dfs_message_if_routable(&primary_node_id, message)?
+        };
         if !sent {
             return Err(Self::metadata_primary_unroutable_error(
                 &shard,

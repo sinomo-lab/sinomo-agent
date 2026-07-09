@@ -373,6 +373,13 @@ run_remote_shard_dfs_probe() {
     --param "timeout-seconds=$EXPECT_TIMEOUT"
 }
 
+run_remote_shard_dfs_split_probe() {
+  local node="$1"
+  run_probe "$node" cluster.dfs.remote-shard-write \
+    --param "timeout-seconds=$EXPECT_TIMEOUT" \
+    --param split-diagnostics=true
+}
+
 assert_forwarded_endpoint_configured() {
   log "checking node1 manual forwarded endpoint config"
   compose exec -T node1 grep -F "host.docker.internal:$PUBLIC_PORT" /data/configs/cluster/endpoints.json
@@ -778,6 +785,9 @@ run_dfs_routed_status_probe node3
 run_remote_shard_dfs_probe node1
 run_remote_shard_dfs_probe node2
 run_remote_shard_dfs_probe node3
+run_remote_shard_dfs_split_probe node1
+run_remote_shard_dfs_split_probe node2
+run_remote_shard_dfs_split_probe node3
 assert_forwarded_endpoint_active
 run_concurrent_duplex_dfs_probe
 run_cross_segment_dfs

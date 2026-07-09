@@ -181,6 +181,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             command.policy,
                             touch_parent_on_create,
                             write_foreground_replica_repair,
+                            false,
+                            true,
                         )
                     }
                 }) {

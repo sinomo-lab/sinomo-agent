@@ -9863,8 +9863,6 @@ fn posix_remote_primary_deferred_small_write_inlines_payload() {
             },
         )
         .expect("pending routed write returns stat for existing object");
-    dfs.flush_detached_transport_sends()
-        .expect("no detached send should be queued");
 
     assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
     let command = captured_command
@@ -9879,6 +9877,10 @@ fn posix_remote_primary_deferred_small_write_inlines_payload() {
     );
     assert_eq!(command.content_size_bytes, None);
     assert_eq!(command.desired_replica_nodes, vec![writer, primary]);
+    assert!(
+        dfs.flush_detached_transport_sends().is_ok(),
+        "remote-primary POSIX writes must not leave detached sends behind"
+    );
     assert!(
         !command.foreground_replica_repair,
         "deferred publish must preserve nonforeground repair mode"
@@ -10226,20 +10228,82 @@ fn routed_inline_write_preserves_nonforeground_repair_mode() {
         },
         Some(object.version.clone()),
         b"routed-inline-nonforeground".to_vec(),
+        vec![writer.clone(), primary.clone()],
+        DfsReplicationPolicy::new(1, 2).expect("policy"),
+        object.clone(),
+        shard.clone(),
+        true,
+        false,
+        false,
+        true,
+    )
+    .expect("route inline nonforeground write");
+    dfs.route_distributed_write_to_metadata_primary(
+        DfsWriteRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            target_version: DfsVersion::from_legacy_named("version_routed_inline_no_replay")
+                .expect("version"),
+            requesting_node_id: writer.clone(),
+        },
+        Some(object.version.clone()),
+        b"routed-inline-no-replay".to_vec(),
+        vec![writer.clone(), primary.clone()],
+        DfsReplicationPolicy::new(1, 2).expect("policy"),
+        object.clone(),
+        shard.clone(),
+        true,
+        false,
+        false,
+        false,
+    )
+    .expect("route inline write without response journal");
+    dfs.route_distributed_write_to_metadata_primary(
+        DfsWriteRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            target_version: DfsVersion::from_legacy_named("version_routed_inline_detached")
+                .expect("version"),
+            requesting_node_id: writer.clone(),
+        },
+        Some(object.version.clone()),
+        b"routed-inline-detached".to_vec(),
         vec![writer, primary],
         DfsReplicationPolicy::new(1, 2).expect("policy"),
         object,
         shard,
         true,
         false,
+        true,
+        true,
     )
-    .expect("route inline nonforeground write");
+    .expect("route detached inline write");
+
+    assert_eq!(
+        captured_commands.lock().expect("capture").len(),
+        2,
+        "detached inline routed writes should not send synchronously"
+    );
+    dfs.flush_detached_transport_sends()
+        .expect("flush detached inline write");
 
     let commands = captured_commands.lock().expect("capture").clone();
-    assert_eq!(commands.len(), 1);
+    assert_eq!(commands.len(), 3);
     assert!(
         !commands[0].foreground_replica_repair,
         "inline routed writes must preserve nonforeground repair mode"
+    );
+    assert!(
+        commands[0].metadata_journal_after_sequence.is_some(),
+        "synchronous inline routed writes should request response journal replay"
+    );
+    assert!(
+        commands[1].metadata_journal_after_sequence.is_none(),
+        "synchronous inline routed writes may skip response journal replay"
+    );
+    assert!(
+        commands[2].metadata_journal_after_sequence.is_none(),
+        "detached inline routed writes should skip response journal replay"
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -32138,6 +32202,66 @@ fn sifs_replica_distributed_stat_prefers_primary_tombstone_over_stale_local_hit(
     );
 
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_replica_distributed_read_prefers_primary_over_stale_local_hit() {
+    let mut cluster = sifs_posix_cluster("sifs-replica-read-primary-current");
+    let path = "/users/read-stale-live.txt";
+    let old = b"writer-local stale payload should lose to primary current payload".to_vec();
+    let new = b"primary current payload must win the distributed read".to_vec();
+
+    sifs_cluster_routed_posix_write(&mut cluster, path, &old);
+    assert_eq!(
+        cluster
+            .writer
+            .posix_read_file(path)
+            .expect("writer old read"),
+        old
+    );
+
+    cluster
+        .primary
+        .posix_write_file(
+            path,
+            &new,
+            sifs_cluster_write_options(&cluster.primary_node.clone()),
+        )
+        .expect("primary overwrite");
+    assert_eq!(
+        cluster
+            .primary
+            .posix_read_file(path)
+            .expect("primary new read"),
+        new
+    );
+    assert_eq!(
+        cluster
+            .writer
+            .posix_read_file(path)
+            .expect("writer stale read"),
+        old,
+        "test setup must leave a stale local live entry on the writer"
+    );
+
+    let read = {
+        let primary = &mut cluster.primary;
+        let writer = &mut cluster.writer;
+        sifs_cluster_blocking_distributed_read_with_pump(
+            writer,
+            path,
+            "replica current read prefers primary object",
+            || {
+                primary.process_incoming().expect("primary pump");
+            },
+        )
+    };
+    assert_eq!(
+        read, new,
+        "distributed/current reads must prefer the shard primary over a stale replica-local hit"
+    );
+
+    std::fs::remove_dir_all(&cluster.root).ok();
 }
 
 #[test]

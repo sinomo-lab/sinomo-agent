@@ -248,8 +248,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .unwrap_or(0))
     }
 
-    /// Distributed path lookup with bounded mirror catch-up. Reads serve local
-    /// hits directly and use a read-only primary lookup for local misses.
+    /// Distributed path lookup with bounded mirror catch-up. Reads on a
+    /// non-primary shard route a read-only lookup to the metadata primary
+    /// before trusting a local replica hit, because the local replica may lag
+    /// journal publication after another writer advances the path.
     /// Nodes outside a shard's replica set only use the SyncPath fallback when
     /// the read-only lookup cannot answer, keeping ordinary cold reads from
     /// materializing metadata locally.
@@ -291,12 +293,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 break;
             };
-            if self.is_local_metadata_replica_for_shard(&shard)
-                && let Some(object) = local_object.as_ref()
-                && object.kind != DfsObjectKind::Tombstone
-            {
-                return Ok((resolved, local_object));
-            }
             if shard.primary_node_id != self.node_id {
                 match self.route_namespace_lookup_path_to_metadata_primary(
                     sifs_file_system_id(),
@@ -317,6 +313,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     Err(_) => {}
                 }
+            }
+            if self.is_local_metadata_replica_for_shard(&shard)
+                && let Some(object) = local_object.as_ref()
+                && object.kind != DfsObjectKind::Tombstone
+            {
+                return Ok((resolved, local_object));
             }
             if let Some(object) = local_object
                 && object.kind != DfsObjectKind::Tombstone
