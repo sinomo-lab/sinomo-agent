@@ -390,6 +390,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         for entry in &batch.entries {
             self.apply_metadata_journal_entry_to_service_state(entry)?;
         }
+        let cursor = self
+            .local_metadata_journal_cursors
+            .entry(batch.shard_id.clone())
+            .or_insert(0);
+        *cursor = (*cursor).max(batch.next_after_sequence);
         Ok(())
     }
 

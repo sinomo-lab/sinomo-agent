@@ -1527,7 +1527,7 @@ fn node_transport_transfer_profile_keeps_remote_sizing_network_neutral() {
 }
 
 #[test]
-fn routed_namespace_sync_uses_synced_path_object_without_draining_backlog() {
+fn routed_namespace_sync_drains_limited_response_backlog() {
     let writer = NodeId::from_legacy_named("node_routed_sync_writer").expect("writer");
     let primary = NodeId::from_legacy_named("node_routed_sync_primary").expect("primary");
     let file_system_id = sifs_file_system_id();
@@ -1646,17 +1646,27 @@ fn routed_namespace_sync_uses_synced_path_object_without_draining_backlog() {
             .expect("writer bootstrap object");
     }
     writer_service
-        .set_transport_operation_deadline(Some(Instant::now() + Duration::from_millis(80)));
-    writer_service
         .posix_mkdir_all("/services/routed-sync-backlog/new-dir")
-        .expect("routed mkdir should use synced path object without draining backlog");
-    writer_service.set_transport_operation_deadline(None);
+        .expect("routed mkdir should drain bounded response backlog");
 
     let calls = namespace_calls.lock().expect("namespace calls").clone();
     assert_eq!(
-        calls,
-        vec!["mkdir-all".to_string()],
-        "path-level sync metadata should avoid foreground replay of unrelated journal backlog"
+        calls.first().map(String::as_str),
+        Some("mkdir-all"),
+        "the mutating operation should be sent first"
+    );
+    assert!(
+        calls.iter().any(|call| call == "sync-path"),
+        "bounded response replay should continue with follow-up sync-path calls"
+    );
+    assert!(
+        writer_service
+            .posix_stat(&format!(
+                "/services/backlog-seed-{}.txt",
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT + 7
+            ))
+            .is_ok(),
+        "latest backlog entry should be visible after routed mkdir returns"
     );
 }
 
