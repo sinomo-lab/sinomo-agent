@@ -1,4 +1,6 @@
 use crate::cluster::{CLUSTER_HEALTH_PROBE_TIMEOUT, start_shadow_daemon_status_publisher};
+#[cfg(not(unix))]
+use crate::spawn_shadow_rollout_completion_helper_process;
 use crate::{
     CandidateMainDiagnostics, DaemonClusterStatus, DaemonError, DaemonLock, DaemonPaths,
     DaemonProbeStatus, DaemonStatus, daemon_connect_address, prepare_background_command,
@@ -1298,16 +1300,8 @@ pub fn run_shadow_daemon_supervision_loop(
         }
         #[cfg(not(unix))]
         {
-            let (child, _) = spawn_shadow_for_cluster_rollout(
-                &target,
-                &installed_main_binary,
-                &main_options.host,
-                main_options.port,
-                &options.host,
-                options.port,
-                &rollout_paths,
-            )?;
-            reap_detached_shadow_supervisor(child);
+            let _ = target;
+            spawn_shadow_rollout_completion_helper_process(&installed_main_binary)?;
         }
     }
 
