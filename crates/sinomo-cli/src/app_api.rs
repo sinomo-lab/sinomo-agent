@@ -22,14 +22,15 @@ use sinomo_agent::{
     AgentChannelMessage, AgentChannelMessageKind, AgentChannelParticipant, AgentChannelRuntime,
     AgentChannelRuntimeEvent, AgentChannelSource, AgentChannelSpeakDecision, AgentChannelStore,
     AgentChannelStoreError, AgentChannelTurn, AgentChannelTurnExecutor, AgentContextAttachment,
-    AgentDefinition, AgentItem, AgentModelEvent, AgentRuntimeControlHost,
-    AgentRuntimeControlRegistry, AgentRuntimeEvent, AgentRuntimeEventPayload, AgentSession,
-    AgentSessionControlResult, AgentSessionFollowUpRequest, AgentSessionInterruptRequest,
-    AgentSessionReattachState, AgentSessionResumeRequest, AgentSessionResumeResponse,
-    AgentSessionSteerRequest, AgentTaskLifecycleStatus, AgentTaskSnapshot, AgentToolProgressEvent,
-    ContextAssemblyReport, InteractionOutput, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore,
-    SkillCatalogSource, SkillCatalogStore, SkillCatalogWrite, TaskId, render_common_skill_markdown,
+    AgentDefinition, AgentEvent, AgentEventPayload, AgentItem, AgentModelEvent,
+    AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentRuntimeEvent,
+    AgentRuntimeEventPayload, AgentSession, AgentSessionControlResult, AgentSessionFollowUpRequest,
+    AgentSessionInterruptRequest, AgentSessionReattachState, AgentSessionRemoveQueuedInputRequest,
+    AgentSessionResumeRequest, AgentSessionResumeResponse, AgentSessionSteerRequest,
+    AgentTaskLifecycleStatus, AgentTaskSnapshot, AgentToolProgressEvent, ContextAssemblyReport,
+    InteractionOutput, InteractionSession, InteractionSurface, InteractionSurfaceKind,
+    SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore, SkillCatalogSource,
+    SkillCatalogStore, SkillCatalogWrite, TaskId, render_common_skill_markdown,
     safe_agent_channel_attachment_file_name,
 };
 use sinomo_lm::{
@@ -366,6 +367,29 @@ pub struct ChatControlStatus {
     pub task_count: usize,
     pub terminal_result_count: usize,
     pub tasks: Vec<ChatTaskSnapshot>,
+    /// The steering/follow-up message this control call queued, if any —
+    /// carries the queue id the UI needs to offer removal.
+    pub queued_input: Option<ChatQueuedTurnInput>,
+    /// The queue id this control call removed, if any.
+    pub removed_input_id: Option<String>,
+}
+
+/// Which session queue a pending turn input rides in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatQueuedTurnInputKind {
+    /// Consumed by the next model step of the running turn.
+    Steering,
+    /// Runs as a fresh user turn once the active one completes.
+    FollowUp,
+}
+
+/// A steering/follow-up message sitting in a session queue, not yet consumed.
+/// Queued items are visible and removable in the composer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatQueuedTurnInput {
+    pub input_id: String,
+    pub kind: ChatQueuedTurnInputKind,
+    pub message: String,
 }
 
 /// Snapshot of the live chat runtime's current control state.
@@ -385,6 +409,9 @@ pub struct ChatControlState {
     pub event_cursor_offset: usize,
     pub steering_count: usize,
     pub follow_up_count: usize,
+    /// Authoritative queue contents (ids + texts) from the session snapshot,
+    /// so clients can render removable pending chips.
+    pub queued_inputs: Vec<ChatQueuedTurnInput>,
     pub detail: Option<String>,
 }
 
@@ -1378,6 +1405,20 @@ impl AgentChat {
         Ok(chat_control_status(result))
     }
 
+    /// Remove a queued steering/follow-up message before the runtime consumes
+    /// it (queued items are visible and removable).
+    pub fn remove_queued_input(&self, input_id: TaskId) -> Result<ChatControlStatus, CliError> {
+        let session_id = self.runtime.session().session_id.clone();
+        let result = self
+            .runtime_control_registry()
+            .remove_queued_input(AgentSessionRemoveQueuedInputRequest {
+                session_id,
+                input_id,
+            })
+            .map_err(agent_control_cli_error)?;
+        Ok(chat_control_status(result))
+    }
+
     /// Request interruption of the active agent turn.
     pub fn interrupt(&self, reason: impl Into<String>) -> Result<ChatControlStatus, CliError> {
         let session_id = self.runtime.session().session_id.clone();
@@ -1980,7 +2021,60 @@ fn chat_control_status(result: AgentSessionControlResult) -> ChatControlStatus {
             .iter()
             .map(chat_task_snapshot)
             .collect(),
+        queued_input: chat_queued_input_from_events(&result.events),
+        removed_input_id: chat_removed_input_id_from_events(&result.events),
     }
+}
+
+/// Extract the steering/follow-up input a control call queued, if any.
+pub fn chat_queued_input_from_events(events: &[AgentEvent]) -> Option<ChatQueuedTurnInput> {
+    events.iter().find_map(|event| match &event.payload {
+        AgentEventPayload::SteeringQueued { steering } => Some(ChatQueuedTurnInput {
+            input_id: steering.steering_id.to_string(),
+            kind: ChatQueuedTurnInputKind::Steering,
+            message: steering.message.clone(),
+        }),
+        AgentEventPayload::FollowUpQueued { follow_up } => Some(ChatQueuedTurnInput {
+            input_id: follow_up.follow_up_id.to_string(),
+            kind: ChatQueuedTurnInputKind::FollowUp,
+            message: follow_up.message.clone(),
+        }),
+        _ => None,
+    })
+}
+
+/// Extract the queue id a control call removed, if any.
+pub fn chat_removed_input_id_from_events(events: &[AgentEvent]) -> Option<String> {
+    events.iter().find_map(|event| match &event.payload {
+        AgentEventPayload::SteeringRemoved { steering } => Some(steering.steering_id.to_string()),
+        AgentEventPayload::FollowUpRemoved { follow_up } => {
+            Some(follow_up.follow_up_id.to_string())
+        }
+        _ => None,
+    })
+}
+
+/// Mirror a session's pending queues (steering first — it is consumed sooner).
+pub fn chat_queued_inputs_from_session(session: &AgentSession) -> Vec<ChatQueuedTurnInput> {
+    session
+        .steering_queue
+        .iter()
+        .map(|steering| ChatQueuedTurnInput {
+            input_id: steering.steering_id.to_string(),
+            kind: ChatQueuedTurnInputKind::Steering,
+            message: steering.message.clone(),
+        })
+        .chain(
+            session
+                .follow_up_queue
+                .iter()
+                .map(|follow_up| ChatQueuedTurnInput {
+                    input_id: follow_up.follow_up_id.to_string(),
+                    kind: ChatQueuedTurnInputKind::FollowUp,
+                    message: follow_up.message.clone(),
+                }),
+        )
+        .collect()
 }
 
 fn chat_control_state(response: AgentSessionResumeResponse) -> ChatControlState {
@@ -2000,6 +2094,11 @@ fn chat_control_state(response: AgentSessionResumeResponse) -> ChatControlState 
         .as_ref()
         .map(|session| (session.steering_queue.len(), session.follow_up_queue.len()))
         .unwrap_or((0, 0));
+    let queued_inputs = response
+        .session
+        .as_ref()
+        .map(chat_queued_inputs_from_session)
+        .unwrap_or_default();
     ChatControlState {
         session_id: response.session_id.to_string(),
         accepted: response.accepted,
@@ -2019,6 +2118,7 @@ fn chat_control_state(response: AgentSessionResumeResponse) -> ChatControlState 
         event_cursor_offset: response.event_cursor.offset,
         steering_count,
         follow_up_count,
+        queued_inputs,
         detail: response.detail,
     }
 }
@@ -3065,8 +3165,32 @@ fn parse_chat_tool_runtime_node_id(value: &str) -> Result<NodeId, CliError> {
 
 /// All agents available for selection (stored definitions first, else built-ins).
 pub fn agent_summaries(data_dir: &SinomoDataDir) -> Vec<AgentSummary> {
-    let catalog =
-        AgentCatalog::load_from_data_dir(data_dir).unwrap_or_else(|_| AgentCatalog::built_ins());
+    agent_summaries_with_error(data_dir).0
+}
+
+/// Like [`agent_summaries`], but also reports the catalog-load error (if any) that
+/// forced the fallback to built-ins. The stored catalog lives in SIFS, so this can
+/// be slow or fail while the distributed file system is unhealthy — callers off the
+/// UI thread use the error to surface a degraded-state notice.
+pub fn agent_summaries_with_error(
+    data_dir: &SinomoDataDir,
+) -> (Vec<AgentSummary>, Option<String>) {
+    match AgentCatalog::load_from_data_dir(data_dir) {
+        Ok(catalog) => (agent_catalog_summaries(&catalog), None),
+        Err(error) => (
+            agent_catalog_summaries(&AgentCatalog::built_ins()),
+            Some(error.to_string()),
+        ),
+    }
+}
+
+/// Summaries for the built-in agent catalog only. Does no data-dir or SIFS I/O, so
+/// it is safe on startup paths that must not block on the distributed file system.
+pub fn built_in_agent_summaries() -> Vec<AgentSummary> {
+    agent_catalog_summaries(&AgentCatalog::built_ins())
+}
+
+fn agent_catalog_summaries(catalog: &AgentCatalog) -> Vec<AgentSummary> {
     catalog
         .list()
         .map(|definition| AgentSummary {

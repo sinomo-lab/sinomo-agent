@@ -20,6 +20,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
+use std::time::Duration;
 
 use serde_json::Value;
 use sinomo_agent::{AgentDefinition, AgentOutputFormat, AgentPackageDefinition, AgentRole};
@@ -40,7 +41,7 @@ use sinomo_runtime::local::SinomoDataDir;
 use crate::backend::Backend;
 use crate::backend::agents::{
     AgentConfigSnapshot, AgentConfigSummary, agent_definition_is_editable, agent_role_label,
-    agent_source_label,
+    agent_source_label, built_in_agent_config_snapshot,
 };
 use crate::backend::cluster::{AppClusterInvite, AppClusterStatus};
 use crate::backend::config::{
@@ -57,6 +58,11 @@ use crate::state::{Shared, Tab};
 use crate::theme::{AppThemeMode, Palette};
 use crate::ui::widgets;
 use sinomo_runtime::module::{ModuleRuntimeConfigSource, resolve_module_runtime_config};
+
+/// Budget for each SIFS-backed section (skills, stored agents) of the full settings
+/// snapshot; past this the section reports itself unavailable instead of wedging the
+/// preload while the distributed file system is unhealthy.
+const SETTINGS_SIFS_LOAD_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Below this content width the tab collapses to a single drill-down column.
 const WIDE_THRESHOLD: f32 = 700.0;
@@ -385,6 +391,15 @@ impl AgentForm {
 
 impl SettingsState {
     pub fn new(backend: &Backend) -> Self {
+        Self::new_with_sifs_timeout(backend, SETTINGS_SIFS_LOAD_TIMEOUT)
+    }
+
+    /// Full settings snapshot with a bound on the SIFS-backed sections (skills and
+    /// the stored agent catalog). When the distributed file system is unhealthy those
+    /// loads can grind through multi-second network timeouts; past `sifs_timeout`
+    /// each affected section reports itself unavailable instead of wedging the whole
+    /// snapshot — cluster status, connection info, and config stay usable.
+    pub(crate) fn new_with_sifs_timeout(backend: &Backend, sifs_timeout: Duration) -> Self {
         let config = backend.config.clone();
         let (config_items, config_error) = match config.catalog(None) {
             Ok(_) => (resolve_items(config.as_ref()), None),
@@ -393,9 +408,28 @@ impl SettingsState {
         let provider_forms = provider_forms(config.as_ref());
         let data_dir = backend.data_dir.clone();
         let skills_include_all = true;
+        let skills_data_dir = data_dir.clone();
         let (skills, skill_selected, skill_detail, skill_action_error) =
-            load_initial_skill_state(data_dir.as_ref(), skills_include_all);
-        let agent_snapshot = backend.agent_config_snapshot(None);
+            match crate::backend::run_with_timeout("skill-catalog", sifs_timeout, move || {
+                load_initial_skill_state(skills_data_dir.as_ref(), skills_include_all)
+            }) {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::warn!(%error, "settings skill catalog load degraded");
+                    (Vec::new(), None, None, Some(error))
+                }
+            };
+        let agent_backend = backend.clone();
+        let agent_snapshot =
+            match crate::backend::run_with_timeout("agent-catalog", sifs_timeout, move || {
+                agent_backend.agent_config_snapshot(None)
+            }) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(%error, "settings agent catalog load degraded");
+                    built_in_agent_config_snapshot(None, Some(error))
+                }
+            };
         let agent_selected_id = agent_snapshot
             .selected_agent
             .as_ref()
@@ -6967,6 +7001,43 @@ mod tests {
             .iter()
             .position(|item| item.edit_kind != ConfigEditKind::Bool)?;
         Some((state, idx))
+    }
+
+    #[test]
+    fn settings_snapshot_degrades_sifs_sections_instead_of_wedging() {
+        let backend = Backend::local_fallback();
+        // A zero budget stands in for SIFS loads wedged behind distributed
+        // timeouts: both SIFS-backed sections must degrade with an error while
+        // the rest of the snapshot (connection, cluster, config) stays usable.
+        let state = SettingsState::new_with_sifs_timeout(&backend, Duration::ZERO);
+
+        let skill_error = state
+            .skill_action_error
+            .as_deref()
+            .expect("skills section should report the degraded load");
+        assert!(
+            skill_error.contains("skill-catalog timed out"),
+            "unexpected skills error: {skill_error}"
+        );
+
+        let agent_error = state
+            .agent_snapshot
+            .error
+            .as_deref()
+            .expect("agents section should report the degraded load");
+        assert!(
+            agent_error.contains("agent-catalog timed out"),
+            "unexpected agents error: {agent_error}"
+        );
+        assert!(
+            !state.agent_snapshot.agents.is_empty(),
+            "agents section should fall back to built-ins"
+        );
+
+        assert!(
+            !state.mode_label.is_empty() && !state.node_id.is_empty(),
+            "connection details must stay available in the degraded snapshot"
+        );
     }
 
     fn provider_section_signature_for_state(settings: &SettingsState) -> String {

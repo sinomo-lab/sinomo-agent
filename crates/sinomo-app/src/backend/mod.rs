@@ -163,7 +163,7 @@ impl Backend {
 
         let connection =
             ensure_app_cluster(connection, &paths, data_dir.as_ref(), &node, &progress);
-        progress("Loading workspace…");
+        progress("Preparing configuration…");
         let config = build_config_client(&connection, &data_dir, app_runtime.handle());
 
         Backend {
@@ -289,6 +289,37 @@ impl Backend {
     /// Whether the runtime is healthy enough to talk to.
     pub fn is_online(&self) -> bool {
         true
+    }
+}
+
+/// Run `work` on a detached named thread and wait up to `timeout` for its result.
+///
+/// On timeout the worker keeps running in the background and its late result is
+/// discarded; the caller gets an `Err` describing the timeout. This bounds
+/// SIFS/DFS-backed loads so an unhealthy distributed file system degrades the
+/// affected surface instead of wedging it (the app must stay usable — cluster
+/// status and settings in particular — while DFS is down).
+pub(crate) fn run_with_timeout<T: Send + 'static>(
+    label: &'static str,
+    timeout: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name(format!("sinomo-app-timed-{label}"))
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .map_err(|error| format!("{label}: failed to spawn worker: {error}"))?;
+    match rx.recv_timeout(timeout) {
+        Ok(value) => Ok(value),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "{label} timed out after {}s; the distributed file system (SIFS) may be unavailable",
+            timeout.as_secs()
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(format!(
+            "{label}: worker exited before returning a result"
+        )),
     }
 }
 
@@ -488,6 +519,35 @@ mod tests {
     use super::*;
     use sinomo_runtime::node::NodeRole;
     use sinomo_runtime::service::ServiceRegistry;
+
+    #[test]
+    fn run_with_timeout_returns_result_within_budget() {
+        let value = run_with_timeout("fast-load", Duration::from_secs(10), || 42)
+            .expect("fast work completes");
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn run_with_timeout_reports_timeout_and_discards_late_result() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let error = run_with_timeout("wedged-load", Duration::from_millis(50), move || {
+            // Simulate a SIFS load stuck behind distributed timeouts until released.
+            let _ = release_rx.recv();
+            "late result"
+        })
+        .expect_err("wedged work should time out");
+
+        assert!(
+            error.contains("wedged-load timed out after 0s"),
+            "unexpected timeout message: {error}"
+        );
+        assert!(
+            error.contains("SIFS"),
+            "timeout message should point at the distributed file system: {error}"
+        );
+        // Unblock the detached worker; its late result must be discarded harmlessly.
+        let _ = release_tx.send(());
+    }
 
     #[test]
     fn test_local_fallback_uses_temp_data_dir_and_cleans_up() {

@@ -2127,7 +2127,7 @@ fn try_fetch_daemon_cluster_health_rows() -> Result<Option<Vec<ClusterHealthRow>
     };
     Ok(client
         .with_timeout(CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT)
-        .cluster_health()
+        .cluster_health_with_peer_views()
         .ok())
 }
 
@@ -2673,6 +2673,26 @@ fn prepare_local_cluster_state_for_cli(
 
 pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Result<(), CliError> {
     let Some(status) = default_main_daemon_status()? else {
+        return refresh_cluster_kv_from_reachable_voters(paths);
+    };
+    match daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {
+        Ok(snapshot) => {
+            write_imported_cluster_kv_snapshot(paths, &snapshot)?;
+            Ok(())
+        }
+        Err(_) => refresh_cluster_kv_from_reachable_voters(paths),
+    }
+}
+
+/// Like [`refresh_cluster_kv_from_local_daemon`], but probes the daemon that
+/// owns `data_dir` instead of the env/home default. A caller operating on a
+/// foreign data directory must never import another cluster's KV snapshot
+/// (and, transitively, its peer targets) into its own paths.
+pub(crate) fn refresh_cluster_kv_from_local_daemon_for_data_dir(
+    data_dir: &SinomoDataDir,
+    paths: &ClusterPaths,
+) -> Result<(), CliError> {
+    let Some(status) = main_daemon_status_for_data_dir(data_dir)? else {
         return refresh_cluster_kv_from_reachable_voters(paths);
     };
     match daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {

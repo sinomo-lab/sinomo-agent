@@ -197,7 +197,11 @@ pub fn spawn_shadow_rollout_recovery_helper_process() -> Result<(), DaemonError>
         path: "current executable".to_string(),
         detail: source.to_string(),
     })?;
-    spawn_detached_no_inherit(&exe, SHADOW_ROLLOUT_RECOVERY_HELPER_ARGS)
+    spawn_shadow_rollout_completion_helper_process(&exe)
+}
+
+pub fn spawn_shadow_rollout_completion_helper_process(binary: &Path) -> Result<(), DaemonError> {
+    spawn_detached_no_inherit(binary, SHADOW_ROLLOUT_RECOVERY_HELPER_ARGS)
 }
 
 #[cfg(not(windows))]

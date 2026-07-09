@@ -26718,6 +26718,217 @@ fn sifs_cluster_posix_contract_stale_cache_current_read_invalidation() {
 }
 
 #[test]
+fn sharded_lazy_reader_sees_sibling_visible_overwrite() {
+    let root = temp_root("sifs-sharded-lazy-reader-current");
+    let node = NodeId::from_legacy_named("node_sifs_sharded_lazy_reader").expect("node");
+    let shards = sifs_two_primary_shard_configs(&node, &node, 1, Vec::new(), Vec::new());
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(node.clone())))
+            .expect("sifs filesystem config");
+        for shard in &shards {
+            control.put_metadata_shard(shard).expect("metadata shard");
+        }
+    });
+    let network = InProcessNetwork::new();
+    let content_root = root.join("content");
+    let metadata_root = root.join("metadata");
+    let mut writer = NetworkedDfsService::new(
+        network.add_node(node.clone()),
+        LocalContentStore::new(&content_root).expect("writer content"),
+    )
+    .with_control_plane(shared_kv.clone())
+    .with_metadata_backend_lazy(
+        open_local_sharded_metadata_backend(&metadata_root, shards.clone())
+            .expect("writer metadata"),
+    )
+    .expect("writer metadata backend");
+    writer
+        .bootstrap_distributed_sifs()
+        .expect("writer bootstrap");
+
+    let path = "/services/current-read-refresh.txt";
+    let old = b"old sharded lazy reader payload".to_vec();
+    let new = b"new sharded lazy reader payload".to_vec();
+    writer
+        .posix_write_file(
+            path,
+            &old,
+            DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+        )
+        .expect("initial write");
+
+    let mut reader = NetworkedDfsService::new(
+        network.add_node(node.clone()),
+        LocalContentStore::new(&content_root).expect("reader content"),
+    )
+    .with_control_plane(shared_kv)
+    .with_metadata_backend_lazy(
+        open_local_sharded_metadata_backend(&metadata_root, shards).expect("reader metadata"),
+    )
+    .expect("reader metadata backend");
+    reader
+        .bootstrap_distributed_sifs()
+        .expect("reader bootstrap");
+    assert_eq!(
+        reader
+            .posix_read_file_distributed(path)
+            .expect("reader old payload"),
+        old
+    );
+
+    writer
+        .posix_write_file(
+            path,
+            &new,
+            DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+        )
+        .expect("overwrite");
+
+    assert_eq!(
+        reader
+            .posix_read_file_distributed(path)
+            .expect("reader current payload"),
+        new
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sharded_lazy_reader_refreshes_after_remote_primary_overwrite() {
+    let root = temp_root("sifs-sharded-lazy-reader-remote-primary");
+    let primary_node = NodeId::from_legacy_named("node_sifs_lazy_remote_primary").expect("primary");
+    let writer_node = NodeId::from_legacy_named("node_sifs_lazy_remote_writer").expect("writer");
+    let shards = sifs_two_primary_shard_configs(
+        &primary_node,
+        &primary_node,
+        1,
+        vec![writer_node.clone()],
+        vec![writer_node.clone()],
+    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                primary_node.clone(),
+            )))
+            .expect("sifs filesystem config");
+        for shard in &shards {
+            control.put_metadata_shard(shard).expect("metadata shard");
+        }
+    });
+    let network = InProcessNetwork::new();
+    let primary_root = root.join("primary");
+    let writer_root = root.join("writer");
+    let mut primary = NetworkedDfsService::new(
+        network.add_node(primary_node.clone()),
+        LocalContentStore::new(primary_root.join("content")).expect("primary content"),
+    )
+    .with_control_plane(shared_kv.clone())
+    .with_metadata_backend_lazy(
+        open_local_sharded_metadata_backend(primary_root.join("metadata"), shards.clone())
+            .expect("primary metadata"),
+    )
+    .expect("primary metadata backend");
+    let mut writer = NetworkedDfsService::new(
+        network.add_node(writer_node.clone()),
+        LocalContentStore::new(writer_root.join("content")).expect("writer content"),
+    )
+    .with_control_plane(shared_kv.clone())
+    .with_metadata_backend_lazy(
+        open_local_sharded_metadata_backend(writer_root.join("metadata"), shards.clone())
+            .expect("writer metadata"),
+    )
+    .expect("writer metadata backend");
+    primary
+        .bootstrap_distributed_sifs()
+        .expect("primary bootstrap");
+
+    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    loop {
+        primary
+            .replicate_configured_metadata_shards(&sifs_file_system_id())
+            .expect("primary publish");
+        primary.process_incoming().expect("primary pump");
+        writer.process_incoming().expect("writer pump");
+        if writer.posix_stat(SIFS_SERVICES_PATH).is_ok() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("writer did not learn SIFS services namespace");
+        }
+        std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+    }
+    writer
+        .bootstrap_distributed_sifs()
+        .expect("writer bootstrap");
+
+    let stop_primary = Arc::new(AtomicBool::new(false));
+    let primary_stop = Arc::clone(&stop_primary);
+    let primary_thread = std::thread::spawn(move || {
+        let mut primary = primary;
+        while !primary_stop.load(Ordering::SeqCst) {
+            primary.process_incoming().expect("primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        primary
+    });
+
+    let path = "/services/current-read-remote-primary.txt";
+    let old = b"old remote primary reader payload".to_vec();
+    let new = b"new remote primary reader payload".to_vec();
+    writer
+        .posix_write_file(
+            path,
+            &old,
+            DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
+        )
+        .expect("initial remote-primary write");
+
+    let mut reader = NetworkedDfsService::new(
+        network.add_node(writer_node.clone()),
+        LocalContentStore::new(writer_root.join("content")).expect("reader content"),
+    )
+    .with_control_plane(shared_kv)
+    .with_metadata_backend_lazy(
+        open_local_sharded_metadata_backend(writer_root.join("metadata"), shards)
+            .expect("reader metadata"),
+    )
+    .expect("reader metadata backend");
+    reader
+        .bootstrap_distributed_sifs()
+        .expect("reader bootstrap");
+    assert_eq!(
+        reader
+            .posix_read_file_distributed(path)
+            .expect("reader old payload"),
+        old
+    );
+
+    writer
+        .posix_write_file(
+            path,
+            &new,
+            DfsWriteOptions::replicated_eventual(vec![writer_node]),
+        )
+        .expect("remote-primary overwrite");
+
+    assert_eq!(
+        reader
+            .posix_read_file_distributed(path)
+            .expect("reader current payload"),
+        new
+    );
+
+    stop_primary.store(true, Ordering::SeqCst);
+    primary_thread.join().expect("primary thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn sifs_cluster_posix_contract_damaged_replica_under_concurrent_reads() {
     let mut cluster = sifs_posix_cluster("sifs-contract-damaged-replica");
     let scenario = "damaged-replica-under-concurrent-reads";

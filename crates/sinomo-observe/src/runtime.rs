@@ -31,6 +31,12 @@ pub struct ObserveRuntimeConfig {
 
 impl ObserveRuntimeConfig {
     pub fn daemon(label: impl Into<String>, node_id: Option<String>) -> Self {
+        Self::process(label, node_id)
+    }
+
+    /// Config for any Sinomo process role (daemon, graphical app, tooling), with the
+    /// filter taken from `SINOMO_OBSERVE_FILTER` when set.
+    pub fn process(label: impl Into<String>, node_id: Option<String>) -> Self {
         let configured_filter = std::env::var("SINOMO_OBSERVE_FILTER")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -205,6 +211,36 @@ pub fn register_observe_metric_exporter(
 }
 
 pub fn init_observe_runtime(config: ObserveRuntimeConfig) -> Result<(), ObserveError> {
+    init_observe_runtime_inner(config, None)
+}
+
+/// Initialize the observe runtime with formatted trace output additionally copied to
+/// `log_file` (created/appended, ANSI disabled). Graphical processes use this: they
+/// have no supervised stdout, so without a file sink their diagnostics are lost.
+pub fn init_observe_runtime_with_log_file(
+    config: ObserveRuntimeConfig,
+    log_file: &std::path::Path,
+) -> Result<(), ObserveError> {
+    if OBSERVE_RUNTIME.get().is_some() {
+        return Ok(());
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file)
+        .map_err(|source| ObserveError::Runtime {
+            detail: format!(
+                "failed to open observe log file {}: {source}",
+                log_file.display()
+            ),
+        })?;
+    init_observe_runtime_inner(config, Some(Arc::new(file)))
+}
+
+fn init_observe_runtime_inner(
+    config: ObserveRuntimeConfig,
+    log_file: Option<Arc<std::fs::File>>,
+) -> Result<(), ObserveError> {
     if OBSERVE_RUNTIME.get().is_some() {
         return Ok(());
     }
@@ -235,10 +271,17 @@ pub fn init_observe_runtime(config: ObserveRuntimeConfig) -> Result<(), ObserveE
     let _ = metrics::set_global_recorder(Arc::clone(&metrics));
     let _ = OBSERVE_RUNTIME.set(runtime);
 
+    let file_layer = log_file.map(|file| {
+        fmt::layer()
+            .with_target(true)
+            .with_ansi(false)
+            .with_writer(file)
+    });
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(ObserveTraceLayer { traces })
         .with(fmt::layer().with_target(true))
+        .with(file_layer)
         .try_init()
         .map_err(|source| ObserveError::Runtime {
             detail: format!("failed to initialize observe tracing subscriber: {source}"),

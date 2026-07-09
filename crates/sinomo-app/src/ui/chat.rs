@@ -28,11 +28,13 @@
 //!   the worker each frame, applies events to `ChatState`, and re-requests an
 //!   animation frame — the same wiring the old `ChatView::pump` had.
 //!
-//! The agents/chats sidebar and the composer's provider/model/effort
-//! selectors are stock widgets. The model `Select` (and the effort selector's
-//! visibility) depend on the current provider + fetched model list, which change
-//! at runtime, so the composer row is wrapped in a [`RebuildOnChange`] keyed on
-//! a small signature of the selection state.
+//! The agents/chats sidebar and the composer are stock widgets. The composer
+//! follows the Mesh design language: one field surface ([`ComposerFieldFrame`])
+//! holding queued-steering chips, attachment chips, the borderless message
+//! `TextArea` and the action bar (attach · voice · model/context/activity ·
+//! Send-becomes-Stop). Each region is wrapped in a [`RebuildOnChange`] keyed on
+//! a small signature of the state it renders; the provider/model/effort
+//! `Select`s live in the model popup above the field.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -72,9 +74,10 @@ use sinomo_agent::{
 use sinomo_cli::app_api::{
     AgentChannelMessagePage, AgentChannelTimelineOverview, AgentChannelTimelineSegment,
     AgentChatSifsStorage, AgentSummary, ChatAttachmentInput, ChatContextSnapshot,
-    ChatHistoryMessage, ChatProcessSnapshot, ChatTaskSnapshot, ChatToolCallSnapshot,
-    ChatToolRuntimeSelection, ChatUsageSnapshot, ProviderSummary, SifsAgentChannelStore,
-    agent_summaries, reasoning_efforts,
+    ChatHistoryMessage, ChatProcessSnapshot, ChatQueuedTurnInput, ChatQueuedTurnInputKind,
+    ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection, ChatUsageSnapshot,
+    ProviderSummary, SifsAgentChannelStore, agent_summaries, agent_summaries_with_error,
+    built_in_agent_summaries, reasoning_efforts,
 };
 use sinomo_runtime::{config::ConfigClient, events::SessionId, local::SinomoDataDir};
 
@@ -100,23 +103,36 @@ const SIDEBAR_ROW_EDIT_W: f32 = 26.0;
 const SIDEBAR_ROW_EDIT_H: f32 = 24.0;
 const SIDEBAR_ROW_EDIT_GAP: f32 = 8.0;
 const SELECTOR_H: f32 = 30.0;
-const CONTROL_ROW_H: f32 = 34.0;
-const CONTROL_ROW_GAP: f32 = 8.0;
 const COMPOSER_POPUP_H: f32 = 132.0;
 const ATTACHMENT_ENTRY_H: f32 = 30.0;
 const ATTACHMENT_CHIPS_H: f32 = 22.0;
-const COMPOSER_ATTACHMENT_CHIP_W: f32 = 136.0;
 const COMPOSER_PAD_Y: f32 = 12.0;
 const COMPOSER_SECTION_GAP: f32 = 10.0;
-const INPUT_ACTION_GAP: f32 = 10.0;
-const SEND_BUTTON_SIZE: f32 = 40.0;
-const COMPOSER_DEFAULT_ACTION_W: f32 = SEND_BUTTON_SIZE * 2.0 + 6.0;
-const COMPOSER_REUSE_ACTION_W: f32 = 166.0;
+/// Mesh `--sm-r-3`: the composer field surface radius.
+const COMPOSER_FIELD_RADIUS: f32 = 10.0;
+/// Mesh focus-within halo: `box-shadow: 0 0 0 3px var(--sm-accent-soft)`.
+const COMPOSER_FOCUS_RING_W: f32 = 3.0;
+/// Chip rows inside the field ride `padding: 8px 10px 0` (`.sm-ctx-row`, `.sm-composer-queue`).
+const COMPOSER_CHIP_ROW_PAD_X: f32 = 10.0;
+const COMPOSER_CHIP_ROW_PAD_TOP: f32 = 8.0;
+/// The action bar's `padding: 6px 8px` and control gap (`.sm-composer-bar`).
+const COMPOSER_BAR_PAD_X: f32 = 8.0;
+const COMPOSER_BAR_PAD_Y: f32 = 6.0;
+const COMPOSER_BAR_GAP: f32 = 4.0;
+/// Quiet bar controls are compact; Send is the one primary action and reads larger.
+const COMPOSER_GHOST_BUTTON_SIZE: f32 = 28.0;
+const SEND_BUTTON_SIZE: f32 = 36.0;
 const COMPOSER_INPUT_MIN_LINES: usize = 2;
-const COMPOSER_INPUT_MAX_H: f32 = 400.0;
-const COMPOSER_INPUT_PAD_Y: f32 = 18.0;
+/// The docked composer input grows to 160px, then scrolls (Mesh layout spec).
+const COMPOSER_INPUT_MAX_H: f32 = 160.0;
+const COMPOSER_INPUT_PAD_Y: f32 = 14.0;
+/// Below this composer width the keyboard hint in the action bar folds away.
+const COMPOSER_HINT_MIN_W: f32 = 560.0;
 const SESSION_LIST_UI_TIMEOUT: Duration = Duration::from_secs(8);
 const TRANSCRIPT_LOAD_UI_TIMEOUT: Duration = Duration::from_secs(8);
+/// Budget for the background SIFS-backed agent-catalog load; past this the app
+/// keeps the built-in agents and reports the catalog as degraded.
+const AGENT_CATALOG_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 const TOOL_CHAIN_COLLAPSE_AFTER: usize = 1;
 const TOOL_DETAIL_COLLAPSE_CHARS: usize = 420;
 const TOOL_DETAIL_PREVIEW_CHARS: usize = 220;
@@ -659,6 +675,55 @@ enum ComposerPopup {
     Activity,
 }
 
+/// How a mid-run composer submit rides into the active turn (Mesh: "steer, don't just stop").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueuedTurnKind {
+    /// Consumed by the next model step of the running turn.
+    Steer,
+    /// Runs as a fresh user turn once the active one completes.
+    FollowUp,
+}
+
+impl QueuedTurnKind {
+    fn label(self) -> &'static str {
+        match self {
+            QueuedTurnKind::Steer => "steer",
+            QueuedTurnKind::FollowUp => "follow-up",
+        }
+    }
+}
+
+impl From<ChatQueuedTurnInputKind> for QueuedTurnKind {
+    fn from(kind: ChatQueuedTurnInputKind) -> Self {
+        match kind {
+            ChatQueuedTurnInputKind::Steering => QueuedTurnKind::Steer,
+            ChatQueuedTurnInputKind::FollowUp => QueuedTurnKind::FollowUp,
+        }
+    }
+}
+
+/// A message queued into the active turn and not yet consumed by the runtime.
+/// Rendered as pending chips above the input; the transcript echo is the
+/// durable record, the chip is the "I already told it" status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QueuedTurnInput {
+    kind: QueuedTurnKind,
+    text: String,
+    /// The runtime queue id, once a control status confirms it. Removal keys
+    /// on the id, so the chip's remove affordance appears when this lands.
+    input_id: Option<String>,
+}
+
+impl From<&ChatQueuedTurnInput> for QueuedTurnInput {
+    fn from(queued: &ChatQueuedTurnInput) -> Self {
+        QueuedTurnInput {
+            kind: queued.kind.into(),
+            text: queued.message.clone(),
+            input_id: Some(queued.input_id.clone()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct ConversationTimelineState {
     total_messages: u64,
@@ -836,6 +901,9 @@ pub struct ChatState {
     attachment_path_input: String,
     attachment_controls_open: bool,
     attachments: Vec<PendingChatAttachment>,
+    /// Steering/follow-up messages queued into the active turn from this
+    /// composer and not yet consumed by the runtime (pending chips).
+    queued_turn_inputs: Vec<QueuedTurnInput>,
     pub streaming: bool,
     pub notice: Option<String>,
     pub context: Option<ChatContextSnapshot>,
@@ -878,6 +946,8 @@ pub struct ChatState {
     transcript_load_started_at: Option<Instant>,
     transcript_load_slow_notice_shown: bool,
     provider_list_rx: Option<Receiver<ProviderListWorkerResult>>,
+    agent_list_rx: Option<Receiver<AgentListWorkerResult>>,
+    agents_loading: bool,
     session_list_rx: Option<Receiver<SessionListWorkerResult>>,
     session_list_loading: bool,
     session_list_started_at: Option<Instant>,
@@ -913,6 +983,12 @@ struct ProviderListWorkerResult {
     providers: Vec<ProviderSummary>,
 }
 
+struct AgentListWorkerResult {
+    /// `None` when the load timed out (built-ins stay in place).
+    agents: Option<Vec<AgentSummary>>,
+    error: Option<String>,
+}
+
 impl ChatState {
     pub fn new(backend: &Backend) -> Self {
         Self::new_with_waker(backend, None)
@@ -936,7 +1012,17 @@ impl ChatState {
             event_wake,
         );
 
-        let agents = agent_summaries(&backend.data_dir);
+        // The interactive app must not read the SIFS-backed agent catalog here: this
+        // constructor runs on the connect thread while the window shows the launch
+        // status, and SIFS grinds through multi-second distributed timeouts whenever
+        // the cluster DFS is unhealthy. Boot with the built-ins (no I/O) and let the
+        // shell load the stored catalog in the background once the app is ready.
+        let defer_agent_load = waker.is_some();
+        let agents = if defer_agent_load {
+            built_in_agent_summaries()
+        } else {
+            agent_summaries(&backend.data_dir)
+        };
         let defer_provider_load = waker.is_some() && backend.connection.daemon_address().is_some();
         let providers = if defer_provider_load {
             Vec::new()
@@ -968,6 +1054,7 @@ impl ChatState {
             attachment_path_input: String::new(),
             attachment_controls_open: false,
             attachments: Vec::new(),
+            queued_turn_inputs: Vec::new(),
             streaming: false,
             notice: None,
             context: None,
@@ -1009,6 +1096,8 @@ impl ChatState {
             transcript_load_started_at: None,
             transcript_load_slow_notice_shown: false,
             provider_list_rx: None,
+            agent_list_rx: None,
+            agents_loading: defer_agent_load,
             session_list_rx: None,
             session_list_loading: false,
             session_list_started_at: None,
@@ -2067,6 +2156,7 @@ impl ChatState {
         self.attachment_path_input.clear();
         self.attachment_controls_open = false;
         self.streaming = false;
+        self.queued_turn_inputs.clear();
         self.notice = preserved_notice;
         self.context = None;
         self.usage = None;
@@ -2625,6 +2715,7 @@ impl ChatState {
         self.messages = vec![transcript_loading_message(&session)];
         self.timeline = ConversationTimelineState::default();
         self.streaming = false;
+        self.queued_turn_inputs.clear();
         self.notice = None;
         self.context = None;
         self.usage = None;
@@ -3304,6 +3395,7 @@ impl ChatState {
             ChatEvent::TurnDone { .. } => {
                 self.streaming = false;
                 self.control.active_turn = false;
+                self.queued_turn_inputs.clear();
                 self.notice = None;
                 Self::finish_turn_messages(&mut self.messages);
                 self.persist();
@@ -3322,6 +3414,14 @@ impl ChatState {
                 self.control.terminal_result_count = status.terminal_result_count;
                 self.control.tasks = status.tasks;
                 self.control.runtime_attached = status.runtime_attached;
+                if let Some(queued) = &status.queued_input {
+                    self.attach_queued_input_id(queued);
+                }
+                if let Some(removed_id) = &status.removed_input_id {
+                    // Confirmation of a removal (usually already applied optimistically).
+                    self.queued_turn_inputs
+                        .retain(|item| item.input_id.as_deref() != Some(removed_id.as_str()));
+                }
                 self.notice = Some(format!(
                     "agent control {} at sequence {}",
                     if status.accepted {
@@ -3351,6 +3451,14 @@ impl ChatState {
                 self.control.steering_count = state.steering_count;
                 self.control.follow_up_count = state.follow_up_count;
                 self.control.runtime_attached = state.runtime_attached;
+                // The session snapshot is authoritative for the pending chips:
+                // it carries ids + texts for everything still queued (including
+                // inputs queued from other surfaces) and drops the consumed.
+                self.queued_turn_inputs = state
+                    .queued_inputs
+                    .iter()
+                    .map(QueuedTurnInput::from)
+                    .collect();
                 self.notice = Some(format!(
                     "agent control: {} steering, {} follow-ups",
                     state.steering_count, state.follow_up_count
@@ -3377,6 +3485,7 @@ impl ChatState {
                 self.messages.clear();
                 self.timeline = ConversationTimelineState::default();
                 self.streaming = false;
+                self.queued_turn_inputs.clear();
                 self.notice = None;
                 self.context = None;
                 self.usage = None;
@@ -3411,6 +3520,7 @@ impl ChatState {
             ChatEvent::Error { error, .. } => {
                 self.streaming = false;
                 self.control.active_turn = false;
+                self.queued_turn_inputs.clear();
                 if let Some(detail) = connection_problem_summary(&error) {
                     self.push_activity("chat connection", detail.clone(), ActivityTone::Warn);
                     if !self
@@ -3501,9 +3611,16 @@ impl ChatState {
                 self.notice = Some("send attachments after the current response".to_string());
                 return;
             }
-            self.handle.send_command(ChatCommand::FollowUp {
+            // Mesh: mid-run typing steers the active turn instead of killing it.
+            // The message is consumed by the next model step; Esc interrupts outright.
+            self.handle.send_command(ChatCommand::Steer {
                 session_id: session_id.clone(),
                 message: text.clone(),
+            });
+            self.queued_turn_inputs.push(QueuedTurnInput {
+                kind: QueuedTurnKind::Steer,
+                text: text.clone(),
+                input_id: None,
             });
             self.messages.push(ChatMessage::user(text));
             self.input.clear();
@@ -3513,7 +3630,10 @@ impl ChatState {
             if self.composer_popup == Some(ComposerPopup::Attachments) {
                 self.composer_popup = None;
             }
-            self.notice = Some("queued follow-up".to_string());
+            // The input host keys on the revision; bump it so the focused
+            // `TextArea` rebuilds empty rather than keeping the queued text.
+            self.draft_revision = self.draft_revision.wrapping_add(1);
+            self.notice = Some("queued steering".to_string());
             self.stick_bottom = true;
             self.scroll = f32::MAX;
             self.persist();
@@ -3565,6 +3685,62 @@ impl ChatState {
             reason: "user interrupted from app chat".to_string(),
         });
         self.notice = Some("interrupting…".to_string());
+    }
+
+    /// Attach the runtime queue id to the optimistic chip it confirms (newest
+    /// same-kind, same-text chip still missing an id), or surface the queued
+    /// input as a fresh chip when no optimistic echo exists.
+    fn attach_queued_input_id(&mut self, queued: &ChatQueuedTurnInput) {
+        let kind = QueuedTurnKind::from(queued.kind);
+        if self
+            .queued_turn_inputs
+            .iter()
+            .any(|item| item.input_id.as_deref() == Some(queued.input_id.as_str()))
+        {
+            return;
+        }
+        if let Some(item) = self.queued_turn_inputs.iter_mut().rev().find(|item| {
+            item.input_id.is_none() && item.kind == kind && item.text == queued.message
+        }) {
+            item.input_id = Some(queued.input_id.clone());
+            return;
+        }
+        self.queued_turn_inputs.push(QueuedTurnInput::from(queued));
+    }
+
+    /// Remove a pending queued message: optimistically drop the chip and ask
+    /// the runtime to delete it from the session queue. If the runtime already
+    /// consumed it, the removal is moot and the error path reports the race.
+    fn remove_queued_turn_input(&mut self, index: usize) {
+        let Some(item) = self.queued_turn_inputs.get(index) else {
+            return;
+        };
+        let Some(input_id) = item.input_id.clone() else {
+            self.notice = Some("queued message is still registering".to_string());
+            return;
+        };
+        self.queued_turn_inputs.remove(index);
+        self.handle.send_command(ChatCommand::RemoveQueuedInput {
+            session_id: self.session_id.clone(),
+            input_id,
+        });
+        self.notice = Some("removing queued message…".to_string());
+    }
+
+    /// Mesh: Esc is interruption-first-class. One press closes an open composer
+    /// popup; the next (or the first, with nothing open) halts the active turn.
+    /// Returns whether the key was consumed. The session-edit dialog owns Esc
+    /// while it is open, so callers skip this entirely in that state.
+    fn handle_escape(&mut self) -> bool {
+        if self.composer_popup.is_some() {
+            self.set_composer_popup(None);
+            return true;
+        }
+        if self.streaming {
+            self.interrupt_turn();
+            return true;
+        }
+        false
     }
 
     // -- Composed-view action methods (mutation entry points for the widgets) --
@@ -3695,6 +3871,93 @@ impl ChatState {
         }
     }
 
+    /// Load the stored (SIFS-backed) agent catalog in the background. The composer
+    /// starts on the built-ins; this upgrades it once — or reports the catalog as
+    /// degraded — without ever blocking the boot path on the distributed file system.
+    pub fn start_agent_list_load(
+        &mut self,
+        data_dir: Arc<SinomoDataDir>,
+        waker: Option<sui::UiHandle>,
+    ) -> bool {
+        if !self.agents_loading || self.agent_list_rx.is_some() {
+            return false;
+        }
+        let (tx, rx) = mpsc::channel();
+        match thread::Builder::new()
+            .name("sinomo-app-chat-agents".to_string())
+            .spawn(move || {
+                let result = match crate::backend::run_with_timeout(
+                    "agent-catalog",
+                    AGENT_CATALOG_LOAD_TIMEOUT,
+                    move || agent_summaries_with_error(&data_dir),
+                ) {
+                    Ok((agents, error)) => AgentListWorkerResult {
+                        agents: Some(agents),
+                        error,
+                    },
+                    Err(error) => AgentListWorkerResult {
+                        agents: None,
+                        error: Some(error),
+                    },
+                };
+                let _ = tx.send(result);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }) {
+            Ok(_) => {
+                self.agent_list_rx = Some(rx);
+                true
+            }
+            Err(error) => {
+                self.agents_loading = false;
+                self.replace_activity(
+                    "agents",
+                    format!("agent catalog load failed: {error}"),
+                    ActivityTone::Warn,
+                );
+                true
+            }
+        }
+    }
+
+    pub fn pump_agent_list(&mut self) -> bool {
+        let Some(rx) = self.agent_list_rx.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.agent_list_rx = None;
+                self.agents_loading = false;
+                if let Some(agents) = result.agents
+                    && !agents.is_empty()
+                {
+                    self.refresh_agents(agents);
+                }
+                if let Some(error) = result.error {
+                    tracing::warn!(%error, "chat agent catalog load degraded");
+                    self.replace_activity(
+                        "agents",
+                        format!("stored agent catalog unavailable (using built-ins): {error}"),
+                        ActivityTone::Warn,
+                    );
+                }
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.agent_list_rx = None;
+                self.agents_loading = false;
+                self.replace_activity(
+                    "agents",
+                    "agent catalog load failed: worker exited",
+                    ActivityTone::Warn,
+                );
+                true
+            }
+        }
+    }
+
     /// Replace the selectable agent catalog after Settings changes custom definitions.
     pub fn refresh_agents(&mut self, agents: Vec<AgentSummary>) {
         let previous = self.info.agent.clone();
@@ -3728,6 +3991,10 @@ impl ChatState {
         self.input = text;
     }
 
+    /// Reset the draft, attachments and pending attachment entry. The Mesh
+    /// composer has no Clear button (Send is its one primary action), so this
+    /// is a state-level affordance for quick actions and tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn clear_draft(&mut self) {
         if self.input.is_empty()
             && self.attachments.is_empty()
@@ -4922,6 +5189,78 @@ fn composer_control_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 
         let mut theme = reader();
         theme.typography.body_font_size = theme.text.base.size;
         theme.typography.body_line_height = theme.text.base.line_height;
+        theme
+    }
+}
+
+/// The composer's borderless `TextArea`: the field frame paints the composer's
+/// fill, border and focus halo, so the input's own chrome goes fully
+/// transparent (`.sm-composer-input` — no background, no border, no outline).
+fn composer_input_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || {
+        let mut theme = reader();
+        theme.typography.body_font_size = theme.text.base.size;
+        theme.typography.body_line_height = theme.text.base.line_height;
+        theme.palette.field = Color::TRANSPARENT;
+        theme.palette.surface = Color::TRANSPARENT;
+        theme.palette.surface_focus = Color::TRANSPARENT;
+        theme.palette.border = Color::TRANSPARENT;
+        theme.palette.border_hover = Color::TRANSPARENT;
+        theme.palette.border_focus = Color::TRANSPARENT;
+        theme.palette.focus_ring = Color::TRANSPARENT;
+        theme
+    }
+}
+
+/// Ghost bar controls (Mesh `sm-btn--ghost`): transparent at rest, neutral
+/// hover well, no hairline. Keyboard focus keeps the shared focus ring, and a
+/// selected toggle (the mic) keeps the stock accent wash + accent icon.
+fn ghost_icon_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || {
+        let mut theme = reader();
+        theme.palette.control = Color::TRANSPARENT;
+        theme.palette.border = Color::TRANSPARENT;
+        theme.palette.border_hover = Color::TRANSPARENT;
+        theme
+    }
+}
+
+/// The composer's one primary action (Send / Stop): an accent-filled icon
+/// button, unlike the neutral `control` family stock `IconButton`s ride.
+fn primary_icon_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || {
+        let mut theme = reader();
+        theme.palette.control = theme.palette.accent;
+        theme.palette.control_hover = theme.palette.accent_hover;
+        theme.palette.control_active = theme.palette.accent_pressed;
+        theme.palette.border = theme.palette.accent_border;
+        theme.palette.border_hover = theme.palette.accent_border_hover;
+        theme.palette.text = theme.surfaces.on_accent;
+        theme
+    }
+}
+
+/// Mesh chip surface: `--sm-surface-2` fill with the standard hairline.
+fn context_chip_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || {
+        let mut theme = reader();
+        theme.surfaces.field = theme.surfaces.surface_2;
+        theme
+    }
+}
+
+/// Queued-steering chip surface: accent wash + accent hairline
+/// (`.sm-queue-chip` — `--sm-accent-soft` on `--sm-accent-border`).
+fn queue_chip_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || {
+        let mut theme = reader();
+        theme.surfaces.field = theme.surfaces.accent_soft;
+        theme.surfaces.border = theme.surfaces.accent_border;
         theme
     }
 }
@@ -11137,36 +11476,38 @@ fn model_button_label(chat: &ChatState) -> String {
     "Model".to_string()
 }
 
-fn attachment_button_label(chat: &ChatState) -> String {
-    match chat.attachments.len() {
-        0 => "Attach file".to_string(),
-        1 => "1 attachment".to_string(),
-        count => format!("{count} attachments"),
-    }
+/// The live-voice hint beside the mic toggle (`voice link · MM:SS`), present
+/// only while the full-duplex call is running.
+fn voice_link_hint(chat: &ChatState) -> Option<String> {
+    chat.media_call
+        .active
+        .then(|| format!("voice link · {}", chat.media_call_elapsed_label()))
 }
 
-fn composer_controls_signature(
+/// The action bar rebuild key: the Send<->Stop swap, the quiet-control labels,
+/// and the live voice state (whose hint ticks once a second).
+fn composer_bar_signature(
     shared: &Shared,
 ) -> (
-    Option<ComposerPopup>,
+    bool,
     String,
     String,
-    usize,
-    u64,
     String,
+    bool,
+    Option<String>,
     bool,
     bool,
 ) {
     let chat = shared.chat();
     (
-        chat.composer_popup(),
+        chat.streaming,
         model_button_label(&chat),
         context_overview_summary(&chat),
-        chat.attachments.len(),
-        chat.draft_revision,
         activity_button_label(&chat).to_string(),
         chat.media_call.active,
-        chat.media_call_details_visible(),
+        voice_link_hint(&chat),
+        chat.can_reuse_latest_answer(),
+        chat.providers.is_empty(),
     )
 }
 
@@ -11464,7 +11805,9 @@ fn composer_popup_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
     )
 }
 
-fn composer_attachment_chip(
+/// A pending attachment as a Mesh context chip riding on top of the input:
+/// pill silhouette, leading file glyph, `name · size` label, remove affordance.
+fn composer_context_chip(
     shared: &Shared,
     reader: &ThemeReader,
     index: usize,
@@ -11472,147 +11815,233 @@ fn composer_attachment_chip(
 ) -> impl Widget + use<> {
     let label = format!(
         "{} · {}",
-        compact_line(&attachment.file_name, 18),
+        compact_line(&attachment.file_name, 22),
         format_bytes(attachment.size_bytes.min(usize::MAX as u64) as usize)
     );
     let remove_label = format!("Remove {}", attachment.file_name);
+    let icon = {
+        let s = shared.clone();
+        Icon::new(IconGlyph::FileText)
+            .size(11.0)
+            .color_when(move || palette(&s).text_faint)
+    };
+    let remove = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Close, remove_label)
+            .size(16.0)
+            .icon_size(10.0)
+            .theme_when(ghost_icon_button_theme(reader))
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut().remove_attachment(index);
+                request_chat_window_relayout(ctx);
+            })
+    };
     let s = shared.clone();
-    let remove = IconButton::new(IconGlyph::Close, remove_label)
-        .size(22.0)
-        .icon_size(11.0)
-        .theme_when(secondary_button_theme(reader))
-        .on_press_with_ctx(move |ctx| {
-            s.chat_mut().remove_attachment(index);
-            request_chat_window_relayout(ctx);
-        });
-    let s = shared.clone();
-    SizedBox::new()
-        .width(COMPOSER_ATTACHMENT_CHIP_W)
-        .height(28.0)
-        .with_child(
+    SizedBox::new().height(ATTACHMENT_CHIPS_H).with_child(
+        Surface::field(
             Flex::horizontal()
-                .gap(4.0)
+                .main_gap(5.0)
                 .align_items(Alignment::Center)
-                .with_item(
+                .with_child(icon)
+                .with_child(
                     Label::new(label)
-                        .font_size(11.0)
+                        .font_size(12.0)
                         .color_when(move || palette(&s).text_muted),
-                    FlexItem::flex(1.0).min_width(72.0),
                 )
                 .with_child(remove),
         )
-}
-
-fn composer_attachment_inline_width(count: usize) -> f32 {
-    if count == 0 {
-        0.0
-    } else {
-        count as f32 * COMPOSER_ATTACHMENT_CHIP_W + count as f32 * 6.0 + CONTROL_ROW_H
-    }
-}
-
-fn composer_attachment_collapsed_width(count: usize) -> f32 {
-    if count == 0 { 118.0 } else { 132.0 }
-}
-
-fn composer_attachment_control_width(count: usize, inline: bool) -> f32 {
-    if inline && (1..=2).contains(&count) {
-        composer_attachment_inline_width(count)
-    } else {
-        composer_attachment_collapsed_width(count)
-    }
-}
-
-fn composer_attachments_inline_for_width(chat: &ChatState, width: f32) -> bool {
-    let count = chat.attachments.len();
-    if !(1..=2).contains(&count) {
-        return false;
-    }
-    let required = 132.0
-        + composer_attachment_inline_width(count)
-        + 82.0
-        + 64.0
-        + 96.0
-        + CONTROL_ROW_GAP * 4.0;
-    width >= required
-}
-
-fn composer_attachments_control(shared: &Shared, reader: &ThemeReader, inline: bool) -> WidgetPod {
-    let attachment_count = shared.chat().attachments.len();
-    if !inline || attachment_count == 0 || attachment_count > 2 {
-        let s = shared.clone();
-        let button = sui::Button::new(attachment_button_label(&shared.chat()))
-            .icon(IconGlyph::File)
-            .min_height(CONTROL_ROW_H)
-            .theme_when(secondary_button_theme(reader))
-            .on_press_with_ctx(move |ctx| {
-                s.chat_mut()
-                    .set_composer_popup(Some(ComposerPopup::Attachments));
-                request_chat_window_relayout(ctx);
-            });
-        return WidgetPod::new(SizedBox::new().height(CONTROL_ROW_H).with_child(button));
-    }
-
-    let mut row = Flex::horizontal().gap(6.0).align_items(Alignment::Center);
-    for (index, attachment) in shared.chat().attachments.iter().enumerate() {
-        row = row.with_child(composer_attachment_chip(shared, reader, index, attachment));
-    }
-    let s = shared.clone();
-    let add = IconButton::new(IconGlyph::Add, "Attach file")
-        .size(CONTROL_ROW_H)
-        .icon_size(14.0)
-        .theme_when(secondary_button_theme(reader))
-        .on_press_with_ctx(move |ctx| {
-            s.chat_mut()
-                .set_composer_popup(Some(ComposerPopup::Attachments));
-            request_chat_window_relayout(ctx);
-        });
-    row = row.with_child(add);
-    WidgetPod::new(SizedBox::new().height(CONTROL_ROW_H).with_child(row))
-}
-
-fn composer_attachments_control_host(
-    shared: &Shared,
-    reader: &ThemeReader,
-    inline: bool,
-) -> impl Widget + use<> {
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    RebuildOnChange::new(
-        {
-            let s = s.clone();
-            move || attachment_signature(&s)
-        },
-        move |_sig| composer_attachments_control(&s, &r, inline),
+        .radius(999.0)
+        .padding(Insets {
+            left: 7.0,
+            top: 0.0,
+            right: 3.0,
+            bottom: 0.0,
+        })
+        .theme_when(context_chip_theme(reader)),
     )
 }
 
-fn composer_control_item(preferred_width: f32, min_width: f32) -> FlexItem {
-    FlexItem::new()
-        .basis(preferred_width)
-        .min_width(min_width)
-        .min_height(CONTROL_ROW_H)
-}
-
-fn composer_control_row(
+/// One queued steering/follow-up message: an accent-washed chip with the kind
+/// spelled out, pending until the runtime consumes it into the turn. Once the
+/// runtime confirms the queue id, the chip grows a remove affordance —
+/// queued items are visible *and removable*.
+fn composer_queue_chip(
     shared: &Shared,
     reader: &ThemeReader,
-    inline_attachments: bool,
-) -> WidgetPod {
-    let attachment_width =
-        composer_attachment_control_width(shared.chat().attachments.len(), inline_attachments);
-    let attachment_min_width = if inline_attachments {
-        CONTROL_ROW_H
-    } else {
-        42.0
+    index: usize,
+    item: &QueuedTurnInput,
+) -> impl Widget + use<> {
+    let icon = {
+        let s = shared.clone();
+        Icon::new(IconGlyph::Hourglass)
+            .size(10.0)
+            .color_when(move || palette(&s).accent_text)
     };
+    let kind = {
+        let s = shared.clone();
+        let theme = shared.theme();
+        Label::new(item.kind.label().to_uppercase())
+            .style(sui::TextStyle {
+                font_size: 9.0,
+                line_height: 12.0,
+                weight: FontWeight::BOLD,
+                ..theme.body_text_style()
+            })
+            .color_when(move || palette(&s).accent_text)
+    };
+    let s = shared.clone();
+    let text = Label::new(compact_line(&item.text, 46))
+        .font_size(11.0)
+        .color_when(move || palette(&s).accent_text);
+    let mut row = Flex::horizontal()
+        .main_gap(5.0)
+        .align_items(Alignment::Center)
+        .with_child(icon)
+        .with_child(kind)
+        .with_child(text);
+    let mut right_pad = 7.0;
+    if item.input_id.is_some() {
+        let s = shared.clone();
+        row = row.with_child(
+            IconButton::new(
+                IconGlyph::Close,
+                format!("Remove queued {}", item.kind.label()),
+            )
+            .size(16.0)
+            .icon_size(10.0)
+            .theme_when(ghost_icon_button_theme(reader))
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut().remove_queued_turn_input(index);
+                request_chat_window_relayout(ctx);
+            }),
+        );
+        right_pad = 2.0;
+    }
+    SizedBox::new().height(20.0).with_child(
+        Surface::field(row)
+            .radius(4.0)
+            .padding(Insets {
+                left: 7.0,
+                top: 0.0,
+                right: right_pad,
+                bottom: 0.0,
+            })
+            .theme_when(queue_chip_theme(reader)),
+    )
+}
+
+/// Chip rows ride on top of the composer input (`.sm-composer-queue`,
+/// `.sm-ctx-row`): wrap-flex with the Mesh 8/10 row padding, collapsing to
+/// nothing when empty.
+fn composer_chip_row(row: impl Widget + 'static, semantic_label: &'static str) -> WidgetPod {
+    WidgetPod::new(SemanticRegion::new(
+        semantic_label,
+        WidgetPadding::new(
+            Insets {
+                left: COMPOSER_CHIP_ROW_PAD_X,
+                top: COMPOSER_CHIP_ROW_PAD_TOP,
+                right: COMPOSER_CHIP_ROW_PAD_X,
+                bottom: 0.0,
+            },
+            row,
+        ),
+    ))
+}
+
+/// Steering / follow-up messages queued into the next turn, visible so
+/// "I already told it" is never in doubt.
+fn composer_queue_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let items = shared.chat().queued_turn_inputs.clone();
+    if items.is_empty() {
+        return WidgetPod::new(SizedBox::new().height(0.0));
+    }
+    let mut row = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(6.0)
+        .align_items(Alignment::Center);
+    for (index, item) in items.iter().enumerate() {
+        row = row.with_child(composer_queue_chip(shared, reader, index, item));
+    }
+    composer_chip_row(row, "Queued for next turn")
+}
+
+/// Attached context files as removable chips.
+fn composer_context_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let attachments = shared.chat().attachments.clone();
+    if attachments.is_empty() {
+        return WidgetPod::new(SizedBox::new().height(0.0));
+    }
+    let mut row = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(6.0)
+        .align_items(Alignment::Center);
+    for (index, attachment) in attachments.iter().enumerate() {
+        row = row.with_child(composer_context_chip(shared, reader, index, attachment));
+    }
+    composer_chip_row(row, "Attached context")
+}
+
+/// The composer action bar (`.sm-composer-bar`): quiet controls on the left
+/// (attach, voice, model/context/activity), the keyboard hint, and the one
+/// primary action — Send, which becomes Stop while a response streams.
+fn composer_bar(shared: &Shared, reader: &ThemeReader, show_hint: bool) -> WidgetPod {
+    let (streaming, media_active, hint, can_reuse) = {
+        let chat = shared.chat();
+        (
+            chat.streaming,
+            chat.media_call.active,
+            voice_link_hint(&chat),
+            chat.can_reuse_latest_answer(),
+        )
+    };
+
+    let attach = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::Attach, "Attach files")
+            .size(COMPOSER_GHOST_BUTTON_SIZE)
+            .icon_size(14.0)
+            .theme_when(ghost_icon_button_theme(reader))
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut()
+                    .toggle_composer_popup(ComposerPopup::Attachments);
+                request_chat_window_relayout(ctx);
+            })
+    };
+
+    let mic = {
+        let s = shared.clone();
+        IconButton::new(
+            if media_active {
+                IconGlyph::AudioLines
+            } else {
+                IconGlyph::Mic
+            },
+            if media_active {
+                "Voice link on — tap to end"
+            } else {
+                "Start voice link"
+            },
+        )
+        .size(COMPOSER_GHOST_BUTTON_SIZE)
+        .icon_size(14.0)
+        .theme_when(ghost_icon_button_theme(reader))
+        .selected_when({
+            let s = s.clone();
+            move || s.chat().media_call.active
+        })
+        .on_press_with_ctx(move |ctx| {
+            s.chat_mut().toggle_media_call();
+            request_chat_window_relayout(ctx);
+        })
+    };
+
     // Mesh accent discipline: Send is the composer's one primary action, so
-    // the model picker rides the quiet neutral treatment like its siblings.
+    // the model/context/activity pickers ride the quiet neutral treatment.
     let model = {
         let s = shared.clone();
         sui::Button::new(model_button_label(&shared.chat()))
             .icon(IconGlyph::Sparkles)
-            .min_height(CONTROL_ROW_H)
+            .min_height(COMPOSER_GHOST_BUTTON_SIZE)
             .theme_when(secondary_button_theme(reader))
             .on_press_with_ctx(move |ctx| {
                 s.chat_mut().toggle_composer_popup(ComposerPopup::Model);
@@ -11624,7 +12053,7 @@ fn composer_control_row(
         let s = shared.clone();
         sui::Button::new(context_overview_summary(&shared.chat()))
             .icon(IconGlyph::History)
-            .min_height(CONTROL_ROW_H)
+            .min_height(COMPOSER_GHOST_BUTTON_SIZE)
             .theme_when(secondary_button_theme(reader))
             .on_press_with_ctx(move |ctx| {
                 s.chat_mut().toggle_composer_popup(ComposerPopup::Context);
@@ -11636,7 +12065,7 @@ fn composer_control_row(
         let s = shared.clone();
         sui::Button::new(activity_button_label(&shared.chat()))
             .icon(IconGlyph::History)
-            .min_height(CONTROL_ROW_H)
+            .min_height(COMPOSER_GHOST_BUTTON_SIZE)
             .theme_when(secondary_button_theme(reader))
             .on_press_with_ctx(move |ctx| {
                 s.chat_mut().toggle_activity_panel();
@@ -11644,154 +12073,100 @@ fn composer_control_row(
             })
     };
 
-    let call = {
+    let mut row = Flex::horizontal()
+        .gap(COMPOSER_BAR_GAP)
+        .align_items(Alignment::Center)
+        .with_child(attach)
+        .with_child(mic);
+
+    if let Some(hint_text) = hint {
         let s = shared.clone();
-        sui::Button::new("Call")
-            .icon(IconGlyph::Phone)
-            .min_height(CONTROL_ROW_H)
-            .theme_when(secondary_button_theme(reader))
-            .on_press_with_ctx(move |ctx| {
-                s.chat_mut().toggle_media_call();
-                request_chat_window_relayout(ctx);
-            })
-    };
+        row = row.with_child(
+            Label::new(hint_text)
+                .font_size(11.0)
+                .color_when(move || palette(&s).accent_text),
+        );
+    }
 
-    WidgetPod::new(
-        Flex::horizontal()
-            .gap(CONTROL_ROW_GAP)
-            .align_items(Alignment::Center)
-            .with_item(model, composer_control_item(132.0, 76.0))
-            .with_item(
-                context,
-                FlexItem::flex(1.0).min_width(0.0).min_height(CONTROL_ROW_H),
-            )
-            .with_item(
-                composer_attachments_control_host(shared, reader, inline_attachments),
-                composer_control_item(attachment_width, attachment_min_width),
-            )
-            .with_item(activity, composer_control_item(82.0, 44.0))
-            .with_item(call, composer_control_item(64.0, 42.0)),
-    )
-}
+    row = row
+        .with_item(
+            model,
+            FlexItem::new()
+                .basis(132.0)
+                .min_width(76.0)
+                .min_height(COMPOSER_GHOST_BUTTON_SIZE),
+        )
+        .with_item(
+            context,
+            FlexItem::flex(1.0)
+                .min_width(0.0)
+                .min_height(COMPOSER_GHOST_BUTTON_SIZE),
+        )
+        .with_item(
+            activity,
+            FlexItem::new()
+                .basis(88.0)
+                .min_width(44.0)
+                .min_height(COMPOSER_GHOST_BUTTON_SIZE),
+        );
 
-/// The composer's bottom row: a flexible message `TextArea` and a fixed-size action slot. The input
-/// is bound to the draft via `on_change`; Enter submits normally, or queues a follow-up during an
-/// active stream. The action control swaps from Send to Interrupt while streaming.
-fn composer_action_signature(shared: &Shared) -> (bool, bool, bool) {
-    let chat = shared.chat();
-    (
-        chat.streaming,
-        !chat.input.is_empty()
-            || !chat.attachments.is_empty()
-            || !chat.attachment_path_input.is_empty(),
-        chat.can_reuse_latest_answer(),
-    )
-}
-
-fn composer_actions(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let (streaming, has_draft, can_reuse_answer) = composer_action_signature(shared);
-    if streaming {
+    if show_hint {
         let s = shared.clone();
-        WidgetPod::new(
-            Flex::horizontal()
-                .align_items(Alignment::Center)
-                .spacer()
-                .with_child(
-                    IconButton::new(IconGlyph::Close, "Interrupt")
-                        .size(SEND_BUTTON_SIZE)
-                        .icon_size(17.0)
-                        .theme_when(clone_reader(reader))
-                        .on_press(move || {
-                            s.chat_mut().interrupt_turn();
-                        }),
-                ),
-        )
-    } else if has_draft {
-        let clear = {
-            let s = shared.clone();
-            IconButton::new(IconGlyph::Close, "Clear draft")
-                .size(SEND_BUTTON_SIZE)
-                .icon_size(16.0)
-                .theme_when(secondary_button_theme(reader))
-                .on_press(move || {
-                    s.chat_mut().clear_draft();
-                })
-        };
-        let send = {
-            let s = shared.clone();
-            IconButton::new(IconGlyph::Send, "Send")
-                .size(SEND_BUTTON_SIZE)
-                .icon_size(17.0)
-                .theme_when(clone_reader(reader))
-                .enabled_when({
-                    let s = s.clone();
-                    move || s.chat().can_send()
-                })
-                .on_press(move || {
-                    s.chat_mut().submit();
-                })
-        };
-        WidgetPod::new(
-            Flex::horizontal()
-                .gap(6.0)
-                .align_items(Alignment::Center)
-                .spacer()
-                .with_child(clear)
-                .with_child(send),
-        )
-    } else if can_reuse_answer {
-        let reuse = {
-            let s = shared.clone();
+        row = row.with_child(
+            Label::new("Enter sends · Shift+Enter newline")
+                .font_size(11.0)
+                .color_when(move || palette(&s).text_faint),
+        );
+    }
+
+    if can_reuse && !streaming {
+        let s = shared.clone();
+        row = row.with_child(
             sui::Button::new("Use answer")
                 .icon(IconGlyph::Redo)
-                .min_height(SEND_BUTTON_SIZE)
-                .min_width(112.0)
+                .min_height(COMPOSER_GHOST_BUTTON_SIZE)
                 .theme_when(secondary_button_theme(reader))
                 .on_press(move || {
                     s.chat_mut().use_latest_answer_as_draft();
-                })
-        };
+                }),
+        );
+    }
+
+    // Interruption is first-class: the send button becomes stop mid-stream.
+    let action = if streaming {
         let s = shared.clone();
-        let send = IconButton::new(IconGlyph::Send, "Send")
+        IconButton::new(IconGlyph::Stop, "Stop generation")
             .size(SEND_BUTTON_SIZE)
-            .icon_size(17.0)
-            .theme_when(clone_reader(reader))
+            .icon_size(13.0)
+            .theme_when(primary_icon_button_theme(reader))
+            .on_press(move || {
+                s.chat_mut().interrupt_turn();
+            })
+    } else {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::ArrowUp, "Send message")
+            .size(SEND_BUTTON_SIZE)
+            .icon_size(16.0)
+            .theme_when(primary_icon_button_theme(reader))
             .enabled_when({
                 let s = s.clone();
                 move || s.chat().can_send()
             })
             .on_press(move || {
                 s.chat_mut().submit();
-            });
-        WidgetPod::new(
-            Flex::horizontal()
-                .gap(6.0)
-                .align_items(Alignment::Center)
-                .spacer()
-                .with_child(reuse)
-                .with_child(send),
-        )
-    } else {
-        let s = shared.clone();
-        WidgetPod::new(
-            Flex::horizontal()
-                .align_items(Alignment::Center)
-                .spacer()
-                .with_child(
-                    IconButton::new(IconGlyph::Send, "Send")
-                        .size(SEND_BUTTON_SIZE)
-                        .icon_size(17.0)
-                        .theme_when(clone_reader(reader))
-                        .enabled_when({
-                            let s = s.clone();
-                            move || s.chat().can_send()
-                        })
-                        .on_press(move || {
-                            s.chat_mut().submit();
-                        }),
-                ),
-        )
-    }
+            })
+    };
+    row = row.with_child(action);
+
+    WidgetPod::new(WidgetPadding::new(
+        Insets {
+            left: COMPOSER_BAR_PAD_X,
+            top: COMPOSER_BAR_PAD_Y,
+            right: COMPOSER_BAR_PAD_X,
+            bottom: COMPOSER_BAR_PAD_Y,
+        },
+        row,
+    ))
 }
 
 fn composer_input_min_height() -> f32 {
@@ -11799,143 +12174,167 @@ fn composer_input_min_height() -> f32 {
         + COMPOSER_INPUT_PAD_Y
 }
 
-fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let input = {
-        let s = shared.clone();
-        let draft = shared.chat().input.clone();
-        let provider_ready = !shared.chat().providers.is_empty();
-        let placeholder = if provider_ready {
-            "Message Sinomo...  (Enter to send, Shift+Enter for newline)"
-        } else {
-            "Set up a provider before sending."
-        };
-        let mut input = TextArea::new("chat-input")
-            .value(draft)
-            .placeholder(placeholder)
-            .min_height(composer_input_min_height())
-            .padding(Insets {
-                left: 12.0,
-                top: 8.0,
-                right: 12.0,
-                bottom: 8.0,
-            })
-            .theme_when(composer_control_reader(reader));
-        if provider_ready {
-            input = input.on_change({
-                let s = s.clone();
-                move |value| {
-                    s.chat_mut().set_draft(value);
-                }
-            });
-            // Enter sends, Shift+Enter inserts a newline (the on_submit only fires while the
-            // TextArea is focused — Enter only reaches a focused input). While streaming, `submit()`
-            // queues the draft as a follow-up for the active runtime turn.
-            input = input.on_submit(move |_text| {
-                s.chat_mut().submit();
-            });
-        } else {
-            input = input.read_only();
-        }
-        let scroll_state = ScrollState::new();
-        ComposerInputScroll::new(
-            WidgetPod::new(
-                ScrollView::vertical(input)
-                    .name("chat-input-scroll")
-                    .state(scroll_state.clone()),
-            ),
-            WidgetPod::new(
-                ScrollBar::vertical(scroll_state)
-                    .name("chat-input-scrollbar")
-                    .width(8.0)
-                    .theme(reader()),
-            ),
-        )
-    };
-
-    let action = {
-        let s = shared.clone();
-        let r = Rc::clone(reader);
-        RebuildOnChange::new(
-            {
-                let s = s.clone();
-                move || composer_action_signature(&s)
-            },
-            move |_sig| composer_actions(&s, &r),
-        )
-    };
-    let action_width = if shared.chat().can_reuse_latest_answer() {
-        COMPOSER_REUSE_ACTION_W
-    } else {
-        COMPOSER_DEFAULT_ACTION_W
-    };
-
-    WidgetPod::new(
-        TrailingSlotRow::new(input, action)
-            .trailing_width(action_width)
-            .trailing_height(SEND_BUTTON_SIZE)
-            .gap(INPUT_ACTION_GAP),
+/// The input host rebuild key: provider availability (editable <-> setup-required
+/// read-only state) and the draft revision, bumped only by programmatic draft
+/// replacement — normal typing must not rebuild the focused `TextArea`.
+fn composer_input_signature(shared: &Shared) -> (bool, bool, u64) {
+    let chat = shared.chat();
+    (
+        chat.streaming,
+        chat.providers.is_empty(),
+        chat.draft_revision,
     )
 }
 
-fn composer_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    // The input row is rebuilt when the streaming flag flips (Send <-> Interrupt), when provider
-    // availability changes (editable composer <-> setup-required read-only state), and when a
-    // programmatic quick action replaces the draft. Normal typing does not bump the revision, so the
-    // focused `TextArea` is not rebuilt on every keystroke.
-    let input_host = {
+/// The borderless message input. The field frame owns the composer's border and
+/// focus treatment, so the `TextArea` itself paints no chrome of its own.
+/// Enter submits (steering the turn while one streams); Shift+Enter breaks the line.
+fn composer_input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let s = shared.clone();
+    let draft = shared.chat().input.clone();
+    let provider_ready = !shared.chat().providers.is_empty();
+    let placeholder = if provider_ready {
+        "Message sinomo…"
+    } else {
+        "Set up a provider before sending."
+    };
+    let mut input = TextArea::new("chat-input")
+        .value(draft)
+        .placeholder(placeholder)
+        .min_height(composer_input_min_height())
+        .padding(Insets {
+            left: 12.0,
+            top: 10.0,
+            right: 12.0,
+            bottom: 4.0,
+        })
+        .theme_when(composer_input_theme(reader));
+    if provider_ready {
+        input = input.on_change({
+            let s = s.clone();
+            move |value| {
+                s.chat_mut().set_draft(value);
+            }
+        });
+        // Enter sends, Shift+Enter inserts a newline (the on_submit only fires while the
+        // TextArea is focused — Enter only reaches a focused input). While streaming,
+        // `submit()` queues the draft as steering for the active runtime turn.
+        input = input.on_submit(move |_text| {
+            s.chat_mut().submit();
+        });
+    } else {
+        input = input.read_only();
+    }
+    let scroll_state = ScrollState::new();
+    WidgetPod::new(ComposerInputScroll::new(
+        WidgetPod::new(
+            ScrollView::vertical(input)
+                .name("chat-input-scroll")
+                .state(scroll_state.clone()),
+        ),
+        WidgetPod::new(
+            ScrollBar::vertical(scroll_state)
+                .name("chat-input-scrollbar")
+                .width(8.0)
+                .theme(reader()),
+        ),
+    ))
+}
+
+/// Assemble the Mesh composer field — one surface for text, attachments and
+/// voice: queued-steering chips and context chips ride on top, the borderless
+/// input grows in the middle, and the action bar closes the surface.
+fn composer_field(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let queue_host = {
         let s = shared.clone();
         let r = Rc::clone(reader);
         RebuildOnChange::new(
             {
                 let s = s.clone();
                 move || {
-                    let chat = s.chat();
-                    (
-                        chat.streaming,
-                        chat.providers.is_empty(),
-                        chat.draft_revision,
-                    )
+                    s.chat()
+                        .queued_turn_inputs
+                        .iter()
+                        .map(|item| {
+                            (
+                                item.kind == QueuedTurnKind::Steer,
+                                item.text.clone(),
+                                item.input_id.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
                 }
             },
-            move |_streaming| input_row(&s, &r),
+            move |_items| composer_queue_row(&s, &r),
         )
     };
 
-    let controls_host = {
+    let context_host = {
         let s = shared.clone();
         let r = Rc::clone(reader);
         RebuildOnChange::new(
             {
                 let s = s.clone();
-                move || composer_controls_signature(&s)
+                move || attachment_signature(&s)
+            },
+            move |_sig| composer_context_row(&s, &r),
+        )
+    };
+
+    let input_host = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::new(
+            {
+                let s = s.clone();
+                move || composer_input_signature(&s)
+            },
+            move |_sig| composer_input_row(&s, &r),
+        )
+    };
+
+    let bar_host = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::new(
+            {
+                let s = s.clone();
+                move || composer_bar_signature(&s)
             },
             move |_sig| {
-                let key_s = s.clone();
                 let build_s = s.clone();
                 let build_r = Rc::clone(&r);
                 WidgetPod::new(RebuildOnConstraints::new(
-                    false,
+                    true,
                     move |constraints| {
                         let width = if constraints.max.width.is_finite() {
                             constraints.max.width
                         } else {
                             constraints.min.width.max(360.0)
                         };
-                        composer_attachments_inline_for_width(&key_s.chat(), width.max(0.0))
+                        width >= COMPOSER_HINT_MIN_W
                     },
-                    move |inline_attachments| {
-                        composer_control_row(&build_s, &build_r, *inline_attachments)
-                    },
+                    move |show_hint| composer_bar(&build_s, &build_r, *show_hint),
                 ))
             },
         )
     };
 
+    let rows = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .with_child(queue_host)
+        .with_child(context_host)
+        .with_child(input_host)
+        .with_child(bar_host);
+
+    ComposerFieldFrame::new(shared.clone(), WidgetPod::new(rows))
+}
+
+fn composer_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let body = ComposerPanel::new(
         shared.clone(),
         WidgetPod::new(composer_popup_host(shared, reader)),
-        WidgetPod::new(controls_host),
-        WidgetPod::new(input_host),
+        WidgetPod::new(composer_field(shared, reader)),
     );
 
     Surface::new(SurfaceRole::Titlebar, body)
@@ -11944,7 +12343,7 @@ fn composer_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .theme_when(clone_reader(reader))
 }
 
-/// The full composer: a bottom-anchored panel with popups opening above the controls.
+/// The full composer: a bottom-anchored panel with popups opening above the field.
 fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     composer_body(shared, reader)
 }
@@ -12189,9 +12588,17 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.streaming.hash(&mut h);
     chat.media_call.active.hash(&mut h);
     chat.media_call_details_visible().hash(&mut h);
+    voice_link_hint(&chat).hash(&mut h);
+    chat.can_reuse_latest_answer().hash(&mut h);
     chat.draft_revision.hash(&mut h);
     chat.attachments.len().hash(&mut h);
     chat.attachment_path_input.is_empty().hash(&mut h);
+    chat.queued_turn_inputs.len().hash(&mut h);
+    for queued in &chat.queued_turn_inputs {
+        (queued.kind == QueuedTurnKind::Steer).hash(&mut h);
+        queued.text.hash(&mut h);
+        queued.input_id.hash(&mut h);
+    }
     chat.models_loading.hash(&mut h);
     chat.composer_popup().hash(&mut h);
     chat.activity_panel_visible().hash(&mut h);
@@ -12274,6 +12681,25 @@ impl Widget for ChatView {
             return;
         }
 
+        // Mesh: Esc is the most important key in an agent UI — it halts
+        // generation. One press closes an open composer popup; the next (or
+        // the first, with nothing open) interrupts the active turn. The
+        // session-edit dialog owns Esc while it is open (it dismisses itself
+        // deeper on this capture path), so leave the key alone in that state.
+        if let Event::Keyboard(key) = event
+            && key.state == KeyState::Pressed
+            && key.key == "Escape"
+            && self.shared.chat().session_edit_id.is_none()
+        {
+            let handled = self.shared.chat_mut().handle_escape();
+            if handled {
+                self.ensure_pump(ctx);
+                self.force_window_relayout(ctx);
+                ctx.set_handled();
+                return;
+            }
+        }
+
         // Any pointer or key activity over the tab is a moment the worker may have pending events:
         // a turn just started (Send click / Enter submit), a selection changed (sidebar / Select),
         // or the initial Ready/Models fetch landed in the channel. Make sure the pump is running so
@@ -12331,20 +12757,118 @@ impl Widget for ChatView {
     }
 }
 
+/// The Mesh composer field frame (`.sm-composer`): one rounded surface holding
+/// the chip rows, the borderless input and the action bar. Paints the
+/// `--sm-field-bg` fill under a `--sm-border-strong` hairline; while focus is
+/// anywhere inside, the border turns accent and a 3px `--sm-accent-soft` halo
+/// rings the surface (`:focus-within`). Focus can't be observed via callbacks
+/// in sui, so the frame checks the focused widget id against its own subtree —
+/// any focus change repaints every window, which keeps the polled value fresh.
+struct ComposerFieldFrame {
+    shared: Shared,
+    child: WidgetPod,
+}
+
+impl ComposerFieldFrame {
+    fn new(shared: Shared, child: WidgetPod) -> Self {
+        Self { shared, child }
+    }
+
+    fn focus_within(&self, focused: Option<sui::WidgetId>) -> bool {
+        let Some(focused) = focused else {
+            return false;
+        };
+        if self.child.id() == focused {
+            return true;
+        }
+        struct Finder {
+            target: sui::WidgetId,
+            found: bool,
+        }
+        impl WidgetPodVisitor for Finder {
+            fn visit(&mut self, child: &WidgetPod) {
+                if self.found {
+                    return;
+                }
+                if child.id() == self.target {
+                    self.found = true;
+                    return;
+                }
+                child.visit_children(self);
+            }
+        }
+        let mut finder = Finder {
+            target: focused,
+            found: false,
+        };
+        self.child.visit_children(&mut finder);
+        finder.found
+    }
+}
+
+impl Widget for ComposerFieldFrame {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let pal = palette(&self.shared);
+        let bounds = ctx.bounds();
+        let focused = self.focus_within(ctx.focused_widget_id());
+        if focused {
+            paint_rounded_rect(
+                ctx,
+                bounds.inflate(COMPOSER_FOCUS_RING_W, COMPOSER_FOCUS_RING_W),
+                pal.accent_soft,
+                COMPOSER_FIELD_RADIUS + COMPOSER_FOCUS_RING_W,
+            );
+        }
+        paint_rounded_panel(
+            ctx,
+            bounds,
+            pal.field,
+            if focused {
+                pal.accent
+            } else {
+                pal.border_strong
+            },
+            COMPOSER_FIELD_RADIUS,
+        );
+        self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+/// The docked composer panel: an optional popup block above the field surface.
+/// The popup keeps its fixed height; the field takes its natural height (the
+/// input grows to `COMPOSER_INPUT_MAX_H`, then scrolls).
 struct ComposerPanel {
     shared: Shared,
     popup: WidgetPod,
-    controls: WidgetPod,
-    input: WidgetPod,
+    field: WidgetPod,
 }
 
 impl ComposerPanel {
-    fn new(shared: Shared, popup: WidgetPod, controls: WidgetPod, input: WidgetPod) -> Self {
+    fn new(shared: Shared, popup: WidgetPod, field: WidgetPod) -> Self {
         Self {
             shared,
             popup,
-            controls,
-            input,
+            field,
         }
     }
 
@@ -12377,19 +12901,8 @@ impl Widget for ComposerPanel {
         } else {
             constraints.min.width.max(420.0)
         };
-        let max_height = if constraints.max.height.is_finite() {
-            constraints.max.height
-        } else {
-            f32::INFINITY
-        };
         let content_w = (width - PAD * 2.0).max(0.0);
         let popup_block_h = self.popup_block_h();
-        let fixed_h = COMPOSER_PAD_Y * 2.0 + popup_block_h + CONTROL_ROW_H + COMPOSER_SECTION_GAP;
-        let input_max_h = if max_height.is_finite() {
-            (max_height - fixed_h).max(0.0)
-        } else {
-            COMPOSER_INPUT_MAX_H
-        };
 
         if self.popup_visible() {
             self.popup.measure(
@@ -12400,77 +12913,63 @@ impl Widget for ComposerPanel {
             self.popup
                 .measure(ctx, Constraints::tight(Size::new(content_w, 0.0)));
         }
-        self.controls
-            .measure(ctx, Constraints::tight(Size::new(content_w, CONTROL_ROW_H)));
 
-        let natural_input = self.input.measure(
+        let field = self.field.measure(
             ctx,
             Constraints::new(
                 Size::new(content_w, 0.0),
                 Size::new(content_w, f32::INFINITY),
             ),
         );
-        let input_h = natural_input
-            .height
-            .max(composer_input_min_height())
-            .min(COMPOSER_INPUT_MAX_H)
-            .min(input_max_h);
-        self.input
-            .measure(ctx, Constraints::tight(Size::new(content_w, input_h)));
 
-        constraints.clamp(Size::new(width, fixed_h + input_h))
+        constraints.clamp(Size::new(
+            width,
+            COMPOSER_PAD_Y * 2.0 + popup_block_h + field.height,
+        ))
     }
 
     fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        let input_h = self
-            .input
+        let field_h = self
+            .field
             .measured_size()
             .height
-            .min(bounds.height())
-            .max(0.0);
-        let input_y = bounds.max_y() - COMPOSER_PAD_Y - input_h;
-        let controls_y = input_y - COMPOSER_SECTION_GAP - CONTROL_ROW_H;
-        let popup_y = controls_y - COMPOSER_SECTION_GAP - COMPOSER_POPUP_H;
+            .min((bounds.height() - COMPOSER_PAD_Y * 2.0).max(0.0));
+        let field_y = bounds.max_y() - COMPOSER_PAD_Y - field_h;
+        let popup_y = field_y - COMPOSER_SECTION_GAP - COMPOSER_POPUP_H;
 
         if self.popup_visible() {
             self.popup
                 .arrange(ctx, Self::content_rect(bounds, popup_y, COMPOSER_POPUP_H));
         } else {
             self.popup
-                .arrange(ctx, Self::content_rect(bounds, controls_y, 0.0));
+                .arrange(ctx, Self::content_rect(bounds, field_y, 0.0));
         }
-        self.controls
-            .arrange(ctx, Self::content_rect(bounds, controls_y, CONTROL_ROW_H));
-        self.input
-            .arrange(ctx, Self::content_rect(bounds, input_y, input_h));
+        self.field
+            .arrange(ctx, Self::content_rect(bounds, field_y, field_h));
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
         if self.popup_visible() {
             self.popup.paint(ctx);
         }
-        self.controls.paint(ctx);
-        self.input.paint(ctx);
+        self.field.paint(ctx);
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         if self.popup_visible() {
             self.popup.semantics(ctx);
         }
-        self.controls.semantics(ctx);
-        self.input.semantics(ctx);
+        self.field.semantics(ctx);
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         visitor.visit(&self.popup);
-        visitor.visit(&self.controls);
-        visitor.visit(&self.input);
+        visitor.visit(&self.field);
     }
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
         visitor.visit(&mut self.popup);
-        visitor.visit(&mut self.controls);
-        visitor.visit(&mut self.input);
+        visitor.visit(&mut self.field);
     }
 }
 
@@ -12499,10 +12998,14 @@ impl Widget for ComposerInputScroll {
                 ctx,
                 Constraints::new(Size::new(width, 0.0), Size::new(width, f32::INFINITY)),
             );
+            // Mesh: the docked input grows to 160px, then scrolls.
             let height = natural
                 .height
                 .max(composer_input_min_height())
+                .min(COMPOSER_INPUT_MAX_H)
                 .max(constraints.min.height);
+            self.scroll
+                .measure(ctx, Constraints::tight(Size::new(width, height)));
             self.bar.measure(
                 ctx,
                 Constraints::tight(Size::new(Self::BAR_W.min(width), height)),
@@ -12593,6 +13096,60 @@ mod tests {
             },
         ];
         state.info.agent = "main-agent".to_string();
+    }
+
+    #[test]
+    fn headless_chat_state_loads_agent_catalog_synchronously() {
+        let backend = Backend::local_fallback();
+        let state = ChatState::new(&backend);
+
+        assert!(
+            !state.agents.is_empty(),
+            "headless construction should load agents synchronously"
+        );
+        assert!(
+            !state.agents_loading,
+            "headless construction must not schedule a background agent load"
+        );
+    }
+
+    #[test]
+    fn background_agent_list_load_upgrades_built_ins() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        // Mirror the interactive boot: built-ins only, catalog deferred.
+        state.agents = built_in_agent_summaries();
+        state.agents_loading = true;
+
+        assert!(
+            state.start_agent_list_load(backend.data_dir.clone(), None),
+            "background agent load should start"
+        );
+        assert!(
+            !state.start_agent_list_load(backend.data_dir.clone(), None),
+            "a second load must not start while one is in flight"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !state.pump_agent_list() {
+            assert!(
+                Instant::now() < deadline,
+                "agent list load should resolve well within its budget"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(!state.agents_loading);
+        assert!(state.agent_list_rx.is_none());
+        assert!(
+            state.agents.iter().any(|agent| agent.key == "main-agent"),
+            "stored/built-in catalog should include the default agent: {:?}",
+            state
+                .agents
+                .iter()
+                .map(|agent| agent.key.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     struct TempAttachmentFile {
@@ -14826,10 +15383,10 @@ mod tests {
         let revision_after_quick_action = chat.draft_revision;
         drop(chat);
 
-        window
-            .get_by_role(SemanticsRole::Button)
-            .with_name("Clear draft")
-            .click()?;
+        // The Mesh composer keeps Send as its one action; clearing is a
+        // state-level affordance and must still ride the programmatic
+        // composer refresh path.
+        shared.chat_mut().clear_draft();
 
         let chat = shared.chat();
         assert!(
@@ -15178,10 +15735,18 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Clear draft")
+                .with_name("Use answer")
+                .count()?,
+            0,
+            "a populated draft should hide the reuse action"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Send message")
                 .count()?,
             1,
-            "loading an answer should switch the composer back to draft actions"
+            "loading an answer should leave the primary Send action ready"
         );
 
         Ok(())
@@ -15575,7 +16140,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_submit_is_noop_and_streaming_submit_queues_follow_up() {
+    fn empty_submit_is_noop_and_streaming_submit_queues_steering() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
         seed_default_provider(&mut state);
@@ -15583,20 +16148,257 @@ mod tests {
         state.submit();
         assert!(!state.streaming);
         assert!(state.messages.is_empty());
-        // While streaming, a submit is queued as a follow-up for the active runtime turn.
+        // While streaming, a submit queues steering into the active runtime
+        // turn (Mesh: "steer, don't just stop") instead of killing the run.
+        let revision = state.draft_revision;
         state.set_draft("queued".to_string());
         state.streaming = true;
         state.submit();
-        assert_eq!(state.messages.len(), 1, "queued follow-up is echoed");
+        assert_eq!(state.messages.len(), 1, "queued steering is echoed");
         assert_eq!(state.messages[0].role, ChatRole::User);
         assert_eq!(state.messages[0].source, ChatMessageSource::User);
         assert_eq!(state.messages[0].text, "queued");
         assert!(state.input.is_empty(), "the queued draft is cleared");
+        assert_ne!(
+            state.draft_revision, revision,
+            "queueing must rebuild the composer input so the cleared draft shows"
+        );
         assert!(
             state.streaming,
-            "queueing follow-up keeps active stream state"
+            "queueing steering keeps active stream state"
         );
-        assert_eq!(state.notice.as_deref(), Some("queued follow-up"));
+        assert_eq!(state.notice.as_deref(), Some("queued steering"));
+        assert_eq!(
+            state.queued_turn_inputs,
+            vec![QueuedTurnInput {
+                kind: QueuedTurnKind::Steer,
+                text: "queued".to_string(),
+                input_id: None,
+            }],
+            "the pending chip mirrors the queued message"
+        );
+    }
+
+    #[test]
+    fn queued_steering_chips_clear_when_the_turn_settles() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.set_draft("prefer AV1".to_string());
+        state.streaming = true;
+        state.submit();
+        assert_eq!(state.queued_turn_inputs.len(), 1);
+
+        // A control-state snapshot with drained queues means the runtime
+        // consumed the steering mid-turn: the pending chip disappears.
+        state.apply_event(ChatEvent::ControlState(
+            sinomo_cli::app_api::ChatControlState {
+                session_id: state.session_id.clone(),
+                accepted: true,
+                steering_count: 0,
+                follow_up_count: 0,
+                ..Default::default()
+            },
+        ));
+        assert!(
+            state.queued_turn_inputs.is_empty(),
+            "drained runtime queues clear the pending chips"
+        );
+
+        // Queue again, then finish the turn: chips never outlive the stream.
+        state.set_draft("share to #renders".to_string());
+        state.submit();
+        assert_eq!(state.queued_turn_inputs.len(), 1);
+        state.apply_event(ChatEvent::TurnDone {
+            session_id: state.session_id.clone(),
+        });
+        assert!(!state.streaming);
+        assert!(
+            state.queued_turn_inputs.is_empty(),
+            "turn completion consumes the queue"
+        );
+    }
+
+    fn control_status_with_queue(
+        session_id: &str,
+        queued_input: Option<sinomo_cli::app_api::ChatQueuedTurnInput>,
+        removed_input_id: Option<String>,
+    ) -> sinomo_cli::app_api::ChatControlStatus {
+        sinomo_cli::app_api::ChatControlStatus {
+            session_id: session_id.to_string(),
+            accepted: true,
+            runtime_attached: true,
+            sequence: 1,
+            event_count: 1,
+            active_turn: true,
+            task_count: 0,
+            terminal_result_count: 0,
+            tasks: Vec::new(),
+            queued_input,
+            removed_input_id,
+        }
+    }
+
+    #[test]
+    fn control_status_attaches_queue_ids_and_confirms_removals() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.set_draft("prefer AV1".to_string());
+        state.streaming = true;
+        state.submit();
+        assert_eq!(state.queued_turn_inputs.len(), 1);
+        assert_eq!(state.queued_turn_inputs[0].input_id, None);
+
+        // The steer control status confirms the runtime queue id: the
+        // optimistic chip picks it up and becomes removable.
+        state.apply_event(ChatEvent::ControlStatus(control_status_with_queue(
+            &state.session_id.clone(),
+            Some(ChatQueuedTurnInput {
+                input_id: "task_queued_1".to_string(),
+                kind: ChatQueuedTurnInputKind::Steering,
+                message: "prefer AV1".to_string(),
+            }),
+            None,
+        )));
+        assert_eq!(
+            state.queued_turn_inputs.len(),
+            1,
+            "id attaches, no duplicate chip"
+        );
+        assert_eq!(
+            state.queued_turn_inputs[0].input_id.as_deref(),
+            Some("task_queued_1")
+        );
+
+        // Re-delivery of the same confirmation stays idempotent.
+        state.apply_event(ChatEvent::ControlStatus(control_status_with_queue(
+            &state.session_id.clone(),
+            Some(ChatQueuedTurnInput {
+                input_id: "task_queued_1".to_string(),
+                kind: ChatQueuedTurnInputKind::Steering,
+                message: "prefer AV1".to_string(),
+            }),
+            None,
+        )));
+        assert_eq!(state.queued_turn_inputs.len(), 1);
+
+        // A removal confirmation drops the chip.
+        state.apply_event(ChatEvent::ControlStatus(control_status_with_queue(
+            &state.session_id.clone(),
+            None,
+            Some("task_queued_1".to_string()),
+        )));
+        assert!(state.queued_turn_inputs.is_empty());
+    }
+
+    #[test]
+    fn control_state_queue_snapshot_is_authoritative_for_chips() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.streaming = true;
+        state.queued_turn_inputs.push(QueuedTurnInput {
+            kind: QueuedTurnKind::Steer,
+            text: "stale optimistic chip".to_string(),
+            input_id: None,
+        });
+
+        // The resume snapshot replaces local chips wholesale — including a
+        // follow-up queued from another surface that this composer never saw.
+        state.apply_event(ChatEvent::ControlState(
+            sinomo_cli::app_api::ChatControlState {
+                session_id: state.session_id.clone(),
+                accepted: true,
+                steering_count: 1,
+                follow_up_count: 1,
+                queued_inputs: vec![
+                    ChatQueuedTurnInput {
+                        input_id: "task_steer_1".to_string(),
+                        kind: ChatQueuedTurnInputKind::Steering,
+                        message: "prefer AV1".to_string(),
+                    },
+                    ChatQueuedTurnInput {
+                        input_id: "task_follow_1".to_string(),
+                        kind: ChatQueuedTurnInputKind::FollowUp,
+                        message: "share to #renders".to_string(),
+                    },
+                ],
+                ..Default::default()
+            },
+        ));
+        assert_eq!(
+            state.queued_turn_inputs,
+            vec![
+                QueuedTurnInput {
+                    kind: QueuedTurnKind::Steer,
+                    text: "prefer AV1".to_string(),
+                    input_id: Some("task_steer_1".to_string()),
+                },
+                QueuedTurnInput {
+                    kind: QueuedTurnKind::FollowUp,
+                    text: "share to #renders".to_string(),
+                    input_id: Some("task_follow_1".to_string()),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn remove_queued_turn_input_drops_chip_and_requires_id() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.queued_turn_inputs.push(QueuedTurnInput {
+            kind: QueuedTurnKind::Steer,
+            text: "not yet confirmed".to_string(),
+            input_id: None,
+        });
+        state.queued_turn_inputs.push(QueuedTurnInput {
+            kind: QueuedTurnKind::Steer,
+            text: "confirmed".to_string(),
+            input_id: Some("task_queued_2".to_string()),
+        });
+
+        // Without a runtime id there is nothing to address yet.
+        state.remove_queued_turn_input(0);
+        assert_eq!(state.queued_turn_inputs.len(), 2);
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("queued message is still registering")
+        );
+
+        // With an id the chip drops optimistically and the removal is issued.
+        state.remove_queued_turn_input(1);
+        assert_eq!(state.queued_turn_inputs.len(), 1);
+        assert_eq!(state.queued_turn_inputs[0].text, "not yet confirmed");
+        assert_eq!(state.notice.as_deref(), Some("removing queued message…"));
+
+        // Out-of-range indices are ignored.
+        state.remove_queued_turn_input(9);
+        assert_eq!(state.queued_turn_inputs.len(), 1);
+    }
+
+    #[test]
+    fn escape_closes_composer_popup_before_interrupting() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+
+        // Nothing open, nothing streaming: Esc is left for others.
+        assert!(!state.handle_escape());
+
+        // An open popup wins the first press.
+        state.streaming = true;
+        state.set_composer_popup(Some(ComposerPopup::Model));
+        assert!(state.handle_escape());
+        assert_eq!(state.composer_popup(), None);
+        assert!(state.streaming, "closing the popup must not interrupt");
+        assert_ne!(state.notice.as_deref(), Some("interrupting…"));
+
+        // The next press halts generation — interruption is first-class.
+        assert!(state.handle_escape());
+        assert_eq!(state.notice.as_deref(), Some("interrupting…"));
     }
 
     #[test]
@@ -16690,7 +17492,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_call_button_starts_media_call_and_opens_controls() -> sui::Result<()> {
+    fn rendered_voice_link_button_starts_media_call_and_opens_controls() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -16714,7 +17516,7 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Call")
+                .with_name("Start voice link")
                 .count()?,
             1
         );
@@ -16732,12 +17534,12 @@ mod tests {
                 .with_name("Start media call")
                 .count()?,
             0,
-            "idle media controls should be hidden until Call is opened"
+            "idle media controls should be hidden until the voice link opens"
         );
 
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Call")
+            .with_name("Start voice link")
             .click()?;
         assert!(shared.chat().media_call.active);
         assert!(shared.chat().media_call_details_visible());
@@ -17162,6 +17964,8 @@ mod tests {
                 task_count: 0,
                 terminal_result_count: 0,
                 tasks: Vec::new(),
+                queued_input: None,
+                removed_input_id: None,
             },
         ));
         assert!(state.streaming);
@@ -17205,6 +18009,8 @@ mod tests {
                 task_count: 0,
                 terminal_result_count: 1,
                 tasks: Vec::new(),
+                queued_input: None,
+                removed_input_id: None,
             },
         ));
 
@@ -18653,21 +19459,21 @@ mod tests {
         let chat_artifacts = chat_window.capture_artifacts()?;
         write_visual_debug_artifacts("chat", &chat_artifacts)?;
         let chat_viewport = assert_debug_artifacts_have_visual_content("chat", &chat_artifacts);
-        let clear = assert_node_inside_viewport(
+        let attach = assert_node_inside_viewport(
             "chat",
             &chat_artifacts,
             chat_viewport,
             SemanticsRole::Button,
-            "Clear draft",
+            "Attach files",
         );
         let send = assert_node_inside_viewport(
             "chat",
             &chat_artifacts,
             chat_viewport,
             SemanticsRole::Button,
-            "Send",
+            "Send message",
         );
-        assert_non_overlapping("chat draft action", clear, send);
+        assert_non_overlapping("chat composer bar action", attach, send);
         assert_node_inside_viewport(
             "chat",
             &chat_artifacts,
@@ -18809,9 +19615,11 @@ mod tests {
             0
         );
 
+        // The bar's attach button opens the attachments popup with the path
+        // entry visible.
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Attach file")
+            .with_name("Attach files")
             .click()?;
         assert!(shared.chat().attachment_controls_visible());
         assert_eq!(
@@ -18868,19 +19676,21 @@ mod tests {
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
+        // Each attachment is removable from two surfaces at once: the popup
+        // drawer chip and the composer field's context row chip.
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
                 .with_name("Remove report-a.txt")
                 .count()?,
-            1
+            2
         );
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
                 .with_name("Remove report-e.txt")
                 .count()?,
-            1,
+            2,
             "the open attachment drawer should expose later chips through wrapped layout"
         );
 
@@ -18888,7 +19698,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_attachment_chips_collapse_when_control_row_is_narrow() -> sui::Result<()> {
+    fn rendered_attachment_chips_stay_visible_when_composer_is_narrow() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -18919,13 +19729,6 @@ mod tests {
             1,
             "desktop-width composer should show removable attachment chips"
         );
-        assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("2 attachments")
-                .count()?,
-            0
-        );
 
         window
             .root()
@@ -18934,21 +19737,24 @@ mod tests {
             ))))?;
         window.run_until_idle()?;
 
+        // Mesh: context chips ride on top of the field and wrap — a narrow
+        // composer keeps every attachment visible and removable instead of
+        // collapsing them behind a summary dropdown.
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
                 .with_name("Remove report-a.txt")
                 .count()?,
-            0,
-            "narrow composer should collapse attachment chips"
+            1,
+            "narrow composer keeps attachment chips visible"
         );
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("2 attachments")
+                .with_name("Remove report-b.txt")
                 .count()?,
             1,
-            "narrow composer should expose attachments through the dropdown"
+            "narrow composer keeps later chips reachable through wrapping"
         );
 
         Ok(())

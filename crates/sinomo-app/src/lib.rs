@@ -60,6 +60,7 @@ pub fn build_runtime(shared: Shared) -> sui::Result<sui::Runtime> {
 /// once it's ready. This keeps launch responsive even when the in-process daemon takes a moment.
 #[cfg(feature = "desktop")]
 pub fn run() -> sui::Result<()> {
+    install_app_observability();
     let shared = Shared::new(AppState::connecting());
     let app = build_application(shared.clone())?;
     app.run_with_handle(move |ui| {
@@ -77,7 +78,12 @@ pub fn run() -> sui::Result<()> {
                 tracing::info!(mode = %backend.mode_label(), "sinomo-app connected");
                 let _ = tx.send(ConnectEvent::Status("Loading workspace…".to_string()));
                 ui.wake();
-                let ready = ReadyState::build_with_waker(backend, Some(ui.clone()));
+                let ready =
+                    ReadyState::build_with_waker_and_progress(backend, Some(ui.clone()), |status| {
+                        tracing::info!(%status, "sinomo-app launch step");
+                        let _ = tx.send(ConnectEvent::Status(status.to_string()));
+                        ui.wake();
+                    });
                 let _ = tx.send(ConnectEvent::Connected(Box::new(ready)));
                 ui.wake();
             })
@@ -88,6 +94,7 @@ pub fn run() -> sui::Result<()> {
 /// Build and run the Android application from the NativeActivity entrypoint.
 #[cfg(all(target_os = "android", feature = "mobile"))]
 pub fn run_android(android_app: sui::AndroidApp) -> sui::Result<()> {
+    install_app_observability();
     let shared = Shared::new(AppState::connecting());
     let app = build_application(shared.clone())?;
     app.run_android_with_handle(android_app, move |ui| {
@@ -104,12 +111,61 @@ pub fn run_android(android_app: sui::AndroidApp) -> sui::Result<()> {
                 tracing::info!(mode = %backend.mode_label(), "sinomo-app connected");
                 let _ = tx.send(ConnectEvent::Status("Loading workspace…".to_string()));
                 ui.wake();
-                let ready = ReadyState::build_with_waker(backend, Some(ui.clone()));
+                let ready =
+                    ReadyState::build_with_waker_and_progress(backend, Some(ui.clone()), |status| {
+                        tracing::info!(%status, "sinomo-app launch step");
+                        let _ = tx.send(ConnectEvent::Status(status.to_string()));
+                        ui.wake();
+                    });
                 let _ = tx.send(ConnectEvent::Connected(Box::new(ready)));
                 ui.wake();
             })
             .expect("spawn connect thread");
     })
+}
+
+/// Install the observe/tracing runtime with the app's log file
+/// (`<data_dir>/logs/app.log`) as an additional sink. The graphical app has no
+/// supervised stdout, so without this every `tracing` diagnostic — including
+/// launch-stall and SIFS-degradation warnings — would be silently dropped. Errors
+/// here must never stop the app from opening.
+#[cfg(any(feature = "desktop", all(target_os = "android", feature = "mobile")))]
+fn install_app_observability() {
+    let data_dir = crate::backend::app_config::default_data_dir();
+    let logs_dir = data_dir.root().join("logs");
+    let log_path = logs_dir.join("app.log");
+    let _ = std::fs::create_dir_all(&logs_dir);
+    rotate_app_log_if_large(&log_path);
+    let config = sinomo_runtime::observe::ObserveRuntimeConfig::process("app", None);
+    match sinomo_runtime::observe::init_observe_runtime_with_log_file(config, &log_path) {
+        Ok(()) => {
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                log = %log_path.display(),
+                "sinomo-app starting"
+            );
+        }
+        Err(error) => {
+            eprintln!("sinomo-app: observability init failed: {error}");
+        }
+    }
+}
+
+/// Keep the append-only app log bounded: past ~5 MB the previous log rolls to
+/// `app.log.1` (replacing the roll before it) at startup.
+#[cfg(any(feature = "desktop", all(target_os = "android", feature = "mobile")))]
+fn rotate_app_log_if_large(path: &std::path::Path) {
+    const MAX_APP_LOG_BYTES: u64 = 5 * 1024 * 1024;
+    let large = std::fs::metadata(path)
+        .map(|meta| meta.len() > MAX_APP_LOG_BYTES)
+        .unwrap_or(false);
+    if large {
+        let mut rotated = path.as_os_str().to_owned();
+        rotated.push(".1");
+        let rotated = std::path::PathBuf::from(rotated);
+        let _ = std::fs::remove_file(&rotated);
+        let _ = std::fs::rename(path, rotated);
+    }
 }
 
 #[cfg(test)]

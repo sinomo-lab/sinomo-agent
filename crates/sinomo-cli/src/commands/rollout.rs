@@ -1318,10 +1318,10 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
                         );
                     } else {
                         println!("{}: {}", target.label(), response.status);
-                        if response.status == "accepted"
-                            && let Some(node_id) = target.rollout_node_id()
-                        {
-                            completed_rollout_nodes.insert(node_id.clone());
+                        if response.status == "accepted" {
+                            if let Some(node_id) = target.rollout_node_id() {
+                                completed_rollout_nodes.insert(node_id.clone());
+                            }
                         }
                     }
                     if !response.detail.is_empty() {
@@ -1364,10 +1364,10 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
         match send_prepared_daemon_rollout_binary(&target, request) {
             Ok(response) => {
                 println!("{}: {}", target.label(), response.status);
-                if response.status == "accepted"
-                    && let Some(node_id) = target.rollout_node_id()
-                {
-                    completed_rollout_nodes.insert(node_id.clone());
+                if response.status == "accepted" {
+                    if let Some(node_id) = target.rollout_node_id() {
+                        completed_rollout_nodes.insert(node_id.clone());
+                    }
                 }
                 if !response.detail.is_empty() {
                     println!("  {}", response.detail);

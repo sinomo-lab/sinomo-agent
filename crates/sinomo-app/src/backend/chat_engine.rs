@@ -14,15 +14,16 @@ use std::thread::JoinHandle;
 
 use sinomo_agent::{
     AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentSessionControlResult,
-    AgentSessionFollowUpRequest, AgentSessionInterruptRequest, AgentSessionResumeRequest,
-    AgentSessionResumeResponse, AgentSessionSteerRequest, AgentTaskLifecycleStatus,
-    AgentTaskSnapshot,
+    AgentSessionFollowUpRequest, AgentSessionInterruptRequest,
+    AgentSessionRemoveQueuedInputRequest, AgentSessionResumeRequest, AgentSessionResumeResponse,
+    AgentSessionSteerRequest, AgentTaskLifecycleStatus, AgentTaskSnapshot, TaskId,
 };
 use sinomo_cli::app_api::{
     AgentChat, AgentChatSifsStorage, ChatAttachmentInput, ChatContextSnapshot, ChatControlState,
     ChatControlStatus, ChatHistoryMessage, ChatProcessSnapshot, ChatRuntimeInfo, ChatSpeaker,
     ChatStreamEvent, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
-    ChatUsageSnapshot,
+    ChatUsageSnapshot, chat_queued_input_from_events, chat_queued_inputs_from_session,
+    chat_removed_input_id_from_events,
 };
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
@@ -93,6 +94,12 @@ pub enum ChatCommand {
     FollowUp {
         session_id: String,
         message: String,
+    },
+    /// Remove a queued steering/follow-up message (by queue id) before the
+    /// runtime consumes it.
+    RemoveQueuedInput {
+        session_id: String,
+        input_id: String,
     },
     Interrupt {
         session_id: String,
@@ -296,6 +303,12 @@ impl ChatHandle {
                 session_id,
                 message,
             } => self.direct_control.follow_up(session_id, message),
+            ChatCommand::RemoveQueuedInput {
+                session_id,
+                input_id,
+            } => self
+                .direct_control
+                .remove_queued_input(session_id, input_id),
             ChatCommand::Interrupt { session_id, reason } => {
                 self.direct_control.interrupt(session_id, reason)
             }
@@ -356,6 +369,31 @@ impl DirectControl {
                     .follow_up(AgentSessionFollowUpRequest {
                         session_id,
                         message,
+                    })
+                    .map(|result| ChatEvent::ControlStatus(chat_control_status(result)))
+            },
+        );
+    }
+
+    fn remove_queued_input(&self, requested_session_id: String, input_id: String) {
+        let input_id = match input_id.parse::<TaskId>() {
+            Ok(input_id) => input_id,
+            Err(error) => {
+                self.evt_tx.send(ChatEvent::Error {
+                    session_id: Some(requested_session_id),
+                    error: format!("remove queued input failed: invalid input id: {error}"),
+                });
+                return;
+            }
+        };
+        self.spawn(
+            "remove queued input",
+            requested_session_id,
+            move |registry, session_id| {
+                registry
+                    .remove_queued_input(AgentSessionRemoveQueuedInputRequest {
+                        session_id,
+                        input_id,
                     })
                     .map(|result| ChatEvent::ControlStatus(chat_control_status(result)))
             },
@@ -491,6 +529,8 @@ fn chat_control_status(result: AgentSessionControlResult) -> ChatControlStatus {
             .iter()
             .map(chat_task_snapshot)
             .collect(),
+        queued_input: chat_queued_input_from_events(&result.events),
+        removed_input_id: chat_removed_input_id_from_events(&result.events),
     }
 }
 
@@ -511,6 +551,11 @@ fn chat_control_state(response: AgentSessionResumeResponse) -> ChatControlState 
         .as_ref()
         .map(|session| (session.steering_queue.len(), session.follow_up_queue.len()))
         .unwrap_or((0, 0));
+    let queued_inputs = response
+        .session
+        .as_ref()
+        .map(chat_queued_inputs_from_session)
+        .unwrap_or_default();
     ChatControlState {
         session_id: response.session_id.to_string(),
         accepted: response.accepted,
@@ -530,6 +575,7 @@ fn chat_control_state(response: AgentSessionResumeResponse) -> ChatControlState 
         event_cursor_offset: response.event_cursor.offset,
         steering_count,
         follow_up_count,
+        queued_inputs,
         detail: response.detail,
     }
 }
@@ -726,6 +772,25 @@ fn worker(
                     });
                 }
             },
+            ChatCommand::RemoveQueuedInput { input_id, .. } => {
+                match input_id
+                    .parse::<TaskId>()
+                    .map_err(|error| format!("invalid input id: {error}"))
+                    .and_then(|input_id| {
+                        chat.remove_queued_input(input_id)
+                            .map_err(|error| error.to_string())
+                    }) {
+                    Ok(status) => {
+                        let _ = evt_tx.send(ChatEvent::ControlStatus(status));
+                    }
+                    Err(error) => {
+                        let _ = evt_tx.send(ChatEvent::Error {
+                            session_id: Some(chat.session_id()),
+                            error: format!("remove queued input failed: {error}"),
+                        });
+                    }
+                }
+            }
             ChatCommand::Interrupt { reason, .. } => match chat.interrupt(reason) {
                 Ok(status) => {
                     let _ = evt_tx.send(ChatEvent::ControlStatus(status));
@@ -899,10 +964,14 @@ mod tests {
             matches!(event, ChatEvent::ControlStatus(status) if status.session_id == session_id)
         })
         .expect("steer status");
-        assert!(matches!(
-            steer,
-            ChatEvent::ControlStatus(status) if status.accepted
-        ));
+        let ChatEvent::ControlStatus(steer_status) = steer else {
+            panic!("steer wait returned a non-status event");
+        };
+        assert!(steer_status.accepted);
+        let queued_input = steer_status
+            .queued_input
+            .expect("steer status carries the runtime queue id");
+        assert_eq!(queued_input.message, "keep this constraint");
 
         handle.send_command(ChatCommand::FollowUp {
             session_id: session_id.clone(),
@@ -927,10 +996,45 @@ mod tests {
                     if state.session_id == session_id
                         && state.steering_count == 1
                         && state.follow_up_count == 1
+                        && state.queued_inputs.len() == 2
             )
         })
         .expect("updated control state");
         assert!(matches!(state, ChatEvent::ControlState(_)));
+
+        // The queued steering message is removable by its runtime id; the
+        // follow-up stays queued.
+        handle.send_command(ChatCommand::RemoveQueuedInput {
+            session_id: session_id.clone(),
+            input_id: queued_input.input_id.clone(),
+        });
+        let removed = wait_for_event(&handle, |event| {
+            matches!(
+                event,
+                ChatEvent::ControlStatus(status)
+                    if status.removed_input_id.as_deref() == Some(queued_input.input_id.as_str())
+            )
+        })
+        .expect("remove status");
+        assert!(matches!(
+            removed,
+            ChatEvent::ControlStatus(status) if status.accepted
+        ));
+
+        handle.send_command(ChatCommand::ControlState {
+            session_id: session_id.clone(),
+        });
+        wait_for_event(&handle, |event| {
+            matches!(
+                event,
+                ChatEvent::ControlState(state)
+                    if state.session_id == session_id
+                        && state.steering_count == 0
+                        && state.follow_up_count == 1
+                        && state.queued_inputs.len() == 1
+            )
+        })
+        .expect("control state after removal");
 
         let new_session_id = SessionId::from_legacy_named("sess_chat_new_session")
             .expect("session id")
@@ -1095,6 +1199,13 @@ mod tests {
                 .lock()
                 .expect("follow-up lock")
                 .push(message);
+            Ok(self.result())
+        }
+
+        fn remove_queued_input(
+            &self,
+            _input_id: TaskId,
+        ) -> Result<AgentSessionControlResult, sinomo_agent::AgentRuntimeControlError> {
             Ok(self.result())
         }
 

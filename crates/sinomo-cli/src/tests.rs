@@ -949,6 +949,10 @@ fn cluster_health_daemon_rpc_timeout_covers_health_probe_budget() {
         CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT >= CLUSTER_HEALTH_PROBE_TIMEOUT,
         "cluster health must not time out the daemon aggregation before the bounded health probe budget elapses"
     );
+    assert!(
+        CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT <= std::time::Duration::from_secs(5),
+        "cluster health is a hard 5s gate"
+    );
 }
 
 #[test]

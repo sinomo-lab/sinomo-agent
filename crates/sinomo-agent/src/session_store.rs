@@ -438,6 +438,12 @@ pub enum AgentSessionStoreRecordKind {
     FollowUpQueued {
         follow_up: AgentFollowUpMessage,
     },
+    SteeringRemoved {
+        steering: AgentSteeringMessage,
+    },
+    FollowUpRemoved {
+        follow_up: AgentFollowUpMessage,
+    },
     Compacted {
         summary: AgentCompactionSummary,
         item_count: usize,
