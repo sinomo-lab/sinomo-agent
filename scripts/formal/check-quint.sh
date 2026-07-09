@@ -11,6 +11,10 @@ network_endpoint_verify_steps="${QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS:-4}"
 network_route_verify_steps="${QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS:-4}"
 network_delivery_verify_steps="${QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS:-5}"
 network_attempt_budget_verify_steps="${QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS:-3}"
+network_timed_transport_verify_steps="${QUINT_NETWORK_TIMED_TRANSPORT_VERIFY_MAX_STEPS:-4}"
+network_timed_delivery_verify_steps="${QUINT_NETWORK_TIMED_DELIVERY_VERIFY_MAX_STEPS:-4}"
+network_timed_smoke_run_steps="${QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_STEPS:-80}"
+network_timed_smoke_run_samples="${QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_SAMPLES:-500}"
 system_smoke_run_steps="${QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS:-80}"
 system_smoke_run_samples="${QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES:-500}"
 dfs_routing_verify_steps="${QUINT_DFS_ROUTING_VERIFY_MAX_STEPS:-$verify_steps}"
@@ -76,6 +80,15 @@ run_system_smoke() {
     --verbosity=1
 }
 
+run_network_timed_smoke() {
+  quint run specs/quint/scenarios/network/timed_delivery_smoke.qnt \
+    --main=network_timed_delivery_smoke \
+    --invariant=safety \
+    --max-steps="$network_timed_smoke_run_steps" \
+    --max-samples="$network_timed_smoke_run_samples" \
+    --verbosity=1
+}
+
 typecheck_all
 
 run_check specs/quint/checks/kv/raft_kv_safety.qnt raft_kv_safety
@@ -84,6 +97,9 @@ run_check specs/quint/checks/network/endpoint_selection_safety.qnt network_endpo
 run_check specs/quint/checks/network/route_planning_safety.qnt network_route_planning_safety
 run_check specs/quint/checks/network/delivery_retry_safety.qnt network_delivery_retry_safety
 run_check specs/quint/checks/network/attempt_budget_safety.qnt network_attempt_budget_safety
+run_check specs/quint/checks/network/timed_transport_safety.qnt network_timed_transport_safety
+run_check specs/quint/checks/network/timed_delivery_retry_safety.qnt network_timed_delivery_retry_safety
+run_network_timed_smoke
 run_system_smoke
 run_check specs/quint/checks/membership/membership_safety.qnt membership_safety
 run_check specs/quint/checks/membership/membership_kv_safety.qnt membership_kv_safety --step=step
@@ -114,6 +130,8 @@ verify_check specs/quint/checks/network/endpoint_selection_safety.qnt network_en
 verify_check specs/quint/checks/network/route_planning_safety.qnt network_route_planning_safety "$network_route_verify_steps"
 verify_check specs/quint/checks/network/delivery_retry_safety.qnt network_delivery_retry_safety "$network_delivery_verify_steps"
 verify_check specs/quint/checks/network/attempt_budget_safety.qnt network_attempt_budget_safety "$network_attempt_budget_verify_steps"
+verify_check specs/quint/checks/network/timed_transport_safety.qnt network_timed_transport_safety "$network_timed_transport_verify_steps"
+verify_check specs/quint/checks/network/timed_delivery_retry_safety.qnt network_timed_delivery_retry_safety "$network_timed_delivery_verify_steps"
 verify_check specs/quint/checks/membership/membership_safety.qnt membership_safety "$membership_verify_steps"
 verify_check specs/quint/checks/membership/membership_kv_safety.qnt membership_kv_safety "$membership_kv_verify_steps" --backend=tlc --step=stepCore
 verify_check specs/quint/checks/dfs/metadata_safety.qnt dfs_metadata_safety "$verify_steps"

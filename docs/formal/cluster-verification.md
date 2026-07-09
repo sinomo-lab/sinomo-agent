@@ -46,8 +46,10 @@ The model inventory is split by subsystem:
   KV-state replay from the committed log. Its invariant entrypoint is
   `checks/kv/raft_kv_safety.qnt`.
 - `models/network/` contains the base network mechanism, endpoint selection,
-  route planning, delivery retry, and endpoint attempt-budget models. Matching
-  invariant entrypoints live under `checks/network/`.
+  route planning, delivery retry, endpoint attempt-budget, timed transport, and
+  timed delivery-retry models. Matching invariant entrypoints live under
+  `checks/network/`, and `scenarios/network/timed_delivery_smoke.qnt` composes
+  the timed transport and retry layers for randomized exploration.
 - `models/membership/` contains standalone membership authority and the
   membership/KV bridge over the abstract committed-prefix contract. Matching
   invariant entrypoints live under `checks/membership/`.
@@ -174,6 +176,48 @@ the per-endpoint attempt loop, and `RelayEnvelope`'s stable inner request. It
 models duplicate suppression as a replay-cache contract at the delivery-key
 level; concrete daemon-auth nonce handling stays in Rust tests because each
 endpoint attempt still needs a fresh transport nonce.
+
+The `network_timed_transport_safety.safety` invariant combines these
+properties:
+
+- logical transport time stays within the finite model bound;
+- in-flight, dropped, and delivered packet copies all refer to sent copies;
+- sent copies have bounded send, deliverable, and expiry times;
+- delivery cannot occur before send time, before the deliverable time, or after
+  packet expiry;
+- delivery records that source, target, and link were live at the delivery
+  step;
+- dropped copies are no longer in flight;
+- if the original packet is dropped before any delivery and no duplicate was
+  created before that drop, no later copy can produce delivery;
+- duplicate copies cannot exist before the original and preserve the original
+  packet expiry.
+
+The `network_timed_delivery_retry_safety.safety` invariant combines these
+properties:
+
+- request time and global deadline stay inside the bounded logical clock;
+- endpoint attempts require a prepared stable delivery key;
+- per-attempt timeout and accepted-attempt timeout never extend the global
+  deadline;
+- primary and fallback attempts reuse the original stable delivery key while
+  using distinct transport attempt nonces;
+- accepted responses arrive before both the global deadline and the current
+  attempt timeout;
+- accepted responses were due, came from an attempted endpoint, and came from an
+  endpoint configured to respond;
+- late responses do not dispatch the request;
+- terminal `TimedDeadlineExpired` requires the logical clock to have reached the
+  global deadline;
+- `TimedAllEndpointsFailed` cannot skip a usable fallback while time remains;
+- failed, timed-out, and suppressed endpoints were attempted;
+- identity-mismatch endpoint failures suppress the endpoint;
+- duplicate replay does not redispatch the already completed request.
+
+These timed models are still finite and safety-oriented. They model bounded
+logical time, packet loss, delay, duplication, per-attempt timeout, late
+responses, and fallback behavior; they do not yet prove unbounded real-time
+fairness or scheduler progress.
 
 The full-system smoke model is intentionally different from the focused proof
 modules. `system_base` owns one shared cross-layer state vocabulary, and
@@ -609,17 +653,21 @@ find specs/quint -name '*.qnt' -print0 | sort -z | xargs -0 -n1 quint typecheck
 
 quint run specs/quint/checks/kv/raft_kv_safety.qnt --main=raft_kv_safety --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/checks/network/route_planning_safety.qnt --main=network_route_planning_safety --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
+quint run specs/quint/checks/network/timed_delivery_retry_safety.qnt --main=network_timed_delivery_retry_safety --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
+quint run specs/quint/scenarios/network/timed_delivery_smoke.qnt --main=network_timed_delivery_smoke --invariant=safety --max-steps=80 --max-samples=500 --verbosity=1
 quint run specs/quint/checks/dfs/posix_namespace_safety.qnt --main=dfs_posix_namespace_safety --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/scenarios/system/smoke.qnt --main=system_smoke --invariant=safety --max-steps=80 --max-samples=500 --verbosity=1
 
 quint verify specs/quint/checks/kv/raft_kv_safety.qnt --main=raft_kv_safety --invariant=safety --max-steps=5 --verbosity=1
 quint verify specs/quint/checks/network/route_planning_safety.qnt --main=network_route_planning_safety --invariant=safety --max-steps=4 --verbosity=1
+quint verify specs/quint/checks/network/timed_delivery_retry_safety.qnt --main=network_timed_delivery_retry_safety --invariant=safety --max-steps=4 --verbosity=1
 quint verify specs/quint/checks/dfs/posix_namespace_safety.qnt --main=dfs_posix_namespace_safety --invariant=safety --max-steps=2 --verbosity=1
 ```
 
 `check-quint.sh` repeats this `checks/<subsystem>/*_safety.qnt` run/verify
-pattern for every focused invariant suite, and runs the full-system smoke
-scenario from `scenarios/system/smoke.qnt`.
+pattern for every focused invariant suite, runs the timed network smoke
+scenario from `scenarios/network/timed_delivery_smoke.qnt`, and runs the
+full-system smoke scenario from `scenarios/system/smoke.qnt`.
 
 The default symbolic bound is deliberately modest. On this checkout,
 the Raft, network, DFS metadata, and DFS routing specs use
@@ -633,6 +681,11 @@ planning spec uses `QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS`, defaulting to 4; its
 uses `QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS`, defaulting to 5; its isolated
 6-step symbolic check passed in about 6 seconds. The network attempt-budget spec
 uses `QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS`, defaulting to 3. The
+timed transport and timed delivery-retry specs use
+`QUINT_NETWORK_TIMED_TRANSPORT_VERIFY_MAX_STEPS` and
+`QUINT_NETWORK_TIMED_DELIVERY_VERIFY_MAX_STEPS`, each defaulting to 4. The
+timed network smoke scenario uses `QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_STEPS` and
+`QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_SAMPLES`, defaulting to 80 and 500. The
 read-freshness, routed namespace-freshness, and metadata-primary failover specs
 use `QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS`,
 `QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS`, and
@@ -683,7 +736,7 @@ broader random exploration and seed-based replay.
 Use larger bounds for local audit runs, not as a routine CI gate:
 
 ```bash
-QUINT_VERIFY_MAX_STEPS=8 QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS=6 QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS=4 QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS=240 QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES=10000 QUINT_DFS_ROUTING_VERIFY_MAX_STEPS=6 QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS=4 QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_NAMESPACE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_LINKS_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_CROSS_SHARD_VERIFY_MAX_STEPS=3 QUINT_DFS_POSIX_READ_WRITE_VERIFY_MAX_STEPS=2 QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS=4 QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_SHARDED_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_JOURNAL_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_VERIFY_MAX_STEPS=6 QUINT_DFS_REPLICATION_VERIFY_MAX_STEPS=6 QUINT_DFS_NO_CONFLICT_VERIFY_MAX_STEPS=6 QUINT_DFS_PENDING_VERIFY_MAX_STEPS=4 QUINT_DFS_REPAIR_CONTENT_VERIFY_MAX_STEPS=6 QUINT_DFS_CHUNKED_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_LOST_AUTHORITY_VERIFY_MAX_STEPS=5 QUINT_DFS_ANTI_ENTROPY_VERIFY_MAX_STEPS=6 QUINT_MEMBERSHIP_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_KV_VERIFY_MAX_STEPS=5 bash scripts/formal/check-quint.sh
+QUINT_VERIFY_MAX_STEPS=8 QUINT_NETWORK_ENDPOINT_VERIFY_MAX_STEPS=5 QUINT_NETWORK_ROUTE_VERIFY_MAX_STEPS=5 QUINT_NETWORK_DELIVERY_VERIFY_MAX_STEPS=6 QUINT_NETWORK_ATTEMPT_BUDGET_VERIFY_MAX_STEPS=4 QUINT_NETWORK_TIMED_TRANSPORT_VERIFY_MAX_STEPS=5 QUINT_NETWORK_TIMED_DELIVERY_VERIFY_MAX_STEPS=5 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_STEPS=160 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_SAMPLES=5000 QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS=240 QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES=10000 QUINT_DFS_ROUTING_VERIFY_MAX_STEPS=6 QUINT_DFS_READ_FRESHNESS_VERIFY_MAX_STEPS=4 QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS=4 QUINT_DFS_POSIX_NAMESPACE_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_LINKS_VERIFY_MAX_STEPS=2 QUINT_DFS_POSIX_CROSS_SHARD_VERIFY_MAX_STEPS=3 QUINT_DFS_POSIX_READ_WRITE_VERIFY_MAX_STEPS=2 QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS=4 QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_SHARDED_NAMESPACE_VERIFY_MAX_STEPS=6 QUINT_DFS_JOURNAL_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_VERIFY_MAX_STEPS=6 QUINT_DFS_REPLICATION_VERIFY_MAX_STEPS=6 QUINT_DFS_NO_CONFLICT_VERIFY_MAX_STEPS=6 QUINT_DFS_PENDING_VERIFY_MAX_STEPS=4 QUINT_DFS_REPAIR_CONTENT_VERIFY_MAX_STEPS=6 QUINT_DFS_CHUNKED_VERIFY_MAX_STEPS=6 QUINT_DFS_REPAIR_LOST_AUTHORITY_VERIFY_MAX_STEPS=5 QUINT_DFS_ANTI_ENTROPY_VERIFY_MAX_STEPS=6 QUINT_MEMBERSHIP_VERIFY_MAX_STEPS=5 QUINT_MEMBERSHIP_KV_VERIFY_MAX_STEPS=5 bash scripts/formal/check-quint.sh
 ```
 
 ## Current Abstractions
@@ -705,7 +758,8 @@ This slice does not yet model:
   contents;
 - route-table cache invalidation, live `ClusterDirectory` read failures during
   an in-flight delivery, raw streamed response retry budgets, concrete transport
-  nonce generation, and dynamic module enable/disable races;
+  nonce entropy, unbounded wall-clock fairness, and dynamic module
+  enable/disable races;
 - directory fragments, local-owned owner routing, owner-inclusion replica-set
   normalization, cross-primary repair handoff progress, router-local recovery
   after sharded namespace index write failures, chunked patch offset/base
@@ -726,10 +780,15 @@ semantics.
    directory-version changes, local connectivity file marks, and module dialer
    snapshots. Prove that stale cached route plans are not reused after the
    inputs that affect route validity change.
-2. **Purpose-specific endpoint selectors.** Refine `network_endpoint_selection`
+2. **Timed retry conformance tests.** Add deterministic Rust tests with virtual
+   time for the finite scenarios in `network_timed_transport` and
+   `network_timed_delivery_retry`: delayed response after deadline, primary
+   timeout plus fallback success, packet drop with pre-drop duplicate, and
+   identity mismatch suppression.
+3. **Purpose-specific endpoint selectors.** Refine `network_endpoint_selection`
    for rollout, Raft replication, member status, and data-plane selectors. Prove
    each purpose's special ranking still preserves the shared safety rules.
-3. **Stream and raw-response retry budgets.** Extend `network_delivery_retry`
+4. **Stream and raw-response retry budgets.** Extend `network_delivery_retry`
    with streamed routes and raw-response capability flags. Prove that fallback
    attempts cannot silently expand the caller's deadline or send raw streams to
    transports that cannot carry them.
