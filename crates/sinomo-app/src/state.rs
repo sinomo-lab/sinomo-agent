@@ -10,6 +10,7 @@ use std::cell::{Ref, RefCell, RefMut};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+use std::time::Instant;
 
 use sui::{DefaultTheme, WindowRenderOptions};
 
@@ -95,15 +96,32 @@ impl ReadyState {
     }
 
     pub fn build_with_waker(backend: Backend, waker: Option<sui::UiHandle>) -> Self {
+        Self::build_with_waker_and_progress(backend, waker, |_| {})
+    }
+
+    /// Like [`build_with_waker`](Self::build_with_waker), reporting each stage through
+    /// `progress` so the launch status names the step in flight instead of an opaque
+    /// "Loading workspace…". If a stage ever stalls (regressions here have wedged the
+    /// boot behind distributed-file-system timeouts), the stuck step stays on screen.
+    pub fn build_with_waker_and_progress(
+        backend: Backend,
+        waker: Option<sui::UiHandle>,
+        progress: impl Fn(&str),
+    ) -> Self {
         let interactive = waker.is_some();
+        progress("Starting the chat engine…");
         let chat = ChatState::new_with_waker(&backend, waker);
+        progress("Preparing self-evolution…");
         let evolution = if interactive {
             EvolutionState::new_lightweight(&backend)
         } else {
             EvolutionState::new(&backend)
         };
+        progress("Reading cluster status…");
         let cluster = ClusterState::new(&backend);
+        progress("Preparing the file browser…");
         let files = FilesState::new(&backend);
+        progress("Reading settings…");
         let settings = if interactive {
             SettingsState::new_lightweight(&backend)
         } else {
@@ -128,6 +146,10 @@ pub struct AppState {
     pub data_dir: Arc<SinomoDataDir>,
     /// Live status line for the title-bar indicator while connecting.
     pub status: String,
+    /// When the current `status` line was set — the loading screen surfaces the
+    /// elapsed time once a launch step stalls, so a wedged step is visible instead
+    /// of an apparently frozen "Loading…".
+    pub status_since: Option<Instant>,
     /// `Some` once the backend connection has resolved.
     pub ready: Option<ReadyState>,
     /// Channel from the background connect thread (drained by the shell on wake).
@@ -149,6 +171,7 @@ impl AppState {
             render_mode,
             data_dir,
             status: "Starting…".to_string(),
+            status_since: Some(Instant::now()),
             ready: None,
             connect_rx: None,
             waker: None,
@@ -167,6 +190,7 @@ impl AppState {
             render_mode,
             data_dir,
             status: backend.mode_label(),
+            status_since: None,
             ready: Some(ReadyState::build(backend)),
             connect_rx: None,
             waker: None,
@@ -233,6 +257,16 @@ impl Shared {
             Some(ready) => ready.backend.mode_label(),
             None => state.status.clone(),
         }
+    }
+
+    /// Seconds the current launch step has been in flight (`None` once ready). The
+    /// loading screen uses this to surface a stalled step.
+    pub fn status_elapsed_secs(&self) -> Option<u64> {
+        let state = self.0.borrow();
+        if state.ready.is_some() {
+            return None;
+        }
+        state.status_since.map(|since| since.elapsed().as_secs())
     }
 
     /// One-line connection detail (daemon address/cluster once connected, else progress).
@@ -329,7 +363,11 @@ impl Shared {
         for event in events {
             match event {
                 ConnectEvent::Status(status) => {
-                    self.0.borrow_mut().status = status;
+                    let mut state = self.0.borrow_mut();
+                    if state.status != status {
+                        state.status = status;
+                        state.status_since = Some(Instant::now());
+                    }
                     changed = true;
                 }
                 ConnectEvent::Connected(ready) => {
@@ -341,6 +379,7 @@ impl Shared {
                     state.render_mode = render_mode;
                     state.data_dir = data_dir;
                     state.status = ready.backend.mode_label();
+                    state.status_since = None;
                     state.ready = Some(*ready);
                     state.connect_rx = None;
                     changed = true;
@@ -377,5 +416,43 @@ impl Shared {
         if let Err(error) = app_config::save_render_mode(&data_dir, mode) {
             tracing::warn!(%error, "failed to persist app render preference");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn pump_connect_tracks_launch_step_transitions() {
+        let shared = Shared::new(AppState::connecting());
+        let (tx, rx) = mpsc::channel();
+        shared.borrow_mut().connect_rx = Some(rx);
+
+        tx.send(ConnectEvent::Status("Starting the chat engine…".to_string()))
+            .expect("send status");
+        let (changed, became_ready) = shared.pump_connect();
+        assert!(changed);
+        assert!(!became_ready);
+        assert_eq!(shared.borrow().status, "Starting the chat engine…");
+        let first_since = shared.borrow().status_since.expect("step start time");
+        assert!(shared.status_elapsed_secs().is_some());
+
+        // The same status again must not reset the step clock — the elapsed time
+        // is what makes a stalled step visible on the loading screen.
+        tx.send(ConnectEvent::Status("Starting the chat engine…".to_string()))
+            .expect("send status");
+        let (changed, _) = shared.pump_connect();
+        assert!(changed);
+        assert_eq!(shared.borrow().status_since, Some(first_since));
+
+        // A new step restarts the clock.
+        tx.send(ConnectEvent::Status("Reading settings…".to_string()))
+            .expect("send status");
+        shared.pump_connect();
+        assert_eq!(shared.borrow().status, "Reading settings…");
+        let second_since = shared.borrow().status_since.expect("new step start time");
+        assert!(second_since >= first_since);
     }
 }

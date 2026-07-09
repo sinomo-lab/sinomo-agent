@@ -76,7 +76,8 @@ use sinomo_cli::app_api::{
     AgentChatSifsStorage, AgentSummary, ChatAttachmentInput, ChatContextSnapshot,
     ChatHistoryMessage, ChatProcessSnapshot, ChatQueuedTurnInput, ChatQueuedTurnInputKind,
     ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection, ChatUsageSnapshot,
-    ProviderSummary, SifsAgentChannelStore, agent_summaries, reasoning_efforts,
+    ProviderSummary, SifsAgentChannelStore, agent_summaries, agent_summaries_with_error,
+    built_in_agent_summaries, reasoning_efforts,
 };
 use sinomo_runtime::{config::ConfigClient, events::SessionId, local::SinomoDataDir};
 
@@ -129,6 +130,9 @@ const COMPOSER_INPUT_PAD_Y: f32 = 14.0;
 const COMPOSER_HINT_MIN_W: f32 = 560.0;
 const SESSION_LIST_UI_TIMEOUT: Duration = Duration::from_secs(8);
 const TRANSCRIPT_LOAD_UI_TIMEOUT: Duration = Duration::from_secs(8);
+/// Budget for the background SIFS-backed agent-catalog load; past this the app
+/// keeps the built-in agents and reports the catalog as degraded.
+const AGENT_CATALOG_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 const TOOL_CHAIN_COLLAPSE_AFTER: usize = 1;
 const TOOL_DETAIL_COLLAPSE_CHARS: usize = 420;
 const TOOL_DETAIL_PREVIEW_CHARS: usize = 220;
@@ -942,6 +946,8 @@ pub struct ChatState {
     transcript_load_started_at: Option<Instant>,
     transcript_load_slow_notice_shown: bool,
     provider_list_rx: Option<Receiver<ProviderListWorkerResult>>,
+    agent_list_rx: Option<Receiver<AgentListWorkerResult>>,
+    agents_loading: bool,
     session_list_rx: Option<Receiver<SessionListWorkerResult>>,
     session_list_loading: bool,
     session_list_started_at: Option<Instant>,
@@ -977,6 +983,12 @@ struct ProviderListWorkerResult {
     providers: Vec<ProviderSummary>,
 }
 
+struct AgentListWorkerResult {
+    /// `None` when the load timed out (built-ins stay in place).
+    agents: Option<Vec<AgentSummary>>,
+    error: Option<String>,
+}
+
 impl ChatState {
     pub fn new(backend: &Backend) -> Self {
         Self::new_with_waker(backend, None)
@@ -1000,7 +1012,17 @@ impl ChatState {
             event_wake,
         );
 
-        let agents = agent_summaries(&backend.data_dir);
+        // The interactive app must not read the SIFS-backed agent catalog here: this
+        // constructor runs on the connect thread while the window shows the launch
+        // status, and SIFS grinds through multi-second distributed timeouts whenever
+        // the cluster DFS is unhealthy. Boot with the built-ins (no I/O) and let the
+        // shell load the stored catalog in the background once the app is ready.
+        let defer_agent_load = waker.is_some();
+        let agents = if defer_agent_load {
+            built_in_agent_summaries()
+        } else {
+            agent_summaries(&backend.data_dir)
+        };
         let defer_provider_load = waker.is_some() && backend.connection.daemon_address().is_some();
         let providers = if defer_provider_load {
             Vec::new()
@@ -1074,6 +1096,8 @@ impl ChatState {
             transcript_load_started_at: None,
             transcript_load_slow_notice_shown: false,
             provider_list_rx: None,
+            agent_list_rx: None,
+            agents_loading: defer_agent_load,
             session_list_rx: None,
             session_list_loading: false,
             session_list_started_at: None,
@@ -3840,6 +3864,93 @@ impl ChatState {
                 self.replace_activity(
                     "providers",
                     "provider list failed: worker exited",
+                    ActivityTone::Warn,
+                );
+                true
+            }
+        }
+    }
+
+    /// Load the stored (SIFS-backed) agent catalog in the background. The composer
+    /// starts on the built-ins; this upgrades it once — or reports the catalog as
+    /// degraded — without ever blocking the boot path on the distributed file system.
+    pub fn start_agent_list_load(
+        &mut self,
+        data_dir: Arc<SinomoDataDir>,
+        waker: Option<sui::UiHandle>,
+    ) -> bool {
+        if !self.agents_loading || self.agent_list_rx.is_some() {
+            return false;
+        }
+        let (tx, rx) = mpsc::channel();
+        match thread::Builder::new()
+            .name("sinomo-app-chat-agents".to_string())
+            .spawn(move || {
+                let result = match crate::backend::run_with_timeout(
+                    "agent-catalog",
+                    AGENT_CATALOG_LOAD_TIMEOUT,
+                    move || agent_summaries_with_error(&data_dir),
+                ) {
+                    Ok((agents, error)) => AgentListWorkerResult {
+                        agents: Some(agents),
+                        error,
+                    },
+                    Err(error) => AgentListWorkerResult {
+                        agents: None,
+                        error: Some(error),
+                    },
+                };
+                let _ = tx.send(result);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }) {
+            Ok(_) => {
+                self.agent_list_rx = Some(rx);
+                true
+            }
+            Err(error) => {
+                self.agents_loading = false;
+                self.replace_activity(
+                    "agents",
+                    format!("agent catalog load failed: {error}"),
+                    ActivityTone::Warn,
+                );
+                true
+            }
+        }
+    }
+
+    pub fn pump_agent_list(&mut self) -> bool {
+        let Some(rx) = self.agent_list_rx.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.agent_list_rx = None;
+                self.agents_loading = false;
+                if let Some(agents) = result.agents
+                    && !agents.is_empty()
+                {
+                    self.refresh_agents(agents);
+                }
+                if let Some(error) = result.error {
+                    tracing::warn!(%error, "chat agent catalog load degraded");
+                    self.replace_activity(
+                        "agents",
+                        format!("stored agent catalog unavailable (using built-ins): {error}"),
+                        ActivityTone::Warn,
+                    );
+                }
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.agent_list_rx = None;
+                self.agents_loading = false;
+                self.replace_activity(
+                    "agents",
+                    "agent catalog load failed: worker exited",
                     ActivityTone::Warn,
                 );
                 true
@@ -12985,6 +13096,60 @@ mod tests {
             },
         ];
         state.info.agent = "main-agent".to_string();
+    }
+
+    #[test]
+    fn headless_chat_state_loads_agent_catalog_synchronously() {
+        let backend = Backend::local_fallback();
+        let state = ChatState::new(&backend);
+
+        assert!(
+            !state.agents.is_empty(),
+            "headless construction should load agents synchronously"
+        );
+        assert!(
+            !state.agents_loading,
+            "headless construction must not schedule a background agent load"
+        );
+    }
+
+    #[test]
+    fn background_agent_list_load_upgrades_built_ins() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        // Mirror the interactive boot: built-ins only, catalog deferred.
+        state.agents = built_in_agent_summaries();
+        state.agents_loading = true;
+
+        assert!(
+            state.start_agent_list_load(backend.data_dir.clone(), None),
+            "background agent load should start"
+        );
+        assert!(
+            !state.start_agent_list_load(backend.data_dir.clone(), None),
+            "a second load must not start while one is in flight"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !state.pump_agent_list() {
+            assert!(
+                Instant::now() < deadline,
+                "agent list load should resolve well within its budget"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(!state.agents_loading);
+        assert!(state.agent_list_rx.is_none());
+        assert!(
+            state.agents.iter().any(|agent| agent.key == "main-agent"),
+            "stored/built-in catalog should include the default agent: {:?}",
+            state
+                .agents
+                .iter()
+                .map(|agent| agent.key.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     struct TempAttachmentFile {

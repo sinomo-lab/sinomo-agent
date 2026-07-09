@@ -29,9 +29,10 @@ pub use runtime::{
     OBSERVE_DEFAULT_QUIET_FILTER_DIRECTIVES, ObserveControlRequest, ObserveControlResponse,
     ObserveMetricKind, ObserveMetricRecord, ObserveMetricsRequest, ObserveMetricsResponse,
     ObserveRuntimeConfig, ObserveTraceRecord, ObserveTracesRequest, ObserveTracesResponse,
-    init_observe_runtime, observe_control_snapshot, observe_filter_with_builtin_quiet_directives,
-    observe_filter_with_quiet_directives, read_observe_metrics, read_observe_metrics_for_data_dir,
-    read_observe_traces, register_observe_metric_exporter, update_observe_control,
+    init_observe_runtime, init_observe_runtime_with_log_file, observe_control_snapshot,
+    observe_filter_with_builtin_quiet_directives, observe_filter_with_quiet_directives,
+    read_observe_metrics, read_observe_metrics_for_data_dir, read_observe_traces,
+    register_observe_metric_exporter, update_observe_control,
 };
 
 pub const OBSERVE_PROTOCOL: &str = "sinomo.observe.v1";

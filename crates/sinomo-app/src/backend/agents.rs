@@ -27,42 +27,55 @@ pub struct AgentConfigSummary {
     pub sandbox_node_id: Option<String>,
 }
 
+/// Snapshot the built-in agent catalog only — no data-dir or SIFS I/O. Used as the
+/// degraded fallback when the SIFS-backed catalog cannot be read in time.
+pub fn built_in_agent_config_snapshot(
+    selected_agent_id: Option<&str>,
+    error: Option<String>,
+) -> AgentConfigSnapshot {
+    agent_config_snapshot_from_catalog(AgentCatalog::built_ins(), selected_agent_id, error)
+}
+
+fn agent_config_snapshot_from_catalog(
+    catalog: AgentCatalog,
+    selected_agent_id: Option<&str>,
+    error: Option<String>,
+) -> AgentConfigSnapshot {
+    let mut definitions = catalog.list().cloned().collect::<Vec<_>>();
+    definitions.sort_by(|left, right| {
+        agent_definition_sort_group(left)
+            .cmp(&agent_definition_sort_group(right))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.key().cmp(right.key()))
+    });
+
+    let selected_agent = selected_agent_id
+        .and_then(|id| definitions.iter().find(|definition| definition.key() == id))
+        .or_else(|| {
+            definitions
+                .iter()
+                .find(|definition| agent_definition_is_editable(definition))
+        })
+        .or_else(|| definitions.first())
+        .cloned();
+    let agents = definitions
+        .iter()
+        .map(AgentConfigSummary::from_definition)
+        .collect();
+    AgentConfigSnapshot {
+        agents,
+        selected_agent,
+        error,
+    }
+}
+
 impl Backend {
     pub fn agent_config_snapshot(&self, selected_agent_id: Option<&str>) -> AgentConfigSnapshot {
-        let mut error = None;
-        let catalog = match AgentCatalog::load_from_data_dir(self.data_dir.as_ref()) {
-            Ok(catalog) => catalog,
-            Err(source) => {
-                error = Some(source.to_string());
-                AgentCatalog::built_ins()
-            }
+        let (catalog, error) = match AgentCatalog::load_from_data_dir(self.data_dir.as_ref()) {
+            Ok(catalog) => (catalog, None),
+            Err(source) => (AgentCatalog::built_ins(), Some(source.to_string())),
         };
-        let mut definitions = catalog.list().cloned().collect::<Vec<_>>();
-        definitions.sort_by(|left, right| {
-            agent_definition_sort_group(left)
-                .cmp(&agent_definition_sort_group(right))
-                .then_with(|| left.name.cmp(&right.name))
-                .then_with(|| left.key().cmp(right.key()))
-        });
-
-        let selected_agent = selected_agent_id
-            .and_then(|id| definitions.iter().find(|definition| definition.key() == id))
-            .or_else(|| {
-                definitions
-                    .iter()
-                    .find(|definition| agent_definition_is_editable(definition))
-            })
-            .or_else(|| definitions.first())
-            .cloned();
-        let agents = definitions
-            .iter()
-            .map(AgentConfigSummary::from_definition)
-            .collect();
-        AgentConfigSnapshot {
-            agents,
-            selected_agent,
-            error,
-        }
+        agent_config_snapshot_from_catalog(catalog, selected_agent_id, error)
     }
 
     pub fn save_custom_agent_definition(
