@@ -1474,6 +1474,50 @@ fn status_is_main_daemon(status: &DaemonStatus) -> bool {
 }
 
 #[cfg(unix)]
+fn rollout_process_is_running(pid: u32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe { kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn rollout_process_is_running(pid: u32) -> bool {
+    use std::ffi::c_void;
+    use std::ptr::null_mut;
+
+    type Bool = i32;
+    type Dword = u32;
+    type Handle = *mut c_void;
+
+    unsafe extern "system" {
+        fn OpenProcess(dwDesiredAccess: Dword, bInheritHandle: Bool, dwProcessId: Dword) -> Handle;
+        fn GetExitCodeProcess(hProcess: Handle, lpExitCode: *mut Dword) -> Bool;
+        fn CloseHandle(hObject: Handle) -> Bool;
+    }
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: Dword = 0x0000_1000;
+    const STILL_ACTIVE: Dword = 259;
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle == null_mut() {
+        return false;
+    }
+    let mut exit_code = 0;
+    let running =
+        unsafe { GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code == STILL_ACTIVE };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    running
+}
+
+#[cfg(not(any(unix, windows)))]
+fn rollout_process_is_running(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
 fn terminate_process_for_rollout_stop(
     pid: u32,
     _mode: RolloutTerminationMode,
@@ -2542,6 +2586,24 @@ fn daemon_control_port_released(host: &str, port: u16) -> bool {
     std::net::TcpListener::bind(daemon_connect_address(host, port)).is_ok()
 }
 
+fn rollout_stop_ready_for_binary_activation(
+    control_listener_released: bool,
+    previous_process_running: bool,
+) -> bool {
+    control_listener_released && !previous_process_running
+}
+
+fn daemon_released_for_rollout_stop(
+    host: &str,
+    port: u16,
+    last_status: Option<&DaemonStatus>,
+) -> bool {
+    rollout_stop_ready_for_binary_activation(
+        daemon_control_port_released(host, port),
+        last_status.is_some_and(|status| rollout_process_is_running(status.pid)),
+    )
+}
+
 fn stop_daemon_for_rollout(
     daemon_paths: &DaemonPaths,
     host: &str,
@@ -2573,12 +2635,12 @@ fn stop_daemon_for_rollout(
                 }
             }
             DaemonProbeStatus::Locked { status: None } => {
-                if daemon_control_port_released(host, port) {
+                if daemon_released_for_rollout_stop(host, port, last_status.as_ref()) {
                     return Ok(());
                 }
             }
             DaemonProbeStatus::NotRunning => {
-                if daemon_control_port_released(host, port) {
+                if daemon_released_for_rollout_stop(host, port, last_status.as_ref()) {
                     return Ok(());
                 }
             }
@@ -2598,7 +2660,7 @@ fn stop_daemon_for_rollout(
                         | DaemonProbeStatus::Locked { status: Some(_) } => {}
                         DaemonProbeStatus::Locked { status: None }
                         | DaemonProbeStatus::NotRunning => {
-                            if daemon_control_port_released(host, port) {
+                            if daemon_released_for_rollout_stop(host, port, last_status.as_ref()) {
                                 return Ok(());
                             }
                         }
@@ -4047,6 +4109,18 @@ mod tests {
         assert!(PENDING_MAIN_ACTIVATION_FORCE_TERMINATE_AFTER <= Duration::from_secs(10));
         assert!(PENDING_MAIN_ACTIVATION_TERMINATE_WAIT <= Duration::from_secs(5));
         assert!(ROLLOUT_DAEMON_TERMINATE_WAIT <= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn rollout_stop_waits_for_previous_pid_before_binary_activation() {
+        assert!(rollout_stop_ready_for_binary_activation(true, false));
+        assert!(!rollout_stop_ready_for_binary_activation(false, false));
+        assert!(!rollout_stop_ready_for_binary_activation(true, true));
+    }
+
+    #[test]
+    fn rollout_process_liveness_detects_current_process() {
+        assert!(rollout_process_is_running(std::process::id()));
     }
 
     #[test]
