@@ -21,6 +21,7 @@ pub const AGENT_SESSION_PROGRESS_ROUTE: &str = "/agent/session/progress";
 pub const AGENT_SESSION_TERMINAL_RESULTS_ROUTE: &str = "/agent/session/terminal-results";
 pub const AGENT_SESSION_STEER_ROUTE: &str = "/agent/session/steer";
 pub const AGENT_SESSION_FOLLOW_UP_ROUTE: &str = "/agent/session/follow-up";
+pub const AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE: &str = "/agent/session/remove-queued-input";
 pub const AGENT_SESSION_INTERRUPT_ROUTE: &str = "/agent/session/interrupt";
 pub const AGENT_SESSION_RESUME_ROUTE: &str = "/agent/session/resume";
 pub const AGENT_OBJECT_RPC_ROUTES: &[&str] = &[
@@ -31,6 +32,7 @@ pub const AGENT_OBJECT_RPC_ROUTES: &[&str] = &[
 pub const AGENT_RUNTIME_CONTROL_OBJECT_RPC_ROUTES: &[&str] = &[
     AGENT_SESSION_STEER_ROUTE,
     AGENT_SESSION_FOLLOW_UP_ROUTE,
+    AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE,
     AGENT_SESSION_INTERRUPT_ROUTE,
     AGENT_SESSION_RESUME_ROUTE,
 ];
@@ -91,6 +93,14 @@ pub struct AgentSessionSteerRequest {
 pub struct AgentSessionFollowUpRequest {
     pub session_id: SessionId,
     pub message: String,
+}
+
+/// Remove a queued steering/follow-up message (by its queue id) before the
+/// runtime consumes it.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentSessionRemoveQueuedInputRequest {
+    pub session_id: SessionId,
+    pub input_id: TaskId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -241,6 +251,11 @@ pub trait AgentRuntimeControlHost: Send + Sync {
         request: AgentSessionFollowUpRequest,
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError>;
 
+    fn remove_queued_input(
+        &self,
+        request: AgentSessionRemoveQueuedInputRequest,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError>;
+
     fn interrupt(
         &self,
         request: AgentSessionInterruptRequest,
@@ -261,6 +276,11 @@ pub trait AgentRuntimeControlSession: Send + Sync {
     fn follow_up(
         &self,
         message: String,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError>;
+
+    fn remove_queued_input(
+        &self,
+        input_id: TaskId,
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError>;
 
     fn interrupt(
@@ -294,6 +314,14 @@ where
         message: String,
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
         self.submit_op(AgentOp::follow_up(message))
+            .map_err(agent_runtime_error)
+    }
+
+    fn remove_queued_input(
+        &self,
+        input_id: TaskId,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        self.submit_op(AgentOp::remove_queued_input(input_id))
             .map_err(agent_runtime_error)
     }
 
@@ -417,6 +445,14 @@ impl AgentRuntimeControlHost for AgentRuntimeControlRegistry {
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
         self.session(&request.session_id)?
             .follow_up(request.message)
+    }
+
+    fn remove_queued_input(
+        &self,
+        request: AgentSessionRemoveQueuedInputRequest,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        self.session(&request.session_id)?
+            .remove_queued_input(request.input_id)
     }
 
     fn interrupt(
@@ -551,6 +587,17 @@ impl Service for AgentRuntimeControlService {
                     let result = host.follow_up(request).map_err(agent_control_error)?;
                     ObjectRpcResponse::encode_body(
                         AGENT_SESSION_FOLLOW_UP_ROUTE,
+                        &AgentSessionControlResponse { session_id, result },
+                    )?
+                }
+                AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE => {
+                    let request: AgentSessionRemoveQueuedInputRequest = request.decode_body()?;
+                    let session_id = request.session_id.clone();
+                    let result = host
+                        .remove_queued_input(request)
+                        .map_err(agent_control_error)?;
+                    ObjectRpcResponse::encode_body(
+                        AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE,
                         &AgentSessionControlResponse { session_id, result },
                     )?
                 }
@@ -761,6 +808,7 @@ fn agent_control_service_route(route: &'static str) -> ServiceRoute {
     let capability = match route {
         AGENT_SESSION_STEER_ROUTE => "agent.session.steer",
         AGENT_SESSION_FOLLOW_UP_ROUTE => "agent.session.follow_up",
+        AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE => "agent.session.remove_queued_input",
         AGENT_SESSION_INTERRUPT_ROUTE => "agent.session.interrupt",
         AGENT_SESSION_RESUME_ROUTE => "agent.session.resume",
         _ => "agent.session.control",
@@ -858,6 +906,14 @@ mod tests {
         ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
             self.record("follow_up");
             Ok(test_control_result(request.session_id, 2))
+        }
+
+        fn remove_queued_input(
+            &self,
+            request: AgentSessionRemoveQueuedInputRequest,
+        ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+            self.record("remove_queued_input");
+            Ok(test_control_result(request.session_id, 5))
         }
 
         fn interrupt(
@@ -1249,6 +1305,86 @@ mod tests {
             live_session.steering_queue[0].message,
             "keep the current constraint"
         );
+    }
+
+    #[test]
+    fn runtime_control_registry_removes_queued_input_over_route() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-control-remove");
+        let data_dir = SinomoDataDir::new(&root);
+        let session_id =
+            SessionId::from_legacy_named("sess_agent_control_remove").expect("session id");
+        let agent = Agent::new(TestInteractionModel, "fake", "fake");
+        let runtime = AgentSessionRuntime::new(
+            agent,
+            AgentSession::new(session_id.clone(), AgentRole::Main),
+        );
+        let control_registry = AgentRuntimeControlRegistry::new();
+        control_registry
+            .register_runtime(runtime.clone())
+            .expect("register runtime");
+
+        let queued = control_registry
+            .steer(AgentSessionSteerRequest {
+                session_id: session_id.clone(),
+                message: "prefer AV1, skip the HEVC pass".to_string(),
+            })
+            .expect("steer");
+        let input_id = queued
+            .events
+            .iter()
+            .find_map(|event| match &event.payload {
+                AgentEventPayload::SteeringQueued { steering } => {
+                    Some(steering.steering_id.clone())
+                }
+                _ => None,
+            })
+            .expect("queued steering id");
+
+        let registry = register_runtime_control_services(
+            ServiceRegistry::builder(),
+            Arc::new(control_registry.clone()),
+        )
+        .build();
+        let sink = TestSink::default();
+        let ctx = ServiceContext {
+            data_dir: Arc::new(data_dir),
+            cluster: None,
+            signer: ServiceSigner::Local,
+            sink: Box::new(sink.clone()),
+        };
+        let request = ObjectRpcRequest::encode_body(
+            AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE,
+            AGENT_RPC_CATEGORY,
+            &AgentSessionRemoveQueuedInputRequest {
+                session_id: session_id.clone(),
+                input_id: input_id.clone(),
+            },
+        )
+        .expect("request");
+
+        block_on_ready(registry.dispatch_direct(ctx, request)).expect("dispatch");
+
+        let frames = sink.frames();
+        assert_eq!(frames.len(), 1);
+        let response: AgentSessionControlResponse =
+            frames[0].decode_body().expect("control response");
+        assert_eq!(response.session_id, session_id);
+        assert!(response.result.accepted);
+        assert!(response.result.events.iter().any(|event| matches!(
+            &event.payload,
+            AgentEventPayload::SteeringRemoved { steering }
+                if steering.steering_id == input_id
+        )));
+        let live_session = runtime.session_snapshot().expect("session snapshot");
+        assert!(live_session.steering_queue.is_empty());
+
+        // Removing the same id again misses: the queued-vs-consumed race is
+        // surfaced as an error rather than a silent success.
+        let missing = control_registry.remove_queued_input(AgentSessionRemoveQueuedInputRequest {
+            session_id: session_id.clone(),
+            input_id,
+        });
+        assert!(missing.is_err());
     }
 
     #[test]

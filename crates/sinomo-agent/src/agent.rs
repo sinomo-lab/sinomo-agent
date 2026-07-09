@@ -232,6 +232,15 @@ impl AgentFollowUpMessage {
     }
 }
 
+/// A queued turn input removed from a session queue before the runtime
+/// consumed it (queued items are visible **and removable**).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentRemovedQueuedInput {
+    Steering { steering: AgentSteeringMessage },
+    FollowUp { follow_up: AgentFollowUpMessage },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentAbortRecord {
     pub abort_id: TaskId,
@@ -4603,6 +4612,10 @@ impl AgentOp {
         })
     }
 
+    pub fn remove_queued_input(input_id: TaskId) -> Self {
+        Self::new(AgentOpAction::RemoveQueuedInput { input_id })
+    }
+
     pub fn compact(reason: impl Into<String>) -> Self {
         Self::new(AgentOpAction::Compact {
             reason: reason.into(),
@@ -4633,6 +4646,7 @@ pub enum AgentOpAction {
     ContinueTurn { input: AgentLoopInput },
     Steer { message: String },
     FollowUp { message: String },
+    RemoveQueuedInput { input_id: TaskId },
     Compact { reason: String },
     Abort { reason: String },
     CancelActiveTurn { reason: String },
@@ -4646,6 +4660,7 @@ impl AgentOpAction {
             Self::ContinueTurn { .. } => "continue_turn",
             Self::Steer { .. } => "steer",
             Self::FollowUp { .. } => "follow_up",
+            Self::RemoveQueuedInput { .. } => "remove_queued_input",
             Self::Compact { .. } => "compact",
             Self::Abort { .. } => "abort",
             Self::CancelActiveTurn { .. } => "cancel_active_turn",
@@ -4733,6 +4748,12 @@ pub enum AgentEventPayload {
         steering: AgentSteeringMessage,
     },
     FollowUpQueued {
+        follow_up: AgentFollowUpMessage,
+    },
+    SteeringRemoved {
+        steering: AgentSteeringMessage,
+    },
+    FollowUpRemoved {
         follow_up: AgentFollowUpMessage,
     },
     Compacted {
@@ -7715,6 +7736,21 @@ impl<M: InteractionModel> Agent<M> {
                     AgentEventPayload::FollowUpQueued { follow_up },
                 ));
             }
+            AgentOpAction::RemoveQueuedInput { input_id } => {
+                let removed = self.remove_queued_input(session, &input_id)?;
+                events.push(agent_session_event(
+                    &op_id,
+                    &session_id,
+                    match removed {
+                        AgentRemovedQueuedInput::Steering { steering } => {
+                            AgentEventPayload::SteeringRemoved { steering }
+                        }
+                        AgentRemovedQueuedInput::FollowUp { follow_up } => {
+                            AgentEventPayload::FollowUpRemoved { follow_up }
+                        }
+                    },
+                ));
+            }
             AgentOpAction::Compact { reason } => {
                 let summary = self.compact(session, reason)?;
                 events.push(agent_session_event(
@@ -7996,6 +8032,49 @@ impl<M: InteractionModel> Agent<M> {
         )?;
         self.save_session(session)?;
         Ok(follow_up)
+    }
+
+    /// Remove a not-yet-consumed queued message from either session queue by
+    /// its id. A miss is an error so callers can surface the queued-vs-consumed
+    /// race honestly instead of pretending the removal took effect.
+    pub fn remove_queued_input(
+        &self,
+        session: &mut AgentSession,
+        input_id: &TaskId,
+    ) -> Result<AgentRemovedQueuedInput, AgentError> {
+        if let Some(index) = session
+            .steering_queue
+            .iter()
+            .position(|queued| queued.steering_id == *input_id)
+        {
+            let steering = session.steering_queue.remove(index);
+            self.session_store_record(
+                &session.session_id,
+                AgentSessionStoreRecordKind::SteeringRemoved {
+                    steering: steering.clone(),
+                },
+            )?;
+            self.save_session(session)?;
+            return Ok(AgentRemovedQueuedInput::Steering { steering });
+        }
+        if let Some(index) = session
+            .follow_up_queue
+            .iter()
+            .position(|queued| queued.follow_up_id == *input_id)
+        {
+            let follow_up = session.follow_up_queue.remove(index);
+            self.session_store_record(
+                &session.session_id,
+                AgentSessionStoreRecordKind::FollowUpRemoved {
+                    follow_up: follow_up.clone(),
+                },
+            )?;
+            self.save_session(session)?;
+            return Ok(AgentRemovedQueuedInput::FollowUp { follow_up });
+        }
+        Err(AgentError::Runtime {
+            detail: format!("no queued steering or follow-up message with id {input_id}"),
+        })
     }
 
     pub fn compact(
@@ -18021,6 +18100,67 @@ old
             AgentEventPayload::Aborted { abort } if abort.reason == "op abort"
         ));
         assert!(session.is_aborted());
+    }
+
+    #[test]
+    fn agent_op_removes_queued_inputs_by_id() {
+        let model = SequencedModel::new(Vec::<String>::new());
+        let agent = Agent::new(model, "fake", "fake");
+        let session_id = SessionId::from_legacy_named("sess_agent_remove_queued").expect("session");
+        let mut session = AgentSession::new(session_id.clone(), AgentRole::Deliberation);
+
+        let removable = agent
+            .steer(&mut session, "prefer AV1, skip the HEVC pass")
+            .expect("steer");
+        let kept = agent.steer(&mut session, "keep this one").expect("steer");
+        let follow_up = agent
+            .follow_up(&mut session, "share to #renders when done")
+            .expect("follow up");
+        assert_eq!(session.steering_queue.len(), 2);
+        assert_eq!(session.follow_up_queue.len(), 1);
+
+        let removed = agent
+            .handle_op(
+                &mut session,
+                AgentOp::remove_queued_input(removable.steering_id.clone()),
+            )
+            .expect("remove steering");
+        assert!(matches!(
+            &removed.events[0].payload,
+            AgentEventPayload::SteeringRemoved { steering }
+                if steering.steering_id == removable.steering_id
+                    && steering.message == "prefer AV1, skip the HEVC pass"
+        ));
+        assert_eq!(session.steering_queue.len(), 1);
+        assert_eq!(
+            session.steering_queue[0].steering_id, kept.steering_id,
+            "only the addressed steering message is removed"
+        );
+
+        let removed_follow_up = agent
+            .handle_op(
+                &mut session,
+                AgentOp::remove_queued_input(follow_up.follow_up_id.clone()),
+            )
+            .expect("remove follow-up");
+        assert!(matches!(
+            &removed_follow_up.events[0].payload,
+            AgentEventPayload::FollowUpRemoved { follow_up: removed }
+                if removed.follow_up_id == follow_up.follow_up_id
+        ));
+        assert!(session.follow_up_queue.is_empty());
+
+        // A miss (already consumed or bogus id) is an error, not a silent no-op.
+        let missing = agent.handle_op(
+            &mut session,
+            AgentOp::remove_queued_input(TaskId::generate()),
+        );
+        assert!(matches!(missing, Err(AgentError::Runtime { .. })));
+        assert_eq!(
+            session.steering_queue.len(),
+            1,
+            "a miss leaves the queues untouched"
+        );
     }
 
     #[test]

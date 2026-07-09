@@ -955,9 +955,7 @@ fn capture_files_nav() {
 #[test]
 #[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_typing() {
-    use sui::{
-        Event, KeyState, KeyboardEvent, Point, PointerButton, PointerEvent, PointerEventKind,
-    };
+    use sui::{Event, KeyState, KeyboardEvent, SemanticsRole};
 
     let dir = shots_dir();
     std::fs::create_dir_all(&dir).expect("create shots dir");
@@ -968,16 +966,15 @@ fn capture_typing() {
     let app = TestApp::from_runtime(runtime).expect("headless test app");
     let window = app.main_window().expect("main window");
     let root = window.root();
+    app.run_until_idle().expect("settle initial layout");
 
-    // Focus the composer input, then type a message.
-    let pos = Point::new(600.0, 675.0);
-    let mut down = PointerEvent::new(PointerEventKind::Down, pos);
-    down.button = Some(PointerButton::Primary);
-    root.dispatch_event(Event::Pointer(down))
-        .expect("pointer down");
-    let mut up = PointerEvent::new(PointerEventKind::Up, pos);
-    up.button = Some(PointerButton::Primary);
-    root.dispatch_event(Event::Pointer(up)).expect("pointer up");
+    // Focus the composer input through semantics (stable as the layout evolves),
+    // then type a message.
+    window
+        .get_by_role(SemanticsRole::TextInput)
+        .with_name("chat-input")
+        .click()
+        .expect("focus composer input");
 
     for key in [
         "H", "e", "l", "l", "o", " ", "S", "i", "n", "o", "m", "o", ",", " ", "w", "h", "a", "t",
@@ -2155,9 +2152,7 @@ fn pixel_diff_in_rect(
 #[test]
 #[ignore = "SUI visual smoke; run explicitly with --ignored --nocapture"]
 fn enter_in_composer_sends_the_message() {
-    use sui::{
-        Event, KeyState, KeyboardEvent, Point, PointerButton, PointerEvent, PointerEventKind,
-    };
+    use sui::{Event, KeyState, KeyboardEvent, SemanticsRole};
 
     let shared = boot(Tab::Sinomo);
     seed_chat_providers(&shared);
@@ -2167,14 +2162,12 @@ fn enter_in_composer_sends_the_message() {
     let root = window.root();
     app.run_until_idle().expect("settle initial layout");
 
-    // Focus the composer input near the bottom of the window.
-    let pos = Point::new(600.0, 675.0);
-    let mut down = PointerEvent::new(PointerEventKind::Down, pos);
-    down.button = Some(PointerButton::Primary);
-    root.dispatch_event(Event::Pointer(down)).expect("down");
-    let mut up = PointerEvent::new(PointerEventKind::Up, pos);
-    up.button = Some(PointerButton::Primary);
-    root.dispatch_event(Event::Pointer(up)).expect("up");
+    // Focus the composer input through semantics (stable as the layout evolves).
+    window
+        .get_by_role(SemanticsRole::TextInput)
+        .with_name("chat-input")
+        .click()
+        .expect("focus composer input");
 
     // Type a short message.
     for key in ["H", "i"] {
@@ -2215,9 +2208,7 @@ fn enter_in_composer_sends_the_message() {
 #[test]
 #[ignore = "SUI visual smoke; run explicitly with --ignored --nocapture"]
 fn shift_enter_in_composer_inserts_a_newline() {
-    use sui::{
-        Event, KeyState, KeyboardEvent, Point, PointerButton, PointerEvent, PointerEventKind,
-    };
+    use sui::{Event, KeyState, KeyboardEvent, SemanticsRole};
 
     let shared = boot(Tab::Sinomo);
     seed_chat_providers(&shared);
@@ -2227,13 +2218,11 @@ fn shift_enter_in_composer_inserts_a_newline() {
     let root = window.root();
     app.run_until_idle().expect("settle initial layout");
 
-    let pos = Point::new(600.0, 675.0);
-    let mut down = PointerEvent::new(PointerEventKind::Down, pos);
-    down.button = Some(PointerButton::Primary);
-    root.dispatch_event(Event::Pointer(down)).expect("down");
-    let mut up = PointerEvent::new(PointerEventKind::Up, pos);
-    up.button = Some(PointerButton::Primary);
-    root.dispatch_event(Event::Pointer(up)).expect("up");
+    window
+        .get_by_role(SemanticsRole::TextInput)
+        .with_name("chat-input")
+        .click()
+        .expect("focus composer input");
 
     for key in ["a", "b"] {
         root.dispatch_event(Event::Keyboard(KeyboardEvent::new(key, KeyState::Pressed)))
@@ -2260,10 +2249,7 @@ fn shift_enter_in_composer_inserts_a_newline() {
 #[test]
 #[ignore = "SUI visual smoke; run explicitly with --ignored --nocapture"]
 fn composer_without_provider_is_read_only_and_opens_setup() {
-    use sui::{
-        Event, KeyState, KeyboardEvent, Point, PointerButton, PointerEvent, PointerEventKind,
-        SemanticsRole,
-    };
+    use sui::{Event, KeyState, KeyboardEvent, SemanticsRole};
 
     let shared = boot(Tab::Sinomo);
     {
@@ -2280,13 +2266,11 @@ fn composer_without_provider_is_read_only_and_opens_setup() {
     let root = window.root();
     app.run_until_idle().expect("settle initial layout");
 
-    let pos = Point::new(600.0, 675.0);
-    let mut down = PointerEvent::new(PointerEventKind::Down, pos);
-    down.button = Some(PointerButton::Primary);
-    root.dispatch_event(Event::Pointer(down)).expect("down");
-    let mut up = PointerEvent::new(PointerEventKind::Up, pos);
-    up.button = Some(PointerButton::Primary);
-    root.dispatch_event(Event::Pointer(up)).expect("up");
+    window
+        .get_by_role(SemanticsRole::TextInput)
+        .with_name("chat-input")
+        .click()
+        .expect("focus composer input");
 
     for key in ["H", "i"] {
         root.dispatch_event(Event::Keyboard(KeyboardEvent::new(key, KeyState::Pressed)))

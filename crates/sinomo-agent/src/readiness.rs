@@ -13,9 +13,9 @@ use crate::{
     AgentSessionControlEventCursor, AgentSessionControlResponse, AgentSessionControlResult,
     AgentSessionControlSnapshot, AgentSessionFollowUpRequest, AgentSessionInspectRequest,
     AgentSessionInspectResponse, AgentSessionInterruptRequest, AgentSessionProgressRequest,
-    AgentSessionProgressResponse, AgentSessionReattachState, AgentSessionResumeRequest,
-    AgentSessionResumeResponse, AgentSessionRuntime, AgentSessionSnapshot,
-    AgentSessionSteerRequest, AgentSessionStore, AgentSessionStoreRecord,
+    AgentSessionProgressResponse, AgentSessionReattachState, AgentSessionRemoveQueuedInputRequest,
+    AgentSessionResumeRequest, AgentSessionResumeResponse, AgentSessionRuntime,
+    AgentSessionSnapshot, AgentSessionSteerRequest, AgentSessionStore, AgentSessionStoreRecord,
     AgentSessionStoreRecordKind, AgentSessionTerminalResultsRequest,
     AgentSessionTerminalResultsResponse, AgentSkillPlan, AgentStopReason, AgentTaskLifecycleStatus,
     AgentTaskRef, AgentTaskSnapshot, AgentToolCall, AgentToolCapability, AgentToolEvidence,
@@ -5643,6 +5643,13 @@ impl AgentRuntimeControlHost for ReadinessAgentRuntimeControlHost {
     fn follow_up(
         &self,
         _request: AgentSessionFollowUpRequest,
+    ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
+        Err(readiness_control_host_error())
+    }
+
+    fn remove_queued_input(
+        &self,
+        _request: AgentSessionRemoveQueuedInputRequest,
     ) -> Result<AgentSessionControlResult, AgentRuntimeControlError> {
         Err(readiness_control_host_error())
     }
