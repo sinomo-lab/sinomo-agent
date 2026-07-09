@@ -266,6 +266,34 @@ pub fn dfs_message_is_read_only_request(command: &DfsMessageCommand) -> bool {
     dfs_network_message_is_read_only_request(&command.routed_message.message)
 }
 
+fn dfs_network_message_uses_full_response_budget(message: &DfsNetworkMessage) -> bool {
+    matches!(
+        message,
+        DfsNetworkMessage::ReadRequest(_)
+            | DfsNetworkMessage::ReadResponse(_)
+            | DfsNetworkMessage::ReadResponseChunk(_)
+            | DfsNetworkMessage::BulkReadRequest(_)
+            | DfsNetworkMessage::BulkReadResponse(_)
+            | DfsNetworkMessage::WriteRequest(_)
+            | DfsNetworkMessage::DistributedWriteRequest(_)
+            | DfsNetworkMessage::StageBlob(_)
+            | DfsNetworkMessage::StageBlobChunk(_)
+            | DfsNetworkMessage::StagePatch(_)
+            | DfsNetworkMessage::StagePatchChunk(_)
+            | DfsNetworkMessage::RepairReplica(_)
+            | DfsNetworkMessage::RepairReplicaChunk(_)
+            | DfsNetworkMessage::FetchBlob(_)
+            | DfsNetworkMessage::FetchBlobResponse(_)
+            | DfsNetworkMessage::FetchBlobResponseChunk(_)
+            | DfsNetworkMessage::MetadataJournalBatch(_)
+            | DfsNetworkMessage::MetadataSnapshotInstall(_)
+    )
+}
+
+pub fn dfs_message_uses_full_response_budget(command: &DfsMessageCommand) -> bool {
+    dfs_network_message_uses_full_response_budget(&command.routed_message.message)
+}
+
 fn dfs_network_message_requires_full_metadata_hydrate(message: &DfsNetworkMessage) -> bool {
     matches!(
         message,
@@ -367,8 +395,10 @@ pub fn dfs_message_rpc_request(
     command: &DfsMessageCommand,
 ) -> Result<ObjectRpcRequest, NetworkError> {
     let mut request =
-        ObjectRpcRequest::encode_body(dfs_message_route(command), DFS_RPC_CATEGORY, command)?
-            .with_full_response_budget();
+        ObjectRpcRequest::encode_body(dfs_message_route(command), DFS_RPC_CATEGORY, command)?;
+    if dfs_message_uses_full_response_budget(command) {
+        request = request.with_full_response_budget();
+    }
     request.ensure_trace_context();
     Ok(request)
 }

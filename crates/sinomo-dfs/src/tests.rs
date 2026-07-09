@@ -2136,7 +2136,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     );
     assert!(
         message_request.uses_full_response_budget(),
-        "DFS data-plane message RPCs need the full verified final-hop response budget"
+        "DFS read data-plane message RPCs need the full verified final-hop response budget"
     );
     assert_eq!(
         message_request
@@ -2147,6 +2147,32 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     assert_eq!(
         decode_dfs_message_rpc_request(&message_request).expect("validated message request"),
         message_command
+    );
+    let namespace_command = DfsMessageCommand {
+        request_id: "namespace-request".to_string(),
+        routed_message: DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: remote.clone(),
+            frame_id: 6,
+            message_id: 7,
+            message: DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                request_id: "namespace-mkdir".to_string(),
+                file_system_id: sifs_file_system_id(),
+                requesting_node_id: local.clone(),
+                include_metadata_journal_batches: true,
+                metadata_journal_after_sequences: Vec::new(),
+                operation: DfsNamespaceOperation::Mkdir {
+                    path: "/rpc-helper".to_string(),
+                },
+            }),
+        },
+    };
+    let namespace_request =
+        dfs_message_rpc_request(&namespace_command).expect("namespace message request");
+    assert_eq!(namespace_request.route, DFS_DATA_NAMESPACE_ROUTE);
+    assert!(
+        !namespace_request.uses_full_response_budget(),
+        "DFS namespace message RPCs should preserve normal route fallback budgets"
     );
     let mismatched_route_request = sinomo_core::network::ObjectRpcRequest::encode_body(
         DFS_DATA_WRITE_ROUTE,

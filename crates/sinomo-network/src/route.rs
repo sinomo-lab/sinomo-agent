@@ -40,8 +40,6 @@ const CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED: Duration =
     Duration::from_millis(3500);
 const CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_FALLBACK_RESERVE: Duration =
     Duration::from_millis(500);
-const CLUSTER_TARGET_FULL_RESPONSE_ENDPOINT_ATTEMPT_PREFERRED: Duration =
-    CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX;
 const CLUSTER_DELIVERY_DEGRADED_LINK_COST: u64 = 50_000;
 const CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST: u64 = CLUSTER_DELIVERY_DEGRADED_LINK_COST / 2;
 const CLUSTER_DELIVERY_UNOBSERVED_NEIGHBOR_COST: u64 = 75_000;
@@ -2624,10 +2622,7 @@ where
                     && !reserve_fallback_budget;
                 let final_hop_full_response_budget = final_hop
                     && !reserve_fallback_budget
-                    && cluster_endpoint_has_reachable_route_evidence(
-                        &local_connectivity,
-                        &endpoint,
-                    )
+                    && (endpoints_left <= 1 || final_hop_verified_endpoint)
                     && cluster_target_final_hop_request_uses_full_response_budget(request);
                 let final_hop_attempt_budget = if final_hop {
                     cluster_target_final_hop_attempt_budget(
@@ -3056,10 +3051,7 @@ where
                     && !reserve_fallback_budget;
                 let final_hop_full_response_budget = final_hop
                     && !reserve_fallback_budget
-                    && cluster_endpoint_has_reachable_route_evidence(
-                        &local_connectivity,
-                        &endpoint,
-                    );
+                    && (endpoints_left <= 1 || final_hop_verified_endpoint);
                 let final_hop_attempt_budget = if final_hop {
                     cluster_target_final_hop_attempt_budget(
                         remaining,
@@ -3582,16 +3574,8 @@ fn cluster_target_final_hop_attempt_budget(
     if use_full_response_budget && endpoints_left <= 1 {
         return remaining_route_budget;
     }
-    if use_full_response_budget
-        && !verified_endpoint
-        && let Some(remaining) = remaining_route_budget
-    {
-        let preferred =
-            cluster_target_full_response_endpoint_attempt_preferred(remaining, endpoints_left);
-        let baseline = endpoint_attempt_budget.unwrap_or(Duration::ZERO);
-        if preferred > Duration::ZERO && preferred >= baseline {
-            return Some(preferred.min(remaining));
-        }
+    if use_full_response_budget && !verified_endpoint {
+        return endpoint_attempt_budget;
     }
     if verified_endpoint
         && let (Some(budget), Some(remaining)) = (endpoint_attempt_budget, remaining_route_budget)
@@ -3618,41 +3602,6 @@ fn cluster_target_verified_direct_endpoint_attempt_preferred(
     remaining_route_budget
         .saturating_sub(fallback_reserve)
         .min(CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_ATTEMPT_PREFERRED)
-}
-
-fn cluster_target_full_response_endpoint_attempt_preferred(
-    remaining_route_budget: Duration,
-    endpoints_left: usize,
-) -> Duration {
-    let fallback_reserve = if endpoints_left > 1 {
-        CLUSTER_TARGET_VERIFIED_DIRECT_ENDPOINT_FALLBACK_RESERVE
-    } else {
-        Duration::ZERO
-    };
-    let response_cap = CLUSTER_TARGET_FULL_RESPONSE_ENDPOINT_ATTEMPT_PREFERRED;
-    remaining_route_budget
-        .saturating_sub(fallback_reserve)
-        .min(response_cap)
-}
-
-fn cluster_endpoint_has_reachable_route_evidence(
-    local_connectivity: &ClusterConnectivityGraph,
-    endpoint: &ClusterEndpointRecord,
-) -> bool {
-    if matches!(
-        endpoint.transport,
-        ClusterTransportKind::InProcess | ClusterTransportKind::Loopback
-    ) {
-        return true;
-    }
-    local_connectivity
-        .record_for_endpoint(endpoint)
-        .is_some_and(|record| {
-            record.state != ClusterConnectivityState::Unreachable
-                && !crate::connectivity::cluster_connectivity_failure_reason_is_identity_mismatch(
-                    record,
-                )
-        })
 }
 
 fn cluster_endpoint_has_healthy_route_evidence(
@@ -5568,7 +5517,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_target_final_hop_attempt_budget_preserves_full_response_under_short_gate() {
+    fn cluster_target_final_hop_attempt_budget_keeps_unverified_full_response_fair() {
         let split_budget = Some(Duration::from_millis(1000));
         let budget = cluster_target_final_hop_attempt_budget(
             Some(Duration::from_secs(5)),
@@ -5579,7 +5528,7 @@ mod tests {
         )
         .expect("full response budget");
 
-        assert_eq!(budget, Duration::from_millis(4500));
+        assert_eq!(budget, split_budget.expect("split budget"));
     }
 
     #[test]
@@ -5669,7 +5618,7 @@ mod tests {
             true,
         )
         .expect("full response unverified budget");
-        assert_eq!(full_response_unverified, Duration::from_millis(4500));
+        assert_eq!(full_response_unverified, Duration::from_secs(1));
 
         let verified_direct = cluster_target_final_hop_attempt_budget(
             Some(Duration::from_secs(5)),
