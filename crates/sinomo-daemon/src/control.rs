@@ -1216,16 +1216,7 @@ async fn try_handle_loopback_daemon_status_request_pre_auth(
 async fn daemon_liveness_status_response_async(
     paths: &DaemonPaths,
 ) -> Result<crate::DaemonStatus, DaemonError> {
-    let read_paths = paths.clone();
-    let read_path = read_paths.root.display().to_string();
-    Ok(
-        tokio::task::spawn_blocking(move || read_daemon_status(&read_paths))
-            .await
-            .map_err(|source| DaemonError::Io {
-                path: read_path,
-                detail: format!("daemon liveness status read task failed: {source}"),
-            })??,
-    )
+    daemon_status_response_async(paths, None).await
 }
 
 pub(crate) async fn dispatch_daemon_control_request_in_process_async(
@@ -4569,6 +4560,74 @@ mod tests {
         assert_eq!(actual.pid, expected.pid);
         assert_eq!(actual.data_dir, expected.data_dir);
         assert!(actual.rollout.is_none());
+    }
+
+    #[test]
+    fn daemon_liveness_status_response_uses_rollout_state_file() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-liveness-rollout-state");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = DaemonPaths::new(&data_dir);
+        paths.ensure().expect("daemon paths");
+        let options = DaemonRunOptions::default();
+        let mut raw = crate::DaemonStatus::new(&options, &paths, None);
+        raw.rollout = Some(sinomo_core::ClusterNodeRolloutStatus {
+            status: "in-progress".to_string(),
+            mode: Some("cluster-remote-build".to_string()),
+            detail: Some("building".to_string()),
+            phase: Some("building".to_string()),
+            progress_current: Some(2),
+            progress_total: Some(5),
+            progress_message: Some("building".to_string()),
+            source: None,
+            requested_at: None,
+            staged_at: None,
+            updated_at: None,
+            failed_at: None,
+            diagnostics: None,
+            stdout_log: None,
+            stderr_log: None,
+            stdout_tail: None,
+            stderr_tail: None,
+        });
+        crate::write_daemon_status(&paths, &raw).expect("write daemon status");
+        let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
+        sinomo_rollout::write_rollout_status(
+            &rollout_paths,
+            &sinomo_core::ClusterNodeRolloutStatus {
+                status: "accepted".to_string(),
+                mode: Some("local-apply".to_string()),
+                detail: Some("shadow rollout finalized".to_string()),
+                phase: Some("shadow-finalized".to_string()),
+                progress_current: Some(5),
+                progress_total: Some(5),
+                progress_message: Some("shadow rollout finalized".to_string()),
+                source: None,
+                requested_at: None,
+                staged_at: None,
+                updated_at: None,
+                failed_at: None,
+                diagnostics: None,
+                stdout_log: None,
+                stderr_log: None,
+                stdout_tail: None,
+                stderr_tail: None,
+            },
+        )
+        .expect("write rollout status");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let actual = runtime
+            .block_on(daemon_liveness_status_response_async(&paths))
+            .expect("liveness status");
+
+        let rollout = actual.rollout.expect("decorated rollout status");
+        assert_eq!(rollout.status, "accepted");
+        assert_eq!(rollout.phase.as_deref(), Some("shadow-finalized"));
+        assert_eq!(rollout.progress_current, Some(5));
     }
 
     fn append_cluster_raft_command(

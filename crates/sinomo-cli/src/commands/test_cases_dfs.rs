@@ -1219,7 +1219,7 @@ fn run_failover_current_read(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let nonce = probe_nonce();
     let path = format!("{base}/current-read-{nonce}.txt");
     let old = format!("old current-read payload {nonce}");
-    let new = format!("new current-read payload {nonce}");
+    let new = format!("new current-read payload {nonce} refreshed");
     backend
         .write_file(&path, old.as_bytes())
         .map_err(SinomoTestError::failed)?;
@@ -1245,10 +1245,18 @@ fn run_failover_current_read(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         let read = cached_reader
             .read_file(&path)
             .map_err(SinomoTestError::failed)?;
+        let payload = if read == old.as_bytes() {
+            "old"
+        } else if read == new.as_bytes() {
+            "new"
+        } else {
+            "other"
+        };
         observations.push(format!(
-            "elapsed_ms={}:bytes={}",
+            "elapsed_ms={}:bytes={}:payload={}",
             started.elapsed().as_millis(),
-            read.len()
+            read.len(),
+            payload
         ));
         if read == new.as_bytes() {
             ctx.record("node", &node);

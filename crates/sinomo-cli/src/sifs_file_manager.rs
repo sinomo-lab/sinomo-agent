@@ -1,5 +1,6 @@
 use crate::commands::{
-    cli_commit_cluster_kv_txn_with_quorum_response, refresh_cluster_kv_from_local_daemon_for_data_dir,
+    cli_commit_cluster_kv_txn_with_quorum_response,
+    refresh_cluster_kv_from_local_daemon_for_data_dir,
 };
 use crate::file_manager::{
     FileManagerBackend, FileManagerEntry, FileManagerEntryKind, FileManagerMetadata,
@@ -1012,7 +1013,10 @@ fn open_sifs_service_with_hydration(
         .ensure_root_layout()
         .map_err(|error| format!("cannot prepare Sinomo data directory: {error}"))?;
     let cluster_paths = ClusterPaths::new(data_dir);
-    let peer_transport = Arc::new(SifsDfsPeerTransport::new(rpc_runtime.clone(), data_dir.clone()));
+    let peer_transport = Arc::new(SifsDfsPeerTransport::new(
+        rpc_runtime.clone(),
+        data_dir.clone(),
+    ));
     let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
     let _ = refresh_sifs_cluster_kv_snapshot(data_dir, &cluster_paths);
     let _ = refresh_cluster_dfs_kv_snapshot_with_peer_transport(
@@ -1610,6 +1614,24 @@ mod tests {
         manager.delete_selected("DELETE").expect("delete file");
         manager.go_parent().expect("parent");
         manager.delete_selected("DELETE").expect("delete dir");
+    }
+
+    #[test]
+    fn sifs_read_only_backend_refreshes_visible_overwrite() {
+        let root = temp_sifs_data_dir("current-read-refresh");
+        let data_dir = SinomoDataDir::new(&root);
+        let writer = SifsFileManagerBackend::open(&data_dir).expect("writer");
+        let path = "/services/current-read-refresh.txt";
+        let old = b"old visible payload";
+        let new = b"new visible payload";
+
+        writer.write_file(path, old).expect("write old payload");
+        let reader = SifsFileManagerBackend::open_read_only(&data_dir).expect("reader");
+        assert_eq!(reader.read_file(path).expect("read old payload"), old);
+
+        writer.write_file(path, new).expect("write new payload");
+
+        assert_eq!(reader.read_file(path).expect("read new payload"), new);
     }
 
     #[test]
