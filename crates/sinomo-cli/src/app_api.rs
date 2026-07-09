@@ -3165,8 +3165,32 @@ fn parse_chat_tool_runtime_node_id(value: &str) -> Result<NodeId, CliError> {
 
 /// All agents available for selection (stored definitions first, else built-ins).
 pub fn agent_summaries(data_dir: &SinomoDataDir) -> Vec<AgentSummary> {
-    let catalog =
-        AgentCatalog::load_from_data_dir(data_dir).unwrap_or_else(|_| AgentCatalog::built_ins());
+    agent_summaries_with_error(data_dir).0
+}
+
+/// Like [`agent_summaries`], but also reports the catalog-load error (if any) that
+/// forced the fallback to built-ins. The stored catalog lives in SIFS, so this can
+/// be slow or fail while the distributed file system is unhealthy — callers off the
+/// UI thread use the error to surface a degraded-state notice.
+pub fn agent_summaries_with_error(
+    data_dir: &SinomoDataDir,
+) -> (Vec<AgentSummary>, Option<String>) {
+    match AgentCatalog::load_from_data_dir(data_dir) {
+        Ok(catalog) => (agent_catalog_summaries(&catalog), None),
+        Err(error) => (
+            agent_catalog_summaries(&AgentCatalog::built_ins()),
+            Some(error.to_string()),
+        ),
+    }
+}
+
+/// Summaries for the built-in agent catalog only. Does no data-dir or SIFS I/O, so
+/// it is safe on startup paths that must not block on the distributed file system.
+pub fn built_in_agent_summaries() -> Vec<AgentSummary> {
+    agent_catalog_summaries(&AgentCatalog::built_ins())
+}
+
+fn agent_catalog_summaries(catalog: &AgentCatalog) -> Vec<AgentSummary> {
     catalog
         .list()
         .map(|definition| AgentSummary {

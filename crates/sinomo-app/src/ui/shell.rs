@@ -42,6 +42,11 @@ const COMPACT_CHROME_WIDTH: f32 = 620.0;
 const COMPACT_STATUS_PILL_W: f32 = 24.0;
 /// Spinner shown in the connecting indicator / loading screen.
 const SPINNER_SIZE: f32 = 18.0;
+/// Loading screen: show the per-step elapsed time once a launch step has been in
+/// flight this long, and point at the app log a bit later. Keeps a stalled boot
+/// (e.g. behind distributed-file-system timeouts) readable instead of frozen.
+const LOADING_STALL_AFTER_SECS: u64 = 5;
+const LOADING_LOG_HINT_AFTER_SECS: u64 = 10;
 
 /// Stable image handle for the brand logo (registered at startup).
 pub fn logo_image_handle() -> ImageHandle {
@@ -72,6 +77,9 @@ pub struct Shell {
     status_pill_rect: Cell<Rect>,
     status_pill_pressed: Cell<bool>,
     chat_session_timer: Cell<Option<TimerToken>>,
+    /// Repaint driver for the loading screen: keeps the per-step elapsed time live
+    /// while the backend connection resolves, so a stalled launch step is visible.
+    connect_status_timer: Cell<Option<TimerToken>>,
     body_rect: Rect,
 }
 
@@ -110,6 +118,7 @@ impl Shell {
             status_pill_rect: Cell::new(Rect::ZERO),
             status_pill_pressed: Cell::new(false),
             chat_session_timer: Cell::new(None),
+            connect_status_timer: Cell::new(None),
             body_rect: Rect::ZERO,
         };
         // Built already-ready (headless tooling / visual tests) → show the tabs immediately. The
@@ -154,6 +163,14 @@ impl Shell {
         let changed = self.shared.chat_mut().pump_session_list();
         self.schedule_chat_session_timer(ctx);
         changed
+    }
+
+    fn schedule_connect_status_timer(&self, ctx: &mut EventCtx) {
+        if self.shared.is_ready() || self.connect_status_timer.get().is_some() {
+            return;
+        }
+        let token = ctx.schedule_timer_after(1.0);
+        self.connect_status_timer.set(Some(token));
     }
 
     fn palette(&self) -> (sui::DefaultTheme, Palette) {
@@ -480,10 +497,23 @@ impl Widget for Shell {
             }
             return;
         }
+        // Loading-screen heartbeat: repaint once a second while connecting so the
+        // per-step elapsed time stays live (and a stalled step becomes obvious).
+        if let Event::Wake(sui::WakeEvent::Timer { token, .. }) = event
+            && self.connect_status_timer.get() == Some(*token)
+        {
+            self.connect_status_timer.set(None);
+            if !self.shared.is_ready() {
+                ctx.request_paint();
+                self.schedule_connect_status_timer(ctx);
+            }
+            return;
+        }
         // The background connect thread wakes us via the sui external-wake mechanism; drain its
         // progress/result here. When the backend arrives, build the tab content and relayout.
         if let Event::Custom(custom) = event {
             if custom.kind.as_str() == sui::EXTERNAL_WAKE_KIND {
+                self.schedule_connect_status_timer(ctx);
                 let (changed, became_ready) = self.shared.pump_connect();
                 if became_ready {
                     self.build_content();
@@ -501,6 +531,7 @@ impl Widget for Shell {
                     {
                         let mut chat = self.shared.chat_mut();
                         chat.start_provider_list_load(backend.config.clone(), waker.clone());
+                        chat.start_agent_list_load(backend.data_dir.clone(), waker.clone());
                         chat.start_session_list_load(waker);
                     }
                     self.schedule_chat_session_timer(ctx);
@@ -535,9 +566,11 @@ impl Widget for Shell {
                     let mut chat = self.shared.chat_mut();
                     let worker_changed = chat.pump_worker_events();
                     let providers_changed = chat.pump_provider_list();
+                    let agents_changed = chat.pump_agent_list();
                     let list_changed = chat.pump_session_list();
                     let delete_changed = chat.pump_delete();
-                    worker_changed || providers_changed || list_changed || delete_changed
+                    worker_changed || providers_changed || agents_changed || list_changed
+                        || delete_changed
                 } else {
                     false
                 };
@@ -572,12 +605,14 @@ impl Widget for Shell {
         // fresh measure+arrange. Detect the change on the redraw the TabBar triggered and request
         // the relayout while preserving the TabBar instance and its selector animation.
         if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
+            self.schedule_connect_status_timer(ctx);
             let cluster_changed = self.pump_cluster_refresh();
             let chat_changed = if self.shared.is_ready() {
                 let mut chat = self.shared.chat_mut();
                 let providers_changed = chat.pump_provider_list();
+                let agents_changed = chat.pump_agent_list();
                 let list_changed = chat.pump_session_list();
-                providers_changed || list_changed
+                providers_changed || agents_changed || list_changed
             } else {
                 false
             };
@@ -670,7 +705,9 @@ impl Widget for Shell {
 
 impl Shell {
     /// Centered status while the backend connection is resolving: a spinner above the live status
-    /// line, for a more polished loading look.
+    /// line, for a more polished loading look. Once the current step has been in flight for a
+    /// while, the elapsed time and a pointer at the app log appear underneath so a stalled step
+    /// reads as "stuck on X" (with somewhere to look for details) instead of a frozen screen.
     fn paint_loading(&self, ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette) {
         let status = self.shared.status_text();
         let style = pal.text_style(theme, 14.0, FontWeight::MEDIUM, pal.text_muted);
@@ -688,6 +725,47 @@ impl Shell {
         let tx = cx - tw / 2.0;
         let ty = cy + 10.0 - th / 2.0;
         widgets::draw_text_in(ctx, Rect::new(tx, ty, tw + 4.0, th + 4.0), &status, style);
+
+        for (line_index, line) in self
+            .loading_stall_lines()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let hint_style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_muted);
+            let hint_w = ctx
+                .measure_text(line.clone(), hint_style.clone())
+                .map(|m| m.width)
+                .unwrap_or(240.0);
+            let hint_y = ty + th + 12.0 + line_index as f32 * 20.0;
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(cx - hint_w / 2.0, hint_y, hint_w + 4.0, 20.0),
+                &line,
+                hint_style,
+            );
+        }
+    }
+
+    /// Extra loading-screen lines once the current launch step has stalled: the elapsed
+    /// time after [`LOADING_STALL_AFTER_SECS`], plus where to find technical details after
+    /// [`LOADING_LOG_HINT_AFTER_SECS`].
+    fn loading_stall_lines(&self) -> [Option<String>; 2] {
+        let Some(elapsed) = self.shared.status_elapsed_secs() else {
+            return [None, None];
+        };
+        if elapsed < LOADING_STALL_AFTER_SECS {
+            return [None, None];
+        }
+        let stall = Some(format!("Still working — {elapsed}s on this step"));
+        let log_hint = (elapsed >= LOADING_LOG_HINT_AFTER_SECS).then(|| {
+            let log_path = {
+                let state = self.shared.borrow();
+                state.data_dir.root().join("logs").join("app.log")
+            };
+            format!("Details: {}", log_path.display())
+        });
+        [stall, log_hint]
     }
 
     fn paint_status_pill(
@@ -1227,6 +1305,34 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn loading_screen_surfaces_stalled_step_and_log_hint() {
+        let shared = Shared::new(AppState::connecting());
+        {
+            let mut app = shared.borrow_mut();
+            app.status = "Starting the chat engine…".to_string();
+            app.status_since =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
+        }
+        let shell = Shell::new(shared.clone());
+
+        let [stall, log_hint] = shell.loading_stall_lines();
+        let stall = stall.expect("stalled step should surface its elapsed time");
+        assert!(
+            stall.contains("s on this step"),
+            "unexpected stall line: {stall}"
+        );
+        let log_hint = log_hint.expect("stalled step should point at the app log");
+        assert!(
+            log_hint.contains("app.log"),
+            "unexpected log hint: {log_hint}"
+        );
+
+        // A step that just started shows neither line.
+        shared.borrow_mut().status_since = Some(std::time::Instant::now());
+        assert_eq!(shell.loading_stall_lines(), [None, None]);
     }
 
     #[test]
