@@ -66,6 +66,12 @@ enum RolloutTerminationMode {
     ProcessTree,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StagedMainActivationShutdown {
+    Immediate,
+    DeferredSelf,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_cluster_rollout_progress(
     daemon_paths: &DaemonPaths,
@@ -2290,10 +2296,29 @@ pub fn stage_rollout_main_activation(
     }
     write_main_activation(rollout_paths, &activation)?;
     record_main_activation_staged(rollout_paths, &activation)?;
-    if current_daemon_is_shadow {
-        request_main_shutdown_for_shadow_rollout(data_dir, &activation)?;
+    match staged_main_activation_shutdown_action(current_daemon_is_shadow) {
+        StagedMainActivationShutdown::Immediate => {
+            request_main_shutdown_for_shadow_rollout(data_dir, &activation)?;
+        }
+        StagedMainActivationShutdown::DeferredSelf => {
+            request_main_shutdown_for_shadow_rollout_deferred(
+                data_dir.to_path_buf(),
+                rollout_paths.clone(),
+                activation.clone(),
+            );
+        }
     }
     Ok(RolloutActivationStrategy::ShadowSupervised)
+}
+
+fn staged_main_activation_shutdown_action(
+    current_daemon_is_shadow: bool,
+) -> StagedMainActivationShutdown {
+    if current_daemon_is_shadow {
+        StagedMainActivationShutdown::Immediate
+    } else {
+        StagedMainActivationShutdown::DeferredSelf
+    }
 }
 
 fn stage_main_only_rollout_without_existing_shadow(
@@ -2391,6 +2416,35 @@ fn request_main_shutdown_for_shadow_rollout(
         .unwrap_or_else(|| daemon_connect_address(&activation.main_host, activation.main_port));
     let _ = send_daemon_shutdown_request(&address, DAEMON_PROBE_TIMEOUT);
     Ok(())
+}
+
+fn request_main_shutdown_for_shadow_rollout_deferred(
+    data_dir: PathBuf,
+    rollout_paths: SelfRolloutPaths,
+    activation: RolloutMainActivation,
+) {
+    #[cfg(test)]
+    {
+        let _ = (data_dir, rollout_paths, activation);
+    }
+    #[cfg(not(test))]
+    {
+        if let Err(error) = thread::Builder::new()
+            .name("sinomo-rollout-main-yield".to_string())
+            .spawn(move || {
+                thread::sleep(MAIN_ACTIVATION_SHUTDOWN_GRACE);
+                if !rollout_main_activation_path(&rollout_paths).exists() {
+                    return;
+                }
+                if let Err(error) = request_main_shutdown_for_shadow_rollout(&data_dir, &activation)
+                {
+                    tracing::warn!("deferred rollout main shutdown request failed: {error}");
+                }
+            })
+        {
+            tracing::warn!("deferred rollout main shutdown task spawn failed: {error}");
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3924,6 +3978,18 @@ mod tests {
         assert!(!pending_main_activation_stop_target(
             &DaemonProbeStatus::NotRunning
         ));
+    }
+
+    #[test]
+    fn staged_main_activation_shutdown_is_deferred_when_main_handles_request() {
+        assert_eq!(
+            staged_main_activation_shutdown_action(false),
+            StagedMainActivationShutdown::DeferredSelf
+        );
+        assert_eq!(
+            staged_main_activation_shutdown_action(true),
+            StagedMainActivationShutdown::Immediate
+        );
     }
 
     #[test]

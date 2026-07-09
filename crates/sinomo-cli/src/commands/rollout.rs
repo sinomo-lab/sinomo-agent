@@ -1301,7 +1301,7 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
                     request.source_head = Some(head.clone());
                 }
             }
-            match send_daemon_rollout_build(&target, &request) {
+            match send_daemon_rollout_build(&target, &request, Some(&target_status)) {
                 Ok(response) => {
                     let source_head_mismatch = response.status == "accepted"
                         && request.source_head.is_some()
@@ -1318,10 +1318,10 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
                         );
                     } else {
                         println!("{}: {}", target.label(), response.status);
-                        if response.status == "accepted"
-                            && let Some(node_id) = target.rollout_node_id()
-                        {
-                            completed_rollout_nodes.insert(node_id.clone());
+                        if response.status == "accepted" {
+                            if let Some(node_id) = target.rollout_node_id() {
+                                completed_rollout_nodes.insert(node_id.clone());
+                            }
                         }
                     }
                     if !response.detail.is_empty() {
@@ -1361,13 +1361,13 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
             )?);
         }
         let request = binary_request.as_ref().expect("binary rollout request");
-        match send_prepared_daemon_rollout_binary(&target, request) {
+        match send_prepared_daemon_rollout_binary(&target, request, Some(&target_status)) {
             Ok(response) => {
                 println!("{}: {}", target.label(), response.status);
-                if response.status == "accepted"
-                    && let Some(node_id) = target.rollout_node_id()
-                {
-                    completed_rollout_nodes.insert(node_id.clone());
+                if response.status == "accepted" {
+                    if let Some(node_id) = target.rollout_node_id() {
+                        completed_rollout_nodes.insert(node_id.clone());
+                    }
                 }
                 if !response.detail.is_empty() {
                     println!("  {}", response.detail);
@@ -1968,6 +1968,36 @@ pub(crate) fn read_rollout_target_status(target: &RolloutTarget) -> Result<Daemo
     )
 }
 
+pub(crate) fn rollout_status_is_shadow_daemon(status: &DaemonStatus) -> bool {
+    status
+        .lock_file
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .is_some_and(|name| name == std::ffi::OsStr::new("shadow-daemon"))
+}
+
+fn request_rollout_target_main_shutdown_after_accept(
+    target: &RolloutTarget,
+    target_status: &DaemonStatus,
+) {
+    if rollout_status_is_shadow_daemon(target_status) {
+        return;
+    }
+    let result: Result<String, CliError> = send_rollout_object_rpc_body(
+        target,
+        sinomo_runtime::daemon::DAEMON_SHUTDOWN_ROUTE,
+        sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
+        &(),
+        DAEMON_PROBE_TIMEOUT,
+    );
+    if let Err(error) = result {
+        eprintln!(
+            "warning: rollout target {} accepted staging but shutdown nudge failed: {error}",
+            target.label()
+        );
+    }
+}
+
 fn send_rollout_object_rpc_body<Req, Resp>(
     target: &RolloutTarget,
     route: &str,
@@ -2195,30 +2225,39 @@ fn rollout_file_blake3(path: &Path) -> Result<Vec<u8>, CliError> {
 pub(crate) fn send_daemon_rollout_binary(
     target: &RolloutTarget,
     request: &ClusterRolloutBinaryRequest,
+    target_status: Option<&DaemonStatus>,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
     let request = request.clone();
+    let target_status = target_status.cloned();
     let expectation = RolloutProgressExpectation {
         source: request.source.clone(),
         requested_at: request.requested_at.clone(),
         source_head: None,
     };
     send_rollout_request_with_progress(target, "binary rollout", expectation, move |target| {
-        send_daemon_rollout_binary_direct(&target, &request)
+        let response = send_daemon_rollout_binary_direct(&target, &request)?;
+        if response.status == "accepted"
+            && let Some(target_status) = target_status.as_ref()
+        {
+            request_rollout_target_main_shutdown_after_accept(&target, target_status);
+        }
+        Ok(response)
     })
 }
 
 pub(crate) fn send_prepared_daemon_rollout_binary(
     target: &RolloutTarget,
     request: &PreparedClusterBinaryRollout,
+    target_status: Option<&DaemonStatus>,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
     match request {
         PreparedClusterBinaryRollout::Inline(request) => {
-            send_daemon_rollout_binary(target, request)
+            send_daemon_rollout_binary(target, request, target_status)
         }
         PreparedClusterBinaryRollout::Chunked {
             finalize,
             artifacts,
-        } => send_daemon_rollout_binary_chunked(target, finalize, artifacts),
+        } => send_daemon_rollout_binary_chunked(target, finalize, artifacts, target_status),
     }
 }
 
@@ -2226,18 +2265,26 @@ fn send_daemon_rollout_binary_chunked(
     target: &RolloutTarget,
     finalize: &ClusterRolloutBinaryUploadFinalizeRequest,
     artifacts: &[RolloutUploadSource],
+    target_status: Option<&DaemonStatus>,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
     for artifact in artifacts {
         upload_rollout_artifact_chunks(target, &finalize.manifest.upload_id, artifact)?;
     }
     let finalize = finalize.clone();
+    let target_status = target_status.cloned();
     let expectation = RolloutProgressExpectation {
         source: finalize.manifest.source.clone(),
         requested_at: finalize.manifest.requested_at.clone(),
         source_head: None,
     };
     send_rollout_request_with_progress(target, "binary rollout", expectation, move |target| {
-        send_daemon_rollout_binary_finalize_direct(&target, &finalize)
+        let response = send_daemon_rollout_binary_finalize_direct(&target, &finalize)?;
+        if response.status == "accepted"
+            && let Some(target_status) = target_status.as_ref()
+        {
+            request_rollout_target_main_shutdown_after_accept(&target, target_status);
+        }
+        Ok(response)
     })
 }
 
@@ -2442,15 +2489,30 @@ pub(crate) fn send_daemon_rollout_diagnostics(target: &RolloutTarget) -> Result<
 pub(crate) fn send_daemon_rollout_build(
     target: &RolloutTarget,
     request: &ClusterRolloutBuildRequest,
+    target_status: Option<&DaemonStatus>,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
     let request = request.clone();
+    let target_status = target_status.cloned();
     let expectation = RolloutProgressExpectation {
         source: request.source.clone(),
         requested_at: request.requested_at.clone(),
         source_head: request.source_head.clone(),
     };
     send_rollout_request_with_progress(target, "remote build", expectation, move |target| {
-        send_daemon_rollout_build_direct(&target, &request)
+        let response = send_daemon_rollout_build_direct(&target, &request)?;
+        let source_head_mismatch = response.status == "accepted"
+            && request.source_head.is_some()
+            && !source_heads_match(
+                response.source_head.as_deref(),
+                request.source_head.as_deref().unwrap_or_default(),
+            );
+        if response.status == "accepted"
+            && !source_head_mismatch
+            && let Some(target_status) = target_status.as_ref()
+        {
+            request_rollout_target_main_shutdown_after_accept(&target, target_status);
+        }
+        Ok(response)
     })
 }
 

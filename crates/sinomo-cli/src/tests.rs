@@ -45,14 +45,14 @@ use super::{
     parse_uninstall_options, parse_usage_options, read_cluster_rollout_status,
     require_cluster_runtime_quorum_with_paths_and_daemon, rollout_advance_with_data_dir,
     rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_missing_status_grace,
-    rollout_pending_error_grace, rollout_progress_bar, rollout_status_matches_expectation,
-    rollout_target_endpoint_for_main_with_connectivity, rollout_telemetry_gates_set_with_data_dir,
-    rollout_terminal_response, run_tui_with_handler_io, run_tui_with_handler_io_and_daemon,
-    send_rollout_request_with_progress_for_test, shadow_daemon_node_id,
-    sign_daemon_rpc_request_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
-    test_command_requires_cluster_state, tui_default_daemon_status, uninstall_with_layout,
-    with_cli_force_local_mode, write_daemon_status, write_imported_cluster_kv_snapshot,
-    write_model_runtime_config_for_node, write_rollout_status,
+    rollout_pending_error_grace, rollout_progress_bar, rollout_status_is_shadow_daemon,
+    rollout_status_matches_expectation, rollout_target_endpoint_for_main_with_connectivity,
+    rollout_telemetry_gates_set_with_data_dir, rollout_terminal_response, run_tui_with_handler_io,
+    run_tui_with_handler_io_and_daemon, send_rollout_request_with_progress_for_test,
+    shadow_daemon_node_id, sign_daemon_rpc_request_from_data_dir, stage_rollout_main_activation,
+    sync_cluster_state_to_kv, test_command_requires_cluster_state, tui_default_daemon_status,
+    uninstall_with_layout, with_cli_force_local_mode, write_daemon_status,
+    write_imported_cluster_kv_snapshot, write_model_runtime_config_for_node, write_rollout_status,
 };
 use super::{
     daemon_handle_daemon_sandbox_http_fetch_to_file, daemon_handle_daemon_sandbox_import_busybox,
@@ -11930,6 +11930,32 @@ fn rollout_cluster_target_prefers_direct_shadow_endpoint_before_iroh() {
 
     assert_eq!(selected.node_id, shadow_node_id);
     assert_eq!(selected.transport, ClusterTransportKind::LanTcp);
+}
+
+#[test]
+fn rollout_status_identifies_shadow_daemon_by_lock_path() {
+    let mut status = DaemonStatus {
+        pid: 4242,
+        host: "0.0.0.0".to_string(),
+        port: 21_353,
+        address: "node.test:21353".to_string(),
+        version: daemon_package_version(),
+        commit: None,
+        target_os: Some(std::env::consts::OS.to_string()),
+        target_arch: Some(std::env::consts::ARCH.to_string()),
+        hostname: None,
+        executable: None,
+        rollout: None,
+        started_at: "2026-05-04T00:00:00Z".to_string(),
+        data_dir: PathBuf::from("data"),
+        lock_file: PathBuf::from("data/daemon/daemon.lock"),
+        cluster: None,
+        idle_stats: None,
+    };
+
+    assert!(!rollout_status_is_shadow_daemon(&status));
+    status.lock_file = PathBuf::from("data/shadow-daemon/daemon.lock");
+    assert!(rollout_status_is_shadow_daemon(&status));
 }
 
 #[test]
