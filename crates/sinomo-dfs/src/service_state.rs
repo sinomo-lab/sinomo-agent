@@ -1,6 +1,8 @@
 //! Networked DFS service state, outcome, event, and pending-state types.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -53,6 +55,31 @@ pub(crate) const DFS_ROUTED_NAMESPACE_IDLE_WAIT: Duration = Duration::from_milli
 
 pub(crate) const DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES: usize = 64;
 
+/// Cooperative cancellation handle for a [`NetworkedDfsService`]. Cloneable and
+/// thread-safe: a caller keeps one clone, hands the service the other, and flips
+/// it when a budgeted operation gives up (e.g. a degraded cluster link on a
+/// mobile device — a normal operating state, not an exceptional one). The
+/// service's distributed wait/retry loops observe the flag and return
+/// [`DfsError::Cancelled`] instead of running out their full network timeouts.
+#[derive(Clone, Debug, Default)]
+pub struct DfsCancellationFlag(Arc<AtomicBool>);
+
+impl DfsCancellationFlag {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cancellation. Idempotent; already-running local work finishes,
+    /// distributed waits and retries stop at their next flag check.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// Stateful networked DFS data-plane and metadata coordinator.
 #[derive(Debug)]
 pub struct NetworkedDfsService<T> {
@@ -93,6 +120,7 @@ pub struct NetworkedDfsService<T> {
     pub(crate) next_frame_id: u64,
     pub(crate) next_message_id: u64,
     pub(crate) next_request_id: u64,
+    pub(crate) cancellation: Option<DfsCancellationFlag>,
 }
 
 /// Result from serving one DFS message command through a networked service.

@@ -11,10 +11,11 @@ use crate::transfer::{
     range_transfer_size_bytes,
 };
 use crate::{
-    AsyncDfsMessageTransport, DfsConflictStatus, DfsControlPlaneKvClient, DfsError, DfsFileSystem,
-    DfsMessageTransport, DfsMetadataBackend, DfsMetadataStore, DfsNetworkMessage,
-    DfsOperationalMetrics, DfsRoutedMessage, DfsTransportIdentity, DistributedEventualCoordinator,
-    LocalContentStore, NetworkedDfsService, NetworkedDfsServiceEvent, build_dfs_routed_message,
+    AsyncDfsMessageTransport, DfsCancellationFlag, DfsConflictStatus, DfsControlPlaneKvClient,
+    DfsError, DfsFileSystem, DfsMessageTransport, DfsMetadataBackend, DfsMetadataStore,
+    DfsNetworkMessage, DfsOperationalMetrics, DfsRoutedMessage, DfsTransportIdentity,
+    DistributedEventualCoordinator, LocalContentStore, NetworkedDfsService,
+    NetworkedDfsServiceEvent, build_dfs_routed_message,
 };
 
 impl<T> NetworkedDfsService<T> {
@@ -81,6 +82,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             next_frame_id: 1,
             next_message_id: 1,
             next_request_id: 1,
+            cancellation: None,
         }
     }
 }
@@ -142,6 +144,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             total_size_bytes,
             DFS_FETCH_CHUNK_WINDOW_SIZE,
         )
+    }
+
+    /// Install a cooperative cancellation flag. Distributed wait/retry loops
+    /// (write settling, remote reads, routed namespace sync) observe the flag
+    /// and stop with [`DfsError::Cancelled`] once it flips — the caller's way
+    /// to abandon budgeted work promptly when the cluster link is degraded.
+    pub fn with_cancellation(mut self, cancellation: DfsCancellationFlag) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    pub fn set_cancellation(&mut self, cancellation: Option<DfsCancellationFlag>) {
+        self.cancellation = cancellation;
+    }
+
+    pub(crate) fn check_cancelled(&self, operation: &'static str) -> Result<(), DfsError> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(DfsCancellationFlag::is_cancelled)
+        {
+            return Err(DfsError::Cancelled { operation });
+        }
+        Ok(())
     }
 
     pub fn with_control_plane(mut self, kv: impl DfsControlPlaneKvClient + Send + 'static) -> Self {

@@ -37,6 +37,17 @@ const MOUNTED_SIFS_CLUSTER_KV_TXN_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn open_mounted_sifs_service(
     data_dir: Option<PathBuf>,
 ) -> Result<OpenedMountedSifsService, DfsError> {
+    open_mounted_sifs_service_with_cancellation(data_dir, None)
+}
+
+/// Like [`open_mounted_sifs_service`], with a cooperative cancellation flag
+/// installed on the service before any distributed work runs. Budgeted callers
+/// (app catalog loads) flip the flag to abandon the open and every subsequent
+/// distributed operation promptly when the cluster link is degraded.
+pub fn open_mounted_sifs_service_with_cancellation(
+    data_dir: Option<PathBuf>,
+    cancellation: Option<crate::DfsCancellationFlag>,
+) -> Result<OpenedMountedSifsService, DfsError> {
     let data_dir = match data_dir {
         Some(path) => SinomoDataDir::new(path),
         None => SinomoDataDir::from_env_or_home().map_err(|source| DfsError::Metadata {
@@ -85,6 +96,7 @@ pub fn open_mounted_sifs_service(
         async_peer_transport,
         control_plane,
     )?;
+    service.set_cancellation(cancellation);
     service
         .bootstrap_distributed_sifs()
         .map_err(|source| match source {

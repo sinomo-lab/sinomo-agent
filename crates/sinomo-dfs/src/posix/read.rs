@@ -169,6 +169,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_read_file_distributed(&mut self, path: &str) -> Result<Vec<u8>> {
+        self.check_cancelled("distributed read")?;
         let trace_started = Instant::now();
         let lookup_started = Instant::now();
         let (path, object) = self.distributed_posix_file_content_object(path, true)?;
@@ -430,6 +431,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let deadline = Instant::now() + POSIX_REMOTE_READ_TIMEOUT;
         let mut idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
         loop {
+            self.check_cancelled("bulk read wait")?;
             let events = self.process_incoming()?;
             if !events.is_empty() {
                 idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
@@ -577,6 +579,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let deadline = Instant::now() + POSIX_REMOTE_READ_TIMEOUT;
         let mut idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
         loop {
+            self.check_cancelled("remote object read wait")?;
             let events = self.process_incoming()?;
             if !events.is_empty() {
                 idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
@@ -604,10 +607,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .next_pending_remote_read_retry_for_current_object(object_id)?
                 .map(|next_retry_at| next_retry_at.saturating_duration_since(now))
                 .unwrap_or(remaining);
-            let wait = idle_wait.min(remaining).min(until_retry);
-            if wait.is_zero() {
-                continue;
-            }
+            // An already-due retry must still pace the loop: on a degraded link
+            // every retry fails fast and stays due, and a zero wait here spun
+            // this loop at a full core until the read timeout.
+            let wait = idle_wait
+                .min(remaining)
+                .min(until_retry)
+                .max(POSIX_REMOTE_READ_IDLE_WAIT_INITIAL.min(remaining));
             if self
                 .transport
                 .wait_for_incoming(wait)
@@ -638,6 +644,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let deadline = Instant::now() + POSIX_REMOTE_READ_TIMEOUT;
         let mut idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
         loop {
+            self.check_cancelled("remote metadata read wait")?;
             let events = self.process_incoming()?;
             if !events.is_empty() {
                 idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
@@ -683,10 +690,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .next_pending_remote_read_retry_for_metadata(&object)
                 .map(|next_retry_at| next_retry_at.saturating_duration_since(now))
                 .unwrap_or(remaining);
-            let wait = idle_wait.min(remaining).min(until_retry);
-            if wait.is_zero() {
-                continue;
-            }
+            // Same pacing floor as `read_current_object_or_fetch_remote`: an
+            // always-due retry on a degraded link must not spin this loop hot.
+            let wait = idle_wait
+                .min(remaining)
+                .min(until_retry)
+                .max(POSIX_REMOTE_READ_IDLE_WAIT_INITIAL.min(remaining));
             if self
                 .transport
                 .wait_for_incoming(wait)

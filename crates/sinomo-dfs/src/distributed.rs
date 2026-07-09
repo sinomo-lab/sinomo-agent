@@ -380,6 +380,21 @@ impl DistributedEventualCoordinator {
         &mut self,
         intent: DistributedWriteIntent,
     ) -> Result<(), DfsDistributedError> {
+        self.restore_intent_deferring_repair_rebuild(intent)?;
+        self.rebuild_repair_jobs();
+        Ok(())
+    }
+
+    /// [`restore_intent`](Self::restore_intent) without the repair-job rebuild.
+    /// Bulk restore paths (metadata hydration) call this per record and issue
+    /// one [`rebuild_repair_jobs_after_bulk_restore`](Self::rebuild_repair_jobs_after_bulk_restore)
+    /// at the end — rebuilding per record turned hydration quadratic and burned
+    /// seconds of CPU per SIFS open once a degraded cluster accumulated a
+    /// backlog of unsettled intents.
+    pub(crate) fn restore_intent_deferring_repair_rebuild(
+        &mut self,
+        intent: DistributedWriteIntent,
+    ) -> Result<(), DfsDistributedError> {
         validate_replication_plan(&intent.desired_replica_nodes, &intent.policy)?;
         if let Some(existing) = self.intents.get(&intent.intent_id)
             && (existing.file_system_id != intent.file_system_id
@@ -410,7 +425,6 @@ impl DistributedEventualCoordinator {
             );
         }
         self.intents.insert(intent.intent_id.clone(), intent);
-        self.rebuild_repair_jobs();
         Ok(())
     }
 
@@ -423,6 +437,23 @@ impl DistributedEventualCoordinator {
         intent_id: &str,
         replica_node_id: NodeId,
     ) -> Result<(), DfsDistributedError> {
+        let rebuild =
+            self.restore_durable_receipt_deferring_repair_rebuild(intent_id, replica_node_id)?;
+        if rebuild {
+            self.rebuild_repair_jobs();
+        }
+        Ok(())
+    }
+
+    /// [`restore_durable_receipt`](Self::restore_durable_receipt) without the
+    /// repair-job rebuild; returns whether the caller-visible rebuild would
+    /// have run (a committed intent's receipt landed). Bulk restore paths call
+    /// this per receipt and rebuild once at the end.
+    pub(crate) fn restore_durable_receipt_deferring_repair_rebuild(
+        &mut self,
+        intent_id: &str,
+        replica_node_id: NodeId,
+    ) -> Result<bool, DfsDistributedError> {
         let intent = self.intents.get(intent_id).cloned().ok_or_else(|| {
             DfsDistributedError::UnknownIntent {
                 intent_id: intent_id.to_string(),
@@ -445,14 +476,13 @@ impl DistributedEventualCoordinator {
                 state: DfsReplicaReceiptState::Durable,
             },
         );
-        if self
-            .intents
-            .get(intent_id)
-            .is_some_and(|intent| matches!(intent.state, DfsWriteIntentState::Committed))
-        {
-            self.rebuild_repair_jobs();
-        }
-        Ok(())
+        Ok(matches!(intent.state, DfsWriteIntentState::Committed))
+    }
+
+    /// Rebuild repair jobs once after a bulk restore that used the deferring
+    /// restore variants.
+    pub(crate) fn rebuild_repair_jobs_after_bulk_restore(&mut self) {
+        self.rebuild_repair_jobs();
     }
 
     pub fn receipts_for_intent(&self, intent_id: &str) -> Vec<&DistributedReplicaReceipt> {
@@ -721,20 +751,32 @@ impl DistributedEventualCoordinator {
 
     fn rebuild_repair_jobs(&mut self) {
         self.repair_jobs.clear();
-        let committed: Vec<DistributedWriteIntent> = self
+        // One pass over receipts, one over intents. The previous shape scanned
+        // the whole receipt map once per committed intent, which made rebuilds
+        // quadratic on data dirs that accumulated an unsettled-write backlog
+        // while the cluster link was degraded.
+        let mut durable_by_intent: BTreeMap<&str, BTreeSet<&NodeId>> = BTreeMap::new();
+        for ((receipt_intent_id, replica_node_id), receipt) in &self.receipts {
+            if receipt.state == DfsReplicaReceiptState::Durable {
+                durable_by_intent
+                    .entry(receipt_intent_id.as_str())
+                    .or_default()
+                    .insert(replica_node_id);
+            }
+        }
+        let mut jobs = Vec::new();
+        for intent in self
             .intents
             .values()
             .filter(|intent| matches!(intent.state, DfsWriteIntentState::Committed))
-            .cloned()
-            .collect();
-        for intent in committed {
-            let durable_nodes = self.durable_receipt_nodes(&intent.intent_id);
-            for missing_replica_node_id in intent
-                .desired_replica_nodes
-                .iter()
-                .filter(|node_id| !durable_nodes.contains(*node_id))
+        {
+            let durable_nodes = durable_by_intent.get(intent.intent_id.as_str());
+            for missing_replica_node_id in
+                intent.desired_replica_nodes.iter().filter(|node_id| {
+                    !durable_nodes.is_some_and(|durable| durable.contains(node_id))
+                })
             {
-                self.repair_jobs.push(DistributedRepairJob {
+                jobs.push(DistributedRepairJob {
                     intent_id: intent.intent_id.clone(),
                     file_system_id: intent.file_system_id.clone(),
                     object_id: intent.object_id.clone(),
@@ -743,6 +785,7 @@ impl DistributedEventualCoordinator {
                 });
             }
         }
+        self.repair_jobs = jobs;
     }
 }
 

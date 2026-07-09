@@ -647,6 +647,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         follow: bool,
     ) -> Result<DfsStat> {
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
+            self.check_cancelled("routed stat sync")?;
             let attempt = if follow {
                 self.posix_stat(path)
             } else {
@@ -705,6 +706,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             None => return Ok(()),
         };
         for _ in 0..POSIX_ROUTED_DEEP_SYNC_ROUNDS {
+            self.check_cancelled("routed namespace sync")?;
             let routed = self
                 .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
                     file_system_id.clone(),

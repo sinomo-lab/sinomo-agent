@@ -74,7 +74,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(None);
         };
         self.restore_pending_write_for_intent_if_missing(&record.intent_id, &record.object_id)?;
-        self.restore_backend_receipt_pages_for_intent(&record)?;
+        self.restore_backend_receipt_pages_for_intent(&record, true)?;
         if matches!(record.status, DfsWriteIntentStatus::Committed) {
             self.restore_visible_committed_object_location_receipts(&record)?;
         }
