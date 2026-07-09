@@ -802,6 +802,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let target_version = next_version(&object.version);
         let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
         let committed_locations = candidates.clone();
+        let detach_request = !options.wait_for_commit && !options.foreground_replica_repair;
+        let inline_remote_primary_write = match self.select_metadata_shard_for_object(&object) {
+            Ok(Some(shard)) => {
+                !detach_request
+                    && shard.primary_node_id != self.node_id
+                    && (bytes.len() as u64) <= crate::DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT
+            }
+            Ok(None) => false,
+            Err(error) => {
+                if transient_create {
+                    self.remove_transient_object_metadata(&object.object_id);
+                }
+                return Err(error.into());
+            }
+        };
         let content_started = Instant::now();
         let manifest_result = if options.wait_for_commit {
             self.content.put_object_version_blob_only_durable(
@@ -827,15 +842,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let content_elapsed = content_started.elapsed();
         let distributed_started = Instant::now();
-        let detach_request = !options.wait_for_commit && !options.foreground_replica_repair;
-        let outcome = self
-            .write_distributed_eventual_from_local_manifest_with_candidates_and_parent_touch(
-                DfsWriteRequest {
-                    file_system_id: object.file_system_id.clone(),
-                    object_id: object.object_id.clone(),
-                    target_version: target_version.clone(),
-                    requesting_node_id: self.node_id.clone(),
-                },
+        let request = DfsWriteRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            target_version: target_version.clone(),
+            requesting_node_id: self.node_id.clone(),
+        };
+        let outcome = if inline_remote_primary_write {
+            self.write_distributed_eventual_with_base_and_parent_touch_and_repair_mode(
+                request,
+                Some(object.version.clone()),
+                bytes.to_vec(),
+                candidates,
+                options.policy,
+                touch_parent_on_create,
+                options.foreground_replica_repair,
+            )
+        } else {
+            self.write_distributed_eventual_from_local_manifest_with_candidates_and_parent_touch(
+                request,
                 Some(object.version.clone()),
                 manifest.content_hash.clone(),
                 manifest.size_bytes,
@@ -845,7 +870,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 options.foreground_replica_repair,
                 detach_request,
                 replay_response_journal,
-            );
+            )
+        };
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -870,12 +896,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let distributed_elapsed = distributed_started.elapsed();
         crate::dfs_perf_trace(format_args!(
-            "posix-byte-write node={} path={} object={} version={} bytes={} content_ms={} distributed_ms={} total_ms={}",
+            "posix-byte-write node={} path={} object={} version={} bytes={} inline_routed={} content_ms={} distributed_ms={} total_ms={}",
             self.node_id,
             trace_path,
             object.object_id,
             target_version,
             trace_bytes,
+            inline_remote_primary_write,
             content_elapsed.as_millis(),
             distributed_elapsed.as_millis(),
             trace_started.elapsed().as_millis()

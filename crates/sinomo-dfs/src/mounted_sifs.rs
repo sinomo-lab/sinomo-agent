@@ -17,14 +17,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
-    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsEndpointTransport, DfsError,
-    DfsNodeAdvertisement, DfsNodeId, DfsObjectRpcSendOptions, DfsPeerTransport,
-    DfsPeerTransportError, DfsPeerTransportFuture, DfsPosixError, NetworkedDfsService,
-    cluster_dfs_peer_node_ids, content_services_prefix, fallback_dfs_node_id,
-    object_rpc_request_from_kv_payload, open_cluster_dfs_service_with_peer_transports_for_nodes,
+    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsError, DfsNodeAdvertisement, DfsNodeId,
+    DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
+    DfsPeerTransportFuture, DfsPosixError, NetworkedDfsService, cluster_dfs_peer_node_ids,
+    content_services_prefix, fallback_dfs_node_id, object_rpc_request_from_kv_payload,
+    open_cluster_dfs_service_with_peer_transports_for_nodes,
 };
 
-pub type MountedSifsService = NetworkedDfsService<DfsEndpointTransport>;
+pub type MountedSifsService = NetworkedDfsService<DfsNodeTransport>;
 
 #[derive(Debug)]
 pub struct OpenedMountedSifsService {
@@ -362,11 +362,11 @@ struct MountedSifsObjectRpcHost {
     runtime: tokio::runtime::Handle,
 }
 
-impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for MountedSifsObjectRpcHost {
-    fn sign_endpoint_rpc_request_async<'a>(
+impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for MountedSifsObjectRpcHost {
+    fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         request: &'a ObjectRpcRequest,
-    ) -> sinomo_core::network::ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+    ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
         let data_dir = self.data_dir.clone();
         let request = request.clone();
         let runtime = self.runtime.clone();
@@ -377,8 +377,8 @@ impl sinomo_core::network::ClusterSignedEndpointRpcAsyncHost for MountedSifsObje
                 })
                 .await
                 .map_err(|source| NetworkError::Io {
-                    operation: "mounted SIFS endpoint signing".to_string(),
-                    detail: format!("endpoint signing task failed: {source}"),
+                    operation: "mounted SIFS object RPC signing".to_string(),
+                    detail: format!("object RPC signing task failed: {source}"),
                 })?
         })
     }

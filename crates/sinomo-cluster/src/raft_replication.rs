@@ -16,6 +16,7 @@ use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use std::time::Duration;
 
+#[cfg(any(test, feature = "test-support"))]
 pub trait ClusterRaftAppendReplicationHost {
     fn last_local_raft_log_index(
         &mut self,
@@ -40,6 +41,7 @@ pub trait ClusterRaftAppendReplicationHost {
     fn on_raft_append_sent(&mut self) {}
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub trait ClusterKvAppendReplicationAsyncHost {
     fn last_local_kv_replication_index_async<'a>(
         &'a mut self,
@@ -66,6 +68,7 @@ pub trait ClusterKvAppendReplicationAsyncHost {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub trait ClusterRaftAppendReplicationAsyncHost {
     fn last_local_raft_log_index_async<'a>(
         &'a mut self,
@@ -92,6 +95,7 @@ pub trait ClusterRaftAppendReplicationAsyncHost {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl<T> ClusterRaftAppendReplicationAsyncHost for T
 where
     T: ClusterKvAppendReplicationAsyncHost,
@@ -127,12 +131,14 @@ where
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct NetworkClusterKvRaftAppendReplicationHost<'a, H> {
     paths: &'a ClusterPaths,
     options: ClusterRaftAppendReplicationOptions,
     host: &'a mut H,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl<H> sinomo_kv::ClusterKvRaftAppendReplicationHost
     for NetworkClusterKvRaftAppendReplicationHost<'_, H>
 where
@@ -186,12 +192,14 @@ where
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct NetworkClusterKvRaftAppendReplicationAsyncHost<'a, H> {
     paths: &'a ClusterPaths,
     options: ClusterRaftAppendReplicationOptions,
     host: &'a mut H,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl<H> sinomo_kv::ClusterKvRaftAppendReplicationAsyncHost
     for NetworkClusterKvRaftAppendReplicationAsyncHost<'_, H>
 where
@@ -246,6 +254,7 @@ where
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn replicate_cluster_raft_to_endpoint_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -289,6 +298,7 @@ pub async fn replicate_cluster_raft_to_endpoint_async_with_host(
     .await
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub async fn replicate_cluster_kv_to_endpoint_async_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -309,6 +319,7 @@ pub async fn replicate_cluster_kv_to_endpoint_async_with_host(
     .await
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn replicate_cluster_raft_to_endpoint_async_with_options(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,

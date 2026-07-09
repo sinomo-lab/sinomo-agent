@@ -4,7 +4,10 @@
 //! The Docker cluster gate uses them before DFS scenarios so routing, relay,
 //! authentication, and concurrent request handling must be healthy first.
 
-use sinomo_runtime::api::DaemonApiClient;
+use sinomo_runtime::api::{
+    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DaemonApiClient,
+    DaemonObjectRpcForwardRequest, send_daemon_rpc_async,
+};
 use sinomo_runtime::cluster;
 use sinomo_runtime::core::{
     ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
@@ -44,6 +47,7 @@ pub fn register_network_cluster_test_cases(
         .register(network_state_hygiene_dirty_fixture())
         .register(network_endpoint_error_fallback())
         .register(network_tcp_tunnel_stale_fallback())
+        .register(network_stale_direct_timeout_demotion())
 }
 
 sinomo_runtime::test::sinomo_test_case! {
@@ -106,6 +110,18 @@ sinomo_runtime::test::sinomo_test_case! {
     }
 }
 
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn network_stale_direct_timeout_demotion(ctx) {
+        id: "cluster.network.stale-direct-timeout-demotion",
+        summary: "A routed timeout demotes stale healthy direct endpoint evidence before follow-up RPCs",
+        tags: ["cluster-network", "probe", "routing", "failure-mode"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_network_stale_direct_timeout_demotion(ctx)
+        }
+    }
+}
+
 fn run_network_state_hygiene(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let expected_targets = optional_usize_parameter(ctx, "expected-targets", 1)?;
     let max_findings = optional_usize_parameter(ctx, "max-findings", 0)?;
@@ -120,7 +136,8 @@ fn run_network_state_hygiene(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     })?;
     let cluster_state = cluster::read_cluster_state(&cluster_paths)
         .map_err(|error| SinomoTestError::failed(error.to_string()))?;
-    let targets = network_ping_targets_from_state(&cluster_state)?;
+    let targets =
+        filter_network_test_targets(ctx, network_ping_targets_from_state(&cluster_state)?)?;
     ctx.record("target_count", targets.len());
     ctx.record(
         "targets",
@@ -150,9 +167,7 @@ fn run_network_state_hygiene(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         &local_records,
         &kv_records,
         &active_records,
-        NetworkHygieneOptions {
-            require_active_routes,
-        },
+        NetworkHygieneOptions::for_targets(require_active_routes, targets.iter().cloned()),
     );
     ctx.record("local_connectivity_records", local_records.len());
     ctx.record("kv_connectivity_records", kv_records.len());
@@ -187,7 +202,8 @@ fn run_network_state_hygiene_dirty_fixture(ctx: &mut SinomoTestContext) -> Sinom
     })?;
     let cluster_state = cluster::read_cluster_state(&cluster_paths)
         .map_err(|error| SinomoTestError::failed(error.to_string()))?;
-    let targets = network_ping_targets_from_state(&cluster_state)?;
+    let targets =
+        filter_network_test_targets(ctx, network_ping_targets_from_state(&cluster_state)?)?;
     ctx.record("target_count", targets.len());
     ctx.record(
         "targets",
@@ -316,9 +332,7 @@ fn run_network_state_hygiene_dirty_fixture_probe(
         &local_records,
         &kv_records,
         &active_records,
-        NetworkHygieneOptions {
-            require_active_routes: false,
-        },
+        NetworkHygieneOptions::unscoped(false),
     ))
 }
 
@@ -389,7 +403,8 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         cluster::read_cluster_state(&cluster_paths)
             .map_err(|error| SinomoTestError::failed(error.to_string()))?,
     );
-    let targets = network_ping_targets_from_state(&cluster_state)?;
+    let targets =
+        filter_network_test_targets(ctx, network_ping_targets_from_state(&cluster_state)?)?;
     let target_count = targets.len();
     ctx.record("target_count", target_count);
     ctx.record(
@@ -425,6 +440,8 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ))
         })?
         .with_timeout(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1)));
+    let daemon_address = daemon_client.address().to_string();
+    let control_timeout = Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1));
     let build_jobs =
         |phase: &str, requests_per_target: usize| -> Result<Vec<NetworkPingJob>, SinomoTestError> {
             let mut jobs = Vec::with_capacity(target_count.saturating_mul(requests_per_target));
@@ -445,11 +462,12 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     jobs.push(NetworkPingJob {
                         target_node_id: target_node_id.clone(),
                         timeout: Duration::from_millis(timeout_ms),
+                        control_timeout,
                         request_payload_bytes: payload_bytes,
                         response_payload_bytes,
                         nonce,
                         request,
-                        daemon_client: daemon_client.clone(),
+                        daemon_address: daemon_address.clone(),
                     });
                 }
             }
@@ -906,9 +924,19 @@ fn run_network_tcp_tunnel_stale_fallback(ctx: &mut SinomoTestContext) -> SinomoT
                 && member.state.is_authorized()
                 && member_has_main_daemon(member)
         })
+        .or_else(|| {
+            cluster_state.members.iter().find(|member| {
+                member.state.is_authorized()
+                    && member_has_main_daemon(member)
+                    && member
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.address == stall_endpoint_address)
+            })
+        })
         .ok_or_else(|| {
             SinomoTestError::failed(format!(
-                "cannot find authorized main daemon target named {target_name}"
+                "cannot find authorized main daemon target named {target_name} or advertising stale direct endpoint {stall_endpoint_address}"
             ))
         })?;
     let stall_endpoint = target
@@ -950,6 +978,155 @@ fn run_network_tcp_tunnel_stale_fallback(ctx: &mut SinomoTestContext) -> SinomoT
     Ok(SinomoTestOutcome::passed(
         "routed RPC recovered from a stalled tcp tunnel by using direct RPC on the same endpoint",
     ))
+}
+
+fn run_network_stale_direct_timeout_demotion(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let target_name = ctx.required_parameter("target-name")?.trim().to_string();
+    let stall_endpoint_address = ctx
+        .required_parameter("stall-endpoint-address")?
+        .trim()
+        .to_string();
+    if target_name.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "target-name".to_string(),
+            detail: "must not be empty".to_string(),
+        });
+    }
+    if stall_endpoint_address.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "stall-endpoint-address".to_string(),
+            detail: "must not be empty".to_string(),
+        });
+    }
+    let timeout_ms = optional_u64_parameter(ctx, "timeout-ms", DEFAULT_TIMEOUT_MS)?;
+    let followup_max_ms = optional_u64_parameter(ctx, "followup-max-ms", 1_000)?;
+
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot refresh cluster snapshot before stale direct demotion probe: {error}"
+        ))
+    })?;
+    let cluster_state = cluster::read_cluster_state(&cluster_paths)
+        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+    let target = cluster_state
+        .members
+        .iter()
+        .find(|member| {
+            member.display_name == target_name
+                && member.state.is_authorized()
+                && member_has_main_daemon(member)
+        })
+        .or_else(|| {
+            cluster_state.members.iter().find(|member| {
+                member.state.is_authorized()
+                    && member_has_main_daemon(member)
+                    && member
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.address == stall_endpoint_address)
+            })
+        })
+        .ok_or_else(|| {
+            SinomoTestError::failed(format!(
+                "cannot find authorized main daemon target named {target_name} or advertising stale direct endpoint {stall_endpoint_address}"
+            ))
+        })?;
+    let stall_endpoint = target
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.address == stall_endpoint_address)
+        .cloned()
+        .ok_or_else(|| {
+            let addresses = target
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.address.clone())
+                .collect::<Vec<_>>();
+            SinomoTestError::failed(format!(
+                "target {target_name} does not advertise stale direct endpoint {stall_endpoint_address}; addresses={addresses:?}"
+            ))
+        })?;
+
+    let original_connectivity = cluster_connectivity_records_for_source_with_bootstrap_fallback(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+    )
+    .map_err(|error| {
+        SinomoTestError::failed(format!(
+            "cannot snapshot KV connectivity before stale direct demotion probe: {error}"
+        ))
+    })?;
+    let seed_records = endpoint_error_fallback_seed_records(
+        &cluster_state,
+        target,
+        &stall_endpoint,
+        original_connectivity.clone(),
+    );
+    sync_connectivity_fixture_to_quorum(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+        seed_records,
+        "seed stale direct endpoint preference",
+    )?;
+
+    let probe_result = (|| -> Result<(SinomoTestOutcome, Duration, Duration), SinomoTestError> {
+        let (first_outcome, first_elapsed) =
+            run_network_target_ping_timed(target, timeout_ms, "stale-direct-timeout-demotion")?;
+        if !matches!(
+            first_outcome.status,
+            sinomo_runtime::test::SinomoTestStatus::Passed
+        ) {
+            return Ok((first_outcome, first_elapsed, Duration::ZERO));
+        }
+        let (followup_outcome, followup_elapsed) =
+            run_network_target_ping_timed(target, timeout_ms, "stale-direct-followup")?;
+        if !matches!(
+            followup_outcome.status,
+            sinomo_runtime::test::SinomoTestStatus::Passed
+        ) {
+            return Ok((followup_outcome, first_elapsed, followup_elapsed));
+        }
+        Ok((followup_outcome, first_elapsed, followup_elapsed))
+    })();
+
+    let restore_result = sync_connectivity_fixture_to_quorum(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+        original_connectivity,
+        "restore connectivity after stale direct demotion probe",
+    );
+    restore_result?;
+
+    let (probe_outcome, first_elapsed, followup_elapsed) = probe_result?;
+    if !matches!(
+        probe_outcome.status,
+        sinomo_runtime::test::SinomoTestStatus::Passed
+    ) {
+        return Ok(probe_outcome);
+    }
+    if followup_elapsed > Duration::from_millis(followup_max_ms) {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "follow-up routed RPC took {}ms after stale endpoint demotion, above allowed {followup_max_ms}ms",
+            followup_elapsed.as_millis()
+        )));
+    }
+
+    ctx.record("target_name", target_name);
+    ctx.record("target_node_id", target.node_id.to_string());
+    ctx.record("stall_endpoint_address", stall_endpoint_address);
+    ctx.record(
+        "seeded_stall_endpoint_id",
+        stall_endpoint.endpoint_id.to_string(),
+    );
+    ctx.record("first_rpc_ms", first_elapsed.as_millis().to_string());
+    ctx.record("followup_rpc_ms", followup_elapsed.as_millis().to_string());
+    Ok(SinomoTestOutcome::passed(format!(
+        "stale direct endpoint timed out once in {}ms and follow-up routed RPC completed in {}ms",
+        first_elapsed.as_millis(),
+        followup_elapsed.as_millis()
+    )))
 }
 
 fn endpoint_error_fallback_seed_records(
@@ -1022,6 +1199,61 @@ fn endpoint_error_fallback_seed_records(
     });
     records.push(bad_preference);
     records
+}
+
+fn run_network_target_ping_timed(
+    target: &ClusterMemberRecord,
+    timeout_ms: u64,
+    nonce_prefix: &str,
+) -> Result<(SinomoTestOutcome, Duration), SinomoTestError> {
+    let nonce = format!("{nonce_prefix}-{}-{}", current_millis(), std::process::id());
+    let request = cluster::cluster_network_ping_rpc_request_with_response_payload(&nonce, 0, 0)
+        .map_err(|source| {
+            SinomoTestError::failed(format!("cannot prepare routed ping request: {source}"))
+        })?;
+    let daemon_client = DaemonApiClient::connect()
+        .map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot connect to local daemon for routed ping probe: {source}"
+            ))
+        })?
+        .with_timeout(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(1)));
+    let started = Instant::now();
+    let response = daemon_client
+        .object_rpc_to_target(
+            &target.node_id,
+            &request,
+            Duration::from_millis(timeout_ms),
+            true,
+        )
+        .map_err(|source| {
+            SinomoTestError::failed(format!(
+                "routed ping RPC to {} failed: {source}",
+                target.display_name
+            ))
+        })?;
+    let elapsed = started.elapsed();
+    let response = cluster::decode_cluster_network_ping_rpc_response(&response)
+        .map_err(|source| SinomoTestError::failed(source.to_string()))?;
+    if response.nonce != nonce {
+        return Ok((
+            SinomoTestOutcome::failed(format!(
+                "nonce mismatch: got {}, expected {}",
+                response.nonce, nonce
+            )),
+            elapsed,
+        ));
+    }
+    if response.responder_node_id != target.node_id {
+        return Ok((
+            SinomoTestOutcome::failed(format!(
+                "responder mismatch: got {}, expected {}",
+                response.responder_node_id, target.node_id
+            )),
+            elapsed,
+        ));
+    }
+    Ok((SinomoTestOutcome::passed(""), elapsed))
 }
 
 fn run_network_endpoint_error_fallback_probe(
@@ -1137,6 +1369,40 @@ fn network_ping_targets_from_state(
     Ok(targets)
 }
 
+fn filter_network_test_targets(
+    ctx: &SinomoTestContext,
+    targets: Vec<NodeId>,
+) -> Result<Vec<NodeId>, SinomoTestError> {
+    let Some(target_node_id) = ctx.parameter("target-node-id") else {
+        return Ok(targets);
+    };
+    let target_node_id = target_node_id.trim();
+    if target_node_id.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "target-node-id".to_string(),
+            detail: "must not be empty".to_string(),
+        });
+    }
+    let target_node_id =
+        target_node_id
+            .parse::<NodeId>()
+            .map_err(|source| SinomoTestError::InvalidParameter {
+                name: "target-node-id".to_string(),
+                detail: source.to_string(),
+            })?;
+    let filtered = targets
+        .into_iter()
+        .filter(|target| target == &target_node_id)
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "target-node-id".to_string(),
+            detail: format!("no network test target matched {target_node_id}"),
+        });
+    }
+    Ok(filtered)
+}
+
 fn member_has_main_daemon(member: &ClusterMemberRecord) -> bool {
     member
         .capabilities
@@ -1144,9 +1410,26 @@ fn member_has_main_daemon(member: &ClusterMemberRecord) -> bool {
         .any(|capability| capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct NetworkHygieneOptions {
     require_active_routes: bool,
+    active_route_targets: Option<BTreeSet<NodeId>>,
+}
+
+impl NetworkHygieneOptions {
+    fn unscoped(require_active_routes: bool) -> Self {
+        Self {
+            require_active_routes,
+            active_route_targets: None,
+        }
+    }
+
+    fn for_targets(require_active_routes: bool, targets: impl IntoIterator<Item = NodeId>) -> Self {
+        Self {
+            require_active_routes,
+            active_route_targets: Some(targets.into_iter().collect()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1188,7 +1471,12 @@ fn network_hygiene_findings(
         &mut findings,
     );
     if options.require_active_routes {
-        collect_active_route_hygiene_findings(state, active_records, &mut findings);
+        collect_active_route_hygiene_findings(
+            state,
+            active_records,
+            options.active_route_targets.as_ref(),
+            &mut findings,
+        );
     }
     findings.sort();
     findings.dedup();
@@ -1369,13 +1657,18 @@ fn synthetic_tcp_tunnel_record_targets_peer(record: &network::ClusterConnectivit
 fn collect_active_route_hygiene_findings(
     state: &ClusterBootstrapState,
     active_records: &[network::ClusterConnectivityRecord],
+    active_route_targets: Option<&BTreeSet<NodeId>>,
     findings: &mut Vec<String>,
 ) {
     let graph = network::ClusterConnectivityGraph::from_records(
         state.local_node_id.clone(),
         active_records.to_vec(),
     );
-    for target in network_ping_targets_from_state(state).unwrap_or_default() {
+    let targets = match active_route_targets {
+        Some(targets) => targets.iter().cloned().collect::<Vec<_>>(),
+        None => network_ping_targets_from_state(state).unwrap_or_default(),
+    };
+    for target in targets {
         if network::cluster_route_next_hop(&graph, &state.local_node_id, &target).is_none() {
             findings.push(format!(
                 "active connectivity graph has no route from {} to remote main {}",
@@ -1433,10 +1726,11 @@ struct NetworkPingJob {
     target_node_id: NodeId,
     nonce: String,
     timeout: Duration,
+    control_timeout: Duration,
     request_payload_bytes: usize,
     response_payload_bytes: usize,
     request: network::ObjectRpcRequest,
-    daemon_client: DaemonApiClient,
+    daemon_address: String,
 }
 
 #[derive(Debug)]
@@ -1455,7 +1749,14 @@ enum NetworkPingOutcome {
 
 async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
     let started = Instant::now();
-    let outcome = run_network_ping_job_inner(&job).await;
+    let deadline = job.timeout.saturating_add(Duration::from_secs(2));
+    let outcome = match tokio::time::timeout(deadline, run_network_ping_job_inner(&job)).await {
+        Ok(outcome) => outcome,
+        Err(_) => NetworkPingOutcome::Failure(format!(
+            "network ping job exceeded {}ms deadline",
+            deadline.as_millis()
+        )),
+    };
     let elapsed = started.elapsed();
     NetworkPingResult {
         target_node_id: job.target_node_id,
@@ -1466,19 +1767,38 @@ async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
 }
 
 async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome {
-    let daemon_client = job.daemon_client.clone();
-    let target_node_id = job.target_node_id.clone();
-    let request = job.request.clone();
-    let timeout = job.timeout;
-    let response = match tokio::task::spawn_blocking(move || {
-        daemon_client.object_rpc_to_target(&target_node_id, &request, timeout, true)
-    })
+    let forward_payload = DaemonObjectRpcForwardRequest {
+        target_node_id: job.target_node_id.clone(),
+        request: job.request.clone(),
+        connect_timeout_millis: u64::try_from(job.timeout.as_millis()).unwrap_or(u64::MAX),
+        observe_connectivity: true,
+        raw_response: false,
+    };
+    let forward_request = match network::ObjectRpcRequest::encode_body(
+        DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+        DAEMON_RPC_CATEGORY,
+        &forward_payload,
+    ) {
+        Ok(request) => request,
+        Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
+    };
+    let response = match send_daemon_rpc_async(
+        &job.daemon_address,
+        &forward_request,
+        network::DaemonRpcTimeouts::connect_and_idle(job.control_timeout),
+        &tokio::runtime::Handle::current(),
+    )
     .await
-    .map_err(|source| source.to_string())
-    .and_then(|response| response.map_err(|source| source.to_string()))
     {
         Ok(response) => response,
-        Err(error) => return NetworkPingOutcome::Failure(error),
+        Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
+    };
+    if let Err(error) = response.error_detail() {
+        return NetworkPingOutcome::Failure(error.to_string());
+    }
+    let response = match response.decode_body::<network::ObjectRpcResponse>() {
+        Ok(response) => response,
+        Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
     };
     let response = match cluster::decode_cluster_network_ping_rpc_response(&response) {
         Ok(response) => response,
@@ -1732,6 +2052,21 @@ mod tests {
         state
     }
 
+    fn add_remote_main(state: &mut ClusterBootstrapState, name: &str) -> NodeId {
+        let now = OffsetDateTime::now_utc();
+        let node = NodeId::from_legacy_named(name).expect("node");
+        let mut member = ClusterMemberRecord::local_voter(
+            state.cluster_id.clone(),
+            node.clone(),
+            name,
+            format!("{name}-public-key"),
+            now,
+        );
+        member.capabilities.push(main_daemon_capability());
+        state.members.push(member);
+        node
+    }
+
     fn main_daemon_capability() -> CapabilityName {
         CapabilityName::new(sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY)
             .expect("main daemon capability")
@@ -1815,9 +2150,7 @@ mod tests {
             &[],
             &[],
             &[],
-            NetworkHygieneOptions {
-                require_active_routes: false,
-            },
+            NetworkHygieneOptions::unscoped(false),
         );
 
         assert!(
@@ -1844,9 +2177,7 @@ mod tests {
             &[record],
             &[],
             &[],
-            NetworkHygieneOptions {
-                require_active_routes: false,
-            },
+            NetworkHygieneOptions::unscoped(false),
         );
 
         assert!(
@@ -1861,15 +2192,8 @@ mod tests {
     fn network_hygiene_flags_missing_active_route_to_remote_main() {
         let state = test_state();
 
-        let findings = network_hygiene_findings(
-            &state,
-            &[],
-            &[],
-            &[],
-            NetworkHygieneOptions {
-                require_active_routes: true,
-            },
-        );
+        let findings =
+            network_hygiene_findings(&state, &[], &[], &[], NetworkHygieneOptions::unscoped(true));
 
         assert!(
             findings
@@ -1896,9 +2220,7 @@ mod tests {
             &[record.clone()],
             &[],
             &[record],
-            NetworkHygieneOptions {
-                require_active_routes: true,
-            },
+            NetworkHygieneOptions::unscoped(true),
         );
 
         assert!(findings.is_empty(), "{findings:?}");
@@ -1915,9 +2237,7 @@ mod tests {
             &[record.clone()],
             &[],
             &[record],
-            NetworkHygieneOptions {
-                require_active_routes: true,
-            },
+            NetworkHygieneOptions::unscoped(true),
         );
 
         assert!(findings.is_empty(), "{findings:?}");
@@ -1939,9 +2259,7 @@ mod tests {
             &[],
             &[],
             &[],
-            NetworkHygieneOptions {
-                require_active_routes: false,
-            },
+            NetworkHygieneOptions::unscoped(false),
         );
 
         assert!(
@@ -1970,11 +2288,83 @@ mod tests {
             &[],
             &[],
             &[],
-            NetworkHygieneOptions {
-                require_active_routes: false,
-            },
+            NetworkHygieneOptions::unscoped(false),
         );
 
         assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn network_target_filter_selects_requested_remote_main() {
+        let mut state = test_state();
+        let selected = state.members[1].node_id.clone();
+        let other = add_remote_main(&mut state, "node_network_hygiene_roaming_remote");
+        let targets = network_ping_targets_from_state(&state).expect("targets");
+        assert_eq!(targets.len(), 2);
+        assert!(targets.contains(&selected), "{targets:?}");
+        assert!(targets.contains(&other), "{targets:?}");
+
+        let ctx =
+            SinomoTestContext::new("/tmp").with_parameter("target-node-id", selected.to_string());
+        let filtered = filter_network_test_targets(&ctx, targets).expect("filter");
+
+        assert_eq!(filtered, vec![selected]);
+    }
+
+    #[test]
+    fn network_target_filter_rejects_unavailable_target() {
+        let state = test_state();
+        let missing = NodeId::from_legacy_named("node_network_hygiene_missing").expect("node");
+        let targets = network_ping_targets_from_state(&state).expect("targets");
+        let ctx =
+            SinomoTestContext::new("/tmp").with_parameter("target-node-id", missing.to_string());
+
+        let error = filter_network_test_targets(&ctx, targets).expect_err("missing target");
+
+        assert!(
+            matches!(
+                error,
+                SinomoTestError::InvalidParameter { ref name, .. } if name == "target-node-id"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn network_hygiene_scoped_active_route_ignores_unselected_roaming_node() {
+        let mut state = test_state();
+        let selected = state.members[1].node_id.clone();
+        let roaming = add_remote_main(&mut state, "node_network_hygiene_roaming_remote");
+        let endpoint = test_endpoint(
+            &selected,
+            "endpoint_network_hygiene_selected",
+            "selected.example.test:21353",
+        );
+        let record = test_connectivity_record(&state, &endpoint);
+        state.members[1].endpoints.push(endpoint);
+
+        let unscoped_findings = network_hygiene_findings(
+            &state,
+            &[record.clone()],
+            &[],
+            &[record.clone()],
+            NetworkHygieneOptions::unscoped(true),
+        );
+        assert!(
+            unscoped_findings
+                .iter()
+                .any(|finding| finding.contains(roaming.as_str())),
+            "{unscoped_findings:?}"
+        );
+
+        let scoped_findings = network_hygiene_findings(
+            &state,
+            &[record.clone()],
+            &[],
+            &[record],
+            NetworkHygieneOptions::for_targets(true, [selected]),
+        );
+
+        assert!(scoped_findings.is_empty(), "{scoped_findings:?}");
     }
 }

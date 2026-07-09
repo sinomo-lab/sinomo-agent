@@ -70,6 +70,7 @@ pub const OBJECT_RPC_OPERATION_ID_METADATA_KEY: &str = "sinomo-operation-id";
 pub const OBJECT_RPC_CANCELS_OPERATION_ID_METADATA_KEY: &str = "sinomo-cancels-operation-id";
 pub const OBJECT_RPC_RESPONSE_RETRY_SAFE_METADATA_KEY: &str = "sinomo-response-retry-safe";
 pub const OBJECT_RPC_RESPONDER_NODE_ID_METADATA_KEY: &str = "sinomo-responder-node-id";
+pub const OBJECT_RPC_FULL_RESPONSE_BUDGET_METADATA_KEY: &str = "sinomo-full-response-budget";
 pub const OBJECT_RPC_TRACEPARENT_METADATA_KEY: &str = "traceparent";
 pub const OBJECT_RPC_TRACESTATE_METADATA_KEY: &str = "tracestate";
 pub const OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY: &str = "sinomo-observe-sampled";
@@ -194,6 +195,10 @@ impl ObjectRpcRequest {
         self.with_metadata(OBJECT_RPC_RESPONSE_RETRY_SAFE_METADATA_KEY, "true")
     }
 
+    pub fn with_full_response_budget(self) -> Self {
+        self.with_metadata(OBJECT_RPC_FULL_RESPONSE_BUDGET_METADATA_KEY, "true")
+    }
+
     pub fn with_traceparent(self, traceparent: impl Into<String>) -> Self {
         self.with_metadata(OBJECT_RPC_TRACEPARENT_METADATA_KEY, traceparent)
     }
@@ -253,6 +258,12 @@ impl ObjectRpcRequest {
     pub fn observe_sampled(&self) -> bool {
         self.metadata
             .get(OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY)
+            .is_some_and(|value| value == "true")
+    }
+
+    pub fn uses_full_response_budget(&self) -> bool {
+        self.metadata
+            .get(OBJECT_RPC_FULL_RESPONSE_BUDGET_METADATA_KEY)
             .is_some_and(|value| value == "true")
     }
 }

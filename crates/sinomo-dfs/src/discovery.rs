@@ -1,8 +1,9 @@
 //! DFS node discovery and service advertisements stored in the DFS control plane.
 //!
-//! These records are intentionally compact. They advertise where DFS metadata
-//! and content services run; namespace, inode, object, version, and receipt
-//! metadata remains in DFS metadata shards.
+//! These records are intentionally compact. They advertise which nodes host DFS
+//! metadata and content services; namespace, inode, object, version, and receipt
+//! metadata remains in DFS metadata shards. DFS data traffic is routed by
+//! `sinomo-network`, so service advertisements carry node identity only.
 
 use crate::control_plane::DfsControlPlaneStore;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -31,7 +32,6 @@ pub fn content_services_prefix() -> &'static str {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsNodeAdvertisement {
     pub node_id: NodeId,
-    pub endpoint: String,
     #[serde(default)]
     pub capacity_weight: u32,
     #[serde(default)]
@@ -45,10 +45,9 @@ pub struct DfsNodeAdvertisement {
 }
 
 impl DfsNodeAdvertisement {
-    pub fn metadata(node_id: NodeId, endpoint: impl Into<String>) -> Self {
+    pub fn metadata(node_id: NodeId) -> Self {
         Self {
             node_id,
-            endpoint: endpoint.into(),
             capacity_weight: 1,
             accepts_metadata: true,
             accepts_content: false,
@@ -57,10 +56,9 @@ impl DfsNodeAdvertisement {
         }
     }
 
-    pub fn content(node_id: NodeId, endpoint: impl Into<String>) -> Self {
+    pub fn content(node_id: NodeId) -> Self {
         Self {
             node_id,
-            endpoint: endpoint.into(),
             capacity_weight: 1,
             accepts_metadata: false,
             accepts_content: true,

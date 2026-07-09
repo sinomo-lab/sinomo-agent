@@ -138,12 +138,11 @@ pub fn cluster_network_maintenance_due(
         .startup_settle_until
         .is_some_and(|deadline| now < deadline);
     let convergence_due = !schedule.connectivity_converged || startup_settle_due;
-    let publish_due = convergence_due
-        || cluster_network_maintenance_interval_due(
-            now,
-            schedule.last_publish,
-            cluster_network_publish_interval_for_role(&schedule.local_node_role),
-        );
+    let publish_due = cluster_network_maintenance_interval_due(
+        now,
+        schedule.last_publish,
+        cluster_network_publish_interval_for_role(&schedule.local_node_role),
+    );
     let probe_due = convergence_due
         || cluster_network_maintenance_interval_due(
             now,
@@ -210,5 +209,60 @@ pub fn cluster_network_maintenance_last_timestamp_for_next_due(
     } else {
         now.checked_sub(interval.saturating_sub(delay))
             .unwrap_or(now)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workstation_schedule(now: Instant) -> ClusterNetworkMaintenanceSchedule {
+        ClusterNetworkMaintenanceSchedule {
+            local_node_role: ClusterNodeRole::Workstation,
+            has_discovery: true,
+            connectivity_converged: true,
+            startup_settle_until: None,
+            last_publish: now,
+            last_probe: now,
+            last_discovery: now,
+        }
+    }
+
+    #[test]
+    fn convergence_tick_accelerates_probe_without_bypassing_publish_backoff() {
+        let now = Instant::now();
+        let mut schedule = workstation_schedule(now);
+        schedule.connectivity_converged = false;
+        schedule.last_publish = cluster_network_maintenance_last_timestamp_for_next_due(
+            now,
+            cluster_network_publish_interval_for_role(&schedule.local_node_role),
+            Duration::from_secs(30),
+        );
+
+        let due = cluster_network_maintenance_due(now, &schedule);
+
+        assert!(due.convergence_due);
+        assert!(!due.publish_due);
+        assert!(due.probe_due);
+        assert!(due.discovery_due);
+    }
+
+    #[test]
+    fn overdue_publish_still_runs_during_convergence() {
+        let now = Instant::now();
+        let mut schedule = workstation_schedule(now);
+        schedule.connectivity_converged = false;
+        schedule.last_publish = now
+            .checked_sub(cluster_network_publish_interval_for_role(
+                &schedule.local_node_role,
+            ))
+            .expect("overdue publish timestamp");
+
+        let due = cluster_network_maintenance_due(now, &schedule);
+
+        assert!(due.convergence_due);
+        assert!(due.publish_due);
+        assert!(due.probe_due);
+        assert!(due.discovery_due);
     }
 }

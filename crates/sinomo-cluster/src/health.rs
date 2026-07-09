@@ -870,12 +870,6 @@ fn merge_reachable_peer_health_rows<P: ClusterStatusProbe + ?Sized>(
     let mut queried = std::collections::BTreeSet::new();
     queried.insert(state.local_node_id.clone());
     while queried.len() <= CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS {
-        if !rows
-            .iter()
-            .any(|row| row.availability != ClusterNodeAvailability::Online)
-        {
-            return;
-        }
         let Some(member) = next_online_peer_to_query(state, rows, &queried) else {
             return;
         };
@@ -925,12 +919,6 @@ async fn merge_reachable_peer_health_rows_async<P: ClusterStatusAsyncProbe + ?Si
     let mut queried = std::collections::BTreeSet::new();
     queried.insert(state.local_node_id.clone());
     while queried.len() <= CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS {
-        if !rows
-            .iter()
-            .any(|row| row.availability != ClusterNodeAvailability::Online)
-        {
-            return Ok(());
-        }
         let Some(member) = next_online_peer_to_query(state, rows, &queried) else {
             return Ok(());
         };
@@ -943,23 +931,31 @@ async fn merge_reachable_peer_health_rows_async<P: ClusterStatusAsyncProbe + ?Si
     Ok(())
 }
 
-fn merge_online_peer_health_rows(rows: &mut [ClusterHealthRow], peer_rows: Vec<ClusterHealthRow>) {
+fn merge_online_peer_health_rows(
+    rows: &mut [ClusterHealthRow],
+    peer_rows: Vec<ClusterHealthRow>,
+) -> bool {
+    let mut changed = false;
     let mut by_node = peer_rows
         .into_iter()
         .filter(|row| row.availability == ClusterNodeAvailability::Online)
         .map(|row| (row.member.node_id.clone(), row))
         .collect::<BTreeMap<_, _>>();
     for row in rows {
-        if row.availability == ClusterNodeAvailability::Online {
-            continue;
-        }
         let Some(peer_row) = by_node.remove(&row.member.node_id) else {
             continue;
         };
+        if row.availability == ClusterNodeAvailability::Online
+            && peer_row.status.observed_at <= row.status.observed_at
+        {
+            continue;
+        }
         row.status = peer_row.status;
         row.status.availability = ClusterNodeAvailability::Online;
         row.availability = ClusterNodeAvailability::Online;
+        changed = true;
     }
+    changed
 }
 
 #[cfg(test)]
@@ -1009,5 +1005,171 @@ mod tests {
             },
             "response_payload",
         );
+    }
+
+    fn health_test_member(
+        cluster_id: &ClusterId,
+        node_id: &NodeId,
+        name: &str,
+        now: OffsetDateTime,
+    ) -> ClusterMemberRecord {
+        let mut member =
+            ClusterMemberRecord::local_voter(cluster_id.clone(), node_id.clone(), name, "pk", now);
+        member
+            .capabilities
+            .push(CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability"));
+        member
+    }
+
+    fn health_test_status(
+        cluster_id: &ClusterId,
+        node_id: &NodeId,
+        commit: &str,
+        observed_at: OffsetDateTime,
+    ) -> ClusterNodeStatusRecord {
+        ClusterNodeStatusRecord {
+            cluster_id: cluster_id.clone(),
+            node_id: node_id.clone(),
+            process: "daemon-main".to_string(),
+            availability: ClusterNodeAvailability::Online,
+            daemon_version: "0.1.0".to_string(),
+            commit: Some(commit.to_string()),
+            target_os: Some("linux".to_string()),
+            target_arch: Some("x86_64".to_string()),
+            hostname: None,
+            pid: None,
+            address: Some("127.0.0.1:21353".to_string()),
+            bind_address: None,
+            executable: None,
+            rollout: None,
+            daemon_started_at: None,
+            observed_at,
+        }
+    }
+
+    fn health_test_row(
+        member: &ClusterMemberRecord,
+        status: ClusterNodeStatusRecord,
+    ) -> ClusterHealthRow {
+        ClusterHealthRow {
+            member: member.clone(),
+            status,
+            availability: ClusterNodeAvailability::Online,
+        }
+    }
+
+    #[test]
+    fn peer_health_merge_refreshes_online_row_when_peer_status_is_newer() {
+        let cluster_id = ClusterId::from_legacy_named("cluster_health_refresh").expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_health_refresh").expect("node");
+        let now = OffsetDateTime::now_utc();
+        let member = health_test_member(&cluster_id, &node_id, "node", now);
+        let mut rows = vec![health_test_row(
+            &member,
+            health_test_status(
+                &cluster_id,
+                &node_id,
+                "old",
+                now - time::Duration::seconds(60),
+            ),
+        )];
+        let peer_rows = vec![health_test_row(
+            &member,
+            health_test_status(&cluster_id, &node_id, "new", now),
+        )];
+
+        assert!(merge_online_peer_health_rows(&mut rows, peer_rows));
+        assert_eq!(rows[0].status.commit.as_deref(), Some("new"));
+        assert_eq!(rows[0].availability, ClusterNodeAvailability::Online);
+
+        let older_peer_rows = vec![health_test_row(
+            &member,
+            health_test_status(
+                &cluster_id,
+                &node_id,
+                "older",
+                now - time::Duration::seconds(120),
+            ),
+        )];
+        assert!(!merge_online_peer_health_rows(&mut rows, older_peer_rows));
+        assert_eq!(rows[0].status.commit.as_deref(), Some("new"));
+    }
+
+    struct StaticPeerHealthProbe {
+        rows_by_peer: BTreeMap<NodeId, Vec<ClusterHealthRow>>,
+    }
+
+    impl ClusterStatusProbe for StaticPeerHealthProbe {
+        fn probe_member_status(
+            &self,
+            _state: &ClusterBootstrapState,
+            _member: &ClusterMemberRecord,
+        ) -> Option<ClusterNodeStatusRecord> {
+            None
+        }
+
+        fn peer_local_health_rows(
+            &self,
+            _state: &ClusterBootstrapState,
+            member: &ClusterMemberRecord,
+        ) -> Option<Vec<ClusterHealthRow>> {
+            self.rows_by_peer.get(&member.node_id).cloned()
+        }
+    }
+
+    #[test]
+    fn reachable_peer_health_refreshes_stale_online_rows() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_health_all_online_refresh").expect("cluster");
+        let local_id =
+            NodeId::from_legacy_named("node_health_all_online_local").expect("local node");
+        let remote_id =
+            NodeId::from_legacy_named("node_health_all_online_remote").expect("remote node");
+        let now = OffsetDateTime::now_utc();
+        let local_member = health_test_member(&cluster_id, &local_id, "local", now);
+        let remote_member = health_test_member(&cluster_id, &remote_id, "remote", now);
+        let state = ClusterBootstrapState {
+            cluster_id: cluster_id.clone(),
+            cluster_name: "health refresh".to_string(),
+            local_node_id: local_id.clone(),
+            local_node_display_name: "local".to_string(),
+            term: 1,
+            kv_revision: 1,
+            members: vec![local_member.clone(), remote_member.clone()],
+            initialized_at: now,
+            updated_at: now,
+        };
+        let mut rows = vec![
+            health_test_row(
+                &local_member,
+                health_test_status(&cluster_id, &local_id, "local", now),
+            ),
+            health_test_row(
+                &remote_member,
+                health_test_status(
+                    &cluster_id,
+                    &remote_id,
+                    "stale",
+                    now - time::Duration::seconds(60),
+                ),
+            ),
+        ];
+        let probe = StaticPeerHealthProbe {
+            rows_by_peer: BTreeMap::from([(
+                remote_id.clone(),
+                vec![health_test_row(
+                    &remote_member,
+                    health_test_status(&cluster_id, &remote_id, "fresh", now),
+                )],
+            )]),
+        };
+
+        merge_reachable_peer_health_rows(&state, &mut rows, &probe);
+
+        let remote = rows
+            .iter()
+            .find(|row| row.member.node_id == remote_id)
+            .expect("remote row");
+        assert_eq!(remote.status.commit.as_deref(), Some("fresh"));
     }
 }

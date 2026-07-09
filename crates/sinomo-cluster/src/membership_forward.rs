@@ -9,7 +9,7 @@ use sinomo_network::DaemonRpcTimeouts;
 use sinomo_network::NetworkError;
 use sinomo_network::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
 use sinomo_network::{
-    ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedEndpointRpcAsyncHost,
+    ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedObjectRpcAsyncHost,
 };
 use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_node::NodeId;
@@ -71,7 +71,7 @@ pub async fn forward_cluster_membership_rpc_to_state_authority_async_with_host(
     state: &ClusterBootstrapState,
     request: &ObjectRpcRequest,
     failure_detail: &str,
-    host: &mut (impl ClusterSignedEndpointRpcAsyncHost + Send),
+    host: &mut (impl ClusterSignedObjectRpcAsyncHost + Send),
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let state_authority_targets =
         ClusterEndpointSelector::select_internal_unique_node_targets_async(
@@ -207,7 +207,7 @@ pub async fn forward_cluster_join_challenge_rpc_to_state_authority_async_with_ho
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     request: &ObjectRpcRequest,
-    host: &mut (impl ClusterSignedEndpointRpcAsyncHost + Send),
+    host: &mut (impl ClusterSignedObjectRpcAsyncHost + Send),
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let state_paths = paths.clone();
     let state = runtime

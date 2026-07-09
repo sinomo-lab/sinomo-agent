@@ -152,6 +152,7 @@ use sinomo_runtime::daemon::{
     send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,
     send_daemon_rpc_with_timeouts as daemon_send_daemon_rpc_with_timeouts,
     send_daemon_shutdown_request, send_object_rpc_to_target as daemon_send_object_rpc_to_target,
+    send_object_rpc_to_target_with_timeouts as daemon_send_object_rpc_to_target_with_timeouts,
     shadow_main_binary_from_env as daemon_shadow_main_binary_from_env,
     shadow_main_options_from_env as daemon_shadow_main_options_from_env,
     sign_daemon_rpc_request_for_local_node as daemon_sign_daemon_rpc_request_for_local_node,
@@ -289,12 +290,28 @@ pub(crate) use voice::*;
 struct CliClusterStateAuthorityReachabilityHost;
 
 impl cluster::ClusterStateAuthorityReachabilityHost for CliClusterStateAuthorityReachabilityHost {
-    fn probe_cluster_state_authority(
+    fn probe_cluster_state_authority_node(
         &mut self,
-        endpoint: &ClusterEndpointRecord,
+        _state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
         timeout: Duration,
     ) -> bool {
-        daemon_fetch_daemon_status_from_endpoint(endpoint, timeout).is_ok()
+        let request = match network::ObjectRpcRequest::encode_body(
+            sinomo_runtime::daemon::DAEMON_STATUS_ROUTE,
+            sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
+            &(),
+        ) {
+            Ok(request) => request,
+            Err(_) => return false,
+        };
+        daemon_send_object_rpc_to_target_with_timeouts(
+            target_node_id,
+            &request,
+            network::DaemonRpcTimeouts::connect_and_idle(timeout),
+            false,
+        )
+        .and_then(|response| response.error_detail().map_err(Into::into))
+        .is_ok()
     }
 }
 

@@ -5,7 +5,9 @@ use crate::kv_local_store::{
     read_cluster_kv_cached_snapshot_if_present, read_cluster_kv_current_snapshot_arc,
     read_cluster_kv_latest_observed_snapshot_arc_if_present,
 };
-use sinomo_base::{ClusterEndpointRecord, ClusterMemberRecord, ClusterNodeStatusRecord};
+use sinomo_base::{
+    ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord, ClusterNodeStatusRecord,
+};
 use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvSnapshot};
 #[cfg(any(test, feature = "test-support"))]
 use sinomo_network::ClusterNetworkInfoRecord;
@@ -38,6 +40,9 @@ pub fn read_cluster_members_from_snapshot(
     }
     let policies = read_cluster_capability_policies_from_snapshot(&snapshot)?;
     for member in &mut members {
+        member
+            .endpoints
+            .retain(cluster_endpoint_record_is_cluster_visible);
         if let Some(policy) = policies.get(&member.node_id) {
             member.capabilities = policy.capabilities.clone();
             member.allowed_capabilities = policy.allowed_capabilities.clone();
@@ -106,7 +111,10 @@ fn read_cluster_member_endpoints_from_snapshot(
         .range_prefix_limited(&endpoint_prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)
         .map_err(kv_err)?
     {
-        endpoints.push(entry.decode().map_err(kv_err)?);
+        let endpoint: ClusterEndpointRecord = entry.decode().map_err(kv_err)?;
+        if cluster_endpoint_record_is_cluster_visible(&endpoint) {
+            endpoints.push(endpoint);
+        }
     }
     Ok(endpoints)
 }
@@ -120,12 +128,19 @@ fn read_cluster_endpoints_from_snapshot(
         .map_err(kv_err)?
     {
         let endpoint: ClusterEndpointRecord = entry.decode().map_err(kv_err)?;
+        if !cluster_endpoint_record_is_cluster_visible(&endpoint) {
+            continue;
+        }
         endpoints
             .entry(endpoint.node_id.clone())
             .or_default()
             .push(endpoint);
     }
     Ok(endpoints)
+}
+
+fn cluster_endpoint_record_is_cluster_visible(endpoint: &ClusterEndpointRecord) -> bool {
+    endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
 }
 
 pub(crate) fn read_cluster_capability_policies_from_snapshot(
@@ -281,5 +296,53 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
                 .map(|revision| revision.0)
                 .unwrap_or(0),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keyspace::{cluster_endpoint_key, cluster_member_key};
+    use sinomo_kv::InProcessKvStore;
+    use sinomo_node::ClusterId;
+
+    #[test]
+    fn kv_read_model_filters_local_only_endpoint_records() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_kv_read_model_endpoint_filter").expect("cluster");
+        let node_id =
+            NodeId::from_legacy_named("node_kv_read_model_endpoint_filter").expect("node");
+        let mut member =
+            ClusterMemberRecord::local_voter(cluster_id, node_id.clone(), "node", "pk-node", now);
+        let loopback = ClusterEndpointRecord::loopback(node_id.clone(), "127.0.0.1:21353");
+        let public = sinomo_network::daemon_lan_endpoint(
+            &node_id,
+            "peer.example.test:21353".to_string(),
+            10,
+        );
+        member.endpoints = vec![loopback.clone(), public.clone()];
+
+        let mut store = InProcessKvStore::new();
+        store
+            .put_serde(cluster_member_key(&node_id), &member, None)
+            .expect("put member");
+        store
+            .put_serde(cluster_endpoint_key(&node_id, &loopback), &loopback, None)
+            .expect("put loopback endpoint");
+        store
+            .put_serde(cluster_endpoint_key(&node_id, &public), &public, None)
+            .expect("put public endpoint");
+        let snapshot = store.try_snapshot().expect("snapshot");
+
+        let members = read_cluster_members_from_snapshot(&snapshot).expect("read members");
+        let member = members
+            .iter()
+            .find(|member| member.node_id == node_id)
+            .expect("member");
+        assert_eq!(member.endpoints, vec![public.clone()]);
+
+        let endpoints = read_cluster_endpoints_from_snapshot(&snapshot).expect("read endpoints");
+        assert_eq!(endpoints.get(&node_id), Some(&vec![public]));
     }
 }

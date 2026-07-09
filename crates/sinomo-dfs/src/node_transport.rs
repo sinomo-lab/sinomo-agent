@@ -1,4 +1,4 @@
-//! Endpoint-backed DFS data-plane transport and served-message processing.
+//! Node-routed DFS data-plane transport and served-message processing.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use sinomo_core::ClusterEndpointRecord;
 #[cfg(test)]
 use sinomo_core::local::SinomoDataDir;
 #[cfg(test)]
@@ -283,7 +282,7 @@ pub(crate) fn dfs_direct_read_sender_from_peer_transport(
     })
 }
 #[derive(Clone)]
-struct DeferredDfsEndpointSend {
+struct DeferredDfsPeerSend {
     sender: DfsMessageSender,
     connect_timeout: Duration,
     target_node_id: NodeId,
@@ -291,11 +290,11 @@ struct DeferredDfsEndpointSend {
 }
 
 #[derive(Clone)]
-pub struct DfsEndpointTransport {
+pub struct DfsNodeTransport {
     local_node_id: NodeId,
     known_remote_nodes: BTreeSet<NodeId>,
     incoming_messages: VecDeque<DfsRoutedMessage>,
-    detached_sends: Arc<std::sync::Mutex<Vec<DeferredDfsEndpointSend>>>,
+    detached_sends: Arc<std::sync::Mutex<Vec<DeferredDfsPeerSend>>>,
     connect_timeout: Duration,
     sender: Option<DfsMessageSender>,
     async_sender: Option<AsyncDfsMessageSender>,
@@ -304,10 +303,10 @@ pub struct DfsEndpointTransport {
     async_direct_read_stream_sender: Option<AsyncDfsDirectReadStreamSender>,
 }
 
-impl std::fmt::Debug for DfsEndpointTransport {
+impl std::fmt::Debug for DfsNodeTransport {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("DfsEndpointTransport")
+            .debug_struct("DfsNodeTransport")
             .field("local_node_id", &self.local_node_id)
             .field("known_remote_nodes", &self.known_remote_nodes)
             .field("incoming_messages", &self.incoming_messages)
@@ -316,16 +315,16 @@ impl std::fmt::Debug for DfsEndpointTransport {
     }
 }
 
-impl DfsEndpointTransport {
+impl DfsNodeTransport {
     #[cfg(test)]
     pub(crate) fn new(
         local_node_id: NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
         sender: DfsMessageSender,
     ) -> Self {
         Self::with_connect_timeout(
             local_node_id,
-            endpoints,
+            peer_node_ids,
             DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
             sender,
         )
@@ -334,13 +333,13 @@ impl DfsEndpointTransport {
     #[cfg(test)]
     pub(crate) fn with_connect_timeout(
         local_node_id: NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
         connect_timeout: Duration,
         sender: DfsMessageSender,
     ) -> Self {
-        Self::with_senders(
+        Self::with_senders_for_nodes(
             local_node_id,
-            endpoints,
+            peer_node_ids,
             connect_timeout,
             Some(sender),
             None,
@@ -350,15 +349,15 @@ impl DfsEndpointTransport {
         )
     }
 
-    pub(crate) fn with_message_sender(
+    pub(crate) fn with_message_sender_for_nodes(
         local_node_id: NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
         connect_timeout: Duration,
         sender: DfsMessageSender,
     ) -> Self {
-        Self::with_senders(
+        Self::with_senders_for_nodes(
             local_node_id,
-            endpoints,
+            peer_node_ids,
             connect_timeout,
             Some(sender),
             None,
@@ -371,13 +370,13 @@ impl DfsEndpointTransport {
     #[cfg(test)]
     pub(crate) fn with_connect_timeout_async(
         local_node_id: NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
         connect_timeout: Duration,
         sender: AsyncDfsMessageSender,
     ) -> Self {
-        Self::with_senders(
+        Self::with_senders_for_nodes(
             local_node_id,
-            endpoints,
+            peer_node_ids,
             connect_timeout,
             None,
             Some(sender),
@@ -390,14 +389,14 @@ impl DfsEndpointTransport {
     #[cfg(test)]
     pub(crate) fn with_connect_timeout_and_senders(
         local_node_id: NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
         connect_timeout: Duration,
         sender: DfsMessageSender,
         async_sender: AsyncDfsMessageSender,
     ) -> Self {
-        Self::with_senders(
+        Self::with_senders_for_nodes(
             local_node_id,
-            endpoints,
+            peer_node_ids,
             connect_timeout,
             Some(sender),
             Some(async_sender),
@@ -410,37 +409,20 @@ impl DfsEndpointTransport {
     #[cfg(test)]
     pub(crate) fn new_with_peer_senders(
         local_node_id: NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
         sender: DfsMessageSender,
         async_sender: AsyncDfsMessageSender,
         direct_read_sender: DfsDirectReadSender,
     ) -> Self {
-        Self::with_senders(
+        Self::with_senders_for_nodes(
             local_node_id,
-            endpoints,
+            peer_node_ids,
             DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
             Some(sender),
             Some(async_sender),
             Some(direct_read_sender),
             None,
             None,
-        )
-    }
-
-    pub fn with_peer_transports(
-        local_node_id: NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
-        connect_timeout: Duration,
-        peer_transport: Arc<dyn DfsPeerTransport>,
-        async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
-    ) -> Self {
-        let peer_node_ids = endpoints.into_iter().map(|endpoint| endpoint.node_id);
-        Self::with_peer_transports_for_nodes(
-            local_node_id,
-            peer_node_ids,
-            connect_timeout,
-            peer_transport,
-            async_peer_transport,
         )
     }
 
@@ -476,45 +458,22 @@ impl DfsEndpointTransport {
     #[cfg(test)]
     pub(crate) fn new_with_message_peer_senders(
         local_node_id: NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
         sender: DfsMessageSender,
         async_sender: AsyncDfsMessageSender,
         direct_read_sender: DfsDirectReadSender,
         async_direct_read_sender: AsyncDfsDirectReadSender,
         async_direct_read_stream_sender: AsyncDfsDirectReadStreamSender,
     ) -> Self {
-        Self::with_senders(
+        Self::with_senders_for_nodes(
             local_node_id,
-            endpoints,
+            peer_node_ids,
             DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
             Some(sender),
             Some(async_sender),
             Some(direct_read_sender),
             Some(async_direct_read_sender),
             Some(async_direct_read_stream_sender),
-        )
-    }
-
-    fn with_senders(
-        local_node_id: NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
-        connect_timeout: Duration,
-        sender: Option<DfsMessageSender>,
-        async_sender: Option<AsyncDfsMessageSender>,
-        direct_read_sender: Option<DfsDirectReadSender>,
-        async_direct_read_sender: Option<AsyncDfsDirectReadSender>,
-        async_direct_read_stream_sender: Option<AsyncDfsDirectReadStreamSender>,
-    ) -> Self {
-        let peer_node_ids = endpoints.into_iter().map(|endpoint| endpoint.node_id);
-        Self::with_senders_for_nodes(
-            local_node_id,
-            peer_node_ids,
-            connect_timeout,
-            sender,
-            async_sender,
-            direct_read_sender,
-            async_direct_read_sender,
-            async_direct_read_stream_sender,
         )
     }
 
@@ -546,10 +505,6 @@ impl DfsEndpointTransport {
         }
     }
 
-    fn replace_endpoints(&mut self, endpoints: impl IntoIterator<Item = ClusterEndpointRecord>) {
-        self.replace_peer_nodes(endpoints.into_iter().map(|endpoint| endpoint.node_id));
-    }
-
     fn replace_peer_nodes(&mut self, peer_node_ids: impl IntoIterator<Item = NodeId>) {
         self.known_remote_nodes = peer_node_ids
             .into_iter()
@@ -564,7 +519,7 @@ impl DfsEndpointTransport {
         DfsTransferProfile::Conservative
     }
 
-    fn send_routed_message_to_endpoint(
+    fn send_routed_message_to_peer(
         &mut self,
         target_node_id: &NodeId,
         routed_message: DfsRoutedMessage,
@@ -584,7 +539,7 @@ impl DfsEndpointTransport {
                 require_local_source,
             )?;
             if let Some(returned_messages) =
-                self.try_send_direct_read_message_to_endpoint(&target_node_id, &routed_message)?
+                self.try_send_direct_read_message_to_peer(&target_node_id, &routed_message)?
             {
                 for returned_message in returned_messages {
                     pending.push_back((
@@ -598,11 +553,10 @@ impl DfsEndpointTransport {
             let Some(sender) = self.sender.as_ref().cloned() else {
                 return Err(NetworkError::Io {
                     operation: format!("send DFS message to {target_node_id}"),
-                    detail: "DFS endpoint transport was constructed without a sync sender"
-                        .to_string(),
+                    detail: "DFS peer transport was constructed without a sync sender".to_string(),
                 });
             };
-            let returned_messages = send_dfs_routed_message_to_endpoint(
+            let returned_messages = send_dfs_routed_message_to_peer(
                 sender,
                 self.connect_timeout,
                 target_node_id,
@@ -619,7 +573,7 @@ impl DfsEndpointTransport {
         Ok(())
     }
 
-    fn try_send_direct_read_message_to_endpoint(
+    fn try_send_direct_read_message_to_peer(
         &self,
         target_node_id: &NodeId,
         routed_message: &DfsRoutedMessage,
@@ -633,7 +587,7 @@ impl DfsEndpointTransport {
         let Some(request) = dfs_direct_read_request_from_read_request(read_request) else {
             return Ok(None);
         };
-        let response = send_dfs_direct_read_to_endpoint(
+        let response = send_dfs_direct_read_to_peer(
             sender,
             self.connect_timeout,
             target_node_id.clone(),
@@ -646,7 +600,7 @@ impl DfsEndpointTransport {
         )]))
     }
 
-    async fn try_send_direct_read_message_to_endpoint_async(
+    async fn try_send_direct_read_message_to_peer_async(
         &self,
         target_node_id: &NodeId,
         routed_message: &DfsRoutedMessage,
@@ -659,7 +613,7 @@ impl DfsEndpointTransport {
         };
         let response = if let Some(sender) = self.async_direct_read_stream_sender.as_ref().cloned()
         {
-            send_dfs_direct_read_stream_to_endpoint_async(
+            send_dfs_direct_read_stream_to_peer_async(
                 sender,
                 self.connect_timeout,
                 target_node_id.clone(),
@@ -667,7 +621,7 @@ impl DfsEndpointTransport {
             )
             .await?
         } else if let Some(sender) = self.async_direct_read_sender.as_ref().cloned() {
-            send_dfs_direct_read_to_endpoint_async(
+            send_dfs_direct_read_to_peer_async(
                 sender,
                 self.connect_timeout,
                 target_node_id.clone(),
@@ -684,7 +638,7 @@ impl DfsEndpointTransport {
         )]))
     }
 
-    fn send_routed_message_to_endpoint_detached(
+    fn send_routed_message_to_peer_detached(
         &mut self,
         target_node_id: &NodeId,
         routed_message: DfsRoutedMessage,
@@ -698,7 +652,7 @@ impl DfsEndpointTransport {
         let Some(sender) = self.sender.as_ref().cloned() else {
             return Err(NetworkError::Io {
                 operation: format!("send DFS message to {target_node_id}"),
-                detail: "DFS endpoint transport was constructed without a sync sender".to_string(),
+                detail: "DFS peer transport was constructed without a sync sender".to_string(),
             });
         };
         self.detached_sends
@@ -707,7 +661,7 @@ impl DfsEndpointTransport {
                 operation: "track detached DFS message send".to_string(),
                 detail: "detached send lock is poisoned".to_string(),
             })?
-            .push(DeferredDfsEndpointSend {
+            .push(DeferredDfsPeerSend {
                 sender,
                 connect_timeout: self.connect_timeout,
                 target_node_id: target_node_id.clone(),
@@ -716,7 +670,7 @@ impl DfsEndpointTransport {
         Ok(())
     }
 
-    fn flush_detached_endpoint_sends(&mut self) -> Result<(), NetworkError> {
+    fn flush_detached_peer_sends(&mut self) -> Result<(), NetworkError> {
         let sends = {
             let mut sends = self.detached_sends.lock().map_err(|_| NetworkError::Io {
                 operation: "flush detached DFS message sends".to_string(),
@@ -725,7 +679,7 @@ impl DfsEndpointTransport {
             std::mem::take(&mut *sends)
         };
         for send in sends {
-            let returned_messages = send_dfs_routed_message_to_endpoint(
+            let returned_messages = send_dfs_routed_message_to_peer(
                 send.sender,
                 send.connect_timeout,
                 send.target_node_id,
@@ -733,7 +687,7 @@ impl DfsEndpointTransport {
             )?;
             for returned_message in returned_messages {
                 let target_node_id = returned_message.target_node_id.clone();
-                self.send_routed_message_to_endpoint(&target_node_id, returned_message, false)?;
+                self.send_routed_message_to_peer(&target_node_id, returned_message, false)?;
             }
         }
         Ok(())
@@ -775,7 +729,7 @@ impl DfsEndpointTransport {
         Ok(())
     }
 
-    async fn send_routed_message_to_endpoint_async(
+    async fn send_routed_message_to_peer_async(
         &mut self,
         target_node_id: &NodeId,
         routed_message: DfsRoutedMessage,
@@ -795,7 +749,7 @@ impl DfsEndpointTransport {
                 require_local_source,
             )?;
             if let Some(returned_messages) = self
-                .try_send_direct_read_message_to_endpoint_async(&target_node_id, &routed_message)
+                .try_send_direct_read_message_to_peer_async(&target_node_id, &routed_message)
                 .await?
             {
                 for returned_message in returned_messages {
@@ -811,11 +765,11 @@ impl DfsEndpointTransport {
             let Some(sender) = self.async_sender.as_ref().cloned() else {
                 return Err(NetworkError::Io {
                     operation: format!("send DFS message to {target_node_id}"),
-                    detail: "DFS endpoint transport was constructed without an async sender"
+                    detail: "DFS peer transport was constructed without an async sender"
                         .to_string(),
                 });
             };
-            let returned_messages = send_dfs_routed_message_to_endpoint_async(
+            let returned_messages = send_dfs_routed_message_to_peer_async(
                 sender,
                 connect_timeout,
                 target_node_id,
@@ -848,7 +802,7 @@ fn dfs_direct_read_response_routed_message(
     }
 }
 
-fn send_dfs_routed_message_to_endpoint(
+fn send_dfs_routed_message_to_peer(
     sender: DfsMessageSender,
     connect_timeout: Duration,
     target_node_id: NodeId,
@@ -906,7 +860,7 @@ fn send_dfs_routed_message_to_endpoint(
     }
 }
 
-fn send_dfs_direct_read_to_endpoint(
+fn send_dfs_direct_read_to_peer(
     sender: DfsDirectReadSender,
     connect_timeout: Duration,
     target_node_id: NodeId,
@@ -942,7 +896,7 @@ fn send_dfs_direct_read_to_endpoint(
     }
 }
 
-async fn send_dfs_direct_read_to_endpoint_async(
+async fn send_dfs_direct_read_to_peer_async(
     sender: AsyncDfsDirectReadSender,
     connect_timeout: Duration,
     target_node_id: NodeId,
@@ -978,7 +932,7 @@ async fn send_dfs_direct_read_to_endpoint_async(
     }
 }
 
-async fn send_dfs_direct_read_stream_to_endpoint_async(
+async fn send_dfs_direct_read_stream_to_peer_async(
     sender: AsyncDfsDirectReadStreamSender,
     connect_timeout: Duration,
     target_node_id: NodeId,
@@ -1015,7 +969,7 @@ async fn send_dfs_direct_read_stream_to_endpoint_async(
     }
 }
 
-async fn send_dfs_routed_message_to_endpoint_async(
+async fn send_dfs_routed_message_to_peer_async(
     sender: AsyncDfsMessageSender,
     connect_timeout: Duration,
     target_node_id: NodeId,
@@ -1098,13 +1052,13 @@ fn dfs_message_response_body_bytes(
         .map(|body| body.len())
 }
 
-impl DfsTransportIdentity for DfsEndpointTransport {
+impl DfsTransportIdentity for DfsNodeTransport {
     fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
     }
 }
 
-impl AsyncDfsMessageTransport for DfsEndpointTransport {
+impl AsyncDfsMessageTransport for DfsNodeTransport {
     fn local_node_id(&self) -> &NodeId {
         DfsTransportIdentity::local_node_id(self)
     }
@@ -1115,7 +1069,7 @@ impl AsyncDfsMessageTransport for DfsEndpointTransport {
         message: DfsRoutedMessage,
     ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>> {
         Box::pin(async move {
-            self.send_routed_message_to_endpoint_async(target_node_id, message, true)
+            self.send_routed_message_to_peer_async(target_node_id, message, true)
                 .await
         })
     }
@@ -1133,13 +1087,13 @@ impl AsyncDfsMessageTransport for DfsEndpointTransport {
     }
 }
 
-impl DfsMessageTransport for DfsEndpointTransport {
+impl DfsMessageTransport for DfsNodeTransport {
     fn send_routed_message(
         &mut self,
         target_node_id: &NodeId,
         message: DfsRoutedMessage,
     ) -> Result<(), NetworkError> {
-        self.send_routed_message_to_endpoint(target_node_id, message, true)
+        self.send_routed_message_to_peer(target_node_id, message, true)
     }
 
     fn send_detached_routed_message(
@@ -1147,7 +1101,7 @@ impl DfsMessageTransport for DfsEndpointTransport {
         target_node_id: &NodeId,
         message: DfsRoutedMessage,
     ) -> Result<(), NetworkError> {
-        self.send_routed_message_to_endpoint_detached(target_node_id, message, true)
+        self.send_routed_message_to_peer_detached(target_node_id, message, true)
     }
 
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
@@ -1155,7 +1109,7 @@ impl DfsMessageTransport for DfsEndpointTransport {
     }
 
     fn flush_detached_sends(&mut self) -> Result<(), NetworkError> {
-        self.flush_detached_endpoint_sends()
+        self.flush_detached_peer_sends()
     }
 
     fn can_send_synchronously(&self) -> bool {
@@ -1171,41 +1125,22 @@ impl DfsMessageTransport for DfsEndpointTransport {
     }
 }
 
-impl NetworkedDfsService<DfsEndpointTransport> {
-    pub fn refresh_endpoint_targets(&mut self, endpoints: Vec<ClusterEndpointRecord>) {
-        self.transport.replace_endpoints(endpoints);
-    }
-
+impl NetworkedDfsService<DfsNodeTransport> {
     pub fn refresh_peer_targets(&mut self, peer_node_ids: Vec<NodeId>) {
         self.transport.replace_peer_nodes(peer_node_ids);
     }
 }
 
 #[derive(Debug)]
-pub struct DfsEndpointServedMessageTransport {
+pub struct DfsNodeServedMessageTransport {
     local_node_id: NodeId,
     return_node_id: Option<NodeId>,
     inbound_messages: VecDeque<DfsRoutedMessage>,
     outbound_messages: Vec<DfsRoutedMessage>,
-    endpoint_transport: DfsEndpointTransport,
+    node_transport: DfsNodeTransport,
 }
 
-impl DfsEndpointServedMessageTransport {
-    pub fn new_with_peer_transport(
-        local_node_id: NodeId,
-        endpoints: Vec<ClusterEndpointRecord>,
-        peer_transport: Arc<dyn DfsPeerTransport>,
-        connect_timeout: Duration,
-    ) -> Self {
-        let peer_node_ids = endpoints.into_iter().map(|endpoint| endpoint.node_id);
-        Self::new_with_peer_transport_for_nodes(
-            local_node_id,
-            peer_node_ids,
-            peer_transport,
-            connect_timeout,
-        )
-    }
-
+impl DfsNodeServedMessageTransport {
     pub fn new_with_peer_transport_for_nodes(
         local_node_id: NodeId,
         peer_node_ids: impl IntoIterator<Item = NodeId>,
@@ -1223,11 +1158,10 @@ impl DfsEndpointServedMessageTransport {
     #[cfg(test)]
     pub(crate) fn new_with_message_sender(
         local_node_id: NodeId,
-        endpoints: Vec<ClusterEndpointRecord>,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
         sender: DfsMessageSender,
         connect_timeout: Duration,
     ) -> Self {
-        let peer_node_ids = endpoints.into_iter().map(|endpoint| endpoint.node_id);
         Self::new_with_message_sender_for_nodes(
             local_node_id,
             peer_node_ids,
@@ -1242,7 +1176,7 @@ impl DfsEndpointServedMessageTransport {
         sender: DfsMessageSender,
         connect_timeout: Duration,
     ) -> Self {
-        let endpoint_transport = DfsEndpointTransport::with_senders_for_nodes(
+        let node_transport = DfsNodeTransport::with_senders_for_nodes(
             local_node_id.clone(),
             peer_node_ids,
             connect_timeout,
@@ -1257,7 +1191,7 @@ impl DfsEndpointServedMessageTransport {
             return_node_id: None,
             inbound_messages: VecDeque::new(),
             outbound_messages: Vec::new(),
-            endpoint_transport,
+            node_transport,
         }
     }
 
@@ -1275,16 +1209,12 @@ impl DfsEndpointServedMessageTransport {
     pub fn finish_message(&mut self) -> Vec<DfsRoutedMessage> {
         self.return_node_id = None;
         self.inbound_messages.clear();
-        self.endpoint_transport.incoming_messages.clear();
+        self.node_transport.incoming_messages.clear();
         std::mem::take(&mut self.outbound_messages)
     }
 
-    pub fn replace_endpoints(&mut self, endpoints: Vec<ClusterEndpointRecord>) {
-        self.endpoint_transport.replace_endpoints(endpoints);
-    }
-
     pub fn replace_peer_nodes(&mut self, peer_node_ids: Vec<NodeId>) {
-        self.endpoint_transport.replace_peer_nodes(peer_node_ids);
+        self.node_transport.replace_peer_nodes(peer_node_ids);
     }
 
     fn drain_queued_messages(&mut self) -> Vec<DfsRoutedMessage> {
@@ -1292,13 +1222,13 @@ impl DfsEndpointServedMessageTransport {
     }
 }
 
-impl DfsTransportIdentity for DfsEndpointServedMessageTransport {
+impl DfsTransportIdentity for DfsNodeServedMessageTransport {
     fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
     }
 }
 
-impl DfsMessageTransport for DfsEndpointServedMessageTransport {
+impl DfsMessageTransport for DfsNodeServedMessageTransport {
     fn send_routed_message(
         &mut self,
         target_node_id: &NodeId,
@@ -1323,19 +1253,19 @@ impl DfsMessageTransport for DfsEndpointServedMessageTransport {
             self.outbound_messages.push(message);
             return Ok(());
         }
-        self.endpoint_transport
-            .send_routed_message_to_endpoint(target_node_id, message, true)
+        self.node_transport
+            .send_routed_message_to_peer(target_node_id, message, true)
     }
 
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
         let mut messages = self.inbound_messages.drain(..).collect::<Vec<_>>();
-        messages.extend(self.endpoint_transport.drain_incoming_messages()?);
+        messages.extend(self.node_transport.drain_incoming_messages()?);
         Ok(messages)
     }
 
     fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
         let nested = self
-            .endpoint_transport
+            .node_transport
             .pending_incoming_count()?
             .unwrap_or_default();
         Ok(Some(self.inbound_messages.len().saturating_add(nested)))
@@ -1349,7 +1279,7 @@ impl DfsMessageTransport for DfsEndpointServedMessageTransport {
         if target_node_id == &self.local_node_id {
             return DfsTransferProfile::Local;
         }
-        self.endpoint_transport
+        self.node_transport
             .transfer_profile_for_target(target_node_id)
     }
 }
@@ -1378,11 +1308,7 @@ fn dfs_network_message_can_return_to_served_caller(message: &DfsNetworkMessage) 
         || matches!(message, DfsNetworkMessage::FetchBlob(_))
 }
 
-impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
-    pub fn refresh_message_endpoints(&mut self, endpoints: Vec<ClusterEndpointRecord>) {
-        self.transport.replace_endpoints(endpoints);
-    }
-
+impl NetworkedDfsService<DfsNodeServedMessageTransport> {
     pub fn refresh_message_peer_targets(&mut self, peer_node_ids: Vec<NodeId>) {
         self.transport.replace_peer_nodes(peer_node_ids);
     }
@@ -1608,13 +1534,13 @@ pub(crate) fn process_cluster_dfs_message_command(
     .local_node_id;
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let metadata_backend = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
-    let message_sender: DfsMessageSender = Arc::new(|endpoint, command, _timeout| {
+    let message_sender: DfsMessageSender = Arc::new(|target_node_id, command, _timeout| {
         Err(DfsPeerTransportError::new(format!(
             "unexpected DFS message hop to {} while processing test command {}",
-            endpoint, command.request_id
+            target_node_id, command.request_id
         )))
     });
-    let transport = DfsEndpointServedMessageTransport::new_with_message_sender(
+    let transport = DfsNodeServedMessageTransport::new_with_message_sender(
         local_node_id,
         Vec::new(),
         message_sender,

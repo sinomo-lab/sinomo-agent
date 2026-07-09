@@ -3,7 +3,8 @@ use crate::connectivity::{
     ClusterConnectivityState, cluster_network_record_live,
 };
 use crate::connectivity_store::{
-    read_local_cluster_connectivity_records, sort_cluster_connectivity_records,
+    local_cluster_connectivity_content_generation, read_local_cluster_connectivity_records,
+    sort_cluster_connectivity_records,
 };
 use crate::error::NetworkError;
 use crate::file_mark::{ClusterFileMark, cluster_file_mark};
@@ -35,12 +36,14 @@ pub struct ClusterRouteGraphCacheMark {
     state: ClusterFileMark,
     pub directory_version: Option<crate::directory::DirectoryVersion>,
     local_connectivity: ClusterFileMark,
+    local_connectivity_generation: u64,
 }
 
 #[derive(Clone, Debug, Default)]
 struct ClusterRouteGraphLiveEndpointIndex {
     known_nodes: BTreeSet<NodeId>,
     endpoint_ids_by_node: BTreeMap<NodeId, BTreeSet<ClusterEndpointId>>,
+    endpoint_routes_by_node: BTreeMap<NodeId, Vec<(sinomo_base::ClusterTransportKind, String)>>,
 }
 
 impl ClusterRouteGraphLiveEndpointIndex {
@@ -71,18 +74,41 @@ impl ClusterRouteGraphLiveEndpointIndex {
                 &endpoint.endpoint_id,
                 operation,
             )?);
+        self.endpoint_routes_by_node
+            .entry(crate::object::try_clone_id(&endpoint.node_id, operation)?)
+            .or_default()
+            .push((
+                endpoint.transport.clone(),
+                crate::object::try_clone_string(&endpoint.address, operation)?,
+            ));
         Ok(())
     }
 
     fn is_empty(&self) -> bool {
-        self.known_nodes.is_empty() && self.endpoint_ids_by_node.is_empty()
+        self.known_nodes.is_empty()
+            && self.endpoint_ids_by_node.is_empty()
+            && self.endpoint_routes_by_node.is_empty()
     }
 
     fn record_targets_live_endpoint(&self, record: &ClusterConnectivityRecord) -> bool {
         if let Some(endpoint_ids) = self.endpoint_ids_by_node.get(&record.target_node_id) {
-            return endpoint_ids.contains(&record.endpoint_id);
+            if endpoint_ids.contains(&record.endpoint_id) {
+                return true;
+            }
         }
-        true
+        if let Some(endpoint_routes) = self.endpoint_routes_by_node.get(&record.target_node_id) {
+            return endpoint_routes.iter().any(|(transport, address)| {
+                transport == &record.transport && address == &record.address
+            });
+        }
+        !self
+            .endpoint_ids_by_node
+            .contains_key(&record.target_node_id)
+    }
+
+    fn record_nodes_are_known(&self, record: &ClusterConnectivityRecord) -> bool {
+        self.known_nodes.contains(&record.source_node_id)
+            && self.known_nodes.contains(&record.target_node_id)
     }
 }
 
@@ -113,18 +139,34 @@ impl ClusterRouteGraphRecordIndex {
         Ok(())
     }
 
+    fn try_insert_if_newer(
+        &mut self,
+        record: ClusterConnectivityRecord,
+        operation: &str,
+    ) -> Result<(), NetworkError> {
+        let key = Self::record_key(&record, operation)?;
+        let should_insert = self.records.get(&key).is_none_or(|existing| {
+            if existing.state == ClusterConnectivityState::Healthy
+                && crate::connectivity::cluster_connectivity_failure_reason_is_identity_mismatch(
+                    &record,
+                )
+            {
+                return false;
+            }
+            record.observed_at > existing.observed_at
+        });
+        if should_insert {
+            self.records.insert(key, record);
+        }
+        Ok(())
+    }
+
     fn into_records(self) -> Vec<ClusterConnectivityRecord> {
         self.records.into_values().collect()
     }
 
     fn is_empty(&self) -> bool {
         self.records.is_empty()
-    }
-
-    fn contains_source(&self, source_node_id: &NodeId) -> bool {
-        self.records
-            .keys()
-            .any(|(record_source_node_id, _, _)| record_source_node_id == source_node_id)
     }
 }
 
@@ -228,6 +270,7 @@ pub fn cluster_route_graph_cache_mark(paths: &ClusterPaths) -> Option<ClusterRou
                 .ok()?,
         ),
         local_connectivity: cluster_file_mark(&paths.connectivity_local)?,
+        local_connectivity_generation: local_cluster_connectivity_content_generation(paths),
     })
 }
 
@@ -322,7 +365,19 @@ pub fn read_cluster_connectivity_graph_with_query<Q>(
 where
     Q: ClusterConnectivityRecordQuery + ?Sized,
 {
-    read_cluster_connectivity_graph_with_bootstrap_and_query(paths, None, None, None, query)
+    let state =
+        crate::object_file_store::read_optional_object_file::<ClusterBootstrapState>(&paths.state)
+            .ok()
+            .flatten();
+    let cluster_id = state.as_ref().map(|state| &state.cluster_id);
+    let local_source_node_id = state.as_ref().map(|state| &state.local_node_id);
+    read_cluster_connectivity_graph_with_bootstrap_and_query(
+        paths,
+        cluster_id,
+        local_source_node_id,
+        state.as_ref(),
+        query,
+    )
 }
 
 pub(crate) fn read_cluster_connectivity_graph_for_state(
@@ -359,30 +414,14 @@ where
                 records_by_key.try_insert(record, "index directory route graph records")?;
             }
             if !records_by_key.is_empty() {
-                if let Some(local_source_node_id) = _local_source_node_id
-                    && !records_by_key.contains_source(local_source_node_id)
-                    && let Ok(local_records) = read_local_cluster_connectivity_records(paths)
-                {
-                    // During cold join, a node may know how to reach the
-                    // cluster before its own source-owned probe records have
-                    // replicated into cluster KV. Only those local-source
-                    // records may supplement the KV graph; local records
-                    // from other sources never extend the authoritative view.
-                    for record in local_records.into_iter().filter(|record| {
-                        record.source_node_id == *local_source_node_id
-                            && route_graph_record_is_usable(
-                                record,
-                                cluster_id,
-                                live_endpoint_index.as_ref(),
-                                now,
-                            )
-                    }) {
-                        records_by_key.try_insert(
-                            record,
-                            "index local source bootstrap route graph records",
-                        )?;
-                    }
-                }
+                overlay_newer_local_source_records(
+                    paths,
+                    cluster_id,
+                    live_endpoint_index.as_ref(),
+                    now,
+                    _local_source_node_id,
+                    &mut records_by_key,
+                )?;
                 let mut records = records_by_key.into_records();
                 sort_cluster_connectivity_records(&mut records);
                 return Ok(records);
@@ -419,6 +458,32 @@ where
     Ok(records)
 }
 
+fn overlay_newer_local_source_records(
+    paths: &ClusterPaths,
+    cluster_id: Option<&sinomo_node::ClusterId>,
+    live_endpoint_index: Option<&ClusterRouteGraphLiveEndpointIndex>,
+    now: OffsetDateTime,
+    local_source_node_id: Option<&NodeId>,
+    records_by_key: &mut ClusterRouteGraphRecordIndex,
+) -> Result<(), NetworkError> {
+    let Some(local_source_node_id) = local_source_node_id else {
+        return Ok(());
+    };
+    let local_records = match read_local_cluster_connectivity_records(paths) {
+        Ok(records) => records,
+        Err(_) => return Ok(()),
+    };
+    for record in local_records.into_iter().filter(|record| {
+        record.source_node_id == *local_source_node_id
+            && route_graph_record_is_usable(record, cluster_id, live_endpoint_index, now)
+    }) {
+        // The local node owns observations for its own outbound links. Overlay them while
+        // they await KV publication so route choice does not freeze on stale KV failures.
+        records_by_key.try_insert_if_newer(record, "overlay local source route graph records")?;
+    }
+    Ok(())
+}
+
 fn route_graph_record_is_usable(
     record: &ClusterConnectivityRecord,
     cluster_id: Option<&sinomo_node::ClusterId>,
@@ -427,6 +492,9 @@ fn route_graph_record_is_usable(
 ) -> bool {
     cluster_id.is_none_or(|cluster_id| record.cluster_id == *cluster_id)
         && cluster_network_record_live(record.expires_at, now)
+        && live_endpoint_index
+            .as_ref()
+            .is_none_or(|index| index.record_nodes_are_known(record))
         && (record.state != ClusterConnectivityState::Unreachable
             || live_endpoint_index
                 .as_ref()
@@ -440,6 +508,9 @@ fn cluster_route_graph_live_endpoint_index(
     let mut index = ClusterRouteGraphLiveEndpointIndex::default();
     if let Some(state) = state {
         for member in &state.members {
+            if !member.state.is_authorized() {
+                continue;
+            }
             index.try_insert_known_node(&member.node_id, "index route graph live endpoints")?;
             for endpoint in &member.endpoints {
                 index.try_insert_endpoint(endpoint, "index route graph live endpoints")?;
@@ -450,6 +521,9 @@ fn cluster_route_graph_live_endpoint_index(
     match directory.members() {
         Ok(members) => {
             for member in members {
+                if !member.state.is_authorized() {
+                    continue;
+                }
                 index.try_insert_known_node(&member.node_id, "index route graph live endpoints")?;
                 for endpoint in &member.endpoints {
                     index.try_insert_endpoint(endpoint, "index route graph live endpoints")?;
@@ -476,7 +550,7 @@ mod tests {
     use super::*;
     use crate::connectivity::{CLUSTER_CONNECTIVITY_TTL_SECONDS, cluster_connectivity_record};
     use crate::connectivity_store::write_local_cluster_connectivity_records;
-    use sinomo_base::{ClusterEndpointSource, ClusterTransportKind};
+    use sinomo_base::{ClusterEndpointSource, ClusterMemberRecord, ClusterTransportKind};
     use sinomo_node::ClusterId;
 
     #[derive(Clone)]
@@ -506,6 +580,23 @@ mod tests {
         }
     }
 
+    fn add_test_member(
+        state: &mut ClusterBootstrapState,
+        node_id: &NodeId,
+        endpoints: Vec<ClusterEndpointRecord>,
+        now: OffsetDateTime,
+    ) {
+        let mut member = ClusterMemberRecord::local_voter(
+            state.cluster_id.clone(),
+            node_id.clone(),
+            node_id.as_str(),
+            "pk-test",
+            now,
+        );
+        member.endpoints = endpoints;
+        state.members.push(member);
+    }
+
     #[test]
     fn route_graph_uses_kv_graph_as_source_of_truth_when_available() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-route-graph-bootstrap-missing");
@@ -522,7 +613,7 @@ mod tests {
             NodeId::from_legacy_named("node_route_graph_bootstrap_kv").expect("kv target");
         let bootstrap_target = NodeId::from_legacy_named("node_route_graph_bootstrap_local_edge")
             .expect("bootstrap target");
-        let state = ClusterBootstrapState::initialized_locally(
+        let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id,
             "route graph bootstrap",
             local.clone(),
@@ -540,6 +631,7 @@ mod tests {
             &bootstrap_target,
             "node-bootstrap:21353",
         );
+        add_test_member(&mut state, &kv_target, vec![kv_endpoint.clone()], now);
         let kv_record = cluster_connectivity_record(
             &state,
             &kv_endpoint,
@@ -614,7 +706,7 @@ mod tests {
             NodeId::from_legacy_named("node_route_graph_bootstrap_upstream").expect("upstream");
         let upstream_target =
             NodeId::from_legacy_named("node_route_graph_bootstrap_peer").expect("peer");
-        let state = ClusterBootstrapState::initialized_locally(
+        let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
             "route graph bootstrap",
             local.clone(),
@@ -639,6 +731,19 @@ mod tests {
             "endpoint_route_graph_bootstrap_authority",
             &authority,
             "node-authority:21353",
+        );
+        add_test_member(
+            &mut state,
+            &authority,
+            vec![authority_endpoint.clone()],
+            now,
+        );
+        add_test_member(&mut state, &upstream_source, Vec::new(), now);
+        add_test_member(
+            &mut state,
+            &upstream_target,
+            vec![upstream_endpoint.clone()],
+            now,
         );
         let upstream_kv_record = cluster_connectivity_record(
             &upstream_state,
@@ -689,6 +794,232 @@ mod tests {
     }
 
     #[test]
+    fn route_graph_prefers_newer_local_source_record_over_stale_kv_failure() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-route-graph-local-newer");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_route_graph_local_newer").expect("cluster id");
+        let local =
+            NodeId::from_legacy_named("node_route_graph_local_newer_local").expect("local node");
+        let target =
+            NodeId::from_legacy_named("node_route_graph_local_newer_target").expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "route graph local newer",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint = test_endpoint(
+            "endpoint_route_graph_local_newer_target",
+            &target,
+            "198.51.100.76:21353",
+        );
+        add_test_member(&mut state, &target, vec![endpoint.clone()], now);
+
+        let mut stale_kv_failure = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Unreachable,
+            None,
+            3,
+            None,
+            Some(now.to_string()),
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        stale_kv_failure.failure_reason =
+            Some(crate::ClusterConnectivityFailureReason::IdentityMismatch);
+        let refreshed_at = now + time::Duration::seconds(1);
+        let local_healthy = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(42),
+            0,
+            Some(refreshed_at.to_string()),
+            None,
+            refreshed_at,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            std::slice::from_ref(&local_healthy),
+        )
+        .expect("write local connectivity");
+
+        let records = read_cluster_connectivity_graph_with_bootstrap_and_query(
+            &paths,
+            Some(&state.cluster_id),
+            Some(&state.local_node_id),
+            Some(&state),
+            &StaticConnectivityQuery {
+                records: vec![stale_kv_failure],
+            },
+        )
+        .expect("read route graph records");
+        let graph = ClusterConnectivityGraph::from_records(local.clone(), records);
+        let endpoint = graph
+            .best_healthy_endpoint(&local, &target)
+            .expect("newer local healthy endpoint should override stale KV failure");
+
+        assert_eq!(endpoint.address, "198.51.100.76:21353");
+        assert_eq!(endpoint.last_observed_latency_ms, Some(42));
+    }
+
+    #[test]
+    fn route_graph_keeps_kv_healthy_over_newer_local_identity_mismatch() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-route-graph-kv-healthy");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_route_graph_kv_healthy").expect("cluster id");
+        let local =
+            NodeId::from_legacy_named("node_route_graph_kv_healthy_local").expect("local node");
+        let target =
+            NodeId::from_legacy_named("node_route_graph_kv_healthy_target").expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "route graph kv healthy",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint = test_endpoint(
+            "endpoint_route_graph_kv_healthy_target",
+            &target,
+            "198.51.100.88:21353",
+        );
+        add_test_member(&mut state, &target, vec![endpoint.clone()], now);
+
+        let kv_healthy = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(31),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let mismatch_at = now + time::Duration::seconds(1);
+        let local_mismatch = crate::connectivity::cluster_connectivity_record_for_identity_mismatch(
+            &state,
+            &endpoint,
+            &mismatch_at.to_string(),
+            mismatch_at,
+        );
+        write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            std::slice::from_ref(&local_mismatch),
+        )
+        .expect("write local connectivity");
+
+        let records = read_cluster_connectivity_graph_with_bootstrap_and_query(
+            &paths,
+            Some(&state.cluster_id),
+            Some(&state.local_node_id),
+            Some(&state),
+            &StaticConnectivityQuery {
+                records: vec![kv_healthy],
+            },
+        )
+        .expect("read route graph records");
+        let graph = ClusterConnectivityGraph::from_records(local.clone(), records);
+        let endpoint = graph
+            .best_healthy_endpoint(&local, &target)
+            .expect("KV healthy endpoint should survive local identity mismatch");
+
+        assert_eq!(endpoint.address, "198.51.100.88:21353");
+        assert_eq!(endpoint.last_observed_latency_ms, Some(31));
+    }
+
+    #[test]
+    fn route_graph_prefers_newer_local_command_auth_denied_over_kv_healthy() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-route-graph-command-auth-denied");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_route_graph_command_auth_denied")
+            .expect("cluster id");
+        let local = NodeId::from_legacy_named("node_route_graph_command_auth_denied_local")
+            .expect("local node");
+        let target = NodeId::from_legacy_named("node_route_graph_command_auth_denied_target")
+            .expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "route graph command auth denied",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint = test_endpoint(
+            "endpoint_route_graph_command_auth_denied_target",
+            &target,
+            "198.51.100.89:21353",
+        );
+        add_test_member(&mut state, &target, vec![endpoint.clone()], now);
+
+        let kv_healthy = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(29),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let denied_at = now + time::Duration::seconds(1);
+        let local_auth_denied =
+            crate::connectivity::cluster_connectivity_record_for_command_auth_denied(
+                &state,
+                &endpoint,
+                &denied_at.to_string(),
+                denied_at,
+            );
+        write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            std::slice::from_ref(&local_auth_denied),
+        )
+        .expect("write local connectivity");
+
+        let records = read_cluster_connectivity_graph_with_bootstrap_and_query(
+            &paths,
+            Some(&state.cluster_id),
+            Some(&state.local_node_id),
+            Some(&state),
+            &StaticConnectivityQuery {
+                records: vec![kv_healthy],
+            },
+        )
+        .expect("read route graph records");
+        let graph = ClusterConnectivityGraph::from_records(local.clone(), records);
+
+        assert!(
+            graph.best_healthy_endpoint(&local, &target).is_none(),
+            "newer command-auth-denied observations must block stale healthy route evidence"
+        );
+    }
+
+    #[test]
     fn route_graph_composes_local_source_bootstrap_with_kv_upstream_route() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-route-graph-bootstrap-route");
         let data_dir = sinomo_local::SinomoDataDir::new(&root);
@@ -704,7 +1035,7 @@ mod tests {
             NodeId::from_legacy_named("node_route_graph_bootstrap_route_bridge").expect("bridge");
         let authority = NodeId::from_legacy_named("node_route_graph_bootstrap_route_authority")
             .expect("authority");
-        let state = ClusterBootstrapState::initialized_locally(
+        let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
             "route graph bootstrap route",
             local.clone(),
@@ -729,6 +1060,13 @@ mod tests {
             "endpoint_route_graph_bootstrap_route_authority",
             &authority,
             "authority:21353",
+        );
+        add_test_member(&mut state, &bridge, vec![bridge_endpoint.clone()], now);
+        add_test_member(
+            &mut state,
+            &authority,
+            vec![authority_endpoint.clone()],
+            now,
         );
         let local_to_bridge = cluster_connectivity_record(
             &state,
@@ -792,7 +1130,7 @@ mod tests {
             NodeId::from_legacy_named("node_route_graph_bootstrap_local").expect("local node");
         let bootstrap_target = NodeId::from_legacy_named("node_route_graph_bootstrap_local_edge")
             .expect("bootstrap target");
-        let state = ClusterBootstrapState::initialized_locally(
+        let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id,
             "route graph bootstrap",
             local.clone(),
@@ -804,6 +1142,12 @@ mod tests {
             "endpoint_route_graph_bootstrap_local",
             &bootstrap_target,
             "node-bootstrap:21353",
+        );
+        add_test_member(
+            &mut state,
+            &bootstrap_target,
+            vec![bootstrap_endpoint.clone()],
+            now,
         );
         let bootstrap_record = cluster_connectivity_record(
             &state,
@@ -841,5 +1185,175 @@ mod tests {
             .expect("bootstrap target record");
         assert_eq!(bootstrap.latency_ms, Some(22));
         assert_eq!(bootstrap.address, bootstrap_record.address);
+    }
+
+    #[test]
+    fn route_graph_excludes_local_connectivity_for_removed_members() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-route-graph-removed-members");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_route_graph_removed").expect("cluster id");
+        let local = NodeId::from_legacy_named("node_route_graph_removed_local").expect("local");
+        let removed_target =
+            NodeId::from_legacy_named("node_route_graph_removed_target").expect("removed target");
+        let removed_source =
+            NodeId::from_legacy_named("node_route_graph_removed_source").expect("removed source");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "route graph removed members",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let removed_target_endpoint = test_endpoint(
+            "endpoint_route_graph_removed_target",
+            &removed_target,
+            "removed-target:21353",
+        );
+        let local_endpoint = test_endpoint(
+            "endpoint_route_graph_removed_local",
+            &local,
+            "local-node:21353",
+        );
+        let removed_target_record = cluster_connectivity_record(
+            &state,
+            &removed_target_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let removed_source_state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "route graph removed source",
+            removed_source.clone(),
+            "removed-source",
+            "pk-removed",
+            now,
+        );
+        let removed_source_record = cluster_connectivity_record(
+            &removed_source_state,
+            &local_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            std::slice::from_ref(&removed_target_record),
+        )
+        .expect("write removed target record");
+        write_local_cluster_connectivity_records(
+            &paths,
+            &removed_source,
+            std::slice::from_ref(&removed_source_record),
+        )
+        .expect("write removed source record");
+
+        let records = read_cluster_connectivity_graph_with_bootstrap_and_query(
+            &paths,
+            Some(&state.cluster_id),
+            Some(&state.local_node_id),
+            Some(&state),
+            &StaticConnectivityQuery {
+                records: Vec::new(),
+            },
+        )
+        .expect("read route graph records");
+
+        assert!(
+            records.is_empty(),
+            "state-scoped route graph must ignore local records for removed members"
+        );
+    }
+
+    #[test]
+    fn route_graph_cache_tracks_route_stable_local_connectivity_refresh() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-route-graph-cache-refresh");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_route_graph_cache").expect("cluster id");
+        let local = NodeId::from_legacy_named("node_route_graph_cache_local").expect("local node");
+        let target =
+            NodeId::from_legacy_named("node_route_graph_cache_target").expect("target node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "route graph cache",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint = test_endpoint("endpoint_route_graph_cache", &target, "target:21353");
+        add_test_member(&mut state, &target, vec![endpoint.clone()], now);
+        let initial_record = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(7),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, &[initial_record])
+            .expect("write initial local connectivity");
+
+        let initial_graph =
+            ClusterConnectivityGraph::try_read_for_local(&paths, &state).expect("initial graph");
+        let initial_endpoint = initial_graph
+            .best_healthy_endpoint(&local, &target)
+            .expect("initial healthy endpoint");
+        assert_eq!(initial_endpoint.last_observed_latency_ms, Some(7));
+        let cached_mark = cluster_route_graph_cache_mark(&paths).expect("cached mark");
+
+        let refreshed_at = now + time::Duration::seconds(1);
+        let refreshed_record = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(19),
+            0,
+            Some(refreshed_at.to_string()),
+            None,
+            refreshed_at,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, &[refreshed_record])
+            .expect("refresh local connectivity");
+        let refreshed_mark = cluster_route_graph_cache_mark(&paths).expect("refreshed mark");
+        assert_eq!(
+            cached_mark.local_connectivity,
+            refreshed_mark.local_connectivity
+        );
+        assert_ne!(
+            cached_mark.local_connectivity_generation,
+            refreshed_mark.local_connectivity_generation
+        );
+
+        let refreshed_graph =
+            ClusterConnectivityGraph::try_read_for_local(&paths, &state).expect("refreshed graph");
+        let refreshed_endpoint = refreshed_graph
+            .best_healthy_endpoint(&local, &target)
+            .expect("refreshed healthy endpoint");
+        assert_eq!(refreshed_endpoint.last_observed_latency_ms, Some(19));
     }
 }

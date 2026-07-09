@@ -34,7 +34,7 @@ services:
       SINOMO_CLUSTER_JOIN_TRACE: "${SINOMO_CLUSTER_JOIN_TRACE:-0}"
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
-      SINOMO_MANUAL_ENDPOINTS_JSON: '{"main":[{"address":"tcp://host.docker.internal:${SINOMO_SCENARIO_PUBLIC_PORT:-32166}","scope":"internet-direct","priority":0}]}'
+      SINOMO_MANUAL_ENDPOINTS_JSON: '{"main":[{"address":"tcp://host.docker.internal:${SINOMO_SCENARIO_DIRECT_STALL_PORT:-32169}","scope":"internet-direct","priority":0},{"address":"tcp://host.docker.internal:${SINOMO_SCENARIO_PUBLIC_PORT:-32166}","scope":"internet-direct","priority":1}]}'
       PUBLISH_INVITES: "node1:21353=/shared/lan-a-invite.json host.docker.internal:${SINOMO_SCENARIO_PUBLIC_PORT:-32166}=/shared/forwarded-invite.json"
     volumes:
       - node1-data:/data

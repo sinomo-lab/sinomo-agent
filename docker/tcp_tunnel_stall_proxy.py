@@ -5,7 +5,9 @@ The proxy relays normal daemon object-RPC connections to a real daemon, but
 when the first request on a connection is the TCP tunnel open route it relays
 the open handshake and then stops forwarding tunnel frames. This reproduces a
 stale persistent tunnel while keeping the same endpoint usable for direct RPC
-fallback.
+fallback. With --stall-direct it accepts ordinary daemon RPC connections and
+stalls them without forwarding, which reproduces stale healthy direct endpoint
+evidence.
 """
 
 import argparse
@@ -108,7 +110,8 @@ def stall_client(client: socket.socket) -> None:
 
 class StallProxyHandler(socketserver.BaseRequestHandler):
     target_host: str
-    target_port: int
+    target_port: int | None
+    stall_direct: bool
 
     def handle(self) -> None:
         peer = f"{self.client_address[0]}:{self.client_address[1]}"
@@ -122,6 +125,14 @@ class StallProxyHandler(socketserver.BaseRequestHandler):
                 f"{peer} first_request_bytes={len(initial)} "
                 f"tunnel_open={str(is_tunnel_open).lower()}"
             )
+            if self.stall_direct and not is_tunnel_open:
+                log(f"{peer} direct rpc stalling")
+                stall_client(self.request)
+                return
+            if self.target_port is None:
+                log(f"{peer} no proxy target configured; stalling")
+                stall_client(self.request)
+                return
             with socket.create_connection(
                 (self.target_host, self.target_port), timeout=5.0
             ) as target:
@@ -154,15 +165,22 @@ def main() -> int:
     parser.add_argument("--listen-host", default="127.0.0.1")
     parser.add_argument("--listen-port", type=int, required=True)
     parser.add_argument("--target-host", default="127.0.0.1")
-    parser.add_argument("--target-port", type=int, required=True)
+    parser.add_argument("--target-port", type=int)
+    parser.add_argument("--stall-direct", action="store_true")
     args = parser.parse_args()
 
     StallProxyHandler.target_host = args.target_host
     StallProxyHandler.target_port = args.target_port
+    StallProxyHandler.stall_direct = args.stall_direct
     server = ThreadedTcpServer((args.listen_host, args.listen_port), StallProxyHandler)
+    target = (
+        "direct-stall"
+        if args.stall_direct
+        else f"{args.target_host}:{args.target_port}"
+    )
     print(
-        f"tcp tunnel stall proxy listening on {args.listen_host}:{args.listen_port} "
-        f"-> {args.target_host}:{args.target_port}",
+        f"tcp tunnel stall proxy listening on "
+        f"{args.listen_host}:{args.listen_port} -> {target}",
         flush=True,
     )
     try:

@@ -498,7 +498,11 @@ impl Widget for Shell {
                     self.shared
                         .evolution_mut()
                         .begin_dashboard_load(backend.data_dir.clone(), waker.clone());
-                    self.shared.chat_mut().start_session_list_load(waker);
+                    {
+                        let mut chat = self.shared.chat_mut();
+                        chat.start_provider_list_load(backend.config.clone(), waker.clone());
+                        chat.start_session_list_load(waker);
+                    }
                     self.schedule_chat_session_timer(ctx);
                     self.start_cluster_refresh_if_active();
                     ctx.request_measure();
@@ -530,9 +534,10 @@ impl Widget for Shell {
                 let chat_changed = if self.shared.is_ready() {
                     let mut chat = self.shared.chat_mut();
                     let worker_changed = chat.pump_worker_events();
+                    let providers_changed = chat.pump_provider_list();
                     let list_changed = chat.pump_session_list();
                     let delete_changed = chat.pump_delete();
-                    worker_changed || list_changed || delete_changed
+                    worker_changed || providers_changed || list_changed || delete_changed
                 } else {
                     false
                 };
@@ -569,7 +574,10 @@ impl Widget for Shell {
         if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
             let cluster_changed = self.pump_cluster_refresh();
             let chat_changed = if self.shared.is_ready() {
-                self.shared.chat_mut().pump_session_list()
+                let mut chat = self.shared.chat_mut();
+                let providers_changed = chat.pump_provider_list();
+                let list_changed = chat.pump_session_list();
+                providers_changed || list_changed
             } else {
                 false
             };

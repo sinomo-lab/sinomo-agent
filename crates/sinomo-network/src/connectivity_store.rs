@@ -1,5 +1,6 @@
 use crate::connectivity::{
     ClusterConnectivityRecord, ClusterConnectivityState, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
+    cluster_connectivity_record_for_command_auth_denied,
     cluster_connectivity_record_for_hard_failure,
     cluster_connectivity_record_for_identity_mismatch,
     cluster_connectivity_record_for_probe_outcome, cluster_connectivity_stable_eq,
@@ -10,8 +11,9 @@ use crate::object_file_store::{
     read_optional_object_file, remove_optional_file, write_object_file,
 };
 use crate::{ClusterEndpointId, ClusterPaths};
+use sinomo_base::{ClusterBootstrapState, ClusterEndpointRecord, ClusterTransportKind};
 use sinomo_node::NodeId;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -171,6 +173,25 @@ pub fn record_local_cluster_endpoint_command_connectivity(
     Ok(record)
 }
 
+pub fn record_local_cluster_endpoint_command_auth_denied(
+    paths: &ClusterPaths,
+    state: &sinomo_base::ClusterBootstrapState,
+    endpoint: &sinomo_base::ClusterEndpointRecord,
+) -> Result<ClusterConnectivityRecord, NetworkError> {
+    let now = OffsetDateTime::now_utc();
+    let timestamp = now
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let record =
+        cluster_connectivity_record_for_command_auth_denied(state, endpoint, &timestamp, now);
+    write_local_cluster_connectivity_records(
+        paths,
+        &state.local_node_id,
+        std::slice::from_ref(&record),
+    )?;
+    Ok(record)
+}
+
 pub fn write_local_cluster_connectivity_records(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
@@ -205,6 +226,133 @@ pub async fn write_local_cluster_connectivity_record_set_async(
             operation: "write local cluster connectivity records".to_string(),
             detail: format!("local cluster connectivity write task failed: {source}"),
         })?
+}
+
+pub fn prune_local_cluster_connectivity_records_for_state(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<usize, NetworkError> {
+    let now = OffsetDateTime::now_utc();
+    let Some(mut existing_records) =
+        read_optional_object_file::<Vec<ClusterConnectivityRecord>>(&paths.connectivity_local)?
+    else {
+        if let Ok(mut cache) = LOCAL_CLUSTER_CONNECTIVITY_RECORDS.lock() {
+            cache.remove(&paths.root);
+        }
+        return Ok(0);
+    };
+    sort_cluster_connectivity_records(&mut existing_records);
+
+    let topology = LocalConnectivityTopology::from_state(state);
+    let mut retained = existing_records
+        .iter()
+        .filter(|record| topology.record_is_usable(record, now))
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_cluster_connectivity_records(&mut retained);
+
+    let removed = existing_records.len().saturating_sub(retained.len());
+    if existing_records == retained {
+        return Ok(0);
+    }
+
+    if retained.is_empty() {
+        remove_optional_file(&paths.connectivity_local)?;
+    } else {
+        write_object_file(&paths.connectivity_local, &retained)?;
+    }
+
+    let mut cache =
+        LOCAL_CLUSTER_CONNECTIVITY_RECORDS
+            .lock()
+            .map_err(|error| NetworkError::Io {
+                operation: "lock local cluster connectivity cache".to_string(),
+                detail: error.to_string(),
+            })?;
+    if retained.is_empty() {
+        cache.remove(&paths.root);
+    } else {
+        store_local_cluster_connectivity_cache_entry(&mut cache, paths.root.clone(), retained, now);
+    }
+    bump_local_cluster_connectivity_content_generation(paths);
+    Ok(removed)
+}
+
+pub async fn prune_local_cluster_connectivity_records_for_state_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<usize, NetworkError> {
+    let paths = paths.clone();
+    let state = state.clone();
+    runtime
+        .spawn_blocking(move || prune_local_cluster_connectivity_records_for_state(&paths, &state))
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "prune local cluster connectivity records".to_string(),
+            detail: format!("local cluster connectivity prune task failed: {source}"),
+        })?
+}
+
+#[derive(Default)]
+struct LocalConnectivityTopology {
+    cluster_id: Option<sinomo_node::ClusterId>,
+    authorized_nodes: BTreeSet<NodeId>,
+    endpoints: BTreeMap<ClusterEndpointId, ClusterEndpointRecord>,
+}
+
+impl LocalConnectivityTopology {
+    fn from_state(state: &ClusterBootstrapState) -> Self {
+        let mut topology = Self {
+            cluster_id: Some(state.cluster_id.clone()),
+            authorized_nodes: BTreeSet::new(),
+            endpoints: BTreeMap::new(),
+        };
+        for member in &state.members {
+            if !member.state.is_authorized() {
+                continue;
+            }
+            topology.authorized_nodes.insert(member.node_id.clone());
+            for endpoint in &member.endpoints {
+                topology
+                    .endpoints
+                    .entry(endpoint.endpoint_id.clone())
+                    .or_insert_with(|| endpoint.clone());
+            }
+        }
+        topology
+    }
+
+    fn record_is_usable(&self, record: &ClusterConnectivityRecord, now: OffsetDateTime) -> bool {
+        if self
+            .cluster_id
+            .as_ref()
+            .is_some_and(|cluster_id| record.cluster_id != *cluster_id)
+            || !cluster_network_record_live(record.expires_at, now)
+            || !self.authorized_nodes.contains(&record.source_node_id)
+            || !self.authorized_nodes.contains(&record.target_node_id)
+        {
+            return false;
+        }
+        if local_connectivity_record_is_synthetic_tcp_tunnel(record) {
+            return true;
+        }
+        self.endpoints
+            .get(&record.endpoint_id)
+            .is_some_and(|endpoint| {
+                endpoint.node_id == record.target_node_id
+                    && endpoint.transport == record.transport
+                    && endpoint.address == record.address
+            })
+    }
+}
+
+fn local_connectivity_record_is_synthetic_tcp_tunnel(record: &ClusterConnectivityRecord) -> bool {
+    record.transport == ClusterTransportKind::LanTcp
+        && record
+            .address
+            .strip_prefix(crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
+            == Some(record.target_node_id.as_str())
 }
 
 fn local_cluster_connectivity_cache_tick() -> u64 {
@@ -408,6 +556,7 @@ fn write_local_cluster_connectivity_records_inner(
     merged_records.extend(merged.into_values());
     let mut merged = merged_records;
     sort_cluster_connectivity_records(&mut merged);
+    let records_changed = existing_records != merged;
     let route_records_stable =
         local_cluster_connectivity_route_records_stable(&existing_records, &merged);
     let mut persisted_records_stable = route_records_stable
@@ -445,7 +594,7 @@ fn write_local_cluster_connectivity_records_inner(
     } else {
         store_local_cluster_connectivity_cache_entry(&mut cache, paths.root.clone(), merged, now);
     }
-    if !route_records_stable {
+    if records_changed {
         bump_local_cluster_connectivity_content_generation(paths);
     }
     Ok(())
@@ -501,5 +650,144 @@ pub fn remove_local_cluster_connectivity_record_cache_entries_under_root_for_tes
 ) {
     if let Ok(mut cache) = LOCAL_CLUSTER_CONNECTIVITY_RECORDS.lock() {
         cache.retain(|path, _| !path.starts_with(root));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connectivity::{CLUSTER_CONNECTIVITY_TTL_SECONDS, cluster_connectivity_record};
+    use sinomo_base::{
+        ClusterEndpointPrivacy, ClusterEndpointSource, ClusterMemberRecord, ClusterTransportKind,
+    };
+    use sinomo_local::SinomoDataDir;
+    use sinomo_node::ClusterId;
+
+    #[test]
+    fn topology_prune_removes_removed_members_and_unadvertised_endpoints() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-topology-prune");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_connectivity_topology_prune").expect("cluster");
+        let local =
+            NodeId::from_legacy_named("node_connectivity_topology_prune_local").expect("local");
+        let remote =
+            NodeId::from_legacy_named("node_connectivity_topology_prune_remote").expect("remote");
+        let removed =
+            NodeId::from_legacy_named("node_connectivity_topology_prune_removed").expect("removed");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "connectivity topology prune",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &remote,
+            "target:21353".to_string(),
+            10,
+        );
+        let mut remote_member =
+            ClusterMemberRecord::local_non_voting(cluster_id, remote.clone(), "remote", "pk", now);
+        remote_member.endpoints = vec![endpoint.clone()];
+        state.members.push(remote_member);
+
+        let current = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(3),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let dirty_endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::derived(
+                "sinomo.test.connectivity.prune.dirty",
+                b"dirty",
+            ),
+            node_id: remote.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "stale.example.test:21353".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 20,
+            last_observed_latency_ms: None,
+        };
+        let dirty = cluster_connectivity_record(
+            &state,
+            &dirty_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some("dirty".to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let removed_endpoint = crate::endpoint_advertisement::daemon_lan_endpoint(
+            &removed,
+            "removed:21353".to_string(),
+            10,
+        );
+        let removed_record = cluster_connectivity_record(
+            &state,
+            &removed_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(2),
+            0,
+            Some("removed".to_string()),
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let tunnel = ClusterConnectivityRecord {
+            cluster_id: state.cluster_id.clone(),
+            source_node_id: local.clone(),
+            target_node_id: remote.clone(),
+            endpoint_id: ClusterEndpointId::derived(
+                "sinomo.test.connectivity.prune.tunnel",
+                b"tunnel",
+            ),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!(
+                "{}{}",
+                crate::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX,
+                remote.as_str()
+            ),
+            state: ClusterConnectivityState::Healthy,
+            latency_ms: Some(0),
+            consecutive_failures: 0,
+            last_success_at: Some("tunnel".to_string()),
+            last_failure_at: None,
+            failure_reason: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(CLUSTER_CONNECTIVITY_TTL_SECONDS),
+        };
+
+        write_local_cluster_connectivity_record_set(
+            &paths,
+            &local,
+            &[current.clone(), dirty, removed_record, tunnel.clone()],
+        )
+        .expect("seed local connectivity");
+
+        let removed_count =
+            prune_local_cluster_connectivity_records_for_state(&paths, &state).expect("prune");
+
+        assert_eq!(removed_count, 2);
+        let records =
+            read_local_cluster_connectivity_records(&paths).expect("read pruned connectivity");
+        assert_eq!(records.len(), 2);
+        assert!(records.contains(&current));
+        assert!(records.contains(&tunnel));
     }
 }

@@ -414,7 +414,7 @@ impl AgentPlacementMetadata {
 pub struct AgentTraceRecord {
     pub record_id: TaskId,
     pub session_id: SessionId,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub recorded_at: time::OffsetDateTime,
     pub record: AgentTraceRecordKind,
 }
@@ -2946,7 +2946,7 @@ pub struct AgentSessionProjection {
     pub projection_id: TaskId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_projection_id: Option<TaskId>,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
     pub reason: String,
     pub summary: String,
@@ -4688,7 +4688,7 @@ pub struct AgentEvent {
     pub event_id: TaskId,
     pub op_id: TaskId,
     pub session_id: SessionId,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub emitted_at: time::OffsetDateTime,
     pub payload: AgentEventPayload,
 }
@@ -4808,7 +4808,7 @@ pub struct AgentTaskSnapshot {
     pub result_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_ids: Vec<EventId>,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub updated_at: time::OffsetDateTime,
 }
 
@@ -4830,7 +4830,7 @@ impl AgentTaskSnapshot {
 pub struct AgentActiveTurn {
     pub op_id: TaskId,
     pub sequence: u64,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub started_at: time::OffsetDateTime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
@@ -4934,7 +4934,7 @@ pub struct AgentRuntimeEventBatch {
 pub struct AgentRuntimeEvent {
     pub event_id: TaskId,
     pub session_id: SessionId,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub emitted_at: time::OffsetDateTime,
     pub payload: AgentRuntimeEventPayload,
 }
@@ -5026,7 +5026,7 @@ pub struct AgentTaskTerminalResult {
     pub result_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_ids: Vec<EventId>,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::time_serde::rfc3339")]
     pub updated_at: time::OffsetDateTime,
 }
 

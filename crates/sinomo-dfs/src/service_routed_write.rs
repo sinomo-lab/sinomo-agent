@@ -173,12 +173,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             write_foreground_replica_repair,
                         )
                     } else {
-                        self.write_distributed_eventual_with_base_and_repair_mode(
+                        self.write_distributed_eventual_with_base_and_parent_touch_and_repair_mode(
                             command.request,
                             command.expected_base_version,
                             command.bytes,
                             command.desired_replica_nodes,
                             command.policy,
+                            touch_parent_on_create,
                             write_foreground_replica_repair,
                         )
                     }
@@ -673,7 +674,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 continue;
             }
-            // Endpoint-served DFS RPCs can return once the metadata primary has
+            // Node-routed DFS RPCs can return once the metadata primary has
             // committed the intent. Remaining repair jobs stay in the normal
             // repair backlog so a slow desired replica does not consume the
             // caller's data-plane deadline after the write is durable.
@@ -781,7 +782,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        let Some(shard) = self.select_metadata_shard_for_object(object)? else {
+        let Some(mut shard) = self.select_metadata_shard_for_object(object)? else {
             return Err(DfsError::Distributed {
                 message: format!(
                     "routed write for {} has no metadata shard assignment",
@@ -789,6 +790,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         };
+        if shard.primary_node_id != self.node_id {
+            self.refresh_control_plane_latest()?;
+            let Some(refreshed) = self.select_metadata_shard_for_object(object)? else {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "routed write for {} has no metadata shard assignment",
+                        request.object_id
+                    ),
+                });
+            };
+            shard = refreshed;
+        }
         if shard.primary_node_id != self.node_id {
             return Err(DfsError::StaleOwnerEpoch {
                 file_system_id: object.file_system_id.clone(),

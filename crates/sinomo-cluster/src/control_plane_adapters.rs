@@ -117,13 +117,14 @@ impl<T> ClusterStateAuthorityReachabilityHost for ClusterControlPlaneDriver<T>
 where
     T: ClusterControlPlaneTransport,
 {
-    fn probe_cluster_state_authority(
+    fn probe_cluster_state_authority_node(
         &mut self,
-        endpoint: &ClusterEndpointRecord,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
         timeout: Duration,
     ) -> bool {
         self.transport
-            .probe_cluster_state_authority(endpoint, timeout)
+            .probe_cluster_state_authority_node(state, target_node_id, timeout)
     }
 }
 
@@ -137,14 +138,6 @@ where
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError> {
         locked_kv_state_authority_id(paths, state)
-    }
-
-    fn fetch_cluster_kv_snapshot(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        timeout: Duration,
-    ) -> Result<KvSnapshot, NetworkError> {
-        self.transport.fetch_cluster_kv_snapshot(endpoint, timeout)
     }
 
     fn restore_cluster_kv_from_snapshot_if_newer(

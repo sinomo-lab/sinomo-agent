@@ -7,14 +7,12 @@
 //! `metadata_backend`.
 
 use serde::{Deserialize, Serialize};
+use sinomo_core::ClusterBootstrapState;
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{ClusterPaths, NetworkError};
 use sinomo_core::node::NodeId;
-use sinomo_core::{
-    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterTransportKind,
-};
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
@@ -33,7 +31,7 @@ use crate::{
     DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
     DfsMetadataSnapshotInstallResult, DfsNamespaceResult, DfsObjectRpcSendOptions,
     DfsObjectVersionRecord, DfsPeerTransport, DfsPeerTransportFuture, LocalShardedMetadataBackend,
-    NetworkedDfsServiceEvent, cluster_dfs_data_endpoints, cluster_dfs_metadata_shards,
+    NetworkedDfsServiceEvent, cluster_dfs_metadata_shards, cluster_dfs_peer_node_ids,
     decode_dfs_metadata_journal_batch_rpc_response,
     decode_dfs_metadata_snapshot_install_rpc_response,
     default_dfs_metadata_replication_suppression_snapshot_path,
@@ -66,8 +64,8 @@ pub fn publish_cluster_dfs_metadata_journal(
     let file_system = distributed_sifs(state.local_node_id.clone());
     let shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
 
-    let endpoints = cluster_dfs_data_endpoints(cluster_paths, &state);
-    let mut transport = DfsMetadataEndpointTransport::new(endpoints, sender, snapshot_sender);
+    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+    let mut transport = DfsMetadataNodeTransport::new(peer_node_ids, sender, snapshot_sender);
     let mut host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     publish_dfs_metadata_journal_with_host(
         file_system.file_system_id,
@@ -95,7 +93,7 @@ pub async fn publish_cluster_dfs_metadata_journal_async(
         });
     };
     let mut transport =
-        AsyncDfsMetadataEndpointTransport::new(plan.endpoints.clone(), sender, snapshot_sender);
+        AsyncDfsMetadataNodeTransport::new(plan.peer_node_ids.clone(), sender, snapshot_sender);
     execute_prepared_dfs_metadata_journal_publish_async(plan, &mut transport, options).await
 }
 
@@ -222,10 +220,10 @@ fn refresh_cluster_dfs_kv_snapshot_with_peer_transport_for_state(
         cluster_paths,
         state,
         options,
-        |endpoint, timeout| {
+        |target_node_id, timeout| {
             let response = peer_transport
                 .call_object_rpc(
-                    &endpoint.node_id,
+                    target_node_id,
                     &request,
                     DfsObjectRpcSendOptions::new(timeout).with_observe_connectivity(false),
                 )
@@ -299,7 +297,7 @@ pub enum DfsMetadataJournalReplicationOutcome {
         shard_id: DfsMetadataShardId,
         after_sequence: u64,
     },
-    MissingEndpoint {
+    MissingRoute {
         target_node_id: NodeId,
         shard_id: DfsMetadataShardId,
         after_sequence: u64,
@@ -389,7 +387,7 @@ pub fn dfs_metadata_replication_notice_lines(
                 "DFS metadata replication to {target_node_id} still has backlog after {max_batches} batches"
             )),
             DfsMetadataJournalReplicationOutcome::NoChanges { .. }
-            | DfsMetadataJournalReplicationOutcome::MissingEndpoint { .. }
+            | DfsMetadataJournalReplicationOutcome::MissingRoute { .. }
             | DfsMetadataJournalReplicationOutcome::TopologyMismatchSuppressed { .. }
             | DfsMetadataJournalReplicationOutcome::MissingShard { .. }
             | DfsMetadataJournalReplicationOutcome::NotPrimary { .. } => None,
@@ -870,7 +868,7 @@ impl DfsMetadataPublishScheduler {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DfsMetadataJournalReplicationTransportError {
-    MissingEndpoint,
+    MissingRoute,
     Failed { reason: String },
 }
 
@@ -919,7 +917,7 @@ pub trait AsyncDfsMetadataJournalReplicationTransport: Send {
     >;
 }
 
-pub const DFS_METADATA_REPLICATION_MAX_ENDPOINTS_PER_TARGET: usize = 3;
+pub const DFS_METADATA_REPLICATION_MAX_NODE_ROUTES_PER_TARGET: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsMetadataPeerTransportError {
@@ -963,36 +961,36 @@ pub type DfsMetadataSnapshotInstallSender = Arc<
 >;
 
 #[derive(Clone)]
-pub struct DfsMetadataEndpointTransport {
-    endpoints: Vec<ClusterEndpointRecord>,
+pub struct DfsMetadataNodeTransport {
+    peer_node_ids: BTreeSet<NodeId>,
     sender: DfsMetadataJournalBatchSender,
     snapshot_sender: DfsMetadataSnapshotInstallSender,
 }
 
-impl std::fmt::Debug for DfsMetadataEndpointTransport {
+impl std::fmt::Debug for DfsMetadataNodeTransport {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("DfsMetadataEndpointTransport")
-            .field("endpoints", &self.endpoints)
+            .debug_struct("DfsMetadataNodeTransport")
+            .field("peer_node_ids", &self.peer_node_ids)
             .finish_non_exhaustive()
     }
 }
 
-impl DfsMetadataEndpointTransport {
+impl DfsMetadataNodeTransport {
     pub fn new(
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
         sender: DfsMetadataJournalBatchSender,
         snapshot_sender: DfsMetadataSnapshotInstallSender,
     ) -> Self {
         Self {
-            endpoints: endpoints.into_iter().collect(),
+            peer_node_ids: peer_node_ids.into_iter().collect(),
             sender,
             snapshot_sender,
         }
     }
 
-    fn target_endpoints(&self, target_node_id: &NodeId) -> Vec<&ClusterEndpointRecord> {
-        dfs_metadata_replication_target_endpoints(&self.endpoints, target_node_id)
+    fn has_peer_node(&self, target_node_id: &NodeId) -> bool {
+        self.peer_node_ids.contains(target_node_id)
     }
 }
 
@@ -1055,9 +1053,9 @@ fn validate_dfs_metadata_snapshot_install_replication_response(
     Ok(())
 }
 
-impl DfsMetadataJournalReplicationTransport for DfsMetadataEndpointTransport {
+impl DfsMetadataJournalReplicationTransport for DfsMetadataNodeTransport {
     fn has_metadata_replication_route(&self, target_node_id: &NodeId) -> bool {
-        !self.target_endpoints(target_node_id).is_empty()
+        self.has_peer_node(target_node_id)
     }
 
     fn send_metadata_journal_batch(
@@ -1066,8 +1064,8 @@ impl DfsMetadataJournalReplicationTransport for DfsMetadataEndpointTransport {
         command: &DfsMetadataJournalBatchCommand,
         timeout: Duration,
     ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError> {
-        if self.target_endpoints(target_node_id).is_empty() {
-            return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
+        if !self.has_peer_node(target_node_id) {
+            return Err(DfsMetadataJournalReplicationTransportError::MissingRoute);
         }
         match (self.sender)(target_node_id, command, timeout) {
             Ok(response) => {
@@ -1090,8 +1088,8 @@ impl DfsMetadataJournalReplicationTransport for DfsMetadataEndpointTransport {
         timeout: Duration,
     ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>
     {
-        if self.target_endpoints(target_node_id).is_empty() {
-            return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
+        if !self.has_peer_node(target_node_id) {
+            return Err(DfsMetadataJournalReplicationTransportError::MissingRoute);
         }
         match (self.snapshot_sender)(target_node_id, command, timeout) {
             Ok(response) => {
@@ -1109,45 +1107,42 @@ impl DfsMetadataJournalReplicationTransport for DfsMetadataEndpointTransport {
 }
 
 #[derive(Clone)]
-pub struct AsyncDfsMetadataEndpointTransport {
-    endpoints: Vec<ClusterEndpointRecord>,
+pub struct AsyncDfsMetadataNodeTransport {
+    peer_node_ids: BTreeSet<NodeId>,
     sender: AsyncDfsMetadataJournalBatchSender,
     snapshot_sender: AsyncDfsMetadataSnapshotInstallSender,
 }
 
-impl std::fmt::Debug for AsyncDfsMetadataEndpointTransport {
+impl std::fmt::Debug for AsyncDfsMetadataNodeTransport {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("AsyncDfsMetadataEndpointTransport")
-            .field("endpoints", &self.endpoints)
+            .debug_struct("AsyncDfsMetadataNodeTransport")
+            .field("peer_node_ids", &self.peer_node_ids)
             .finish_non_exhaustive()
     }
 }
 
-impl AsyncDfsMetadataEndpointTransport {
+impl AsyncDfsMetadataNodeTransport {
     pub fn new(
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        peer_node_ids: impl IntoIterator<Item = NodeId>,
         sender: AsyncDfsMetadataJournalBatchSender,
         snapshot_sender: AsyncDfsMetadataSnapshotInstallSender,
     ) -> Self {
         Self {
-            endpoints: endpoints.into_iter().collect(),
+            peer_node_ids: peer_node_ids.into_iter().collect(),
             sender,
             snapshot_sender,
         }
     }
 
-    fn target_endpoints(&self, target_node_id: &NodeId) -> Vec<ClusterEndpointRecord> {
-        dfs_metadata_replication_target_endpoints(&self.endpoints, target_node_id)
-            .into_iter()
-            .cloned()
-            .collect()
+    fn has_peer_node(&self, target_node_id: &NodeId) -> bool {
+        self.peer_node_ids.contains(target_node_id)
     }
 }
 
-impl AsyncDfsMetadataJournalReplicationTransport for AsyncDfsMetadataEndpointTransport {
+impl AsyncDfsMetadataJournalReplicationTransport for AsyncDfsMetadataNodeTransport {
     fn has_metadata_replication_route(&self, target_node_id: &NodeId) -> bool {
-        !self.target_endpoints(target_node_id).is_empty()
+        self.has_peer_node(target_node_id)
     }
 
     fn send_metadata_journal_batch_async<'a>(
@@ -1160,8 +1155,8 @@ impl AsyncDfsMetadataJournalReplicationTransport for AsyncDfsMetadataEndpointTra
         Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError>,
     > {
         Box::pin(async move {
-            if self.target_endpoints(target_node_id).is_empty() {
-                return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
+            if !self.has_peer_node(target_node_id) {
+                return Err(DfsMetadataJournalReplicationTransportError::MissingRoute);
             }
             match (self.sender)(target_node_id, command, timeout).await {
                 Ok(response) => {
@@ -1192,8 +1187,8 @@ impl AsyncDfsMetadataJournalReplicationTransport for AsyncDfsMetadataEndpointTra
         Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>,
     > {
         Box::pin(async move {
-            if self.target_endpoints(target_node_id).is_empty() {
-                return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
+            if !self.has_peer_node(target_node_id) {
+                return Err(DfsMetadataJournalReplicationTransportError::MissingRoute);
             }
             match (self.snapshot_sender)(target_node_id, command, timeout).await {
                 Ok(response) => {
@@ -1212,70 +1207,6 @@ impl AsyncDfsMetadataJournalReplicationTransport for AsyncDfsMetadataEndpointTra
                 }),
             }
         })
-    }
-}
-
-fn dfs_metadata_replication_target_endpoints<'a>(
-    endpoints: &'a [ClusterEndpointRecord],
-    target_node_id: &NodeId,
-) -> Vec<&'a ClusterEndpointRecord> {
-    let mut candidates = endpoints
-        .iter()
-        .filter(|endpoint| endpoint.node_id == *target_node_id)
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|endpoint| dfs_metadata_replication_endpoint_order_key(endpoint));
-    let mut selected = Vec::new();
-    let mut deferred = Vec::new();
-    let mut seen_routes = BTreeSet::new();
-    let mut seen_classes = BTreeSet::new();
-    for endpoint in candidates {
-        if !seen_routes.insert((
-            format!("{:?}", endpoint.transport),
-            endpoint.address.clone(),
-        )) {
-            continue;
-        }
-        if seen_classes.insert(dfs_metadata_replication_endpoint_class(endpoint)) {
-            selected.push(endpoint);
-        } else {
-            deferred.push(endpoint);
-        }
-        if selected.len() >= DFS_METADATA_REPLICATION_MAX_ENDPOINTS_PER_TARGET {
-            return selected;
-        }
-    }
-    for endpoint in deferred {
-        if selected.len() >= DFS_METADATA_REPLICATION_MAX_ENDPOINTS_PER_TARGET {
-            break;
-        }
-        selected.push(endpoint);
-    }
-    selected
-}
-
-fn dfs_metadata_replication_endpoint_order_key(
-    endpoint: &ClusterEndpointRecord,
-) -> (u8, u16, String) {
-    (
-        dfs_metadata_replication_endpoint_class(endpoint),
-        endpoint.priority,
-        endpoint.address.clone(),
-    )
-}
-
-fn dfs_metadata_replication_endpoint_class(endpoint: &ClusterEndpointRecord) -> u8 {
-    match (&endpoint.transport, &endpoint.privacy) {
-        (
-            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback,
-            ClusterEndpointPrivacy::Lan,
-        ) => 0,
-        (
-            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback,
-            ClusterEndpointPrivacy::InternetDirect,
-        ) => 1,
-        (ClusterTransportKind::Iroh, _) => 2,
-        (ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback, _) => 3,
-        _ => 4,
     }
 }
 
@@ -1336,7 +1267,7 @@ impl DfsMetadataJournalPublisherHost for LocalDfsMetadataJournalPublisherHost {
 struct DfsPreparedClusterMetadataJournalPublish {
     data_dir: SinomoDataDir,
     local_node_id: NodeId,
-    endpoints: Vec<ClusterEndpointRecord>,
+    peer_node_ids: Vec<NodeId>,
     outcomes: Vec<DfsMetadataJournalReplicationOutcome>,
     targets: Vec<DfsPreparedMetadataJournalTargetPublish>,
 }
@@ -1364,7 +1295,7 @@ fn prepare_cluster_dfs_metadata_journal_publish(
         .map_err(DfsError::from_network)?;
     let file_system = distributed_sifs(state.local_node_id.clone());
     let shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
-    let endpoints = cluster_dfs_data_endpoints(&cluster_paths, &state);
+    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
     let metadata_suppressions = read_dfs_metadata_replication_suppression_snapshot(
         &default_dfs_metadata_replication_suppression_snapshot_path(&data_dir),
     )?
@@ -1382,7 +1313,7 @@ fn prepare_cluster_dfs_metadata_journal_publish(
     Ok(Some(DfsPreparedClusterMetadataJournalPublish {
         data_dir,
         local_node_id: state.local_node_id,
-        endpoints,
+        peer_node_ids,
         outcomes,
         targets,
     }))
@@ -1649,7 +1580,7 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
         backlog_after_sequence,
     } = target;
     if !transport.has_metadata_replication_route(&target_node_id) {
-        outcomes.push(DfsMetadataJournalReplicationOutcome::MissingEndpoint {
+        outcomes.push(DfsMetadataJournalReplicationOutcome::MissingRoute {
             target_node_id,
             shard_id,
             after_sequence,
@@ -1964,7 +1895,7 @@ pub async fn publish_dfs_metadata_journal_with_async_host(
         DfsPreparedClusterMetadataJournalPublish {
             data_dir: data_dir.clone(),
             local_node_id: local_node_id.clone(),
-            endpoints: Vec::new(),
+            peer_node_ids: Vec::new(),
             outcomes,
             targets,
         },
@@ -2319,8 +2250,8 @@ fn push_dfs_metadata_transport_error_outcome(
     error: DfsMetadataJournalReplicationTransportError,
 ) {
     match error {
-        DfsMetadataJournalReplicationTransportError::MissingEndpoint => {
-            outcomes.push(DfsMetadataJournalReplicationOutcome::MissingEndpoint {
+        DfsMetadataJournalReplicationTransportError::MissingRoute => {
+            outcomes.push(DfsMetadataJournalReplicationOutcome::MissingRoute {
                 target_node_id: target_node_id.clone(),
                 shard_id: shard_id.clone(),
                 after_sequence,
@@ -2455,8 +2386,8 @@ fn push_dfs_metadata_snapshot_transport_error_outcome(
     error: DfsMetadataJournalReplicationTransportError,
 ) {
     match error {
-        DfsMetadataJournalReplicationTransportError::MissingEndpoint => {
-            outcomes.push(DfsMetadataJournalReplicationOutcome::MissingEndpoint {
+        DfsMetadataJournalReplicationTransportError::MissingRoute => {
+            outcomes.push(DfsMetadataJournalReplicationOutcome::MissingRoute {
                 target_node_id: target_node_id.clone(),
                 shard_id: shard_id.clone(),
                 after_sequence,
@@ -2526,7 +2457,7 @@ pub fn replicate_dfs_metadata_shard_to_target(
             break;
         };
         if !transport.has_metadata_replication_route(target_node_id) {
-            outcomes.push(DfsMetadataJournalReplicationOutcome::MissingEndpoint {
+            outcomes.push(DfsMetadataJournalReplicationOutcome::MissingRoute {
                 target_node_id: target_node_id.clone(),
                 shard_id: shard_id.clone(),
                 after_sequence,

@@ -36,6 +36,7 @@ mod migration;
 mod raft_election;
 mod raft_fanout;
 mod raft_quorum;
+#[cfg(any(test, feature = "test-support"))]
 mod raft_replication;
 mod raft_rpc;
 mod state_authority_reachability;
@@ -58,8 +59,9 @@ pub use control_plane_options::{
     DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_MAX_ATTEMPTS,
-    DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT, DEFAULT_CLUSTER_CONTROL_PLANE_RPC_TIMEOUT,
-    DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT,
+    DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
+    DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_CAMPAIGN_JITTER_MAX,
+    DEFAULT_CLUSTER_CONTROL_PLANE_RPC_TIMEOUT, DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
 };
 pub use control_routes::{
@@ -138,9 +140,10 @@ pub use kv_read_model::{
     read_cluster_members_from_snapshot, read_cluster_node_statuses_from_kv,
 };
 pub use kv_snapshot::{
-    ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions,
+    ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions, ClusterKvSnapshotRefreshOutcome,
     refresh_current_cluster_kv_store_with_host,
     refresh_current_cluster_kv_store_with_local_storage_and_transport,
+    refresh_current_cluster_kv_store_with_outcome,
 };
 pub use kv_txn_quorum::{
     ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost,
@@ -191,12 +194,10 @@ pub use migration::{
     write_local_cluster_migration_record,
 };
 pub use raft_fanout::{
-    ClusterKvCommittedFanoutAsyncHost, spawn_cluster_kv_committed_fanout_worker_on_runtime,
+    ClusterKvCommittedFanoutAsyncHost, replicate_cluster_kv_to_node_async_with_host,
+    spawn_cluster_kv_committed_fanout_worker_on_runtime,
 };
 pub use raft_quorum::ClusterKvQuorumAsyncHost;
-pub use raft_replication::{
-    ClusterKvAppendReplicationAsyncHost, replicate_cluster_kv_to_endpoint_async_with_host,
-};
 pub use raft_rpc::handle_cluster_kv_consensus_rpc_request_async;
 pub use state_authority_reachability::{
     ClusterStateAuthorityReachabilityAsyncHost, ClusterStateAuthorityReachabilityHost,
@@ -417,6 +418,7 @@ pub use raft_quorum::{
 #[cfg(any(test, feature = "test-support"))]
 pub use raft_replication::{
     ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
+    replicate_cluster_kv_to_endpoint_async_with_host,
     replicate_cluster_raft_to_endpoint_async_with_host,
     replicate_cluster_raft_to_endpoint_with_host,
     replicate_cluster_raft_to_endpoint_with_local_host,

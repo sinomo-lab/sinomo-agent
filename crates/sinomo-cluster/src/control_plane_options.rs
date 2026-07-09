@@ -63,6 +63,18 @@ impl ClusterRaftAppendReplicationOptions {
         }
         self.fair_command_timeout(endpoint, remaining)
     }
+
+    pub(crate) fn routed_node_command_timeout(&self, remaining: Duration) -> Duration {
+        remaining.min(self.tcp_command_timeout.max(self.iroh_command_timeout))
+    }
+
+    pub(crate) fn routed_node_append_attempt_timeout(
+        &self,
+        remaining: Duration,
+        _request: &ClusterRaftAppendRequest,
+    ) -> Duration {
+        self.routed_node_command_timeout(remaining)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +87,7 @@ pub struct ClusterRaftCommittedFanoutOptions {
 pub struct ClusterRaftLeaderElectionOptions {
     pub kv: ClusterKvRaftLeaderElectionOptions,
     pub timeout: Duration,
+    pub campaign_jitter_max: Duration,
     pub tcp_command_timeout: Duration,
     pub iroh_command_timeout: Duration,
     pub tcp_foreground_attempt_timeout: Duration,
@@ -87,30 +100,8 @@ impl ClusterRaftLeaderElectionOptions {
         self.kv
     }
 
-    pub(crate) fn command_timeout(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        remaining: Duration,
-    ) -> Duration {
-        match endpoint.transport {
-            ClusterTransportKind::Iroh => remaining.min(self.iroh_command_timeout),
-            _ => remaining.min(self.tcp_command_timeout),
-        }
-    }
-
-    pub(crate) fn fair_command_timeout(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        remaining: Duration,
-    ) -> Duration {
-        let attempt_cap = match endpoint.transport {
-            ClusterTransportKind::Iroh => self.iroh_foreground_attempt_timeout,
-            _ if matches!(endpoint.privacy, ClusterEndpointPrivacy::InternetDirect) => {
-                self.public_foreground_attempt_timeout
-            }
-            _ => self.tcp_foreground_attempt_timeout,
-        };
-        self.command_timeout(endpoint, remaining.min(attempt_cap))
+    pub(crate) fn routed_node_command_timeout(&self, remaining: Duration) -> Duration {
+        remaining.min(self.tcp_command_timeout.max(self.iroh_command_timeout))
     }
 }
 
@@ -146,6 +137,8 @@ pub const DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT: Durat
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT: Duration =
     Duration::from_millis(1500);
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_CAMPAIGN_JITTER_MAX: Duration =
+    Duration::from_millis(750);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterControlPlaneTimeouts {
@@ -153,6 +146,7 @@ pub struct ClusterControlPlaneTimeouts {
     pub raft_append_timeout: Duration,
     pub rpc_timeout: Duration,
     pub membership_rpc_timeout: Duration,
+    pub raft_campaign_jitter_max: Duration,
     pub tcp_command_timeout: Duration,
     pub iroh_command_timeout: Duration,
     pub tcp_foreground_attempt_timeout: Duration,
@@ -167,6 +161,7 @@ impl ClusterControlPlaneTimeouts {
             raft_append_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
             rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RPC_TIMEOUT,
             membership_rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
+            raft_campaign_jitter_max: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_CAMPAIGN_JITTER_MAX,
             tcp_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT,
             iroh_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
             tcp_foreground_attempt_timeout:
@@ -216,6 +211,7 @@ impl ClusterControlPlaneTimeouts {
                 max_attempts: sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,
             },
             timeout: self.raft_append_timeout,
+            campaign_jitter_max: self.raft_campaign_jitter_max,
             tcp_command_timeout: self.tcp_command_timeout,
             iroh_command_timeout: self.iroh_command_timeout,
             tcp_foreground_attempt_timeout: self.tcp_foreground_attempt_timeout,

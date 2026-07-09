@@ -22,8 +22,8 @@ use sinomo_runtime::config::{
 };
 use sinomo_runtime::core::{EvaluationOutcome, EvaluationScorecard};
 use sinomo_runtime::dfs::{
-    AsyncDfsPeerTransport, DfsEndpointTransport, DfsMetadataJournalReplicationOptions,
-    DfsMetadataShardConfig, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
+    AsyncDfsPeerTransport, DfsMetadataJournalReplicationOptions, DfsMetadataShardConfig,
+    DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
     DfsPeerTransportFuture, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
     cluster_dfs_peer_node_ids, default_dfs_metadata_root, default_dfs_metadata_shards_root,
     fallback_dfs_node_id, metadata_shards_prefix, open_local_sharded_metadata_backend,
@@ -2577,7 +2577,7 @@ struct SifsWriteDigest {
 
 fn open_evolution_sifs_service(
     data_dir: &SinomoDataDir,
-) -> Result<NetworkedDfsService<DfsEndpointTransport>, EvolutionPersistenceError> {
+) -> Result<NetworkedDfsService<DfsNodeTransport>, EvolutionPersistenceError> {
     data_dir
         .ensure_root_layout()
         .map_err(|source| EvolutionPersistenceError::Io {
@@ -2607,7 +2607,7 @@ fn open_evolution_sifs_service(
     let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
     let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
     let service = NetworkedDfsService::new(
-        DfsEndpointTransport::with_peer_transports_for_nodes(
+        DfsNodeTransport::with_peer_transports_for_nodes(
             local_node_id,
             peer_node_ids,
             sinomo_runtime::dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
@@ -2782,7 +2782,7 @@ fn should_skip_sifs_bundle_mirror_path(relative: &str) -> bool {
 }
 
 fn write_reader_to_sifs<R: Read>(
-    service: &mut NetworkedDfsService<DfsEndpointTransport>,
+    service: &mut NetworkedDfsService<DfsNodeTransport>,
     sifs_path: &str,
     mut reader: R,
 ) -> Result<SifsWriteDigest, EvolutionPersistenceError> {
@@ -2797,7 +2797,7 @@ fn write_reader_to_sifs<R: Read>(
 }
 
 fn write_bytes_to_sifs(
-    service: &mut NetworkedDfsService<DfsEndpointTransport>,
+    service: &mut NetworkedDfsService<DfsNodeTransport>,
     sifs_path: &str,
     bytes: &[u8],
 ) -> Result<SifsWriteDigest, EvolutionPersistenceError> {

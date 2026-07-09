@@ -1,14 +1,19 @@
 use crate::control_plane_driver::ClusterControlPlaneDriver;
 use crate::control_plane_options::{
-    ClusterControlPlaneTimeouts, ClusterRaftCommittedFanoutOptions,
+    ClusterControlPlaneTimeouts, ClusterRaftAppendReplicationOptions,
+    ClusterRaftCommittedFanoutOptions,
 };
 use crate::kv_local_store::kv_err;
 use crate::kv_local_store::read_cluster_kv_snapshot;
 use crate::local_state_store::read_cluster_state;
 use crate::prelude::*;
+use crate::raft_quorum::ClusterKvQuorumAsyncHost;
 use sinomo_kv::ClusterKvRaftAppendReplicationOutcome;
 #[allow(unused_imports)]
-use sinomo_kv::{ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, KvEvent};
+use sinomo_kv::{
+    ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, ClusterRaftAppendRequest,
+    ClusterRaftAppendResponse, KvError, KvEvent,
+};
 use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
@@ -22,42 +27,44 @@ static CLUSTER_RAFT_FANOUT_PENDING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ClusterRaftCommittedFanoutReport {
-    pub attempted_endpoints: usize,
+    pub attempted_nodes: usize,
     pub replicated_nodes: Vec<NodeId>,
     pub watch_event_batches_sent: usize,
 }
 
 pub trait ClusterKvCommittedFanoutAsyncHost {
-    fn replicate_cluster_kv_to_endpoint_async<'a>(
+    fn replicate_cluster_kv_to_node_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a ClusterBootstrapState,
-        endpoint: &'a ClusterEndpointRecord,
+        target_node_id: &'a NodeId,
         watch_events: &'a [KvEvent],
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ClusterKvRaftAppendReplicationOutcome>;
 
-    fn send_cluster_kv_watch_events_async<'a>(
+    fn send_cluster_kv_watch_events_to_node_async<'a>(
         &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
+        state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
         request: &'a ClusterKvWatchEventsRequest,
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ClusterKvWatchEventsResponse>;
 }
 
 pub trait ClusterRaftCommittedFanoutAsyncHost {
-    fn replicate_cluster_raft_to_endpoint_async<'a>(
+    fn replicate_cluster_raft_to_node_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a ClusterBootstrapState,
-        endpoint: &'a ClusterEndpointRecord,
+        target_node_id: &'a NodeId,
         watch_events: &'a [KvEvent],
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ClusterKvRaftAppendReplicationOutcome>;
 
-    fn send_cluster_kv_watch_events_async<'a>(
+    fn send_cluster_kv_watch_events_to_node_async<'a>(
         &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
+        state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
         request: &'a ClusterKvWatchEventsRequest,
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ClusterKvWatchEventsResponse>;
@@ -67,25 +74,30 @@ impl<T> ClusterRaftCommittedFanoutAsyncHost for T
 where
     T: ClusterKvCommittedFanoutAsyncHost,
 {
-    fn replicate_cluster_raft_to_endpoint_async<'a>(
+    fn replicate_cluster_raft_to_node_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a ClusterBootstrapState,
-        endpoint: &'a ClusterEndpointRecord,
+        target_node_id: &'a NodeId,
         watch_events: &'a [KvEvent],
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ClusterKvRaftAppendReplicationOutcome> {
-        self.replicate_cluster_kv_to_endpoint_async(paths, state, endpoint, watch_events, timeout)
+        self.replicate_cluster_kv_to_node_async(paths, state, target_node_id, watch_events, timeout)
     }
 
-    fn send_cluster_kv_watch_events_async<'a>(
+    fn send_cluster_kv_watch_events_to_node_async<'a>(
         &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
+        state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
         request: &'a ClusterKvWatchEventsRequest,
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ClusterKvWatchEventsResponse> {
-        ClusterKvCommittedFanoutAsyncHost::send_cluster_kv_watch_events_async(
-            self, endpoint, request, timeout,
+        ClusterKvCommittedFanoutAsyncHost::send_cluster_kv_watch_events_to_node_async(
+            self,
+            state,
+            target_node_id,
+            request,
+            timeout,
         )
     }
 }
@@ -94,31 +106,36 @@ impl<T> ClusterKvCommittedFanoutAsyncHost for ClusterControlPlaneDriver<T>
 where
     T: ClusterKvCommittedFanoutAsyncHost,
 {
-    fn replicate_cluster_kv_to_endpoint_async<'a>(
+    fn replicate_cluster_kv_to_node_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a ClusterBootstrapState,
-        endpoint: &'a ClusterEndpointRecord,
+        target_node_id: &'a NodeId,
         watch_events: &'a [KvEvent],
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ClusterKvRaftAppendReplicationOutcome> {
-        self.transport.replicate_cluster_kv_to_endpoint_async(
+        self.transport.replicate_cluster_kv_to_node_async(
             paths,
             state,
-            endpoint,
+            target_node_id,
             watch_events,
             timeout,
         )
     }
 
-    fn send_cluster_kv_watch_events_async<'a>(
+    fn send_cluster_kv_watch_events_to_node_async<'a>(
         &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
+        state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
         request: &'a ClusterKvWatchEventsRequest,
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ClusterKvWatchEventsResponse> {
-        self.transport
-            .send_cluster_kv_watch_events_async(endpoint, request, timeout)
+        self.transport.send_cluster_kv_watch_events_to_node_async(
+            state,
+            target_node_id,
+            request,
+            timeout,
+        )
     }
 }
 
@@ -132,7 +149,7 @@ pub async fn fan_out_committed_cluster_raft_command_async_with_host(
 ) -> Result<ClusterRaftCommittedFanoutReport, NetworkError> {
     let mut report = ClusterRaftCommittedFanoutReport::default();
     let mut replicated_nodes = BTreeSet::new();
-    for endpoint in ClusterEndpointSelector::select_internal_async(
+    for target_node_id in ClusterEndpointSelector::select_internal_unique_node_ids_async(
         runtime,
         paths,
         state,
@@ -140,15 +157,15 @@ pub async fn fan_out_committed_cluster_raft_command_async_with_host(
     )
     .await?
     {
-        if replicated_nodes.contains(&endpoint.node_id) {
+        if target_node_id == state.local_node_id || replicated_nodes.contains(&target_node_id) {
             continue;
         }
-        report.attempted_endpoints += 1;
+        report.attempted_nodes += 1;
         let Ok(outcome) = host
-            .replicate_cluster_raft_to_endpoint_async(
+            .replicate_cluster_raft_to_node_async(
                 paths,
                 state,
-                &endpoint,
+                &target_node_id,
                 events,
                 options.raft_append_timeout,
             )
@@ -159,13 +176,13 @@ pub async fn fan_out_committed_cluster_raft_command_async_with_host(
         if !outcome.response.accepted {
             continue;
         }
-        replicated_nodes.insert(endpoint.node_id.clone());
-        report.replicated_nodes.push(endpoint.node_id.clone());
+        replicated_nodes.insert(target_node_id.clone());
+        report.replicated_nodes.push(target_node_id.clone());
         if outcome.watch_event_fanout_needed {
             report.watch_event_batches_sent +=
                 send_cluster_kv_watch_event_fanout_batches_async_with_host(
                     state,
-                    &endpoint,
+                    &target_node_id,
                     events,
                     options.watch_event_timeout,
                     host,
@@ -300,7 +317,7 @@ fn claim_next_cluster_raft_fanout_pass(active: &AtomicBool, pending: &AtomicBool
 
 async fn send_cluster_kv_watch_event_fanout_batches_async_with_host(
     state: &ClusterBootstrapState,
-    endpoint: &ClusterEndpointRecord,
+    target_node_id: &NodeId,
     events: &[KvEvent],
     timeout: Duration,
     host: &mut impl ClusterRaftCommittedFanoutAsyncHost,
@@ -308,8 +325,9 @@ async fn send_cluster_kv_watch_event_fanout_batches_async_with_host(
     let mut sent = 0;
     for event_batch in sinomo_kv::cluster_kv_watch_event_fanout_batches(events) {
         let response = host
-            .send_cluster_kv_watch_events_async(
-                endpoint,
+            .send_cluster_kv_watch_events_to_node_async(
+                state,
+                target_node_id,
                 &ClusterKvWatchEventsRequest {
                     state: state.clone(),
                     leader_id: state.local_node_id.clone(),
@@ -324,4 +342,95 @@ async fn send_cluster_kv_watch_event_fanout_batches_async_with_host(
         sent += 1;
     }
     sent
+}
+
+struct CommittedFanoutNodeAppendHost<'a, H> {
+    paths: &'a ClusterPaths,
+    options: ClusterRaftAppendReplicationOptions,
+    host: &'a mut H,
+}
+
+impl<H> sinomo_kv::ClusterKvRaftAppendReplicationAsyncHost for CommittedFanoutNodeAppendHost<'_, H>
+where
+    H: ClusterKvQuorumAsyncHost + Send,
+{
+    type Error = NetworkError;
+    type Target = NodeId;
+
+    fn kv_error(error: KvError) -> Self::Error {
+        kv_err(error)
+    }
+
+    fn last_local_raft_log_index_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, u64, Self::Error> {
+        self.host
+            .last_local_kv_replication_index_async(self.paths, state)
+    }
+
+    fn build_raft_append_request_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+        next_index: u64,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, ClusterRaftAppendRequest, Self::Error> {
+        self.host
+            .build_kv_replication_request_async(self.paths, state, next_index)
+    }
+
+    fn append_attempt_timeout(
+        &mut self,
+        _target: &Self::Target,
+        remaining: Duration,
+        request: &ClusterRaftAppendRequest,
+    ) -> Duration {
+        self.options
+            .routed_node_append_attempt_timeout(remaining, request)
+    }
+
+    fn on_raft_append_sent_async<'a>(
+        &'a mut self,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
+        self.host.on_kv_replication_sent_async()
+    }
+
+    fn send_raft_append_async<'a>(
+        &'a mut self,
+        target: &'a Self::Target,
+        request: &'a ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, ClusterRaftAppendResponse, Self::Error> {
+        self.host.send_cluster_kv_replication_to_node_async(
+            self.paths,
+            &request.state,
+            target,
+            request,
+            timeout,
+        )
+    }
+}
+
+pub async fn replicate_cluster_kv_to_node_async_with_host(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+    watch_events: &[KvEvent],
+    timeouts: ClusterControlPlaneTimeouts,
+    timeout: Duration,
+    host: &mut (impl ClusterKvQuorumAsyncHost + Send),
+) -> Result<ClusterKvRaftAppendReplicationOutcome, NetworkError> {
+    let options = timeouts.raft_append_replication_options(timeout);
+    let mut append_host = CommittedFanoutNodeAppendHost {
+        paths,
+        options,
+        host,
+    };
+    sinomo_kv::replicate_cluster_kv_raft_to_target_async_with_host(
+        state,
+        target_node_id,
+        watch_events,
+        options.kv_options(),
+        &mut append_host,
+    )
+    .await
 }

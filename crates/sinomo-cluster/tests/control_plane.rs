@@ -62,7 +62,7 @@ use sinomo_cluster::{
 };
 use sinomo_cluster::{
     ClusterRaftAppendReplicationOptions, ClusterRaftCommittedFanoutOptions,
-    ClusterRaftLeaderElectionOptions,
+    ClusterRaftLeaderElectionOptions, DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_CAMPAIGN_JITTER_MAX,
 };
 use sinomo_cluster::{
     LocalClusterRaftCommandStorage, cluster_member_removal_txns_from_store,
@@ -4801,6 +4801,7 @@ fn connectivity_graph_uses_local_bootstrap_for_sources_missing_from_kv() {
         "pk-a",
         now,
     );
+    write_cluster_state(&paths, &state).expect("write state");
     let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.1.22:21353".to_string(), 10);
     let endpoint_c = daemon_lan_endpoint(&node_c, "10.0.1.23:21353".to_string(), 10);
     let local_a_record = cluster_connectivity_record(
@@ -6163,7 +6164,7 @@ fn rollout_target_selection_applies_connectivity_to_equivalent_tcp_route() {
         ClusterId::from_legacy_named("cluster_network_rollout_equivalent").expect("cluster");
     let local = NodeId::from_legacy_named("node_network_rollout_equivalent_local").expect("local");
     let main = NodeId::from_legacy_named("node_network_rollout_equivalent_main").expect("main");
-    let state = ClusterBootstrapState::initialized_locally(
+    let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id,
         "network rollout equivalent",
         local.clone(),
@@ -6171,14 +6172,25 @@ fn rollout_target_selection_applies_connectivity_to_equivalent_tcp_route() {
         "pk-local",
         now,
     );
-    write_cluster_state(&paths, &state).expect("write state");
-    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
     let private_recorded = daemon_lan_endpoint(&main, "10.0.0.41:21353".to_string(), 10);
     let mut private_readvertised = private_recorded.clone();
     private_readvertised.endpoint_id =
         ClusterEndpointId::from_legacy_named("endpoint_rollout_equivalent_readvertised")
             .expect("endpoint");
     let public = daemon_lan_endpoint(&main, "203.0.113.41:21353".to_string(), 20);
+    let mut main_member = ClusterMemberRecord::local_non_voting(
+        state.cluster_id.clone(),
+        main.clone(),
+        "main",
+        "pk-main",
+        now,
+    );
+    main_member.capabilities = main_daemon_capabilities(&main_member.role);
+    main_member.allowed_capabilities = main_member.capabilities.clone();
+    main_member.endpoints = vec![private_readvertised.clone(), public.clone()];
+    state.members.push(main_member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
     sync_cluster_connectivity_records_to_kv(
         &paths,
         &local,
@@ -6266,6 +6278,71 @@ fn rollout_target_selection_keeps_transient_public_tcp_before_iroh() {
     .expect("rollout endpoint");
 
     assert_eq!(selected.endpoint_id, public.endpoint_id);
+}
+
+#[test]
+fn rollout_target_selection_prefers_healthy_public_tcp_over_degraded_private_tcp() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-rollout-healthy-public");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_rollout_healthy_public").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_network_rollout_healthy_public_local").expect("local");
+    let main = NodeId::from_legacy_named("node_network_rollout_healthy_public_main").expect("main");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "network rollout healthy public",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    let private = daemon_lan_endpoint(&main, "192.168.254.41:21353".to_string(), 10);
+    let public = daemon_lan_endpoint(&main, "203.0.113.41:21353".to_string(), 20);
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local,
+        vec![
+            cluster_connectivity_record(
+                &state,
+                &private,
+                ClusterConnectivityState::Degraded,
+                None,
+                1,
+                None,
+                Some("transient private route failure".to_string()),
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &public,
+                ClusterConnectivityState::Healthy,
+                Some(87),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            ),
+        ],
+    )
+    .expect("connectivity records");
+
+    let ordered = ClusterEndpointSelector::new(&paths, &state)
+        .rollout_targets_for_main_with_command_endpoint(
+            &main,
+            None,
+            &[private.clone(), public.clone()],
+        );
+
+    assert_eq!(ordered[0].endpoint_id, public.endpoint_id);
+    assert_eq!(ordered[1].endpoint_id, private.endpoint_id);
 }
 
 #[test]
@@ -8013,7 +8090,7 @@ async fn async_cluster_raft_committed_fanout_uses_async_host_and_batches_watch_e
     .await
     .expect("async fanout");
 
-    assert_eq!(report.attempted_endpoints, 1);
+    assert_eq!(report.attempted_nodes, 1);
     assert_eq!(report.replicated_nodes, vec![peer.clone()]);
     assert_eq!(report.watch_event_batches_sent, expected_batches);
     assert_eq!(host.appended_nodes, vec![peer.clone()]);
@@ -9058,9 +9135,8 @@ impl ClusterRaftAppendReplicationHost for RecordingRaftAppendHost {
 struct RecordingQuorumCommitHost {
     paths: Option<ClusterPaths>,
     local_node_id: Option<NodeId>,
-    failing_addresses: BTreeSet<String>,
+    failing_nodes: BTreeSet<NodeId>,
     replicated_nodes: Vec<NodeId>,
-    replicated_endpoints: Vec<String>,
     connectivity: Vec<(NodeId, ClusterConnectivityState, bool)>,
     committed_indices: Vec<u64>,
     fanout_targets: Vec<NodeId>,
@@ -9128,19 +9204,18 @@ impl sinomo_kv::ClusterKvRaftCommandStorage for RecordingQuorumCommitHost {
 }
 
 impl ClusterRaftQuorumTransportHost for RecordingQuorumCommitHost {
-    fn replicate_cluster_raft_to_endpoint(
+    fn replicate_cluster_raft_to_node(
         &mut self,
         _paths: &ClusterPaths,
         state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         _timeout: Duration,
     ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-        self.replicated_nodes.push(endpoint.node_id.clone());
-        self.replicated_endpoints.push(endpoint.address.clone());
-        if self.failing_addresses.contains(&endpoint.address) {
+        self.replicated_nodes.push(target_node_id.clone());
+        if self.failing_nodes.contains(target_node_id) {
             return Err(NetworkError::Io {
                 operation: "cluster raft append".to_string(),
-                detail: format!("scripted failure for {}", endpoint.address),
+                detail: format!("scripted failure for {target_node_id}"),
             });
         }
         Ok(ClusterRaftAppendResponse {
@@ -9155,16 +9230,16 @@ impl ClusterRaftQuorumTransportHost for RecordingQuorumCommitHost {
         })
     }
 
-    fn record_endpoint_command_connectivity(
+    fn record_node_command_connectivity(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         connectivity_state: ClusterConnectivityState,
         latency_ms: Option<u64>,
     ) {
         self.connectivity.push((
-            endpoint.node_id.clone(),
+            target_node_id.clone(),
             connectivity_state,
             latency_ms.is_some(),
         ));
@@ -9175,13 +9250,10 @@ impl ClusterRaftQuorumTransportHost for RecordingQuorumCommitHost {
         _paths: ClusterPaths,
         _state: ClusterBootstrapState,
         events: Vec<KvEvent>,
-        targets: Vec<ClusterEndpointRecord>,
+        targets: Vec<NodeId>,
     ) {
         self.fanout_events = events.len();
-        self.fanout_targets = targets
-            .into_iter()
-            .map(|endpoint| endpoint.node_id)
-            .collect();
+        self.fanout_targets = targets;
     }
 }
 
@@ -9201,15 +9273,15 @@ struct RecordedWatchBatch {
 }
 
 impl ClusterRaftCommittedFanoutAsyncHost for RecordingCommittedFanoutHost {
-    fn replicate_cluster_raft_to_endpoint_async<'a>(
+    fn replicate_cluster_raft_to_node_async<'a>(
         &'a mut self,
         _paths: &'a ClusterPaths,
         state: &'a ClusterBootstrapState,
-        endpoint: &'a ClusterEndpointRecord,
+        target_node_id: &'a NodeId,
         watch_events: &'a [KvEvent],
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ClusterKvRaftAppendReplicationOutcome> {
-        self.appended_nodes.push(endpoint.node_id.clone());
+        self.appended_nodes.push(target_node_id.clone());
         self.appended_event_counts.push(watch_events.len());
         self.append_timeouts.push(timeout);
         let state = state.clone();
@@ -9230,14 +9302,15 @@ impl ClusterRaftCommittedFanoutAsyncHost for RecordingCommittedFanoutHost {
         })
     }
 
-    fn send_cluster_kv_watch_events_async<'a>(
+    fn send_cluster_kv_watch_events_to_node_async<'a>(
         &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
+        _state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
         request: &'a ClusterKvWatchEventsRequest,
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ClusterKvWatchEventsResponse> {
         self.watch_batches.push(RecordedWatchBatch {
-            node_id: endpoint.node_id.clone(),
+            node_id: target_node_id.clone(),
             leader_id: request.leader_id.clone(),
             revisions: request.events.iter().map(|event| event.revision).collect(),
             timeout,
@@ -9260,25 +9333,27 @@ struct RecordingStateAuthorityReachabilityHost {
 }
 
 impl ClusterStateAuthorityReachabilityHost for RecordingStateAuthorityReachabilityHost {
-    fn probe_cluster_state_authority(
+    fn probe_cluster_state_authority_node(
         &mut self,
-        endpoint: &ClusterEndpointRecord,
+        _state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
         timeout: Duration,
     ) -> bool {
-        self.probes.push((endpoint.node_id.clone(), timeout));
-        self.reachable.contains(&endpoint.node_id)
+        self.probes.push((target_node_id.clone(), timeout));
+        self.reachable.contains(target_node_id)
     }
 }
 
 impl ClusterStateAuthorityReachabilityAsyncHost for RecordingStateAuthorityReachabilityHost {
-    fn probe_cluster_state_authority_async<'a>(
+    fn probe_cluster_state_authority_node_async<'a>(
         &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
+        _state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, bool> {
         Box::pin(async move {
-            self.probes.push((endpoint.node_id.clone(), timeout));
-            Ok(self.reachable.contains(&endpoint.node_id))
+            self.probes.push((target_node_id.clone(), timeout));
+            Ok(self.reachable.contains(target_node_id))
         })
     }
 }
@@ -9291,12 +9366,13 @@ struct RecordingLeaderElectionHost {
 impl ClusterRaftVoteTransportHost for RecordingLeaderElectionHost {
     fn send_raft_vote(
         &mut self,
-        endpoint: &ClusterEndpointRecord,
+        _state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
         request: &ClusterRaftVoteRequest,
         timeout: Duration,
     ) -> Result<ClusterRaftVoteResponse, NetworkError> {
         self.sent_votes
-            .push((endpoint.node_id.clone(), request.vote.term, timeout));
+            .push((target_node_id.clone(), request.vote.term, timeout));
         Ok(ClusterRaftVoteResponse {
             accepted: true,
             detail: "granted".to_string(),
@@ -9310,28 +9386,25 @@ impl ClusterRaftVoteTransportHost for RecordingLeaderElectionHost {
 }
 
 #[derive(Default)]
-struct AddressSensitiveLeaderElectionHost {
-    failing_addresses: BTreeSet<String>,
-    sent_votes: Vec<(NodeId, String, u64, Duration)>,
+struct NodeSensitiveLeaderElectionHost {
+    failing_nodes: BTreeSet<NodeId>,
+    sent_votes: Vec<(NodeId, u64, Duration)>,
 }
 
-impl ClusterRaftVoteTransportHost for AddressSensitiveLeaderElectionHost {
+impl ClusterRaftVoteTransportHost for NodeSensitiveLeaderElectionHost {
     fn send_raft_vote(
         &mut self,
-        endpoint: &ClusterEndpointRecord,
+        _state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
         request: &ClusterRaftVoteRequest,
         timeout: Duration,
     ) -> Result<ClusterRaftVoteResponse, NetworkError> {
-        self.sent_votes.push((
-            endpoint.node_id.clone(),
-            endpoint.address.clone(),
-            request.vote.term,
-            timeout,
-        ));
-        if self.failing_addresses.contains(&endpoint.address) {
+        self.sent_votes
+            .push((target_node_id.clone(), request.vote.term, timeout));
+        if self.failing_nodes.contains(target_node_id) {
             return Err(NetworkError::Io {
                 operation: "cluster raft vote".to_string(),
-                detail: format!("scripted failure for {}", endpoint.address),
+                detail: format!("scripted failure for {target_node_id}"),
             });
         }
         Ok(ClusterRaftVoteResponse {
@@ -9387,21 +9460,21 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
     }
 }
 
-impl ClusterSignedEndpointRpcAsyncHost for RecordingKvTxnForwardHost {
-    fn sign_endpoint_rpc_request_async<'a>(
+impl ClusterSignedObjectRpcAsyncHost for RecordingKvTxnForwardHost {
+    fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         _request: &'a ObjectRpcRequest,
-    ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+    ) -> ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
         Box::pin(async { Ok(b"test-signature".to_vec()) })
     }
 
-    fn send_signed_endpoint_rpc_async<'a>(
+    fn send_signed_object_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
         _auth: &'a [u8],
         request: &'a ObjectRpcRequest,
         _timeouts: DaemonRpcTimeouts,
-    ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
+    ) -> ClusterSignedObjectRpcFuture<'a, ObjectRpcResponse> {
         self.rpcs
             .push((endpoint.node_id.clone(), request.route.clone()));
         let response: Result<ObjectRpcResponse, NetworkError> = match request.route.as_str() {
@@ -9437,21 +9510,6 @@ impl ClusterKvSnapshotRefreshHost for RecordingKvSnapshotRefreshHost {
         Ok(self.known_authority.clone())
     }
 
-    fn fetch_cluster_kv_snapshot(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        timeout: Duration,
-    ) -> Result<KvSnapshot, NetworkError> {
-        self.fetches.push((endpoint.node_id.clone(), timeout));
-        self.snapshots
-            .get(&endpoint.node_id)
-            .cloned()
-            .ok_or_else(|| NetworkError::Io {
-                operation: "test snapshot refresh".to_string(),
-                detail: format!("no snapshot for {}", endpoint.node_id),
-            })
-    }
-
     fn restore_cluster_kv_from_snapshot_if_newer(
         &mut self,
         _paths: &ClusterPaths,
@@ -9460,6 +9518,28 @@ impl ClusterKvSnapshotRefreshHost for RecordingKvSnapshotRefreshHost {
     ) -> Result<bool, NetworkError> {
         self.restored = Some((local_node_id.clone(), snapshot.revision));
         Ok(true)
+    }
+
+    fn call_node_object_rpc(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        self.fetches.push((target_node_id.clone(), timeout));
+        assert_eq!(request.route, CLUSTER_KV_SNAPSHOT_ROUTE);
+        let snapshot =
+            self.snapshots
+                .get(target_node_id)
+                .cloned()
+                .ok_or_else(|| NetworkError::Io {
+                    operation: "test snapshot refresh".to_string(),
+                    detail: format!("no snapshot for {target_node_id}"),
+                })?;
+        let payload =
+            sinomo_kv::cluster_kv_snapshot_response_rpc_payload(&snapshot).map_err(kv_err)?;
+        Ok(object_rpc_response_from_kv_payload(payload))
     }
 }
 
@@ -9501,7 +9581,8 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
 
     fn request_kv_state_authority_vote(
         &mut self,
-        _endpoint: &ClusterEndpointRecord,
+        _state: &ClusterBootstrapState,
+        _target_node_id: &NodeId,
         _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
         _timeout: Duration,
     ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
@@ -9604,7 +9685,8 @@ impl ClusterKvTxnQuorumHost for RetryableCommitFailureKvTxnQuorumHost {
 
     fn request_kv_state_authority_vote(
         &mut self,
-        _endpoint: &ClusterEndpointRecord,
+        _state: &ClusterBootstrapState,
+        _target_node_id: &NodeId,
         _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
         _timeout: Duration,
     ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
@@ -9692,6 +9774,7 @@ fn leader_election_test_options() -> ClusterRaftLeaderElectionOptions {
     ClusterRaftLeaderElectionOptions {
         kv: ClusterKvRaftLeaderElectionOptions { max_attempts: 1 },
         timeout: Duration::from_secs(10),
+        campaign_jitter_max: Duration::ZERO,
         tcp_command_timeout: Duration::from_secs(8),
         iroh_command_timeout: Duration::from_secs(6),
         tcp_foreground_attempt_timeout: Duration::from_secs(2),
@@ -9748,6 +9831,7 @@ fn cluster_control_plane_timeouts_derive_driver_options() {
             raft_append_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
             rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RPC_TIMEOUT,
             membership_rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
+            raft_campaign_jitter_max: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_CAMPAIGN_JITTER_MAX,
             tcp_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT,
             iroh_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
             tcp_foreground_attempt_timeout:
@@ -9764,6 +9848,7 @@ fn cluster_control_plane_timeouts_derive_driver_options() {
         raft_append_timeout: Duration::from_secs(10),
         rpc_timeout: Duration::from_secs(2),
         membership_rpc_timeout: Duration::from_secs(15),
+        raft_campaign_jitter_max: Duration::from_millis(17),
         tcp_command_timeout: Duration::from_secs(8),
         iroh_command_timeout: Duration::from_secs(6),
         tcp_foreground_attempt_timeout: Duration::from_secs(3),
@@ -10578,8 +10663,8 @@ fn cluster_kv_snapshot_refresh_local_driver_owns_local_raft_storage() {
         &paths,
         &state,
         kv_snapshot_refresh_test_options(),
-        |endpoint, timeout| {
-            fetches.push((endpoint.node_id.clone(), timeout));
+        |target_node_id, timeout| {
+            fetches.push((target_node_id.clone(), timeout));
             Ok(remote_snapshot.clone())
         },
     )
@@ -11099,15 +11184,15 @@ fn cluster_raft_quorum_commit_deduplicates_remote_voter_endpoints() {
 }
 
 #[test]
-fn cluster_raft_quorum_commit_retries_next_endpoint_for_same_remote_voter() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-quorum-same-voter-retry");
+fn cluster_raft_quorum_commit_targets_same_remote_voter_once_by_node() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-quorum-same-voter-node");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
     let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
-        "cluster_raft_quorum_same_voter_retry",
-        "node_raft_quorum_same_voter_retry_local",
-        "node_raft_quorum_same_voter_retry_peer",
+        "cluster_raft_quorum_same_voter_node",
+        "node_raft_quorum_same_voter_node_local",
+        "node_raft_quorum_same_voter_node_peer",
     );
     let private_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.41:21353".to_string(), 10);
     let mut public_endpoint =
@@ -11122,8 +11207,6 @@ fn cluster_raft_quorum_commit_retries_next_endpoint_for_same_remote_voter() {
         .extend([private_endpoint.clone(), public_endpoint.clone()]);
     write_cluster_state(&paths, &state).expect("write state");
     let mut host = RecordingQuorumCommitHost::new(paths.clone(), local_node_id);
-    host.failing_addresses
-        .insert(private_endpoint.address.clone());
 
     commit_cluster_raft_command_with_quorum_driver(
         &paths,
@@ -11140,27 +11223,90 @@ fn cluster_raft_quorum_commit_retries_next_endpoint_for_same_remote_voter() {
     )
     .expect("commit");
 
-    assert_eq!(
-        host.replicated_endpoints,
-        vec![private_endpoint.address, public_endpoint.address]
-    );
+    assert_eq!(host.replicated_nodes, vec![peer_node_id.clone()]);
     assert_eq!(
         host.connectivity,
-        vec![
-            (
-                peer_node_id.clone(),
-                ClusterConnectivityState::Degraded,
-                false
-            ),
-            (
-                peer_node_id.clone(),
-                ClusterConnectivityState::Healthy,
-                true
-            )
-        ]
+        vec![(
+            peer_node_id.clone(),
+            ClusterConnectivityState::Healthy,
+            true
+        )]
     );
     assert_eq!(host.fanout_targets, vec![peer_node_id]);
     assert!(!host.discarded);
+}
+
+#[test]
+fn cluster_raft_quorum_commit_succeeds_with_two_of_three_voters_online() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-quorum-two-of-three");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_raft_quorum_two_of_three",
+        "node_raft_quorum_two_of_three_local",
+        "node_raft_quorum_two_of_three_peer",
+    );
+    let offline_node_id =
+        NodeId::from_legacy_named("node_raft_quorum_two_of_three_offline").expect("offline");
+    let cluster_id = state.cluster_id.clone();
+    let now = OffsetDateTime::now_utc();
+    let mut offline = ClusterMemberRecord::local_voter(
+        cluster_id,
+        offline_node_id.clone(),
+        "offline",
+        "pk-offline",
+        now,
+    );
+    offline.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    offline.allowed_capabilities = offline.capabilities.clone();
+    offline.endpoints = vec![daemon_lan_endpoint(
+        &offline_node_id,
+        "192.0.2.94:21353".to_string(),
+        20,
+    )];
+    state.members.push(offline);
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .push(daemon_lan_endpoint(
+            &peer_node_id,
+            "192.0.2.93:21353".to_string(),
+            10,
+        ));
+    write_cluster_state(&paths, &state).expect("write state");
+    let mut host = RecordingQuorumCommitHost::new(paths.clone(), local_node_id);
+    host.failing_nodes.insert(offline_node_id.clone());
+
+    let result = commit_cluster_raft_command_with_quorum_driver(
+        &paths,
+        &mut state,
+        KvCommand::Op(KvOp::Put {
+            key: "/quorum/two-of-three".to_string(),
+            value: b"committed".to_vec(),
+            lease_id: None,
+        }),
+        ClusterKvRaftQuorumCommitOptions {
+            timeout: Duration::from_secs(5),
+        },
+        &mut host,
+    )
+    .expect("two online voters should satisfy a three-voter quorum");
+
+    assert_eq!(
+        result
+            .snapshot
+            .get("/quorum/two-of-three")
+            .expect("committed entry")
+            .value,
+        b"committed".to_vec()
+    );
+    assert!(host.replicated_nodes.contains(&peer_node_id));
+    assert!(!host.discarded);
+    assert_eq!(host.committed_indices, vec![1]);
 }
 
 #[test]
@@ -11286,21 +11432,18 @@ fn cluster_raft_local_storage_quorum_helper_uses_callbacks_for_transport_and_fan
                 },
             })
         },
-        move |_paths, _state, endpoint, connectivity_state, latency_ms| {
+        move |_paths, _state, node_id, connectivity_state, latency_ms| {
             connectivity_for_record.lock().expect("connectivity").push((
-                endpoint.node_id.clone(),
+                node_id.clone(),
                 connectivity_state,
                 latency_ms.is_some(),
             ));
         },
         move |_paths, _state, events, targets| {
-            fanout_for_callback.lock().expect("fanout").push((
-                events.len(),
-                targets
-                    .into_iter()
-                    .map(|endpoint| endpoint.node_id)
-                    .collect::<Vec<_>>(),
-            ));
+            fanout_for_callback
+                .lock()
+                .expect("fanout")
+                .push((events.len(), targets));
         },
         move || {
             *sent_count_for_callback.lock().expect("sent count") += 1;
@@ -11373,6 +11516,7 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
                 max_attempts: sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,
             },
             timeout: Duration::from_secs(5),
+            campaign_jitter_max: Duration::ZERO,
             tcp_command_timeout: Duration::from_secs(5),
             iroh_command_timeout: Duration::from_secs(3),
             tcp_foreground_attempt_timeout: Duration::from_secs(1),
@@ -11392,22 +11536,25 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
         Some(local_node_id)
     );
     let expected_term = sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP + 1;
-    assert_eq!(
-        host.sent_votes,
-        vec![(peer_node_id, expected_term, Duration::from_secs(1))]
+    assert_eq!(host.sent_votes.len(), 1);
+    assert_eq!(host.sent_votes[0].0, peer_node_id);
+    assert_eq!(host.sent_votes[0].1, expected_term);
+    assert!(
+        host.sent_votes[0].2 > Duration::from_secs(4),
+        "node-targeted election should use the routed node budget, not a one-endpoint foreground slice"
     );
 }
 
 #[test]
-fn cluster_raft_leader_election_retries_next_endpoint_for_same_remote_voter() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-leader-same-voter-retry");
+fn cluster_raft_leader_election_targets_same_remote_voter_once_by_node() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-leader-same-voter-node");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
     let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
-        "cluster_raft_leader_same_voter_retry",
-        "node_raft_leader_same_voter_retry_local",
-        "node_raft_leader_same_voter_retry_peer",
+        "cluster_raft_leader_same_voter_node",
+        "node_raft_leader_same_voter_node_local",
+        "node_raft_leader_same_voter_node_peer",
     );
     let private_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.41:21353".to_string(), 10);
     let mut public_endpoint =
@@ -11421,10 +11568,7 @@ fn cluster_raft_leader_election_retries_next_endpoint_for_same_remote_voter() {
         .endpoints
         .extend([private_endpoint.clone(), public_endpoint.clone()]);
     write_cluster_state(&paths, &state).expect("write state");
-    let mut host = AddressSensitiveLeaderElectionHost {
-        failing_addresses: BTreeSet::from([private_endpoint.address.clone()]),
-        ..Default::default()
-    };
+    let mut host = NodeSensitiveLeaderElectionHost::default();
 
     let elected = elect_cluster_raft_leader_with_host(
         &paths,
@@ -11434,6 +11578,7 @@ fn cluster_raft_leader_election_retries_next_endpoint_for_same_remote_voter() {
                 max_attempts: sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,
             },
             timeout: Duration::from_secs(5),
+            campaign_jitter_max: Duration::ZERO,
             tcp_command_timeout: Duration::from_secs(5),
             iroh_command_timeout: Duration::from_secs(3),
             tcp_foreground_attempt_timeout: Duration::from_secs(1),
@@ -11453,22 +11598,12 @@ fn cluster_raft_leader_election_retries_next_endpoint_for_same_remote_voter() {
         Some(local_node_id)
     );
     let expected_term = sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP + 1;
-    assert_eq!(
-        host.sent_votes,
-        vec![
-            (
-                peer_node_id.clone(),
-                private_endpoint.address,
-                expected_term,
-                Duration::from_secs(1)
-            ),
-            (
-                peer_node_id,
-                public_endpoint.address,
-                expected_term,
-                Duration::from_secs(4)
-            )
-        ]
+    assert_eq!(host.sent_votes.len(), 1);
+    assert_eq!(host.sent_votes[0].0, peer_node_id);
+    assert_eq!(host.sent_votes[0].1, expected_term);
+    assert!(
+        host.sent_votes[0].2 > Duration::from_secs(4),
+        "node-targeted election should use the routed node budget, not a one-endpoint foreground slice"
     );
 }
 
@@ -13157,11 +13292,11 @@ impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
     }
 }
 
-impl ClusterSignedEndpointRpcAsyncHost for RecordingJoinRegistrationHost {
-    fn sign_endpoint_rpc_request_async<'a>(
+impl ClusterSignedObjectRpcAsyncHost for RecordingJoinRegistrationHost {
+    fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         _request: &'a ObjectRpcRequest,
-    ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+    ) -> ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
         Box::pin(async { panic!("voter-local join registration should not forward object RPCs") })
     }
 }
@@ -14643,23 +14778,23 @@ fn join_challenge_forwarding_uses_membership_state_authority_policy() {
         }
     }
 
-    impl ClusterSignedEndpointRpcAsyncHost for RecordingForwardHost {
-        fn sign_endpoint_rpc_request_async<'a>(
+    impl ClusterSignedObjectRpcAsyncHost for RecordingForwardHost {
+        fn sign_object_rpc_request_async<'a>(
             &'a mut self,
             request: &'a ObjectRpcRequest,
-        ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+        ) -> ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
             assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
             assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
             Box::pin(async { Ok(b"test-signature".to_vec()) })
         }
 
-        fn send_signed_endpoint_rpc_async<'a>(
+        fn send_signed_object_rpc_async<'a>(
             &'a mut self,
             endpoint: &'a ClusterEndpointRecord,
             _auth: &'a [u8],
             request: &'a ObjectRpcRequest,
             _timeouts: DaemonRpcTimeouts,
-        ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
+        ) -> ClusterSignedObjectRpcFuture<'a, ObjectRpcResponse> {
             assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
             assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
             self.node_rpcs.push(endpoint.node_id.clone());
@@ -18739,6 +18874,7 @@ fn async_cluster_raft_append_replication_retries_from_rejected_match_index() {
                 raft_append_timeout: Duration::from_secs(5),
                 rpc_timeout: Duration::from_secs(5),
                 membership_rpc_timeout: Duration::from_secs(5),
+                raft_campaign_jitter_max: Duration::ZERO,
             },
             Duration::from_secs(5),
             &mut host,
@@ -18819,16 +18955,75 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
     }
 
     impl ClusterRaftQuorumAsyncHost for AcceptingAsyncQuorumHost {
-        fn record_endpoint_command_connectivity(
+        fn last_local_raft_log_index_async<'a>(
+            &'a mut self,
+            paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+        ) -> ClusterMembershipRpcFuture<'a, u64> {
+            Box::pin(async move {
+                paths
+                    .kv_paths()
+                    .locked_last_raft_log_index_async(&state.local_node_id)
+                    .await
+                    .map_err(kv_err)
+            })
+        }
+
+        fn build_raft_append_request_async<'a>(
+            &'a mut self,
+            paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+            next_index: u64,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendRequest> {
+            Box::pin(async move {
+                paths
+                    .kv_paths()
+                    .locked_build_raft_append_request_from_next_index_async(state, next_index)
+                    .await
+                    .map_err(kv_err)
+            })
+        }
+
+        fn send_raft_append_to_node_async<'a>(
+            &'a mut self,
+            _paths: &'a ClusterPaths,
+            _state: &'a ClusterBootstrapState,
+            _target_node_id: &'a NodeId,
+            request: &'a ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse> {
+            self.sent_appends += 1;
+            let state = request.state.clone();
+            let match_index = request
+                .append
+                .entries
+                .last()
+                .map(|entry| entry.index)
+                .unwrap_or(request.append.prev_log_index);
+            Box::pin(async move {
+                Ok(ClusterRaftAppendResponse {
+                    accepted: true,
+                    detail: "accepted".to_string(),
+                    state,
+                    append: RaftAppendEntriesResponse {
+                        term: 1,
+                        success: true,
+                        match_index,
+                    },
+                })
+            })
+        }
+
+        fn record_node_command_connectivity(
             &mut self,
             _paths: &ClusterPaths,
             _state: &ClusterBootstrapState,
-            endpoint: &ClusterEndpointRecord,
+            target_node_id: &NodeId,
             connectivity_state: ClusterConnectivityState,
             _latency_ms: Option<u64>,
         ) {
             self.connectivity_records
-                .push((endpoint.node_id.clone(), connectivity_state));
+                .push((target_node_id.clone(), connectivity_state));
         }
 
         fn fan_out_committed_cluster_raft_command_async<'a>(
@@ -18836,13 +19031,10 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
             _paths: ClusterPaths,
             _state: ClusterBootstrapState,
             _events: Vec<KvEvent>,
-            targets: Vec<ClusterEndpointRecord>,
+            targets: Vec<NodeId>,
         ) -> ClusterMembershipRpcFuture<'a, ()> {
             Box::pin(async move {
-                self.fanout_targets = targets
-                    .into_iter()
-                    .map(|endpoint| endpoint.node_id)
-                    .collect();
+                self.fanout_targets = targets;
                 Ok(())
             })
         }
@@ -21653,6 +21845,98 @@ fn connectivity_quorum_sync_driver_delegates_commits_and_remembers() {
     assert!(cached.is_none(), "host cache hit should skip KV planning");
     assert_eq!(host.commits, Vec::<usize>::new());
     assert_eq!(host.remembers, 1, "cache-hit path should not re-remember");
+}
+
+#[test]
+fn connectivity_quorum_sync_does_not_cache_uncommitted_ttl_refresh() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-noop-cache");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_noop_cache").expect("cluster");
+    let source_node =
+        NodeId::from_legacy_named("node_connectivity_noop_cache_source").expect("source");
+    let target_node =
+        NodeId::from_legacy_named("node_connectivity_noop_cache_target").expect("target");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity noop cache",
+        source_node.clone(),
+        "source",
+        "pk-source",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state to kv");
+
+    let endpoint = daemon_lan_endpoint(&target_node, "10.54.0.2:21353".to_string(), 10);
+    let stored = cluster_connectivity_record(
+        &state,
+        &endpoint,
+        ClusterConnectivityState::Healthy,
+        Some(6),
+        0,
+        Some("stored".to_string()),
+        None,
+        now,
+        600,
+    );
+    let key = cluster_connectivity_key(
+        &stored.source_node_id,
+        &stored.target_node_id,
+        &stored.endpoint_id,
+    );
+    append_cluster_raft_command(
+        &paths,
+        &source_node,
+        KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::put_serde(&key, &stored, None).expect("stored put")],
+            failure: Vec::new(),
+        }),
+    )
+    .expect("seed connectivity");
+
+    let mut refreshed = cluster_connectivity_record(
+        &state,
+        &endpoint,
+        ClusterConnectivityState::Healthy,
+        Some(1),
+        0,
+        Some("refreshed".to_string()),
+        None,
+        now + time::Duration::seconds(60),
+        900,
+    );
+    refreshed.latency_ms = Some(1);
+    let mut host = RecordingClusterConnectivityPublishHost::default();
+    let result = sync_cluster_connectivity_records_to_quorum_with_host(
+        &paths,
+        &source_node,
+        vec![refreshed],
+        &mut host,
+    )
+    .expect("connectivity quorum sync");
+
+    assert!(
+        result.is_none(),
+        "fresh stable KV records should not be rewritten"
+    );
+    assert_eq!(host.cache_checks, 1);
+    assert_eq!(host.commits, Vec::<usize>::new());
+    assert_eq!(
+        host.remembers, 0,
+        "a stable no-op must not remember the refreshed incoming TTL as published"
+    );
+    let snapshot = read_cluster_kv_current_snapshot(&paths).expect("snapshot");
+    let kept = snapshot
+        .get(&key)
+        .expect("stored connectivity")
+        .decode::<ClusterConnectivityRecord>()
+        .expect("decode stored connectivity");
+    assert_eq!(kept.expires_at, stored.expires_at);
 }
 
 /// Simulates a forwarding learner: commits land in the "voter's" in-memory
@@ -32708,7 +32992,6 @@ fn local_member_publish_forced_sync_continues_after_stale_accepted_response() {
 #[derive(Default)]
 struct NodeOnlySnapshotRefreshHost {
     node_snapshot: Option<KvSnapshot>,
-    direct_fetches: usize,
     node_calls: usize,
 }
 
@@ -32719,18 +33002,6 @@ impl ClusterKvSnapshotRefreshHost for NodeOnlySnapshotRefreshHost {
         _state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError> {
         Ok(None)
-    }
-
-    fn fetch_cluster_kv_snapshot(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        _timeout: Duration,
-    ) -> Result<KvSnapshot, NetworkError> {
-        self.direct_fetches += 1;
-        Err(NetworkError::Io {
-            operation: "test direct snapshot fetch".to_string(),
-            detail: format!("{} is unreachable in this test", endpoint.address),
-        })
     }
 
     fn restore_cluster_kv_from_snapshot_if_newer(
@@ -32764,7 +33035,7 @@ impl ClusterKvSnapshotRefreshHost for NodeOnlySnapshotRefreshHost {
 }
 
 #[test]
-fn refresh_current_cluster_kv_store_falls_back_to_node_snapshot_fetch() {
+fn refresh_current_cluster_kv_store_uses_node_snapshot_fetch() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-refresh-node-fallback");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -32823,8 +33094,10 @@ fn refresh_current_cluster_kv_store_falls_back_to_node_snapshot_fetch() {
     )
     .expect("refresh with relay fallback");
 
-    assert!(host.direct_fetches > 0, "direct fetch must be attempted");
-    assert_eq!(host.node_calls, 1, "node fallback must run exactly once");
+    assert_eq!(
+        host.node_calls, 1,
+        "node-routed fetch must run exactly once"
+    );
     assert!(
         store
             .snapshot()
@@ -33636,23 +33909,23 @@ mod route_cache_tests {
         }
     }
 
-    impl ClusterSignedEndpointRpcAsyncHost for RecordingTargetHost {
-        fn sign_endpoint_rpc_request_async<'a>(
+    impl ClusterSignedObjectRpcAsyncHost for RecordingTargetHost {
+        fn sign_object_rpc_request_async<'a>(
             &'a mut self,
             request: &'a ObjectRpcRequest,
-        ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+        ) -> ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
             self.signed_routes.push(request.route.clone());
             let auth = format!("auth-{}", self.signed_routes.len()).into_bytes();
             Box::pin(async move { Ok(auth) })
         }
 
-        fn send_signed_endpoint_rpc_async<'a>(
+        fn send_signed_object_rpc_async<'a>(
             &'a mut self,
             endpoint: &'a ClusterEndpointRecord,
             auth: &'a [u8],
             request: &'a ObjectRpcRequest,
             timeouts: DaemonRpcTimeouts,
-        ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
+        ) -> ClusterSignedObjectRpcFuture<'a, ObjectRpcResponse> {
             self.sent
                 .push((endpoint.clone(), request.clone(), auth.to_vec(), timeouts));
             let outcome = self
@@ -33796,16 +34069,6 @@ mod route_cache_tests {
                 good_endpoint.clone(),
             ],
         );
-        mark_local_endpoints_healthy(
-            &paths,
-            &state,
-            &[
-                stale_endpoint,
-                stale_endpoint_2,
-                stale_endpoint_3,
-                good_endpoint,
-            ],
-        );
         let runtime = tokio::runtime::Handle::current();
         let mut host = RecordingTargetHost::new([
             SendOutcome::Error("stale endpoint hung"),
@@ -33837,18 +34100,18 @@ mod route_cache_tests {
             .connect_timeout
             .expect("first endpoint budget");
         assert!(
-            first_budget <= Duration::from_millis(3_750)
-                && first_budget >= Duration::from_millis(3_000),
-            "first endpoint budget should reserve time for the remaining candidates: {first_budget:?}"
+            first_budget <= Duration::from_millis(2_100)
+                && first_budget >= Duration::from_millis(1_500),
+            "unverified first endpoint budget should be capped tightly: {first_budget:?}"
         );
         let second_budget = host.sent[1]
             .3
             .connect_timeout
             .expect("second endpoint budget");
         assert!(
-            second_budget <= CLUSTER_TARGET_ENDPOINT_ATTEMPT_MAX
-                && second_budget >= Duration::from_millis(4_000),
-            "second endpoint budget should be capped near the per-endpoint max: {second_budget:?}"
+            second_budget <= Duration::from_millis(2_100)
+                && second_budget >= Duration::from_millis(1_500),
+            "unverified second endpoint budget should be capped tightly: {second_budget:?}"
         );
     }
 
@@ -34273,7 +34536,7 @@ mod route_cache_tests {
     }
 
     #[test]
-    fn stable_connectivity_refresh_does_not_bump_route_generation() {
+    fn stable_connectivity_refresh_bumps_route_generation() {
         let (_root, paths) = test_paths("sinomo-network-stable-connectivity-generation");
         let cluster_id = cid("cluster_stable_connectivity_generation");
         let local = nid("node_stable_connectivity_generation_local");
@@ -34321,7 +34584,7 @@ mod route_cache_tests {
         )
         .expect("write stable connectivity refresh");
 
-        assert_eq!(
+        assert_ne!(
             sinomo_network::local_cluster_connectivity_content_generation(&paths),
             generation_after_first
         );

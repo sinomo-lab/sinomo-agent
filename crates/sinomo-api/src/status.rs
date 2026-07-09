@@ -12,6 +12,7 @@ use sinomo_core::{
 };
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -19,6 +20,56 @@ use time::format_description::well_known::Rfc3339;
 pub const SINOMO_DAEMON_DEFAULT_HOST: &str = "127.0.0.1";
 pub const SINOMO_DAEMON_DEFAULT_PORT: u16 = 21_353;
 pub const SINOMO_SHADOW_DAEMON_DEFAULT_PORT: u16 = 21_354;
+
+static DAEMON_BUILD_INFO: OnceLock<DaemonBuildInfo> = OnceLock::new();
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DaemonBuildInfo {
+    pub version: String,
+    pub commit: Option<String>,
+}
+
+impl DaemonBuildInfo {
+    pub fn new(version: impl Into<String>, commit: Option<String>) -> Self {
+        let version = version.into();
+        let version = match version.trim() {
+            "" => env!("CARGO_PKG_VERSION").to_string(),
+            version => version.to_string(),
+        };
+        let commit = commit.and_then(|commit| {
+            let commit = commit.trim();
+            if commit.is_empty() || commit == "unknown" {
+                None
+            } else {
+                Some(commit.to_string())
+            }
+        });
+        Self { version, commit }
+    }
+}
+
+impl Default for DaemonBuildInfo {
+    fn default() -> Self {
+        Self::new(env!("CARGO_PKG_VERSION"), None)
+    }
+}
+
+pub fn install_daemon_build_info(info: DaemonBuildInfo) -> Result<(), &'static str> {
+    if let Some(existing) = DAEMON_BUILD_INFO.get() {
+        return if existing == &info {
+            Ok(())
+        } else {
+            Err("daemon build info was already installed")
+        };
+    }
+    DAEMON_BUILD_INFO
+        .set(info)
+        .map_err(|_| "daemon build info was already installed")
+}
+
+pub fn daemon_build_info() -> DaemonBuildInfo {
+    DAEMON_BUILD_INFO.get().cloned().unwrap_or_default()
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DaemonRunOptions {
@@ -119,16 +170,13 @@ impl DaemonStatus {
 }
 
 pub fn daemon_package_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+    daemon_build_info().version
 }
 
-/// Short git commit the daemon binary was built from, embedded by build.rs.
-/// Returns None when the build had no git context (commit recorded as "unknown").
+/// Short git commit the daemon process was built from, installed by the application binary.
+/// Returns None when the process had no git context (commit recorded as "unknown").
 pub fn daemon_git_commit() -> Option<String> {
-    match option_env!("SINOMO_GIT_COMMIT") {
-        Some(commit) if !commit.is_empty() && commit != "unknown" => Some(commit.to_string()),
-        _ => None,
-    }
+    daemon_build_info().commit
 }
 
 pub fn daemon_hostname() -> Option<String> {

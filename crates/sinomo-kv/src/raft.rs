@@ -682,7 +682,7 @@ where
 /// Storage-side contract for applying a cluster KV command to the local Raft log.
 ///
 /// Implementors own KV/Raft durability only. They must not choose peers, route
-/// messages, score endpoints, or interpret the cluster connectivity graph.
+/// messages, score routes, or interpret the cluster connectivity graph.
 pub trait ClusterKvRaftCommandStorage {
     type Error;
 

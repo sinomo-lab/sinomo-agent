@@ -131,8 +131,9 @@ use crate::{
     DAEMON_DFS_BROWSER_RENAME_ROUTE, DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STAT_ROUTE,
     DAEMON_DFS_BROWSER_STATUS_ROUTE, DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
     DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE, DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
-    DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
-    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
+    DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
+    DAEMON_STATUS_ROUTE,
 };
 
 static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
@@ -159,10 +160,12 @@ fn require_service_runtime<'a>(
 }
 
 async fn forward_object_rpc_from_daemon_control(
+    paths: &crate::DaemonPaths,
     payload: crate::DaemonObjectRpcForwardRequest,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ObjectRpcResponse, ServiceError> {
-    crate::client::send_object_rpc_to_target_async(
+    crate::client::send_object_rpc_to_target_async_with_daemon_paths(
+        paths,
         &payload.target_node_id,
         &payload.request,
         Duration::from_millis(payload.connect_timeout_millis),
@@ -498,13 +501,16 @@ impl Service for DaemonControlService {
             DAEMON_SHUTDOWN_ROUTE,
             DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
             DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+            DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
         ]
     }
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
         let mut routes = service_route_categories(self.routes(), DAEMON_RPC_CATEGORY);
         for route in &mut routes {
-            if route.route == DAEMON_OBJECT_RPC_FORWARD_ROUTE {
+            if route.route == DAEMON_OBJECT_RPC_FORWARD_ROUTE
+                || route.route == DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
+            {
                 route.auth_scope = Some("local-command".to_string());
             }
         }
@@ -550,6 +556,7 @@ impl Service for DaemonControlService {
                 DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE => {
                     let _: crate::DaemonClusterMaintenanceRefreshRequest = request.decode_body()?;
                     crate::control::request_daemon_cluster_maintenance_refresh();
+                    crate::dfs::notify_daemon_dfs_maintenance_work();
                     tracing::info!("sinomo daemon cluster maintenance refresh requested by RPC");
                     (
                         ObjectRpcResponse::encode_body(
@@ -559,7 +566,7 @@ impl Service for DaemonControlService {
                         ServiceDisposition::Continue,
                     )
                 }
-                DAEMON_OBJECT_RPC_FORWARD_ROUTE => {
+                DAEMON_OBJECT_RPC_FORWARD_ROUTE | DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE => {
                     let payload: crate::DaemonObjectRpcForwardRequest = request.decode_body()?;
                     if payload.raw_response {
                         return Err(ServiceError::Service(
@@ -571,7 +578,7 @@ impl Service for DaemonControlService {
                         require_service_runtime(runtime.as_ref(), "daemon object RPC forward")?
                             .clone();
                     let response =
-                        forward_object_rpc_from_daemon_control(payload, &runtime).await?;
+                        forward_object_rpc_from_daemon_control(&paths, payload, &runtime).await?;
                     (
                         ObjectRpcResponse::encode_body(request.route.as_str(), &response)?,
                         ServiceDisposition::Continue,
@@ -589,13 +596,15 @@ impl Service for DaemonControlService {
         _ctx: ServiceContext,
         request: ObjectRpcRequest,
     ) -> Option<ServiceStreamFuture<'_>> {
-        if request.route != DAEMON_OBJECT_RPC_FORWARD_ROUTE
+        if (request.route != DAEMON_OBJECT_RPC_FORWARD_ROUTE
+            && request.route != DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE)
             || !sinomo_core::network::object_rpc_request_stream_mode(&request)
                 .expects_raw_streamed_response()
         {
             return None;
         }
         let runtime = self.runtime.clone();
+        let paths = self.paths.clone();
         Some(Box::pin(async move {
             let payload: crate::DaemonObjectRpcForwardRequest = request.decode_body()?;
             if !payload.raw_response {
@@ -606,7 +615,8 @@ impl Service for DaemonControlService {
             let runtime =
                 require_service_runtime(runtime.as_ref(), "daemon object RPC stream forward")?
                     .clone();
-            let response = forward_object_rpc_from_daemon_control(payload, &runtime).await?;
+            let response =
+                forward_object_rpc_from_daemon_control(&paths, payload, &runtime).await?;
             Ok(service_stream_response_from_collected_object_rpc_response(
                 response,
             ))
@@ -2679,15 +2689,19 @@ async fn publish_daemon_sifs_metadata(
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<(), ServiceError> {
     let runtime = require_service_runtime(runtime, "DFS browser metadata publish")?.clone();
+    let daemon_paths = crate::DaemonPaths::new(data_dir);
     let batch_runtime = runtime.clone();
+    let batch_paths = daemon_paths.clone();
     let batch_sender: sinomo_dfs::AsyncDfsMetadataJournalBatchSender =
         Arc::new(move |target_node_id, command, connect_timeout| {
             let runtime = batch_runtime.clone();
+            let paths = batch_paths.clone();
             Box::pin(async move {
                 let request = sinomo_dfs::dfs_metadata_journal_batch_rpc_request(command).map_err(
                     |source| sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string()),
                 )?;
-                let response = crate::client::send_object_rpc_to_target_async(
+                let response = crate::client::send_object_rpc_to_target_async_with_daemon_paths(
+                    &paths,
                     target_node_id,
                     &request,
                     connect_timeout,
@@ -2704,15 +2718,18 @@ async fn publish_daemon_sifs_metadata(
             })
         });
     let snapshot_runtime = runtime;
+    let snapshot_paths = daemon_paths;
     let snapshot_sender: sinomo_dfs::AsyncDfsMetadataSnapshotInstallSender =
         Arc::new(move |target_node_id, command, connect_timeout| {
             let runtime = snapshot_runtime.clone();
+            let paths = snapshot_paths.clone();
             Box::pin(async move {
                 let request = sinomo_dfs::dfs_metadata_snapshot_install_rpc_request(command)
                     .map_err(|source| {
                         sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string())
                     })?;
-                let response = crate::client::send_object_rpc_to_target_async(
+                let response = crate::client::send_object_rpc_to_target_async_with_daemon_paths(
+                    &paths,
                     target_node_id,
                     &request,
                     connect_timeout,
@@ -3432,6 +3449,32 @@ fn daemon_signer_authorizes_route_scope(authority: &DaemonSignerAuthority, scope
         "admin" => authority.can_run_admin_command(),
         _ => false,
     }
+}
+
+fn daemon_auth_public_key_prefix(public_key: &str) -> &str {
+    public_key
+        .get(..public_key.len().min(8))
+        .unwrap_or(public_key)
+}
+
+fn warn_daemon_service_auth_denied(
+    route: &str,
+    auth_scope: &str,
+    signer: &DaemonSignerAuthority,
+    signer_node_id: Option<&str>,
+    signer_public_key: Option<&str>,
+) {
+    tracing::warn!(
+        target: "sinomo.daemon.service_auth",
+        route,
+        auth_scope,
+        signer = ?signer,
+        signer_node_id = signer_node_id.unwrap_or("unknown"),
+        signer_public_key_prefix = signer_public_key
+            .map(daemon_auth_public_key_prefix)
+            .unwrap_or("unknown"),
+        "daemon service object RPC authorization denied"
+    );
 }
 
 fn module_error_to_network_error(error: impl std::fmt::Display) -> NetworkError {
@@ -4327,6 +4370,13 @@ fn daemon_service_object_rpc_authorization_layer(
             if daemon_signer_authorizes_route_scope(&signer_authority, auth_scope) {
                 Ok(())
             } else {
+                warn_daemon_service_auth_denied(
+                    &descriptor.route,
+                    auth_scope,
+                    &signer_authority,
+                    None,
+                    None,
+                );
                 Err(NetworkError::AuthDenied)
             }
         }
@@ -4703,6 +4753,13 @@ pub(crate) async fn dispatch_rpc_via_registry_to_stream_response_async(
         if let Some(auth_scope) = descriptor.auth_scope.as_deref()
             && !daemon_signer_authorizes_route_scope(&authenticated.signer, auth_scope)
         {
+            warn_daemon_service_auth_denied(
+                &request.route,
+                auth_scope,
+                &authenticated.signer,
+                Some(&authenticated.signer_node_id),
+                Some(&authenticated.signer_public_key),
+            );
             return Err(DaemonError::AuthDenied);
         }
     } else {
@@ -5061,6 +5118,51 @@ mod tests {
                 .map(String::as_str),
             Some("continue")
         );
+    }
+
+    #[test]
+    fn daemon_maintenance_refresh_rpc_notifies_dfs_maintenance() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-maintenance-refresh-dfs");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let registry = ServiceRegistry::builder()
+            .register(DaemonControlService {
+                paths,
+                runtime: Some(runtime.handle().clone()),
+            })
+            .build();
+        let host = test_service_host(&root, registry);
+        let mut router = host.route_policy_layer().layer(host.active_router());
+
+        runtime.block_on(async {
+            let dfs_notify = crate::dfs::daemon_dfs_maintenance_notify();
+            while tokio::time::timeout(Duration::from_millis(1), dfs_notify.notified())
+                .await
+                .is_ok()
+            {}
+            let notified = dfs_notify.notified();
+            tokio::pin!(notified);
+            let response = sinomo_core::network::call_object_rpc_service_async(&mut router, {
+                let mut request = ObjectRpcRequest::encode_body(
+                    DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
+                    DAEMON_RPC_CATEGORY,
+                    &crate::DaemonClusterMaintenanceRefreshRequest,
+                )
+                .expect("request");
+                annotate_test_request(&mut request, DaemonSignerAuthority::Local);
+                request
+            })
+            .await
+            .expect("maintenance refresh response");
+            response.error_detail().expect("maintenance refresh ok");
+            tokio::time::timeout(Duration::from_secs(1), &mut notified)
+                .await
+                .expect("DFS maintenance notification");
+        });
     }
 
     #[test]
@@ -6066,6 +6168,15 @@ mod tests {
         assert_eq!(object_rpc_forward.category, crate::DAEMON_RPC_CATEGORY);
         assert_eq!(
             object_rpc_forward.auth_scope.as_deref(),
+            Some("local-command")
+        );
+        let dfs_object_rpc_forward = route_metadata
+            .iter()
+            .find(|route| route.route == crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE)
+            .expect("daemon DFS object RPC forward route metadata");
+        assert_eq!(dfs_object_rpc_forward.category, crate::DAEMON_RPC_CATEGORY);
+        assert_eq!(
+            dfs_object_rpc_forward.auth_scope.as_deref(),
             Some("local-command")
         );
         let snapshot = route_metadata

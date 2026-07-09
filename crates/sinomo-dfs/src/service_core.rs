@@ -155,6 +155,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self
     }
 
+    pub(crate) fn refresh_control_plane_latest(&mut self) -> Result<(), DfsError> {
+        let Some(control_plane) = self.control_plane.as_mut() else {
+            return Ok(());
+        };
+        control_plane.refresh_latest().map_err(DfsError::from)?;
+        self.cached_sifs_metadata_shards = None;
+        Ok(())
+    }
+
     pub fn with_metadata_backend(
         mut self,
         backend: impl DfsMetadataBackend + Send + 'static,

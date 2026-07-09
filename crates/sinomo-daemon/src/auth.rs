@@ -261,7 +261,10 @@ pub fn authorize_authenticated_daemon_command(
         route if route == crate::DAEMON_SHUTDOWN_ROUTE => {
             authenticated.signer.can_run_local_command()
         }
-        route if route == crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE => {
+        route
+            if route == crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE
+                || route == crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE =>
+        {
             authenticated.signer.can_run_local_command()
         }
         route if route == ROLLOUT_FINALIZE_SHADOW_ROUTE => {
@@ -698,17 +701,34 @@ fn refresh_daemon_auth_membership_snapshot(data_dir: &Path) -> Result<(), Daemon
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
     let options =
         ClusterControlPlaneTimeouts::default_daemon_transport().kv_snapshot_refresh_options();
+    let payload = sinomo_core::kv::cluster_kv_snapshot_rpc_payload()?;
+    let request = sinomo_core::network::ObjectRpcRequest::from_encoded_body(
+        payload.route,
+        payload.category,
+        payload.body,
+    );
     sinomo_core::cluster::refresh_current_cluster_kv_store_with_local_storage_and_transport(
         &cluster_paths,
         &state,
         options,
-        |endpoint, timeout| {
-            crate::client::fetch_cluster_kv_snapshot_from_endpoint(endpoint, timeout).map_err(
-                |error| sinomo_core::network::NetworkError::Io {
-                    operation: "cluster auth membership refresh".to_string(),
-                    detail: error.to_string(),
-                },
+        |target_node_id, timeout| {
+            let response = crate::client::send_object_rpc_to_target_with_timeouts(
+                target_node_id,
+                &request,
+                sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+                false,
             )
+            .map_err(|error| sinomo_core::network::NetworkError::Io {
+                operation: "cluster auth membership refresh".to_string(),
+                detail: error.to_string(),
+            })?;
+            response.error_detail()?;
+            sinomo_core::kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(|source| {
+                sinomo_core::network::NetworkError::Io {
+                    operation: "decode cluster auth membership snapshot".to_string(),
+                    detail: source.to_string(),
+                }
+            })
         },
     )
     .map(|_| ())
@@ -1663,20 +1683,24 @@ mod tests {
 
     #[test]
     fn daemon_object_rpc_forward_authorizes_only_local_signer() {
-        let route = crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE;
-        authorize_authenticated_daemon_command(&authenticated_command(
-            route.to_string(),
-            DaemonSignerAuthority::Local,
-        ))
-        .expect("local operators must be able to forward object RPCs through the daemon");
-        for signer in [
-            DaemonSignerAuthority::Voter,
-            DaemonSignerAuthority::Member,
-            DaemonSignerAuthority::JoinCandidate,
-            DaemonSignerAuthority::StatusProbe,
+        for route in [
+            crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+            crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
         ] {
-            let authenticated = authenticated_command(route.to_string(), signer);
-            assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+            authorize_authenticated_daemon_command(&authenticated_command(
+                route.to_string(),
+                DaemonSignerAuthority::Local,
+            ))
+            .expect("local operators must be able to forward object RPCs through the daemon");
+            for signer in [
+                DaemonSignerAuthority::Voter,
+                DaemonSignerAuthority::Member,
+                DaemonSignerAuthority::JoinCandidate,
+                DaemonSignerAuthority::StatusProbe,
+            ] {
+                let authenticated = authenticated_command(route.to_string(), signer);
+                assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+            }
         }
     }
 

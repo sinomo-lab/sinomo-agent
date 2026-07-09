@@ -1748,6 +1748,14 @@ pub(crate) fn rollout_pending_error_grace(
     ROLLOUT_ACTIVE_STATUS_ERROR_GRACE
 }
 
+pub(crate) fn rollout_missing_status_grace(has_seen_matching_status: bool) -> Duration {
+    if has_seen_matching_status {
+        ROLLOUT_TERMINAL_STATUS_GRACE
+    } else {
+        ROLLOUT_ACTIVE_STATUS_ERROR_GRACE
+    }
+}
+
 fn send_rollout_request_with_progress<F>(
     target: &RolloutTarget,
     operation: &'static str,
@@ -1769,6 +1777,8 @@ where
     let mut drew_progress = false;
     let mut pending_error: Option<CliError> = None;
     let mut pending_error_started_at: Option<Instant> = None;
+    let mut has_seen_matching_status = false;
+    let mut missing_status_started_at: Option<Instant> = None;
     loop {
         if pending_error.is_none() {
             match result_rx.recv_timeout(ROLLOUT_PROGRESS_POLL_INTERVAL) {
@@ -1799,6 +1809,33 @@ where
             .ok()
             .and_then(|status| status.rollout)
             .filter(|status| rollout_status_matches_expectation(status, &expectation));
+        if rollout_status.is_some() {
+            has_seen_matching_status = true;
+            missing_status_started_at = None;
+        } else {
+            let missing_started_at = *missing_status_started_at.get_or_insert_with(Instant::now);
+            if missing_started_at.elapsed()
+                >= rollout_missing_status_grace(has_seen_matching_status)
+            {
+                if drew_progress {
+                    println!();
+                }
+                return Err(CliError::Network {
+                    address: target.label().to_string(),
+                    detail: if has_seen_matching_status {
+                        format!(
+                            "{operation} progress disappeared before the rollout request returned; run `sinomo rollout diagnostics --target {}`",
+                            target.label()
+                        )
+                    } else {
+                        format!(
+                            "{operation} did not publish progress before timeout; run `sinomo rollout diagnostics --target {}`",
+                            target.label()
+                        )
+                    },
+                });
+            }
+        }
         let line = format_rollout_progress_line(
             target.label(),
             operation,
@@ -1829,11 +1866,78 @@ where
 }
 
 pub(crate) fn read_rollout_target_status(target: &RolloutTarget) -> Result<DaemonStatus, CliError> {
-    if let Some(endpoint) = &target.endpoint {
-        sinomo_runtime::daemon::fetch_daemon_status_from_endpoint(endpoint, DAEMON_JOIN_TIMEOUT)
+    send_rollout_object_rpc_body(
+        target,
+        sinomo_runtime::daemon::DAEMON_STATUS_ROUTE,
+        sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
+        &(),
+        DAEMON_JOIN_TIMEOUT,
+    )
+}
+
+fn send_rollout_object_rpc_body<Req, Resp>(
+    target: &RolloutTarget,
+    route: &str,
+    category: &str,
+    request: &Req,
+    timeout: Duration,
+) -> Result<Resp, CliError>
+where
+    Req: serde::Serialize + ?Sized,
+    Resp: serde::de::DeserializeOwned,
+{
+    send_rollout_object_rpc_body_with_timeouts(
+        target,
+        route,
+        category,
+        request,
+        network::DaemonRpcTimeouts::connect_and_idle(timeout),
+    )
+}
+
+fn send_rollout_object_rpc_body_with_timeouts<Req, Resp>(
+    target: &RolloutTarget,
+    route: &str,
+    category: &str,
+    request: &Req,
+    timeouts: network::DaemonRpcTimeouts,
+) -> Result<Resp, CliError>
+where
+    Req: serde::Serialize + ?Sized,
+    Resp: serde::de::DeserializeOwned,
+{
+    let request = network::ObjectRpcRequest::encode_body(route, category, request)?;
+    let response = send_rollout_object_rpc_with_timeouts(target, &request, timeouts)?;
+    response.decode_body().map_err(CliError::from)
+}
+
+fn send_rollout_object_rpc_with_timeouts(
+    target: &RolloutTarget,
+    request: &network::ObjectRpcRequest,
+    timeouts: network::DaemonRpcTimeouts,
+) -> Result<network::ObjectRpcResponse, CliError> {
+    if let Some(node_id) = target.rollout_node_id() {
+        let status = default_main_daemon_status()?.ok_or_else(|| CliError::Network {
+            address: node_id.to_string(),
+            detail:
+                "cluster-selected rollout target requires the local daemon to route the request"
+                    .to_string(),
+        })?;
+        let connect_timeout = timeouts.connect_timeout.ok_or_else(|| CliError::Network {
+            address: node_id.to_string(),
+            detail: "cluster-selected rollout target requires a bounded routing timeout"
+                .to_string(),
+        })?;
+        sinomo_runtime::api::DaemonApiClient::at_address(status.address)
+            .object_rpc_to_target(node_id, request, connect_timeout, true)
             .map_err(Into::into)
+    } else if let Some(endpoint) = &target.endpoint {
+        sinomo_runtime::daemon::send_daemon_rpc_to_endpoint_with_timeouts(
+            endpoint, request, timeouts,
+        )
+        .map_err(Into::into)
     } else {
-        daemon_fetch_daemon_status_from_address(&target.address, DAEMON_JOIN_TIMEOUT)
+        sinomo_runtime::daemon::send_daemon_rpc_with_timeouts(&target.address, request, timeouts)
             .map_err(Into::into)
     }
 }
@@ -2078,19 +2182,20 @@ fn upload_rollout_artifact_chunks(
             total_bytes: artifact.total_bytes,
             bytes: buffer[..read].to_vec(),
         };
-        let response = if let Some(endpoint) = &target.endpoint {
-            daemon_send_daemon_rollout_binary_upload_chunk_to_endpoint(
-                endpoint,
-                &chunk,
-                DAEMON_ROLLOUT_TIMEOUT,
-            )
-        } else {
-            daemon_send_daemon_rollout_binary_upload_chunk(
-                &target.address,
-                &chunk,
-                DAEMON_ROLLOUT_TIMEOUT,
-            )
-        }?;
+        let request = network::ObjectRpcRequest::encode_body(
+            sinomo_runtime::rollout::ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
+            sinomo_runtime::rollout::ROLLOUT_RPC_CATEGORY,
+            &chunk,
+        )?
+        .with_response_retry_safe();
+        let response: sinomo_runtime::rollout::ClusterRolloutBinaryUploadChunkResponse =
+            send_rollout_object_rpc_with_timeouts(
+                target,
+                &request,
+                network::DaemonRpcTimeouts::connect_and_idle(DAEMON_ROLLOUT_TIMEOUT),
+            )?
+            .decode_body()
+            .map_err(CliError::from)?;
         let expected_received =
             offset + u64::try_from(read).expect("chunk length should fit in u64");
         if !response.accepted || response.received_bytes != expected_received {
@@ -2130,7 +2235,15 @@ fn send_daemon_rollout_binary_direct(
     target: &RolloutTarget,
     request: &ClusterRolloutBinaryRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
-    if let Some(endpoint) = &target.endpoint {
+    if target.rollout_node_id().is_some() {
+        send_rollout_object_rpc_body(
+            target,
+            sinomo_runtime::rollout::ROLLOUT_BINARY_ROUTE,
+            sinomo_runtime::rollout::ROLLOUT_RPC_CATEGORY,
+            request,
+            DAEMON_ROLLOUT_TIMEOUT,
+        )
+    } else if let Some(endpoint) = &target.endpoint {
         daemon_send_daemon_rollout_binary_to_endpoint(endpoint, request, DAEMON_ROLLOUT_TIMEOUT)
             .map_err(Into::into)
     } else {
@@ -2143,7 +2256,15 @@ fn send_daemon_rollout_binary_finalize_direct(
     target: &RolloutTarget,
     request: &ClusterRolloutBinaryUploadFinalizeRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
-    if let Some(endpoint) = &target.endpoint {
+    if target.rollout_node_id().is_some() {
+        send_rollout_object_rpc_body(
+            target,
+            sinomo_runtime::rollout::ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+            sinomo_runtime::rollout::ROLLOUT_RPC_CATEGORY,
+            request,
+            DAEMON_ROLLOUT_TIMEOUT,
+        )
+    } else if let Some(endpoint) = &target.endpoint {
         daemon_send_daemon_rollout_binary_upload_finalize_to_endpoint(
             endpoint,
             request,
@@ -2164,7 +2285,15 @@ pub(crate) fn send_daemon_rollout_native_dylib_module(
     target: &RolloutTarget,
     request: &ClusterRolloutNativeDylibModuleRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
-    if let Some(endpoint) = &target.endpoint {
+    if target.rollout_node_id().is_some() {
+        send_rollout_object_rpc_body(
+            target,
+            sinomo_runtime::rollout::ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
+            sinomo_runtime::rollout::ROLLOUT_RPC_CATEGORY,
+            request,
+            DAEMON_ROLLOUT_TIMEOUT,
+        )
+    } else if let Some(endpoint) = &target.endpoint {
         daemon_send_daemon_rollout_native_dylib_module_to_endpoint(
             endpoint,
             request,
@@ -2182,7 +2311,15 @@ pub(crate) fn send_daemon_rollout_native_dylib_module(
 }
 
 pub(crate) fn send_daemon_rollout_clear_status(target: &RolloutTarget) -> Result<String, CliError> {
-    if let Some(endpoint) = &target.endpoint {
+    if target.rollout_node_id().is_some() {
+        send_rollout_object_rpc_body(
+            target,
+            sinomo_runtime::rollout::ROLLOUT_CLEAR_STATUS_ROUTE,
+            sinomo_runtime::rollout::ROLLOUT_RPC_CATEGORY,
+            &(),
+            DAEMON_CLUSTER_KV_TXN_TIMEOUT,
+        )
+    } else if let Some(endpoint) = &target.endpoint {
         daemon_send_daemon_rollout_clear_status_to_endpoint(endpoint, DAEMON_CLUSTER_KV_TXN_TIMEOUT)
             .map_err(Into::into)
     } else {
@@ -2192,7 +2329,15 @@ pub(crate) fn send_daemon_rollout_clear_status(target: &RolloutTarget) -> Result
 }
 
 pub(crate) fn send_daemon_rollout_diagnostics(target: &RolloutTarget) -> Result<String, CliError> {
-    if let Some(endpoint) = &target.endpoint {
+    if target.rollout_node_id().is_some() {
+        send_rollout_object_rpc_body(
+            target,
+            sinomo_runtime::rollout::ROLLOUT_DIAGNOSTICS_ROUTE,
+            sinomo_runtime::rollout::ROLLOUT_RPC_CATEGORY,
+            &(),
+            CLUSTER_HEALTH_PROBE_TIMEOUT,
+        )
+    } else if let Some(endpoint) = &target.endpoint {
         daemon_send_daemon_rollout_diagnostics_to_endpoint(endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT)
             .map_err(Into::into)
     } else {
@@ -2220,7 +2365,15 @@ fn send_daemon_rollout_build_direct(
     target: &RolloutTarget,
     request: &ClusterRolloutBuildRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
-    if let Some(endpoint) = &target.endpoint {
+    if target.rollout_node_id().is_some() {
+        send_rollout_object_rpc_body_with_timeouts(
+            target,
+            sinomo_runtime::rollout::ROLLOUT_BUILD_ROUTE,
+            sinomo_runtime::rollout::ROLLOUT_RPC_CATEGORY,
+            request,
+            remote_build_rollout_timeouts(),
+        )
+    } else if let Some(endpoint) = &target.endpoint {
         daemon_send_daemon_rollout_build_to_endpoint_with_timeouts(
             endpoint,
             request,
