@@ -152,8 +152,7 @@ pub fn install_binary_atomically(source: &Path, destination: &Path) -> Result<()
         detail: error.to_string(),
     })?;
     if destination.exists() {
-        let previous = rollout_previous_binary_path(destination);
-        let _ = fs::remove_file(&previous);
+        let previous = rollout_new_previous_binary_path(destination);
         fs::rename(destination, &previous).map_err(|source| RolloutError::Io {
             path: format!("{} -> {}", destination.display(), previous.display()),
             detail: source.to_string(),
@@ -247,12 +246,18 @@ pub fn activate_staged_rollout_binary(
     if destination.exists() {
         match ensure_non_empty_rollout_artifact(destination) {
             Ok(()) => {
-                let _ = fs::remove_file(&previous);
-                fs::rename(destination, &previous).map_err(|source| RolloutError::Io {
-                    path: format!("{} -> {}", destination.display(), previous.display()),
-                    detail: source.to_string(),
+                let destination_backup = rollout_new_previous_binary_path(destination);
+                fs::rename(destination, &destination_backup).map_err(|source| {
+                    RolloutError::Io {
+                        path: format!(
+                            "{} -> {}",
+                            destination.display(),
+                            destination_backup.display()
+                        ),
+                        detail: source.to_string(),
+                    }
                 })?;
-                backup = Some(previous.clone());
+                backup = Some(destination_backup);
             }
             Err(RolloutError::InvalidArtifact { .. }) => {
                 fs::remove_file(destination).map_err(|source| RolloutError::Io {
@@ -324,6 +329,31 @@ pub fn rollout_previous_binary_path(destination: &Path) -> PathBuf {
     destination.with_file_name(format!("{file_name}.previous"))
 }
 
+fn rollout_new_previous_binary_path(destination: &Path) -> PathBuf {
+    let previous = rollout_previous_binary_path(destination);
+    if !previous.exists() {
+        return previous;
+    }
+    let file_name = previous
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sinomo.previous");
+    for attempt in 0..1024 {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let candidate = previous.with_file_name(format!(
+            "{file_name}.{}-{suffix}-{attempt}",
+            std::process::id()
+        ));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    previous.with_file_name(format!("{file_name}.{}", std::process::id()))
+}
+
 fn set_executable(_destination: &Path) -> Result<(), RolloutError> {
     #[cfg(unix)]
     {
@@ -362,6 +392,43 @@ mod tests {
             b"previous"
         );
         assert!(!root.join("sinomo.previous").exists());
+    }
+
+    #[test]
+    fn install_binary_atomically_preserves_existing_previous_backup() {
+        let root = sinomo_testdir::TestDir::new("sinomo-rollout-existing-install-backup");
+        let source = root.join("candidate");
+        let destination = root.join("sinomo");
+        let previous = rollout_previous_binary_path(&destination);
+        fs::write(&source, b"candidate").expect("source");
+        fs::write(&destination, b"current").expect("destination");
+        fs::write(&previous, b"older-previous").expect("previous");
+
+        install_binary_atomically(&source, &destination).expect("install");
+
+        assert_eq!(
+            fs::read(&destination).expect("destination bytes"),
+            b"candidate"
+        );
+        assert_eq!(
+            fs::read(&previous).expect("previous bytes"),
+            b"older-previous"
+        );
+        let backups = fs::read_dir(root.path())
+            .expect("root entries")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("sinomo.previous."))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            fs::read(&backups[0]).expect("fresh backup bytes"),
+            b"current"
+        );
     }
 
     #[test]
@@ -493,6 +560,34 @@ mod tests {
             fs::read(&previous).expect("previous bytes"),
             b"previous-good"
         );
+    }
+
+    #[test]
+    fn activate_staged_rollout_binary_uses_unique_backup_when_previous_exists() {
+        let root = sinomo_testdir::TestDir::new("sinomo-rollout-existing-previous");
+        let staged = root.join("staged").join("sinomo");
+        let destination = root.join("bin").join("sinomo");
+        let previous = rollout_previous_binary_path(&destination);
+        fs::create_dir_all(staged.parent().expect("staged parent")).expect("staged parent");
+        fs::create_dir_all(destination.parent().expect("bin parent")).expect("bin parent");
+        fs::write(&staged, b"candidate").expect("staged");
+        fs::write(&destination, b"current").expect("current destination");
+        fs::write(&previous, b"older-previous").expect("previous backup");
+
+        let backup =
+            activate_staged_rollout_binary(&staged, &destination).expect("activate staged");
+        let backup = backup.expect("fresh backup");
+
+        assert_ne!(backup, previous);
+        assert_eq!(
+            fs::read(&destination).expect("destination bytes"),
+            b"candidate"
+        );
+        assert_eq!(
+            fs::read(&previous).expect("previous bytes"),
+            b"older-previous"
+        );
+        assert_eq!(fs::read(&backup).expect("backup bytes"), b"current");
     }
 
     #[test]
