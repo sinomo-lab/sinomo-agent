@@ -1,5 +1,5 @@
 use crate::commands::{
-    cli_commit_cluster_kv_txn_with_quorum_response, refresh_cluster_kv_from_local_daemon,
+    cli_commit_cluster_kv_txn_with_quorum_response, refresh_cluster_kv_from_local_daemon_for_data_dir,
 };
 use crate::file_manager::{
     FileManagerBackend, FileManagerEntry, FileManagerEntryKind, FileManagerMetadata,
@@ -129,7 +129,7 @@ impl SifsFileManagerBackend {
         if !cluster_paths.state.exists() {
             return false;
         }
-        if refresh_sifs_cluster_kv_snapshot(&cluster_paths).is_err() {
+        if refresh_sifs_cluster_kv_snapshot(&self.data_dir, &cluster_paths).is_err() {
             return false;
         }
         let Ok(state) = cluster::read_cluster_state(&cluster_paths) else {
@@ -148,7 +148,7 @@ impl SifsFileManagerBackend {
             let _ = service.process_incoming_without_deferred_parent_touches();
         }
         let _ = publish_sifs_metadata_journal_from_data_dir(&self.data_dir, &self.rpc_runtime);
-        request_sifs_daemon_maintenance_refresh();
+        request_sifs_daemon_maintenance_refresh(&self.data_dir);
     }
 
     /// The node id objects written here are placed on (the local SIFS node).
@@ -415,8 +415,8 @@ impl SifsFileManagerBackend {
         if !cluster_paths.state.exists() {
             return Ok(None);
         }
-        refresh_sifs_cluster_kv_snapshot(&cluster_paths)?;
-        let mut kv = SifsControlPlaneKvClient::new(&cluster_paths);
+        refresh_sifs_cluster_kv_snapshot(&self.data_dir, &cluster_paths)?;
+        let mut kv = SifsControlPlaneKvClient::new(&self.data_dir, &cluster_paths);
         let store = DfsControlPlaneStore::new(&mut kv);
         store
             .select_metadata_shard_for_path_strict_default_sifs_split(&sifs_file_system_id(), &path)
@@ -433,11 +433,11 @@ impl SifsFileManagerBackend {
         if !cluster_paths.state.exists() {
             return Err("SIFS metadata primary transfer requires a cluster".to_string());
         }
-        refresh_sifs_cluster_kv_snapshot(&cluster_paths)?;
+        refresh_sifs_cluster_kv_snapshot(&self.data_dir, &cluster_paths)?;
         let state = cluster::read_cluster_state(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
         let local_node_id = state.local_node_id;
-        let mut kv = SifsControlPlaneKvClient::new(&cluster_paths);
+        let mut kv = SifsControlPlaneKvClient::new(&self.data_dir, &cluster_paths);
         let mut store = DfsControlPlaneStore::new(&mut kv);
         let previous = store
             .select_metadata_shard_for_path_strict_default_sifs_split(&sifs_file_system_id(), &path)
@@ -854,16 +854,33 @@ impl std::fmt::Debug for SifsRpcRuntime {
 }
 
 impl SifsRpcRuntime {
+    /// The process-wide SIFS RPC runtime.
+    ///
+    /// A single shared runtime — never dropped — instead of one per backend.
+    /// Dropping a tokio runtime blocks until every started `spawn_blocking`
+    /// task finishes, and this runtime's blocking tasks probe the daemon and
+    /// forward object RPCs to cluster peers, which can stall for the full
+    /// network timeout. Per-open runtimes therefore wedged whichever thread
+    /// dropped the last handle (the app on chat persist/list churn, the test
+    /// harness at teardown) and stranded 16 `sinomo-sifs-rpc` workers each
+    /// time. Sharing also caps thread churn: chat session-list refreshes and
+    /// persists open SIFS stores constantly and were paying a 16-thread
+    /// runtime build/teardown per call.
     fn new() -> Result<Self, String> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(sifs_rpc_runtime_worker_threads())
-            .thread_name("sinomo-sifs-rpc")
-            .enable_all()
-            .build()
-            .map_err(|error| format!("cannot create SIFS RPC runtime: {error}"))?;
-        Ok(Self {
-            runtime: Arc::new(runtime),
-        })
+        static SHARED: std::sync::OnceLock<Result<Arc<tokio::runtime::Runtime>, String>> =
+            std::sync::OnceLock::new();
+        SHARED
+            .get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(sifs_rpc_runtime_worker_threads())
+                    .thread_name("sinomo-sifs-rpc")
+                    .enable_all()
+                    .build()
+                    .map(Arc::new)
+                    .map_err(|error| format!("cannot create SIFS RPC runtime: {error}"))
+            })
+            .clone()
+            .map(|runtime| Self { runtime })
     }
 }
 
@@ -923,9 +940,9 @@ fn open_sifs_service_with_hydration(
         .ensure_root_layout()
         .map_err(|error| format!("cannot prepare Sinomo data directory: {error}"))?;
     let cluster_paths = ClusterPaths::new(data_dir);
-    let peer_transport = Arc::new(SifsDfsPeerTransport::new(rpc_runtime.clone()));
+    let peer_transport = Arc::new(SifsDfsPeerTransport::new(rpc_runtime.clone(), data_dir.clone()));
     let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
-    let _ = refresh_sifs_cluster_kv_snapshot(&cluster_paths);
+    let _ = refresh_sifs_cluster_kv_snapshot(data_dir, &cluster_paths);
     let _ = refresh_cluster_dfs_kv_snapshot_with_peer_transport(
         &cluster_paths,
         Arc::clone(&sync_peer_transport),
@@ -952,7 +969,8 @@ fn open_sifs_service_with_hydration(
         content,
     );
     if cluster_paths.state.exists() {
-        service = service.with_control_plane(SifsControlPlaneKvClient::new(&cluster_paths));
+        service =
+            service.with_control_plane(SifsControlPlaneKvClient::new(data_dir, &cluster_paths));
     }
     let service =
         if let Some(metadata) = open_sifs_sharded_metadata_backend(data_dir, &cluster_paths)? {
@@ -985,9 +1003,17 @@ fn open_sifs_service_with_hydration(
     Ok(service)
 }
 
-fn refresh_sifs_cluster_kv_snapshot(cluster_paths: &ClusterPaths) -> Result<(), String> {
+/// Refresh the cluster KV snapshot under `cluster_paths` from the daemon that
+/// owns `data_dir`. Scoped on purpose: probing the env/home default daemon
+/// from a backend opened on another data directory imported the developer's
+/// live cluster KV (real peer targets included) into that directory — tests
+/// then talked to the real cluster.
+fn refresh_sifs_cluster_kv_snapshot(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+) -> Result<(), String> {
     if cluster_paths.state.exists() {
-        refresh_cluster_kv_from_local_daemon(cluster_paths)
+        refresh_cluster_kv_from_local_daemon_for_data_dir(data_dir, cluster_paths)
             .map_err(|error| format!("cannot refresh SIFS cluster KV snapshot: {error}"))?;
     }
     Ok(())
@@ -995,12 +1021,14 @@ fn refresh_sifs_cluster_kv_snapshot(cluster_paths: &ClusterPaths) -> Result<(), 
 
 #[derive(Clone, Debug)]
 struct SifsControlPlaneKvClient {
+    data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
 }
 
 impl SifsControlPlaneKvClient {
-    fn new(cluster_paths: &ClusterPaths) -> Self {
+    fn new(data_dir: &SinomoDataDir, cluster_paths: &ClusterPaths) -> Self {
         Self {
+            data_dir: data_dir.clone(),
             cluster_paths: cluster_paths.clone(),
         }
     }
@@ -1020,7 +1048,7 @@ impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
         if entry.is_some() {
             return Ok(entry);
         }
-        refresh_sifs_cluster_kv_snapshot(&self.cluster_paths)
+        refresh_sifs_cluster_kv_snapshot(&self.data_dir, &self.cluster_paths)
             .map_err(|source| self.kv_error(source))?;
         cluster::read_cluster_kv_latest_observed_entry(&self.cluster_paths, key)
             .map_err(|source| self.kv_error(source))
@@ -1033,7 +1061,7 @@ impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
         if !entries.is_empty() {
             return Ok(entries);
         }
-        refresh_sifs_cluster_kv_snapshot(&self.cluster_paths)
+        refresh_sifs_cluster_kv_snapshot(&self.data_dir, &self.cluster_paths)
             .map_err(|source| self.kv_error(source))?;
         cluster::read_cluster_kv_latest_observed_prefix_entries(&self.cluster_paths, prefix)
             .map_err(|source| self.kv_error(source))
@@ -1181,11 +1209,15 @@ fn sifs_replica_candidate_rank(
 #[derive(Clone, Debug)]
 struct SifsDfsPeerTransport {
     rpc_runtime: SifsRpcRuntime,
+    data_dir: SinomoDataDir,
 }
 
 impl SifsDfsPeerTransport {
-    fn new(rpc_runtime: SifsRpcRuntime) -> Self {
-        Self { rpc_runtime }
+    fn new(rpc_runtime: SifsRpcRuntime, data_dir: SinomoDataDir) -> Self {
+        Self {
+            rpc_runtime,
+            data_dir,
+        }
     }
 }
 
@@ -1196,7 +1228,13 @@ impl DfsPeerTransport for SifsDfsPeerTransport {
         request: &network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
-        sifs_send_dfs_object_rpc(&self.rpc_runtime, target_node_id, request, options)
+        sifs_send_dfs_object_rpc(
+            &self.rpc_runtime,
+            &self.data_dir,
+            target_node_id,
+            request,
+            options,
+        )
     }
 }
 
@@ -1210,11 +1248,13 @@ impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
         let handle = self.rpc_runtime.runtime.handle().clone();
         let target_node_id = target_node_id.clone();
         let request = request.clone();
+        let data_dir = self.data_dir.clone();
         Box::pin(async move {
             let daemon_target_node_id = target_node_id.clone();
             let daemon_request = request.clone();
             if let Some(result) = tokio::task::spawn_blocking(move || {
                 sifs_send_dfs_object_rpc_via_daemon(
+                    &data_dir,
                     &daemon_target_node_id,
                     &daemon_request,
                     options,
@@ -1241,11 +1281,14 @@ impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
 
 fn sifs_send_dfs_object_rpc(
     rpc_runtime: &SifsRpcRuntime,
+    data_dir: &SinomoDataDir,
     target_node_id: &NodeId,
     request: &network::ObjectRpcRequest,
     options: DfsObjectRpcSendOptions,
 ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
-    if let Some(result) = sifs_send_dfs_object_rpc_via_daemon(target_node_id, request, options) {
+    if let Some(result) =
+        sifs_send_dfs_object_rpc_via_daemon(data_dir, target_node_id, request, options)
+    {
         return result;
     }
 
@@ -1287,12 +1330,18 @@ fn sifs_send_dfs_object_rpc(
         .map_err(|error| DfsPeerTransportError::new(error.to_string()))
 }
 
+/// Forward a peer RPC through the daemon that owns `data_dir`, when it is
+/// running. Scoped to the backend's own data directory on purpose — probing
+/// the env/home default daemon routed backends opened on foreign directories
+/// (tests, tooling) through the developer's live daemon and its real cluster.
 fn sifs_send_dfs_object_rpc_via_daemon(
+    data_dir: &SinomoDataDir,
     target_node_id: &NodeId,
     request: &network::ObjectRpcRequest,
     options: DfsObjectRpcSendOptions,
 ) -> Option<Result<network::ObjectRpcResponse, DfsPeerTransportError>> {
-    let Ok(client) = sinomo_runtime::daemon::DaemonApiClient::connect() else {
+    let paths = sinomo_runtime::daemon::DaemonPaths::new(data_dir);
+    let Ok(client) = sinomo_runtime::daemon::DaemonApiClient::connect_for_paths(&paths) else {
         return None;
     };
     Some(
@@ -1312,8 +1361,10 @@ fn publish_sifs_metadata_journal_from_data_dir(
     rpc_runtime: &SifsRpcRuntime,
 ) -> Result<(), sinomo_runtime::dfs::DfsError> {
     let cluster_paths = ClusterPaths::new(data_dir);
-    let peer_transport: Arc<dyn DfsPeerTransport> =
-        Arc::new(SifsDfsPeerTransport::new(rpc_runtime.clone()));
+    let peer_transport: Arc<dyn DfsPeerTransport> = Arc::new(SifsDfsPeerTransport::new(
+        rpc_runtime.clone(),
+        data_dir.clone(),
+    ));
     publish_cluster_dfs_metadata_journal_with_peer_transport(
         data_dir,
         &cluster_paths,
@@ -1332,8 +1383,9 @@ fn sifs_foreground_metadata_publish_options() -> DfsMetadataJournalReplicationOp
     }
 }
 
-fn request_sifs_daemon_maintenance_refresh() {
-    let Ok(client) = sinomo_runtime::daemon::DaemonApiClient::connect() else {
+fn request_sifs_daemon_maintenance_refresh(data_dir: &SinomoDataDir) {
+    let paths = sinomo_runtime::daemon::DaemonPaths::new(data_dir);
+    let Ok(client) = sinomo_runtime::daemon::DaemonApiClient::connect_for_paths(&paths) else {
         return;
     };
     let _ = sinomo_runtime::daemon::send_daemon_cluster_maintenance_refresh(
@@ -1456,6 +1508,18 @@ mod tests {
         assert_eq!(sifs_parallel_read_worker_count_for(64, 32), 4);
         assert_eq!(sifs_parallel_read_worker_count_for(1024, 32), 32);
         assert_eq!(sifs_parallel_read_worker_count_for(1024, 64), 64);
+    }
+
+    #[test]
+    fn sifs_rpc_runtime_is_process_shared() {
+        let first = SifsRpcRuntime::new().expect("runtime");
+        let second = SifsRpcRuntime::new().expect("runtime");
+        assert!(
+            Arc::ptr_eq(&first.runtime, &second.runtime),
+            "the SIFS RPC runtime must stay process-shared: per-open runtimes \
+             deadlock whichever thread drops the last handle while a blocking \
+             daemon probe or peer RPC is still in flight"
+        );
     }
 
     #[test]
