@@ -540,18 +540,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn local_metadata_shard_cursors(
         &self,
     ) -> Result<Vec<DfsNamespaceShardCursor>, DfsError> {
-        let mut cursors = self.local_metadata_journal_cursors.clone();
-        if let Some(backend) = self.metadata_backend.as_ref() {
-            for status in backend.metadata_shard_statuses()? {
-                let cursor = cursors.entry(status.shard_id).or_insert(0);
-                *cursor = (*cursor).max(status.journal_last_sequence);
-            }
-        }
-        Ok(cursors
-            .into_iter()
+        Ok(self
+            .local_metadata_journal_cursors
+            .iter()
             .map(|(shard_id, after_sequence)| DfsNamespaceShardCursor {
-                shard_id,
-                after_sequence,
+                shard_id: shard_id.clone(),
+                after_sequence: *after_sequence,
             })
             .collect())
     }

@@ -29570,6 +29570,35 @@ fn routed_namespace_without_local_replay_omits_response_journal_batches() {
 }
 
 #[test]
+fn routed_namespace_cursor_snapshot_uses_cached_state_not_backend_status() {
+    let mut cluster = sifs_two_primary_cluster("sifs-namespace-cached-cursors");
+    let services_shard = DfsMetadataShardId::new("services");
+    cluster.replica.local_metadata_journal_cursors.clear();
+    assert!(
+        cluster
+            .replica
+            .local_metadata_shard_cursors()
+            .expect("cached cursors")
+            .is_empty(),
+        "routed namespace sends must not scan backend shard status when the cache is empty"
+    );
+
+    cluster
+        .replica
+        .local_metadata_journal_cursors
+        .insert(services_shard.clone(), 42);
+    let cursors = cluster
+        .replica
+        .local_metadata_shard_cursors()
+        .expect("cached cursor snapshot");
+    assert_eq!(cursors.len(), 1);
+    assert_eq!(cursors[0].shard_id, services_shard);
+    assert_eq!(cursors[0].after_sequence, 42);
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
 fn apply_transaction_shard_selection_lists_control_plane_once_for_bulk_paths() {
     let root = temp_root("apply-transaction-shard-selection-once");
     let primary = NodeId::from_legacy_named("node_apply_txn_primary").expect("primary");

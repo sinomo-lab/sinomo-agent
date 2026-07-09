@@ -242,10 +242,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let shard_id = DfsMetadataShardId::new(shard.shard_id);
         Ok(self
-            .local_metadata_shard_cursors()?
-            .into_iter()
-            .find(|cursor| cursor.shard_id == shard_id)
-            .map(|cursor| cursor.after_sequence)
+            .local_metadata_journal_cursors
+            .get(&shard_id)
+            .copied()
             .unwrap_or(0))
     }
 

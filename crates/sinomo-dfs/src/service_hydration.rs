@@ -15,6 +15,22 @@ use crate::transfer::PendingNetworkedWrite;
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    pub(crate) fn seed_local_metadata_journal_cursors_from_backend(
+        &mut self,
+    ) -> Result<(), DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(());
+        };
+        for status in backend.metadata_shard_statuses()? {
+            let cursor = self
+                .local_metadata_journal_cursors
+                .entry(status.shard_id)
+                .or_insert(0);
+            *cursor = (*cursor).max(status.journal_last_sequence);
+        }
+        Ok(())
+    }
+
     fn rebuild_cross_shard_namespace_locks(&mut self) -> Result<(), DfsError> {
         self.cross_shard_namespace_locks.clear();
         let Some(backend) = self.metadata_backend.as_ref() else {
@@ -127,7 +143,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // Rebuilding per restored intent/receipt made hydration
                 // quadratic over an unsettled-write backlog and burned seconds
                 // of CPU on every SIFS open of an affected data dir.
-                match self.coordinator.restore_intent_deferring_repair_rebuild(intent) {
+                match self
+                    .coordinator
+                    .restore_intent_deferring_repair_rebuild(intent)
+                {
                     Ok(()) => {}
                     Err(DfsDistributedError::PendingIntentConflict { .. })
                         if matches!(
@@ -235,6 +254,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.cleanup_committed_pending_write_if_repaired(&intent_id);
         }
 
+        self.seed_local_metadata_journal_cursors_from_backend()?;
         Ok(())
     }
 
@@ -253,6 +273,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.metadata
                 .add_file_system(DfsFileSystem::sifs(self.node_id.clone()));
         }
+        self.seed_local_metadata_journal_cursors_from_backend()?;
         Ok(())
     }
 
