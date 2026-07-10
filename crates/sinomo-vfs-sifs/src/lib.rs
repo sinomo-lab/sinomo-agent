@@ -100,15 +100,13 @@ impl MountedSifsVfsBackend {
         data_dir: Option<PathBuf>,
         options: MountedSifsOpenOptions,
     ) -> Result<Self> {
-        let opened = sinomo_dfs::open_mounted_sifs_service_with_cancellation(
-            data_dir,
-            options.cancellation,
-        )
-        .map_err(|source| VfsError::Backend {
-            backend: "mounted-sifs".to_string(),
-            path: "/".to_string(),
-            detail: source.to_string(),
-        })?;
+        let opened =
+            sinomo_dfs::open_mounted_sifs_service_with_cancellation(data_dir, options.cancellation)
+                .map_err(|source| VfsError::Backend {
+                    backend: "mounted-sifs".to_string(),
+                    path: "/".to_string(),
+                    detail: source.to_string(),
+                })?;
         Ok(Self {
             opened: Mutex::new(opened),
             read_mode: options.read_mode,

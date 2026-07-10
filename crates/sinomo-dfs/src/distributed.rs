@@ -771,10 +771,10 @@ impl DistributedEventualCoordinator {
             .filter(|intent| matches!(intent.state, DfsWriteIntentState::Committed))
         {
             let durable_nodes = durable_by_intent.get(intent.intent_id.as_str());
-            for missing_replica_node_id in
-                intent.desired_replica_nodes.iter().filter(|node_id| {
-                    !durable_nodes.is_some_and(|durable| durable.contains(node_id))
-                })
+            for missing_replica_node_id in intent
+                .desired_replica_nodes
+                .iter()
+                .filter(|node_id| !durable_nodes.is_some_and(|durable| durable.contains(node_id)))
             {
                 jobs.push(DistributedRepairJob {
                     intent_id: intent.intent_id.clone(),
