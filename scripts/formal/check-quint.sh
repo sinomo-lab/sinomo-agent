@@ -58,8 +58,11 @@ register_case dfs-read-freshness specs/quint/checks/dfs/read_freshness_safety.qn
 register_case dfs-routed-namespace specs/quint/checks/dfs/routed_namespace_freshness_safety.qnt dfs_routed_namespace_freshness_safety "${QUINT_DFS_ROUTED_NAMESPACE_VERIFY_MAX_STEPS:-3}"
 register_case dfs-posix-namespace specs/quint/checks/dfs/posix_namespace_safety.qnt dfs_posix_namespace_safety "${QUINT_DFS_POSIX_NAMESPACE_VERIFY_MAX_STEPS:-2}" apalache step step deep
 register_case dfs-posix-links specs/quint/checks/dfs/posix_links_safety.qnt dfs_posix_links_safety "${QUINT_DFS_POSIX_LINKS_VERIFY_MAX_STEPS:-2}" apalache step step deep
-register_case dfs-posix-cross-shard specs/quint/checks/dfs/posix_cross_shard_namespace_safety.qnt dfs_posix_cross_shard_namespace_safety "${QUINT_DFS_POSIX_CROSS_SHARD_VERIFY_MAX_STEPS:-3}" apalache step step deep
+register_case dfs-posix-cross-shard specs/quint/checks/dfs/posix_cross_shard_namespace_safety.qnt dfs_posix_cross_shard_namespace_safety "${QUINT_DFS_POSIX_CROSS_SHARD_VERIFY_MAX_STEPS:-3}" apalache step step deep "witnessExhaustedRetryBudgetForwardCompletion"
 register_case dfs-posix-read-write specs/quint/checks/dfs/posix_read_write_visibility_safety.qnt dfs_posix_read_write_visibility_safety "${QUINT_DFS_POSIX_READ_WRITE_VERIFY_MAX_STEPS:-2}" apalache step step deep
+register_case dfs-posix-advisory-locks specs/quint/checks/dfs/posix_advisory_locks_safety.qnt dfs_posix_advisory_locks_safety "${QUINT_DFS_POSIX_ADVISORY_LOCKS_VERIFY_MAX_STEPS:-3}" apalache step step fast "witnessCompatibleSharedLocks witnessExclusiveConflictRejectedNonBlocking witnessBlockingWaiterQueued witnessWaiterGrantedAfterUnlock witnessWaiterGrantedAfterClose witnessWaiterGrantedAfterCrash witnessWaiterGrantedAfterLeaseExpiry witnessHealthyTickRenewsHeldLock witnessEpochFencesHeldLockOrWaiter witnessEpochSettlesBlockedWaiter witnessStaleTokenCannotUnlockNewEpoch"
+register_case dfs-posix-fsync specs/quint/checks/dfs/posix_fsync_safety.qnt dfs_posix_fsync_safety "${QUINT_DFS_POSIX_FSYNC_VERIFY_MAX_STEPS:-3}" apalache step step fast "fileFsyncSuccessWithoutDirectoryDurabilityWitness fdatasyncSuccessWithoutAncillaryMetadataWitness directoryFsyncDoesNotSyncFileDataWitness laterWriteNotCoveredByEarlierFsyncWitness committedUnknownOutcomeDeduplicatesWitness payloadMismatchRejectedWitness inflightSyncFencedWithoutStaleCommitWitness successfulSyncSurvivesAuthorityChangeWitness committedPrefixRepairWitness"
+register_case dfs-posix-partitioned-operation specs/quint/checks/dfs/posix_partitioned_operation_safety.qnt dfs_posix_partitioned_operation_safety "${QUINT_DFS_POSIX_PARTITIONED_OPERATION_VERIFY_MAX_STEPS:-8}" apalache step step fast "witnessCompleteHolderContinuesBeforeFence witnessHolderSyncEvidencePrepared witnessIncompleteHolderSuspends witnessCompleteHolderCanStillBeFencedAfterExpiry witnessQuorumWinsAndWaitsForRepair witnessStaleUnlockRejected witnessQuorumCompletesAfterRepair witnessQuorumCommitsWhileHolderOffline witnessFencedHolderSettlesAfterRejoin witnessBothSidesReachCleanHolderWinnerEndState witnessBothSidesReachCleanQuorumWinnerEndState"
 register_case dfs-primary-failover specs/quint/checks/dfs/metadata_primary_failover_safety.qnt dfs_metadata_primary_failover_safety "${QUINT_DFS_PRIMARY_FAILOVER_VERIFY_MAX_STEPS:-3}"
 register_case dfs-namespace-command-replay specs/quint/checks/dfs/namespace_command_replay_safety.qnt dfs_namespace_command_replay_safety "${QUINT_DFS_NAMESPACE_REPLAY_VERIFY_MAX_STEPS:-5}" apalache step step deep "witnessExactResidentRetryReplays witnessSameRequestIdChangedPayloadExecutes witnessCancelledCommandStillExecutes witnessEvictedExactRetryReexecutes witnessRestartClearedRetryReexecutes witnessCancelledFreshIdRetryExecutes"
 register_case dfs-namespace-transaction specs/quint/checks/dfs/namespace_transaction_safety.qnt dfs_namespace_transaction_safety "${QUINT_DFS_NAMESPACE_VERIFY_MAX_STEPS:-$verify_steps}"
@@ -277,6 +280,42 @@ run_smoke_scenarios() {
     6 \
     1
   run_scenario \
+    dfs-posix-complete-holder-partition \
+    specs/quint/scenarios/dfs/posix_lock_partition_recovery.qnt \
+    dfs_posix_complete_holder_partition_scenario \
+    14 \
+    1
+  run_scenario \
+    dfs-posix-quorum-repair-partition \
+    specs/quint/scenarios/dfs/posix_lock_partition_recovery.qnt \
+    dfs_posix_quorum_repair_partition_scenario \
+    18 \
+    1
+  run_scenario \
+    dfs-posix-advisory-lock-fencing \
+    specs/quint/scenarios/dfs/posix_advisory_lock_fencing.qnt \
+    dfs_posix_advisory_lock_fencing_scenario \
+    10 \
+    1
+  run_scenario \
+    dfs-posix-fsync-unknown-recovery \
+    specs/quint/scenarios/dfs/posix_fsync_recovery.qnt \
+    dfs_posix_fsync_unknown_recovery_scenario \
+    12 \
+    1
+  run_scenario \
+    dfs-posix-directory-fsync-generation \
+    specs/quint/scenarios/dfs/posix_fsync_recovery.qnt \
+    dfs_posix_directory_fsync_generation_scenario \
+    12 \
+    1
+  run_scenario \
+    dfs-posix-cross-shard-retry-exhaustion \
+    specs/quint/scenarios/dfs/posix_cross_shard_retry_exhaustion.qnt \
+    dfs_posix_cross_shard_retry_exhaustion_scenario \
+    12 \
+    1
+  run_scenario \
     system-smoke \
     specs/quint/scenarios/system/smoke.qnt \
     system_smoke \
@@ -327,6 +366,60 @@ verify_cases() {
       verify_check "$id" "$file" "$main" "$steps" "$backend" "$verify_step"
     fi
   done
+
+  # Long causal outcomes stay in deterministic modules so their complete
+  # traces can be symbolically verified without widening the nondeterministic
+  # focused models to impractical depths.
+  if case_selected dfs-posix-advisory-locks; then
+    verify_check \
+      dfs-posix-advisory-lock-fencing-scenario \
+      specs/quint/scenarios/dfs/posix_advisory_lock_fencing.qnt \
+      dfs_posix_advisory_lock_fencing_scenario \
+      8 \
+      apalache \
+      step
+  fi
+  if case_selected dfs-posix-fsync; then
+    verify_check \
+      dfs-posix-fsync-unknown-recovery-scenario \
+      specs/quint/scenarios/dfs/posix_fsync_recovery.qnt \
+      dfs_posix_fsync_unknown_recovery_scenario \
+      11 \
+      apalache \
+      step
+    verify_check \
+      dfs-posix-directory-fsync-generation-scenario \
+      specs/quint/scenarios/dfs/posix_fsync_recovery.qnt \
+      dfs_posix_directory_fsync_generation_scenario \
+      10 \
+      apalache \
+      step
+  fi
+  if case_selected dfs-posix-partitioned-operation; then
+    verify_check \
+      dfs-posix-complete-holder-partition-scenario \
+      specs/quint/scenarios/dfs/posix_lock_partition_recovery.qnt \
+      dfs_posix_complete_holder_partition_scenario \
+      10 \
+      apalache \
+      step
+    verify_check \
+      dfs-posix-quorum-repair-partition-scenario \
+      specs/quint/scenarios/dfs/posix_lock_partition_recovery.qnt \
+      dfs_posix_quorum_repair_partition_scenario \
+      13 \
+      apalache \
+      step
+  fi
+  if [[ "$requested_tier" == "all" ]] && case_selected dfs-posix-cross-shard; then
+    verify_check \
+      dfs-posix-cross-shard-retry-exhaustion-scenario \
+      specs/quint/scenarios/dfs/posix_cross_shard_retry_exhaustion.qnt \
+      dfs_posix_cross_shard_retry_exhaustion_scenario \
+      10 \
+      apalache \
+      step
+  fi
 
   if [[ -n "$verify_lock_fd" ]]; then
     flock --unlock "$verify_lock_fd"

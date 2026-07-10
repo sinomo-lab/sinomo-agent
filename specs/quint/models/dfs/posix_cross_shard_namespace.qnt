@@ -29,6 +29,7 @@ module dfs_posix_cross_shard_namespace {
     | FailedBeforeDestination
     | FailedAfterDestination
     | RecoverableRetried
+    | RetryBudgetExhaustedForwarded
     | TerminalStutter
 
   pure val Paths: Set[CrossPath] =
@@ -228,6 +229,39 @@ module dfs_posix_cross_shard_namespace {
     }
   }
 
+  /// Exhausting the bounded destination retry budget must not strand a
+  /// half-visible namespace operation. The destination adoption already
+  /// contains enough durable evidence to finish the job forward, so the
+  /// recovery worker finalizes the source without consuming another retry.
+  action finishExhaustedRecoverable: bool = {
+    val object = sourceObject(beforeObjectAt, sourcePath)
+    all {
+      jobPhase == FailedRecoverable,
+      retryCount == MaxRetries,
+      kindAt' =
+        if (jobOp == RenameMove) {
+          kindAt.set(destinationPath, File).set(sourcePath, Tombstone)
+        } else {
+          kindAt.set(destinationPath, Hardlink)
+        },
+      objectAt' =
+        if (jobOp == RenameMove) {
+          objectAt.set(destinationPath, Some(object)).set(sourcePath, None)
+        } else {
+          objectAt.set(destinationPath, Some(object))
+        },
+      beforeKindAt' = beforeKindAt,
+      beforeObjectAt' = beforeObjectAt,
+      jobOp' = jobOp,
+      jobPhase' = Completed,
+      sourcePath' = sourcePath,
+      destinationPath' = destinationPath,
+      blockedPaths' = Set(),
+      retryCount' = retryCount,
+      lastDecision' = RetryBudgetExhaustedForwarded,
+    }
+  }
+
   action stutterTerminal: bool = all {
     jobPhase == Completed or jobPhase == FailedNoChange,
     kindAt' = kindAt,
@@ -255,6 +289,7 @@ module dfs_posix_cross_shard_namespace {
     failBeforeDestination,
     failAfterDestination,
     retryRecoverable,
+    finishExhaustedRecoverable,
     stutterTerminal,
   }
 }

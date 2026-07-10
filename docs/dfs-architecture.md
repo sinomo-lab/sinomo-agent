@@ -223,6 +223,91 @@ adoption, recovery proceeds forward; it does not roll back an already visible
 destination into an ambiguous state. Authority changes are re-resolved on
 resume, and both sides validate current epochs.
 
+## POSIX Synchronization and Partition Fencing
+
+The canonical DFS synchronization contract distinguishes advisory file locks,
+internal namespace-job reservations, write visibility, and durability. These
+are separate mechanisms:
+
+- a POSIX advisory lock coordinates cooperating sessions on a stable object id;
+- an internal reservation protects a bounded metadata transaction or durable
+  namespace job;
+- neither kind of lock grants metadata authority or counts as a content
+  receipt; and
+- `fsync` is a durability barrier for writes that already returned, not a lock
+  acquisition or an authority transfer.
+
+The first formally modeled advisory-lock surface is deliberately bounded to
+whole-file shared and exclusive locks. Grants carry the metadata-authority
+epoch, a unique grant token, and a finite validity interval. An exact token can
+release its grant. A session that can reach the current authority renews the
+same grant, so logical time alone cannot expire a healthy lock. A session-local
+renewal outage starts the bounded expiry countdown. Close, process/session loss,
+expiry, or a newer authority epoch makes the old grant ineffective. Expiry and
+fencing produce explicit lost-lock outcomes, including terminal errors for
+blocking requests. A stale token cannot release a lock granted in the new
+epoch. The locks remain advisory: clients that bypass the lock protocol are not
+made safe by the existence of a grant.
+
+A partitioned lock holder may finish an already certified canonical operation
+only while all of these remain true:
+
+1. every metadata shard touched by the operation is present at the certified
+   current journal prefix on the holder's component;
+2. all required content is present and hash-validated; and
+3. the operation's strong permit remains valid;
+4. before publication, the combined model consumes an abstract proof token for
+   the configured content-receipt threshold and metadata prepare quorum. The
+   focused sync model verifies that their bounded recovery sets intersect; the
+   atomic publication point then forms the failover-recoverable commit
+   certificate. A direct refinement mapping between the two models remains
+   future work.
+
+Shard or content presence alone never grants authority. With renewable permits,
+the quorum component waits through the old permit's fencing deadline before it
+activates a higher epoch. If the holder lacks any required state, it suspends
+immediately and cannot commit while waiting for that barrier. Once a quorum
+activates the higher epoch, it wins regardless of how many content shards are
+currently reachable on either side. The old lock and reservation are fenced.
+If the winner lacks the latest committed content, it remains in an explicit
+`pending-repair` state and cannot serve stale bytes or accept dependent writes
+until repair validates the canonical object, version, and hash.
+
+This rule permits a complete holder to finish a bounded operation before its
+permit expires without allowing it to race a new quorum authority. Allowing a
+minority holder to commit while a quorum can immediately activate another epoch
+would create two canonical histories and is forbidden.
+
+The synchronization barriers are:
+
+| Operation | Successful-return guarantee |
+|---|---|
+| `write` | The write is visible through the current authority, but may still be volatile across authority loss. |
+| `fdatasync(file)` | All writes returned before the call, plus data-retrieval metadata such as length/extents, meet the configured receipt policy and have a failover-recoverable metadata certificate. |
+| `fsync(file)` | The same prefix plus file-integrity metadata is durable. It does not make the parent directory entry durable. |
+| `fsync(directory)` | Namespace changes captured by the call, such as create, rename, and unlink entries, are durably certified. |
+
+Every sync request has a durable idempotency id and immutable payload. A lost
+reply is `outcome-unknown`, not a definite failure. Retrying the same id and
+payload returns the stored canonical result; reusing the id with another
+payload is rejected. A successful sync is never rolled back by primary change.
+An in-flight sync fenced before canonical certification becomes terminal and
+cannot later commit under its stale epoch.
+
+Obsolete locks and abandoned internal reservations must not create protocol
+deadlock. Multi-shard reservations use deterministic acquisition order,
+destination-visible jobs recover forward, expired/fenced locks do not block the
+current epoch, and terminal jobs release their effective reservations. Eventual
+completion still assumes eventual logical-time advancement, a stable quorum, a
+validated source for committed content, and fair recovery scheduling.
+
+The Quint slices for advisory locks, sync barriers, and partition recovery are
+currently **target-hardening contracts**. The FUSE adapter does not yet expose
+distributed advisory-lock callbacks, and its current `flush`, `release`, and
+`fsync` paths share one commit operation while `fdatasync` is not distinguished.
+Those implementation gaps must be closed before the formal contract is claimed
+as current POSIX conformance.
+
 ## Reads and Caches
 
 Reads prefer the closest valid copy:

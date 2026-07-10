@@ -18,6 +18,8 @@ module dfs_metadata_primary_failover_safety {
       )
 
 
+  /// `PromoteLocalReplica` is candidate selection only. This predicate proves
+  /// the local durability precondition, not quorum-backed authority transfer.
   def localPromotionRequiresDurableReplica: bool =
     failoverDecision == PromoteLocalReplica implies
       localReplicaFailoverReady(

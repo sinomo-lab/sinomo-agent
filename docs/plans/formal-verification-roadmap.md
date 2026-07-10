@@ -59,6 +59,17 @@ requester/command key, exact cached-response replay, FIFO eviction, process
 restart, and requester-local cancellation boundary. It deliberately exposes
 re-execution after cache loss as a remaining durable-idempotency limitation.
 
+Completed 2026-07-10: the canonical POSIX synchronization slices now cover
+whole-file shared/exclusive advisory locks, exact epoch-fenced lock tokens,
+healthy-session lease renewal, partitioned-session expiry, close/crash cleanup,
+file `fsync`, `fdatasync`, directory `fsync`,
+outcome-unknown sync retry, and the partition rule for a lock-holding operation.
+A complete holder may finish only within an unexpired strong permit; otherwise
+the quorum side fences it after the barrier, repairs the certified canonical
+prefix, and proceeds. Deterministic traces cover clean terminal states for both
+outcomes. Cross-shard retry exhaustion now finalizes forward instead of
+stranding durable jobs with path reservations held.
+
 1. **Anti-entropy progress.** Under explicit fairness assumptions, prove that a
    missing desired replica eventually obtains a durable receipt or remains
    visibly suppressed because authority was lost.
@@ -76,5 +87,14 @@ re-execution after cache loss as a remaining durable-idempotency limitation.
 6. **Authority handoff.** Prove that the old primary becomes quiescent and the
    new primary eventually rediscovers and schedules committed repair work.
 7. **POSIX conformance.** Replay finite namespace, link, cross-shard, and
-   visibility scenarios against the Rust DFS service, then deepen directory,
-   by-id lookup, and aborted-move lock-release models.
+   visibility scenarios against the Rust DFS service. Add conformance gates for
+   distributed advisory locks and distinct `fsync`/`fdatasync`/directory-sync
+   behavior before reclassifying those models from target hardening. Then
+   deepen directory, by-id lookup, open-handle rename/unlink, byte-range locks,
+   application wait-cycle detection, and aborted-move reservation release.
+8. **Local-first DFS extension (deferred).** Do not add provisional branches or
+   reconciliation to the canonical model until the authority permit, lock-loss,
+   sync durability, and partition-recovery contracts have corresponding Rust
+   boundaries and trace refinement. The first later slice should remain regular
+   file content only; hardlinks, cross-shard local changes, branch gossip, and
+   service-defined configuration merge stay out of the initial model.

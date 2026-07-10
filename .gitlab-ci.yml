@@ -38,6 +38,7 @@ formal:quint-fast:
         - .gitlab-ci.yml
         - scripts/formal/**/*
         - specs/quint/**/*
+        - docs/dfs-architecture.md
         - docs/formal/**/*
         - docs/plans/formal-verification-roadmap.md
         - crates/sinomo-network/**/*
@@ -47,8 +48,8 @@ formal:quint-fast:
   script:
     - bash scripts/formal/check-quint.sh typecheck
     - QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_STEPS=40 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_SAMPLES=200 QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS=40 QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES=200 bash scripts/formal/check-quint.sh smoke
-    - QUINT_CASE_FILTER=raft-protocol,network-route-cache,network-delivery,network-attempt-budget,network-timed-delivery,membership-raft-config,dfs-pending-requests,dfs-namespace-command-replay QUINT_COVERAGE_MAX_SAMPLES=5000 bash scripts/formal/check-quint.sh coverage
-    - QUINT_CASE_FILTER=raft-protocol,network-route-cache,network-delivery,network-attempt-budget,network-timed-transport,network-timed-delivery,membership-raft-config,dfs-pending-requests,dfs-namespace-command-replay QUINT_CASE_TIMEOUT_SECONDS=240 bash scripts/formal/check-quint.sh verify-full
+    - QUINT_CASE_FILTER=raft-protocol,network-route-cache,network-delivery,network-attempt-budget,network-timed-delivery,membership-raft-config,dfs-posix-cross-shard,dfs-posix-advisory-locks,dfs-posix-fsync,dfs-posix-partitioned-operation,dfs-pending-requests,dfs-namespace-command-replay QUINT_COVERAGE_MAX_SAMPLES=5000 bash scripts/formal/check-quint.sh coverage
+    - QUINT_CASE_FILTER=raft-protocol,network-route-cache,network-delivery,network-attempt-budget,network-timed-transport,network-timed-delivery,membership-raft-config,dfs-posix-cross-shard,dfs-posix-advisory-locks,dfs-posix-fsync,dfs-posix-partitioned-operation,dfs-pending-requests,dfs-namespace-command-replay QUINT_CASE_TIMEOUT_SECONDS=240 bash scripts/formal/check-quint.sh verify-full
 
 formal:rust-conformance:
   image: rust:1.96-bookworm
