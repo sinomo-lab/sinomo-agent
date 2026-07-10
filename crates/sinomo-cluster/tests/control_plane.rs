@@ -3364,11 +3364,11 @@ fn cluster_network_maintenance_schedule_uses_role_cadence_and_convergence() {
         cluster_network_maintenance_due(now, &settling),
         ClusterNetworkMaintenanceDue {
             convergence_due: true,
-            publish_due: true,
+            publish_due: false,
             probe_due: true,
             discovery_due: true,
         },
-        "unconverged/startup-settling maintenance should wake every plane"
+        "convergence should accelerate discovery and probes without bypassing publish backoff"
     );
 }
 
@@ -4668,7 +4668,7 @@ fn connectivity_graph_reads_kv_records_through_query_boundary() {
     let node_a = NodeId::from_legacy_named("node_conn_query_boundary_a").expect("node a");
     let node_b = NodeId::from_legacy_named("node_conn_query_boundary_b").expect("node b");
     let node_c = NodeId::from_legacy_named("node_conn_query_boundary_c").expect("node c");
-    let state = ClusterBootstrapState::initialized_locally(
+    let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id,
         "connectivity query boundary",
         node_a.clone(),
@@ -4678,6 +4678,24 @@ fn connectivity_graph_reads_kv_records_through_query_boundary() {
     );
     let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.1.20:21353".to_string(), 10);
     let endpoint_c = daemon_lan_endpoint(&node_c, "10.0.1.30:21353".to_string(), 10);
+    let mut member_b = ClusterMemberRecord::local_voter(
+        state.cluster_id.clone(),
+        node_b.clone(),
+        "node b",
+        "pk-b",
+        now,
+    );
+    member_b.endpoints = vec![endpoint_b.clone()];
+    state.members.push(member_b);
+    let mut member_c = ClusterMemberRecord::local_voter(
+        state.cluster_id.clone(),
+        node_c.clone(),
+        "node c",
+        "pk-c",
+        now,
+    );
+    member_c.endpoints = vec![endpoint_c.clone()];
+    state.members.push(member_c);
     let local_self_record = cluster_connectivity_record(
         &state,
         &endpoint_b,
@@ -4800,7 +4818,7 @@ fn connectivity_graph_uses_local_bootstrap_for_sources_missing_from_kv() {
     let node_a = NodeId::from_legacy_named("node_conn_missing_source_bootstrap_a").expect("node a");
     let node_b = NodeId::from_legacy_named("node_conn_missing_source_bootstrap_b").expect("node b");
     let node_c = NodeId::from_legacy_named("node_conn_missing_source_bootstrap_c").expect("node c");
-    let state = ClusterBootstrapState::initialized_locally(
+    let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id,
         "connectivity missing source bootstrap",
         node_a.clone(),
@@ -4808,9 +4826,27 @@ fn connectivity_graph_uses_local_bootstrap_for_sources_missing_from_kv() {
         "pk-a",
         now,
     );
-    write_cluster_state(&paths, &state).expect("write state");
     let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.1.22:21353".to_string(), 10);
     let endpoint_c = daemon_lan_endpoint(&node_c, "10.0.1.23:21353".to_string(), 10);
+    let mut member_b = ClusterMemberRecord::local_voter(
+        state.cluster_id.clone(),
+        node_b.clone(),
+        "node b",
+        "pk-b",
+        now,
+    );
+    member_b.endpoints = vec![endpoint_b.clone()];
+    state.members.push(member_b);
+    let mut member_c = ClusterMemberRecord::local_voter(
+        state.cluster_id.clone(),
+        node_c.clone(),
+        "node c",
+        "pk-c",
+        now,
+    );
+    member_c.endpoints = vec![endpoint_c.clone()];
+    state.members.push(member_c);
+    write_cluster_state(&paths, &state).expect("write state");
     let local_a_record = cluster_connectivity_record(
         &state,
         &endpoint_b,
@@ -6289,6 +6325,7 @@ fn rollout_target_selection_keeps_transient_public_tcp_before_iroh() {
 
 #[test]
 fn rollout_target_selection_prefers_healthy_public_tcp_over_degraded_private_tcp() {
+    install_kv_directory_for_tests();
     let root = sinomo_testdir::TestDir::new("sinomo-network-rollout-healthy-public");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -6299,7 +6336,7 @@ fn rollout_target_selection_prefers_healthy_public_tcp_over_degraded_private_tcp
     let local =
         NodeId::from_legacy_named("node_network_rollout_healthy_public_local").expect("local");
     let main = NodeId::from_legacy_named("node_network_rollout_healthy_public_main").expect("main");
-    let state = ClusterBootstrapState::initialized_locally(
+    let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id,
         "network rollout healthy public",
         local.clone(),
@@ -6307,10 +6344,21 @@ fn rollout_target_selection_prefers_healthy_public_tcp_over_degraded_private_tcp
         "pk-local",
         now,
     );
-    write_cluster_state(&paths, &state).expect("write state");
-    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
     let private = daemon_lan_endpoint(&main, "192.168.254.41:21353".to_string(), 10);
     let public = daemon_lan_endpoint(&main, "203.0.113.41:21353".to_string(), 20);
+    let mut main_member = ClusterMemberRecord::local_voter(
+        state.cluster_id.clone(),
+        main.clone(),
+        "main",
+        "pk-main",
+        now,
+    );
+    main_member.capabilities = main_daemon_capabilities(&main_member.role);
+    main_member.allowed_capabilities = main_member.capabilities.clone();
+    main_member.endpoints = vec![private.clone(), public.clone()];
+    state.members.push(main_member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
     sync_cluster_connectivity_records_to_kv(
         &paths,
         &local,
@@ -16470,6 +16518,7 @@ fn member_daemon_status_targets_prefer_healthy_iroh_over_unknown_stale_lan() {
 
 #[test]
 fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
+    install_kv_directory_for_tests();
     let root = sinomo_testdir::TestDir::new("sinomo-network-rollout-lan-public-iroh");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -16479,7 +16528,7 @@ fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
         ClusterId::from_legacy_named("cluster_rollout_lan_public_iroh").expect("cluster");
     let local = NodeId::from_legacy_named("node_rollout_lan_public_iroh_local").expect("local");
     let main = NodeId::from_legacy_named("node_rollout_lan_public_iroh_main").expect("main");
-    let state = ClusterBootstrapState::initialized_locally(
+    let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id,
         "rollout lan public iroh",
         local,
@@ -16487,8 +16536,6 @@ fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
         "pk-local",
         now,
     );
-    write_cluster_state(&paths, &state).expect("write state");
-    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
     let lan = daemon_lan_endpoint(&main, "10.0.0.41:21353".to_string(), 10);
     let public = ClusterEndpointRecord {
         endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_rollout_public")
@@ -16511,6 +16558,19 @@ fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
         priority: 90,
         last_observed_latency_ms: None,
     };
+    let mut main_member = ClusterMemberRecord::local_voter(
+        state.cluster_id.clone(),
+        main.clone(),
+        "main",
+        "pk-main",
+        now,
+    );
+    main_member.capabilities = main_daemon_capabilities(&main_member.role);
+    main_member.allowed_capabilities = main_member.capabilities.clone();
+    main_member.endpoints = vec![lan.clone(), public.clone(), iroh.clone()];
+    state.members.push(main_member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
     let candidates = vec![iroh.clone(), public.clone(), lan.clone()];
 
     let selected =
@@ -33585,7 +33645,7 @@ mod route_cache_tests {
     }
 
     #[test]
-    fn delivery_plan_uses_exploratory_neighbor_after_failed_direct_edge() {
+    fn delivery_plan_rejects_unproven_neighbor_after_failed_direct_edge() {
         let (_root, paths) = test_paths("sinomo-network-delivery-plan-failed-direct");
         let cluster_id = cid("cluster_delivery_plan_failed_direct");
         let local = nid("node_delivery_plan_failed_local");
@@ -33617,11 +33677,12 @@ mod route_cache_tests {
             .try_insert(&local, &target)
             .expect("failed direct edge");
 
-        let plan = cluster_delivery_route_plan(&paths, &state, &local, &target, &failed_edges, &[])
-            .expect("route plan");
+        let plan = cluster_delivery_route_plan(&paths, &state, &local, &target, &failed_edges, &[]);
 
-        assert_eq!(plan.next_hop, bridge);
-        assert_eq!(plan.endpoints.len(), 1);
+        assert!(
+            plan.is_none(),
+            "a reachable neighbor without a graph-proven path to the target must not be used as a relay"
+        );
     }
 
     #[test]
@@ -33631,7 +33692,7 @@ mod route_cache_tests {
         let local = nid("node_delivery_plan_near_bridge_local");
         let bridge = nid("node_delivery_plan_near_bridge_bridge");
         let target = nid("node_delivery_plan_near_bridge_target");
-        let mut state = test_state(cluster_id, local.clone());
+        let mut state = test_state(cluster_id.clone(), local.clone());
         add_local_endpoint(&mut state, endpoint(&local, "172.25.0.9:21353", 0));
         let target_endpoint = endpoint(&target, "172.23.0.2:21353", 0);
         add_member(
@@ -33648,6 +33709,19 @@ mod route_cache_tests {
             vec![bridge_endpoint.clone()],
         );
         mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&bridge_endpoint));
+        let bridge_to_target_record = connectivity_record_from_source(
+            &cluster_id,
+            &bridge,
+            &target_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+        );
+        sinomo_network::write_local_cluster_connectivity_records(
+            &paths,
+            &bridge,
+            std::slice::from_ref(&bridge_to_target_record),
+        )
+        .expect("write bridge target connectivity");
 
         let plan = cluster_delivery_route_plan(
             &paths,
@@ -33700,6 +33774,19 @@ mod route_cache_tests {
         )
         .expect("write degraded target record");
         mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&bridge_endpoint));
+        let bridge_to_target_record = connectivity_record_from_source(
+            &cluster_id,
+            &bridge,
+            &target_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+        );
+        sinomo_network::write_local_cluster_connectivity_records(
+            &paths,
+            &bridge,
+            std::slice::from_ref(&bridge_to_target_record),
+        )
+        .expect("write bridge target connectivity");
 
         let plan = cluster_delivery_route_plan(
             &paths,
@@ -34316,12 +34403,10 @@ mod route_cache_tests {
             Vec::new(),
         )
         .await
-        .expect("first plan")
-        .expect("initial bridge discovery route");
-        assert_eq!(
-            first.path,
-            vec![local.clone(), bridge.clone()],
-            "route table should initially cache the incomplete bridge discovery path"
+        .expect("first plan");
+        assert!(
+            first.is_none(),
+            "a bridge without a graph-proven path to the target must not be cached as a route"
         );
 
         let target_endpoint = endpoint(&target, "10.90.9.11:21353", 0);
