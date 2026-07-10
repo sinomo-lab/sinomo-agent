@@ -25,6 +25,7 @@ use crate::metadata_journal::{
     persist_replayed_journal_entries, read_next_journal_sequence_lenient,
     recover_next_journal_sequence, write_local_journal_entries, write_local_journal_entry,
 };
+use crate::metadata_keys::normalize_path;
 use crate::metadata_limits::{
     DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, OBJECT_LOCAL_METADATA_PAGE_SIZE,
 };
@@ -78,7 +79,7 @@ use crate::metadata_visible_commit::{
     visible_commit_record_from_parts, visible_commit_recovery_order, visible_commit_should_recover,
     visible_commit_table_ops, visible_object_location_recovery_ops,
 };
-use crate::{DfsFileSystem, DfsObjectMetadata};
+use crate::{DfsFileSystem, DfsObjectKind, DfsObjectMetadata};
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 #[cfg(test)]
 use sinomo_core::DfsWriteReceipt;
@@ -94,6 +95,7 @@ use std::fs;
 use std::io;
 #[cfg(test)]
 use std::io::Write;
+use std::ops::Bound::{Included, Unbounded};
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -1291,6 +1293,76 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             &tables,
             file_system_id,
         ))
+    }
+
+    fn child_tombstones_for_directory(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        directory_path: &str,
+    ) -> Result<Vec<DfsObjectMetadata>> {
+        let tables = self.current_tables_snapshot()?;
+        let directory_path = normalize_path(directory_path);
+        let prefix = if directory_path.is_empty() {
+            String::new()
+        } else {
+            format!("{directory_path}/")
+        };
+        let is_direct_child = |path: &str| {
+            let Some(rest) = path.strip_prefix(&prefix) else {
+                return false;
+            };
+            !rest.is_empty() && !rest.contains('/')
+        };
+        let mut tombstones = BTreeMap::<String, DfsObjectMetadata>::new();
+        for ((_record_file_system_id, path), path_record) in tables
+            .paths
+            .range((
+                Included((file_system_id.clone(), prefix.clone())),
+                Unbounded,
+            ))
+            .take_while(|((record_file_system_id, path), _)| {
+                record_file_system_id == file_system_id
+                    && (prefix.is_empty() || path.starts_with(&prefix))
+            })
+        {
+            if !is_direct_child(path) {
+                continue;
+            }
+            let object = tables
+                .objects
+                .get(&path_record.object_id)
+                .cloned()
+                .or_else(|| tables.compacted_tombstone_by_path(file_system_id, path));
+            let Some(object) = object.filter(|object| object.kind == DfsObjectKind::Tombstone)
+            else {
+                continue;
+            };
+            tombstones.insert(path.clone(), object);
+        }
+        for ((record_file_system_id, path), object_id) in tables
+            .compacted_tombstone_paths
+            .range((
+                Included((file_system_id.clone(), prefix.clone())),
+                Unbounded,
+            ))
+            .take_while(|((record_file_system_id, path), _)| {
+                record_file_system_id == file_system_id
+                    && (prefix.is_empty() || path.starts_with(&prefix))
+            })
+        {
+            if !is_direct_child(path) {
+                continue;
+            }
+            if let Some(object) = tables.compacted_tombstones.get(object_id)
+                && object.file_system_id == *record_file_system_id
+                && object.kind == DfsObjectKind::Tombstone
+            {
+                tombstones
+                    .entry(path.clone())
+                    .or_insert_with(|| object.clone());
+            }
+        }
+        Ok(tombstones.into_values().collect())
     }
 
     fn child_objects_for_directory(

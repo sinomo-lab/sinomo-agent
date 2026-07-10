@@ -18,7 +18,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 use crate::maintenance::migrate_legacy_dfs_metadata_replication_cursor;
@@ -264,6 +264,61 @@ impl Default for DfsMetadataJournalReplicationOptions {
             attempt_timeout: DEFAULT_DFS_METADATA_REPLICATION_TIMEOUT,
             target_timeout: DEFAULT_DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT,
         }
+    }
+}
+
+fn dfs_metadata_replication_attempt_timeout(
+    options: DfsMetadataJournalReplicationOptions,
+    target_started_at: Instant,
+) -> Option<Duration> {
+    let remaining = options
+        .target_timeout
+        .checked_sub(target_started_at.elapsed())?;
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(options.attempt_timeout.min(remaining))
+}
+
+#[cfg(test)]
+mod replication_budget_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_replication_defaults_bound_attempt_and_target_time() {
+        let options = DfsMetadataJournalReplicationOptions::default();
+        assert_eq!(options.attempt_timeout, Duration::from_secs(3));
+        assert_eq!(options.target_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn metadata_replication_attempt_uses_remaining_target_budget() {
+        let options = DfsMetadataJournalReplicationOptions {
+            attempt_timeout: Duration::from_secs(10),
+            target_timeout: Duration::from_secs(15),
+            ..DfsMetadataJournalReplicationOptions::default()
+        };
+
+        let fresh = dfs_metadata_replication_attempt_timeout(options, Instant::now())
+            .expect("fresh attempt budget");
+        assert!(fresh > Duration::from_secs(9));
+        assert!(fresh <= Duration::from_secs(10));
+
+        let partly_spent = dfs_metadata_replication_attempt_timeout(
+            options,
+            Instant::now() - Duration::from_secs(9),
+        )
+        .expect("remaining target budget");
+        assert!(partly_spent > Duration::from_secs(5));
+        assert!(partly_spent <= Duration::from_secs(6));
+
+        assert!(
+            dfs_metadata_replication_attempt_timeout(
+                options,
+                Instant::now() - Duration::from_secs(15),
+            )
+            .is_none()
+        );
     }
 }
 
@@ -1588,9 +1643,21 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
         return Ok(());
     }
 
-    let attempt_timeout = options.attempt_timeout.min(options.target_timeout);
+    let target_started_at = Instant::now();
     let mut completed_plan = true;
     for command in commands {
+        let Some(attempt_timeout) =
+            dfs_metadata_replication_attempt_timeout(options, target_started_at)
+        else {
+            outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+                target_node_id: target_node_id.clone(),
+                shard_id: shard_id.clone(),
+                after_sequence,
+                max_batches: options.max_batches_per_target,
+            });
+            completed_plan = false;
+            break;
+        };
         let response = match transport
             .send_metadata_journal_batch_async(&target_node_id, &command, attempt_timeout)
             .await
@@ -1648,7 +1715,8 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                         after_sequence,
                         reason,
                         transport,
-                        attempt_timeout,
+                        options,
+                        target_started_at,
                         outcomes,
                     )
                     .await?;
@@ -1695,7 +1763,8 @@ async fn execute_prepared_dfs_metadata_snapshot_repair_async(
     after_sequence: u64,
     reason: String,
     transport: &mut dyn AsyncDfsMetadataJournalReplicationTransport,
-    attempt_timeout: Duration,
+    options: DfsMetadataJournalReplicationOptions,
+    target_started_at: Instant,
     outcomes: &mut Vec<DfsMetadataJournalReplicationOutcome>,
 ) -> Result<(), DfsError> {
     let command = build_local_dfs_metadata_snapshot_install_command_async(
@@ -1706,6 +1775,17 @@ async fn execute_prepared_dfs_metadata_snapshot_repair_async(
         reason.clone(),
     )
     .await?;
+    let Some(attempt_timeout) =
+        dfs_metadata_replication_attempt_timeout(options, target_started_at)
+    else {
+        outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+            target_node_id: target_node_id.clone(),
+            shard_id: shard_id.clone(),
+            after_sequence,
+            max_batches: options.max_batches_per_target,
+        });
+        return Ok(());
+    };
     let response = match transport
         .send_metadata_snapshot_install_async(target_node_id, &command, attempt_timeout)
         .await
@@ -2440,6 +2520,7 @@ pub fn replicate_dfs_metadata_shard_to_target(
 ) -> Result<Vec<DfsMetadataJournalReplicationOutcome>, DfsError> {
     let mut outcomes = Vec::new();
     let mut sent_batches = 0usize;
+    let target_started_at = Instant::now();
     loop {
         let Some(batch) = backend.journal_batch_since_limited(
             after_sequence,
@@ -2477,7 +2558,17 @@ pub fn replicate_dfs_metadata_shard_to_target(
         }
 
         let command = dfs_metadata_journal_batch_command(local_node_id, target_node_id, batch);
-        let attempt_timeout = options.attempt_timeout.min(options.target_timeout);
+        let Some(attempt_timeout) =
+            dfs_metadata_replication_attempt_timeout(options, target_started_at)
+        else {
+            outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+                target_node_id: target_node_id.clone(),
+                shard_id: shard_id.clone(),
+                after_sequence,
+                max_batches: options.max_batches_per_target,
+            });
+            break;
+        };
         let response = match transport.send_metadata_journal_batch(
             target_node_id,
             &command,
@@ -2514,10 +2605,21 @@ pub fn replicate_dfs_metadata_shard_to_target(
                 reason,
                 command: snapshot_command,
             } => {
+                let Some(snapshot_attempt_timeout) =
+                    dfs_metadata_replication_attempt_timeout(options, target_started_at)
+                else {
+                    outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+                        target_node_id: target_node_id.clone(),
+                        shard_id: shard_id.clone(),
+                        after_sequence,
+                        max_batches: options.max_batches_per_target,
+                    });
+                    break;
+                };
                 match transport.send_metadata_snapshot_install(
                     target_node_id,
                     &snapshot_command,
-                    attempt_timeout,
+                    snapshot_attempt_timeout,
                 ) {
                     Ok(snapshot_response) => {
                         match handle_dfs_metadata_snapshot_install_response(

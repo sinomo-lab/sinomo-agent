@@ -18,8 +18,9 @@ use sinomo_dfs::{
     DfsMetadataPeerTransportError, DfsMetadataShardAssignment, DfsMetadataShardConfig,
     DfsMetadataShardId, DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
     DfsMetadataSnapshotInstallSender, DfsObjectVersionRecord, LocalContentStore,
-    LocalSobjMetadataBackend, distributed_sifs, distributed_sifs_bootstrap_objects,
-    file_system_config_key, metadata_shard_key, sifs_node_files_path,
+    LocalSobjMetadataBackend, default_dfs_metadata_root, distributed_sifs,
+    distributed_sifs_bootstrap_objects, file_system_config_key, metadata_shard_key,
+    sifs_node_files_path,
 };
 use sinomo_dfs::{
     DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture,
@@ -48,10 +49,11 @@ use time::OffsetDateTime;
 const DAEMON_DFS_MESSAGE_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK: usize = 8;
 const DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
-const DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT: Duration =
-    sinomo_dfs::DEFAULT_DFS_METADATA_REPLICATION_TIMEOUT;
-const DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT: Duration =
-    sinomo_dfs::DEFAULT_DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT;
+// A replica journal apply is durable WAN work. Give daemon maintenance a larger
+// response budget than the library default while keeping foreground publication
+// on its explicit two-second best-effort bound.
+const DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT: Duration = Duration::from_secs(15);
 const DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS: usize = 3;
 const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_millis(9_500);
 
@@ -743,8 +745,14 @@ fn open_daemon_dfs_message_service_lane(
         sinomo_dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
     );
     let service = NetworkedDfsService::new(transport, content);
+    // Message lanes hydrate only the filesystem catalog and durable mutation
+    // guards at construction. A full metadata hydrate here is especially costly
+    // because the cache creates the primary lane and the read-lane pool together
+    // while holding its lock. Read requests that need the complete metadata view
+    // hydrate their selected lane below; routed mutations use targeted backend
+    // reads instead.
     let service = with_daemon_dfs_control_plane_on_runtime(service, cluster_paths, Some(runtime))
-        .with_boxed_metadata_backend(metadata_backend)?;
+        .with_boxed_metadata_backend_lazy(metadata_backend)?;
     Ok(Arc::new(Mutex::new(DaemonDfsMessageServiceLane {
         service,
         last_metadata_refresh: Instant::now(),
@@ -821,24 +829,17 @@ fn process_daemon_dfs_message_command_on_runtime(
                 peer_node_ids.clone(),
                 runtime,
             )?;
-            let read_services = (0..daemon_dfs_read_service_pool_size())
-                .map(|_| {
-                    open_daemon_dfs_message_service_lane(
-                        data_dir,
-                        cluster_paths,
-                        &signature.local_node_id,
-                        peer_node_ids.clone(),
-                        runtime,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
             cache.insert(
                 cache_key.clone(),
                 DaemonDfsMessageServiceCacheEntry {
                     signature: signature.clone(),
                     peer_node_ids: peer_node_ids.clone(),
                     primary_service,
-                    read_services,
+                    // Read lanes are opened one at a time below. Building the
+                    // entire pool here makes the first unrelated namespace
+                    // mutation wait for every backend recovery while the
+                    // global cache lock is held.
+                    read_services: Vec::new(),
                     next_read_service: 0,
                 },
             );
@@ -847,6 +848,17 @@ fn process_daemon_dfs_message_command_on_runtime(
         let entry = cache
             .get_mut(&cache_key)
             .expect("daemon DFS message cache entry inserted");
+        if use_read_lane && entry.read_services.len() < daemon_dfs_read_service_pool_size() {
+            entry
+                .read_services
+                .push(open_daemon_dfs_message_service_lane(
+                    data_dir,
+                    cluster_paths,
+                    &signature.local_node_id,
+                    peer_node_ids.clone(),
+                    runtime,
+                )?);
+        }
         if use_read_lane && !entry.read_services.is_empty() {
             let index = entry.next_read_service % entry.read_services.len();
             entry.next_read_service = entry.next_read_service.wrapping_add(1);
@@ -1099,6 +1111,30 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
         tracing::warn!("sinomo daemon {line}");
     }
     Ok(())
+}
+
+/// Run the complete DFS maintenance future from Tokio's blocking pool.
+///
+/// The reusable maintenance entrypoint is async because metadata replication
+/// uses async transports, but it also performs substantial synchronous
+/// backend recovery and metadata scans between awaits. Polling that future on
+/// a daemon worker can starve unrelated control traffic on slower nodes.
+pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
+    paths: DaemonPaths,
+    runtime: tokio::runtime::Handle,
+) -> Result<(), DaemonError> {
+    let tick_runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        runtime.block_on(run_daemon_dfs_maintenance_tick_on_runtime(
+            &paths,
+            &tick_runtime,
+        ))
+    })
+    .await
+    .map_err(|source| DaemonError::Network {
+        address: "DFS maintenance".to_string(),
+        detail: format!("DFS maintenance blocking task failed: {source}"),
+    })?
 }
 
 fn daemon_dfs_maintenance_tick_options() -> DfsMaintenanceTickOptions {
@@ -3271,25 +3307,114 @@ mod tests {
         let data_root = root.join("data");
         let paths = DaemonPaths::with_root(data_root.join("daemon"));
         let local = NodeId::from_legacy_named("node_dfs_protocol_write_local").expect("local");
-        write_test_cluster_state(&data_root, &local);
+        let remote = NodeId::from_legacy_named("node_dfs_protocol_write_remote").expect("remote");
+        write_test_cluster_state_with_remote_endpoint(&data_root, &local, &remote, "127.0.0.1:9");
         let runtime = daemon_test_runtime("daemon-dfs-write-skips-cold-hydrate");
 
-        let cache_key = SinomoDataDir::new(&data_root).root();
+        let data_dir = SinomoDataDir::new(&data_root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let file_system = distributed_sifs(local.clone());
+        let root_shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![remote.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    sinomo_core::kv::KvOp::put_serde(
+                        file_system_config_key(&file_system.file_system_id),
+                        &DfsFileSystemConfig::from(&file_system),
+                        None,
+                    )
+                    .expect("filesystem config op"),
+                    sinomo_core::kv::KvOp::put_serde(
+                        metadata_shard_key(&file_system.file_system_id, "root"),
+                        &root_shard,
+                        None,
+                    )
+                    .expect("root shard op"),
+                ],
+                failure: Vec::new(),
+            }),
+        )
+        .expect("write DFS control plane");
+        let mut unrelated = distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        unrelated.object_id =
+            sinomo_dfs::DfsObjectId::from_legacy_named("obj_daemon_unrelated_cold_metadata")
+                .expect("object id");
+        unrelated.path = "/users/unrelated-cold-metadata.txt".to_string();
+        unrelated.version =
+            sinomo_dfs::DfsVersion::from_legacy_named("version_daemon_unrelated_cold_metadata")
+                .expect("version");
+        let unrelated_object_id = unrelated.object_id.clone();
+        let mut backend = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            default_dfs_metadata_root(&data_dir),
+        )
+        .expect("metadata backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        for object in distributed_sifs_bootstrap_objects(local.clone()) {
+            backend.put_object(&object).expect("bootstrap object");
+        }
+        backend.put_object(&unrelated).expect("unrelated object");
+        drop(backend);
+
+        let cache_key = data_dir.root();
+        let mut routed_message = test_dfs_write_routed_message(
+            &remote,
+            &local,
+            1,
+            "/services/daemon-write-skips-cold-hydrate.txt",
+        );
+        let sinomo_dfs::DfsNetworkMessage::DistributedWriteRequest(write) =
+            &mut routed_message.message
+        else {
+            panic!("write routed message");
+        };
+        write.desired_replica_nodes = vec![local.clone()];
+        write
+            .object_metadata
+            .as_mut()
+            .expect("write object metadata")
+            .current_locations = vec![local.clone()];
         let response = handle_daemon_dfs_message_on_runtime(
             &paths,
-            test_dfs_message_command(
-                "dfs_message_write_skips_cold_hydrate",
-                test_dfs_write_routed_message(
-                    &local,
-                    &local,
-                    1,
-                    "/services/daemon-write-skips-cold-hydrate.txt",
-                ),
-            ),
+            test_dfs_message_command("dfs_message_write_skips_cold_hydrate", routed_message),
             runtime.handle(),
         )
         .expect("distributed write DFS message");
         assert_eq!(response.request_id, "dfs_message_write_skips_cold_hydrate");
+        let written_object_id =
+            sinomo_dfs::DfsObjectId::from_legacy_named("obj_daemon_dfs_write_1")
+                .expect("written object id");
+        let persisted = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            default_dfs_metadata_root(&data_dir),
+        )
+        .expect("reopen metadata backend")
+        .get_object(&written_object_id)
+        .expect("read written object")
+        .unwrap_or_else(|| {
+            panic!(
+                "cold routed write must persist its object: {:?}",
+                response.outbound_messages
+            )
+        });
+        assert_eq!(
+            persisted.path,
+            "/services/daemon-write-skips-cold-hydrate.txt"
+        );
         let primary_service = {
             let cache = daemon_dfs_message_service_cache()
                 .lock()
@@ -3300,6 +3425,25 @@ mod tests {
         assert!(
             !lane.metadata_hydrated,
             "distributed writes must not force a full metadata hydrate on a cold daemon message lane"
+        );
+        assert!(
+            lane.service
+                .metadata()
+                .object(&unrelated_object_id)
+                .is_none(),
+            "cold message-lane construction must not eagerly load unrelated metadata"
+        );
+        drop(lane);
+        let cache = daemon_dfs_message_service_cache()
+            .lock()
+            .expect("cache lock");
+        assert!(
+            cache
+                .get(&cache_key)
+                .expect("cache entry")
+                .read_services
+                .is_empty(),
+            "a cold mutation must not synchronously construct the read-lane pool"
         );
     }
 

@@ -498,7 +498,10 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ) {
                 Ok(response) => match dfs::decode_dfs_status_rpc_response(&response) {
                     Ok(status) => {
-                        let repairs = if status.pending_repair_count > 0 {
+                        let repairs = if routed_status_needs_repair_views(
+                            &status,
+                            &unavailable_repair_targets,
+                        ) {
                             match fetch_dfs_repair_views_for_status(
                                 &daemon_client,
                                 target,
@@ -713,7 +716,10 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             .into_bytes()
         });
     let write_started = Instant::now();
-    let phase_timeout = timeout.min(Duration::from_secs(5));
+    // A cold remote authority may spend the full routed namespace-operation
+    // budget hydrating its lane before it can commit the mutation. Keep each
+    // diagnostic phase bounded, but do not undercut that production budget.
+    let phase_timeout = remote_shard_write_phase_timeout(timeout);
     let next_phase_deadline = || std::cmp::min(Instant::now() + phase_timeout, deadline);
     let mut split_failures = Vec::new();
     if split_diagnostics {
@@ -897,6 +903,10 @@ fn remote_shard_write_probe_prefix(shard_id: &str) -> Option<&'static str> {
         "users" => Some("/users/cluster-tests/remote-shard"),
         _ => None,
     }
+}
+
+fn remote_shard_write_phase_timeout(timeout: Duration) -> Duration {
+    timeout.min(dfs::DFS_ROUTED_NAMESPACE_OP_TIMEOUT)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1163,6 +1173,13 @@ fn dfs_unavailable_pending_repair_count(
             }),
     );
     unavailable_repairs.len().min(status.pending_repair_count)
+}
+
+fn routed_status_needs_repair_views(
+    status: &DfsOperatorStatus,
+    unavailable_repair_targets: &BTreeSet<NodeId>,
+) -> bool {
+    status.pending_repair_count > 0 && !unavailable_repair_targets.is_empty()
 }
 
 fn run_service_advertisements(ctx: &mut SinomoTestContext) -> SinomoTestResult {
@@ -3924,6 +3941,18 @@ mod tests {
     };
     use sinomo_runtime::node::ClusterId;
 
+    #[test]
+    fn remote_shard_write_phase_budget_allows_a_cold_routed_namespace_operation() {
+        assert_eq!(
+            remote_shard_write_phase_timeout(Duration::from_secs(30)),
+            dfs::DFS_ROUTED_NAMESPACE_OP_TIMEOUT
+        );
+        assert_eq!(
+            remote_shard_write_phase_timeout(Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+    }
+
     fn test_state() -> ClusterBootstrapState {
         let now = time::OffsetDateTime::now_utc();
         let cluster_id =
@@ -4290,6 +4319,12 @@ mod tests {
             ],
         };
         let repairs = Vec::new();
+
+        assert!(!routed_status_needs_repair_views(&status, &BTreeSet::new()));
+        assert!(routed_status_needs_repair_views(
+            &status,
+            &unavailable_repair_targets
+        ));
 
         let summary = dfs_status_probe_summary(&status, &repairs, &unavailable_repair_targets);
 

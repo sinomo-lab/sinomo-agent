@@ -102,6 +102,38 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         max_entries: usize,
     ) -> Result<DfsObjectPage>;
 
+    /// List durable direct-child tombstones below a directory. Backends with a
+    /// path index should override this so targeted namespace synchronization
+    /// does not scan the entire filesystem.
+    fn child_tombstones_for_directory(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        directory_path: &str,
+    ) -> Result<Vec<DfsObjectMetadata>> {
+        let directory_path = normalize_posix_path(directory_path);
+        let prefix = if directory_path == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", directory_path.trim_end_matches('/'))
+        };
+        collect_filtered_metadata_pages(
+            |cursor| {
+                let page = self.objects_for_file_system_page(
+                    file_system_id,
+                    cursor,
+                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
+                )?;
+                Ok((page.objects, page.next_cursor))
+            },
+            |object| {
+                let object_path = normalize_posix_path(&object.path);
+                let rest = object_path.strip_prefix(&prefix)?;
+                (object.kind == DfsObjectKind::Tombstone && !rest.is_empty() && !rest.contains('/'))
+                    .then_some(object)
+            },
+        )
+    }
+
     /// Count visible objects in a filesystem without requiring callers to
     /// materialize every record.
     fn count_objects_for_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<usize> {

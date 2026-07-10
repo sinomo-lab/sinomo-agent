@@ -2042,6 +2042,10 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         dfs_metadata_journal_batch_rpc_request(&journal_command).expect("journal request");
     assert_eq!(journal_request.route, DFS_METADATA_JOURNAL_BATCH_ROUTE);
     assert_eq!(journal_request.category, DFS_RPC_CATEGORY);
+    assert!(
+        journal_request.uses_full_response_budget(),
+        "metadata journal apply may perform bounded durable work before responding"
+    );
     assert_eq!(
         journal_request
             .decode_body::<DfsMetadataJournalBatchCommand>()
@@ -2082,6 +2086,10 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         dfs_metadata_snapshot_install_rpc_request(&snapshot_command).expect("snapshot request");
     assert_eq!(snapshot_request.route, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE);
     assert_eq!(snapshot_request.category, DFS_RPC_CATEGORY);
+    assert!(
+        snapshot_request.uses_full_response_budget(),
+        "metadata snapshot install may perform bounded durable work before responding"
+    );
     assert_eq!(
         snapshot_request
             .decode_body::<DfsMetadataSnapshotInstallCommand>()
@@ -27291,6 +27299,252 @@ fn sharded_lazy_reader_sees_sibling_visible_overwrite() {
 }
 
 #[test]
+fn lazy_metadata_hydration_restores_running_cross_shard_mutation_guards() {
+    let root = temp_root("lazy-metadata-cross-shard-mutation-guards");
+    let node = NodeId::from_legacy_named("node_lazy_cross_shard_guards").expect("node");
+    let file_system = distributed_sifs(node.clone());
+    let guarded_root = "/services/guarded-tree";
+    let now = OffsetDateTime::now_utc();
+    let job = DfsNamespaceJobRecord {
+        job_id: "running-cross-shard-rename".to_string(),
+        file_system_id: file_system.file_system_id.clone(),
+        kind: DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
+        status: DfsNamespaceJobStatus::Running,
+        root_path: guarded_root.to_string(),
+        target_path: Some("/users/guarded-tree".to_string()),
+        pending_frames: Vec::new(),
+        processed_object_count: 0,
+        created_at: now,
+        updated_at: now,
+        completed_at: None,
+        failure_reason: None,
+    };
+    let metadata_root = root.join("metadata");
+    let mut backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &metadata_root)
+            .expect("metadata backend");
+    backend.put_file_system(&file_system).expect("filesystem");
+    backend.put_namespace_job(&job).expect("namespace job");
+    drop(backend);
+
+    let service = NetworkedDfsService::new(
+        InProcessNetwork::new().add_node(node),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_metadata_backend_lazy(
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), metadata_root)
+            .expect("reopened metadata backend"),
+    )
+    .expect("lazy metadata service");
+
+    assert!(matches!(
+        service.ensure_path_not_in_cross_shard_flight(
+            &file_system.file_system_id,
+            "/services/guarded-tree/child.txt",
+        ),
+        Err(DfsError::Busy { .. })
+    ));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cold_lazy_sync_path_includes_durable_direct_child_tombstones() {
+    let root = temp_root("cold-lazy-sync-path-tombstones");
+    let node = NodeId::from_legacy_named("node_cold_lazy_sync_primary").expect("node");
+    let requester = NodeId::from_legacy_named("node_cold_lazy_sync_requester").expect("requester");
+    let directory = "/services/cold-sync-dir";
+    let deleted_path = "/services/cold-sync-dir/deleted.txt";
+    let sender: DfsMessageSender = Arc::new(|_, command, _| {
+        Ok(DfsMessageResponse {
+            request_id: command.request_id.clone(),
+            outbound_messages: Vec::new(),
+        })
+    });
+    {
+        let mut writer = NetworkedDfsService::new(
+            DfsNodeServedMessageTransport::new_with_message_sender(
+                node.clone(),
+                Vec::new(),
+                Arc::clone(&sender),
+                Duration::from_secs(1),
+            ),
+            LocalContentStore::new(root.join("content")).expect("writer content"),
+        )
+        .with_metadata_backend(
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+                .expect("writer metadata backend"),
+        )
+        .expect("writer metadata service");
+        writer.bootstrap_distributed_sifs().expect("bootstrap sifs");
+        writer.posix_mkdir_all(directory).expect("directory");
+        writer
+            .posix_write_file(
+                deleted_path,
+                b"deleted payload",
+                DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+            )
+            .expect("write deleted child");
+        writer.posix_unlink(deleted_path).expect("unlink child");
+    }
+
+    let mut cold = NetworkedDfsService::new(
+        DfsNodeServedMessageTransport::new_with_message_sender(
+            node.clone(),
+            Vec::new(),
+            sender,
+            Duration::from_secs(1),
+        ),
+        LocalContentStore::new(root.join("content")).expect("cold content"),
+    )
+    .with_metadata_backend_lazy(
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("cold metadata backend"),
+    )
+    .expect("cold lazy service");
+    let routed_message = build_dfs_routed_message(
+        &requester,
+        &node,
+        1,
+        1,
+        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            request_id: "cold-lazy-sync-path".to_string(),
+            file_system_id: sifs_file_system_id(),
+            requesting_node_id: requester.clone(),
+            include_metadata_journal_batches: false,
+            metadata_journal_after_sequences: Vec::new(),
+            operation: DfsNamespaceOperation::SyncPath {
+                path: directory.to_string(),
+            },
+        }),
+    );
+    let result = cold
+        .process_message_command(test_dfs_message_command(
+            "cold_lazy_sync_path_rpc",
+            routed_message,
+        ))
+        .expect("cold SyncPath");
+
+    assert!(result.response.outbound_messages.iter().any(|message| {
+        matches!(
+            &message.message,
+            DfsNetworkMessage::NamespaceResponse(DfsNamespaceResponse {
+                synced_path_objects,
+                ..
+            }) if synced_path_objects.iter().any(|object| {
+                object.path == deleted_path && object.kind == DfsObjectKind::Tombstone
+            })
+        )
+    }));
+
+    let mut live_overlay =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("overlay metadata backend")
+            .get_object_by_path(&sifs_file_system_id(), deleted_path)
+            .expect("read durable tombstone")
+            .expect("durable tombstone");
+    assert_eq!(live_overlay.kind, DfsObjectKind::Tombstone);
+    let stale_tombstone = live_overlay.clone();
+    live_overlay.kind = DfsObjectKind::File;
+    live_overlay.version = DfsVersion::generate();
+    live_overlay.content_hash = Some(content_hash(b"newer transient live child"));
+    live_overlay.content_size_bytes = Some(b"newer transient live child".len() as u64);
+    cold.add_transient_object_metadata(live_overlay.clone())
+        .expect("newer live overlay");
+    let routed_message = build_dfs_routed_message(
+        &requester,
+        &node,
+        2,
+        2,
+        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            request_id: "cold-lazy-sync-path-live-overlay".to_string(),
+            file_system_id: sifs_file_system_id(),
+            requesting_node_id: requester.clone(),
+            include_metadata_journal_batches: false,
+            metadata_journal_after_sequences: Vec::new(),
+            operation: DfsNamespaceOperation::SyncPath {
+                path: directory.to_string(),
+            },
+        }),
+    );
+    let result = cold
+        .process_message_command(test_dfs_message_command(
+            "cold_lazy_sync_path_live_overlay_rpc",
+            routed_message,
+        ))
+        .expect("cold SyncPath with live overlay");
+    let synced_children = result
+        .response
+        .outbound_messages
+        .iter()
+        .filter_map(|message| match &message.message {
+            DfsNetworkMessage::NamespaceResponse(response) => Some(&response.synced_path_objects),
+            _ => None,
+        })
+        .flatten()
+        .filter(|object| object.path == deleted_path)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        synced_children.len(),
+        1,
+        "SyncPath must return exactly one authoritative child per path"
+    );
+    assert_eq!(synced_children[0].kind, DfsObjectKind::Tombstone);
+    assert_eq!(synced_children[0].version, stale_tombstone.version);
+
+    cold.remove_transient_object_metadata(&live_overlay.object_id);
+    cold.track_metadata_tombstone(&stale_tombstone);
+    let mut durable_live = live_overlay;
+    durable_live.version = DfsVersion::generate();
+    durable_live.content_hash = Some(content_hash(b"newer durable live child"));
+    durable_live.content_size_bytes = Some(b"newer durable live child".len() as u64);
+    LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+        .expect("durable live metadata backend")
+        .put_object(&durable_live)
+        .expect("newer durable live child");
+    let routed_message = build_dfs_routed_message(
+        &requester,
+        &node,
+        3,
+        3,
+        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            request_id: "cold-lazy-sync-path-durable-live".to_string(),
+            file_system_id: sifs_file_system_id(),
+            requesting_node_id: requester.clone(),
+            include_metadata_journal_batches: false,
+            metadata_journal_after_sequences: Vec::new(),
+            operation: DfsNamespaceOperation::SyncPath {
+                path: directory.to_string(),
+            },
+        }),
+    );
+    let result = cold
+        .process_message_command(test_dfs_message_command(
+            "cold_lazy_sync_path_durable_live_rpc",
+            routed_message,
+        ))
+        .expect("cold SyncPath with durable live child");
+    let synced_children = result
+        .response
+        .outbound_messages
+        .iter()
+        .filter_map(|message| match &message.message {
+            DfsNetworkMessage::NamespaceResponse(response) => Some(&response.synced_path_objects),
+            _ => None,
+        })
+        .flatten()
+        .filter(|object| object.path == deleted_path)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        synced_children.len(),
+        1,
+        "a durable live child must suppress an older in-memory tombstone"
+    );
+    assert_eq!(synced_children[0].kind, DfsObjectKind::File);
+    assert_eq!(synced_children[0].version, durable_live.version);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sharded_lazy_reader_refreshes_after_remote_primary_overwrite() {
     let root = temp_root("sifs-sharded-lazy-reader-remote-primary");
     let primary_node = NodeId::from_legacy_named("node_sifs_lazy_remote_primary").expect("primary");
@@ -30034,6 +30288,111 @@ fn routed_namespace_without_local_replay_omits_response_journal_batches() {
         "no-local-replay namespace response must not carry journal batches"
     );
 
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn served_namespace_exact_retry_replays_completed_rename() {
+    let cluster = sifs_two_primary_cluster("sifs-namespace-rename-replay");
+    let SifsTwoPrimaryCluster {
+        root,
+        replica_node,
+        mut services_primary,
+        replica,
+        ..
+    } = cluster;
+    let source = "/services/replay-source.txt";
+    let destination = "/services/replay-destination.txt";
+    let second_destination = "/services/replay-second-destination.txt";
+    let bytes = b"namespace replay payload";
+    let primary_node = services_primary.node_id().clone();
+    services_primary
+        .posix_write_file(
+            source,
+            bytes,
+            DfsWriteOptions::replicated_eventual(vec![primary_node]),
+        )
+        .expect("seed source on services primary");
+
+    let request_id = "dfs_net_req_retried_rename".to_string();
+    let command = DfsNamespaceCommand {
+        request_id: request_id.clone(),
+        file_system_id: sifs_file_system_id(),
+        requesting_node_id: replica_node.clone(),
+        include_metadata_journal_batches: true,
+        metadata_journal_after_sequences: Vec::new(),
+        operation: DfsNamespaceOperation::Rename {
+            from: source.to_string(),
+            to: destination.to_string(),
+        },
+    };
+    let first = services_primary
+        .handle_namespace_request(replica_node.clone(), command.clone())
+        .expect("serve first rename");
+    assert!(matches!(
+        first,
+        NetworkedDfsServiceEvent::RemoteNamespaceServed {
+            result: DfsNamespaceResult::Applied,
+            mutates_metadata: true,
+            ..
+        }
+    ));
+    let destination_version = services_primary
+        .posix_stat(destination)
+        .expect("destination after first rename")
+        .version;
+
+    let replay = services_primary
+        .handle_namespace_request(replica_node.clone(), command)
+        .expect("replay identical rename");
+    assert!(matches!(
+        replay,
+        NetworkedDfsServiceEvent::RemoteNamespaceServed {
+            result: DfsNamespaceResult::Applied,
+            mutates_metadata: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        services_primary.posix_stat(source),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    let replayed_destination = services_primary
+        .posix_stat(destination)
+        .expect("destination remains after replay");
+    assert_eq!(replayed_destination.version, destination_version);
+    assert_eq!(
+        services_primary
+            .posix_read_file(destination)
+            .expect("read replayed destination"),
+        bytes
+    );
+
+    let distinct_same_id = DfsNamespaceCommand {
+        request_id,
+        file_system_id: sifs_file_system_id(),
+        requesting_node_id: replica_node.clone(),
+        include_metadata_journal_batches: true,
+        metadata_journal_after_sequences: Vec::new(),
+        operation: DfsNamespaceOperation::Rename {
+            from: destination.to_string(),
+            to: second_destination.to_string(),
+        },
+    };
+    let distinct = services_primary
+        .handle_namespace_request(replica_node, distinct_same_id)
+        .expect("same request id with a distinct command must execute");
+    assert!(matches!(
+        distinct,
+        NetworkedDfsServiceEvent::RemoteNamespaceServed {
+            result: DfsNamespaceResult::Applied,
+            mutates_metadata: true,
+            ..
+        }
+    ));
+    assert!(services_primary.posix_stat(second_destination).is_ok());
+
+    drop(replica);
     std::fs::remove_dir_all(&root).ok();
 }
 

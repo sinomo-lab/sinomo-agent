@@ -273,6 +273,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.metadata
                 .add_file_system(DfsFileSystem::sifs(self.node_id.clone()));
         }
+        // Lazy services still process mutations. Restore the durable guards for
+        // running cross-shard namespace jobs without paying for a full object,
+        // version, intent, and receipt scan.
+        self.rebuild_cross_shard_namespace_locks()?;
         self.seed_local_metadata_journal_cursors_from_backend()?;
         Ok(())
     }

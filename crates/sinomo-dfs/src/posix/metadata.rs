@@ -6,6 +6,8 @@
 //! the POSIX facade so writes, reads, routed operations, jobs, and queries all
 //! share the same interpretation without adding to the crate-level API.
 
+use std::collections::BTreeMap;
+
 use super::{POSIX_LINK_COUNT_PAGE_SIZE, POSIX_LIST_DIR_COLLECT_PAGE_SIZE, now_unix_nanos};
 use crate::metadata_pages::try_walk_metadata_pages;
 use crate::namespace::{metadata_path, next_version};
@@ -353,8 +355,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             format!("{}/", path.trim_end_matches('/'))
         };
-        let mut tombstone_object_ids = Vec::new();
-        let mut tombstone_paths = Vec::new();
+        let mut overlays = BTreeMap::<String, DfsObjectMetadata>::new();
         for ((tombstone_file_system_id, _), tombstone) in &self.tombstones_by_metadata_path {
             if tombstone_file_system_id != file_system_id {
                 continue;
@@ -364,56 +365,67 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             else {
                 continue;
             };
-            tombstone_object_ids.push(tombstone.object_id.clone());
-            tombstone_paths.push(tombstone_path);
+            overlays.insert(tombstone_path, tombstone.clone());
         }
-        let mut live_children = Vec::new();
         for object in self.metadata.objects.values() {
             let Some(object_path) =
                 sifs_dir_direct_child_path(file_system_id, path, &prefix, object)
             else {
                 continue;
             };
-            if object.kind == DfsObjectKind::Tombstone {
-                continue;
-            } else if tombstone_paths
-                .iter()
-                .any(|tombstone_path| tombstone_path == &object_path)
-            {
-                continue;
-            } else {
-                live_children.push((object_path, object.clone()));
+            let replace = overlays.get(&object_path).is_none_or(|existing| {
+                existing.version < object.version
+                    || (existing.version == object.version
+                        && existing.kind == DfsObjectKind::Tombstone
+                        && object.kind != DfsObjectKind::Tombstone)
+            });
+            if replace {
+                overlays.insert(object_path, object.clone());
             }
         }
-        children.retain(|existing| {
-            if tombstone_object_ids.contains(&existing.object_id) {
-                return false;
+
+        let mut children_by_path = BTreeMap::<String, DfsObjectMetadata>::new();
+        for object in children.drain(..) {
+            let object_path = normalize_posix_path(&object.path)?;
+            let replace = children_by_path
+                .get(&object_path)
+                .is_none_or(|existing| existing.version < object.version);
+            if replace {
+                children_by_path.insert(object_path, object);
             }
-            let Ok(existing_path) = normalize_posix_path(&existing.path) else {
-                return true;
-            };
-            let tombstoned_path = tombstone_paths
-                .iter()
-                .any(|tombstone_path| tombstone_path == &existing_path);
-            let live_path = live_children
-                .iter()
-                .any(|(live_path, _)| live_path == &existing_path);
-            !tombstoned_path || live_path
-        });
-        for (object_path, object) in live_children {
-            if let Some(existing) = children.iter_mut().find(|existing| {
-                if existing.object_id == object.object_id {
-                    return true;
+        }
+        for (object_path, overlay) in overlays {
+            let backend_object = self
+                .metadata_backend
+                .as_ref()
+                .map(|backend| {
+                    backend.get_object_by_path(file_system_id, &metadata_path(&object_path))
+                })
+                .transpose()?
+                .flatten();
+            let authoritative = match backend_object {
+                Some(backend_object)
+                    if self.local_write_view_overrides_backend(
+                        &overlay.object_id,
+                        &overlay,
+                        Some(&backend_object),
+                    ) =>
+                {
+                    overlay
                 }
-                normalize_posix_path(&existing.path)
-                    .map(|existing_path| existing_path == object_path)
-                    .unwrap_or(false)
-            }) {
-                *existing = object;
-            } else {
-                children.push(object);
+                Some(backend_object) => backend_object,
+                None => overlay,
+            };
+            match authoritative.kind {
+                DfsObjectKind::Tombstone => {
+                    children_by_path.remove(&object_path);
+                }
+                _ => {
+                    children_by_path.insert(object_path, authoritative);
+                }
             }
         }
+        children.extend(children_by_path.into_values());
         Ok(())
     }
 

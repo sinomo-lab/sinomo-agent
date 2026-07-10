@@ -59,9 +59,11 @@ const POSIX_ROUTED_SYNC_RETRY_ROUNDS: usize = 4;
 /// If another local service instance advanced the metadata between lookup and
 /// commit, refresh from the backend and retry against the current version.
 const POSIX_WRITE_STALE_BASE_RETRY_ROUNDS: usize = 4;
-/// Budget for the best-effort freshness pull a distributed read performs on
-/// foreign-shard paths; reads fall back to the local mirror when it elapses.
-const POSIX_READ_FRESHNESS_SYNC_TIMEOUT: Duration = Duration::from_secs(3);
+/// Budget for an authoritative path lookup or the best-effort freshness pull
+/// used after that lookup cannot answer. These requests share the serialized
+/// namespace lane with durable mutations, so the budget must tolerate bounded
+/// WAN metadata work already ahead of them.
+const POSIX_READ_FRESHNESS_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
 const POSIX_REMOTE_READ_IDLE_WAIT_MAX: Duration = Duration::from_millis(50);
 
 struct PosixBulkLocalWrite<'a> {

@@ -370,7 +370,10 @@ pub fn decode_dfs_smoke_rpc_response(
 pub fn dfs_metadata_journal_batch_rpc_request(
     command: &DfsMetadataJournalBatchCommand,
 ) -> Result<ObjectRpcRequest, NetworkError> {
-    ObjectRpcRequest::encode_body(DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_RPC_CATEGORY, command)
+    Ok(
+        ObjectRpcRequest::encode_body(DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_RPC_CATEGORY, command)?
+            .with_full_response_budget(),
+    )
 }
 
 pub fn decode_dfs_metadata_journal_batch_rpc_response(
@@ -382,11 +385,12 @@ pub fn decode_dfs_metadata_journal_batch_rpc_response(
 pub fn dfs_metadata_snapshot_install_rpc_request(
     command: &DfsMetadataSnapshotInstallCommand,
 ) -> Result<ObjectRpcRequest, NetworkError> {
-    ObjectRpcRequest::encode_body(
+    Ok(ObjectRpcRequest::encode_body(
         DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
         DFS_RPC_CATEGORY,
         command,
-    )
+    )?
+    .with_full_response_budget())
 }
 
 pub fn decode_dfs_metadata_snapshot_install_rpc_response(

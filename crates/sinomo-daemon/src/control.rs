@@ -8,7 +8,7 @@ use crate::cluster::{
 use crate::dfs::{
     daemon_dfs_maintenance_notify, daemon_dfs_node_transport, daemon_dfs_node_transport_on_runtime,
     daemon_dfs_pending_maintenance_work, ensure_default_distributed_dfs_async_on_runtime,
-    ensure_default_local_dfs_expose, run_daemon_dfs_maintenance_tick_on_runtime,
+    ensure_default_local_dfs_expose, run_daemon_dfs_maintenance_tick_in_blocking_task,
 };
 use crate::{
     AuthenticatedDaemonCommand, DaemonClusterStatus, DaemonDataOwnerLock, DaemonError, DaemonLock,
@@ -662,7 +662,7 @@ async fn run_daemon_background_maintenance_loop(
         {
             let dfs_paths = paths.clone();
             let dfs_runtime = runtime.clone();
-            match run_daemon_dfs_maintenance_tick_on_runtime(&dfs_paths, &dfs_runtime).await {
+            match run_daemon_dfs_maintenance_tick_in_blocking_task(dfs_paths, dfs_runtime).await {
                 Ok(()) => {
                     let probe_paths = paths.clone();
                     match tokio::task::spawn_blocking(move || {

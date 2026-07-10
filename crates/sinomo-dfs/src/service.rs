@@ -20,6 +20,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::local_state::open_cluster_aware_dfs_metadata_backend_for_inspection;
 use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
     DFS_DIRECT_READ_STREAM_CHUNK_BYTES, DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE,
@@ -202,24 +203,42 @@ impl Service for DfsService {
                 }
                 DFS_METADATA_JOURNAL_BATCH_ROUTE => {
                     let command: DfsMetadataJournalBatchCommand = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(
-                        DFS_METADATA_JOURNAL_BATCH_ROUTE,
-                        &dfs_metadata_journal_batch(&ctx.data_dir, command)?,
-                    )?
+                    let data_dir = Arc::clone(&ctx.data_dir);
+                    let response = tokio::task::spawn_blocking(move || {
+                        dfs_metadata_journal_batch(&data_dir, command)
+                    })
+                    .await
+                    .map_err(|source| {
+                        ServiceError::Service(format!("DFS metadata journal task failed: {source}"))
+                    })??;
+                    ObjectRpcResponse::encode_body(DFS_METADATA_JOURNAL_BATCH_ROUTE, &response)?
                 }
                 DFS_METADATA_SNAPSHOT_INSTALL_ROUTE => {
                     let command: DfsMetadataSnapshotInstallCommand = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(
-                        DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-                        &dfs_metadata_snapshot_install(&ctx.data_dir, command)?,
-                    )?
+                    let data_dir = Arc::clone(&ctx.data_dir);
+                    let response = tokio::task::spawn_blocking(move || {
+                        dfs_metadata_snapshot_install(&data_dir, command)
+                    })
+                    .await
+                    .map_err(|source| {
+                        ServiceError::Service(format!(
+                            "DFS metadata snapshot task failed: {source}"
+                        ))
+                    })??;
+                    ObjectRpcResponse::encode_body(DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, &response)?
                 }
                 DFS_INSPECTION_ROUTE => {
                     let inspection: DaemonDfsInspectionRequest = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(
-                        DFS_INSPECTION_ROUTE,
-                        &dfs_inspection(&ctx.data_dir, inspection)?,
-                    )?
+                    let data_dir = Arc::clone(&ctx.data_dir);
+                    let response =
+                        tokio::task::spawn_blocking(move || dfs_inspection(&data_dir, inspection))
+                            .await
+                            .map_err(|source| {
+                                ServiceError::Service(format!(
+                                    "DFS inspection task failed: {source}"
+                                ))
+                            })??;
+                    ObjectRpcResponse::encode_body(DFS_INSPECTION_ROUTE, &response)?
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
@@ -353,13 +372,25 @@ fn dfs_inspection(
     request: DaemonDfsInspectionRequest,
 ) -> Result<DaemonDfsInspectionResponse, ServiceError> {
     data_dir.ensure_root_layout().map_err(service_error)?;
-    let mut metadata = open_metadata_backend(data_dir)?;
+    if matches!(&request, DaemonDfsInspectionRequest::Status) {
+        return Ok(DaemonDfsInspectionResponse::Status {
+            status: dfs_status(data_dir)?,
+        });
+    }
+    let mut metadata = if matches!(
+        &request,
+        DaemonDfsInspectionRequest::ResolveConflicts { .. }
+            | DaemonDfsInspectionRequest::UseConflictVersion { .. }
+    ) {
+        open_metadata_backend(data_dir)?
+    } else {
+        let cluster_paths = ClusterPaths::new(data_dir);
+        open_cluster_aware_dfs_metadata_backend_for_inspection(data_dir, &cluster_paths)
+            .map_err(service_error)?
+    };
     let inspector = DfsOperatorInspector::new(metadata.as_ref());
     let response = match request {
-        DaemonDfsInspectionRequest::Status => {
-            let status = dfs_status(data_dir)?;
-            DaemonDfsInspectionResponse::Status { status }
-        }
+        DaemonDfsInspectionRequest::Status => unreachable!("status handled before backend open"),
         DaemonDfsInspectionRequest::FileSystem { file_system_id } => {
             DaemonDfsInspectionResponse::FileSystem {
                 file_system: inspector

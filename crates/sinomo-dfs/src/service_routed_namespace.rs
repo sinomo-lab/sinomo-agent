@@ -5,10 +5,12 @@
 //! path objects on requesters, and settling pending namespace operations. The
 //! generic data-plane dispatcher remains in `service_protocol`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use sinomo_core::node::NodeId;
 
+use crate::service_state::{DFS_SERVED_NAMESPACE_REPLAY_LIMIT, ServedNamespaceReplay};
 use crate::*;
 use crate::{posix_model, posix_path};
 
@@ -81,12 +83,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let children = self
                 .child_objects_for_sifs_dir(&normalized_path)
                 .map_err(dfs_error_from_posix_namespace_sync)?;
+            let mut children_by_path = BTreeMap::<String, DfsObjectMetadata>::new();
             for object in children {
-                objects.push(self.object_metadata_with_receipt_locations(object)?);
+                let object = self.object_metadata_with_receipt_locations(object)?;
+                children_by_path.insert(metadata_path(&object.path), object);
             }
-            objects.extend(
-                self.direct_child_tombstones_for_sifs_dir(file_system_id, &normalized_path)?,
-            );
+            for tombstone in
+                self.direct_child_tombstones_for_sifs_dir(file_system_id, &normalized_path)?
+            {
+                let path = metadata_path(&tombstone.path);
+                children_by_path.insert(path, tombstone);
+            }
+            objects.extend(children_by_path.into_values());
         }
         Ok(objects)
     }
@@ -96,14 +104,78 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         directory_path: &str,
     ) -> Result<Vec<DfsObjectMetadata>, DfsError> {
-        self.tombstones_by_metadata_path
-            .iter()
-            .filter(|((tombstone_file_system_id, metadata_path), _)| {
-                tombstone_file_system_id == file_system_id
-                    && metadata_path_is_direct_child_of_posix_dir(directory_path, metadata_path)
-            })
-            .map(|(_, object)| self.object_metadata_with_receipt_locations(object.clone()))
-            .collect()
+        let mut memory_by_path = BTreeMap::<String, DfsObjectMetadata>::new();
+        for ((tombstone_file_system_id, metadata_path), object) in &self.tombstones_by_metadata_path
+        {
+            if tombstone_file_system_id == file_system_id
+                && metadata_path_is_direct_child_of_posix_dir(directory_path, metadata_path)
+            {
+                memory_by_path.insert(metadata_path.clone(), object.clone());
+            }
+        }
+        for object in self.metadata.objects.values() {
+            if object.file_system_id != *file_system_id {
+                continue;
+            }
+            let object_metadata_path = metadata_path(&object.path);
+            if !metadata_path_is_direct_child_of_posix_dir(directory_path, &object_metadata_path) {
+                continue;
+            }
+            let replace = memory_by_path
+                .get(&object_metadata_path)
+                .is_none_or(|existing| {
+                    existing.version < object.version
+                        || (existing.version == object.version
+                            && existing.kind == DfsObjectKind::Tombstone
+                            && object.kind != DfsObjectKind::Tombstone)
+                });
+            if replace {
+                memory_by_path.insert(object_metadata_path, object.clone());
+            }
+        }
+        let mut candidate_paths = memory_by_path.keys().cloned().collect::<BTreeSet<_>>();
+        if let Some(backend) = self.metadata_backend.as_ref() {
+            for object in backend.child_tombstones_for_directory(file_system_id, directory_path)? {
+                let object_metadata_path = metadata_path(&object.path);
+                if !metadata_path_is_direct_child_of_posix_dir(
+                    directory_path,
+                    &object_metadata_path,
+                ) {
+                    continue;
+                }
+                candidate_paths.insert(object_metadata_path);
+            }
+        }
+        let mut tombstones = Vec::new();
+        for path in candidate_paths {
+            let memory_object = memory_by_path.get(&path);
+            let backend_object = self
+                .metadata_backend
+                .as_ref()
+                .map(|backend| backend.get_object_by_path(file_system_id, &path))
+                .transpose()?
+                .flatten();
+            let authoritative = match (memory_object, backend_object.as_ref()) {
+                (Some(memory_object), Some(backend_object))
+                    if self.local_write_view_overrides_backend(
+                        &memory_object.object_id,
+                        memory_object,
+                        Some(backend_object),
+                    ) =>
+                {
+                    Some(memory_object.clone())
+                }
+                (_, Some(backend_object)) => Some(backend_object.clone()),
+                (Some(memory_object), None) => Some(memory_object.clone()),
+                (None, None) => None,
+            };
+            if let Some(object) = authoritative
+                && object.kind == DfsObjectKind::Tombstone
+            {
+                tombstones.push(self.object_metadata_with_receipt_locations(object)?);
+            }
+        }
+        Ok(tombstones)
     }
 
     fn synced_mkdir_all_paths(path: &str) -> Vec<String> {
@@ -203,6 +275,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: DfsNamespaceCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let request_id = command.request_id.clone();
+        if let Some(replay) = self
+            .served_namespace_replays
+            .iter()
+            .find(|replay| {
+                replay.requester_node_id == requester_node_id && replay.command == command
+            })
+            .cloned()
+        {
+            self.send_dfs_message_if_routable(
+                &requester_node_id,
+                DfsNetworkMessage::NamespaceResponse(replay.response.clone()),
+            )?;
+            return Ok(NetworkedDfsServiceEvent::RemoteNamespaceServed {
+                request_id,
+                requester_node_id,
+                result: replay.response.result,
+                // The original request may have mutated metadata; replaying
+                // its completed response does not and must not schedule a
+                // second publish/maintenance cycle.
+                mutates_metadata: false,
+            });
+        }
         let trace_started = Instant::now();
         let trace_operation = dfs_namespace_operation_trace_label(&command.operation);
         let trace_involved_paths = command.operation.involved_paths().len();
@@ -357,15 +451,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_sync_ms = sync_started.elapsed().as_millis();
         let trace_synced_path_objects = synced_path_objects.len();
         let send_started = Instant::now();
+        let response = DfsNamespaceResponse {
+            request_id: request_id.clone(),
+            result: result.clone(),
+            synced_path_object,
+            synced_path_objects,
+            metadata_journal_batches,
+        };
+        if self.served_namespace_replays.len() >= DFS_SERVED_NAMESPACE_REPLAY_LIMIT {
+            self.served_namespace_replays.pop_front();
+        }
+        self.served_namespace_replays
+            .push_back(ServedNamespaceReplay {
+                requester_node_id: requester_node_id.clone(),
+                command: command.clone(),
+                response: response.clone(),
+            });
         self.send_dfs_message_if_routable(
             &requester_node_id,
-            DfsNetworkMessage::NamespaceResponse(DfsNamespaceResponse {
-                request_id: request_id.clone(),
-                result: result.clone(),
-                synced_path_object,
-                synced_path_objects,
-                metadata_journal_batches,
-            }),
+            DfsNetworkMessage::NamespaceResponse(response),
         )?;
         let trace_send_ms = send_started.elapsed().as_millis();
         dfs_perf_trace(format_args!(

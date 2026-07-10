@@ -812,6 +812,30 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         })
     }
 
+    fn child_tombstones_for_directory(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        directory_path: &str,
+    ) -> Result<Vec<DfsObjectMetadata>> {
+        let mut candidate_paths = BTreeSet::new();
+        for backend in self.shards.values() {
+            for tombstone in
+                backend.child_tombstones_for_directory(file_system_id, directory_path)?
+            {
+                candidate_paths.insert(normalize_path(&tombstone.path));
+            }
+        }
+        let mut tombstones = Vec::new();
+        for path in candidate_paths {
+            if let Some(object) = self.get_object_by_path(file_system_id, &path)?
+                && object.kind == DfsObjectKind::Tombstone
+            {
+                tombstones.push(object);
+            }
+        }
+        Ok(tombstones)
+    }
+
     fn child_objects_for_directory_page(
         &self,
         file_system_id: &DfsFileSystemId,

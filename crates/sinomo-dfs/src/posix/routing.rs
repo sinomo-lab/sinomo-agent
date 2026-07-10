@@ -261,28 +261,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         follow_final: bool,
     ) -> Result<(String, Option<DfsObjectMetadata>)> {
         let mut resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
-        // Non-replica mirrors can be stale in BOTH directions because they do
-        // not receive the pushed journal stream. A bounded best-effort pull
-        // remains available there, but configured replicas keep ordinary
-        // reads free of local metadata writes.
-        if let Some(shard) = self.routed_namespace_shard_for_path_cached(&resolved)?
-            && !self.is_local_metadata_replica_for_shard(&shard)
-            && self.should_attempt_read_freshness_sync(&shard)
-        {
-            if self
-                .route_namespace_operation_to_metadata_primary_with_timeout(
-                    sifs_file_system_id(),
-                    shard.primary_node_id,
-                    DfsNamespaceOperation::SyncPath {
-                        path: resolved.clone(),
-                    },
-                    POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
-                )
-                .is_ok()
-            {
-                resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
-            }
-        }
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
             let local_object = self.lookup_sifs_path(&resolved)?;
             let Some(shard) = self.routed_namespace_shard_for_path_cached(&resolved)? else {
@@ -328,8 +306,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if self.is_local_metadata_replica_for_shard(&shard) {
                 break;
             }
+            if !self.should_attempt_read_freshness_sync(&shard) {
+                break;
+            }
             let cursor_before = self.metadata_shard_cursor_for_path(&resolved)?;
-            self.sync_remote_namespace_path(&resolved)?;
+            if self
+                .route_namespace_operation_to_metadata_primary_with_timeout(
+                    sifs_file_system_id(),
+                    shard.primary_node_id,
+                    DfsNamespaceOperation::SyncPath {
+                        path: resolved.clone(),
+                    },
+                    POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                )
+                .is_err()
+            {
+                break;
+            }
             if self.metadata_shard_cursor_for_path(&resolved)? <= cursor_before {
                 break;
             }

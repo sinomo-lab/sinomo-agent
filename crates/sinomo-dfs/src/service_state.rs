@@ -1,6 +1,6 @@
 //! Networked DFS service state, outcome, event, and pending-state types.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,9 +17,10 @@ use crate::{
     DfsBulkReadItemResponse, DfsConflictRecord, DfsConflictStatus, DfsControlPlaneKvClient,
     DfsDistributedWriteCommand, DfsDistributedWriteResult, DfsError, DfsFileSystemId,
     DfsMessageResponse, DfsMetadataBackend, DfsMetadataShardConfig, DfsMetadataShardId,
-    DfsMetadataStore, DfsNamespaceResult, DfsObjectId, DfsObjectMetadata, DfsReadData,
-    DfsReadRangeData, DfsReadResult, DfsRepairAttemptRecord, DfsVersion,
-    DistributedEventualCoordinator, DistributedRepairJob, LocalContentStore, ObjectVersionReader,
+    DfsMetadataStore, DfsNamespaceCommand, DfsNamespaceResponse, DfsNamespaceResult, DfsObjectId,
+    DfsObjectMetadata, DfsReadData, DfsReadRangeData, DfsReadResult, DfsRepairAttemptRecord,
+    DfsVersion, DistributedEventualCoordinator, DistributedRepairJob, LocalContentStore,
+    ObjectVersionReader,
 };
 
 pub(crate) const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 1024 * 1024;
@@ -34,10 +35,12 @@ pub(crate) const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 1024;
 pub(crate) const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 2;
 
 pub(crate) const DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT: usize = 8;
-// Namespace RPCs are on the app-visible critical path. A cluster route that
-// cannot answer within this budget is treated as unhealthy rather than hidden
-// behind a long DFS wait.
-pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(5);
+// Namespace RPCs are on the app-visible critical path, but they may include a
+// durable WAN metadata mutation and bounded journal replay. Keep the deadline
+// short enough to surface an unhealthy route while allowing slower real-cluster
+// primaries to finish instead of abandoning an in-flight mutation at five
+// seconds.
+pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Nested coordination depth (serving a namespace request while settling
 /// another) beyond which new coordination rejects as Busy instead of growing
 /// the stack.
@@ -59,6 +62,7 @@ pub const DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT: usize = 1;
 pub(crate) const DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT: usize = 3;
 pub(crate) const DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT: u64 = DFS_BLOB_INLINE_LIMIT_BYTES as u64;
 pub(crate) const DFS_ROUTED_NAMESPACE_IDLE_WAIT: Duration = Duration::from_millis(10);
+pub(crate) const DFS_SERVED_NAMESPACE_REPLAY_LIMIT: usize = 32;
 
 pub(crate) const DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES: usize = 64;
 
@@ -122,6 +126,7 @@ pub struct NetworkedDfsService<T> {
     pub(crate) deferred_routed_create_parent_touches: BTreeSet<String>,
     pub(crate) deferred_untracked_routed_write_responses: BTreeMap<String, DfsObjectId>,
     pub(crate) pending_routed_namespace_ops: BTreeMap<String, PendingRoutedNamespaceOp>,
+    pub(crate) served_namespace_replays: VecDeque<ServedNamespaceReplay>,
     pub(crate) routed_namespace_settle_depth: usize,
     pub(crate) cross_shard_namespace_locks: BTreeSet<(DfsFileSystemId, String)>,
     pub(crate) last_events: Vec<NetworkedDfsServiceEvent>,
@@ -406,6 +411,13 @@ pub(crate) struct PendingRoutedNamespaceOp {
     pub(crate) replay_journal_batches: bool,
     pub(crate) apply_synced_path_object: bool,
     pub(crate) result: Option<PendingRoutedNamespaceResult>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ServedNamespaceReplay {
+    pub(crate) requester_node_id: NodeId,
+    pub(crate) command: DfsNamespaceCommand,
+    pub(crate) response: DfsNamespaceResponse,
 }
 
 /// Event emitted by the networked DFS service while handling data-plane,

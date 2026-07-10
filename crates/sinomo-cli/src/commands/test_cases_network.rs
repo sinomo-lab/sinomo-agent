@@ -31,7 +31,10 @@ const DEFAULT_CONCURRENCY: usize = 32;
 const DEFAULT_TIMEOUT_MS: u64 = 2_000;
 const DEFAULT_EXPECTED_TARGETS: usize = 1;
 const DEFAULT_MAX_FAILURES: usize = 0;
-const DEFAULT_MAX_P50_MS: u64 = 50;
+// The real cluster includes a WAN aarch64 node whose healthy steady-state
+// median is commonly 50-70ms. Keep the 2s failure deadline and 250ms p95 gate
+// strict while leaving enough p50 headroom for that supported topology.
+const DEFAULT_MAX_P50_MS: u64 = 100;
 const DEFAULT_MAX_P95_MS: u64 = 250;
 const DEFAULT_MAX_P50_US: u64 = 0;
 const DEFAULT_MAX_P95_US: u64 = 0;
