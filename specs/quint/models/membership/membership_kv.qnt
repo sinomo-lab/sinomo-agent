@@ -5,6 +5,10 @@
 /// it consumes the lower-layer guarantee as a minimal interface: the KV exposes
 /// one canonical append-only committed command prefix, and membership state is
 /// the deterministic replay of that prefix.
+///
+/// Evidence status: replay and role projection are current-behavior
+/// abstractions; the `caughtUp` gate on voter promotion is target hardening and
+/// is not yet a Rust conformance claim.
 module membership_kv {
   import common.* from "../../lib/common"
   import membership_base.* from "../../lib/membership_base"

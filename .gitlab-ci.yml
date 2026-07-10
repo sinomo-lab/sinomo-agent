@@ -1,0 +1,95 @@
+stages:
+  - test
+  - formal-deep
+
+variables:
+  NPM_CONFIG_CACHE: "$CI_PROJECT_DIR/.cache/npm"
+  XDG_CACHE_HOME: "$CI_PROJECT_DIR/.cache"
+  QUINT_HOME: "$CI_PROJECT_DIR/.cache/quint"
+  QUINT_EXPECTED_VERSION: "0.32.0"
+  QUINT_APALACHE_VERSION: "0.56.1"
+
+.quint-base:
+  image: node:22-bookworm
+  cache:
+    key: quint-0.32.0
+    paths:
+      - .cache/npm/
+      - .cache/quint/
+  before_script:
+    - apt-get update
+    - apt-get install --yes --no-install-recommends openjdk-17-jre-headless
+    - npm install --global @informalsystems/quint@0.32.0
+    - quint --version
+    - java -version
+  artifacts:
+    when: on_failure
+    expire_in: 7 days
+    paths:
+      - _apalache-out/
+
+formal:quint-fast:
+  extends: .quint-base
+  stage: test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - changes:
+        - .gitlab-ci.yml
+        - scripts/formal/**/*
+        - specs/quint/**/*
+        - docs/formal/**/*
+        - docs/plans/formal-verification-roadmap.md
+        - crates/sinomo-network/**/*
+        - crates/sinomo-kv/**/*
+        - crates/sinomo-cluster/**/*
+        - crates/sinomo-dfs/**/*
+  script:
+    - bash scripts/formal/check-quint.sh typecheck
+    - QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_STEPS=40 QUINT_NETWORK_TIMED_SMOKE_RUN_MAX_SAMPLES=200 QUINT_SYSTEM_SMOKE_RUN_MAX_STEPS=40 QUINT_SYSTEM_SMOKE_RUN_MAX_SAMPLES=200 bash scripts/formal/check-quint.sh smoke
+    - QUINT_CASE_FILTER=raft-protocol,network-route-cache,network-delivery,network-attempt-budget,network-timed-delivery,membership-raft-config,dfs-pending-requests,dfs-namespace-command-replay QUINT_COVERAGE_MAX_SAMPLES=5000 bash scripts/formal/check-quint.sh coverage
+    - QUINT_CASE_FILTER=raft-protocol,network-route-cache,network-delivery,network-attempt-budget,network-timed-transport,network-timed-delivery,membership-raft-config,dfs-pending-requests,dfs-namespace-command-replay QUINT_CASE_TIMEOUT_SECONDS=240 bash scripts/formal/check-quint.sh verify-full
+
+formal:rust-conformance:
+  image: rust:1.96-bookworm
+  stage: test
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cache/cargo"
+  cache:
+    key: rust-1.96-formal-conformance
+    paths:
+      - .cache/cargo/registry/
+      - .cache/cargo/git/
+      - target/
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - changes:
+        - .gitlab-ci.yml
+        - specs/quint/models/network/attempt_budget.qnt
+        - specs/quint/models/network/delivery_retry.qnt
+        - specs/quint/models/kv/raft_protocol.qnt
+        - specs/quint/models/membership/raft_config_transition.qnt
+        - specs/quint/models/dfs/pending_request_lifecycle.qnt
+        - specs/quint/models/dfs/namespace_command_replay.qnt
+        - crates/sinomo-network/src/route.rs
+        - crates/sinomo-kv/src/**/*
+        - crates/sinomo-kv/tests/**/*
+        - crates/sinomo-dfs/src/**/*
+  script:
+    - cargo test -p sinomo-network --lib network_attempt_budget_matches_bounded_model_cases
+    - cargo test -p sinomo-network --lib cluster_target_rpc_retries_after_endpoint_error_response
+    - cargo test -p sinomo-kv --test kv raft_votes_require_current_candidate_log
+    - cargo test -p sinomo-kv --test kv durable_raft_observe_higher_term_clears_vote_and_leader
+    - cargo test -p sinomo-kv --test kv durable_raft_discard_uncommitted_tail_keeps_committed_prefix
+    - cargo test -p sinomo-kv --test kv cluster_kv_raft_config_transition_matches_bounded_model_cases
+    - cargo test -p sinomo-dfs --lib inline_remote_read_wrong_object_is_isolated_and_falls_back
+    - cargo test -p sinomo-dfs --lib served_namespace_exact_retry_replays_completed_rename
+
+formal:quint-deep:
+  extends: .quint-base
+  stage: formal-deep
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  script:
+    - QUINT_RAFT_PROTOCOL_VERIFY_MAX_STEPS=2 QUINT_CASE_TIMEOUT_SECONDS=900 bash scripts/formal/check-quint.sh verify-full

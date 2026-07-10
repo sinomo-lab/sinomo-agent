@@ -1,6 +1,6 @@
 # Formal Verification Roadmap
 
-Status: active backlog. Last reviewed 2026-07-09.
+Status: active backlog. Last reviewed 2026-07-10.
 
 This plan tracks the next bounded verification slices. Current models,
 properties, and execution instructions live in the
@@ -10,18 +10,33 @@ New models should consume established lower-layer guarantees rather than
 re-modeling routing, authority, content validation, and retry semantics in one
 large state machine.
 
+## KV and Raft
+
+Completed 2026-07-10: the per-node three-voter protocol slice now covers vote
+freshness and vote-once, quorum election, AppendEntries backtracking and
+divergent-suffix repair, acknowledgement-backed commit, leader completeness,
+state-machine replay, higher-term stepdown, and durable term/vote/log restart.
+
+1. **Persistence refinement.** Connect the abstract durable restart action to
+   WAL append, hard-state persistence, snapshot restore, and failure rollback.
+2. **Raft-over-network composition.** Carry concrete RequestVote and
+   AppendEntries exchanges over the network retry contract, including loss,
+   duplication, reordering, and higher-term responses.
+
 ## Network
 
-1. **Route-cache invalidation.** Model directory versions, local connectivity
-   marks, and transport-module snapshots. Prove that a route plan is not reused
-   after an input affecting its validity changes.
-2. **Timed retry conformance.** Add deterministic virtual-time Rust scenarios
+Completed 2026-07-10: the focused route-cache slice now covers directory
+versions, local-connectivity file/content generations, transport-module
+snapshots, table identities, expiry, membership removal, identity mismatch, and
+before/after build races.
+
+1. **Timed retry conformance.** Add deterministic virtual-time Rust scenarios
    for late responses, fallback after a primary timeout, delivery duplicates,
    packet loss, and identity-mismatch suppression.
-3. **Purpose-specific endpoint selection.** Refine selection for rollout, Raft,
+2. **Purpose-specific endpoint selection.** Refine selection for rollout, Raft,
    member status, and data traffic while preserving the common authorization
    and reachability rules.
-4. **Stream retry budgets.** Extend delivery models with streaming capability
+3. **Stream retry budgets.** Extend delivery models with streaming capability
    and raw-response constraints. Prove that fallback cannot expand the caller's
    deadline or select an incompatible transport.
 
@@ -38,6 +53,11 @@ large state machine.
    modules and retain both random exploration and fixed-seed replay.
 
 ## DFS
+
+Completed 2026-07-10: the namespace-command replay slice now captures the full
+requester/command key, exact cached-response replay, FIFO eviction, process
+restart, and requester-local cancellation boundary. It deliberately exposes
+re-execution after cache loss as a remaining durable-idempotency limitation.
 
 1. **Anti-entropy progress.** Under explicit fairness assumptions, prove that a
    missing desired replica eventually obtains a durable receipt or remains

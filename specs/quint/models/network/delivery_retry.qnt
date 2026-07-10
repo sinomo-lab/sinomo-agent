@@ -2,14 +2,23 @@
 ///
 /// This module models the retry loop around route endpoint attempts in
 /// `crates/sinomo-network/src/route.rs`: one preferred endpoint, one fallback
-/// endpoint, stable inner delivery identity, connectivity observations, and
-/// replay-cache suppression of duplicate delivery.
+/// endpoint, a stable domain operation identity, fresh authentication for each
+/// endpoint attempt, and connectivity observations.
+///
+/// A dispatched attempt may have reached the domain even when its response is
+/// lost. Therefore retrying may dispatch the same operation more than once.
+/// Generic object RPC deliberately does not model a replay cache or an
+/// at-most-once domain effect; side-effecting routes must enforce idempotency at
+/// their own domain boundary.
+///
+/// Evidence class: current-behavior refinement of the bounded endpoint retry
+/// loop. Domain idempotency is an explicit lower-layer obligation.
 module network_delivery_retry {
   import common.* from "../../lib/common"
 
   type DeliveryEndpoint = PrimaryEndpoint | FallbackEndpoint
-  type DeliveryKey = KeyA
-    | KeyB
+  type OperationId = OperationA | OperationB
+  type AttemptNonce = PrimaryAttemptNonce | FallbackAttemptNonce
   type AttemptResult =
     AttemptSuccess
     | AttemptTimeout
@@ -28,10 +37,10 @@ module network_delivery_retry {
     | FailedAfterPrimaryNoFallback
     | DeadlineExpiredAfterPrimary
     | TtlExpiredAfterPrimary
-    | DuplicateReplayReturned
     | TerminalStutter
 
   pure val Endpoints: Set[DeliveryEndpoint] = Set(PrimaryEndpoint, FallbackEndpoint)
+  pure val OperationIds: Set[OperationId] = Set(OperationA, OperationB)
   pure val AttemptResults: Set[AttemptResult] = Set(
     AttemptSuccess,
     AttemptTimeout,
@@ -50,14 +59,14 @@ module network_delivery_retry {
   var failedEndpoints: Set[DeliveryEndpoint]
   var suppressedEndpoints: Set[DeliveryEndpoint]
   var endpointFeedback: DeliveryEndpoint -> Feedback
-  var deliveryKey: Option[DeliveryKey]
-  var primaryAttemptKey: Option[DeliveryKey]
-  var fallbackAttemptKey: Option[DeliveryKey]
-  var replayCache: Set[DeliveryKey]
+  var operationId: Option[OperationId]
+  var primaryAttemptOperationId: Option[OperationId]
+  var fallbackAttemptOperationId: Option[OperationId]
+  var primaryAttemptNonce: Option[AttemptNonce]
+  var fallbackAttemptNonce: Option[AttemptNonce]
   var dispatchCount: int
   var responseDelivered: bool
   var terminalError: Option[DeliveryError]
-  var duplicateReplayObserved: bool
   var lastDecision: Decision
 
   pure val emptyFeedback: DeliveryEndpoint -> Feedback =
@@ -94,14 +103,14 @@ module network_delivery_retry {
     failedEndpoints' = Set(),
     suppressedEndpoints' = Set(),
     endpointFeedback' = emptyFeedback,
-    deliveryKey' = None,
-    primaryAttemptKey' = None,
-    fallbackAttemptKey' = None,
-    replayCache' = Set(),
+    operationId' = None,
+    primaryAttemptOperationId' = None,
+    fallbackAttemptOperationId' = None,
+    primaryAttemptNonce' = None,
+    fallbackAttemptNonce' = None,
     dispatchCount' = 0,
     responseDelivered' = false,
     terminalError' = None,
-    duplicateReplayObserved' = false,
     lastDecision' = NoDecision,
   }
 
@@ -110,7 +119,8 @@ module network_delivery_retry {
     initialBudgetRemaining: bool,
     initialTtlAvailable: bool,
     preferredResult: AttemptResult,
-    backupResult: AttemptResult
+    backupResult: AttemptResult,
+    requestedOperationId: OperationId
   ): bool = all {
     phase == Idle,
     phase' = Prepared,
@@ -123,14 +133,14 @@ module network_delivery_retry {
     failedEndpoints' = Set(),
     suppressedEndpoints' = Set(),
     endpointFeedback' = emptyFeedback,
-    deliveryKey' = Some(KeyA),
-    primaryAttemptKey' = None,
-    fallbackAttemptKey' = None,
-    replayCache' = Set(),
+    operationId' = Some(requestedOperationId),
+    primaryAttemptOperationId' = None,
+    fallbackAttemptOperationId' = None,
+    primaryAttemptNonce' = None,
+    fallbackAttemptNonce' = None,
     dispatchCount' = 0,
     responseDelivered' = false,
     terminalError' = None,
-    duplicateReplayObserved' = false,
     lastDecision' = RequestPrepared,
   }
 
@@ -147,14 +157,14 @@ module network_delivery_retry {
     failedEndpoints' = failedEndpoints,
     suppressedEndpoints' = suppressedEndpoints,
     endpointFeedback' = endpointFeedback,
-    deliveryKey' = deliveryKey,
-    primaryAttemptKey' = primaryAttemptKey,
-    fallbackAttemptKey' = fallbackAttemptKey,
-    replayCache' = replayCache,
+    operationId' = operationId,
+    primaryAttemptOperationId' = primaryAttemptOperationId,
+    fallbackAttemptOperationId' = fallbackAttemptOperationId,
+    primaryAttemptNonce' = primaryAttemptNonce,
+    fallbackAttemptNonce' = fallbackAttemptNonce,
     dispatchCount' = dispatchCount,
     responseDelivered' = false,
     terminalError' = Some(terminalErrorForBudget(ttlAvailable)),
-    duplicateReplayObserved' = duplicateReplayObserved,
     lastDecision' = FailedBeforeAttempt,
   }
 
@@ -164,6 +174,7 @@ module network_delivery_retry {
       phase == Prepared,
       budgetRemaining,
       ttlAvailable,
+      operationId != None,
       phase' = if (failed) { PrimaryFailed } else { Delivered },
       hasFallback' = hasFallback,
       budgetRemaining' = budgetRemaining,
@@ -181,15 +192,14 @@ module network_delivery_retry {
         },
       endpointFeedback' =
         endpointFeedback.set(PrimaryEndpoint, feedbackFor(primaryResult)),
-      deliveryKey' = deliveryKey,
-      primaryAttemptKey' = deliveryKey,
-      fallbackAttemptKey' = fallbackAttemptKey,
-      replayCache' =
-        if (failed) { replayCache } else { replayCache.union(Set(KeyA)) },
-      dispatchCount' = if (failed) { dispatchCount } else { dispatchCount + 1 },
+      operationId' = operationId,
+      primaryAttemptOperationId' = operationId,
+      fallbackAttemptOperationId' = fallbackAttemptOperationId,
+      primaryAttemptNonce' = Some(PrimaryAttemptNonce),
+      fallbackAttemptNonce' = fallbackAttemptNonce,
+      dispatchCount' = dispatchCount + 1,
       responseDelivered' = not(failed),
       terminalError' = None,
-      duplicateReplayObserved' = duplicateReplayObserved,
       lastDecision' = PrimaryAttempted,
     }
   }
@@ -207,14 +217,14 @@ module network_delivery_retry {
     failedEndpoints' = failedEndpoints,
     suppressedEndpoints' = suppressedEndpoints,
     endpointFeedback' = endpointFeedback,
-    deliveryKey' = deliveryKey,
-    primaryAttemptKey' = primaryAttemptKey,
-    fallbackAttemptKey' = fallbackAttemptKey,
-    replayCache' = replayCache,
+    operationId' = operationId,
+    primaryAttemptOperationId' = primaryAttemptOperationId,
+    fallbackAttemptOperationId' = fallbackAttemptOperationId,
+    primaryAttemptNonce' = primaryAttemptNonce,
+    fallbackAttemptNonce' = fallbackAttemptNonce,
     dispatchCount' = dispatchCount,
     responseDelivered' = false,
     terminalError' = Some(AllEndpointsFailed),
-    duplicateReplayObserved' = duplicateReplayObserved,
     lastDecision' = FailedAfterPrimaryNoFallback,
   }
 
@@ -233,14 +243,14 @@ module network_delivery_retry {
     failedEndpoints' = failedEndpoints,
     suppressedEndpoints' = suppressedEndpoints,
     endpointFeedback' = endpointFeedback,
-    deliveryKey' = deliveryKey,
-    primaryAttemptKey' = primaryAttemptKey,
-    fallbackAttemptKey' = fallbackAttemptKey,
-    replayCache' = replayCache,
+    operationId' = operationId,
+    primaryAttemptOperationId' = primaryAttemptOperationId,
+    fallbackAttemptOperationId' = fallbackAttemptOperationId,
+    primaryAttemptNonce' = primaryAttemptNonce,
+    fallbackAttemptNonce' = fallbackAttemptNonce,
     dispatchCount' = dispatchCount,
     responseDelivered' = false,
     terminalError' = Some(DeadlineExpired),
-    duplicateReplayObserved' = duplicateReplayObserved,
     lastDecision' = DeadlineExpiredAfterPrimary,
   }
 
@@ -259,14 +269,14 @@ module network_delivery_retry {
     failedEndpoints' = failedEndpoints,
     suppressedEndpoints' = suppressedEndpoints,
     endpointFeedback' = endpointFeedback,
-    deliveryKey' = deliveryKey,
-    primaryAttemptKey' = primaryAttemptKey,
-    fallbackAttemptKey' = fallbackAttemptKey,
-    replayCache' = replayCache,
+    operationId' = operationId,
+    primaryAttemptOperationId' = primaryAttemptOperationId,
+    fallbackAttemptOperationId' = fallbackAttemptOperationId,
+    primaryAttemptNonce' = primaryAttemptNonce,
+    fallbackAttemptNonce' = fallbackAttemptNonce,
     dispatchCount' = dispatchCount,
     responseDelivered' = false,
     terminalError' = Some(TtlExpired),
-    duplicateReplayObserved' = duplicateReplayObserved,
     lastDecision' = TtlExpiredAfterPrimary,
   }
 
@@ -277,6 +287,7 @@ module network_delivery_retry {
       hasFallback,
       budgetRemaining,
       ttlAvailable,
+      operationId != None,
       not(suppressedEndpoints.contains(FallbackEndpoint)),
       phase' = if (failed) { Failed } else { Delivered },
       hasFallback' = hasFallback,
@@ -295,41 +306,16 @@ module network_delivery_retry {
         },
       endpointFeedback' =
         endpointFeedback.set(FallbackEndpoint, feedbackFor(fallbackResult)),
-      deliveryKey' = deliveryKey,
-      primaryAttemptKey' = primaryAttemptKey,
-      fallbackAttemptKey' = deliveryKey,
-      replayCache' =
-        if (failed) { replayCache } else { replayCache.union(Set(KeyA)) },
-      dispatchCount' = if (failed) { dispatchCount } else { dispatchCount + 1 },
+      operationId' = operationId,
+      primaryAttemptOperationId' = primaryAttemptOperationId,
+      fallbackAttemptOperationId' = operationId,
+      primaryAttemptNonce' = primaryAttemptNonce,
+      fallbackAttemptNonce' = Some(FallbackAttemptNonce),
+      dispatchCount' = dispatchCount + 1,
       responseDelivered' = not(failed),
       terminalError' = if (failed) { Some(AllEndpointsFailed) } else { None },
-      duplicateReplayObserved' = duplicateReplayObserved,
       lastDecision' = FallbackAttempted,
     }
-  }
-
-  action duplicateReplay: bool = all {
-    phase == Delivered,
-    replayCache.contains(KeyA),
-    phase' = phase,
-    hasFallback' = hasFallback,
-    budgetRemaining' = budgetRemaining,
-    ttlAvailable' = ttlAvailable,
-    primaryResult' = primaryResult,
-    fallbackResult' = fallbackResult,
-    attemptedEndpoints' = attemptedEndpoints,
-    failedEndpoints' = failedEndpoints,
-    suppressedEndpoints' = suppressedEndpoints,
-    endpointFeedback' = endpointFeedback,
-    deliveryKey' = deliveryKey,
-    primaryAttemptKey' = primaryAttemptKey,
-    fallbackAttemptKey' = fallbackAttemptKey,
-    replayCache' = replayCache,
-    dispatchCount' = dispatchCount,
-    responseDelivered' = responseDelivered,
-    terminalError' = terminalError,
-    duplicateReplayObserved' = true,
-    lastDecision' = DuplicateReplayReturned,
   }
 
   action stutterTerminal: bool = all {
@@ -347,14 +333,14 @@ module network_delivery_retry {
     failedEndpoints' = failedEndpoints,
     suppressedEndpoints' = suppressedEndpoints,
     endpointFeedback' = endpointFeedback,
-    deliveryKey' = deliveryKey,
-    primaryAttemptKey' = primaryAttemptKey,
-    fallbackAttemptKey' = fallbackAttemptKey,
-    replayCache' = replayCache,
+    operationId' = operationId,
+    primaryAttemptOperationId' = primaryAttemptOperationId,
+    fallbackAttemptOperationId' = fallbackAttemptOperationId,
+    primaryAttemptNonce' = primaryAttemptNonce,
+    fallbackAttemptNonce' = fallbackAttemptNonce,
     dispatchCount' = dispatchCount,
     responseDelivered' = responseDelivered,
     terminalError' = terminalError,
-    duplicateReplayObserved' = duplicateReplayObserved,
     lastDecision' = TerminalStutter,
   }
 
@@ -365,12 +351,14 @@ module network_delivery_retry {
       nondet initialTtlAvailable = oneOf(Set(true, false))
       nondet preferredResult = oneOf(AttemptResults)
       nondet backupResult = oneOf(AttemptResults)
+      nondet requestedOperationId = oneOf(OperationIds)
       beginRequest(
         fallbackConfigured,
         initialBudgetRemaining,
         initialTtlAvailable,
         preferredResult,
-        backupResult
+        backupResult,
+        requestedOperationId
       )
     },
     failBeforeAttempt,
@@ -379,7 +367,6 @@ module network_delivery_retry {
     expireDeadlineAfterPrimary,
     expireTtlAfterPrimary,
     attemptFallback,
-    duplicateReplay,
     stutterTerminal,
   }
 }

@@ -4,6 +4,10 @@
 /// the cluster KV. Network observations and accepted-looking responses are
 /// modeled separately so we can state the important safety rule directly:
 /// reachability, discovery, and unverified acceptance do not authorize a node.
+///
+/// Evidence status: the catch-up certificate required before voter promotion is
+/// target hardening. Current Rust validates learner/non-voting provenance and
+/// configuration overlap, but does not yet enforce this `caughtUp` predicate.
 module membership {
   import common.* from "../../lib/common"
   import membership_base.* from "../../lib/membership_base"
